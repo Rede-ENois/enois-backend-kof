@@ -1,0 +1,28 @@
+package kernel.security
+
+import kernel.http.*
+
+// The 429 of the filters, with the CORS headers the browser needs. The limit filters answer BEFORE the
+// CORS handling of the router: a 429 without Access-Control-Allow-Origin is not read as "too many
+// requests", the browser reports a CORS failure and the app shows "could not ..." without any status.
+// Only an origin the origin gate marked trusted is reflected (with credentials).
+class RateLimitResponses {
+    static String send(retryAfterSeconds: Int, code: String, message: String) {
+        var after = retryAfterSeconds
+        if (after < 1) {
+            after = 1
+        }
+        ResponseHeaders.set("Retry-After", "" + after)
+        TrustedOriginCors.apply()
+        var requested = Req.headerOrNull("access-control-request-headers")
+        var allowHeaders = "content-type,x-client-origin,x-session-token,idempotency-key,x-device-id"
+        if (requested != null) {
+            if (requested.trim().length() > 0) {
+                allowHeaders = requested
+            }
+        }
+        ResponseHeaders.set("Access-Control-Allow-Headers", allowHeaders)
+        ResponseHeaders.set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+        return status(429, "{\"code\":\"" + code + "\",\"message\":\"" + message + "\"}")
+    }
+}

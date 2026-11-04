@@ -16,12 +16,39 @@ import kernel.http.*
 // need `X-CSRF-Protection: 1` (Auth.csrfFilter). Auth.install wires the store and the CSRF filter.
 class Auth {
     static AuthStore? authStore = null
+    static AdminGuard? adminGuard = null
+    static ModeratorGuard? moderatorGuard = null
     static ThreadLocal cached = new ThreadLocal()
     // Wires the session store and registers the CSRF filter (the SessionCookieFilter slot).
     static install(server: HttpServer, store: Db, cfg: Config) {
         Auth.authStore = AuthStore(store)
         SessionCookies.configure(Auth.cookieSecure(cfg))
         server.use("session-csrf", Auth.csrfOrder(), () -> Auth.csrfFilter())
+    }
+    // Called by Security.install once the guards exist.
+    static useGuards(admin: AdminGuard, moderators: ModeratorGuard) {
+        Auth.adminGuard = admin
+        Auth.moderatorGuard = moderators
+    }
+    // The current user, who must be an admin (403 FORBIDDEN "Acesso restrito a administradores.").
+    static String requireAdmin() {
+        var userId = Auth.requireUser()
+        var guard = Auth.adminGuard
+        if (guard == null) {
+            throw "AUTH_NOT_CONFIGURED: call Security.install at boot"
+        }
+        guard.requireAdmin(userId)
+        return userId
+    }
+    // The current user, who must be an admin or a moderator (403 FORBIDDEN "Acesso restrito a moderadores.").
+    static String requireModerator() {
+        var userId = Auth.requireUser()
+        var guard = Auth.moderatorGuard
+        if (guard == null) {
+            throw "AUTH_NOT_CONFIGURED: call Security.install at boot"
+        }
+        guard.requireModerator(userId)
+        return userId
     }
     // Same slot as SessionCookieFilter: after the origin gate, before the limiters.
     static Int csrfOrder() = -980

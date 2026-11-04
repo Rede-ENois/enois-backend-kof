@@ -1,0 +1,170 @@
+package kernel.security
+
+import java.util.HashMap
+import kernel.config.*
+import kernel.error.*
+import kernel.http.*
+
+// Panic mode short-circuit. Runs right after the access log (so the 429 is logged) and before every
+// limiter: with panic on, no write reaches a handler. Exempt: the panic endpoint itself (it must be able
+// to switch off) and the sign-in / recovery flows (login, refresh, confirmation, 2FA): blocking login
+// would stop the admin from turning it off.
+class PanicModeFilter {
+    PanicModeService panic
+    public constructor(panic: PanicModeService) {
+        this.panic = panic
+    }
+    static List<String> exempt() = listOf("/admin/panic", "/auth/login", "/auth/refresh", "/auth/2fa/verify", "/auth/2fa/resend", "/auth/2fa/email/request", "/auth/2fa/email/confirm")
+    String run() {
+        if (!panic.active()) {
+            return Http.next()
+        }
+        if (!RateFilters.isWrite(method())) {
+            return Http.next()
+        }
+        if (PanicModeFilter.exempt().contains(RequestPath.current())) {
+            return Http.next()
+        }
+        throw Errors.api(429, "PANIC_MODE", "Escritas temporariamente bloqueadas pelo modo panico. Tente novamente em instantes.")
+    }
+}
+
+// First half of the FallbackSurfaceFilter: an escape the router could not decode (`/admin/%zz`) is
+// answered 400 with an empty body, before anything else looks at the path. (The unknown-path 200 empty
+// is the kernel's own built-in at order -1000.)
+class PathGuardFilter {
+    String run() {
+        try {
+            RequestPath.routing(path())
+        } catch (String e) {
+            return status(400, "")
+        }
+        return Http.next()
+    }
+}
+
+// Security headers of the API responses. The API only answers JSON, so a restrictive CSP is safe, except
+// on the documentation pages (Swagger UI), which keep only frame-ancestors when enabled. A request that
+// carries a session (header or the enois_session cookie) gets Cache-Control: no-store: per-user data
+// must not be kept by the browser or shared caches.
+class SecurityHeadersFilter {
+    static String strictCsp() = "default-src \'none\'; frame-ancestors \'none\'; base-uri \'none\'; form-action \'none\'"
+    String run() {
+        var csp = SecurityHeadersFilter.strictCsp()
+        if (SecurityHeadersFilter.isDocumentationPath(path())) {
+            csp = "frame-ancestors \'none\'"
+        }
+        ResponseHeaders.set("Content-Security-Policy", csp)
+        ResponseHeaders.set("X-Content-Type-Options", "nosniff")
+        ResponseHeaders.set("X-Frame-Options", "DENY")
+        ResponseHeaders.set("Cross-Origin-Opener-Policy", "same-origin")
+        ResponseHeaders.set("Cross-Origin-Resource-Policy", "same-site")
+        ResponseHeaders.set("Referrer-Policy", "no-referrer")
+        ResponseHeaders.set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+        ResponseHeaders.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        if (isAuthenticated()) {
+            ResponseHeaders.set("Cache-Control", "no-store")
+        }
+        return Http.next()
+    }
+    Bool isAuthenticated() {
+        if (Req.headerOrNull("x-session-token") != null) {
+            return true
+        }
+        return Req.cookies().containsKey("enois_session")
+    }
+    static Bool isDocumentationPath(p: String) = p.startsWith("/swagger-ui") || p.startsWith("/v3/api-docs") || p.endsWith("/openapi.json")
+}
+
+// CORS of the router (Spring CorsConfig): the allowlist is explicit, "*" is rejected at boot, and a
+// credentialed grant never goes to a wildcard pattern (subdomain patterns stay valid for the origin gate,
+// but any sibling subdomain would otherwise read and write the API with the victim's cookie).
+// CORS_ALLOWED_ORIGINS and REDE_TRUSTED_ORIGINS feed it; the origin gate (RequestOriginGate) answers
+// preflights first when enforcing, and a response that already carries Access-Control-Allow-Origin is
+// left alone (the Spring processor skips it too).
+class CorsPolicy {
+    List<String> origins = listOf<String>()
+    public constructor(allowed: String, trusted: String) {
+        CorsPolicy.rejectWildcards(allowed, trusted)
+        var patterns = listOf<String>()
+        if (allowed.trim().length() == 0) {
+            patterns.add("https://enois.ia.br")
+        }
+        else {
+            for (var p in OriginPatterns.parse(allowed)) {
+                patterns.add(p)
+            }
+        }
+        for (var p in OriginPatterns.parse(trusted)) {
+            patterns.add(p)
+        }
+        for (var p in patterns) {
+            if (!p.contains("*")) {
+                origins.add(p)
+            }
+        }
+        if (origins.isEmpty()) {
+            origins.add("https://enois.ia.br")
+        }
+    }
+    // Credentialed CORS with an "any origin" pattern would let every site call the API as the user.
+    static rejectWildcards(allowed: String, trusted: String) {
+        var all = allowed + "," + trusted
+        for (var origin in all.split(",")) {
+            var t = origin.trim()
+            if (t == "*" || t.endsWith("://*")) {
+                throw "CONFIG_INVALID: Wildcard CORS origin \'" + t + "\' is not allowed; list the origins explicitly"
+            }
+        }
+    }
+    static CorsPolicy fromConfig(cfg: Config) = CorsPolicy(OriginPatterns.allowedFrom(cfg), OriginPatterns.trustedFrom(cfg))
+    Bool allows(origin: String) = origins.contains(OriginPatterns.normalize(origin))
+    // The MVC-level handling: preflight answered here, actual requests get their headers, an origin that
+    // is not allowed gets 403 "Invalid CORS request".
+    String run() {
+        var origin = Req.headerOrNull("origin")
+        if (origin == null) {
+            return Http.next()
+        }
+        if (origin.trim().length() == 0) {
+            return Http.next()
+        }
+        if (sameOrigin(origin)) {
+            return Http.next()
+        }
+        if (ResponseHeaders.has("Access-Control-Allow-Origin")) {
+            return Http.next()
+        }
+        var requestMethod = Req.headerOrNull("access-control-request-method")
+        var preflight = method().toUpperCase() == "OPTIONS" && requestMethod != null
+        if (!allows(origin)) {
+            return status(403, "Invalid CORS request")
+        }
+        ResponseHeaders.set("Access-Control-Allow-Origin", origin)
+        ResponseHeaders.set("Access-Control-Allow-Credentials", "true")
+        ResponseHeaders.add("Vary", "Origin")
+        if (!preflight) {
+            ResponseHeaders.set("Access-Control-Expose-Headers", "*")
+            return Http.next()
+        }
+        ResponseHeaders.add("Vary", "Access-Control-Request-Method")
+        ResponseHeaders.add("Vary", "Access-Control-Request-Headers")
+        ResponseHeaders.set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,PATCH,OPTIONS")
+        var requested = Req.headerOrNull("access-control-request-headers")
+        if (requested != null) {
+            if (requested.trim().length() > 0) {
+                ResponseHeaders.set("Access-Control-Allow-Headers", requested)
+            }
+        }
+        ResponseHeaders.set("Access-Control-Max-Age", "1800")
+        return status(200, "")
+    }
+    Bool sameOrigin(origin: String) {
+        var host = Req.headerOrNull("host")
+        if (host == null) {
+            return false
+        }
+        var o = origin.trim().toLowerCase()
+        return o == "http://" + host.toLowerCase() || o == "https://" + host.toLowerCase()
+    }
+}

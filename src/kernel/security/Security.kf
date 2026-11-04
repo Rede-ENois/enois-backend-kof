@@ -1,0 +1,107 @@
+package kernel.security
+
+import kernel.*
+import kernel.config.*
+import kernel.http.*
+
+// Everything Security.install built, for tests and for domains that need an instance
+// (user limiters, guards).
+class SecurityParts {
+    PanicModeService panic
+    AdminGuard admin
+    ModeratorGuard moderators
+    RateLimitSessions sessions
+    IpRateLimiter ipLimiter
+    UserRateLimiter userLimiter
+    ActionThrottle actionThrottle
+    AuthThrottle authThrottle
+    NewAccountCooldown newAccountCooldown
+    BehavioralTimingGuard timingGuard
+    NamedRateLimiters namedLimiters
+    public constructor(panic: PanicModeService, admin: AdminGuard, moderators: ModeratorGuard, sessions: RateLimitSessions, ipLimiter: IpRateLimiter, userLimiter: UserRateLimiter, actionThrottle: ActionThrottle, authThrottle: AuthThrottle, newAccountCooldown: NewAccountCooldown, timingGuard: BehavioralTimingGuard, namedLimiters: NamedRateLimiters) {
+        this.panic = panic
+        this.admin = admin
+        this.moderators = moderators
+        this.sessions = sessions
+        this.ipLimiter = ipLimiter
+        this.userLimiter = userLimiter
+        this.actionThrottle = actionThrottle
+        this.authThrottle = authThrottle
+        this.newAccountCooldown = newAccountCooldown
+        this.timingGuard = timingGuard
+        this.namedLimiters = namedLimiters
+    }
+}
+
+// The request-pipeline of shared/web and shared/security, wired in the order of the Java filters.
+//
+//   var hooks = SecurityHooks.defaults(platform.db)      // a domain replaces its own field
+//   var parts = Security.install(platform, hooks)         // before platform.start
+//
+// Order (lower runs first; the kernel's own -1000 unknown-path 200-empty and 1000 405 stay in place):
+//   -1004 request-observability   RequestObservabilityFilter  (HIGHEST_PRECEDENCE + 2)
+//   -1003 panic-mode              PanicModeFilter             (+ 3)
+//   -1001 path-guard              FallbackSurfaceFilter, malformed escape -> 400 (+ 4)
+//   -1000 fallback-surface        FallbackSurfaceFilter, unknown path -> 200 empty (kernel)
+//    -990 origin-gate             RequestOriginFilter         (+ 5)
+//    -980 session-csrf            SessionCookieFilter         (+ 6)
+//       0 abuse-guard             AbuseGuardFilter            (@Order 0)
+//       1 global-rate-limit       GlobalApiRateLimitFilter    (@Order 1)
+//       2 identity-rate-limit     IdentityRateLimitFilter     (@Order 2)
+//       2 public-read-rate-limit  PublicReadRateLimitFilter   (@Order 2)
+//       3 post-rate-limit         PostRateLimitFilter         (@Order 3)
+//       4 duplicate-post          DuplicatePostFilter         (@Order 4)
+//       5 security-headers        SecurityHeadersFilter       (no @Order: last filter)
+//       6 cors                    Spring MVC CORS (CorsConfig / DefaultCorsProcessor)
+//       7 admin-route-guard       AdminRouteInterceptor       (MVC interceptor, registered first)
+//       8 write-gate              WriteRouteInterceptor       (MVC interceptor, registered second)
+//    1000 method-not-allowed      MVC handler mapping 405 (kernel)
+class Security {
+    static SecurityParts install(platform: Platform, hooks: SecurityHooks) {
+        var server = platform.server
+        var cfg = platform.cfg
+        var store = platform.db
+        Auth.install(server, store, cfg)
+        var panic = PanicModeService(JdbcPanicFlagStore(store), cfg.getStr("PANIC_MODE", ""))
+        var admin = AdminGuard(store, cfg)
+        var moderators = ModeratorGuard(admin, hooks.moderators)
+        Auth.useGuards(admin, moderators)
+        var sessions = RateLimitSessions(Auth.authStoreOrFail(), cfg.getInt("REDE_RATE_GLOBAL_SHARED_MULTIPLIER", 50))
+        var ipLimiter = IpRateLimiter(cfg)
+        var observability = RequestObservability(hooks.monitoring)
+        var panicFilter = PanicModeFilter(panic)
+        var pathGuard = PathGuardFilter()
+        var originAbuse = OriginAbuseGuard.fromConfig(cfg, hooks.origins)
+        var originGate = RequestOriginGate(cfg, hooks.origins, originAbuse)
+        var abuse = AbuseGuardFilter(cfg)
+        var globalLimit = GlobalApiRateLimitFilter(cfg, sessions)
+        var identityLimit = IdentityRateLimitFilter(ipLimiter)
+        var publicRead = PublicReadRateLimitFilter(cfg, sessions)
+        var postLimit = PostRateLimitFilter(cfg)
+        var duplicates = DuplicatePostFilter(cfg)
+        var headers = SecurityHeadersFilter()
+        var cors = CorsPolicy.fromConfig(cfg)
+        var adminRoutes = AdminRouteGuard(server, admin, moderators)
+        var writeGate = WriteGate(server)
+        server.use("request-observability", -1004, () -> observability.run())
+        server.use("panic-mode", -1003, () -> panicFilter.run())
+        server.use("path-guard", -1001, () -> pathGuard.run())
+        server.use("origin-gate", -990, () -> originGate.run())
+        server.use("abuse-guard", 0, () -> abuse.run())
+        server.use("global-rate-limit", 1, () -> globalLimit.run())
+        server.use("identity-rate-limit", 2, () -> identityLimit.run())
+        server.use("public-read-rate-limit", 2, () -> publicRead.run())
+        server.use("post-rate-limit", 3, () -> postLimit.run())
+        server.use("duplicate-post", 4, () -> duplicates.run())
+        server.use("security-headers", 5, () -> headers.run())
+        server.use("cors", 6, () -> cors.run())
+        server.use("admin-route-guard", 7, () -> adminRoutes.run())
+        server.use("write-gate", 8, () -> writeGate.run())
+        server.useAfter("origin-gate", (status: Int, body: String) -> originGate.afterResponse(status))
+        server.useAfter("abuse-guard", (status: Int, body: String) -> abuse.afterResponse(status))
+        server.useAfter("duplicate-post", (status: Int, body: String) -> duplicates.afterResponse(status, body))
+        server.useAfter("request-observability", (status: Int, body: String) -> observability.afterResponse(status))
+        PanicRoutes.register(server, panic, admin)
+        return SecurityParts(panic, admin, moderators, sessions, ipLimiter, UserRateLimiter(cfg, hooks.reports), ActionThrottle(), AuthThrottle.fromConfig(cfg), NewAccountCooldown(store, cfg), BehavioralTimingGuard(), NamedRateLimiters(cfg))
+    }
+}

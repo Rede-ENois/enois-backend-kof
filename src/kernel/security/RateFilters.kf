@@ -1,0 +1,186 @@
+package kernel.security
+
+import java.util.HashMap
+import kernel.config.*
+import kernel.http.*
+import kernel.log.*
+
+// GLOBAL write ceiling for the whole API, the last line of defence against scans, floods and scripts
+// that hammer varied endpoints (per-user and per-action limits live in the specific guards).
+//
+// Keyed by the authenticated user (a live session earns its own bucket, never the token in clear);
+// without a session it falls back to the IP, with a multiplier for trusted proxies (traffic that comes
+// through the ingress shares one address). Reads never count: opening a screen fires several calls and
+// the feed refreshes itself. Probes (/actuator, /health) pass. GLOBAL_RATE_LIMIT_PER_MINUTE (300, 0
+// disables), REDE_RATE_GLOBAL_SHARED_MULTIPLIER (50).
+class GlobalApiRateLimitFilter {
+    SlidingWindows hits = SlidingWindows(100000, 60000L)
+    RateLimitSessions sessions
+    Int perMinute
+    Int sharedMultiplier
+    Log log = Log("kernel.security.global-rate-limit")
+    public constructor(cfg: Config, sessions: RateLimitSessions) {
+        this.sessions = sessions
+        this.perMinute = cfg.getInt("GLOBAL_RATE_LIMIT_PER_MINUTE", 300)
+        this.sharedMultiplier = cfg.getInt("REDE_RATE_GLOBAL_SHARED_MULTIPLIER", 50)
+        if (this.sharedMultiplier < 1) {
+            this.sharedMultiplier = 1
+        }
+    }
+    String run() {
+        var uri = path()
+        if (RateFilters.isProbe(uri) || RateFilters.isRead(method())) {
+            return Http.next()
+        }
+        if (perMinute <= 0) {
+            return Http.next()
+        }
+        var ip = Req.clientIp()
+        var key = "ip:" + ip
+        var limit = perMinute
+        var scope = "ip"
+        if (Req.resolver.isTrustedProxy(ip)) {
+            limit = perMinute * sharedMultiplier
+        }
+        var token = Auth.sessionToken()
+        if (token != null) {
+            var userId = sessions.userId(token, ip)
+            if (userId != null) {
+                key = "u:" + userId
+                limit = perMinute
+                scope = "user"
+            }
+        }
+        if (!hits.tryAcquire(key, SecurityClock.nowMillis(), limit)) {
+            log.warn("global_rate_limit_hit scope=" + scope)
+            return RateLimitResponses.send(60, "RATE_LIMITED", "Muitas requisicoes. Tente novamente em instantes.")
+        }
+        return Http.next()
+    }
+}
+
+// Per-IP limit on the identity routes (signup, login, password, e-mail, second factor, refresh). A filter
+// and not an annotation per endpoint so it cannot be forgotten: a new route under /auth enters by the
+// path rule. The answer is a 429 in the usual error shape that does not say how many attempts are left
+// nor the ceiling (that would help an attacker calibrate).
+class IdentityRateLimitFilter {
+    IpRateLimiter limiter
+    Map<String,String> rules = new HashMap<String, String>()
+    public constructor(limiter: IpRateLimiter) {
+        this.limiter = limiter
+        rules.put("/auth/signup", IpRateLimiter.signup())
+        rules.put("/auth/login", IpRateLimiter.login())
+        rules.put("/auth/password/forgot", IpRateLimiter.password())
+        rules.put("/auth/password/reset", IpRateLimiter.password())
+        rules.put("/auth/email/resend", IpRateLimiter.email())
+        rules.put("/auth/2fa/resend", IpRateLimiter.email())
+        rules.put("/auth/2fa/email/request", IpRateLimiter.email())
+        rules.put("/auth/2fa/verify", IpRateLimiter.twoFactor())
+        rules.put("/auth/2fa/email/confirm", IpRateLimiter.twoFactor())
+        rules.put("/auth/2fa/totp/enable", IpRateLimiter.twoFactor())
+        rules.put("/auth/refresh", IpRateLimiter.refresh())
+    }
+    String run() {
+        if (method().toUpperCase() != "POST") {
+            return Http.next()
+        }
+        var action = rules.get(RequestPath.current())
+        if (action == null) {
+            return Http.next()
+        }
+        if (!limiter.tryAcquire(action, Req.clientIp())) {
+            return RateLimitResponses.send(300, "RATE_LIMITED", "Muitas tentativas em sequencia. Espere alguns minutos e tente de novo.")
+        }
+        return Http.next()
+    }
+}
+
+// POST ceiling, the surface that creates state (publish, comment, like, follow, message, report...).
+// Logged in: bucket of the session digest (120/min); anonymous: bucket of the IP (300/min). Never both,
+// so a logged-in user does not inherit another person's rate limit on the same IP. Window of one minute,
+// per pod. POST_GUARD_ENABLED, POST_USER_RATE_LIMIT, POST_IP_RATE_LIMIT.
+class PostRateLimitFilter {
+    SlidingWindows hits = SlidingWindows(100000, 60000L)
+    Bool enabled
+    Int userLimit
+    Int ipLimit
+    Log log = Log("kernel.security.post-rate-limit")
+    public constructor(cfg: Config) {
+        this.enabled = cfg.getBool("POST_GUARD_ENABLED", true)
+        this.userLimit = cfg.getInt("POST_USER_RATE_LIMIT", 120)
+        this.ipLimit = cfg.getInt("POST_IP_RATE_LIMIT", 300)
+    }
+    String run() {
+        if (!enabled || method().toUpperCase() != "POST" || RateFilters.isProbe(path())) {
+            return Http.next()
+        }
+        var token = Auth.sessionToken()
+        var key = "i:" + Req.clientIp()
+        var limit = ipLimit
+        if (token != null) {
+            key = "u:" + SecurityDigest.sha256Hex(token.trim())
+            limit = userLimit
+        }
+        if (limit > 0) {
+            if (!hits.tryAcquire(key, SecurityClock.nowMillis(), limit)) {
+                log.warn("post_rate_limit_hit")
+                return RateLimitResponses.send(60, "RATE_LIMITED", "Muitas acoes em pouco tempo. Espere um minuto e tente de novo.")
+            }
+        }
+        return Http.next()
+    }
+}
+
+// Read ceiling on the public profile and people-search routes: the surface that serves to ENUMERATE
+// accounts (GET /users/search and GET /users/...). A human opens a few profiles a minute; a script
+// walking the base hits the ceiling in seconds and gets 429 ENUMERATION_GUARD. A logged-in user has
+// their own bucket; an invented token still counts against its IP. REDE_RATE_PUBLIC_READ_PER_MINUTE (600).
+class PublicReadRateLimitFilter {
+    SlidingWindows hits = SlidingWindows(100000, 60000L)
+    RateLimitSessions sessions
+    Int perMinute
+    Log log = Log("kernel.security.public-read")
+    public constructor(cfg: Config, sessions: RateLimitSessions) {
+        this.sessions = sessions
+        this.perMinute = cfg.getInt("REDE_RATE_PUBLIC_READ_PER_MINUTE", 600)
+        if (this.perMinute < 1) {
+            this.perMinute = 1
+        }
+    }
+    String run() {
+        var p = RequestPath.current()
+        if (method().toUpperCase() != "GET") {
+            return Http.next()
+        }
+        if (!(p == "/users/search" || p.startsWith("/users/"))) {
+            return Http.next()
+        }
+        var ip = Req.clientIp()
+        var key = "ip:" + ip
+        var token = Auth.sessionToken()
+        if (token != null) {
+            var userId = sessions.userId(token, ip)
+            if (userId != null) {
+                key = "u:" + userId
+            }
+        }
+        if (!hits.tryAcquire(key, SecurityClock.nowMillis(), perMinute)) {
+            log.warn("public_read_ceiling route=" + p)
+            return RateLimitResponses.send(60, "ENUMERATION_GUARD", "Muitas consultas de perfis em pouco tempo. Tente de novo em instantes.")
+        }
+        return Http.next()
+    }
+}
+
+class RateFilters {
+    // Cluster probes never enter a limiter: knocking the health check down knocks the pod down.
+    static Bool isProbe(uri: String) = uri.contains("/actuator") || uri.contains("/health")
+    static Bool isRead(m: String) {
+        var u = m.toUpperCase()
+        return u == "GET" || u == "HEAD" || u == "OPTIONS"
+    }
+    static Bool isWrite(m: String) {
+        var u = m.toUpperCase()
+        return u == "POST" || u == "PUT" || u == "PATCH" || u == "DELETE"
+    }
+}

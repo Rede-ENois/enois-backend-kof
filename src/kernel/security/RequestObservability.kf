@@ -1,0 +1,156 @@
+package kernel.security
+
+import java.lang.System
+import java.util.HashMap
+import java.util.UUID
+import java.util.regex.Pattern
+import kernel.http.*
+import kernel.log.*
+
+// One access log line per request plus the context every other log line inherits (LogContext:
+// requestId, clientIp, deviceId, http.method, http.path, and userId once Auth authenticates).
+// Runs first in the chain, so the 429s of the limiters and the 400/200 of the path guards are logged
+// too. Health probes log at DEBUG (every 10 s they would flood the log); 5xx at ERROR; a request over
+// 2 s adds a slow_request WARN. Every mutation of /admin/** also writes an `admin_action` line on the
+// separate `audit` logger (the actor is the authenticated user). Metrics go to SecurityMonitoring.
+// The request id is the client's X-Request-Id when it is a safe identifier (8-64 of A-Za-z0-9._-),
+// else a fresh one; it is echoed in the X-Request-Id response header.
+class RequestObservability {
+    SecurityMonitoring monitoring
+    Log access = Log("kernel.http.access")
+    Log audit = Log("audit")
+    static Long slowRequestMs() = 2000L
+    static Int maxUserAgent() = 200
+    // Lines written since the last drain, kept only while capture is on (tests read the log through it).
+    static Bool capturing = false
+    static List<String> captured = listOf<String>()
+    public constructor(monitoring: SecurityMonitoring) {
+        this.monitoring = monitoring
+    }
+    static startCapture() {
+        RequestObservability.captured = listOf<String>()
+        RequestObservability.capturing = true
+    }
+    static List<String> drainCapture() {
+        var out = RequestObservability.captured
+        RequestObservability.captured = listOf<String>()
+        return out
+    }
+    String run() {
+        Auth.resetRequest()
+        TrustedOriginCors.reset()
+        LogContext.reset()
+        var requestId = requestIdOf()
+        var ip = Req.clientIp()
+        LogContext.put("startedAt", "" + System.nanoTime())
+        LogContext.put("requestId", requestId)
+        LogContext.put("clientIp", ip)
+        LogContext.put("http.method", method())
+        LogContext.put("http.path", path())
+        var device = deviceIdOf()
+        if (device != null) {
+            LogContext.put("deviceId", device)
+        }
+        ResponseHeaders.set("X-Request-Id", requestId)
+        if (tracked(path())) {
+            try {
+                monitoring.requestStarted()
+            } catch (String e) {
+            }
+        }
+        return Http.next()
+    }
+    // After hook: the access line, the slow warning, metrics, the admin audit; then the context is cleared.
+    afterResponse(code: Int) {
+        var started = LogContext.get("startedAt")
+        if (started == null) {
+            return
+        }
+        var durationMs = (System.nanoTime() - started.toLong()) / 1000000L
+        var m = method()
+        var uri = path()
+        var route = Http.routePattern()
+        var requestId = LogContext.getOr("requestId", "")
+        var ip = LogContext.getOr("clientIp", "")
+        var userId = LogContext.getOr("userId", "")
+        var device = LogContext.getOr("deviceId", "")
+        var probe = RequestObservability.isProbe(uri)
+        var fields = new HashMap<String, String>()
+        fields.put("http.route", route)
+        fields.put("http.status", "" + code)
+        fields.put("durationMs", "" + durationMs)
+        fields.put("userAgent", userAgentOf())
+        var line = "http_request requestId=" + requestId + " method=" + m + " path=" + uri + " status=" + code + " durationMs=" + durationMs + " clientIp=" + ip + " userId=" + userId + " deviceId=" + device
+        if (probe) {
+            access.debugWith(line, fields)
+        }
+        else 
+            if (code >= 500) {
+                access.errorWith(line, fields)
+            }
+            else {
+                access.infoWith(line, fields)
+            }
+        note("http_request", line)
+        if (!probe && durationMs >= RequestObservability.slowRequestMs()) {
+            access.warn("slow_request requestId=" + requestId + " method=" + m + " route=" + route + " status=" + code + " durationMs=" + durationMs)
+        }
+        if (tracked(uri)) {
+            try {
+                monitoring.recordRequest(m, uri, route, code, durationMs, requestId, userId, ip, device)
+            } catch (String e) {
+            }
+        }
+        if (RequestObservability.isAdminMutation(m, uri)) {
+            var auditLine = "admin_action actor=" + userId + " action=" + m + " " + route + " path=" + uri + " status=" + code
+            audit.info(auditLine)
+            note("audit", auditLine)
+        }
+        LogContext.reset()
+    }
+    note(logger: String, line: String) {
+        if (RequestObservability.capturing) {
+            RequestObservability.captured.add(logger + "|" + line)
+        }
+    }
+    Bool tracked(uri: String) = !RequestObservability.isProbe(uri) && !uri.startsWith("/admin/monitoring")
+    // Every /admin/** mutation is audited in one place; per-action audit with target/before/after needs
+    // explicit calls in the admin services.
+    static Bool isAdminMutation(m: String, uri: String) = uri.contains("/admin/") && m != "GET" && m != "HEAD" && m != "OPTIONS"
+    // Health probes: not in the access log at INFO.
+    static Bool isProbe(uri: String) = uri == "/livez" || uri == "/readyz" || uri.startsWith("/actuator/health")
+    // The optional app header; an invalid value is ignored (it never fails the request).
+    String? deviceIdOf() {
+        var v = Req.headerOrNull("x-device-id")
+        if (v == null) {
+            return null
+        }
+        if (Pattern.compile("^[A-Za-z0-9._-]{16,64}$").matcher(v).matches()) {
+            return v
+        }
+        return null
+    }
+    // Client-controlled: truncated and stripped of control characters so it cannot forge log lines.
+    String userAgentOf() {
+        var v = Req.headerOrNull("user-agent")
+        if (v == null) {
+            return ""
+        }
+        var clean = v.replaceAll("\\p{Cntrl}", "")
+        if (clean.length() > RequestObservability.maxUserAgent()) {
+            return clean.substring(0, RequestObservability.maxUserAgent())
+        }
+        return clean
+    }
+    // The value comes from the client and goes to a response header and to the log: only a safe
+    // identifier is accepted, so it cannot inject headers or log lines.
+    String requestIdOf() {
+        var v = Req.headerOrNull("x-request-id")
+        if (v != null) {
+            if (Pattern.compile("^[A-Za-z0-9._-]{8,64}$").matcher(v).matches()) {
+                return v
+            }
+        }
+        return UUID.randomUUID().toString().replace("-", "")
+    }
+}
