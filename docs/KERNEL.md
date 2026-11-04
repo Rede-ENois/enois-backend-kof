@@ -420,3 +420,37 @@ TOTP is RFC 6238 (HMAC-SHA1, 6 digits, 30 s) and passes the RFC vectors. Times a
 
 Java checked exceptions (`GeneralSecurityException`, `SQLException`) are not caught by `catch (String)`:
 catch them by type (see `SecretCipher`).
+
+## kernel.html: sanitising and Markdown
+
+Third-party jars (versions of the Java `pom.xml`): jsoup 1.23.2, commonmark 0.31.0 with the GFM tables
+and strikethrough extensions.
+
+```kotlin
+import kernel.html.*
+
+SafeHtml.sanitizePageHtml(raw): String?       // null when nothing useful is left (blank, only <script>...)
+SafeHtml.sanitizeProfileHtml(raw)  sanitizeProjectHtml(raw)  sanitizeBlogHtml(raw)
+SafeHtml.requirePageHtml(raw)      requireProfileHtml(raw)   requireBlogHtml(raw)    // 400 INVALID_*_HTML instead of null
+SafeHtml.maxPageHtml() 200000   maxProfileHtml() 20000   maxProjectHtml() 200000   maxBlogHtml() 20000
+```
+
+Port of `shared/html/SafeHtml`, same allowlist (HTML, SVG with SMIL, `data-enois-embed`), same limits
+(raw input 400000, CSS 64000, the length limit applies to the cleaned result) and codes
+(`PAGE_HTML_TOO_LONG`, `PROFILE_HTML_TOO_LONG`, `PROJECT_HTML_TOO_LONG`, `BLOG_HTML_TOO_LONG`,
+`CSS_TOO_LONG`). `<style>` blocks are extracted, cleaned (no `@import`, `expression(`, `behavior:`,
+`image-set(`, `javascript:`; `url()` only for `data:`; CSS escapes decoded before checking) and prepended;
+only https provider embeds survive as `iframe`; links get `target="_blank" rel="noopener noreferrer"`;
+`<use>`/`<mpath>` only reference `#fragment`s. Every scan is linear (cost tests). One deliberate fix: the
+Java `Matcher.replaceAll(Function)` read `$` and `\` in the replacement as group references; here
+replacements are literal (`kernel.text.Regexes`).
+
+```kotlin
+MarkdownBio.render(markdown, owner, repo, branch): String   // README -> bio HTML (MarkdownBioRenderer)
+```
+
+Relative links/images become absolute (blob/raw), the result goes through `requireProfileHtml`; an
+oversized README is `400 README_TOO_LONG`.
+
+`Regexes.replaceAll(pattern, input, (m: Matcher) -> String)` is the regex replace with a callback
+(literal replacements); `Regexes.add(sb, text)` appends to a `StringBuilder` (see G30).

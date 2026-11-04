@@ -1,0 +1,54 @@
+import kernel.error.*
+import kernel.html.*
+
+String mdCaught(f: () -> String) {
+    try {
+        return f()
+    } catch (String e) {
+        return e
+    }
+}
+
+test "renders GFM tables and strikethrough" {
+    var html = MarkdownBio.render("| a | b |\n|---|---|\n| 1 | 2 |\n\n~~velho~~ novo", "o", "r", "main")
+    assert(html.contains("<table>"))
+    assert(html.contains("<th>a</th>"))
+    assert(html.contains("<td>2</td>"))
+    assert(html.contains("<del>velho</del>"))
+}
+
+test "relative links and images become absolute" {
+    var html = MarkdownBio.render("[doc](docs/a.md) [root](/x.md) [dot](./y.md) [anchor](#top) [web](https://e.com) ![logo](img/l.png) ![abs](/i.png)", "own", "rep", "dev")
+    assert(html.contains("href=\"https://github.com/own/rep/blob/dev/docs/a.md\""))
+    assert(html.contains("href=\"https://github.com/own/rep/blob/dev/x.md\""))
+    assert(html.contains("href=\"https://github.com/own/rep/blob/dev/y.md\""))
+    // jsoup drops href values without a protocol (no base URI), as in the Java renderer.
+    assert(html.contains(">anchor</a>"))
+    assert(!html.contains("href=\"#top\""))
+    assert(html.contains("href=\"https://e.com\""))
+    assert(html.contains("src=\"https://raw.githubusercontent.com/own/rep/dev/img/l.png\""))
+    assert(html.contains("src=\"https://raw.githubusercontent.com/own/rep/dev/i.png\""))
+}
+
+test "the result is sanitized like the bio" {
+    var html = MarkdownBio.render("ola <script>alert(1)</script> <img src=x onerror=alert(2)> [x](javascript:alert(3))", "o", "r", "main")
+    assert(!html.contains("<script"))
+    assert(!html.contains("alert(1)"))
+    assert(!html.contains("alert(2)"))
+    assert(!html.contains("onerror"))
+    // The scheme-looking target is made absolute first, so it is a plain path under the repository.
+    assert(!html.contains("href=\"javascript:"))
+    assert(html.contains("href=\"https://github.com/o/r/blob/main/javascript:alert(3)\""))
+    assert(html.contains("ola"))
+}
+
+test "an empty readme leaves nothing and is refused" {
+    var err = mdCaught(() -> MarkdownBio.render(null, "o", "r", "main"))
+    assert(Errors.parse(err).code() == "INVALID_PROFILE_HTML")
+}
+
+test "an oversized readme answers README_TOO_LONG" {
+    var err = mdCaught(() -> MarkdownBio.render(strings.repeat("palavra ", 4000), "o", "r", "main"))
+    assert(Errors.parse(err).status() == 400)
+    assert(Errors.parse(err).code() == "README_TOO_LONG")
+}

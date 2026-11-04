@@ -1,0 +1,79 @@
+package kernel.html
+
+import java.util.ArrayList
+import java.util.List
+import kernel.error.*
+import org.commonmark.Extension
+import org.commonmark.ext.gfm.strikethrough.StrikethroughExtension
+import org.commonmark.ext.gfm.tables.TablesExtension
+import org.commonmark.parser.Parser
+import org.commonmark.renderer.html.HtmlRenderer
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Element
+
+// GitHub README (Markdown) to the profile bio HTML: CommonMark with the GFM tables and strikethrough
+// extensions. Relative links and images of the repository become absolute (blob for links, raw for
+// images), since the bio has no repository context. The result goes through SafeHtml.requireProfileHtml
+// (a README is external content); an oversized one answers 400 README_TOO_LONG.
+//
+//   var html = MarkdownBio.render(markdown, "owner", "repo", "main")
+class MarkdownBio {
+    static String render(markdown: String?, owner: String, repo: String, branch: String) {
+        var extensions = new ArrayList<Extension>()
+        extensions.add(TablesExtension.create())
+        extensions.add(StrikethroughExtension.create())
+        var parser = Parser.builder().extensions(extensions).build()
+        var renderer = HtmlRenderer.builder().extensions(extensions).build()
+        var source = ""
+        if (markdown != null) {
+            source = markdown
+        }
+        var html = Jsoup.parseBodyFragment(renderer.render(parser.parse(source)))
+        var blobBase = "https://github.com/" + owner + "/" + repo + "/blob/" + branch + "/"
+        var rawBase = "https://raw.githubusercontent.com/" + owner + "/" + repo + "/" + branch + "/"
+        // Elements.size()/get() do not resolve on the typed collection: view it as an ArrayList.
+        var links = html.select("a[href]") as ArrayList
+        var i = 0
+        while (i < links.size()) {
+            var link = links.get(i) as Element
+            var rewritten = link.attr("href", MarkdownBio.absolute(link.attr("href"), blobBase))
+            i = i + 1
+        }
+        var images = html.select("img[src]") as ArrayList
+        var j = 0
+        while (j < images.size()) {
+            var image = images.get(j) as Element
+            var rewritten = image.attr("src", MarkdownBio.absolute(image.attr("src"), rawBase))
+            j = j + 1
+        }
+        var result = ""
+        var tooLarge = false
+        try {
+            result = SafeHtml.requireProfileHtml(html.body().html())
+        } catch (String e) {
+            if (Errors.hasCode(e, "PROFILE_HTML_TOO_LONG")) {
+                tooLarge = true
+            }
+            else {
+                throw e
+            }
+        }
+        if (tooLarge) {
+            throw Errors.api(400, "README_TOO_LONG", "O README é grande demais para a bio. Diminua o conteúdo ou cole um trecho.")
+        }
+        return result
+    }
+    static String absolute(value: String, base: String) {
+        var url = value.trim()
+        if (url.length() == 0 || url.startsWith("#") || url.startsWith("http://") || url.startsWith("https://") || url.startsWith("//") || url.startsWith("mailto:") || url.startsWith("data:")) {
+            return url
+        }
+        if (url.startsWith("/")) {
+            return base + url.substring(1)
+        }
+        if (url.startsWith("./")) {
+            return base + url.substring(2)
+        }
+        return base + url
+    }
+}

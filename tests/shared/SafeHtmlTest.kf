@@ -1,0 +1,228 @@
+import kernel.error.*
+import kernel.html.*
+
+String htmlSanitize(raw: String?) {
+    var out = SafeHtml.sanitizePageHtml(raw)
+    if (out == null) {
+        return "<null>"
+    }
+    return out
+}
+
+String htmlProfile(raw: String) {
+    var out = SafeHtml.sanitizeProfileHtml(raw)
+    if (out == null) {
+        return "<null>"
+    }
+    return out
+}
+
+Int htmlCount(text: String, needle: String) = text.split(needle, -1).length - 1
+
+String htmlErr(raw: String) {
+    try {
+        SafeHtml.sanitizePageHtml(raw)
+    } catch (String e) {
+        return e
+    }
+    return ""
+}
+
+test "css animations survive the sanitizer" {
+    var clean = htmlProfile("<style>\n  @keyframes pulse {\n    0% { transform: scale(1); opacity: 1; }\n    100% { transform: scale(1.08); opacity: .85; }\n  }\n  .card {\n    background: linear-gradient(45deg, #7c38ee, #ff0080);\n    animation: pulse 2s infinite alternate;\n    transition: transform .3s ease;\n    scroll-behavior: smooth;\n  }\n  .card:hover { transform: rotate(2deg); }\n  .card::after { content: \"*\"; }\n</style>\n<div class=\"card\" style=\"animation: pulse 3s infinite;\">Ola</div>\n")
+    assert(clean.contains("@keyframes pulse"))
+    assert(clean.contains("animation: pulse 2s infinite alternate"))
+    assert(clean.contains("transition: transform .3s ease"))
+    assert(clean.contains("scroll-behavior: smooth"))
+    assert(clean.contains(".card:hover"))
+    assert(clean.contains(".card::after"))
+    assert(clean.contains("style=\"animation: pulse 3s infinite;\""))
+}
+
+test "dangerous css still dies" {
+    var clean = htmlProfile("<style>\n  .a { behavior: url(script.htc); width: expression(alert(1)); background: url(javascript:alert(2)); }\n  @import url(\"https://evil.test/track.css\");\n</style>\n<div class=\"a\">x</div>\n")
+    assert(!clean.contains("behavior"))
+    assert(!clean.contains("expression"))
+    assert(!clean.contains("javascript"))
+    assert(!clean.contains("@import"))
+    assert(!clean.contains("evil.test"))
+}
+
+test "removes the script tag and its content" {
+    var clean = htmlSanitize("<p>antes</p><script>alert('xss')</script><p>depois</p>")
+    assert(!clean.contains("<script"))
+    assert(!clean.contains("alert"))
+    assert(clean.contains("antes"))
+    assert(clean.contains("depois"))
+}
+
+test "removes event handlers even on allowed tags" {
+    var clean = htmlSanitize("<img src=\"https://exemplo.com/foto.png\" onerror=\"alert(1)\">")
+    assert(!clean.contains("onerror"))
+    assert(!clean.contains("alert"))
+    assert(clean.contains("https://exemplo.com/foto.png"))
+}
+
+test "removes javascript urls" {
+    var clean = htmlSanitize("<a href=\"javascript:alert(1)\">clique</a>")
+    assert(!clean.contains("javascript:"))
+    assert(clean.contains("clique"))
+}
+
+test "keeps formatting, tables, lists and links" {
+    var clean = htmlSanitize("<h2>Titulo</h2><p><strong>negrito</strong> e <em>italico</em></p>\n<ul><li>um</li><li>dois</li></ul>\n<table><tr><th>a</th><th>b</th></tr><tr><td>1</td><td>2</td></tr></table>\n<a href=\"https://exemplo.com\">link</a>\n")
+    assert(clean.contains("<h2>Titulo</h2>"))
+    assert(clean.contains("<strong>negrito</strong>"))
+    assert(clean.contains("<li>um</li>"))
+    assert(clean.contains("<th>a</th>"))
+    assert(clean.contains("href=\"https://exemplo.com\""))
+}
+
+test "keeps native media so it plays in the browser" {
+    var clean = htmlSanitize("<figure><img src=\"https://exemplo.com/foto.png\" alt=\"foto\"><figcaption>A foto</figcaption></figure>\n<video controls poster=\"https://exemplo.com/capa.jpg\" src=\"https://exemplo.com/clipe.mp4\">texto</video>\n<audio controls src=\"https://exemplo.com/musica.mp3\"></audio>\n<picture><source src=\"https://exemplo.com/foto.webp\" type=\"image/webp\"><img src=\"https://exemplo.com/foto.png\" alt=\"\"></picture>\n<video controls><source src=\"https://exemplo.com/b.webm\" type=\"video/webm\"><track src=\"https://exemplo.com/leg.vtt\" kind=\"captions\"></video>\n")
+    assert(clean.contains("<figcaption>A foto</figcaption>"))
+    assert(clean.contains("controls"))
+    assert(clean.contains("poster=\"https://exemplo.com/capa.jpg\""))
+    assert(clean.contains("<audio"))
+    assert(clean.contains("<source src=\"https://exemplo.com/b.webm\""))
+    assert(clean.contains("<track src=\"https://exemplo.com/leg.vtt\""))
+    assert(!clean.contains("autoplay"))
+}
+
+test "autoplay survives and gets what browsers require to actually play" {
+    var clean = htmlSanitize("<video autoplay src=\"https://exemplo.com/clipe.mp4\"></video>\n<video autoplay muted playsinline loop src=\"https://exemplo.com/fundo.mp4\"></video>\n<audio autoplay src=\"https://exemplo.com/musica.mp3\"></audio>\n")
+    assert(clean.contains("autoplay"))
+    assert(clean.contains("<video autoplay=\"\" src=\"https://exemplo.com/clipe.mp4\" muted playsinline=\"playsinline\"></video>"))
+    assert(clean.contains("loop=\"\""))
+    assert(clean.contains("<audio autoplay=\"\" src=\"https://exemplo.com/musica.mp3\" controls=\"controls\"></audio>"))
+}
+
+test "media only by https and documents stay as links" {
+    var httpMedia = htmlSanitize("<video controls src=\"http://exemplo.com/clipe.mp4\"></video>")
+    assert(!httpMedia.contains("http://"))
+    var embeds = htmlSanitize("<iframe src=\"https://exemplo.com/doc.pdf\"></iframe><embed src=\"https://exemplo.com/doc.pdf\"><object data=\"https://exemplo.com/doc.pdf\"></object><a href=\"https://exemplo.com/doc.pdf\">Abrir</a>")
+    assert(!embeds.contains("<iframe"))
+    assert(!embeds.contains("<embed"))
+    assert(!embeds.contains("<object"))
+    assert(embeds.contains("href=\"https://exemplo.com/doc.pdf\""))
+}
+
+test "keeps safe inline style and drops every remote css url" {
+    var clean = htmlSanitize("<div style=\"color:#123456;background:url(https://exemplo.com/bg.png);border-image:url(http://rastreador.test/pixel);cursor:url(data:image/png;base64,AAA)\">conteudo</div>")
+    assert(clean.contains("color"))
+    assert(clean.contains("#123456"))
+    assert(clean.contains("data:image/png;base64,AAA"))
+    assert(!clean.contains("exemplo.com/bg.png"))
+    assert(!clean.contains("rastreador.test"))
+}
+
+test "the style block is preserved but sanitized" {
+    var clean = htmlSanitize("<html><head><style>\n@import url(\"https://externo.test/estilo.css\");\n.card { color: red; background: url(\"http://externo.test/a.png\"); padding: 8px }\n.x { width: expression(alert(1)) }\n</style></head><body><div class=\"card\">oi</div></body></html>\n")
+    assert(clean.contains("<style>"))
+    assert(clean.contains(".card"))
+    assert(!clean.contains("@import"))
+    assert(!clean.contains("expression"))
+    assert(!clean.contains("externo.test"))
+    assert(clean.contains("<div class=\"card\">oi</div>"))
+}
+
+test "cannot break out of the style block" {
+    var clean = htmlSanitize("<style>body{color:red}</style><!--</style><script>alert(1)</script>--><p>ok</p>")
+    assert(!clean.contains("<script"))
+    assert(!clean.contains("alert"))
+    assert(clean.contains("ok"))
+}
+
+test "blank input becomes null and the page type requires html" {
+    assert(SafeHtml.sanitizePageHtml("   ") == null)
+    assert(SafeHtml.sanitizePageHtml(null) == null)
+    assert(SafeHtml.sanitizePageHtml("<script>alert(1)</script>") == null)
+    var err = ""
+    try {
+        SafeHtml.requirePageHtml("<script>alert(1)</script>")
+    } catch (String e) {
+        err = e
+    }
+    assert(Errors.parse(err).status() == 400)
+    assert(Errors.parse(err).code() == "INVALID_PAGE_HTML")
+    assert(Errors.parse(err).message().contains("HTML"))
+}
+
+test "rejects huge pastes without parsing" {
+    var err = htmlErr("<p>" + strings.repeat("a", 400001) + "</p>")
+    assert(Errors.parse(err).status() == 400)
+    assert(Errors.parse(err).code() == "PAGE_HTML_TOO_LONG")
+}
+
+test "accepts a page near the limit and rejects only above it" {
+    assert(SafeHtml.sanitizePageHtml("<p>" + strings.repeat("a", SafeHtml.maxPageHtml() - 10) + "</p>") != null)
+    var err = htmlErr("<p>" + strings.repeat("a", SafeHtml.maxPageHtml()) + "</p>")
+    assert(Errors.parse(err).status() == 400)
+    assert(Errors.parse(err).message().contains("" + SafeHtml.maxPageHtml()))
+}
+
+test "keeps provider embeds and drops unknown ones" {
+    var clean = htmlSanitize("<iframe width=\"560\" height=\"315\" src=\"https://www.youtube.com/embed/aqz-KE-bpKQ\" frameborder=\"0\"></iframe>\n<iframe src=\"https://player.vimeo.com/video/76979871\"></iframe>\n<iframe src=\"https://open.spotify.com/embed/track/4cOdK2wGLETKBW3PvgPWqT\"></iframe>\n<iframe src=\"https://malicioso.test/embed/x\"></iframe>\n<embed src=\"http://www.youtube.com/embed/aqz-KE-bpKQ\">\n<iframe src=\"https://evil.test/y\"></iframe>\n")
+    assert(!clean.contains("<embed"))
+    assert(!clean.contains("malicioso.test"))
+    assert(!clean.contains("evil.test"))
+    assert(clean.contains("src=\"https://www.youtube.com/embed/aqz-KE-bpKQ\""))
+    assert(clean.contains("src=\"https://player.vimeo.com/video/76979871\""))
+    assert(clean.contains("src=\"https://open.spotify.com/embed/track/4cOdK2wGLETKBW3PvgPWqT\""))
+    assert(clean.contains("allow=\"autoplay; fullscreen; encrypted-media\""))
+    assert(htmlCount(clean, "<iframe") == 3)
+}
+
+test "a provider embed cannot smuggle markup or script" {
+    var clean = htmlSanitize("<iframe src=\"https://www.youtube.com/embed/aqz-KE-bpKQ\" onload=\"alert(1)\"><script>alert(2)</script></iframe>\n<iframe src=\"https://www.youtube.com/embed/x&quot;&gt;&lt;script&gt;alert(3)&lt;/script&gt;\"></iframe>\n")
+    assert(!clean.contains("<script"))
+    assert(!clean.contains("alert"))
+    assert(!clean.contains("onload"))
+    assert(clean.contains("src=\"https://www.youtube.com/embed/aqz-KE-bpKQ\""))
+    assert(htmlCount(clean, "<iframe") == 1)
+}
+
+test "a link to a video stays a link for the app to turn into a player" {
+    var clean = htmlSanitize("<p>Veja <a href=\"https://youtu.be/aqz-KE-bpKQ\">o video</a></p>")
+    assert(clean.contains("href=\"https://youtu.be/aqz-KE-bpKQ\""))
+    assert(clean.contains("o video"))
+}
+
+test "inline svg and its animations survive the sanitizer" {
+    var clean = htmlProfile("<style>\n  @keyframes girar { to { transform: rotate(360deg); } }\n  .roda { animation: girar 4s linear infinite; transform-origin: center; }\n</style>\n<svg viewBox=\"0 0 100 100\" width=\"120\">\n  <defs><linearGradient id=\"g\"><stop offset=\"0\" stop-color=\"#7c3aed\"/></linearGradient></defs>\n  <g class=\"roda\">\n    <circle cx=\"50\" cy=\"50\" r=\"40\" fill=\"url(#g)\"/>\n    <animate attributeName=\"r\" from=\"40\" to=\"45\" dur=\"2s\" repeatCount=\"indefinite\"/>\n    <animateTransform attributeName=\"transform\" type=\"rotate\" from=\"0 50 50\" to=\"360 50 50\" dur=\"6s\" repeatCount=\"indefinite\"/>\n  </g>\n</svg>\n")
+    assert(clean.contains("<svg"))
+    assert(clean.contains("viewBox=\"0 0 100 100\""))
+    assert(clean.contains("<circle"))
+    assert(clean.contains("fill=\"url(#g)\""))
+    assert(clean.contains("stop-color=\"#7c3aed\""))
+    assert(clean.contains("<animate "))
+    assert(clean.contains("<animateTransform "))
+    assert(clean.contains("@keyframes girar"))
+    assert(clean.contains("animation: girar"))
+}
+
+test "svg references stay inside the document and media follows the image rule" {
+    var clean = htmlProfile("<svg viewBox=\"0 0 10 10\">\n  <symbol id=\"estrela\"><path d=\"M0 0h10v10z\"/></symbol>\n  <use href=\"#estrela\"/>\n  <use href=\"https://malicioso.test/externo.svg#x\"/>\n  <use xlink:href=\"#estrela\"/>\n  <image href=\"https://enois.ia.br/foto.png\" width=\"10\" height=\"10\"/>\n  <image href=\"javascript:alert(1)\"/>\n</svg>\n")
+    assert(clean.contains("href=\"#estrela\""))
+    assert(!clean.contains("malicioso.test"))
+    assert(!clean.contains("externo.svg"))
+    assert(clean.contains("href=\"https://enois.ia.br/foto.png\""))
+    assert(!clean.contains("javascript:"))
+}
+
+test "svg cannot smuggle script or html" {
+    var clean = htmlSanitize("<svg onload=\"alert(1)\">\n  <script>alert(2)</script>\n  <foreignObject><div onclick=\"alert(3)\">html</div></foreignObject>\n  <a href=\"javascript:alert(4)\">clique</a>\n</svg>\n")
+    assert(!clean.contains("<script"))
+    assert(!clean.contains("alert"))
+    assert(!clean.contains("onload"))
+    assert(!clean.contains("onclick"))
+    assert(!clean.contains("<foreignObject"))
+    assert(!clean.contains("javascript:"))
+}
+
+test "a dollar sign or backslash in the input is kept literally" {
+    var clean = htmlSanitize("<a href=\"https://exemplo.com/a$1b\\c\">preco $2</a><div style=\"background:url(data:image/png;base64,A$1\\B)\">x</div>")
+    assert(clean.contains("a$1b\\c"))
+    assert(clean.contains("preco $2"))
+    assert(clean.contains("data:image/png;base64,A$1\\B"))
+}
