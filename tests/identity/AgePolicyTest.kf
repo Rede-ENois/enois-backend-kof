@@ -1,0 +1,47 @@
+import identity.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+
+IdentityTestApp ctx() = IdentityTestApp.shared("agepolicy", mapOf())
+
+String agePayload(name: String, extra: String) = "{\"name\":\"" + name + "\",\"role\":\"USER\",\"email\":\"" + name + "@test.com\",\"password\":\"Test1234!\",\"acceptedTerms\":true" + extra + "}"
+
+TestResponse ageSignup(t: IdentityTestApp, name: String, extra: String) = t.postWith("/auth/signup", listOf("Idempotency-Key: age-signup-" + name), agePayload(name, extra))
+
+test "signupWithoutBirthDateIsRejected (AgePolicyTests)" {
+    var t = ctx()
+    Check.apiError(ageSignup(t, "age_semdatanasc", ""), 400, "BIRTH_DATE_REQUIRED")
+}
+
+test "futureOrImplausibleBirthDateIsRejected (AgePolicyTests)" {
+    var t = ctx()
+    var nextYear = IdentityDates.today().substring(0, 4).toInt() + 1
+    var future = ageSignup(t, "age_futuro", ",\"birthDate\":\"" + nextYear + "-01-01\"")
+    Check.isTrue("future", future.body.indexOf("INVALID_BIRTH_DATE") >= 0)
+    var ancient = ageSignup(t, "age_antigo", ",\"birthDate\":\"1800-01-01\"")
+    Check.isTrue("ancient", ancient.body.indexOf("INVALID_BIRTH_DATE") >= 0)
+    Check.isTrue("no pending signup", t.pendingCount("age_futuro@test.com") == 0 && t.pendingCount("age_antigo@test.com") == 0)
+}
+
+test "minorIsFlaggedByTheBackendAndAdultIsNot (AgePolicyTests)" {
+    var t = ctx()
+    var minorYear = IdentityDates.today().substring(0, 4).toInt() - 15
+    var adult = ageSignup(t, "age_adulto_ok", ",\"birthDate\":\"1990-05-10\"")
+    Check.status(adult, 201)
+    Check.isTrue("adult body", adult.body.indexOf("verificationRequired") >= 0)
+    var minor = ageSignup(t, "age_menor_ok", ",\"birthDate\":\"" + minorYear + "-01-02\"")
+    Check.status(minor, 201)
+    Check.isTrue("minor body", minor.body.indexOf("verificationRequired") >= 0)
+    // The age state comes from the stored birth date, never from a client flag.
+    for (var n in listOf("age_adulto_ok", "age_menor_ok")) {
+        Check.status(t.post("/auth/email/verify", "{\"token\":\"" + t.mailToken("EMAIL_VERIFICATION", n + "@test.com") + "\"}"), 200)
+    }
+    Check.isTrue("adult is not a minor", !t.age.policy.isMinor(t.userId("age_adulto_ok@test.com")))
+    Check.isTrue("minor is a minor", t.age.policy.isMinor(t.userId("age_menor_ok@test.com")))
+    Check.isTrue("minor has no consent yet", !t.age.policy.parentalConsentActive(t.userId("age_menor_ok@test.com")))
+}
+
+test "zz shutdown agepolicy" {
+    ctx().stop()
+}

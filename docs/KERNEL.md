@@ -811,3 +811,16 @@ test process from exiting).
 a verified account (once) with a live session and returns a `ProfileCaller` (token, JSON content type and a fresh
 `Idempotency-Key` on every write). `ProfileTestApp.finish()` must be the last test of every file: the shared
 jobs keep the test process alive otherwise (G124).
+
+## Identity adapters (`Tokens`, `Jwt`, `Outbound`, `UrlCodec`)
+
+Java interop for the identity flows lives here; domain code only sees Strings.
+
+- `Tokens.random(size)` (base64url of SecureRandom bytes), `randomInt(bound)`, `hmacSha256Url(keyBase64, message)`,
+  `safeEquals(a, b)` (constant time), `base64Encode`, `base64UrlEncode`, `base64UrlDecode`, `validKey`.
+- `Jwt.verifyRs256(token, jwks)`: payload JSON or null (shape, algorithm, key, signature); issuer, audience, expiry and
+  nonce are the caller's. `Jwt.sign("RS256" | "ES256", pkcs8Base64OrPem, header, payload)`; `newRsaPair` and `newEcPair`
+  are test support. `Jwt.looksLikeJwt(value)` tells an id_token from an authorization code.
+- `Outbound.request(method, url, headers, body, timeoutMs)` / `postForm` / `get`: status and body, throws
+  `OUTBOUND_FAILED: ...` on connect or IO failure. Wrap it in an overridable class and stub that in tests.
+- `UrlCodec.encode(value)` / `decode(value)`: form url encoding, UTF-8.

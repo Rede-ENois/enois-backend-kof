@@ -23,7 +23,6 @@ Bool anyLine(lines: List<String>, prefix: String, parts: List<String>) {
 }
 
 // ---- SessionCookieTests
-
 test "loginSetsHardenedCookiesAndKeepsTokensOutOfTheBody (SessionCookieTests)" {
     var t = ctx()
     t.authenticate("cookie_login")
@@ -86,7 +85,6 @@ test "anExplicitSessionHeaderNeedsNoCsrfHeader (SessionCookieTests)" {
 }
 
 // ---- SessionRefreshTests
-
 test "refreshWorksAfterAccessTokenExpires (SessionRefreshTests)" {
     var t = ctx()
     var session = t.authenticate("user_refresh_alive")
@@ -127,7 +125,6 @@ test "refresh without any token is a 400 INVALID_REFRESH_TOKEN" {
 }
 
 // ---- SessionTokenHashingTests (HTTP level)
-
 test "the table keeps only the hash of both tokens" {
     var t = ctx()
     var session = t.authenticate("hash_only")
@@ -135,6 +132,29 @@ test "the table keeps only the hash of both tokens" {
     Check.eqInt("clear tokens stored", 0, rows as Int)
     var hashed = t.db().queryLong("select count(*) from auth_sessions where token = ? and refresh_token = ?", DbParams().bindStr(Hashes.sha256Hex(session.token())).bindStr(Hashes.sha256Hex(session.refreshToken())))
     Check.eqInt("hashed row", 1, hashed as Int)
+}
+
+test "aHashCopiedFromTheTableDoesNotAuthenticate (SessionTokenHashingTests)" {
+    var t = ctx()
+    var session = t.authenticate("hash_copy")
+    var row = t.db().queryOne("select token, refresh_token from auth_sessions where user_id = ?", DbParams().bindStr(session.userId()))
+    Check.apiError(t.getWithToken("/auth/me", row.getStr("token")), 401, "UNAUTHENTICATED")
+    Check.apiError(t.post("/auth/refresh", "{\"refreshToken\":\"" + row.getStr("refresh_token") + "\"}"), 401, "INVALID_REFRESH_TOKEN")
+}
+
+test "migratesLegacyRawSessionWithoutInvalidatingTheClient (SessionTokenHashingTests)" {
+    var t = ctx()
+    var user = t.authenticate("hash_legacy")
+    var now = "2026-11-04T12:00:00Z"
+    var later = "2099-01-01T00:00:00Z"
+    t.db().execute("insert into auth_sessions (token, refresh_token, user_id, created_at, expires_at, refresh_expires_at, ip) values (\'legacy-access-1\', \'legacy-refresh-1\', ?, ?, ?, ?, \'127.0.0.1\')", DbParams().bindStr(user.userId()).bindInstant(now).bindInstant(later).bindInstant(later))
+    // During a rolling update an old pod may create the session in the clear: the fallback keeps the person in.
+    Check.status(t.getWithToken("/auth/me", "legacy-access-1"), 200)
+    Check.eqInt("rehashed", 1, t.module.store.rehashLegacySessions())
+    var clear = t.db().queryLong("select count(*) from auth_sessions where token = \'legacy-access-1\'", DbParams())
+    Check.eqInt("clear row gone", 0, clear as Int)
+    Check.eqInt("hashed row", 1, t.db().queryLong("select count(*) from auth_sessions where token = ? and refresh_token = ?", DbParams().bindStr(Hashes.sha256Hex("legacy-access-1")).bindStr(Hashes.sha256Hex("legacy-refresh-1"))) as Int)
+    Check.status(t.getWithToken("/auth/me", "legacy-access-1"), 200)
 }
 
 test "zz shutdown" {
