@@ -1,0 +1,183 @@
+package kernel.risk
+
+import java.util.concurrent.ConcurrentHashMap
+import kernel.config.*
+import kernel.id.*
+import kernel.log.*
+import kernel.security.*
+import kernel.time.*
+
+// The central risk engine (human-security master plan, item 7). Each guard used to look at one signal and
+// act alone; the plan asks to COMBINE independent signals, turn the sum into a LEVEL and apply the
+// matching answer, recording the reason and the rule version so the decision can be reconstructed.
+//
+// It only runs when a guard already detected something (robot cadence, repeated text), so an assessment
+// costs nothing per post: it costs when there is a signal, which is the case that matters.
+//
+// OBSERVATION MODE by default (REDE_RISK_ENFORCE=false): it assesses, records and escalates what is
+// serious, but blocks nobody. RESTRICT exists in code (with its tests) and waits for a data baseline.
+//
+//   var engine = RiskEngine.fromConfig(cfg, subjects, writer, timing, duplication, escalation)
+//   var assessment = engine.assess(userId, "publish", content)    // null when there is no signal; never throws
+class RiskEngine {
+    RiskSubjectReader subjects
+    RiskAssessmentWriter assessments
+    RiskTimingSignals timing
+    ContentDuplicationGuard duplication
+    RiskEscalation escalation
+    Map<String,Long> lastEscalated = new ConcurrentHashMap<String, Long>()
+    Int roboticCadenceWeight
+    Int duplicateContentWeight
+    Int newAccountWeight
+    Int activeSanctionWeight
+    Int mediumScore
+    Int highScore
+    Int criticalScore
+    Int newAccountHours
+    Bool enforce
+    Log log = Log("kernel.risk")
+    public constructor(subjects: RiskSubjectReader, assessments: RiskAssessmentWriter, timing: RiskTimingSignals, duplication: ContentDuplicationGuard, escalation: RiskEscalation, roboticCadenceWeight: Int, duplicateContentWeight: Int, newAccountWeight: Int, activeSanctionWeight: Int, mediumScore: Int, highScore: Int, criticalScore: Int, newAccountHours: Int, enforce: Bool) {
+        this.subjects = subjects
+        this.assessments = assessments
+        this.timing = timing
+        this.duplication = duplication
+        this.escalation = escalation
+        this.roboticCadenceWeight = roboticCadenceWeight
+        this.duplicateContentWeight = duplicateContentWeight
+        this.newAccountWeight = newAccountWeight
+        this.activeSanctionWeight = activeSanctionWeight
+        this.mediumScore = mediumScore
+        this.highScore = highScore
+        this.criticalScore = criticalScore
+        this.newAccountHours = newAccountHours
+        this.enforce = enforce
+    }
+    // Defaults of the Java properties: weights 3/2/1/3, thresholds 2/5/8, 24 h, enforcement off. Env:
+    // REDE_RISK_WEIGHTS_{ROBOTIC_CADENCE,DUPLICATE_CONTENT,NEW_ACCOUNT,ACTIVE_SANCTION},
+    // REDE_RISK_THRESHOLDS_{MEDIUM,HIGH,CRITICAL}, REDE_RISK_NEW_ACCOUNT_HOURS, REDE_RISK_ENFORCE.
+    static RiskEngine fromConfig(cfg: Config, subjects: RiskSubjectReader, assessments: RiskAssessmentWriter, timing: RiskTimingSignals, duplication: ContentDuplicationGuard, escalation: RiskEscalation) = RiskEngine(subjects, assessments, timing, duplication, escalation, cfg.getInt("REDE_RISK_WEIGHTS_ROBOTIC_CADENCE", 3), cfg.getInt("REDE_RISK_WEIGHTS_DUPLICATE_CONTENT", 2), cfg.getInt("REDE_RISK_WEIGHTS_NEW_ACCOUNT", 1), cfg.getInt("REDE_RISK_WEIGHTS_ACTIVE_SANCTION", 3), cfg.getInt("REDE_RISK_THRESHOLDS_MEDIUM", 2), cfg.getInt("REDE_RISK_THRESHOLDS_HIGH", 5), cfg.getInt("REDE_RISK_THRESHOLDS_CRITICAL", 8), cfg.getInt("REDE_RISK_NEW_ACCOUNT_HOURS", 24), cfg.getBool("REDE_RISK_ENFORCE", false))
+    // Policy version: enters every assessment to reconstruct the decision later.
+    static String ruleVersion() = "v1"
+    // Interval between two automatic cases for the same account (1 hour).
+    static Long escalationCooldownSeconds() = 3600L
+    // Assesses the account and returns the assessment (level and answer). The trigger signals are the ones
+    // the guards already detected; the engine adds context (new account, active sanction), which is what
+    // separates a person's post from a robot's. NEVER throws: a failure here cannot take down the write of
+    // someone acting in good faith.
+    RiskAssessment? assess(userId: String, action: String, content: String?) {
+        try {
+            return this.evaluate(userId, action, content)
+        } catch (String e) {
+            log.warn("risk_assessment_failed action=" + action + " message=" + e)
+            return null
+        }
+    }
+    RiskAssessment? evaluate(userId: String, action: String, content: String?) {
+        var signals = listOf<String>()
+        if (timing.looksAutomated(userId)) {
+            signals.add(RiskSignals.roboticCadence())
+        }
+        if (content != null) {
+            if (duplication.isDuplicate(userId, content)) {
+                signals.add(RiskSignals.duplicateContent())
+            }
+        }
+        if (signals.size() == 0) {
+            // No signal: nothing to assess, and the assessment costs no query.
+            return null
+        }
+        var now = Time.nowIso()
+        var created = subjects.createdAtOf(userId)
+        if (created != null) {
+            if (Time.toMillis(created) > Time.toMillis(now) - newAccountHours * 3600000L) {
+                signals.add(RiskSignals.newAccount())
+            }
+        }
+        if (subjects.hasActiveSanction(userId)) {
+            signals.add(RiskSignals.activeSanction())
+        }
+        var score = 0
+        for (var s in signals) {
+            score = score + this.weightOf(s)
+        }
+        var level = this.levelOf(score)
+        var decision = this.decisionOf(level)
+        var assessment = RiskAssessment(Ids.prefixed("risk_"), userId, action, level, score, signals, RiskEngine.ruleVersion(), decision, now)
+        this.store(assessment)
+        this.escalateIfSerious(assessment, Time.toMillis(now) / 1000L)
+        return assessment
+    }
+    Int weightOf(signal: String) {
+        if (signal == RiskSignals.roboticCadence()) {
+            return roboticCadenceWeight
+        }
+        if (signal == RiskSignals.duplicateContent()) {
+            return duplicateContentWeight
+        }
+        if (signal == RiskSignals.newAccount()) {
+            return newAccountWeight
+        }
+        if (signal == RiskSignals.activeSanction()) {
+            return activeSanctionWeight
+        }
+        return 0
+    }
+    // The level by score: thresholds are configurable and the ruler is always the same.
+    String levelOf(score: Int) {
+        if (score >= criticalScore) {
+            return RiskSignals.critical()
+        }
+        if (score >= highScore) {
+            return RiskSignals.high()
+        }
+        if (score >= mediumScore) {
+            return RiskSignals.medium()
+        }
+        return RiskSignals.low()
+    }
+    // The level's answer. RESTRICT only takes effect with enforcement on.
+    String decisionOf(level: String) {
+        if (level == RiskSignals.low()) {
+            return RiskSignals.allow()
+        }
+        if (level == RiskSignals.medium()) {
+            return RiskSignals.monitor()
+        }
+        if (level == RiskSignals.high()) {
+            return RiskSignals.escalate()
+        }
+        if (enforce) {
+            return RiskSignals.restrict()
+        }
+        return RiskSignals.escalate()
+    }
+    // Hands moderation the case the engine classified as serious ("open an occurrence for moderation": a
+    // person decides, the engine delivers the case with level and signals attached). Automatic: it does not
+    // depend on anybody reporting. The engine keeps its own cooldown: a post per second from the same robot
+    // would otherwise become an insert attempt per second.
+    escalateIfSerious(a: RiskAssessment, nowSeconds: Long) {
+        if (a.level == RiskSignals.low()) {
+            return
+        }
+        var previous = lastEscalated.get(a.userId)
+        if (previous != null) {
+            if (nowSeconds - previous < RiskEngine.escalationCooldownSeconds()) {
+                return
+            }
+        }
+        lastEscalated.put(a.userId, nowSeconds)
+        try {
+            escalation.escalate(a.userId, "[risco automatico] Nivel " + a.level + " (pontos " + a.score + ", sinais " + a.signalsText() + ", regra " + a.ruleVersion + ", acao " + a.action + ").")
+        } catch (String e) {
+            log.warn("risk_escalation_failed id=" + a.id + " message=" + e)
+        }
+    }
+    // Stores the assessment (the risk history). A failure here does not prevent the escalation.
+    store(a: RiskAssessment) {
+        try {
+            assessments.save(a)
+        } catch (String e) {
+            log.warn("risk_record_failed id=" + a.id + " message=" + e)
+        }
+    }
+}

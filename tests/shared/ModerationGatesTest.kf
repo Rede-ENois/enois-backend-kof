@@ -1,0 +1,312 @@
+import kernel.blocks.*
+import kernel.cache.*
+import kernel.config.*
+import kernel.db.*
+import kernel.error.*
+import kernel.risk.*
+import kernel.sanctions.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+
+Db gateDb() = TestApp.shared().db()
+
+insertGateUser(id: String, createdAt: String) {
+    gateDb().execute("insert into users (id, username, name, email, open_to_work, is_mentor, created_at, updated_at) values (?, ?, ?, ?, false, false, ?, ?)", DbParams().bindStr(id).bindStr(id).bindStr(id).bindStr(id + "@example.test").bindInstant(createdAt).bindInstant(createdAt))
+}
+
+insertSanction(user: String, type: String, status: String, reason: String?) {
+    gateDb().execute("insert into user_sanctions (id, user_id, type, reason, status, created_at) values (?, ?, ?, ?, ?, ?)", DbParams().bindStr("sanc_" + user + "_" + type + "_" + status).bindStr(user).bindStr(type).bindStrOrNull(reason).bindStr(status).bindInstant(Time.nowIso()))
+}
+
+insertBlock(blocker: String, blocked: String) {
+    gateDb().execute("insert into user_blocks (blocker_id, blocked_id, created_at) values (?, ?, ?)", DbParams().bindStr(blocker).bindStr(blocked).bindInstant(Time.nowIso()))
+}
+
+insertMute(muter: String, muted: String, expiresAt: String?) {
+    gateDb().execute("insert into user_mutes (muter_id, muted_id, created_at, expires_at) values (?, ?, ?, ?)", DbParams().bindStr(muter).bindStr(muted).bindInstant(Time.nowIso()).bindInstantOrNull(expiresAt))
+}
+
+String gateCode(f: () -> String) {
+    try {
+        return f()
+    } catch (String e) {
+        return Errors.parse(e).code() + ":" + Errors.parse(e).status() + ":" + Errors.parse(e).message()
+    }
+}
+
+test "blocks hide users in both directions and active mutes" {
+    var blocked = BlockedUsers(gateDb())
+    insertBlock("gate_blk_a", "gate_blk_b")
+    insertBlock("gate_blk_c", "gate_blk_a")
+    insertMute("gate_blk_a", "gate_blk_d", null)
+    insertMute("gate_blk_a", "gate_blk_e", Time.plusSeconds(Time.nowIso(), 3600L))
+    insertMute("gate_blk_a", "gate_blk_f", Time.plusSeconds(Time.nowIso(), -3600L))
+    var hidden = blocked.hiddenIdsFor("gate_blk_a")
+    assert(hidden.contains("gate_blk_b"))
+    assert(hidden.contains("gate_blk_c"))
+    assert(hidden.contains("gate_blk_d"))
+    assert(hidden.contains("gate_blk_e"))
+    assert(!hidden.contains("gate_blk_f"))
+    assert(hidden.size() == 4)
+    // The blocked one also does not see the blocker.
+    assert(blocked.hiddenIdsFor("gate_blk_b").contains("gate_blk_a"))
+    // Mutes are one-way and are not blocks.
+    assert(!blocked.hiddenIdsFor("gate_blk_d").contains("gate_blk_a"))
+    assert(!blocked.blockedBetween("gate_blk_a").contains("gate_blk_d"))
+    assert(blocked.hiddenBetween("gate_blk_a", "gate_blk_b"))
+    assert(blocked.hiddenBetween("gate_blk_b", "gate_blk_a"))
+    assert(!blocked.hiddenBetween("gate_blk_b", "gate_blk_c"))
+}
+
+test "blocks are empty without a session or blocks, and none() hides nothing" {
+    var blocked = BlockedUsers(gateDb())
+    assert(blocked.hiddenIdsFor(null).size() == 0)
+    assert(blocked.hiddenIdsFor("").size() == 0)
+    assert(blocked.hiddenIdsFor("gate_blk_nobody").size() == 0)
+    assert(BlockedUsers.none().hiddenIdsFor("gate_blk_a").size() == 0)
+    assert(!BlockedUsers.none().hiddenBetween("a", "b"))
+}
+
+test "the sanction gate refuses a restricted account with 403 ACCOUNT_RESTRICTED" {
+    var reader = SanctionGateReader(gateDb())
+    var gate = SanctionGate(reader)
+    insertSanction("gate_san_restricted", "RESTRICTION", "ACTIVE", "Spam repetido")
+    var out = gateCode(() -> {
+        gate.requireNotRestricted("gate_san_restricted")
+        return "OK"
+    })
+    assert(out == "ACCOUNT_RESTRICTED:403:Sua conta está restrita por moderação. Você pode recorrer na página Penalidades.")
+    assert(SanctionGate.code() == "ACCOUNT_RESTRICTED")
+    assert(reader.restricted("gate_san_restricted"))
+    assert(!reader.banned("gate_san_restricted"))
+    assert(reader.activeReason("gate_san_restricted") == "Spam repetido")
+}
+
+test "an account without sanctions keeps writing" {
+    var gate = SanctionGate(SanctionGateReader(gateDb()))
+    assert(gateCode(() -> {
+        gate.requireNotRestricted("gate_san_free")
+        return "OK"
+    }) == "OK")
+    assert(SanctionGateReader(gateDb()).activeReason("gate_san_free") == null)
+}
+
+test "a removed sanction no longer restricts" {
+    var reader = SanctionGateReader(gateDb())
+    insertSanction("gate_san_removed", "RESTRICTION", "REMOVED", null)
+    assert(!reader.restricted("gate_san_removed"))
+    assert(!reader.banned("gate_san_removed"))
+}
+
+test "suspension, ban and permaban count as banned" {
+    var reader = SanctionGateReader(gateDb())
+    insertSanction("gate_san_suspended", "SUSPENDED", "ACTIVE", null)
+    insertSanction("gate_san_ban", "BAN", "ACTIVE", null)
+    insertSanction("gate_san_perma", "PERMABAN", "ACTIVE", null)
+    insertSanction("gate_san_restr2", "RESTRICTION", "ACTIVE", null)
+    assert(reader.banned("gate_san_suspended"))
+    assert(reader.banned("gate_san_ban"))
+    assert(reader.banned("gate_san_perma"))
+    assert(!reader.banned("gate_san_restr2"))
+    var among = reader.bannedAmong(listOf("gate_san_suspended", "gate_san_ban", "gate_san_perma", "gate_san_restr2", "gate_san_free"))
+    assert(among.size() == 3)
+    assert(among.contains("gate_san_perma"))
+    assert(!among.contains("gate_san_restr2"))
+    assert(reader.bannedAmong(listOf<String>()).size() == 0)
+}
+
+class RiskCadence extends RiskTimingSignals {
+    Bool automated = false
+    public constructor(automated: Bool) {
+        super()
+        this.automated = automated
+    }
+    Bool looksAutomated(userId: String) = automated
+}
+
+class RiskInbox extends RiskEscalation {
+    List<String> cases = listOf<String>()
+    public constructor() {
+        super()
+    }
+    escalate(userId: String, description: String) {
+        cases.add(userId + "|" + description)
+    }
+}
+
+class RiskBrokenWriter extends RiskAssessmentWriter {
+    public constructor(store: Db) {
+        super(store)
+    }
+    save(a: RiskAssessment) {
+        throw "history unavailable"
+    }
+}
+
+RiskEngine riskEngine(automated: Bool, duplication: ContentDuplicationGuard, inbox: RiskInbox, enforce: Bool) {
+    var reader = SanctionGateReader(gateDb())
+    var cfg = Config.of(mapOf("REDE_RISK_ENFORCE", "" + enforce))
+    return RiskEngine.fromConfig(cfg, RiskSubjectReader(gateDb(), reader), RiskAssessmentWriter(gateDb()), RiskCadence(automated), duplication, inbox)
+}
+
+List<String> riskRows(userId: String) = gateDb().queryList("select level, score, signals, rule_version, decision, action_type from risk_assessments where user_id = ?", DbParams().bindStr(userId)).map((r: DbRow) -> r.getStr("level") + "|" + r.getInt("score") + "|" + r.getStr("signals") + "|" + r.getStr("rule_version") + "|" + r.getStr("decision") + "|" + r.getStr("action_type"))
+
+test "a write with a cadence signal records an assessment" {
+    var inbox = RiskInbox()
+    var engine = riskEngine(true, ContentDuplicationGuard(60L), inbox, false)
+    var a = engine.assess("risk-cadencia", "publish", "conteudo qualquer")
+    assert(a != null)
+    if (a != null) {
+        assert(a.signals.contains(RiskSignals.roboticCadence()))
+        assert(a.level != RiskSignals.low())
+        assert(a.ruleVersion.length() > 0)
+        assert(a.action == "publish")
+        assert(a.id.startsWith("risk_"))
+    }
+    var rows = riskRows("risk-cadencia")
+    assert(rows.size() == 1)
+    assert(rows.get(0) == "MEDIUM|3|[\"ROBOTIC_CADENCE\"]|v1|MONITOR|publish")
+}
+
+test "a write without a signal creates no assessment and no record" {
+    var inbox = RiskInbox()
+    var engine = riskEngine(false, ContentDuplicationGuard(60L), inbox, false)
+    assert(engine.assess("risk-sem-sinal", "publish", "conteudo tranquilo") == null)
+    assert(riskRows("risk-sem-sinal").size() == 0)
+    assert(inbox.cases.size() == 0)
+}
+
+test "repeated content enters the record as a signal" {
+    var inbox = RiskInbox()
+    var guard = ContentDuplicationGuard(60L)
+    var engine = riskEngine(false, guard, inbox, false)
+    guard.require("risk-duplicado", "texto para repetir")
+    var a = engine.assess("risk-duplicado", "publish", "texto para repetir")
+    assert(a != null)
+    if (a != null) {
+        assert(a.signals.contains(RiskSignals.duplicateContent()))
+        assert(a.level == RiskSignals.medium())
+    }
+}
+
+test "a serious level becomes a case for moderation" {
+    var inbox = RiskInbox()
+    var guard = ContentDuplicationGuard(60L)
+    var engine = riskEngine(true, guard, inbox, false)
+    // Robot cadence (3) + repeated content (2) = 5, the HIGH threshold.
+    guard.require("risk-escalada", "o mesmo texto do robo")
+    var a = engine.assess("risk-escalada", "publish", "o mesmo texto do robo")
+    assert(a != null)
+    if (a != null) {
+        assert(a.level == RiskSignals.high())
+        assert(a.decision == RiskSignals.escalate())
+    }
+    assert(inbox.cases.size() == 1)
+    var report = inbox.cases.get(0)
+    assert(report.startsWith("risk-escalada|[risco automatico] Nivel HIGH"))
+    assert(report.contains("ROBOTIC_CADENCE"))
+    assert(report.contains("DUPLICATE_CONTENT"))
+    assert(report.contains("pontos 5"))
+    assert(report.contains("regra v1"))
+    assert(report.contains("acao publish"))
+}
+
+test "cadence alone also becomes a case with the level" {
+    var inbox = RiskInbox()
+    var engine = riskEngine(true, ContentDuplicationGuard(60L), inbox, false)
+    var a = engine.assess("risk-medio", "publish", "conteudo")
+    assert(a != null)
+    if (a != null) {
+        assert(a.level == RiskSignals.medium())
+    }
+    assert(inbox.cases.size() == 1)
+    assert(inbox.cases.get(0).contains("MEDIUM"))
+}
+
+test "observation mode blocks nobody, enforcement restricts only CRITICAL" {
+    var guard = ContentDuplicationGuard(60L)
+    var observing = riskEngine(true, guard, RiskInbox(), false)
+    var enforcing = riskEngine(true, guard, RiskInbox(), true)
+    insertGateUser("risk-critico", Time.nowIso())
+    insertSanction("risk-critico", "RESTRICTION", "ACTIVE", null)
+    guard.require("risk-critico", "texto critico")
+    // 3 (cadence) + 2 (duplicate) + 1 (new account) + 3 (sanction) = 9 >= 8.
+    var seen = observing.assess("risk-critico", "publish", "texto critico")
+    assert(seen != null)
+    if (seen != null) {
+        assert(seen.level == RiskSignals.critical())
+        assert(seen.score == 9)
+        assert(seen.signals.size() == 4)
+        assert(seen.decision == RiskSignals.escalate())
+    }
+    var restricted = enforcing.assess("risk-critico", "publish", "texto critico")
+    assert(restricted != null)
+    if (restricted != null) {
+        assert(restricted.decision == RiskSignals.restrict())
+    }
+    // Below CRITICAL is never restricted, even enforcing.
+    var high = enforcing.assess("risk-alto", "publish", null)
+    assert(high != null)
+    if (high != null) {
+        assert(high.level == RiskSignals.medium())
+        assert(high.decision == RiskSignals.monitor())
+    }
+}
+
+test "the level and decision ruler follows the thresholds" {
+    var engine = riskEngine(false, ContentDuplicationGuard(60L), RiskInbox(), false)
+    assert(engine.levelOf(0) == "LOW")
+    assert(engine.levelOf(1) == "LOW")
+    assert(engine.levelOf(2) == "MEDIUM")
+    assert(engine.levelOf(4) == "MEDIUM")
+    assert(engine.levelOf(5) == "HIGH")
+    assert(engine.levelOf(7) == "HIGH")
+    assert(engine.levelOf(8) == "CRITICAL")
+    assert(engine.decisionOf("LOW") == "ALLOW")
+    assert(engine.decisionOf("MEDIUM") == "MONITOR")
+    assert(engine.decisionOf("HIGH") == "ESCALATE")
+    assert(engine.decisionOf("CRITICAL") == "ESCALATE")
+}
+
+test "the same account is escalated once per cooldown" {
+    var inbox = RiskInbox()
+    var engine = riskEngine(true, ContentDuplicationGuard(60L), inbox, false)
+    engine.assess("risk-cooldown", "publish", "a")
+    engine.assess("risk-cooldown", "publish", "b")
+    engine.assess("risk-cooldown", "comment", "c")
+    assert(inbox.cases.size() == 1)
+    assert(riskRows("risk-cooldown").size() == 3)
+    engine.assess("risk-cooldown-outro", "publish", "a")
+    assert(inbox.cases.size() == 2)
+}
+
+test "a new account adds its signal only inside the window" {
+    var inbox = RiskInbox()
+    var engine = riskEngine(true, ContentDuplicationGuard(60L), inbox, false)
+    insertGateUser("risk-nova", Time.nowIso())
+    insertGateUser("risk-velha", Time.plusSeconds(Time.nowIso(), -3 * 86400L))
+    var fresh = engine.assess("risk-nova", "publish", "x")
+    var old = engine.assess("risk-velha", "publish", "x")
+    assert(fresh != null)
+    assert(old != null)
+    if (fresh != null) {
+        assert(fresh.signals.contains(RiskSignals.newAccount()))
+    }
+    if (old != null) {
+        assert(!old.signals.contains(RiskSignals.newAccount()))
+    }
+}
+
+test "assess never throws: a failing history or escalation does not break the write" {
+    var guard = ContentDuplicationGuard(60L)
+    var reader = SanctionGateReader(gateDb())
+    var inbox = RiskInbox()
+    var cfg = Config.of(mapOf("REDE_RISK_ENFORCE", "false"))
+    var engine = RiskEngine.fromConfig(cfg, RiskSubjectReader(gateDb(), reader), RiskBrokenWriter(gateDb()), RiskCadence(true), guard, inbox)
+    var a = engine.assess("risk-falha-historico", "publish", "x")
+    assert(a != null)
+    // The escalation still happened although the record failed.
+    assert(inbox.cases.size() == 1)
+    assert(riskRows("risk-falha-historico").size() == 0)
+}
