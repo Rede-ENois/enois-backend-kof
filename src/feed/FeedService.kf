@@ -526,7 +526,6 @@ class FeedService {
         }
     }
     List<String> mediaIdsOf(postId: String) = FeedRules.orEmpty(posts.mediaOf(listOf(postId)).get(postId))
-
     // ---- delete ----
     FeedDeleteResult deletePost(userId: String, postId: String, reason: String?) {
         var p = posts.post(postId)
@@ -555,6 +554,57 @@ class FeedService {
             return
         }
         media.requestPostMediaDeletion(p.authorId(), p.id(), mediaIds)
+    }
+    // MomentExpiryScheduler: one pass over the due moments, each deleted through the normal flow.
+    Int expireDueMoments(limit: Int) {
+        var done = 0
+        for (var id in posts.expiredMomentIds(Time.nowIso(), limit)) {
+            try {
+                if (this.expireMoment(id)) {
+                    done = done + 1
+                }
+            } catch (String e) {
+            }
+        }
+        // the next pass tries again; one post must not stop the worker
+        return done
+    }
+    Bool expireMoment(postId: String) {
+        var p = posts.post(postId)
+        if (p == null) {
+            return false
+        }
+        if (p.status() != "ACTIVE") {
+            return false
+        }
+        var now = Time.nowIso()
+        posts.markDeleted(p.id(), now)
+        for (var rid in posts.activeRepostIds(p.id())) {
+            posts.markDeleted(rid, now)
+        }
+        outbox.append("PostDeleted", p.id(), "{\"postId\":\"" + p.id() + "\",\"reason\":\"MOMENT_EXPIRED\"}")
+        this.releaseMedia(p)
+        return true
+    }
+    // GET /feed/saved
+    FeedPage savedFeed(userId: String) {
+        var savedIds = posts.savedPostIds(userId)
+        var active = listOf<FeedPostRow>()
+        for (var p in posts.posts(savedIds)) {
+            if (p.status() == "ACTIVE") {
+                active.add(p)
+            }
+        }
+        var enriched = this.enrich(active, userId)
+        var ordered = listOf<FeedPostView>()
+        for (var id in savedIds) {
+            for (var v in enriched) {
+                if (v.id() == id) {
+                    ordered.add(v)
+                }
+            }
+        }
+        return FeedPage(ordered, null)
     }
     // ---- edit, restore, bulk delete ----
     FeedPostView authorView(p: FeedPostRow) {
@@ -601,7 +651,8 @@ class FeedService {
         if (articleBody != null) {
             if (posts.articleBody(p.id()) != null) {
                 posts.updateArticle(p.id(), articleBody, now)
-            } else {
+            }
+            else {
                 posts.insertArticle(p.id(), articleBody, now)
             }
         }
@@ -678,19 +729,21 @@ class FeedService {
             var p = found.get(id)
             if (p == null) {
                 items.add(FeedBulkItem(id, "NOT_FOUND"))
-            } else if (p.status() != "ACTIVE") {
-                items.add(FeedBulkItem(id, "ALREADY_DELETED"))
-            } else {
-                posts.markDeleted(id, now)
-                outbox.append("PostDeleted", id, "{\"postId\":\"" + id + "\"}")
-                this.releaseMedia(p)
-                audit.write(userId, "POST_BULK_DELETED", id, FeedRules.trimmedOrNull(reason))
-                items.add(FeedBulkItem(id, "MARKED_DELETED"))
             }
+            else 
+                if (p.status() != "ACTIVE") {
+                    items.add(FeedBulkItem(id, "ALREADY_DELETED"))
+                }
+                else {
+                    posts.markDeleted(id, now)
+                    outbox.append("PostDeleted", id, "{\"postId\":\"" + id + "\"}")
+                    this.releaseMedia(p)
+                    audit.write(userId, "POST_BULK_DELETED", id, FeedRules.trimmedOrNull(reason))
+                    items.add(FeedBulkItem(id, "MARKED_DELETED"))
+                }
         }
         return FeedBulkResult("COMPLETED", items)
     }
-
     // ---- reactions, saves, shares ----
     FeedActionResult react(userId: String, postId: String, type: String?) {
         if (type == null) {

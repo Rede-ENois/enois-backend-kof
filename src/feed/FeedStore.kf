@@ -44,7 +44,7 @@ class FeedStore {
     updateArticle(postId: String, body: String, at: String) {
         store.execute("update articles set body = ?, edited_at = ? where post_id = ?", DbParams().bindStr(body).bindInstant(at).bindStr(postId))
     }
-    Int undelete(postId: String) = store.execute("update posts set status = 'ACTIVE', deleted_at = null where id = ? and status = 'DELETED'", DbParams().bindStr(postId))
+    Int undelete(postId: String) = store.execute("update posts set status = \'ACTIVE\', deleted_at = null where id = ? and status = \'DELETED\'", DbParams().bindStr(postId))
     FeedPostRow? post(id: String) {
         var r = store.queryOptional("select " + FeedStore.postColumns() + " from posts where id = ?", DbParams().bindStr(id))
         if (r == null) {
@@ -97,6 +97,21 @@ class FeedStore {
     }
     markDeleted(postId: String, at: String) {
         store.execute("update posts set status = \'DELETED\', deleted_at = ? where id = ?", DbParams().bindInstant(at).bindStr(postId))
+    }
+    // Moments past their deadline and still active (MomentExpiryScheduler batch).
+    List<String> expiredMomentIds(now: String, limit: Int) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select id from posts where type = \'MOMENT\' and status = \'ACTIVE\' and expires_at < ? limit " + limit, DbParams().bindInstant(now))) {
+            out.add(r.getStr("id"))
+        }
+        return out
+    }
+    List<String> savedPostIds(userId: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select post_id from saved_posts where user_id = ? order by created_at desc", DbParams().bindStr(userId))) {
+            out.add(r.getStr("post_id"))
+        }
+        return out
     }
     // Active reposts of a post (they never outlive their source).
     List<String> activeRepostIds(sourceId: String) {

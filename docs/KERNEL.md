@@ -353,6 +353,7 @@ hooks.reports = ModerationAutoReports(...)          // moderation: SecurityAutoR
 hooks.origins = DeveloperOrigins(...)               // apiv1: OriginDirectory (default: JdbcOriginDirectory on developer_origins)
 var parts = Security.install(platform, hooks)       // filters, routes, statics; returns SecurityParts
 parts.userLimiter.require(userId, UserRateLimiter.createPost())    // limiter instances for the domains
+Security.parts()                                    // the same SecurityParts from a domain module (after Security.install)
 ```
 
 The seams are classes with a safe default, not interfaces: a Kof interface declared in a package cannot be
