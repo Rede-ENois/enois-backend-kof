@@ -1,0 +1,136 @@
+package kernel.url
+
+import java.io.IOException
+import java.net.InetAddress
+import java.net.URI
+import kernel.log.*
+
+// SSRF guard: validates a URL PROVIDED BY THE USER before the backend fetches it. A support attachment
+// pointing at `http://169.254.169.254/...` (cloud metadata), an internal cluster service or the
+// database must never become our request.
+//
+// Rules (same as the Java OutboundUrlGuard): http/https only, default ports only (80/443), a host that
+// is not a loopback/private/link-local literal or a local name, and whose DNS resolves ONLY to public
+// addresses. A failure is negative: the caller treats it as "do not fetch".
+//
+//   if (!OutboundUrlGuard.safe(url)) { throw Errors.api(400, "UNSAFE_URL", "...") }
+class OutboundUrlGuard {
+    static Bool safe(url: String?) {
+        if (url == null) {
+            return false
+        }
+        if (url.trim().length() == 0 || url.length() > 2000) {
+            return false
+        }
+        var uri = OutboundUrlGuard.parse(url.trim())
+        if (uri == null) {
+            return false
+        }
+        var scheme = uri.getScheme()
+        if (scheme == null) {
+            return false
+        }
+        var lowerScheme = scheme.toLowerCase()
+        if (lowerScheme != "http" && lowerScheme != "https") {
+            return false
+        }
+        var port = uri.getPort()
+        if (port != -1 && port != 80 && port != 443) {
+            return false
+        }
+        var host = uri.getHost()
+        if (host == null) {
+            return false
+        }
+        if (host.trim().length() == 0) {
+            return false
+        }
+        if (OutboundUrlGuard.localName(host.toLowerCase())) {
+            return false
+        }
+        return OutboundUrlGuard.resolvesOnlyPublic(host)
+    }
+    static Bool localName(lower: String) = lower == "localhost" || lower.endsWith(".localhost") || lower.endsWith(".internal") || lower.endsWith(".local") || lower == "metadata.google.internal"
+    // Name and literal alike go through the resolver: a public IP written directly passes here too.
+    static Bool resolvesOnlyPublic(host: String) {
+        var addresses = OutboundUrlGuard.resolve(host)
+        if (addresses == null) {
+            return false
+        }
+        if (addresses.length == 0) {
+            return false
+        }
+        var i = 0
+        while (i < addresses.length) {
+            if (!OutboundUrlGuard.isPublic(addresses[i])) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    static InetAddress[]? resolve(host: String) {
+        try {
+            return InetAddress.getAllByName(host)
+        } catch (IOException e) {
+            Log("kernel.url").debug("outbound_guard host did not resolve")
+            return null
+        } catch (String e) {
+            return null
+        }
+    }
+    static URI? parse(text: String) {
+        try {
+            return URI.create(text)
+        } catch (String e) {
+            return null
+        }
+    }
+    static Bool isPublic(address: InetAddress) {
+        if (address.isAnyLocalAddress() || address.isLoopbackAddress() || address.isLinkLocalAddress() || address.isSiteLocalAddress() || address.isMulticastAddress()) {
+            return false
+        }
+        var bytes = address.getAddress()
+        if (bytes.length == 4) {
+            return !OutboundUrlGuard.isPrivateV4(OutboundUrlGuard.unsigned(bytes, 0), OutboundUrlGuard.unsigned(bytes, 1))
+        }
+        if (bytes.length == 16) {
+            return !OutboundUrlGuard.isPrivateV6(bytes)
+        }
+        return false
+    }
+    static Int unsigned(bytes: Byte[], index: Int) = bytes[index] as Int & 255
+    // 10/8, 172.16/12, 192.168/16, 100.64/10 (CGNAT), 0/8, 198/8 (benchmarking, kept whole like Java) and 127/8.
+    static Bool isPrivateV4(first: Int, second: Int) = first == 10 || first == 172 && second >= 16 && second <= 31 || first == 192 && second == 168 || first == 100 && second >= 64 && second <= 127 || first == 0 || first == 198 || first == 127
+    // fc00::/7 (unique local), fe80::/10 (link local), ::1 and IPv4-mapped (::ffff:x.x.x.x).
+    static Bool isPrivateV6(b: Byte[]) {
+        var first = OutboundUrlGuard.unsigned(b, 0)
+        var second = OutboundUrlGuard.unsigned(b, 1)
+        if ((first & 254) == 252 || first == 254 && (second & 192) == 128) {
+            return true
+        }
+        var allZero = true
+        var i = 0
+        while (i < 15) {
+            if (OutboundUrlGuard.unsigned(b, i) != 0) {
+                allZero = false
+            }
+            i = i + 1
+        }
+        if (allZero && OutboundUrlGuard.unsigned(b, 15) == 1) {
+            return true
+        }
+        var v4Mapped = true
+        var j = 0
+        while (j < 10) {
+            if (OutboundUrlGuard.unsigned(b, j) != 0) {
+                v4Mapped = false
+            }
+            j = j + 1
+        }
+        if (v4Mapped && OutboundUrlGuard.unsigned(b, 10) == 255 && OutboundUrlGuard.unsigned(b, 11) == 255) {
+            return OutboundUrlGuard.isPrivateV4(OutboundUrlGuard.unsigned(b, 12), OutboundUrlGuard.unsigned(b, 13))
+        }
+        return false
+    }
+}

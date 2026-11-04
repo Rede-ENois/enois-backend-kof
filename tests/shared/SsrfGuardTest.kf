@@ -1,0 +1,139 @@
+import kernel.config.*
+import kernel.error.*
+import kernel.security.*
+import kernel.url.*
+
+// IP literals only: the guard resolves every host, and a literal resolves without the network.
+test "a public address on a default port is allowed" {
+    assert(OutboundUrlGuard.safe("https://93.184.216.34/path?q=1"))
+    assert(OutboundUrlGuard.safe("http://93.184.216.34"))
+    assert(OutboundUrlGuard.safe("https://93.184.216.34:443/x"))
+    assert(OutboundUrlGuard.safe("http://93.184.216.34:80/x"))
+    assert(OutboundUrlGuard.safe("  https://93.184.216.34/  "))
+    assert(OutboundUrlGuard.safe("HTTPS://93.184.216.34/"))
+    assert(OutboundUrlGuard.safe("https://[2606:4700:4700::1111]/"))
+}
+
+test "private, loopback, link-local and metadata addresses are refused" {
+    for (var url in listOf("http://127.0.0.1/", "http://127.1.2.3/", "http://10.0.0.1/", "http://172.16.0.1/", "http://172.31.255.255/", "http://192.168.1.1/", "http://169.254.169.254/latest/meta-data", "http://100.64.0.1/", "http://100.127.255.255/", "http://0.0.0.0/", "http://198.18.0.1/", "http://198.51.100.1/", "http://224.0.0.1/", "http://[::1]/", "http://[fe80::1]/", "http://[fc00::1]/", "http://[fd12:3456::1]/", "http://[::ffff:10.0.0.1]/", "http://[::ffff:127.0.0.1]/", "http://[::ffff:192.168.0.1]/")) {
+        if (OutboundUrlGuard.safe(url)) {
+            throw "FAIL expected refusal: " + url
+        }
+    }
+}
+
+test "the edges of the private ranges are public" {
+    assert(OutboundUrlGuard.safe("http://172.15.255.255/"))
+    assert(OutboundUrlGuard.safe("http://172.32.0.1/"))
+    assert(OutboundUrlGuard.safe("http://100.63.255.255/"))
+    assert(OutboundUrlGuard.safe("http://100.128.0.1/"))
+    assert(OutboundUrlGuard.safe("http://192.169.0.1/"))
+    assert(OutboundUrlGuard.safe("http://11.0.0.1/"))
+}
+
+test "local names are refused without resolving them" {
+    for (var url in listOf("http://localhost/", "http://LOCALHOST:80/", "http://app.localhost/", "http://db.internal/", "http://printer.local/", "http://metadata.google.internal/computeMetadata/v1/")) {
+        if (OutboundUrlGuard.safe(url)) {
+            throw "FAIL expected refusal: " + url
+        }
+    }
+}
+
+test "only http and https on the default ports" {
+    for (var url in listOf("ftp://93.184.216.34/", "file:///etc/passwd", "gopher://93.184.216.34/", "javascript:alert(1)", "https://93.184.216.34:8080/", "http://93.184.216.34:22/", "http://93.184.216.34:6379/")) {
+        if (OutboundUrlGuard.safe(url)) {
+            throw "FAIL expected refusal: " + url
+        }
+    }
+}
+
+test "malformed, blank, null and oversized urls are refused" {
+    assert(!OutboundUrlGuard.safe(null))
+    assert(!OutboundUrlGuard.safe(""))
+    assert(!OutboundUrlGuard.safe("   "))
+    assert(!OutboundUrlGuard.safe("not a url"))
+    assert(!OutboundUrlGuard.safe("http://"))
+    assert(!OutboundUrlGuard.safe("https:///path"))
+    assert(!OutboundUrlGuard.safe("http://93.184.216.34/" + strings.repeat("a", 2000)))
+}
+
+test "SuspiciousText matches the attack vocabulary in any field" {
+    var s = SuspiciousText("probe,idor,redteam,msm")
+    assert(s.matches1("Evento MSM125917"))
+    assert(s.matches1("Probe Escrow"))
+    assert(s.matches1("um teste de IDOR"))
+    assert(!s.matches1("Meetup de programacao"))
+    assert(!s.matches1(null))
+    assert(!s.matches1(""))
+    assert(!s.matches1("   "))
+    assert(s.matchesAny(listOf("normal", "texto redteam aqui")))
+    assert(!s.matchesAny(listOf("normal", "outro")))
+    assert(!s.matchesAny(listOf<String>()))
+    assert(!SuspiciousText("").matches1("probe"))
+    assert(!SuspiciousText(" , ,").matches1("probe"))
+}
+
+test "SuspiciousText reads CONTENT_SWEEP_PATTERNS and has the deployed default" {
+    var configured = SuspiciousText.fromConfig(Config.of(mapOf("CONTENT_SWEEP_PATTERNS", "ola, Mundo")))
+    assert(configured.matches1("Ola amigos"))
+    assert(configured.matches1("meu mundo"))
+    assert(!configured.matches1("probe"))
+    var defaults = SuspiciousText.fromConfig(Config.of(mapOf("CONTENT_SWEEP_PATTERNS", "")))
+    assert(defaults.matches1("Teste de Escrow completo"))
+    assert(defaults.matches1("reembolso integral"))
+    assert(!defaults.matches1("aula de kotlin"))
+}
+
+String dupCode(guard: ContentDuplicationGuard, user: String, text: String) {
+    try {
+        guard.require(user, text)
+    } catch (String e) {
+        return Errors.parse(e).code() + ":" + Errors.parse(e).status()
+    }
+    return "OK"
+}
+
+test "the duplication guard refuses the same normalized text from the same user" {
+    var guard = ContentDuplicationGuard(60L)
+    assert(dupCode(guard, "u1", "Texto  Repetido\n aqui") == "OK")
+    assert(dupCode(guard, "u1", "  texto repetido AQUI ") == "DUPLICATE_CONTENT:409")
+    assert(dupCode(guard, "u2", "texto repetido aqui") == "OK")
+    assert(dupCode(guard, "u1", "outro texto") == "OK")
+}
+
+test "the duplication guard answers isDuplicate without recording" {
+    var guard = ContentDuplicationGuard(60L)
+    assert(!guard.isDuplicate("u1", "abc"))
+    assert(!guard.isDuplicate("u1", "abc"))
+    guard.require("u1", "abc")
+    assert(guard.isDuplicate("u1", "ABC "))
+    assert(!guard.isDuplicate("u2", "abc"))
+    assert(!guard.isDuplicate("u1", null))
+}
+
+test "a zero window disables the duplication guard" {
+    var guard = ContentDuplicationGuard(0L)
+    assert(dupCode(guard, "u1", "x") == "OK")
+    assert(dupCode(guard, "u1", "x") == "OK")
+    assert(!guard.isDuplicate("u1", "x"))
+    var fromConfig = ContentDuplicationGuard.fromConfig(Config.of(mapOf("REDE_RATE_DUPLICATE_WINDOW_MINUTES", "0")))
+    assert(dupCode(fromConfig, "u1", "x") == "OK")
+    assert(dupCode(fromConfig, "u1", "x") == "OK")
+}
+
+test "parallel identical posts cannot both pass" {
+    var guard = ContentDuplicationGuard(60L)
+    var handles = listOf<Handle<String>>()
+    var i = 0
+    while (i < 16) {
+        handles.add(__kof_spawn_expr(dupCode(guard, "racer", "mesmo texto")))
+        i = i + 1
+    }
+    var passed = 0
+    for (var h in handles) {
+        if (__kof_await(h) as String == "OK") {
+            passed = passed + 1
+        }
+    }
+    assert(passed == 1)
+}

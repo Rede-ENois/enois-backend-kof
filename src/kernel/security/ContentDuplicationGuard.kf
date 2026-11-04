@@ -1,0 +1,45 @@
+package kernel.security
+
+import kernel.cache.*
+import kernel.config.*
+import kernel.error.*
+
+// Rejects duplicate content from the same user inside a window. The hash of the normalised text is
+// kept for an hour (REDE_RATE_DUPLICATE_WINDOW_MINUTES, 0 disables): the same user publishing the same
+// text again in that interval gets 409. It stops the commonest spam (the same text pasted in a loop)
+// without blocking edits or republishing after the period. Port of shared/security/ContentDuplicationGuard,
+// on kernel.cache.TtlCache (50000 entries); `require` is atomic: two parallel posts cannot both pass.
+//
+//   guard.require(userId, text)         // 409 DUPLICATE_CONTENT
+//   guard.isDuplicate(userId, text)     // pure query (the risk engine combines signals with it)
+class ContentDuplicationGuard {
+    TtlCache? seen = null
+    public constructor(windowMinutes: Long) {
+        if (windowMinutes > 0L) {
+            this.seen = TtlCache("duplicateContent", windowMinutes * 60000L, 50000)
+        }
+    }
+    static ContentDuplicationGuard fromConfig(cfg: Config) = ContentDuplicationGuard(cfg.getLong("REDE_RATE_DUPLICATE_WINDOW_MINUTES", 60L))
+    Bool isDuplicate(userId: String, content: String?) {
+        var cache = seen
+        if (cache == null) {
+            return false
+        }
+        if (content == null) {
+            return false
+        }
+        return cache.get(ContentDuplicationGuard.keyOf(userId, content)) != null
+    }
+    // Throws 409 when the user already published this content in the window; otherwise remembers it.
+    require(userId: String, content: String) {
+        var cache = seen
+        if (cache == null) {
+            return
+        }
+        if (!cache.add(ContentDuplicationGuard.keyOf(userId, content), "1")) {
+            throw Errors.api(409, "DUPLICATE_CONTENT", "Voce ja publicou este conteudo recentemente.")
+        }
+    }
+    static String keyOf(userId: String, content: String) = userId + "|" + Hashes.sha256Hex(ContentDuplicationGuard.normalize(content))
+    static String normalize(text: String) = text.trim().toLowerCase().replaceAll("\\s+", " ")
+}

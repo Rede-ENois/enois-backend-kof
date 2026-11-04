@@ -484,3 +484,55 @@ other pods, the TTL is the guarantee. Caches: `publicProfiles` (20 s, 5000), `pu
 200). `REDE_CACHE_DYNAMIC_TTL` (default `20s`) feeds the 20 s ones; `REDE_CACHE_<NAME>_TTL` (`500ms`,
 `5s`, `10m`, `1h`, `2d`, bare number = ms) and `REDE_CACHE_<NAME>_MAX_ENTRIES` override one cache
 (`REDE_CACHE_JOBS_LIST_TTL`).
+
+## kernel.text, kernel.geo, kernel.search
+
+```kotlin
+import kernel.text.*
+
+PlainText.defuse(raw): String?                 // bidi/zero-width removed, <=5 combining marks, runs capped at 12 ("travazap")
+TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "nome", value, 160)   // 400 "O campo nome aceita no máximo 160 caracteres."
+LikePattern.contains(q)  LikePattern.startsWith(q)  LikePattern.escape(t) // null for blank; SQL must say `escape '!'`
+InlineMedia.idsIn(content)  InlineMedia.validate(content, mediaIds)       // 400 INVALID_INLINE_MEDIA for foreign markers
+Texts.stripAccents(s)  Texts.squash(s)
+Regexes.replaceAll(pattern, input, (m: Matcher) -> String)               // literal replacements
+```
+
+```kotlin
+import kernel.geo.*
+var place = CityState.of(city, state)          // CityState(city, state, cityKey) or null; 400 CITY_STATE_INCOMPLETE / INVALID_STATE / CITY_TOO_LONG
+CityState.requireState("mg") == "MG"           CityState.key("São Paulo") == "sao paulo"   CityState.states()  // the 27 UFs
+```
+
+```kotlin
+import kernel.search.*
+var q = BooleanQuery.parse(raw)                // never fails on bad syntax; 400 BAD_REQUEST past 64 terms / 12 levels
+q.isEmpty()  q.root(): BooleanNode             // kind MATCH_ALL | TERM | PHRASE | AND | OR | NOT, text, children, describe()
+BooleanQuery.rejection(raw): String            // the reason a query is refused, "" when fine
+```
+
+Syntax: loose terms (AND), `AND/E`, `OR/OU`, `NOT/NAO/NÃO`, `-term`, `+term`, `"phrase"`, parentheses; NOT > AND > OR.
+`BooleanNode` is a class with a `kind` string (the Java sealed records cannot be built across packages, G28).
+
+## kernel.url and kernel.security guards
+
+```kotlin
+import kernel.url.*
+import kernel.security.*
+
+SafeUrl.requireHttpUrl(raw, "site")                    // 400 INVALID_URL; blank passes; max 500 chars, host, no credentials
+SafeUrl.requireHttpUrlList(list, field)  SafeUrl.requireHttpUrlsJoined(text, separatorRegex, field)
+SafeUrl.requireSafeMarkdownLinks(text, field)          // 400 UNSAFE_LINK: markdown/reference/html link schemes
+SafeUrl.isSafeLinkTarget(target)                       // no scheme, or http/https/mailto (whitespace/control/format chars ignored)
+SafeLinks.checkRequest()                               // SafeLinkRequestBodyAdvice: every string of a JSON body, decoded
+SafeLinks.checkBody(text)                              // the same on a text; >2 MB -> 400 BAD_REQUEST; malformed -> left to the DTO parser
+OutboundUrlGuard.safe(url): Bool                       // SSRF: http/https, ports 80/443, no local names, DNS only to public addresses
+SuspiciousText.fromConfig(cfg).matches1(text)  .matchesAny(listOf(a, b))        // CONTENT_SWEEP_PATTERNS
+ContentDuplicationGuard.fromConfig(cfg).require(userId, text)   // 409 DUPLICATE_CONTENT; REDE_RATE_DUPLICATE_WINDOW_MINUTES (60, 0 = off)
+guard.isDuplicate(userId, text)                        // pure query; `require` is atomic
+```
+
+`SafeLinks.checkRequest()` is the handler/filter-level equivalent of the Java `@ControllerAdvice`: call it
+before parsing a JSON DTO (JSON content types only; raw payloads a handler verifies as is, such as a
+webhook HMAC, must not go through it). The Kof JSON reader behind it (`JsonStrings`) collects decoded
+string values with their property name because Kof cannot walk a Jackson tree.

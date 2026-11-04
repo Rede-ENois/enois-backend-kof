@@ -1,0 +1,53 @@
+package kernel.url
+
+import kernel.error.*
+import kernel.http.*
+import kernel.text.*
+
+// Every string of every JSON request body goes through SafeUrl.requireSafeMarkdownLinks: Markdown is
+// rendered by the front in posts, comments, messages, blog, bios, job and community descriptions and
+// more, so checking at the request is the one place all of them route through, instead of a call per
+// field that the next new field would forget. Equivalent of the Java SafeLinkRequestBodyAdvice.
+//
+//   SafeLinks.checkRequest()                     // in the handler (or a filter), before parsing the DTO
+//   SafeLinks.checkBody(Req.bodyText())          // the same on a text
+//
+// The text is read once, checked on its DECODED strings (JSON escapes cannot hide a scheme). A malformed
+// body is left alone: the DTO parser reports it as usual (400). Raw String payloads that a handler
+// verifies as is (the GitHub webhook HMAC) must not be passed here.
+class SafeLinks {
+    // Cap of the JSON read for the check (DTOs of the app stay far below).
+    static Int maxJsonBody() = 2097152
+    // The current request: only JSON content types (application/json, +json) are checked.
+    static checkRequest() {
+        var type = Req.headerOrNull("content-type")
+        if (type == null) {
+            return
+        }
+        var lower = type.toLowerCase()
+        var isJson = lower.contains("application/json") || lower.contains("+json")
+        if (!isJson) {
+            return
+        }
+        SafeLinks.checkBody(Req.bodyText())
+    }
+    static checkBody(body: String) {
+        if (body.length() == 0) {
+            return
+        }
+        if (body.getBytes().length > SafeLinks.maxJsonBody()) {
+            throw Errors.badRequest()
+        }
+        var walker = JsonStrings(body)
+        walker.walk()
+        // Check only a fully readable document (as Jackson's readTree would have produced).
+        if (walker.malformed) {
+            return
+        }
+        var i = 0
+        while (i < walker.fields.size()) {
+            SafeUrl.requireSafeMarkdownLinks(walker.values.get(i), walker.fields.get(i))
+            i = i + 1
+        }
+    }
+}

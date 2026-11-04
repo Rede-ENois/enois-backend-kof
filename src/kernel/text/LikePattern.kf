@@ -1,0 +1,42 @@
+package kernel.text
+
+// The one place that turns user text into a LIKE pattern without wildcard injection: a search for `%`
+// used to become `%%` and return every row. `!`, `%` and `_` are escaped; every LIKE fed by user input
+// must say `escape '!'` (`!` and not `\`: the SQL literal of a backslash differs between H2 and MariaDB).
+//
+//   database.queryList("select id from t where lower(name) like ? escape '!'", DbParams().bindStrOrNull(LikePattern.contains(q)))
+class LikePattern {
+    static String escapeChar() = "!"
+    static Int maxTerm() = 80
+    // Escapes the LIKE metacharacters so the text matches literally. Adds no wildcards.
+    static String escape(term: String) = term.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+    // "Contains" pattern, lower-cased and trimmed; null when the term is blank (no filter).
+    static String? contains(raw: String?) {
+        var term = LikePattern.normalize(raw)
+        if (term == null) {
+            return null
+        }
+        return "%" + LikePattern.escape(term) + "%"
+    }
+    // "Starts with" pattern, lower-cased and trimmed; null when the term is blank.
+    static String? startsWith(raw: String?) {
+        var term = LikePattern.normalize(raw)
+        if (term == null) {
+            return null
+        }
+        return LikePattern.escape(term) + "%"
+    }
+    static String? normalize(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        var term = raw.trim().toLowerCase()
+        if (term.length() > LikePattern.maxTerm()) {
+            return term.substring(0, LikePattern.maxTerm())
+        }
+        return term
+    }
+}

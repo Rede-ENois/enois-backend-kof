@@ -1,0 +1,166 @@
+import kernel.error.*
+import kernel.geo.*
+import kernel.text.*
+
+String textCaught(f: () -> String) {
+    try {
+        return f()
+    } catch (String e) {
+        return e
+    }
+}
+
+String plain(raw: String?) {
+    var out = PlainText.defuse(raw)
+    if (out == null) {
+        return "<null>"
+    }
+    return out
+}
+
+String cityCode(city: String?, state: String?) {
+    try {
+        CityState.of(city, state)
+    } catch (String e) {
+        return Errors.parse(e).code()
+    }
+    return "OK"
+}
+
+test "removes bidi and zero-width controls" {
+    var attack = "oi‮‭‬‏‎⁦⁩​‍﻿ tudo bem"
+    assert(plain(attack) == "oi tudo bem")
+}
+
+test "keeps real Arabic and Hebrew text" {
+    assert(plain("مرحبا بالعالم") == "مرحبا بالعالم")
+    assert(plain("שלום עולם") == "שלום עולם")
+}
+
+test "keeps emoji and accents intact" {
+    assert(plain("Olá! 🎉 programação, café e ação") == "Olá! 🎉 programação, café e ação")
+}
+
+test "limits piles of combining marks but keeps the base" {
+    var pile = "e" + strings.repeat("́", 40)
+    var result = plain(pile)
+    assert(result.startsWith("e"))
+    assert(result.length() <= 6)
+}
+
+test "collapses huge repetitions" {
+    var flood = strings.repeat("a", 5000) + " fim"
+    var result = plain(flood)
+    assert(result.startsWith(strings.repeat("a", 12)))
+    assert(!result.contains(strings.repeat("a", 13)))
+    assert(result.endsWith(" fim"))
+}
+
+test "empty and null stay as they are" {
+    assert(plain(null) == "<null>")
+    assert(plain("") == "")
+    assert(plain("   ") == "   ")
+}
+
+test "TextFieldLimit refuses with a 400 naming the field and the ceiling" {
+    var err = textCaught(() -> {
+        TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "nome", strings.repeat("E", 200), 160)
+        return "no error"
+    })
+    assert(Errors.parse(err).status() == 400)
+    assert(Errors.parse(err).code() == "COMPANY_FIELD_TOO_LONG")
+    assert(Errors.parse(err).message() == "O campo nome aceita no máximo 160 caracteres.")
+    var big = textCaught(() -> {
+        TextFieldLimit.check("SERVICE_FIELD_TOO_LONG", "descricao", strings.repeat("D", 2500), 2000)
+        return "no error"
+    })
+    assert(Errors.parse(big).message().contains("descricao"))
+    assert(Errors.parse(big).message().contains("2.000"))
+    assert(textCaught(() -> {
+        TextFieldLimit.check("X", "campo", strings.repeat("a", 255), 255)
+        TextFieldLimit.check("X", "campo", null, 255)
+        return "ok"
+    }) == "ok")
+    assert(TextFieldLimit.thousands(0) == "0")
+    assert(TextFieldLimit.thousands(999) == "999")
+    assert(TextFieldLimit.thousands(1000) == "1.000")
+    assert(TextFieldLimit.thousands(1234567) == "1.234.567")
+}
+
+test "LikePattern escapes the metacharacters" {
+    assert(LikePattern.escape("50%_off!") == "50!%!_off!!")
+    assert(LikePattern.contains("  Foo_Bar ") == "%foo!_bar%")
+    assert(LikePattern.startsWith("100%") == "100!%%")
+    assert(LikePattern.contains("   ") == null)
+    assert(LikePattern.contains(null) == null)
+    var capped = LikePattern.contains(strings.repeat("x", 200))
+    assert(capped == "%" + strings.repeat("x", 80) + "%")
+}
+
+test "InlineMedia lists markers in order without repeats and validates them" {
+    var ids = InlineMedia.idsIn("a {{media:m1}} b {{media:m2}} c {{media:m1}} {{media:bad id}}")
+    assert(ids.size() == 2)
+    assert(ids.get(0) == "m1")
+    assert(ids.get(1) == "m2")
+    assert(InlineMedia.idsIn(null).size() == 0)
+    assert(textCaught(() -> {
+        InlineMedia.validate("so {{media:m1}}", listOf("m1", "m2"))
+        InlineMedia.validate("no markers", null)
+        return "ok"
+    }) == "ok")
+    var err = textCaught(() -> {
+        InlineMedia.validate("so {{media:other}}", listOf("m1"))
+        return "no error"
+    })
+    assert(Errors.parse(err).status() == 400)
+    assert(Errors.parse(err).code() == "INVALID_INLINE_MEDIA")
+    var none = textCaught(() -> {
+        InlineMedia.validate("{{media:m1}}", null)
+        return "no error"
+    })
+    assert(Errors.parse(none).code() == "INVALID_INLINE_MEDIA")
+}
+
+test "the same city with or without accents has the same key" {
+    var a = CityState.of("São Paulo", "sp")
+    var b = CityState.of("  sao   PAULO ", "SP")
+    assert(a != null)
+    assert(b != null)
+    assert(CityState.key("São Paulo") == "sao paulo")
+    assert(CityState.key("  sao   PAULO ") == "sao paulo")
+    assert(CityState.key(" ") == null)
+}
+
+test "keeps the city as written and uppercases the state" {
+    var place = CityState.of("  Belo   Horizonte ", " mg ")
+    assert(place != null)
+    if (place != null) {
+        assert(place.city == "Belo Horizonte")
+        assert(place.state == "MG")
+        assert(place.cityKey == "belo horizonte")
+    }
+}
+
+test "both blank means no place" {
+    assert(CityState.of(null, null) == null)
+    assert(CityState.of("", " ") == null)
+}
+
+test "refuses only one of the two" {
+    assert(cityCode("Recife", null) == "CITY_STATE_INCOMPLETE")
+    assert(cityCode("", "PE") == "CITY_STATE_INCOMPLETE")
+}
+
+test "refuses a state that is not one of the 27" {
+    assert(CityState.states().size() == 27)
+    assert(cityCode("Lisboa", "LX") == "INVALID_STATE")
+    assert(textCaught(() -> {
+        CityState.requireState("Minas")
+        return "no error"
+    }).startsWith("ApiError:"))
+}
+
+test "refuses a city above the column limit" {
+    assert(cityCode(strings.repeat("a", 81), "MG") == "CITY_TOO_LONG")
+    assert(cityCode(strings.repeat("a", 80), "MG") == "OK")
+}

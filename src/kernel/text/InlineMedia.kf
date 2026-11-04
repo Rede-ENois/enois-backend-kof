@@ -1,0 +1,48 @@
+package kernel.text
+
+import java.util.HashSet
+import java.util.regex.Pattern
+import kernel.error.*
+
+// Media in the MIDDLE of a text: the content may carry `{{media:<id>}}` markers and the renderer swaps
+// each for the real media where the author put it. Without a marker the media stays an attachment at
+// the end. Security rule: every marker must reference a media of the SAME publication (the `mediaIds`
+// list, already validated as the author's); an orphan marker pointing at someone else's media is refused.
+class InlineMedia {
+    static Pattern marker() = Pattern.compile("\\{\\{media:([A-Za-z0-9_-]+)}}")
+    // Ids referenced by markers, in order of appearance, without repeats.
+    static List<String> idsIn(content: String?) {
+        var ids = listOf<String>()
+        if (content == null) {
+            return ids
+        }
+        var seen = new HashSet<String>()
+        var m = InlineMedia.marker().matcher(content)
+        while (m.find()) {
+            var id = Regexes.group(m, 1)
+            if (seen.add(id)) {
+                ids.add(id)
+            }
+        }
+        return ids
+    }
+    // Every marker must be in the publication's media list: a stray marker is an author error, and
+    // showing someone else's media as an attachment would be worse than refusing.
+    static validate(content: String?, mediaIds: List<String>?) {
+        var referenced = InlineMedia.idsIn(content)
+        if (referenced.size() == 0) {
+            return
+        }
+        var owned = new HashSet<String>()
+        if (mediaIds != null) {
+            for (var id in mediaIds) {
+                owned.add(id)
+            }
+        }
+        for (var id in referenced) {
+            if (!owned.contains(id)) {
+                throw Errors.api(400, "INVALID_INLINE_MEDIA", "Há uma mídia inserida no texto que não está nos anexos da publicação. Anexe a mídia e insira ela no texto.")
+            }
+        }
+    }
+}
