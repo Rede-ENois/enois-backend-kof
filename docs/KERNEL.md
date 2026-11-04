@@ -310,3 +310,38 @@ test "feed lists posts" {
 - Fixtures: unique prefixes per test (the database is shared by the tests of a file). Seed with
   `app.db().execute(...)`.
 - Time-based code: schedulers/jobs are instances you create in the test and `stop()`.
+
+## kernel.idempotency
+
+`Idempotency-Key` on writes, same `idempotency_keys` table and codes as the Java
+`IdempotencyApplicationService`. Route handlers call one helper:
+
+```kotlin
+import kernel.idempotency.*
+
+var idem = Idempotency(platform.db)
+server.post("/feed/posts", () -> {
+    var hash = Idempotency.hash(Req.bodyText())            // SHA-256 hex of the payload text
+    // user scope, method, route as the Java side wrote it ("/api/..."), hash, success status, action
+    return idem.handle(userId, "POST", "/api/feed/posts", hash, 201, () -> json.encode(createPost(userId)))
+})
+```
+
+`handle` reads the `Idempotency-Key` header and answers `status(successStatus, body)`. `execute(scope,
+method, route, key: String?, hash, status, action): IdempotencyReply(status, body)` is the same without
+HTTP. The action returns the JSON body text; the success status is a parameter (every Java command has a
+fixed status, and a lambda cannot return a type from another package, G28).
+
+The call is one transaction (like `@Transactional`): marker, the action's own writes and the stored
+response commit together; a throwing action leaves no marker, so the client can retry with the same key.
+
+| Situation | Answer |
+|---|---|
+| missing / blank key | 400 `IDEMPOTENCY_KEY_REQUIRED` "Idempotency-Key obrigatoria." |
+| same key + hash, completed | stored status and body, action not run |
+| same key, other hash (checked first) | 409 `IDEMPOTENCY_PAYLOAD_CONFLICT` |
+| marker `PROCESSING` / `FAILED` | 409 `IDEMPOTENCY_IN_PROGRESS` / `IDEMPOTENCY_FAILED` |
+| lost insert race (unique violation) | replay or reject against the winner's row |
+
+Keys are scoped by user, method, route and key; rows live 24 h (`expires_at`).
+`Idempotency.hash(json.encode(dto))` hashes a DTO; hashes only need to be stable within this service.

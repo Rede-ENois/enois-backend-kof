@@ -1,0 +1,109 @@
+package kernel.idempotency
+
+import kernel.db.*
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.time.*
+
+// Idempotency-Key semantics of the Java IdempotencyApplicationService, on the same
+// `idempotency_keys` table (unique per user scope + method + route + key).
+//
+//   var idem = Idempotency(platform.db)
+//   server.post("/feed/posts", () -> {
+//       var hash = Idempotency.hash(Req.bodyText())
+//       return idem.handle(userId, "POST", "/api/feed/posts", hash, 201, () -> json.encode(createPost(...)))
+//   })
+//
+// The whole call is one transaction (like @Transactional): the PROCESSING marker, the action's own
+// writes and the stored response commit together, so a failing action leaves no marker behind and
+// the client may retry with the same key. Rules:
+// The action returns the response body (JSON text) and the success status is a parameter: a lambda
+// cannot return a type from another package (KOF_GAPS G28), and every Java command has a fixed status.
+//   - missing/blank key                      -> 400 IDEMPOTENCY_KEY_REQUIRED
+//   - same key, same hash, completed         -> the stored status and body, action not run
+//   - same key, different hash               -> 409 IDEMPOTENCY_PAYLOAD_CONFLICT
+//   - same key, PROCESSING / FAILED marker   -> 409 IDEMPOTENCY_IN_PROGRESS / IDEMPOTENCY_FAILED
+//   - lost insert race (unique violation)    -> replay/reject against the winner's row
+class Idempotency {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // SHA-256 hex of the request payload text (the Java side hashes the JSON of the DTO: callers
+    // pass json.encode(dto) or the raw body).
+    static String hash(payload: String) = Hashes.sha256Hex(payload)
+    // Handler helper: reads the Idempotency-Key header and answers like ResponseEntity.status(..).
+    String handle(userScope: String, method: String, route: String, requestHash: String, successStatus: Int, action: () -> String) {
+        var reply = this.execute(userScope, method, route, Req.headerOrNull("idempotency-key"), requestHash, successStatus, action)
+        return Http.respond(reply.status(), reply.body())
+    }
+    IdempotencyReply execute(userScope: String, method: String, route: String, idempotencyKey: String?, requestHash: String, successStatus: Int, action: () -> String) {
+        if (idempotencyKey == null) {
+            throw Errors.api(400, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key obrigatoria.")
+        }
+        var key = idempotencyKey.trim()
+        if (key.length() == 0) {
+            throw Errors.api(400, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key obrigatoria.")
+        }
+        var self = this
+        var reply = IdempotencyReply(200, "{}")
+        store.transaction(() -> {
+    reply = self.inTransaction(userScope, method, route, key, requestHash, successStatus, action)
+})
+        return reply
+    }
+    IdempotencyReply inTransaction(userScope: String, method: String, route: String, key: String, requestHash: String, successStatus: Int, action: () -> String) {
+        var existing = this.find(userScope, method, route, key)
+        if (existing != null) {
+            return this.replayOrReject(existing, requestHash)
+        }
+        var now = Time.nowIso()
+        var id = 0L
+        var raced = false
+        try {
+            id = store.insertReturningId("insert into idempotency_keys (user_id, method, route, idempotency_key, request_hash, status, created_at, expires_at) values (?, ?, ?, ?, ?, \'PROCESSING\', ?, ?)", DbParams().bindStr(userScope).bindStr(method).bindStr(route).bindStr(key).bindStr(requestHash).bindInstant(now).bindInstant(Time.plusSeconds(now, 86400L)))
+        } catch (String e) {
+            if (!Errors.hasCode(e, "CONFLICT")) {
+                throw e
+            }
+            raced = true
+        }
+        if (raced) {
+            // Another request won the unique key between our lookup and insert.
+            var concurrent = this.find(userScope, method, route, key)
+            if (concurrent == null) {
+                throw Errors.conflict()
+            }
+            return this.replayOrReject(concurrent, requestHash)
+        }
+        var responseBody = action()
+        store.execute("update idempotency_keys set status = \'COMPLETED\', response_status = ?, response_body = ?, completed_at = ? where id = ?", DbParams().bindInt(successStatus).bindStr(responseBody).bindInstant(Time.nowIso()).bindLong(id))
+        return IdempotencyReply(successStatus, responseBody)
+    }
+    DbRow? find(userScope: String, method: String, route: String, key: String) = store.queryOptional("select request_hash, status, response_status, response_body from idempotency_keys where user_id = ? and method = ? and route = ? and idempotency_key = ?", DbParams().bindStr(userScope).bindStr(method).bindStr(route).bindStr(key))
+    // Row of an earlier call with the same key: its answer, or the reason it cannot be answered.
+    IdempotencyReply replayOrReject(row: DbRow, requestHash: String) {
+        if (row.getStr("request_hash") != requestHash) {
+            throw Errors.api(409, "IDEMPOTENCY_PAYLOAD_CONFLICT", "Idempotency-Key reutilizada com payload diferente.")
+        }
+        var status = row.getStr("status")
+        if (status == "PROCESSING") {
+            throw Errors.api(409, "IDEMPOTENCY_IN_PROGRESS", "Comando ainda em processamento.")
+        }
+        if (status == "FAILED") {
+            throw Errors.api(409, "IDEMPOTENCY_FAILED", "Comando anterior falhou.")
+        }
+        var code = row.getIntOrNull("response_status")
+        var body = row.getStrOrNull("response_body")
+        var replayStatus = 200
+        if (code != null) {
+            replayStatus = code
+        }
+        var replayBody = "{}"
+        if (body != null) {
+            replayBody = body
+        }
+        return IdempotencyReply(replayStatus, replayBody)
+    }
+}

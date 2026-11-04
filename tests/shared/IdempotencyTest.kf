@@ -1,0 +1,298 @@
+import kernel.db.*
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.testkit.*
+import kernel.time.*
+
+class IdemHolder {
+    static TestApp? cached = null
+    static Int runs = 0
+    static TestApp app() {
+        var cur = IdemHolder.cached
+        if (cur != null) {
+            return cur
+        }
+        var created = TestApp.bootWire("idem", (p: Platform) -> idemWire(p))
+        IdemHolder.cached = created
+        return created
+    }
+}
+
+record IdemBody(String data)
+
+idemWire(p: Platform) {
+    var idem = Idempotency(p.db)
+    p.server.post("/idem/echo", () -> {
+        var hash = Idempotency.hash(Req.bodyText())
+        return idem.handle("idem_http_user", "POST", "/api/idem/echo", hash, 201, () -> {
+            IdemHolder.runs = IdemHolder.runs + 1
+            return "{\"run\":" + IdemHolder.runs + "}"
+        })
+    })
+}
+
+Idempotency idemService() = Idempotency(IdemHolder.app().db())
+
+String idemRunCode(svc: Idempotency, user: String, route: String, key: String, hash: String, counter: IdemCounter) {
+    try {
+        idemRun(svc, user, route, key, hash, counter, 200, "{}")
+    } catch (String e) {
+        return Errors.parse(e).code()
+    }
+    return "NONE"
+}
+
+String idemKeyCode(svc: Idempotency, key: String?) {
+    try {
+        svc.execute("idemp_flow_user4", "POST", "/api/test/nokey", key, "somehash", 200, () -> "{}")
+    } catch (String e) {
+        return Errors.parse(e).code()
+    }
+    return "NONE"
+}
+
+IdempotencyReply idemRun(svc: Idempotency, user: String, route: String, key: String, hash: String, counter: IdemCounter, status: Int, body: String) = svc.execute(user, "POST", route, key, hash, status, () -> {
+    counter.hit()
+    return body
+})
+
+class IdemCounter {
+    Int n = 0
+    hit() {
+        n = n + 1
+    }
+}
+
+String idemSlow(svc: Idempotency, user: String, key: String, hash: String, counter: IdemCounter) {
+    var r = svc.execute(user, "POST", "/api/test/race", key, hash, 200, () -> {
+        counter.hit()
+        time.sleep(500)
+        return "{\"ok\":true}"
+    })
+    return "ok:" + r.status() + ":" + r.body()
+}
+
+String idemLate(svc: Idempotency, user: String, key: String, hash: String, counter: IdemCounter) {
+    time.sleep(150)
+    try {
+        var r = svc.execute(user, "POST", "/api/test/race", key, hash, 200, () -> {
+            counter.hit()
+            return "{}"
+        })
+        return "ok:" + r.status() + ":" + r.body()
+    } catch (String e) {
+        return "err:" + Errors.parse(e).code()
+    }
+}
+
+String idemFailingAction() {
+    IdemHolder.app().db().execute("insert into audit_logs (id, actor_id, action, target_id, created_at) values ('idem_atomic_1', 'a', 'x', 't', ?)", DbParams().bindInstant("2026-10-31T12:00:00Z"))
+    throw "action failed"
+}
+
+insertIdemRow(user: String, route: String, key: String, hash: String, status: String) {
+    IdemHolder.app().db().execute("insert into idempotency_keys (user_id, method, route, idempotency_key, request_hash, status, created_at, expires_at) values (?, 'POST', ?, ?, ?, ?, ?, ?)", DbParams().bindStr(user).bindStr(route).bindStr(key).bindStr(hash).bindStr(status).bindInstant("2026-10-31T12:00:00Z").bindInstant("2026-11-01T12:00:00Z"))
+}
+
+test "first execution runs the action and returns its result" {
+    var svc = idemService()
+    var counter = IdemCounter()
+    var reply = idemRun(svc, "idemp_flow_user1", "/api/test/first", "key-first-1", Idempotency.hash("a"), counter, 201, "{\"id\":\"abc\"}")
+    assert(reply.status() == 201)
+    assert(reply.body().contains("\"id\""))
+    assert(reply.body().contains("abc"))
+    assert(counter.n == 1)
+}
+
+test "replay with the same hash returns the same response without running the action" {
+    var svc = idemService()
+    var counter = IdemCounter()
+    var hash = Idempotency.hash("replay")
+    idemRun(svc, "idemp_flow_user2", "/api/test/replay", "key-replay-1", hash, counter, 200, "{\"ok\":true}")
+    var replayed = idemRun(svc, "idemp_flow_user2", "/api/test/replay", "key-replay-1", hash, counter, 200, "{\"ok\":true}")
+    assert(replayed.status() == 200)
+    assert(replayed.body().contains("true"))
+    assert(counter.n == 1)
+}
+
+test "same key with a different payload is a conflict" {
+    var svc = idemService()
+    var counter = IdemCounter()
+    idemRun(svc, "idemp_flow_user3", "/api/test/conflict", "key-conflict-1", Idempotency.hash("amount=10"), counter, 200, "{\"ok\":true}")
+    var code = idemRunCode(svc, "idemp_flow_user3", "/api/test/conflict", "key-conflict-1", Idempotency.hash("amount=20"), counter)
+    assert(code == "IDEMPOTENCY_PAYLOAD_CONFLICT")
+    assert(counter.n == 1)
+}
+
+test "a conflict answers 409 with the pt-BR message" {
+    var svc = idemService()
+    var counter = IdemCounter()
+    idemRun(svc, "idemp_flow_user3b", "/api/test/conflict", "key-conflict-2", Idempotency.hash("x"), counter, 200, "{}")
+    var err = ""
+    try {
+        idemRun(svc, "idemp_flow_user3b", "/api/test/conflict", "key-conflict-2", Idempotency.hash("y"), counter, 200, "{}")
+    } catch (String e) {
+        err = e
+    }
+    assert(Errors.parse(err).status() == 409)
+    assert(Errors.parse(err).message() == "Idempotency-Key reutilizada com payload diferente.")
+}
+
+test "a missing or blank key throws 400" {
+    var svc = idemService()
+    var counter = IdemCounter()
+    var none = idemKeyCode(svc, null)
+    assert(none == "IDEMPOTENCY_KEY_REQUIRED")
+    var blank = idemKeyCode(svc, "  ")
+    assert(blank == "IDEMPOTENCY_KEY_REQUIRED")
+    var err = ""
+    try {
+        svc.execute("idemp_flow_user4", "POST", "/api/test/nokey", null, "somehash", 200, () -> "{}")
+    } catch (String e) {
+        err = e
+    }
+    assert(Errors.parse(err).status() == 400)
+    assert(Errors.parse(err).message() == "Idempotency-Key obrigatoria.")
+}
+
+test "the same key for a different user executes independently" {
+    var svc = idemService()
+    var counter = IdemCounter()
+    var hash = Idempotency.hash("scoped")
+    idemRun(svc, "idemp_flow_userA", "/api/test/scope", "key-scope-1", hash, counter, 200, "{\"who\":\"A\"}")
+    idemRun(svc, "idemp_flow_userB", "/api/test/scope", "key-scope-1", hash, counter, 200, "{\"who\":\"B\"}")
+    assert(counter.n == 2)
+}
+
+test "the same key on a different route executes independently" {
+    var svc = idemService()
+    var counter = IdemCounter()
+    var hash = Idempotency.hash("route")
+    idemRun(svc, "idemp_flow_user5", "/api/test/route-a", "key-route-1", hash, counter, 200, "{\"r\":\"a\"}")
+    idemRun(svc, "idemp_flow_user5", "/api/test/route-b", "key-route-1", hash, counter, 200, "{\"r\":\"b\"}")
+    assert(counter.n == 2)
+}
+
+test "the hash is deterministic and sensitive" {
+    var a = Idempotency.hash("{\"amount\":100,\"to\":\"someone\"}")
+    assert(a == Idempotency.hash("{\"amount\":100,\"to\":\"someone\"}"))
+    assert(a != Idempotency.hash("{\"amount\":999,\"to\":\"someone\"}"))
+    assert(a.length() == 64)
+}
+
+test "a PROCESSING marker answers 409 IDEMPOTENCY_IN_PROGRESS" {
+    var svc = idemService()
+    var counter = IdemCounter()
+    var hash = Idempotency.hash("x1")
+    insertIdemRow("idemp_replay_user1", "/test", "key-1", hash, "PROCESSING")
+    var code = idemRunCode(svc, "idemp_replay_user1", "/test", "key-1", hash, counter)
+    assert(code == "IDEMPOTENCY_IN_PROGRESS")
+    assert(counter.n == 0)
+}
+
+test "a FAILED marker answers 409 IDEMPOTENCY_FAILED" {
+    var svc = idemService()
+    var counter = IdemCounter()
+    var hash = Idempotency.hash("x2")
+    insertIdemRow("idemp_replay_user2", "/test", "key-2", hash, "FAILED")
+    var code = idemRunCode(svc, "idemp_replay_user2", "/test", "key-2", hash, counter)
+    assert(code == "IDEMPOTENCY_FAILED")
+    assert(counter.n == 0)
+}
+
+test "a payload mismatch wins over the marker status" {
+    var svc = idemService()
+    var counter = IdemCounter()
+    insertIdemRow("idemp_replay_user2b", "/test", "key-2b", Idempotency.hash("orig"), "PROCESSING")
+    var code = idemRunCode(svc, "idemp_replay_user2b", "/test", "key-2b", Idempotency.hash("other"), counter)
+    assert(code == "IDEMPOTENCY_PAYLOAD_CONFLICT")
+}
+
+test "a lost insert race falls back to replay of the winner" {
+    var svc = idemService()
+    var counter = IdemCounter()
+    var hash = Idempotency.hash("race")
+    var slow = __kof_spawn_expr(idemSlow(svc, "idemp_replay_user3", "race-key-3", hash, counter))
+    var late = __kof_spawn_expr(idemLate(svc, "idemp_replay_user3", "race-key-3", hash, counter))
+    var first = __kof_await(slow)
+    var second = __kof_await(late)
+    assert(first == "ok:200:{\"ok\":true}")
+    assert(second == "ok:200:{\"ok\":true}")
+    assert(counter.n == 1)
+}
+
+test "a lost insert race with a different payload is a conflict" {
+    var svc = idemService()
+    var counter = IdemCounter()
+    var slow = __kof_spawn_expr(idemSlow(svc, "idemp_replay_user4", "race-key-4", Idempotency.hash("amount=10"), counter))
+    var late = __kof_spawn_expr(idemLate(svc, "idemp_replay_user4", "race-key-4", Idempotency.hash("amount=20"), counter))
+    __kof_await(slow)
+    var second = __kof_await(late)
+    assert(second == "err:IDEMPOTENCY_PAYLOAD_CONFLICT")
+    assert(counter.n == 1)
+}
+
+test "a completed row without response fields replays 200 and an empty object" {
+    var svc = idemService()
+    var counter = IdemCounter()
+    var hash = Idempotency.hash("defaults")
+    insertIdemRow("idemp_replay_user5", "/test", "key-5", hash, "COMPLETED")
+    var reply = idemRun(svc, "idemp_replay_user5", "/test", "key-5", hash, counter, 500, "{\"never\":true}")
+    assert(reply.status() == 200)
+    assert(reply.body() == "{}")
+    assert(counter.n == 0)
+    IdemHolder.app().db().execute("update idempotency_keys set response_status = 201, response_body = ? where user_id = ?", DbParams().bindStr("{\"id\":\"x\"}").bindStr("idemp_replay_user5"))
+    var stored = idemRun(svc, "idemp_replay_user5", "/test", "key-5", hash, counter, 500, "{}")
+    assert(stored.status() == 201)
+    assert(stored.body() == "{\"id\":\"x\"}")
+}
+
+test "a failing action leaves no marker, so a retry with the same key runs" {
+    var svc = idemService()
+    var counter = IdemCounter()
+    var hash = Idempotency.hash("fail-then-retry")
+    var err = ""
+    try {
+        svc.execute("idemp_atomic_user", "POST", "/api/test/atomic", "key-fail", hash, 200, () -> idemFailingAction())
+    } catch (String e) {
+        err = e
+    }
+    assert(err == "action failed")
+    var db = IdemHolder.app().db()
+    assert(db.queryLong("select count(*) from idempotency_keys where user_id = ?", DbParams().bindStr("idemp_atomic_user")) == 0L)
+    assert(db.queryLong("select count(*) from audit_logs where id = ?", DbParams().bindStr("idem_atomic_1")) == 0L)
+    var reply = idemRun(svc, "idemp_atomic_user", "/api/test/atomic", "key-fail", hash, counter, 200, "{}")
+    assert(reply.status() == 200)
+    assert(counter.n == 1)
+}
+
+test "the stored row is COMPLETED with the response and a 24 hour expiry" {
+    var svc = idemService()
+    var counter = IdemCounter()
+    idemRun(svc, "idemp_row_user", "/api/test/row", "key-row", Idempotency.hash("row"), counter, 201, "{\"id\":\"r\"}")
+    var row = IdemHolder.app().db().queryOne("select status, response_status, response_body, created_at, expires_at, completed_at from idempotency_keys where user_id = ?", DbParams().bindStr("idemp_row_user"))
+    assert(row.getStr("status") == "COMPLETED")
+    assert(row.getInt("response_status") == 201)
+    assert(row.getStr("response_body") == "{\"id\":\"r\"}")
+    assert(row.getInstantOrNull("completed_at") != null)
+    var created = Time.toMillis(row.getInstant("created_at"))
+    var expires = Time.toMillis(row.getInstant("expires_at"))
+    assert(expires - created == 86400000L)
+}
+
+test "HTTP: the route helper reads Idempotency-Key and replays" {
+    var app = IdemHolder.app()
+    var before = IdemHolder.runs
+    var missing = app.client.postJson("/idem/echo", "{\"data\":\"a\"}")
+    Check.apiError(missing, 400, "IDEMPOTENCY_KEY_REQUIRED")
+    var headers = listOf("Idempotency-Key: http-key-1")
+    var one = app.client.send("POST", "/idem/echo", headers, "", "{\"data\":\"a\"}")
+    Check.status(one, 201)
+    var two = app.client.send("POST", "/idem/echo", headers, "", "{\"data\":\"a\"}")
+    Check.status(two, 201)
+    assert(one.body == two.body)
+    assert(IdemHolder.runs == before + 1)
+    var other = app.client.send("POST", "/idem/echo", headers, "", "{\"data\":\"b\"}")
+    Check.apiError(other, 409, "IDEMPOTENCY_PAYLOAD_CONFLICT")
+}
