@@ -1,0 +1,29 @@
+import feed.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Port of PublicPostReadTests.
+test "a shared post opens without a session" {
+    var author = FeedTestSupport.user("public_post_author")
+    FeedTestSupport.app().db().execute("update users set username = ? where id = ?", DbParams().bindStr("public-post-author").bindStr("public_post_author"))
+    var postId = FeedFixtures.publish(author, "pp-1", "Post publicado para o link compartilhado")
+    var client = FeedTestSupport.app().client
+    var res = client.get("/feed/posts/" + postId)
+    Check.status(res, 200)
+    Check.jsonEq(res, "id", postId)
+    Check.jsonEq(res, "content", "Post publicado para o link compartilhado")
+    Check.jsonEq(res, "authorUsername", "public-post-author")
+    var reactions = client.get("/feed/posts/" + postId + "/reactions")
+    Check.status(reactions, 200)
+    Check.jsonEq(reactions, "postId", postId)
+    Check.status(client.getWith("/feed/posts/" + postId, FeedTestSupport.read(author)), 200)
+}
+
+test "writing still needs a session" {
+    var author = FeedTestSupport.user("public_post_writer")
+    var postId = FeedFixtures.publish(author, "pp-2", "Post para conferir que escrever exige sessao")
+    var client = FeedTestSupport.app().client
+    var anon = listOf("Idempotency-Key: public-comment", "Content-Type: application/json")
+    Check.status(client.send("POST", "/feed/posts/" + postId + "/comments", anon, "", "{\"content\":\"comentario anonimo\"}"), 401)
+    Check.status(client.send("POST", "/feed/posts/" + postId + "/shares", listOf("Idempotency-Key: public-share"), "", ""), 401)
+}
