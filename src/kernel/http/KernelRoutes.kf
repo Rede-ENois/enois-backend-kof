@@ -1,0 +1,58 @@
+package kernel.http
+
+import java.time.Duration
+import java.time.Instant
+import kernel.config.*
+import kernel.db.*
+
+// GET /health -> {"status":"UP"} (OperationalController).
+record HealthView(String status)
+
+// GET /version (VersionController), public shape.
+record VersionView(String version, String? artefato, String status)
+
+record VersionMedia(String storage, String uploads)
+
+record VersionFlyway(Int aplicadas, Int pendentes, Int falhadas, String ultima)
+
+// Same endpoint with the diagnostics token (header X-Version-Details == REDE_VERSION_DETAILS_TOKEN).
+record VersionDetailsView(String version, String? artefato, String bootEm, Long uptimeSegundos, VersionMedia midia, VersionFlyway flyway)
+
+// The operational routes every deployment answers. Version comes from APP_VERSION (default
+// "desconhecida"), build time from APP_BUILD_TIME (optional).
+class KernelRoutes {
+    static register(server: HttpServer, cfg: Config, migrations: MigrationSummary) {
+        var startedAt = Instant.now()
+        var version = cfg.getStr("APP_VERSION", "desconhecida")
+        var built = cfg.lookup("APP_BUILD_TIME")
+        var token = cfg.getStr("REDE_VERSION_DETAILS_TOKEN", "")
+        var storage = cfg.getStr("REDE_MEDIA_STORAGE", "imagekit")
+        server.get("/health", () -> json.encode(HealthView("UP")))
+        server.get("/version", () -> KernelRoutes.versionBody(version, built, token, storage, startedAt, migrations))
+    }
+    static String versionBody(version: String, built: String?, token: String, storage: String, startedAt: Instant, migrations: MigrationSummary) {
+        var provided = Req.headerOrNull("x-version-details")
+        var allowed = token.length() > 0 && provided != null && KernelRoutes.constantTimeEquals(token, provided)
+        if (!allowed) {
+            return json.encode(VersionView(version, built, "UP"))
+        }
+        var uptime = Duration.between(startedAt, Instant.now()).toSeconds()
+        var media = VersionMedia(storage, "indisponivel")
+        var fw = VersionFlyway(migrations.applied(), migrations.pending(), migrations.failed(), migrations.last())
+        return json.encode(VersionDetailsView(version, built, startedAt.toString(), uptime, media, fw))
+    }
+    static Bool constantTimeEquals(a: String, b: String) {
+        if (a.length() != b.length()) {
+            return false
+        }
+        var diff = 0
+        var i = 0
+        while (i < a.length()) {
+            if (a.substring(i, i + 1) != b.substring(i, i + 1)) {
+                diff = diff + 1
+            }
+            i = i + 1
+        }
+        return diff == 0
+    }
+}

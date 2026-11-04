@@ -1,0 +1,127 @@
+package kernel.http
+
+import java.lang.Class
+import java.lang.ThreadLocal
+import java.util.HashMap
+import kernel.error.*
+
+// Request helpers for handlers and filters. Names avoid the web runtime's own context functions
+// (param, query, header, body, method, path), which stay available unqualified.
+class Req {
+    static ClientIp resolver = ClientIp("", "")
+    // Installed by HttpServer.
+    static useResolver(r: ClientIp) {
+        Req.resolver = r
+    }
+    static String bodyText() {
+        var b = body()
+        if (b == null) {
+            return ""
+        }
+        return b
+    }
+    static String pathParam(name: String) = param(name)
+    static String queryStr(name: String, fallback: String) {
+        var v = query(name)
+        if (v == null) {
+            return fallback
+        }
+        return v
+    }
+    // Absent -> fallback. Malformed -> 400 BAD_REQUEST (Spring MethodArgumentTypeMismatchException).
+    static Int queryInt(name: String, fallback: Int) {
+        var v = query(name)
+        if (v == null) {
+            return fallback
+        }
+        if (v.trim().length() == 0) {
+            return fallback
+        }
+        try {
+            return v.trim().toInt()
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static Long queryLong(name: String, fallback: Long) {
+        var v = query(name)
+        if (v == null) {
+            return fallback
+        }
+        if (v.trim().length() == 0) {
+            return fallback
+        }
+        try {
+            return v.trim().toLong()
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static Bool queryBool(name: String, fallback: Bool) {
+        var v = query(name)
+        if (v == null) {
+            return fallback
+        }
+        if (v.trim().length() == 0) {
+            return fallback
+        }
+        var t = v.trim().toLowerCase()
+        if (t == "true") {
+            return true
+        }
+        if (t == "false") {
+            return false
+        }
+        throw Errors.badRequest()
+    }
+    // Header value or null; names are case-insensitive.
+    static String? headerOrNull(name: String) = header(name)
+    // Parsed Cookie header (first occurrence wins).
+    static Map<String,String> cookies() {
+        var out = new HashMap<String, String>()
+        var raw = header("cookie")
+        if (raw == null) {
+            return out
+        }
+        for (var part in raw.split(";")) {
+            var eq = part.indexOf("=")
+            if (eq > 0) {
+                var k = part.substring(0, eq).trim()
+                var v = part.substring(eq + 1).trim()
+                if (!out.containsKey(k)) {
+                    out.put(k, v)
+                }
+            }
+        }
+        return out
+    }
+    static String? cookie(name: String) = Req.cookies().get(name)
+    // Bearer token of `Authorization: Bearer <token>`, or null.
+    static String? bearerToken() {
+        var h = header("authorization")
+        if (h == null) {
+            return null
+        }
+        if (h.length() > 7 && h.substring(0, 7).toLowerCase() == "bearer ") {
+            return h.substring(7).trim()
+        }
+        return null
+    }
+    // The TCP peer of the current request (the runtime does not expose it, see KOF_GAPS G14).
+    static String peerAddress() {
+        try {
+            var c = Class.forName("dev.kof.runtime.KofRuntime")
+            var f = c.getDeclaredField("KOF_WEB_REQUEST")
+            f.setAccessible(true)
+            var tl = f.get(null) as ThreadLocal
+            var req = tl.get()
+            var rf = req.getClass().getDeclaredField("remoteAddr")
+            rf.setAccessible(true)
+            return rf.get(req).toString()
+        } catch (String e) {
+            return ""
+        }
+    }
+    // Client IP with the ClientIpResolver rules (TRUSTED_PROXY_IPS, Cloudflare).
+    static String clientIp() = Req.resolver.resolve(Req.peerAddress(), header("x-forwarded-for"), header("cf-connecting-ip"))
+}

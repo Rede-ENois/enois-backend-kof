@@ -1,0 +1,105 @@
+package kernel.http
+
+import java.lang.System
+import java.lang.ThreadLocal
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+
+// Response cookies. The web runtime keeps response headers in a map keyed by name, so a second
+// `headerSet("Set-Cookie", ...)` overwrites the first (KOF_GAPS G13). Cookies are therefore emitted
+// under case variants of the header name (`Set-Cookie`, `set-Cookie`, ...), which HTTP treats as
+// the same header and the server writes as separate lines.
+class Cookies {
+    static ThreadLocal count = new ThreadLocal()
+    // Called by the HttpServer at the start of every request.
+    static reset() {
+        count.set("0")
+    }
+    // Set-Cookie line in the format of Spring's ResponseCookie.toString():
+    // name=value; Path=/; Max-Age=N; Expires=...; Secure; HttpOnly; SameSite=Lax
+    static String build(name: String, value: String, maxAgeSeconds: Long, httpOnly: Bool, secure: Bool, sameSite: String, path: String) {
+        var age = maxAgeSeconds
+        if (age < 0L) {
+            age = 0L
+        }
+        var line = name + "=" + value + "; Path=" + path + "; Max-Age=" + age
+        var expires = Instant.ofEpochMilli(System.currentTimeMillis() + age * 1000L).toString()
+        line = line + "; Expires=" + Cookies.rfc1123(expires)
+        if (secure) {
+            line = line + "; Secure"
+        }
+        if (httpOnly) {
+            line = line + "; HttpOnly"
+        }
+        if (sameSite.length() > 0) {
+            line = line + "; SameSite=" + sameSite
+        }
+        return line
+    }
+    // `Wed, 04 Nov 2026 19:30:00 GMT`
+    static String rfc1123(iso: String) {
+        var z = ZonedDateTime.ofInstant(Instant.parse(iso), ZoneOffset.UTC)
+        return DateTimeFormatter.ofPattern("EEE, dd MMM yyyy HH:mm:ss \'GMT\'", Locale.US).format(z)
+    }
+    // Adds one Set-Cookie header to the current response.
+    static add(line: String) {
+        var n = 0
+        var current = count.get()
+        if (current != null) {
+            n = current.toString().toInt()
+        }
+        headerSet(Cookies.headerName(n), line)
+        count.set("" + (n + 1))
+    }
+    // Convenience: session-style cookie (HttpOnly, Path=/).
+    static set(name: String, value: String, maxAgeSeconds: Long, secure: Bool, sameSite: String) {
+        Cookies.add(Cookies.build(name, value, maxAgeSeconds, true, secure, sameSite, "/"))
+    }
+    // Deletes a cookie (Max-Age=0).
+    static clear(name: String, secure: Bool, sameSite: String) {
+        Cookies.add(Cookies.build(name, "", 0L, true, secure, sameSite, "/"))
+    }
+    // n-th case variant of "Set-Cookie": n = 0 is the canonical spelling.
+    static String headerName(n: Int) {
+        var base = "Set-Cookie"
+        var out = ""
+        var bit = 0
+        var i = 0
+        while (i < base.length()) {
+            var c = base.substring(i, i + 1)
+            if (c == "-") {
+                out = out + c
+            }
+            else {
+                var flip = n / Cookies.pow2(bit) % 2 == 1
+                var upperNow = c == c.toUpperCase()
+                if (flip) {
+                    if (upperNow) {
+                        out = out + c.toLowerCase()
+                    }
+                    else {
+                        out = out + c.toUpperCase()
+                    }
+                }
+                else {
+                    out = out + c
+                }
+                bit = bit + 1
+            }
+            i = i + 1
+        }
+        return out
+    }
+    static Int pow2(k: Int) {
+        var r = 1
+        var i = 0
+        while (i < k) {
+            r = r * 2
+            i = i + 1
+        }
+        return r
+    }
+}

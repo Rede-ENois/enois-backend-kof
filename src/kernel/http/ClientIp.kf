@@ -1,0 +1,169 @@
+package kernel.http
+
+import java.net.InetAddress
+import java.util.ArrayList
+import kernel.config.*
+
+// Mirror of shared ClientIpResolver. Forwarding headers count only when the immediate peer is a
+// trusted proxy (loopback, private ranges, or TRUSTED_PROXY_IPS). The X-Forwarded-For chain is read
+// right to left skipping trusted hops; CF-Connecting-IP is honoured only when that hop is a
+// Cloudflare edge. No other client header is ever read.
+class ClientIp {
+    List<String> trusted
+    List<String> cloudflare
+    public constructor(trustedProxyIps: String, cloudflareIps: String) {
+        this.trusted = ClientIp.splitList(trustedProxyIps)
+        this.cloudflare = ClientIp.splitList(cloudflareIps)
+    }
+    static String cloudflareRanges() = "173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,104.24.0.0/14,172.64.0.0/13,131.0.72.0/22,2400:cb00::/32,2606:4700::/32,2803:f800::/32,2405:b500::/32,2405:8100::/32,2a06:98c0::/29,2c0f:f248::/32"
+    static ClientIp fromConfig(cfg: Config) = ClientIp(cfg.getStr("TRUSTED_PROXY_IPS", ""), cfg.getStr("SECURITY_CLOUDFLARE_IPS", ClientIp.cloudflareRanges()))
+    static List<String> splitList(value: String) {
+        var out = listOf<String>()
+        for (var part in value.split(",")) {
+            var t = part.trim()
+            if (t.length() > 0) {
+                out.add(t)
+            }
+        }
+        return out
+    }
+    // `remote` is the TCP peer; the headers are null when absent.
+    String resolve(remote: String, forwardedFor: String?, cfConnectingIp: String?) {
+        if (!isTrustedProxy(remote)) {
+            if (plausible(remote)) {
+                return remote.trim()
+            }
+            return "desconhecido"
+        }
+        if (forwardedFor != null && forwardedFor.trim().length() > 0) {
+            var candidate = clientHop(forwardedFor)
+            if (plausible(candidate)) {
+                if (cfConnectingIp != null && plausible(cfConnectingIp) && inRanges(cloudflare, candidate)) {
+                    return cfConnectingIp.trim()
+                }
+                return candidate
+            }
+        }
+        if (plausible(remote)) {
+            return remote.trim()
+        }
+        return "desconhecido"
+    }
+    Bool isTrustedProxy(ip: String) {
+        if (ip.trim().length() == 0) {
+            return false
+        }
+        var value = ip.trim().toLowerCase()
+        if (value.startsWith("::ffff:")) {
+            value = value.substring(7)
+        }
+        return ClientIp.isBuiltInTrusted(value) || inRanges(trusted, value)
+    }
+    static Bool isBuiltInTrusted(value: String) {
+        if (value == "127.0.0.1" || value == "::1" || value == "0:0:0:0:0:0:0:1") {
+            return true
+        }
+        if (value.startsWith("10.") || value.startsWith("192.168.") || value.startsWith("169.254.")) {
+            return true
+        }
+        if (value.startsWith("172.")) {
+            var parts = value.split("\\.")
+            if (parts.length > 1 && ClientIp.isDigits(parts[1])) {
+                var second = parts[1].toInt()
+                return second >= 16 && second <= 31
+            }
+            return false
+        }
+        return value.startsWith("fc") || value.startsWith("fd") || value.startsWith("fe80:")
+    }
+    static Bool isDigits(s: String) {
+        if (s.length() == 0) {
+            return false
+        }
+        return s.matches("[0-9]+")
+    }
+    String clientHop(header: String) {
+        var hops = header.split(",")
+        var i = hops.length - 1
+        while (i >= 0) {
+            var hop = hops[i].trim()
+            i = i - 1
+            if (!plausible(hop)) {
+                continue
+            }
+            if (isTrustedProxy(hop)) {
+                continue
+            }
+            return hop
+        }
+        return ""
+    }
+    Bool plausible(value: String) {
+        if (value.length() == 0 || value.length() > 45) {
+            return false
+        }
+        if (value.trim().length() != value.length() || value.contains(" ")) {
+            return false
+        }
+        return value.matches("[0-9a-fA-F:.]{3,}")
+    }
+    static Bool inRanges(ranges: List<String>, ip: String) {
+        var address = ClientIp.literal(ip)
+        if (address == null) {
+            return false
+        }
+        for (var range in ranges) {
+            if (ClientIp.cidrContains(range, address)) {
+                return true
+            }
+        }
+        return false
+    }
+    static List<Int>? literal(ip: String) {
+        var value = ip.trim()
+        var ipv4 = value.matches("\\d{1,3}(\\.\\d{1,3}){3}")
+        if (!ipv4 && !(value.contains(":") && value.matches("[0-9a-fA-F:.]+"))) {
+            return null
+        }
+        var out = listOf<Int>()
+        try {
+            var bytes = InetAddress.getByName(value).getAddress()
+            var i = 0
+            while (i < bytes.length) {
+                out.add(bytes[i] & 255)
+                i = i + 1
+            }
+        } catch (String e) {
+            return null
+        }
+        return out
+    }
+    static Bool cidrContains(range: String, address: List<Int>) {
+        var slash = range.indexOf("/")
+        var base = ClientIp.literal(if (slash < 0) range else range.substring(0, slash))
+        if (base == null) {
+            throw "CONFIG_INVALID: invalid IP/CIDR in proxy configuration: " + range
+        }
+        if (base.size() != address.size()) {
+            return false
+        }
+        var prefix = base.size() * 8
+        if (slash >= 0) {
+            prefix = range.substring(slash + 1).trim().toInt()
+        }
+        var full = prefix / 8
+        var i = 0
+        while (i < full) {
+            if (address.get(i) != base.get(i)) {
+                return false
+            }
+            i = i + 1
+        }
+        var rest = prefix % 8
+        if (rest == 0) {
+            return true
+        }
+        var mask = 255 << 8 - rest & 255
+        return (address.get(full) & mask) == (base.get(full) & mask)
+    }
+}

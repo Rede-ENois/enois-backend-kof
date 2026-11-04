@@ -1,0 +1,210 @@
+package kernel.http
+
+import kernel.config.*
+import kernel.error.*
+import kernel.log.*
+
+// A filter of the ordered middleware chain. Lower `order` runs first.
+class HttpFilter {
+    Int order
+    String name
+    () -> String run
+    public constructor(order: Int, name: String, run: () -> String) {
+        this.order = order
+        this.name = name
+        this.run = run
+    }
+}
+
+// One registered route (method + pattern with `:param` segments), used for the unknown-route
+// fallback and the 405 answer.
+record HttpRoute(String method, String pattern)
+
+// Thin layer over web.app():
+//   - route helpers wrap every handler so a thrown ApiError (or any String) becomes the JSON error;
+//   - every route is also served under the `/v1` alias (Java V1AliasFilter: /api/v1/* == /api/*,
+//     the gateway strips /api, and Kof middleware cannot rewrite the path);
+//   - one ordered filter chain; built-ins sit at Http.orderFallback() (unknown path -> 200 empty)
+//     and Http.orderMethod() (known path, wrong method -> 405).
+class HttpServer {
+    kof.web.App app
+    List<HttpFilter> filters = listOf<HttpFilter>()
+    List<HttpRoute> routes = listOf<HttpRoute>()
+    Log log = Log("kernel.http")
+    public constructor() {
+        this.app = web.app()
+    }
+    static Int orderFallback() = -1000
+    static Int orderMethod() = 1000
+    // Registers a filter. A filter returns Http.next() to continue, or a response
+    // (Http.respond(status, body) / Http.blank()), or throws an ApiError.
+    use(name: String, order: Int, run: () -> String) {
+        filters.add(HttpFilter(order, name, run))
+    }
+    get(path: String, handler: () -> String) {
+        add("GET", path, handler)
+    }
+    post(path: String, handler: () -> String) {
+        add("POST", path, handler)
+    }
+    put(path: String, handler: () -> String) {
+        add("PUT", path, handler)
+    }
+    patch(path: String, handler: () -> String) {
+        add("PATCH", path, handler)
+    }
+    delete(path: String, handler: () -> String) {
+        add("DELETE", path, handler)
+    }
+    add(method: String, path: String, handler: () -> String) {
+        register(method, path, handler)
+        register(method, "/v1" + path, handler)
+    }
+    register(method: String, path: String, handler: () -> String) {
+        routes.add(HttpRoute(method, path))
+        if (method == "GET") {
+            app.get(path, () -> guarded(handler))
+        }
+        else 
+            if (method == "POST") {
+                app.post(path, () -> guarded(handler))
+            }
+            else 
+                if (method == "PUT") {
+                    app.put(path, () -> guarded(handler))
+                }
+                else 
+                    if (method == "PATCH") {
+                        app.patch(path, () -> guarded(handler))
+                    }
+                    else 
+                        if (method == "DELETE") {
+                            app.delete(path, () -> guarded(handler))
+                        }
+                        else {
+                            throw "unsupported method " + method
+                        }
+    }
+    String guarded(handler: () -> String) {
+        try {
+            return handler()
+        } catch (String e) {
+            return Http.render(e)
+        }
+    }
+    // True when some route has this path (any method).
+    Bool knowsPath(p: String) {
+        for (var r in routes) {
+            if (HttpServer.matches(r.pattern(), p)) {
+                return true
+            }
+        }
+        return false
+    }
+    Bool knowsMethod(m: String, p: String) {
+        for (var r in routes) {
+            if (r.method() == m && HttpServer.matches(r.pattern(), p)) {
+                return true
+            }
+        }
+        return false
+    }
+    // `/users/:id` matches `/users/7` (a segment is never empty); `/users/` does not match.
+    static Bool matches(pattern: String, p: String) {
+        var a = pattern.split("/")
+        var b = p.split("/")
+        if (p.endsWith("/") || pattern.endsWith("/")) {
+            return pattern == p
+        }
+        if (a.length != b.length) {
+            return false
+        }
+        var i = 0
+        while (i < a.length) {
+            if (a[i].startsWith(":")) {
+                if (b[i].length() == 0) {
+                    return false
+                }
+            }
+            else 
+                if (a[i] != b[i]) {
+                    return false
+                }
+            i = i + 1
+        }
+        return true
+    }
+    // Filters sorted by order (stable).
+    List<HttpFilter> ordered() {
+        var all = listOf<HttpFilter>()
+        for (var f in filters) {
+            all.add(f)
+        }
+        var i = 1
+        while (i < all.size()) {
+            var cur = all.get(i)
+            var j = i - 1
+            while (j >= 0 && all.get(j).order > cur.order) {
+                all.set(j + 1, all.get(j))
+                j = j - 1
+            }
+            all.set(j + 1, cur)
+            i = i + 1
+        }
+        return all
+    }
+    // Installs the dispatcher as the single web middleware. Call after every route and filter is
+    // registered, right before listen.
+    install(cfg: Config) {
+        Req.useResolver(ClientIp.fromConfig(cfg))
+        var server = this
+        use("fallback-surface", HttpServer.orderFallback(), () -> server.fallbackFilter())
+        use("method-not-allowed", HttpServer.orderMethod(), () -> server.methodFilter())
+        var chain = ordered()
+        app.use(() -> {
+    Cookies.reset()
+    try {
+        for (var f in chain) {
+            var step = f.run
+            var r = step()
+            if (r != Http.next()) {
+                return r
+            }
+        }
+        return null
+    } catch (String e) {
+        return Http.render(e)
+    }
+})
+    }
+    String fallbackFilter() {
+        if (knowsPath(path())) {
+            return Http.next()
+        }
+        return Http.blank()
+    }
+    String methodFilter() {
+        if (knowsMethod(method(), path())) {
+            return Http.next()
+        }
+        return Http.methodNotAllowed()
+    }
+    // Blocks serving on `port`.
+    listen(port: Int) {
+        app.listen(port)
+    }
+    // Serves in the background on `port` (0 = ephemeral) and returns the bound port.
+    Int listenAsync(port: Int) {
+        var running = __kof_spawn_expr(app.listen(port))
+        var i = 0
+        while (i < 200 && app.port() <= 0) {
+            time.sleep(25)
+            i = i + 1
+        }
+        return app.port()
+    }
+    Int port() = app.port()
+    close() {
+        app.close()
+    }
+}

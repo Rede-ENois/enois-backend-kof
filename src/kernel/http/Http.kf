@@ -1,0 +1,52 @@
+package kernel.http
+
+import java.time.Instant
+import kernel.error.*
+import kernel.log.*
+
+// {"code","message","timestamp"}: the Java ErrorResponse record as Jackson writes it.
+record HttpErrorBody(String code, String message, String timestamp)
+
+// The Java ApiResponse<T> error member.
+record ApiResponseError(String code, String message)
+
+class Http {
+    // Returned by a filter to let the request continue to the next filter / the route.
+    static String next() = "__kernel_next__"
+    // Filter/handler helper: respond with a status and a body.
+    static String respond(code: Int, bodyText: String) = status(code, bodyText)
+    // Body of an error response: {"code","message","timestamp"} (timestamp is Instant.now().toString(),
+    // like Jackson writes java.time.Instant).
+    static String errorJson(code: String, message: String) = json.encode(HttpErrorBody(code, message, Instant.now().toString()))
+    // Renders a thrown String like GlobalExceptionHandler: ApiError -> its status/code/message
+    // (+ Retry-After); anything else -> 500 INTERNAL_ERROR "Erro interno inesperado." and an ERROR log.
+    static String render(thrown: String) {
+        var err = Errors.parse(thrown)
+        if (!Errors.isApi(thrown)) {
+            Log("kernel.http").error("unhandled_exception " + thrown)
+        }
+        else 
+            if (err.status() >= 500) {
+                Log("kernel.http").error("api_error status=" + err.status() + " code=" + err.code() + " message=" + err.message())
+            }
+        if (err.retryAfterSeconds() > 0L) {
+            headerSet("Retry-After", "" + err.retryAfterSeconds())
+        }
+        return status(err.status(), Http.errorJson(err.code(), err.message()))
+    }
+    // Spring 404/405 bodies for the paths the router knows.
+    static String notFound() = status(404, Http.errorJson("NOT_FOUND", "Recurso nao encontrado."))
+    static String methodNotAllowed() = status(405, Http.errorJson("METHOD_NOT_ALLOWED", "Metodo nao suportado para este recurso."))
+    // Anti-enumeration answer for paths outside the surface: 200 and an empty body.
+    static String blank() = status(200, "")
+}
+
+// ApiResponse<T> envelope, @JsonInclude(NON_NULL): success -> {"success":true,"data":...,"timestamp":...},
+// failure -> {"success":false,"error":{"code","message"},"timestamp":...}.
+// (Kof has no static generics on classes, so these are top-level functions.)
+apiSuccess<T>(data: T): String = "{\"success\":true,\"data\":" + json.encode(data) + ",\"timestamp\":" + json.encode(Instant.now().toString()) + "}"
+
+// ApiResponse.success(null): the data member is omitted.
+String apiSuccessEmpty() = "{\"success\":true,\"timestamp\":" + json.encode(Instant.now().toString()) + "}"
+
+String apiFailure(code: String, message: String) = "{\"success\":false,\"error\":" + json.encode(ApiResponseError(code, message)) + ",\"timestamp\":" + json.encode(Instant.now().toString()) + "}"

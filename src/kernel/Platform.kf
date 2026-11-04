@@ -1,0 +1,52 @@
+package kernel
+
+import kernel.config.*
+import kernel.db.*
+import kernel.http.*
+import kernel.log.*
+
+// The wired platform: config, pool, migrated schema and an HttpServer with the kernel routes.
+// Main.kf (and tests) create it, register domain routes on `server`, then start it.
+//
+//   var platform = Platform.create(Config.env())
+//   FeedRoutes.register(platform.server, platform.db)
+//   platform.start(8081)
+class Platform {
+    Config cfg
+    Db db
+    HttpServer server
+    MigrationSummary migrations
+    public constructor(cfg: Config, db: Db, server: HttpServer, migrations: MigrationSummary) {
+        this.cfg = cfg
+        this.db = db
+        this.server = server
+        this.migrations = migrations
+    }
+    // Config -> datasource -> Flyway -> server + /health + /version. Fails fast (throws a String)
+    // on missing/invalid configuration or a failed migration.
+    static Platform create(cfg: Config) {
+        var url = DbSettings.url(cfg)
+        var user = DbSettings.user(cfg)
+        var password = DbSettings.password(cfg)
+        var db = Db.connect(url, user, password, DbSettings.poolMax(cfg), DbSettings.poolMinIdle(cfg))
+        var summary = Migrations.migrate(cfg, url, user, password)
+        Log("kernel.platform").info("migrations applied=" + summary.applied() + " pending=" + summary.pending() + " failed=" + summary.failed())
+        var server = HttpServer()
+        KernelRoutes.register(server, cfg, summary)
+        return Platform(cfg, db, server, summary)
+    }
+    // Installs the filter chain and serves on `port` (blocking).
+    start(port: Int) {
+        server.install(cfg)
+        server.listen(port)
+    }
+    // Same, in the background; returns the bound port (0 = ephemeral).
+    Int startAsync(port: Int) {
+        server.install(cfg)
+        return server.listenAsync(port)
+    }
+    stop() {
+        server.close()
+        db.close()
+    }
+}
