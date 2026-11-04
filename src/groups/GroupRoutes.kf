@@ -1,0 +1,250 @@
+package groups
+
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+import kernel.time.*
+
+// Endpoints of the groups (GroupController).
+//
+// The public read answers ONLY the presentation of the group (name, description, visual identity, join
+// mode): never posts, members or internal topics. Whoever is not a member sees joined=false and
+// viewerRole=null and nothing else, even knowing the id.
+class GroupRoutes {
+    GroupService groups
+    GroupProfileLookup profiles
+    Idempotency idem
+    public constructor(groups: GroupService, profiles: GroupProfileLookup, idem: Idempotency) {
+        this.groups = groups
+        this.profiles = profiles
+        this.idem = idem
+    }
+    static register(server: HttpServer, routes: GroupRoutes) {
+        server.get("/groups", () -> routes.list())
+        server.get("/groups/:groupId", () -> routes.show())
+        server.post("/groups", () -> routes.create())
+        server.patch("/groups/:groupId", () -> routes.update())
+        server.post("/groups/:groupId/join", () -> routes.join())
+        server.delete("/groups/:groupId/members/me", () -> routes.leave())
+        server.get("/groups/:groupId/members", () -> routes.members())
+        server.delete("/groups/:groupId/members/:memberId", () -> routes.removeMember())
+        server.get("/groups/:groupId/requests", () -> routes.requests())
+        server.post("/groups/:groupId/requests/:requestId/approve", () -> routes.decide(true))
+        server.post("/groups/:groupId/requests/:requestId/reject", () -> routes.decide(false))
+        server.post("/groups/:groupId/transfer", () -> routes.transfer())
+        server.post("/groups/:groupId/status", () -> routes.changeStatus())
+        server.post("/groups/:groupId/close", () -> routes.close())
+    }
+    // Cursor of a page: the createdAt of the last item, ISO-8601. A malformed one is 400 INVALID_CURSOR.
+    static String? cursor() {
+        var raw = Req.queryStr("cursor", "")
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        try {
+            var ignored = Time.toMillis(raw)
+        } catch (String e) {
+            throw Errors.api(400, "INVALID_CURSOR", "Cursor invalido.")
+        }
+        return raw
+    }
+    static GroupBody parseGroup() {
+        try {
+            return json.decode<GroupBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String? parseJoinMode(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        if (raw == "OPEN" || raw == "APPROVAL") {
+            return raw
+        }
+        // Jackson refuses an unknown enum constant: 400.
+        throw Errors.badRequest()
+    }
+    String list() {
+        var viewer = Auth.viewerIdOrNull()
+        var before = GroupRoutes.cursor()
+        var limit = Req.queryInt("limit", 20)
+        var found = groups.list(Req.queryStr("query", ""), before, limit)
+        var items = listOf<GroupView>()
+        for (var g in found) {
+            items.add(this.view(g, viewer))
+        }
+        var next = GroupNil.str()
+        if (found.size() == limit) {
+            next = found.get(found.size() - 1).createdAt()
+        }
+        return json.encode(GroupViewPage(items, next))
+    }
+    String show() {
+        var viewer = Auth.viewerIdOrNull()
+        return json.encode(this.view(groups.resolve(Req.pathParam("groupId")), viewer))
+    }
+    String create() {
+        var user = Auth.requireUser()
+        var body = GroupRoutes.parseGroup()
+        var mode = GroupRoutes.parseJoinMode(body.joinMode())
+        var hash = Idempotency.hash(Req.bodyText())
+        return idem.handle(user, "POST", "/api/groups", hash, 201, () -> {
+    var group = groups.create(body.name(), body.description(), body.topic(), body.avatar(), body.banner(), mode, user)
+    return json.encode(this.view(group, user))
+})
+    }
+    String update() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var body = GroupRoutes.parseGroup()
+        var mode = GroupRoutes.parseJoinMode(body.joinMode())
+        var hash = Idempotency.hash(groupId + "|" + Req.bodyText())
+        return idem.handle(user, "PATCH", "/api/groups/{groupId}", hash, 200, () -> {
+    var group = groups.update(groupId, body.name(), body.description(), body.topic(), body.avatar(), body.banner(), body.bannerHtml(), mode, user)
+    return json.encode(this.view(group, user))
+})
+    }
+    String join() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var hash = Idempotency.hash("join|" + groupId)
+        return idem.handle(user, "POST", "/api/groups/{groupId}/join", hash, 200, () -> json.encode(GroupOutcomeView(groups.join(groupId, user))))
+    }
+    String leave() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var hash = Idempotency.hash("leave|" + groupId)
+        return idem.handle(user, "DELETE", "/api/groups/{groupId}/members/me", hash, 200, () -> {
+    groups.leave(groupId, user)
+    return json.encode(GroupStatusView(groupId, "LEFT"))
+})
+    }
+    String members() {
+        var user = Auth.requireUser()
+        var found = groups.listMembers(Req.pathParam("groupId"), user)
+        var authors = profiles.findAll(found.map((m: GroupMemberRow) -> m.userId()))
+        var items = listOf<GroupMemberView>()
+        for (var m in found) {
+            items.add(GroupRoutes.memberView(m, authors.get(m.userId())))
+        }
+        return json.encode(GroupMemberPage(items, null))
+    }
+    String removeMember() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var memberId = Req.pathParam("memberId")
+        var hash = Idempotency.hash("remove|" + groupId + "|" + memberId)
+        return idem.handle(user, "DELETE", "/api/groups/{groupId}/members/{memberId}", hash, 200, () -> {
+    groups.removeMember(groupId, user, memberId)
+    return json.encode(GroupStatusView(memberId, "REMOVED"))
+})
+    }
+    String requests() {
+        var user = Auth.requireUser()
+        var found = groups.listPendingRequests(Req.pathParam("groupId"), user)
+        var authors = profiles.findAll(found.map((r: GroupJoinRow) -> r.userId()))
+        var items = listOf<GroupRequestView>()
+        for (var r in found) {
+            items.add(GroupRoutes.requestView(r, authors.get(r.userId())))
+        }
+        return json.encode(GroupRequestPage(items, null))
+    }
+    String decide(approve: Bool) {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var requestId = Req.pathParam("requestId")
+        var action = "reject"
+        if (approve) {
+            action = "approve"
+        }
+        var hash = Idempotency.hash(action + "|" + groupId + "|" + requestId)
+        return idem.handle(user, "POST", "/api/groups/{groupId}/requests/{requestId}/" + action, hash, 200, () -> json.encode(GroupOutcomeView(groups.decideRequest(groupId, requestId, user, approve).status())))
+    }
+    String transfer() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var body = GroupRoutes.parseTransfer()
+        var target = GroupRoutes.requireTarget(body)
+        var hash = Idempotency.hash(groupId + "|" + Req.bodyText())
+        return idem.handle(user, "POST", "/api/groups/{groupId}/transfer", hash, 200, () -> {
+    groups.transferOwnership(groupId, user, target)
+    return json.encode(GroupStatusView(target, "OWNER"))
+})
+    }
+    static GroupTransferBody parseTransfer() {
+        try {
+            return json.decode<GroupTransferBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    // Java passes a null target to the service, which answers NOT_MEMBER; an absent userId finds nobody.
+    static String requireTarget(body: GroupTransferBody) {
+        var target = body.userId()
+        if (target == null) {
+            return ""
+        }
+        return target
+    }
+    // Platform admin only: restricted, suspended or reactivation; the decision goes to the audit.
+    String changeStatus() {
+        var user = Auth.requireUser()
+        Auth.requireAdmin()
+        var groupId = Req.pathParam("groupId")
+        var body = GroupRoutes.parseStatusBody()
+        var status = GroupRoutes.parseStatus(body.status())
+        var hash = Idempotency.hash(groupId + "|" + Req.bodyText())
+        return idem.handle(user, "POST", "/api/groups/{groupId}/status", hash, 200, () -> {
+    var group = groups.changeStatus(groupId, status, body.reason(), user)
+    return json.encode(this.view(group, user))
+})
+    }
+    static GroupStatusBody parseStatusBody() {
+        try {
+            return json.decode<GroupStatusBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String parseStatus(raw: String?) {
+        var upper = ""
+        if (raw != null) {
+            upper = raw.trim().toUpperCase()
+        }
+        if (!GroupStatuses.valid(upper)) {
+            throw Errors.api(400, "INVALID_STATUS", "Estado desconhecido.")
+        }
+        return upper
+    }
+    String close() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var hash = Idempotency.hash("close|" + groupId)
+        return idem.handle(user, "POST", "/api/groups/{groupId}/close", hash, 200, () -> json.encode(this.view(groups.close(groupId, user), user)))
+    }
+    GroupView view(group: GroupRow, viewer: String?) {
+        var role = GroupNil.str()
+        var pending = false
+        if (viewer != null) {
+            role = groups.roleOf(group.id(), viewer)
+            if (role == null) {
+                pending = groups.hasPendingRequest(group.id(), viewer)
+            }
+        }
+        return GroupView(group.id(), group.slug(), group.name(), group.description(), group.topic(), group.avatar(), group.banner(), group.bannerHtml(), group.joinMode(), group.status(), groups.countMembers(group.id()), role, role != null, pending, group.createdAt())
+    }
+    static GroupMemberView memberView(m: GroupMemberRow, author: GroupAuthor?) {
+        if (author == null) {
+            return GroupMemberView(m.userId(), null, null, null, m.role(), m.joinedAt(), null)
+        }
+        return GroupMemberView(m.userId(), author.username(), author.name(), author.avatar(), m.role(), m.joinedAt(), author.nameStyle())
+    }
+    static GroupRequestView requestView(r: GroupJoinRow, author: GroupAuthor?) {
+        if (author == null) {
+            return GroupRequestView(r.id(), r.userId(), null, null, null, r.message(), r.createdAt(), null)
+        }
+        return GroupRequestView(r.id(), r.userId(), author.username(), author.name(), author.avatar(), r.message(), r.createdAt(), author.nameStyle())
+    }
+}
