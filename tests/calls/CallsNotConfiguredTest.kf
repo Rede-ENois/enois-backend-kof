@@ -1,0 +1,34 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import calls.*
+import messaging.*
+import notifications.*
+
+class CallsCfgHolder {
+    static TestApp? cached = null
+}
+
+TestApp callsApp() {
+    var cur = CallsCfgHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = DomainTestKit.boot("callscfg", mapOf<String, String>(), (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+    var notifications = NotificationsModule.install(p, s, SecurityHooks(), parts)
+    var messaging = MessagingModule.install(p, s, SecurityHooks(), parts, notifications)
+    CallsModule.install(p, s, SecurityHooks(), parts, notifications, messaging)
+})
+    CallsCfgHolder.cached = created
+    return created
+}
+
+test "without an address a call does not start and nothing is opened" {
+    var app = callsApp()
+    var a = DomainTestKit.loginAdult(app, "call-cfg-a")
+    DomainTestKit.loginAdult(app, "call-cfg-b")
+    var id = MessagingTestKit.direct(app, a, "dm-call-cfg", "call-cfg-b")
+    Check.apiError(app.client.send("POST", "/conversations/" + id + "/calls", DomainTestKit.auth(a), "", ""), 503, "CALLS_NOT_CONFIGURED")
+    Check.eqInt("sessions", 0, app.db().queryLong("select count(*) from call_sessions where conversation_id = ?", DbParams().bindStr(id)) as Int)
+}

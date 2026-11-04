@@ -1,7 +1,11 @@
+import calls.*
 import kernel.*
 import kernel.config.*
 import kernel.log.*
 import kernel.security.*
+import messaging.*
+import notifications.*
+import push.*
 
 // Composition root: config -> datasource -> migrations -> app -> kernel routes -> domain routes -> listen.
 // Domain wiring (stores, services, routes, jobs) is added between Platform.create and start.
@@ -16,7 +20,12 @@ main() {
         // Request pipeline (filters, limiters, guards). Each domain port replaces its own seam in `hooks`
         // (moderators, monitoring, reports, origins) before this line.
         var hooks = SecurityHooks.defaults(platform.db)
-        Security.install(platform, hooks)
+        var parts = Security.install(platform, hooks)
+        // Domains (one block each, ordered by dependency): notifications is the sink the others write to.
+        var notificationsModule = NotificationsModule.install(platform, shared, hooks, parts)
+        PushModule.install(platform, shared, hooks, parts, notificationsModule)
+        var messagingModule = MessagingModule.install(platform, shared, hooks, parts, notificationsModule)
+        CallsModule.install(platform, shared, hooks, parts, notificationsModule, messagingModule)
         log.info("listening on port " + port)
         platform.start(port)
     } catch (String e) {
