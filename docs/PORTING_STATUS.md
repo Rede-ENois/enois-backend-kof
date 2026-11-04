@@ -96,3 +96,113 @@ escalation text instead of reading the `reports` table; `IntelligentCacheTests` 
 behaviours on `TtlCache`/`Caches` (reuse, expiry loads nothing on its own, renew after expiry, a write
 clears after commit, a failed write leaves the cache alone, one load for concurrent callers, closed list of
 caches with their policy) because `EventService` is not ported.
+
+## Groups wave: groups, communities, communityprojects, studypairs
+
+| Domain | Endpoints ported / total | Tests ported / total | Gaps |
+|---|---|---|---|
+| groups | 31 / 31 (`GroupController` 14, `GroupContentController` 17) | 52 / 52 Java tests, plus 4 of the 5 shared `WriteGateCoverageTests` (57 Kof tests in `tests/groups/`) | G180 to G182 |
+| communities | 21 / 21 | 18 / 19 Java tests (22 Kof tests in `tests/communities/CommunitiesTest.kf`) | G190 to G193 |
+| communityprojects | 13 / 13 | 1 / 1 Java tests (3 Kof tests in `tests/communityprojects/`) | G194, G195 |
+| studypairs | 7 / 7 | 30 / 30 Java tests (31 Kof tests: 25 in `StudyPairFlowTest.kf`, 6 in `StudyPairConcurrencyTest.kf`) | G196 |
+
+`Main.kf` installs the four modules after `Security.install` (`GroupsModule`, `CommunitiesModule`,
+`CommunityProjectsModule`, `StudyPairsModule`).
+
+### groups
+
+Ported: create / edit (SafeHtml cover, blank clears an image, null keeps), discovery and page by slug or id (public:
+presentation only), join (OPEN becomes a member, APPROVAL a pending request, one pending per person), leave, owner
+transfer, member removal, request list / approve / reject (atomic: the second decision is 409), platform state
+(RESTRICTED, SUSPENDED, ACTIVE; admin only, audited, owner notified), close by the owner, topics (create, edit,
+archive, reorder), the private feed (publish with the ECA and sanction gates, list, pin / unpin / pinned, comments with
+replies and edits, reactions, local moderation removal), the new-post fan-out on the outbox worker (one counted
+notification per member while unread), and the permission table (`GroupPermissions`, byte-identical rules).
+
+Deliberate differences from Java:
+
+- `groups.member_count` is no longer reset to 0 by `save(group)`: the Java merge of a detached entity wrote 0 on every
+  edit, status change and transfer (nothing reads the column, the views count rows). Updates here leave it alone and the
+  counter never goes below zero.
+- Idempotency hashes are over the raw body text (plus ids), not over the Jackson tree of the DTO: they only need to be
+  stable inside this service.
+- An unknown `joinMode` is `400 BAD_REQUEST` (what Jackson answered for an unknown enum constant).
+
+#### Pending ports (seams owned by groups, defaults wired by `GroupsModule.install`)
+
+| Seam (class in `groups`) | Default | Owner / what it needs |
+|---|---|---|
+| `GroupProfileLookup` (`find`, `findAll`, `nameOf`) | reads `users` (name, social name, nickname, avatar, badges, frame, name style) | profile: `displayWithNickname`, `allBadges`, `NameStyleView` |
+| `GroupAgeGate.requireCanWrite` | reads `users.birth_date` and `parental_links` (ACTIVE), Sao Paulo date | profile/age: `AgeGate` (`BIRTH_DATE_REQUIRED`, `PARENTAL_CONSENT_REQUIRED`) |
+| `GroupMediaLookup.visibleByIds` | reads `media_assets` (`delete_status = 'NONE'`) | media: `MediaSummaryView` |
+| `GroupNotifications` (`create`, `createCounted`) | inserts / updates `notifications` like `NotificationService`, no push | notifications: push, preferences |
+| `GroupCoins.recordPresence` | no-op | coin: daily presence streak |
+
+What groups exposes: `GroupsModule.reports` (`GroupReportReader.read("GROUP_POST" | "GROUP_COMMENT", id)` gives text and
+author for the moderation panel), `GroupsModule.groups` / `.feed` services, `GroupNotifier` (registered on the outbox
+for `GroupPostPublished`), `GroupPermissions`, `GroupsTestKit` (test fixtures).
+
+#### Java tests not ported as such (adapted, assertions kept)
+
+| Java test | Adaptation |
+|---|---|
+| `GroupNotificationsTests` (10) | they read `GET /notifications` (notifications domain): the same facts are asserted on the `notifications` rows, and the outbox worker is drained by hand (`processPending`) instead of waiting for its timer |
+| `GroupReportsTests` (1) | the report endpoints are the moderation domain's: asserted on `GroupReportReader`, the part groups owes the panel |
+| `GroupFeedTests.publicacaoDeGrupoNaoVazaParaOFeedPrincipal` | `/feed` is the feed port's: asserted structurally (the text lives only in `group_posts`, never in `posts`) |
+| `GroupCommunityIsolationTests` (1) | the community post is seeded in `posts` (`POST /feed/posts` is the feed port's); both feeds are read over HTTP |
+| `GroupPlatformTests`, `GroupNotificationsTests` | the platform admin is a `users.is_admin` row instead of the `group-admin@test.com` allowlist |
+| `WriteGateCoverageTests` (5, from shared) | the 4 group tests are ported in `GroupWriteGateTest.kf` (plus `BIRTH_DATE_REQUIRED`); the private-message one belongs to messaging |
+
+### communities
+
+Endpoints ported 21/21 (`CommunityContractController`). Tests 18/19 Java tests ported (22 Kof tests). Ported: community
+CRUD (create/patch with SafeHtml banner, optional description, city/state, ownership rules), join/leave (owner transfer
+required, last member deletes), transfer, delete (owner or admin), members (user ids only for signed-in viewers),
+favorites, /mine, /local, search/filters (topic, q, city, state, cursor), private channels (members only, limit 30, topic
+taxonomy, unique slugs), community and channel feeds, pinned post, and the feed-side readers `CommunityDirectory`
+(`PostCommunityReader`) and `CommunityChannelDirectory` (`CommunityChannelReader`).
+
+Deliberate differences: the `communitiesList` cache is not ported (same results without it); `limit` is clamped to 1..100
+(Java was unbounded).
+
+| Seam (owned by communities) | Default | Owner / what it needs |
+|---|---|---|
+| `CommunityProfileLookup` (cards, placeOf) | reads `users` read-only | profile: displayWithNickname and NameStyleView parity |
+| `CommunityFeedLookup` (postRef, communityFeed, channelFeed, post) | reads `posts` read-only, minimal post JSON | feed: real PostView and FeedPage |
+| `CommunityCoins.recordPresence` | no-op | coin: CoinService.recordPresence |
+
+Not ported (1 of 19): `CommunityChannelTests.channelRulesAreEnforcedByTheBackend` exercises `POST /feed/posts`
+(`CHANNEL_REQUIRES_COMMUNITY`, `TOPIC_FROM_CHANNEL`, `CHANNEL_NOT_FOUND` on publish): feed port. The feed-side
+assertions of `channelsAreVisibleOnlyToCommunityMembersAndStayOutOfEveryFeed` (`GET /feed/posts/{id}` 404 for channel
+posts, `/feed`, `/users/x/posts`) also belong to the feed port; the community-side half is ported. Pin and local tests seed
+`posts` and `users.city` by SQL instead of `POST /feed/posts` and `PATCH /me/profile`.
+
+### communityprojects
+
+Ported: catalogue (search by title/description/tags, order recent or title, offset cursor), creator list and page by
+`/:username/:slug`, `/me/community-projects`, submit, edit (slug rules), resubmit, delete, moderation queue, approve,
+reject, admin suspend and unsuspend. Difference on purpose: catalogue paging reads limit+1 rows from the offset (Java
+returned a short second page).
+
+| Seam (owned by communityprojects) | Default | Owner |
+|---|---|---|
+| `CommunityProjectProfiles` | reads `users.username` | profile |
+| `CommunityProjectModerators` | reads `moderator_applications` APPROVED | moderation |
+
+### studypairs
+
+Ported: requests and FIFO matching with atomic claim, per-user row lock, DB-backed invariants (V228 unique indexes),
+check-ins (one per ISO week, editable), end, anonymous search, popular goals, weekly reminder job (Thursday 18:00
+America/Sao_Paulo, `REDE_STUDY_PAIRS_REMINDER_CRON`, claimed in `study_pair_reminders`). All 30 Java tests ported.
+
+| Seam (owned by studypairs, `StudyPairSeams.kf`) | Default | Owner |
+|---|---|---|
+| `StudyPairProfiles` | reads `users` | profile |
+| `StudyPairAgePolicy` | reads `users.birth_date` (Sao Paulo date) | profile |
+| `StudyPairPreferences` | parses `user_preferences.disabled_modules` | preferences |
+| `StudyPairNotifier` | single insert into `notifications`, no push | notifications |
+
+Tests changed trigger, assertion kept: preferences seeded in `user_preferences` instead of `PUT /me/preferences`; the
+push-off test checks only the in-app row; the reminder schedule test uses `Cron.next` plus the registered job instead of
+reflection on `@Scheduled`. The topic list is copied from `ContentTaxonomy` into `StudyPairRules.topics()` (and into
+`CommunityRules.topics()`): preferences owns it upstream.
