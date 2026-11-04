@@ -1,0 +1,129 @@
+package messaging
+
+import kernel.error.*
+import kernel.http.*
+import kernel.id.*
+import kernel.security.*
+import kernel.time.*
+
+record KeypairBody(String? publicKey, String? encryptedPrivateKey, String? algorithm)
+
+record KeypairView(String publicKey, String encryptedPrivateKey, String algorithm)
+
+record PublicKeyView(String? publicKey, String? algorithm)
+
+record ConversationKeyBody(String? userId, String? encryptedKey)
+
+record ConversationKeyView(String? encryptedKey, Int keyVersion)
+
+record KeypairSavedBody(String id, String status)
+
+record KeysDistributedBody(String status, String conversationId)
+
+// HTTP adapter of the end to end encryption keys (E2eKeyController): /e2e/**.
+class E2eKeyRoutes {
+    static Int maxKeySize() = 8192
+    static register(server: HttpServer, service: MessagingService, store: MessagingStore) {
+        server.post("/e2e/keypair", () -> E2eKeyRoutes.upload(store))
+        server.get("/e2e/keypair", () -> E2eKeyRoutes.mine(store))
+        server.get("/e2e/keypair/:userId", () -> E2eKeyRoutes.publicKey(store))
+        server.post("/e2e/conversations/:conversationId/keys", () -> E2eKeyRoutes.distribute(service, store))
+        server.get("/e2e/conversations/:conversationId/key", () -> E2eKeyRoutes.conversationKey(service, store))
+    }
+    static String upload(store: MessagingStore) {
+        var userId = Auth.requireUser()
+        var body = new KeypairBody(null, null, null)
+        try {
+            body = json.decode<KeypairBody>(Req.bodyText())
+        } catch (String bad) {
+            throw Errors.badRequest()
+        }
+        var publicKey = body.publicKey()
+        var privateKey = body.encryptedPrivateKey()
+        if (publicKey == null) {
+            throw Errors.api(400, "INVALID_KEYPAIR", "Chave publica e privada cifrada sao obrigatorias.")
+        }
+        if (privateKey == null) {
+            throw Errors.api(400, "INVALID_KEYPAIR", "Chave publica e privada cifrada sao obrigatorias.")
+        }
+        if (publicKey.length() > E2eKeyRoutes.maxKeySize()) {
+            throw Errors.api(400, "KEY_TOO_LARGE", "Chave excede o tamanho maximo permitido.")
+        }
+        if (privateKey.length() > E2eKeyRoutes.maxKeySize()) {
+            throw Errors.api(400, "KEY_TOO_LARGE", "Chave excede o tamanho maximo permitido.")
+        }
+        var algorithm = "RSA-OAEP"
+        var declared = body.algorithm()
+        if (declared != null) {
+            algorithm = declared
+        }
+        var id = Ids.uuid()
+        store.deactivateKeypairs(userId)
+        store.saveKeypair(id, userId, publicKey, privateKey, algorithm, Time.nowIso())
+        return json.encode(KeypairSavedBody(id, "ACTIVE"))
+    }
+    static String mine(store: MessagingStore) {
+        var userId = Auth.requireUser()
+        var row = store.activeKeypair(userId)
+        if (row == null) {
+            throw Errors.api(404, "NO_KEYPAIR", "Nenhum keypair configurado.")
+        }
+        return json.encode(KeypairView(row.getStr("public_key"), row.getStr("encrypted_private_key"), row.getStr("algorithm")))
+    }
+    static String publicKey(store: MessagingStore) {
+        Auth.requireUser()
+        var row = store.activeKeypair(Req.pathParam("userId"))
+        if (row == null) {
+            return json.encode(PublicKeyView(null, null))
+        }
+        return json.encode(PublicKeyView(row.getStr("public_key"), row.getStr("algorithm")))
+    }
+    static String distribute(service: MessagingService, store: MessagingStore) {
+        var callerId = Auth.requireUser()
+        var conversationId = Req.pathParam("conversationId")
+        var entries = listOf<ConversationKeyBody>()
+        try {
+            entries = json.decode<List<ConversationKeyBody>>(Req.bodyText())
+        } catch (String bad) {
+            throw Errors.badRequest()
+        }
+        if (!service.isParticipant(conversationId, callerId)) {
+            throw MessagingService.notParticipantError()
+        }
+        var real = listOf<String>()
+        for (var p in service.getParticipants(conversationId)) {
+            real.add(p.userId())
+        }
+        var now = Time.nowIso()
+        for (var entry in entries) {
+            var target = entry.userId()
+            if (target == null) {
+                throw Errors.api(400, "INVALID_PARTICIPANT", "Usuario null nao participa desta conversa.")
+            }
+            if (!real.contains(target)) {
+                throw Errors.api(400, "INVALID_PARTICIPANT", "Usuario " + target + " nao participa desta conversa.")
+            }
+            var key = entry.encryptedKey()
+            if (key == null) {
+                throw Errors.api(400, "INVALID_KEY", "Chave invalida ou excede o tamanho maximo.")
+            }
+            if (key.length() > E2eKeyRoutes.maxKeySize()) {
+                throw Errors.api(400, "INVALID_KEY", "Chave invalida ou excede o tamanho maximo.")
+            }
+            store.saveConversationKey(conversationId, target, key, now)
+        }
+        return json.encode(KeysDistributedBody("DISTRIBUTED", conversationId))
+    }
+    static String conversationKey(service: MessagingService, store: MessagingStore) {
+        var userId = Auth.requireUser()
+        var conversationId = Req.pathParam("conversationId")
+        if (!service.isParticipant(conversationId, userId)) {
+            throw MessagingService.notParticipantError()
+        }
+        var row = store.conversationKey(conversationId, userId)
+        if (row == null) {
+            return json.encode(ConversationKeyView(null, 0))
+        }
+        return json.encode(ConversationKeyView(row.getStr("encrypted_key"), row.getInt("key_version")))
+    }
+}

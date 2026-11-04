@@ -1,0 +1,260 @@
+package messaging
+
+import kernel.db.*
+import kernel.id.*
+import kernel.time.*
+
+// SQL of the messaging domain, same tables and columns as the Java persistence adapters.
+class MessagingStore {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    static ConversationRecord toConversation(r: DbRow) = ConversationRecord(r.getStr("id"), r.getStr("kind"), r.getStrOrNull("title"), r.getStr("created_by"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    static String conversationColumns() = "c.id, c.kind, c.title, c.created_by, c.created_at, c.updated_at"
+    static String messageColumns() = "m.id, m.conversation_id, m.sender_id, m.text, m.media_ids, m.media_spoiler, m.e2e, m.iv, m.reply_to_id, m.created_at"
+    static MessageRecord toMessage(r: DbRow) {
+        var media = listOf<String>()
+        var raw = r.getStrOrNull("media_ids")
+        if (raw != null) {
+            for (var part in raw.split(",")) {
+                if (part.trim().length() > 0) {
+                    media.add(part.trim())
+                }
+            }
+        }
+        return MessageRecord(r.getStr("id"), r.getStr("conversation_id"), r.getStr("sender_id"), r.getStr("text"), media, r.getBool("media_spoiler"), r.getBool("e2e"), r.getStrOrNull("iv"), r.getStrOrNull("reply_to_id"), r.getInstant("created_at"))
+    }
+    static String contextClause(context: String?) {
+        if (context == null) {
+            return ""
+        }
+        if (context == "PROFESSIONAL") {
+            return " and c.kind in " + ConversationContexts.professionalList()
+        }
+        return " and c.kind not in " + ConversationContexts.professionalList()
+    }
+    insertConversation(c: ConversationRecord) {
+        database.execute("insert into conversations (id, kind, title, created_by, created_at, updated_at) values (?, ?, ?, ?, ?, ?)", DbParams().bindStr(c.id()).bindStr(c.kind()).bindStrOrNull(c.title()).bindStr(c.createdBy()).bindInstant(c.createdAt()).bindInstant(c.updatedAt()))
+    }
+    touchConversation(id: String, at: String) {
+        database.execute("update conversations set updated_at = ? where id = ?", DbParams().bindInstant(at).bindStr(id))
+    }
+    insertParticipant(conversationId: String, userId: String, now: String) {
+        database.execute("insert into conversation_participants (conversation_id, user_id, joined_at) values (?, ?, ?)", DbParams().bindStr(conversationId).bindStr(userId).bindInstant(now))
+    }
+    ConversationRecord? findConversation(id: String) {
+        var row = database.queryOptional("select " + MessagingStore.conversationColumns() + " from conversations c where c.id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return MessagingStore.toConversation(row)
+    }
+    // The most recently active conversation of this kind with exactly these two participants.
+    ConversationRecord? findPair(userA: String, userB: String, kind: String) {
+        var row = database.queryOptional("select " + MessagingStore.conversationColumns() + " from conversations c where c.kind = ? and c.id in (select conversation_id from conversation_participants where user_id = ?) and c.id in (select conversation_id from conversation_participants where user_id = ?) and (select count(*) from conversation_participants x where x.conversation_id = c.id) = 2 order by c.updated_at desc limit 1", DbParams().bindStr(kind).bindStr(userA).bindStr(userB))
+        if (row == null) {
+            return null
+        }
+        return MessagingStore.toConversation(row)
+    }
+    List<ConversationRecord> findByParticipant(userId: String, before: String?, context: String?, limit: Int, archived: Bool) {
+        var hidden = "is null"
+        if (archived) {
+            hidden = "is not null"
+        }
+        var params = DbParams().bindStr(userId)
+        var sql = "select " + MessagingStore.conversationColumns() + " from conversations c where c.id in (select conversation_id from conversation_participants where user_id = ? and hidden_at " + hidden + ")"
+        if (before != null) {
+            sql = sql + " and c.updated_at < ?"
+            params.bindInstant(before)
+        }
+        sql = sql + MessagingStore.contextClause(context) + " order by c.updated_at desc limit " + limit
+        var out = listOf<ConversationRecord>()
+        for (var r in database.queryList(sql, params)) {
+            out.add(MessagingStore.toConversation(r))
+        }
+        return out
+    }
+    List<ParticipantRecord> participants(conversationId: String) {
+        var out = listOf<ParticipantRecord>()
+        for (var r in database.queryList("select user_id, last_read_at, joined_at from conversation_participants where conversation_id = ? order by id", DbParams().bindStr(conversationId))) {
+            out.add(ParticipantRecord(r.getStr("user_id"), r.getInstantOrNull("last_read_at"), r.getInstant("joined_at")))
+        }
+        return out
+    }
+    Bool isParticipant(conversationId: String, userId: String) = database.queryLong("select count(*) from conversation_participants where conversation_id = ? and user_id = ?", DbParams().bindStr(conversationId).bindStr(userId)) > 0L
+    static String marks(n: Int) {
+        var out = ""
+        var i = 0
+        while (i < n) {
+            if (i > 0) {
+                out = out + ", "
+            }
+            out = out + "?"
+            i = i + 1
+        }
+        return out
+    }
+    static DbParams strings(first: List<String>, params: DbParams) {
+        for (var v in first) {
+            params.bindStr(v)
+        }
+        return params
+    }
+    Int hideConversations(userId: String, ids: List<String>, now: String) {
+        if (ids.isEmpty()) {
+            return 0
+        }
+        return database.execute("update conversation_participants set hidden_at = ? where user_id = ? and conversation_id in (" + MessagingStore.marks(ids.size()) + ")", MessagingStore.strings(ids, DbParams().bindInstant(now).bindStr(userId)))
+    }
+    Int unhideConversations(userId: String, ids: List<String>) {
+        if (ids.isEmpty()) {
+            return 0
+        }
+        return database.execute("update conversation_participants set hidden_at = null where user_id = ? and conversation_id in (" + MessagingStore.marks(ids.size()) + ")", MessagingStore.strings(ids, DbParams().bindStr(userId)))
+    }
+    markRead(conversationId: String, userId: String, now: String) {
+        database.execute("update conversation_participants set last_read_at = ? where conversation_id = ? and user_id = ?", DbParams().bindInstant(now).bindStr(conversationId).bindStr(userId))
+    }
+    // Messages after the last read (all of them while never read).
+    Int countUnread(conversationId: String, userId: String) {
+        var row = database.queryOptional("select last_read_at from conversation_participants where conversation_id = ? and user_id = ?", DbParams().bindStr(conversationId).bindStr(userId))
+        if (row == null) {
+            return database.queryLong("select count(*) from messages where conversation_id = ?", DbParams().bindStr(conversationId)) as Int
+        }
+        var lastRead = row.getInstantOrNull("last_read_at")
+        if (lastRead == null) {
+            return database.queryLong("select count(*) from messages where conversation_id = ?", DbParams().bindStr(conversationId)) as Int
+        }
+        return database.queryLong("select count(*) from messages where conversation_id = ? and created_at > ?", DbParams().bindStr(conversationId).bindInstant(lastRead)) as Int
+    }
+    Int countTotalUnread(userId: String, context: String?) = database.queryLong("select coalesce(sum((select count(*) from messages m where m.conversation_id = cp.conversation_id and m.created_at > coalesce(cp.last_read_at, cp.joined_at))), 0) from conversation_participants cp join conversations c on c.id = cp.conversation_id where cp.user_id = ? and cp.hidden_at is null" + MessagingStore.contextClause(context), DbParams().bindStr(userId)) as Int
+    insertMessage(m: MessageRecord) {
+        database.execute("insert into messages (id, conversation_id, sender_id, text, media_ids, media_spoiler, e2e, iv, reply_to_id, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(m.id()).bindStr(m.conversationId()).bindStr(m.senderId()).bindStr(m.text()).bindStrOrNull(MessagingStore.mediaColumn(m.mediaIds())).bindBool(m.mediaSpoiler()).bindBool(m.e2e()).bindStrOrNull(m.iv()).bindStrOrNull(m.replyToId()).bindInstant(m.createdAt()))
+    }
+    static String? mediaColumn(values: List<String>) {
+        if (values.isEmpty()) {
+            return null
+        }
+        return MessagingStore.join(values)
+    }
+    static String join(values: List<String>) {
+        var out = ""
+        for (var v in values) {
+            if (out.length() > 0) {
+                out = out + ","
+            }
+            out = out + v
+        }
+        return out
+    }
+    // Messages the viewer did not hide, newest first.
+    List<MessageRecord> visibleMessages(conversationId: String, viewerId: String, before: String?, limit: Int) {
+        var params = DbParams().bindStr(conversationId)
+        var sql = "select " + MessagingStore.messageColumns() + " from messages m where m.conversation_id = ?"
+        if (before != null) {
+            sql = sql + " and m.created_at < ?"
+            params.bindInstant(before)
+        }
+        sql = sql + " and not exists (select 1 from message_hidden h where h.message_id = m.id and h.user_id = ?) order by m.created_at desc limit " + limit
+        params.bindStr(viewerId)
+        var out = listOf<MessageRecord>()
+        for (var r in database.queryList(sql, params)) {
+            out.add(MessagingStore.toMessage(r))
+        }
+        return out
+    }
+    MessageRecord? lastMessage(conversationId: String) {
+        var row = database.queryOptional("select " + MessagingStore.messageColumns() + " from messages m where m.conversation_id = ? order by m.created_at desc limit 1", DbParams().bindStr(conversationId))
+        if (row == null) {
+            return null
+        }
+        return MessagingStore.toMessage(row)
+    }
+    MessageRecord? recentDuplicate(conversationId: String, senderId: String, text: String, since: String) {
+        var row = database.queryOptional("select " + MessagingStore.messageColumns() + " from messages m where m.conversation_id = ? and m.sender_id = ? and m.text = ? and m.created_at > ? order by m.created_at desc limit 1", DbParams().bindStr(conversationId).bindStr(senderId).bindStr(text).bindInstant(since))
+        if (row == null) {
+            return null
+        }
+        return MessagingStore.toMessage(row)
+    }
+    MessageRecord? findMessage(id: String) {
+        var row = database.queryOptional("select " + MessagingStore.messageColumns() + " from messages m where m.id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return MessagingStore.toMessage(row)
+    }
+    List<MessageRecord> findMessages(ids: List<String>) {
+        var out = listOf<MessageRecord>()
+        if (ids.isEmpty()) {
+            return out
+        }
+        for (var r in database.queryList("select " + MessagingStore.messageColumns() + " from messages m where m.id in (" + MessagingStore.marks(ids.size()) + ")", MessagingStore.strings(ids, DbParams()))) {
+            out.add(MessagingStore.toMessage(r))
+        }
+        return out
+    }
+    Long countInConversation(conversationId: String, ids: List<String>) = database.queryLong("select count(*) from messages where conversation_id = ? and id in (" + MessagingStore.marks(ids.size()) + ")", MessagingStore.strings(ids, DbParams().bindStr(conversationId)))
+    // Hides each message once for this person; returns how many are new.
+    Int hideMessages(userId: String, ids: List<String>, now: String) {
+        var hidden = 0
+        for (var id in ids) {
+            if (database.queryLong("select count(*) from message_hidden where user_id = ? and message_id = ?", DbParams().bindStr(userId).bindStr(id)) > 0L) {
+                continue
+            }
+            database.execute("insert into message_hidden (id, user_id, message_id, created_at) values (?, ?, ?, ?)", DbParams().bindStr(Ids.prefixed("mhid_")).bindStr(userId).bindStr(id).bindInstant(now))
+            hidden = hidden + 1
+        }
+        return hidden
+    }
+    // true = added, false = removed (same reaction again) or lost a race.
+    Bool toggleReaction(id: String, messageId: String, userId: String, type: String, now: String) {
+        var existing = database.queryOptional("select id, reaction_type from message_reactions where message_id = ? and user_id = ?", DbParams().bindStr(messageId).bindStr(userId))
+        if (existing != null) {
+            database.execute("delete from message_reactions where id = ?", DbParams().bindStr(existing.getStr("id")))
+            if (existing.getStr("reaction_type") == type) {
+                return false
+            }
+        }
+        try {
+            database.execute("insert into message_reactions (id, message_id, user_id, reaction_type, created_at) values (?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(messageId).bindStr(userId).bindStr(type).bindInstant(now))
+            return true
+        } catch (String lostRace) {
+            return false
+        }
+    }
+    List<MessageReactionView> reactionsOf(messageId: String) {
+        var out = listOf<MessageReactionView>()
+        for (var r in database.queryList("select user_id, reaction_type, created_at from message_reactions where message_id = ? order by created_at desc", DbParams().bindStr(messageId))) {
+            out.add(MessageReactionView(r.getStr("user_id"), r.getStr("reaction_type"), r.getInstant("created_at")))
+        }
+        return out
+    }
+    List<MessageReactionRow> reactionsOfMessages(ids: List<String>) {
+        var out = listOf<MessageReactionRow>()
+        if (ids.isEmpty()) {
+            return out
+        }
+        for (var r in database.queryList("select message_id, user_id, reaction_type from message_reactions where message_id in (" + MessagingStore.marks(ids.size()) + ")", MessagingStore.strings(ids, DbParams()))) {
+            out.add(MessageReactionRow(r.getStr("message_id"), r.getStr("user_id"), r.getStr("reaction_type")))
+        }
+        return out
+    }
+    // E2E keys.
+    deactivateKeypairs(userId: String) {
+        database.execute("update user_e2e_keypairs set active = false where user_id = ?", DbParams().bindStr(userId))
+    }
+    saveKeypair(id: String, userId: String, publicKey: String, encryptedPrivateKey: String, algorithm: String, now: String) {
+        database.execute("insert into user_e2e_keypairs (id, user_id, public_key, encrypted_private_key, algorithm, active, created_at) values (?, ?, ?, ?, ?, true, ?)", DbParams().bindStr(id).bindStr(userId).bindStr(publicKey).bindStr(encryptedPrivateKey).bindStr(algorithm).bindInstant(now))
+    }
+    DbRow? activeKeypair(userId: String) = database.queryOptional("select public_key, encrypted_private_key, algorithm from user_e2e_keypairs where user_id = ? and active = true order by created_at desc limit 1", DbParams().bindStr(userId))
+    saveConversationKey(conversationId: String, userId: String, encryptedKey: String, now: String) {
+        var updated = database.execute("update conversation_e2e_keys set encrypted_key = ?, key_version = 1, created_at = ? where conversation_id = ? and user_id = ?", DbParams().bindStr(encryptedKey).bindInstant(now).bindStr(conversationId).bindStr(userId))
+        if (updated == 0) {
+            database.execute("insert into conversation_e2e_keys (conversation_id, user_id, encrypted_key, key_version, created_at) values (?, ?, ?, 1, ?)", DbParams().bindStr(conversationId).bindStr(userId).bindStr(encryptedKey).bindInstant(now))
+        }
+    }
+    DbRow? conversationKey(conversationId: String, userId: String) = database.queryOptional("select encrypted_key, key_version from conversation_e2e_keys where conversation_id = ? and user_id = ?", DbParams().bindStr(conversationId).bindStr(userId))
+}
