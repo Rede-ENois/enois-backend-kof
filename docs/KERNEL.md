@@ -454,3 +454,33 @@ oversized README is `400 README_TOO_LONG`.
 
 `Regexes.replaceAll(pattern, input, (m: Matcher) -> String)` is the regex replace with a callback
 (literal replacements); `Regexes.add(sb, text)` appends to a `StringBuilder` (see G30).
+
+## kernel.cache
+
+A tiny in-process TTL cache replaces Caffeine (`@Cacheable` lists and hot-path maps); no dependency.
+String keys and String values: cache the JSON text of a response and decode at the call site (generic
+class values come back as `Object` without a cast, and casts to domain types do not compile, G28).
+
+```kotlin
+import kernel.cache.*
+
+var caches = Caches.create(platform.cfg)             // the closed list of the Java CacheConfig
+var ranking = caches.get("publicRanking")             // unknown name throws CACHE_UNKNOWN
+var body = ranking.getOrLoad("top", () -> json.encode(loadRanking()))   // one load per expired key
+ranking.put(k, v)  ranking.get(k): String?  ranking.evict(k)  ranking.clear()
+ranking.evictAfterCommit(database, k)   ranking.clearAfterCommit(database)    // CacheInvalidator
+ranking.add(k, v): Bool                               // atomic first-writer-wins (duplicate guards)
+ranking.hits()  misses()  size()
+var own = TtlCache("name", 20000L, 500)               // ttl millis, max entries
+```
+
+Same semantics as the Caffeine setup: expire-after-write (nothing is scheduled: the next caller that needs
+a stale entry pays the load), a size cap (stale entries go first, then the ones expiring first), and one
+load when many callers hit the same expired key (a loader failure reaches all of them and caches
+nothing; do not call another `getOrLoad` from inside a loader). Per pod: invalidating does not reach the
+other pods, the TTL is the guarantee. Caches: `publicProfiles` (20 s, 5000), `publicRanking` (20 s, 64),
+`communitiesList`, `eventsList`, `jobsList` (20 s, 500), `communityStats` (10 m, 4), `externalJobs` (5 m,
+16), `pagePreviewCards` (1 h, 16), `gifSearch` (10 m, 200), `githubRepositories`, `githubReadme` (3 m,
+200). `REDE_CACHE_DYNAMIC_TTL` (default `20s`) feeds the 20 s ones; `REDE_CACHE_<NAME>_TTL` (`500ms`,
+`5s`, `10m`, `1h`, `2d`, bare number = ms) and `REDE_CACHE_<NAME>_MAX_ENTRIES` override one cache
+(`REDE_CACHE_JOBS_LIST_TTL`).

@@ -1,0 +1,116 @@
+package kernel.cache
+
+import java.util.HashMap
+import kernel.config.*
+
+// The closed list of caches with their freshness policy (CacheConfig + CacheProperties): a cache
+// without a TTL and an owner becomes a bug source. Dynamic lists default to REDE_CACHE_DYNAMIC_TTL
+// (20s); every cache can be overridden with REDE_CACHE_<NAME>_TTL (e.g. `5s`, `10m`, `1h`, `500ms`,
+// bare number = milliseconds) and REDE_CACHE_<NAME>_MAX_ENTRIES.
+//
+//   var caches = Caches.create(platform.cfg)
+//   caches.get("publicProfiles").getOrLoad(username, () -> ...)
+class Caches {
+    Map<String,TtlCache> byName = new HashMap<String, TtlCache>()
+    // Same names as CacheConfig. Ttl in millis, max entries.
+    static List<String> names() = listOf("publicProfiles", "publicRanking", "communitiesList", "eventsList", "jobsList", "communityStats", "externalJobs", "pagePreviewCards", "gifSearch", "githubRepositories", "githubReadme")
+    static Long defaultDynamicTtlMillis() = 20000L
+    static Long defaultTtl(name: String, dynamic: Long) {
+        if (name == "communityStats") {
+            return 600000L
+        }
+        if (name == "externalJobs") {
+            return 300000L
+        }
+        if (name == "pagePreviewCards") {
+            return 3600000L
+        }
+        if (name == "gifSearch") {
+            return 600000L
+        }
+        if (name == "githubRepositories" || name == "githubReadme") {
+            return 180000L
+        }
+        return dynamic
+    }
+    static Int defaultMax(name: String) {
+        if (name == "publicProfiles") {
+            return 5000
+        }
+        if (name == "publicRanking") {
+            return 64
+        }
+        if (name == "communitiesList" || name == "eventsList" || name == "jobsList") {
+            return 500
+        }
+        if (name == "communityStats") {
+            return 4
+        }
+        if (name == "externalJobs" || name == "pagePreviewCards") {
+            return 16
+        }
+        return 200
+    }
+    // `PublicProfiles` style name -> PUBLIC_PROFILES for the environment variable.
+    static String envName(name: String) = name.replaceAll("([a-z])([A-Z])", "$1_$2").toUpperCase()
+    static Long parseDuration(text: String) {
+        var t = text.trim().toLowerCase()
+        var unit = 1L
+        var digits = t
+        if (t.endsWith("ms")) {
+            digits = t.substring(0, t.length() - 2)
+        }
+        else {
+            if (t.endsWith("s")) {
+                unit = 1000L
+                digits = t.substring(0, t.length() - 1)
+            }
+            else {
+                if (t.endsWith("m")) {
+                    unit = 60000L
+                    digits = t.substring(0, t.length() - 1)
+                }
+                else {
+                    if (t.endsWith("h")) {
+                        unit = 3600000L
+                        digits = t.substring(0, t.length() - 1)
+                    }
+                    else {
+                        if (t.endsWith("d")) {
+                            unit = 86400000L
+                            digits = t.substring(0, t.length() - 1)
+                        }
+                    }
+                }
+            }
+        }
+        try {
+            return digits.trim().toLong() * unit
+        } catch (String e) {
+            throw "CONFIG_INVALID: duration must look like 20s, 5m, 1h or 500ms, got " + text
+        }
+    }
+    static Caches create(cfg: Config) {
+        var caches = Caches()
+        var dynamic = Caches.parseDuration(cfg.getStr("REDE_CACHE_DYNAMIC_TTL", "20s"))
+        for (var name in Caches.names()) {
+            var env = "REDE_CACHE_" + Caches.envName(name)
+            var ttl = Caches.defaultTtl(name, dynamic)
+            var configured = cfg.lookup(env + "_TTL")
+            if (configured != null) {
+                ttl = Caches.parseDuration(configured)
+            }
+            var max = cfg.getInt(env + "_MAX_ENTRIES", Caches.defaultMax(name))
+            caches.byName.put(name, TtlCache(name, ttl, max))
+        }
+        return caches
+    }
+    // Throws for an unknown name: the list is closed.
+    TtlCache get(name: String) {
+        var c = byName.get(name)
+        if (c == null) {
+            throw "CACHE_UNKNOWN: no cache named " + name
+        }
+        return c
+    }
+}
