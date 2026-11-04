@@ -1,0 +1,27 @@
+package presence
+
+import kernel.db.*
+
+// Presence row of an account (JdbcPresenceRepository): the status and the last time it was seen.
+record PresenceRow(String status, String lastSeenAt)
+
+class PresenceStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    PresenceRow? find(userId: String) {
+        var r = store.queryOptional("select status, last_seen_at from user_presence where user_id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        return PresenceRow(r.getStr("status"), r.getInstant("last_seen_at"))
+    }
+    setStatus(userId: String, status: String, seenAt: String) {
+        store.execute("insert into user_presence (user_id, status, last_seen_at) values (?, ?, ?) on duplicate key update status = values(status), last_seen_at = values(last_seen_at)", DbParams().bindStr(userId).bindStr(status).bindInstant(seenAt))
+    }
+    // Only the time moves: a concurrent heartbeat must not undo the person's choice.
+    touch(userId: String, seenAt: String) {
+        store.execute("insert into user_presence (user_id, status, last_seen_at) values (?, \'AVAILABLE\', ?) on duplicate key update last_seen_at = greatest(last_seen_at, values(last_seen_at))", DbParams().bindStr(userId).bindInstant(seenAt))
+    }
+}

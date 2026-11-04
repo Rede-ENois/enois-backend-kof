@@ -1,0 +1,58 @@
+package profile
+
+import kernel.db.*
+import kernel.text.*
+
+// Write API of the cosmetic slots of a profile (frame, name style, card, nameplate, banner, effect, garden,
+// status, badges). The cosmetics domain calls these instead of writing `users` itself. Each slot writes
+// exactly its own columns plus updated_at, and the invariants of the Java UserProfile stay here:
+//   - a name style brings its own font and color: equipping a theme clears both (equipNameStyle), a kept
+//     font or color would repaint it;
+//   - the badge list and the single `badge` column move together (the first badge is the one that follows
+//     the name, an empty list clears both);
+//   - the four card slots (card, nameplate, banner, effect) are written as a set, a null clears that slot;
+//   - choosing a cover (photo or HTML) clears the equipped banner item (ProfileService does it in the edit).
+class ProfileSlots {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    updateAvatarFrame(id: String, frameId: String?, now: String) {
+        var clean = Nulls.str()
+        if (Texts.hasText(frameId)) {
+            clean = Texts.trimIfText(frameId)
+        }
+        store.execute("update users set avatar_frame = ?, updated_at = ? where id = ?", DbParams().bindStrOrNull(clean).bindInstant(now).bindStr(id))
+    }
+    // Equip a seasonal name style: theme set, font and color cleared.
+    equipNameStyle(id: String, themeId: String, now: String) {
+        this.updateNameStyle(id, themeId, null, null, now)
+    }
+    // Free form (unequip keeps font and color): all three columns are written, null clears.
+    updateNameStyle(id: String, theme: String?, font: String?, color: String?, now: String) {
+        store.execute("update users set name_theme = ?, name_font = ?, name_color = ?, updated_at = ? where id = ?", DbParams().bindStrOrNull(theme).bindStrOrNull(font).bindStrOrNull(color).bindInstant(now).bindStr(id))
+    }
+    updateContributorTagColor(id: String, color: String?, now: String) {
+        store.execute("update users set contributor_tag_color = ?, updated_at = ? where id = ?", DbParams().bindStrOrNull(color).bindInstant(now).bindStr(id))
+    }
+    updateProfileCosmetics(id: String, cardTheme: String?, nameplate: String?, bannerItem: String?, profileEffect: String?, now: String) {
+        store.execute("update users set card_theme = ?, nameplate = ?, banner_item = ?, profile_effect = ?, updated_at = ? where id = ?", DbParams().bindStrOrNull(cardTheme).bindStrOrNull(nameplate).bindStrOrNull(bannerItem).bindStrOrNull(profileEffect).bindInstant(now).bindStr(id))
+    }
+    updateGardenStyle(id: String, gardenStyle: String?, now: String) {
+        store.execute("update users set garden_style = ?, updated_at = ? where id = ?", DbParams().bindStrOrNull(gardenStyle).bindInstant(now).bindStr(id))
+    }
+    updateStatus(id: String, text: String?, icon: String?, now: String) {
+        store.execute("update users set status_text = ?, status_icon = ?, updated_at = ? where id = ?", DbParams().bindStrOrNull(text).bindStrOrNull(icon).bindInstant(now).bindStr(id))
+    }
+    // Up to 5 badges (the caller validates); empty clears the list and the old column.
+    updateBadges(id: String, badges: List<String>, now: String) {
+        if (badges.size() == 0) {
+            store.execute("update users set badges = ?, badge = ?, updated_at = ? where id = ?", DbParams().bindStrOrNull("").bindStrOrNull(null).bindInstant(now).bindStr(id))
+            return
+        }
+        if (badges.size() > 5) {
+            throw "MAX_BADGES"
+        }
+        store.execute("update users set badges = ?, badge = ?, updated_at = ? where id = ?", DbParams().bindStr(String.join("\n", badges)).bindStr(badges.get(0)).bindInstant(now).bindStr(id))
+    }
+}

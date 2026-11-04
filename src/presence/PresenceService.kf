@@ -1,0 +1,42 @@
+package presence
+
+import kernel.time.*
+
+// Presence rules (PresenceService). The invisible mode and sessions with no recent activity never reveal
+// activity to third parties; "do not disturb" silences push but keeps in-app notifications.
+class PresenceService {
+    PresenceStore repository
+    public constructor(repository: PresenceStore) {
+        this.repository = repository
+    }
+    String ownStatus(userId: String) {
+        var row = repository.find(userId)
+        if (row == null) {
+            return "AVAILABLE"
+        }
+        return row.status
+    }
+    String setStatus(userId: String, status: String) {
+        repository.setStatus(userId, status, Time.nowIso())
+        return status
+    }
+    heartbeat(userId: String) {
+        repository.touch(userId, Time.nowIso())
+    }
+    // Status other people see: OFFLINE unless the person is not invisible and was seen in the last 2 minutes.
+    String publicStatus(userId: String) {
+        var row = repository.find(userId)
+        if (row == null) {
+            return "OFFLINE"
+        }
+        if (row.status == "INVISIBLE") {
+            return "OFFLINE"
+        }
+        if (Time.toMillis(row.lastSeenAt) < Time.nowMillis() - 120000L) {
+            return "OFFLINE"
+        }
+        return row.status
+    }
+    // Read API for the push delivery: do-not-disturb silences push.
+    Bool allowPush(userId: String) = this.ownStatus(userId) != "DO_NOT_DISTURB"
+}

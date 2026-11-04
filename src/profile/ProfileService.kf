@@ -1,0 +1,386 @@
+package profile
+
+import kernel.cache.*
+import kernel.config.*
+import kernel.db.*
+import kernel.error.*
+import kernel.geo.*
+import kernel.html.*
+import kernel.sanctions.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+import kernel.url.*
+
+// Profile use cases (ProfileService): own and public reads (public ones cached 20 s and evicted on edit),
+// search, the newest-profiles showcase, the edit endpoint, the ranking preference and the age flow.
+class ProfileService {
+    Db store
+    ProfileDirectory directory
+    ProfileStore writes
+    ProfileReputation reputation
+    ProfileForeignCounts foreign
+    ProfileParentalLinks parental
+    ProfileBadgeOwnership badgeOwnership
+    SanctionGateReader sanctions
+    ActionThrottle throttle
+    TtlCache publicProfiles
+    TtlCache publicRanking
+    Int updatesPerHour
+    public constructor(store: Db, directory: ProfileDirectory, writes: ProfileStore, reputation: ProfileReputation, foreign: ProfileForeignCounts, parental: ProfileParentalLinks, badgeOwnership: ProfileBadgeOwnership, sanctions: SanctionGateReader, throttle: ActionThrottle, caches: Caches, cfg: Config) {
+        this.store = store
+        this.directory = directory
+        this.writes = writes
+        this.reputation = reputation
+        this.foreign = foreign
+        this.parental = parental
+        this.badgeOwnership = badgeOwnership
+        this.sanctions = sanctions
+        this.throttle = throttle
+        this.publicProfiles = caches.get("publicProfiles")
+        this.publicRanking = caches.get("publicRanking")
+        this.updatesPerHour = cfg.getInt("REDE_PROFILE_UPDATES_PER_HOUR", 30)
+    }
+    static String userNotFound() = Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+    ProfileRecord requireProfile(userId: String) {
+        var p = directory.findById(userId)
+        if (p == null) {
+            throw ProfileService.userNotFound()
+        }
+        return p
+    }
+    // GET /me: the account's own profile with counters, garden and the HTML bio/cover.
+    ProfileOwnView getMe(userId: String) {
+        var p = this.requireProfile(userId)
+        var counts = reputation.countsFor(userId)
+        return ProfileViews.ownView(p, counts, foreign.socialPosts(userId), true)
+    }
+    // GET /users/{username}: same projection for every reader, cached; a banned account answers 404.
+    String publicByUsername(username: String) {
+        var self = this
+        return publicProfiles.getOrLoad("u:" + username.toLowerCase(), () -> json.encode(self.loadPublic(self.directory.findByUsername(username), true)))
+    }
+    // GET /users/by-id/{id} (needs a session). The banned filter applies to the username route only.
+    String publicById(userId: String) {
+        var self = this
+        return publicProfiles.getOrLoad("i:" + userId, () -> json.encode(self.loadPublic(self.directory.findById(userId), false)))
+    }
+    ProfileView loadPublic(found: ProfileRecord?, bannedHidden: Bool) {
+        if (found == null) {
+            throw ProfileService.userNotFound()
+        }
+        var counts = reputation.countsFor(found.id)
+        if (bannedHidden && sanctions.banned(found.id)) {
+            throw ProfileService.userNotFound()
+        }
+        return ProfileViews.publicView(found, counts, foreign.socialPosts(found.id), true)
+    }
+    // GET /users/search: 2+ characters, banned accounts are not suggestions.
+    List<ProfileView> search(query: String) {
+        var out = listOf<ProfileView>()
+        for (var p in directory.search(query)) {
+            if (!sanctions.banned(p.id)) {
+                out.add(ProfileViews.publicView(p, null, null, false))
+            }
+        }
+        return out
+    }
+    // The public "ranking" is the arrivals showcase: newest first, banned accounts out, cached per limit.
+    String rankingJson(limit: Int) {
+        var self = this
+        return publicRanking.getOrLoad("" + limit, () -> json.encode(self.newest(limit)))
+    }
+    List<ProfileView> newest(limit: Int) {
+        var wanted = limit
+        if (wanted < 1) {
+            wanted = 1
+        }
+        var out = listOf<ProfileView>()
+        for (var p in directory.findNewest(wanted * 3)) {
+            if (out.size() < wanted && !sanctions.banned(p.id)) {
+                out.add(ProfileViews.publicView(p, null, null, false))
+            }
+        }
+        return out
+    }
+    // PUT /me/ranking: the ranking section of the profile is optional (a reader preference).
+    ProfileStatusView setShowRanking(userId: String, show: Bool) {
+        var self = this
+        var p = this.requireProfile(userId)
+        store.transaction(() -> {
+    self.writes.setShowRanking(userId, show, Time.nowIso())
+    self.invalidate(p, null)
+})
+        if (show) {
+            return ProfileStatusView(userId, "RANKING_VISIBLE")
+        }
+        return ProfileStatusView(userId, "RANKING_HIDDEN")
+    }
+    // Evicts this person's entries (by id and by both usernames) after commit and clears the showcase.
+    invalidate(p: ProfileRecord, previousUsername: String?) {
+        publicRanking.clearAfterCommit(store)
+        publicProfiles.evictAfterCommit(store, "i:" + p.id)
+        publicProfiles.evictAfterCommit(store, "u:" + p.username.toLowerCase())
+        if (previousUsername != null && previousUsername.toLowerCase() != p.username.toLowerCase()) {
+            publicProfiles.evictAfterCommit(store, "u:" + previousUsername.toLowerCase())
+        }
+    }
+    check(field: String, value: String?, max: Int) {
+        if (value != null && value.length() > max) {
+            throw Errors.api(400, "FIELD_TOO_LONG", "O campo " + field + " pode ter no maximo " + max + " caracteres.")
+        }
+    }
+    // Limit of each field with a message naming WHICH field passed (a long value used to burst the column
+    // and become a generic 409).
+    validateLengths(c: ProfileUpdateBody) {
+        this.check("nome", c.name(), 160)
+        this.check("headline", c.headline(), 180)
+        this.check("empresa", c.company(), 160)
+        this.check("local", c.location(), 160)
+        this.check("disponibilidade", c.availability(), 160)
+        this.check("portfolio", c.portfolio(), 500)
+        this.check("bio", c.bio(), 1024)
+        this.check("avatar", c.avatar(), 500)
+        this.check("banner", c.banner(), 500)
+        this.check("emblema", c.badge(), 500)
+        this.check("vulgo", c.aka(), 60)
+        this.check("curriculo", c.resumeUrl(), 500)
+        this.check("nome do curriculo", c.resumeName(), 200)
+        var links = c.externalLinks()
+        if (links != null) {
+            for (var l in links) {
+                this.check("link", l, 500)
+            }
+        }
+        var skills = c.skills()
+        if (skills != null) {
+            for (var s in skills) {
+                this.check("habilidade", s, 1600)
+            }
+        }
+        var goals = c.goals()
+        if (goals != null) {
+            for (var g in goals) {
+                this.check("objetivo", g, 1600)
+            }
+        }
+    }
+    static Bool hasText(v: String?) = Texts.hasText(v)
+    // StringUtils.hasText ? trim : value
+    static String? trimText(v: String?) = Texts.trimIfText(v)
+    // UserProfile.keep: null keeps the stored value, anything else is trimmed.
+    static String? keep(v: String?, current: String?) {
+        if (v == null) {
+            return current
+        }
+        return v.trim()
+    }
+    static String? clean(v: String?) = v
+    static List<String>? cleanList(values: List<String>?) {
+        if (values == null) {
+            return null
+        }
+        var out = listOf<String>()
+        for (var v in values) {
+            if (v.trim().length() > 0 && !out.contains(v.trim())) {
+                out.add(v.trim())
+            }
+        }
+        return out
+    }
+    // Lowercase, runs of anything but [a-z0-9] become "-", no leading or trailing "-"; null when nothing is left.
+    static String? slug(value: String?) {
+        if (value == null) {
+            return null
+        }
+        if (value.trim().length() == 0) {
+            return null
+        }
+        var s = value.toLowerCase().replaceAll("[^a-z0-9]+", "-").replaceAll("(^-|-$)", "")
+        if (s.trim().length() == 0) {
+            return null
+        }
+        return s
+    }
+    // PATCH /me/profile.
+    ProfileOwnView update(userId: String, c: ProfileUpdateBody) {
+        if (updatesPerHour > 0) {
+            throttle.requireAllowed("profile-update", userId, updatesPerHour, 3600000L)
+        }
+        // HTML/CSS cleaning is CPU work: do it before the first SQL so the pool stays free meanwhile.
+        var bioPresent = c.bioHtml() != null
+        var bannerPresent = c.bannerHtml() != null
+        var bioHtml = Nulls.str()
+        var bannerHtml = Nulls.str()
+        if (bioPresent && ProfileService.hasText(c.bioHtml())) {
+            bioHtml = SafeHtml.requireProfileHtml(c.bioHtml())
+        }
+        if (bannerPresent && ProfileService.hasText(c.bannerHtml())) {
+            bannerHtml = SafeHtml.requireProfileHtml(c.bannerHtml())
+        }
+        var profile = this.requireProfile(userId)
+        var username = ProfileService.trimText(c.username())
+        if (username != null && username != profile.username) {
+            var slug = ProfileService.slug(username)
+            if (slug != null) {
+                if (directory.existsByUsername(slug)) {
+                    throw Errors.api(409, "USERNAME_TAKEN", "Nome de usuario ja esta em uso.")
+                }
+                if (AdminGuard.isReservedUsername(slug) && !profile.admin) {
+                    throw Errors.api(409, "USERNAME_RESERVED", "Este nome de usuario e reservado para a equipe.")
+                }
+            }
+            username = slug
+        }
+        this.validateLengths(c)
+        var badgeIn = c.badge()
+        if (badgeIn != null && !badgeOwnership.ownsAllOfficial(profile.id, listOf(badgeIn.trim()))) {
+            throw Errors.api(403, "NOT_OWNED", "Voce so pode exibir emblemas oficiais que tem.")
+        }
+        var portfolio = SafeUrl.requireHttpUrl(ProfileService.trimText(c.portfolio()), "portfolio")
+        var links = SafeUrl.requireHttpUrlList(ProfileService.cleanList(c.externalLinks()), "link")
+        var now = Time.nowIso()
+        // UserProfile.update: null keeps, anything else is trimmed.
+        var name = ProfileService.keep(ProfileService.trimText(c.name()), profile.name)
+        var banner = ProfileService.keep(ProfileService.trimText(c.banner()), profile.banner)
+        var bannerItem = profile.bannerItem
+        if (banner != profile.banner) {
+            bannerItem = Nulls.str()
+        }
+        var skills = ProfileService.cleanList(c.skills())
+        var goals = ProfileService.cleanList(c.goals())
+        var openToWork = profile.openToWork
+        if (c.openToWork() != null) {
+            openToWork = c.openToWork() == true
+        }
+        var mentor = profile.mentor
+        if (c.isMentor() != null) {
+            mentor = c.isMentor() == true
+        }
+        var finalUsername = profile.username
+        if (username != null) {
+            finalUsername = ProfileService.keep(username, profile.username) as String
+        }
+        var city = profile.city
+        var state = profile.state
+        var cityKey = profile.cityKey
+        if (c.city() != null || c.state() != null) {
+            var place = CityState.of(c.city(), c.state())
+            if (place == null) {
+                city = Nulls.str()
+                state = Nulls.str()
+                cityKey = Nulls.str()
+            }
+            else {
+                city = place.city
+                state = place.state
+                cityKey = place.cityKey
+            }
+        }
+        var showCity = profile.showCity
+        if (c.showCity() != null) {
+            showCity = c.showCity() == true
+        }
+        var resumeUrl = profile.resumeUrl
+        var resumeName = profile.resumeName
+        var resumeIn = c.resumeUrl()
+        if (resumeIn != null) {
+            var url = SafeUrl.requireHttpUrl(resumeIn, "curriculo")
+            if (Texts.isBlank(url)) {
+                resumeUrl = Nulls.str()
+                resumeName = Nulls.str()
+            }
+            else {
+                resumeUrl = Texts.trimIfText(url)
+                resumeName = profileBlankNull(c.resumeName())
+            }
+        }
+        var finalBioHtml = profile.bioHtml
+        if (bioPresent) {
+            finalBioHtml = bioHtml
+        }
+        var finalBannerHtml = profile.bannerHtml
+        if (bannerPresent) {
+            if (bannerHtml != profile.bannerHtml) {
+                bannerItem = Nulls.str()
+            }
+            finalBannerHtml = bannerHtml
+        }
+        var birthDate = profile.birthDate
+        var birthIn = c.birthDate()
+        if (birthIn != null && birthIn.trim().length() > 0) {
+            if (!Dates.valid(birthIn.trim())) {
+                throw Errors.api(400, "INVALID_BIRTH_DATE", "Data de nascimento invalida (use aaaa-mm-dd).")
+            }
+            birthDate = birthIn.trim()
+        }
+        var edit = ProfileEdit(userId, finalUsername, name as String, ProfileService.keep(ProfileService.trimText(c.headline()), profile.headline), ProfileService.keep(ProfileService.trimText(c.company()), profile.company), ProfileService.keep(ProfileService.trimText(c.location()), profile.location), ProfileService.keep(ProfileService.trimText(c.avatar()), profile.avatar), banner, bannerItem, ProfileService.keep(ProfileService.trimText(c.badge()), profile.badge), ProfileService.keep(ProfileService.trimText(c.bio()), profile.bio), ProfileService.keep(ProfileService.trimText(c.aka()), profile.aka), this.orCurrent(skills, profile.skills), this.orCurrent(goals, profile.goals), ProfileService.keep(ProfileService.trimText(c.availability()), profile.availability), ProfileService.keep(portfolio, profile.portfolio), this.orCurrent(links, profile.externalLinks), openToWork, mentor, city, state, cityKey, showCity, resumeUrl, resumeName, finalBioHtml, finalBannerHtml, birthDate, now)
+        var self = this
+        store.transaction(() -> {
+    self.writes.saveEdit(edit, profile)
+    self.invalidate(profile, profile.username)
+    self.publicProfiles.evictAfterCommit(self.store, "u:" + edit.username.toLowerCase())
+})
+        // the cache key of the new username is evicted too
+        // The answer is the stored profile with zero counters, no posts count, no garden, no HTML (the
+        // idempotency table keeps the response body in a text column).
+        return ProfileViews.ownView(this.requireProfile(userId), null, null, false)
+    }
+    List<String> orCurrent(v: List<String>?, current: List<String>) {
+        if (v == null) {
+            return current
+        }
+        return v
+    }
+    // GET /me/age-state.
+    ProfileAgeState ageState(userId: String) {
+        var p = this.requireProfile(userId)
+        var born = p.birthDate
+        if (born == null) {
+            return ProfileAgeState("BIRTH_DATE_REQUIRED", false, false, false)
+        }
+        var minor = Dates.yearsBetween(born, Dates.todayBrazil()) < 18
+        return this.ageStateOf(userId, minor)
+    }
+    ProfileAgeState ageStateOf(userId: String, minor: Bool) {
+        var supervised = minor && parental.activeForMinor(userId)
+        var state = "ADULT_DECLARED"
+        if (minor) {
+            if (supervised) {
+                state = "MINOR_SUPERVISED"
+            }
+            else {
+                state = "MINOR_CONSENT_PENDING"
+            }
+        }
+        return ProfileAgeState(state, minor, true, supervised)
+    }
+    // POST /me/birth-date: the date never comes back, only the resulting state.
+    ProfileAgeState declareBirthDate(userId: String, raw: String?) {
+        var text = ""
+        if (raw != null) {
+            text = raw.trim()
+        }
+        if (text.length() > 0 && !Dates.valid(text)) {
+            throw Errors.api(400, "INVALID_BIRTH_DATE", "Data de nascimento invalida (use aaaa-mm-dd).")
+        }
+        if (text.length() == 0) {
+            throw Errors.api(400, "BIRTH_DATE_REQUIRED", "Informe a data de nascimento.")
+        }
+        var today = Dates.todayBrazil()
+        if (text.compareTo(today) > 0) {
+            throw Errors.api(400, "INVALID_BIRTH_DATE", "A data de nascimento nao pode ser no futuro.")
+        }
+        var age = Dates.yearsBetween(text, today)
+        if (age < 0 || age > 120) {
+            throw Errors.api(400, "INVALID_BIRTH_DATE", "A data de nascimento nao parece real.")
+        }
+        var p = this.requireProfile(userId)
+        var self = this
+        store.transaction(() -> {
+    self.writes.declareBirthDate(userId, text, Time.nowIso())
+    self.invalidate(p, null)
+})
+        return this.ageStateOf(userId, age < 18)
+    }
+}
