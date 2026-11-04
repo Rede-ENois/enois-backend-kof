@@ -1,0 +1,132 @@
+package apiv1
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+
+// GET /v1 (the version index, built from the router itself), the developer's own origins and the admin panel of them.
+class ApiV1Routes {
+    static String note() = "Alias versionado: o caminho e a resposta sao os mesmos do caminho sem versao. O formato do erro e {code, message, timestamp}. Este indice e o contrato legivel por maquina: a API nao publica documento OpenAPI (nao existe /openapi.json); a documentacao legivel esta na pagina /developers do app."
+    static register(server: HttpServer, service: DeveloperOriginService) {
+        server.get("/v1", () -> ApiV1Routes.index(server))
+        server.get("/developers/origins", () -> ApiV1Routes.list(service))
+        server.post("/developers/origins", () -> ApiV1Routes.add(service))
+        server.delete("/developers/origins/:id", () -> ApiV1Routes.remove(service))
+        server.get("/admin/developers/origins", () -> ApiV1Routes.listAll(service))
+        server.post("/admin/developers/origins/:id/block", () -> ApiV1Routes.block(service))
+        server.post("/admin/developers/origins/:id/unblock", () -> ApiV1Routes.unblock(service))
+    }
+    // Every route registered in the router, with its method. A route that enters the backend shows up here by itself.
+    static String index(server: HttpServer) {
+        var endpoints = listOf<ApiV1Endpoint>()
+        for (var r in server.routes) {
+            // The /v1 aliases are the same routes under the version prefix: they are not listed twice.
+            if (!r.pattern().startsWith("/v1")) {
+                endpoints.add(ApiV1Endpoint(r.method(), ApiV1Routes.braces(r.pattern())))
+            }
+        }
+        return json.encode(ApiV1Index("v1", "/v1", ApiV1Routes.note(), ApiV1Routes.sorted(endpoints)))
+    }
+    // `:postId` becomes `{postId}`, the form the developers page shows.
+    static String braces(pattern: String) {
+        var parts = pattern.split("/")
+        var out = ""
+        var i = 0
+        while (i < parts.length) {
+            var part = parts[i]
+            if (part.startsWith(":")) {
+                part = "{" + part.substring(1) + "}"
+            }
+            if (i > 0) {
+                out = out + "/"
+            }
+            out = out + part
+            i = i + 1
+        }
+        return out
+    }
+    // By path, then by method; duplicates (same method and path) collapse.
+    static List<ApiV1Endpoint> sorted(items: List<ApiV1Endpoint>) {
+        var out = listOf<ApiV1Endpoint>()
+        for (var e in items) {
+            var duplicate = false
+            for (var seen in out) {
+                if (ApiV1Routes.compare(seen, e) == 0) {
+                    duplicate = true
+                }
+            }
+            if (!duplicate) {
+                out.add(e)
+                // Insertion sort: walk the new element down to its place.
+                var at = out.size() - 1
+                while (at > 0 && ApiV1Routes.compare(out.get(at - 1), out.get(at)) > 0) {
+                    var above = out.get(at - 1)
+                    out.set(at - 1, out.get(at))
+                    out.set(at, above)
+                    at = at - 1
+                }
+            }
+        }
+        return out
+    }
+    static Int compare(a: ApiV1Endpoint, b: ApiV1Endpoint) {
+        var byPath = a.path().compareTo(b.path())
+        if (byPath != 0) {
+            return byPath
+        }
+        return a.method().compareTo(b.method())
+    }
+    static String list(service: DeveloperOriginService) {
+        var userId = Auth.requireUser()
+        return json.encode(service.list(userId))
+    }
+    static String add(service: DeveloperOriginService) {
+        var userId = Auth.requireUser()
+        SafeLinks.checkRequest()
+        var request = ApiV1Routes.parse()
+        return status(201, json.encode(service.add(userId, request.origin())))
+    }
+    static String remove(service: DeveloperOriginService) {
+        var userId = Auth.requireUser()
+        service.remove(userId, Req.pathParam("id"))
+        return status(200, "")
+    }
+    static String listAll(service: DeveloperOriginService) {
+        Auth.requireAdmin()
+        return json.encode(service.listAll(Req.queryInt("limit", 200)))
+    }
+    static String block(service: DeveloperOriginService) {
+        Auth.requireAdmin()
+        var id = Req.pathParam("id")
+        if (Req.bodyText().trim().length() > 0) {
+            SafeLinks.checkRequest()
+            var request = ApiV1Routes.parseBlock()
+            service.blockById(id, request.reason())
+        }
+        else {
+            service.blockById(id, "Bloqueio manual da administracao")
+        }
+        return json.encode(service.byId(id))
+    }
+    static String unblock(service: DeveloperOriginService) {
+        Auth.requireAdmin()
+        var id = Req.pathParam("id")
+        service.unblock(id)
+        return json.encode(service.byId(id))
+    }
+    static DeveloperOriginRequest parse() {
+        try {
+            return json.decode<DeveloperOriginRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static DeveloperOriginBlockRequest parseBlock() {
+        try {
+            return json.decode<DeveloperOriginBlockRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}
