@@ -96,3 +96,19 @@ escalation text instead of reading the `reports` table; `IntelligentCacheTests` 
 behaviours on `TtlCache`/`Caches` (reuse, expiry loads nothing on its own, renew after expiry, a write
 clears after commit, a failed write leaves the cache alone, one load for concurrent callers, closed list of
 caches with their policy) because `EventService` is not ported.
+
+## gifs
+
+| Domain | Endpoints ported / total | Tests ported / total | Gaps |
+|---|---|---|---|
+| gifs (`src/gifs/`, tests in `tests/gifs/`) | 1 / 1 (`GET /gifs/search`) | 12 / 12 Java tests (18 Kof tests: 6 extra for provider URLs, failure mapping, limit floor and malformed limit, term normalisation, failure not cached, key availability, community provider) | G170 to G172 |
+
+Ported: `GifSearchService` (first available provider that answers wins, Tenor before GIPHY, a failing provider hands over to the next, all failing rethrows `502 GIF_PROVIDER_ERROR`, no key anywhere answers `available: false`), the cache `gifSearch` (`term|limit`, 10 min, failures not cached), the Tenor and GIPHY payload mappers, `CommunityGifProvider`.
+Env: `REDE_GIFS_TENOR_KEY`, `REDE_GIFS_GIPHY_KEY` (cache TTL: `REDE_CACHE_GIF_SEARCH_TTL`).
+
+| Seam (class in `gifs`) | Default | Owner / what it needs |
+|---|---|---|
+| `GifHttp.get(url)` | `kof.http` GET, 8 s timeout (any failure is a 502) | tests subclass it; nothing else |
+| `GifCommunityReader.search(term, limit)` | finds nothing | feed: `CommunityGifAdapter` (comments with a `.gif` URL matching the term). Java never registers `CommunityGifProvider` as a bean, so it is not wired here either; wire it (third provider) only if the feed port wants the "Comunidade" source |
+
+Behaviour notes: the Java `Math.clamp(limit, 1, 50)` and the trim + lower-case of `q` are kept; a malformed `limit` answers `400 BAD_REQUEST` (Spring's argument mismatch). The Java suite had 5 MockMvc + 3 service + 3 mapping + 1 unavailable = 12 tests; all are ported with the same assertions.
