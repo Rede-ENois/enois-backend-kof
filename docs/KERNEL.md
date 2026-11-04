@@ -209,7 +209,7 @@ Cookies.add(Cookies.build(name, value, maxAge, httpOnly, secure, sameSite, path)
 
 Any number of cookies per response (the runtime keeps one value per header name, see G13).
 
-### Filter chain (hook for the security task)
+### Filter chain
 
 ```kotlin
 server.use("session", 100, () -> {
@@ -222,9 +222,9 @@ server.use("session", 100, () -> {
 
 A filter returns `Http.next()` to continue, or a response (`Http.respond(status, body)`), or throws
 an ApiError. Lower order runs first; equal orders keep registration order. Built-ins: order `-1000`
-unknown-path fallback (like `FallbackSurfaceFilter`, before everything), order `1000` method check.
-Use any other integers: below `-1000` runs before the fallback (observability), between the two for
-security filters. The V1 alias needs no filter (routes are registered under both prefixes).
+unknown-path fallback (like `FallbackSurfaceFilter`), order `1000` method check (405). The whole security
+pipeline lives between them and around them, see "Filter order" under `kernel.security`. The V1 alias
+needs no filter (routes are registered under both prefixes); guards compare `RequestPath.current()`.
 
 ### After hooks, request context
 
@@ -293,6 +293,139 @@ hash). The verification check reads `users.email_verified_at / totp_enabled_at /
 federated_second_factor_at`; a missing user row passes (as in Java). One resolution per request is cached by
 token digest (reset by `Auth.resetRequest`, called by the observability filter), so a write that went through
 the write gate does not repeat the two queries in its handler.
+
+### Filter order (Java -> Kof)
+
+`Security.install(platform, hooks)` registers the whole pipeline. The Java order comes from `@Order`
+(Spring filters), the MVC interceptors and the MVC CORS handling; the kernel's `-1000` and `1000` built-ins keep
+their slots.
+
+| Kof order | Name | Java | What it does |
+|---|---|---|---|
+| -1004 | `request-observability` | `RequestObservabilityFilter` (HIGHEST+2) | request id, `LogContext`, `X-Request-Id`, access line (an after hook) |
+| -1003 | `panic-mode` | `PanicModeFilter` (+3) | 429 `PANIC_MODE` on writes while panic is on |
+| -1001 | `path-guard` | `FallbackSurfaceFilter` (+4), malformed escape | `400` empty on a bad `%` escape |
+| -1000 | `fallback-surface` | `FallbackSurfaceFilter` (+4) | unknown path: `200` empty (kernel built-in) |
+| -990 | `origin-gate` | `RequestOriginFilter` + `OriginAbuseGuard` (+5) | `ORIGIN_*` 403s, preflight 204, third-party CORS |
+| -980 | `session-csrf` | `SessionCookieFilter` (+6) | `CSRF_REQUIRED` on cookie writes |
+| 0 | `abuse-guard` | `AbuseGuardFilter` (@Order 0) | timed denial for error scanners (after hook counts) |
+| 1 | `global-rate-limit` | `GlobalApiRateLimitFilter` (1) | write ceiling per user / ip |
+| 2 | `identity-rate-limit` | `IdentityRateLimitFilter` (2) | per-ip limit on `/auth/*` POSTs |
+| 2 | `public-read-rate-limit` | `PublicReadRateLimitFilter` (2) | `ENUMERATION_GUARD` on people reads |
+| 3 | `post-rate-limit` | `PostRateLimitFilter` (3) | POST ceiling per session digest / ip |
+| 4 | `duplicate-post` | `DuplicatePostFilter` (4) | replays the answer of an identical in-flight POST |
+| 5 | `security-headers` | `SecurityHeadersFilter` (no `@Order`: innermost) | the 8 headers, `no-store` for sessions |
+| 5 | `public-read-cache-control` | `PublicReadCacheControlInterceptor` | `public, max-age=0, must-revalidate` on public GETs |
+| 5 (transform) | `public-read-etag` | `ShallowEtagHeaderFilter` | weak ETag / 304 on public GETs |
+| 6 | `cors` | Spring MVC CORS (`CorsConfig`, `DefaultCorsProcessor`) | preflight, credentialed grant, `Invalid CORS request` |
+| 7 | `admin-route-guard` | `AdminRouteInterceptor` | `/admin/**` needs an admin (moderator paths: a moderator) |
+| 8 | `write-gate` | `WriteRouteInterceptor` | every write needs a session unless it is a public flow |
+| 1000 | `method-not-allowed` | MVC handler mapping 405 | kernel built-in |
+
+Differences, all on purpose:
+
+- Java's `V1AliasFilter` (`@Order 0`) runs after the origin gate, the panic filter and the CSRF filter, so
+  those saw `/v1/auth/login`, `/v1/admin/...` raw: the panic exemption missed `/v1/auth/login`, and
+  `/v1/admin/**` needed only a registered origin, not the front end's. Every guard here compares
+  `RequestPath.current()` (alias stripped), so `/v1/...` and `/...` get exactly the same rules.
+- The admin and write gates run only for a request that matched a route and method (Spring interceptors
+  never see a 405), and never on a preflight.
+- A path is "known" only when spelled exactly like a registered route (raw, case-sensitive, no decoding).
+  Java decoded `/auth/%63onfig` into the `/auth/config` route; here it is an unknown path (`200` empty). The
+  other spellings the Java tests lock (`/%61dmin/support`, `/admin;v=1/support`, `//`) are unknown paths in
+  both. A guard can therefore never be skipped by an alternative spelling of a route.
+- `FallbackSurfaceFilter` also served an embedded decoy pack (`LegacyPack`: `.env`, `.git`, wp-admin ...) with a
+  delay and an origin auto-block; that honeypot is not ported (see `docs/PORTING_STATUS.md`).
+
+### Wiring (`Security`, `SecurityHooks`)
+
+```kotlin
+var hooks = SecurityHooks.defaults(platform.db)     // Main.kf: replace a field when its domain lands
+hooks.moderators = ModerationModerators(...)        // moderation: SecurityModerators.isModerator(userId)
+hooks.monitoring = OpsMonitoring(...)               // ops: SecurityMonitoring (counters, events)
+hooks.reports = ModerationAutoReports(...)          // moderation: SecurityAutoReports.report(userId, reason, description)
+hooks.origins = DeveloperOrigins(...)               // apiv1: OriginDirectory (default: JdbcOriginDirectory on developer_origins)
+var parts = Security.install(platform, hooks)       // filters, routes, statics; returns SecurityParts
+parts.userLimiter.require(userId, UserRateLimiter.createPost())    // limiter instances for the domains
+```
+
+The seams are classes with a safe default, not interfaces: a Kof interface declared in a package cannot be
+implemented (KOF_GAPS G30). A domain `extends` the class and overrides its methods.
+
+`Security.install` also registers `GET /admin/panic` and `POST /admin/panic` (`{"active":true}` ->
+`{"active","envLocked","message"}`, admin only, exempt from the panic block itself).
+
+### Guards (`Auth.requireAdmin`, `AdminGuard`, `ModeratorGuard`)
+
+```kotlin
+Auth.requireAdmin()        // userId; 403 FORBIDDEN "Acesso restrito a administradores." unless users.is_admin
+Auth.requireModerator()    // userId; admin or moderator; 403 FORBIDDEN "Acesso restrito a moderadores."
+parts.admin.isAdmin(userId)   AdminGuard.isReservedUsername(name)   AdminGuard.reservedUsernames()
+```
+
+Admin is the immutable `users.is_admin`; `REDE_ADMIN_BOOTSTRAP_ENABLED=true` + `REDE_ADMIN_EMAILS` adds an
+e-mail allowlist for TESTS ONLY. `/admin/**` is gated centrally: moderators also pass `/admin/appeals`,
+`/admin/support` (not `/admin/support/github`), `/admin/suggestions`, `/admin/emails`, `/admin/blocked-ips`,
+`/admin/monitoring` and `/admin/users/{id}/(sanction|sanitize|ips)`.
+
+### Limiters
+
+All in memory, per pod (N replicas = N x the ceiling), sliding windows on `SecurityClock` (tests move time with
+`SecurityClock.advanceSeconds`). A rejected attempt is never counted.
+
+```kotlin
+parts.ipLimiter.tryAcquire(IpRateLimiter.login(), ip): Bool          // signup login password email 2fa contribution refresh
+parts.userLimiter.require(userId, UserRateLimiter.createPost())      // 429 RATE_LIMIT_EXCEEDED; 3 rejections/h -> hooks.reports
+parts.actionThrottle.requireAllowed("report", userId, 5, 3600000L)   // 429 ACTION_THROTTLED
+parts.authThrottle.requireLoginAllowed(email, ip)   recordLoginFailure(email, ip)   clearLogin(email, ip)
+parts.authThrottle.requireSignupAllowed(ip, fingerprint)             // 429 LOGIN_THROTTLED (+Retry-After) / SIGNUP_THROTTLED
+parts.newAccountCooldown.require(userId)                             // 429 ACCOUNT_TOO_NEW
+parts.timingGuard.recordAction(userId)   looksAutomated(userId)      // 10 actions, stddev < 500 ms, log only
+parts.namedLimiters.require("auth")                                  // resilience4j: auth twofa refresh search email-sending
+                                                                     // 429 RATE_LIMITED + Retry-After 60
+```
+
+Env (defaults are the `application.properties` values; Spring-relaxed names for the ones without a placeholder):
+
+| Limiter | Variables |
+|---|---|
+| IpRateLimiter | `SIGNUP_RATE_LIMIT` 10, `LOGIN_RATE_LIMIT` 60, `PASSWORD_RATE_LIMIT` 5, `EMAIL_RATE_LIMIT` 5, `TWO_FACTOR_RATE_LIMIT` 20, `CONTRIBUTION_RATE_LIMIT` 5, `REFRESH_RATE_LIMIT` 120; windows `REDE_SECURITY_RATE_LIMIT_<SIGNUP\|LOGIN\|PASSWORD\|EMAIL\|2FA\|CONTRIBUTION\|REFRESH>_WINDOW_MINUTES` 60/15/15/15/15/60/15 |
+| UserRateLimiter | `REDE_RATE_POST_LIMIT` 10, `REDE_RATE_COMMENT_LIMIT` 30, `REDE_RATE_JOB_APPLY_LIMIT` 100, `REDE_RATE_MESSAGE_LIMIT` 60, `REDE_RATE_GITHUB_SYNC_LIMIT` 3, `REDE_CALL_START_LIMIT` 20; `..._WINDOW_MINUTES` 60/60/30/1/60/60 |
+| AuthThrottle | `REDE_AUTH_THROTTLE_LOGIN_MAX_FAILURES` 5, `REDE_AUTH_THROTTLE_SIGNUP_PER_HOUR` 10 (explicit `SPRING_PROFILES_ACTIVE=dev`: 100 / 100000) |
+| NewAccountCooldown | `REDE_SECURITY_NEW_ACCOUNT_COOLDOWN_SECONDS` 30 (0 off) |
+| named (resilience4j) | `RESILIENCE4J_RATELIMITER_INSTANCES_<AUTH\|TWOFA\|REFRESH\|SEARCH\|EMAIL_SENDING>_LIMIT_FOR_PERIOD` 300/60/120/120/200 and `_LIMIT_REFRESH_PERIOD` 1m/1m/1m/1m/15m |
+| GlobalApiRateLimitFilter | `GLOBAL_RATE_LIMIT_PER_MINUTE` 300 (0 off), `REDE_RATE_GLOBAL_SHARED_MULTIPLIER` 50 |
+| PostRateLimitFilter | `POST_GUARD_ENABLED` true, `POST_USER_RATE_LIMIT` 120, `POST_IP_RATE_LIMIT` 300 |
+| PublicReadRateLimitFilter | `REDE_RATE_PUBLIC_READ_PER_MINUTE` 600 |
+| AbuseGuardFilter | `REDE_SECURITY_ABUSE_MAX_ERRORS` 0 (off), `_WINDOW_SECONDS` 180, `_FIRST_BLOCK_MINUTES` 15, `_MAX_BLOCK_MINUTES` 360 |
+| DuplicatePostFilter | `REDE_SECURITY_DUPLICATE_POST_ENABLED` true |
+| Panic mode | `PANIC_MODE` (`yes\|true\|on\|1`: hard override, the panel cannot switch it off) |
+| Origins and CORS | `CORS_ALLOWED_ORIGINS` (prd/qa/dev profile defaults as in Java), `REDE_TRUSTED_ORIGINS`, `REDE_ORIGINS_ENFORCE` true, `REDE_ORIGINS_MAX_FAILURES` 60, `REDE_ORIGINS_WINDOW_SECONDS` 300, `REDE_ORIGINS_BLOCK_MINUTES` 30; `*` or `scheme://*` is a boot error |
+| Cookies | `REDE_AUTH_COOKIE_SECURE` |
+
+Rate limiter answers are written by hand like in Java: `{"code":"RATE_LIMITED","message":"..."}` with no timestamp,
+`Retry-After`, and the CORS headers of a trusted origin (so the browser shows the 429 instead of a network error).
+Limiter keys never hold a token in clear (digests) and the limiters' own warnings carry no addresses or tokens.
+
+### Access log, audit and request context
+
+`RequestObservability` writes one `http_request requestId=... method=... path=... status=... durationMs=...
+clientIp=... userId=... deviceId=...` line per request (INFO; ERROR for 5xx; DEBUG for `/livez`, `/readyz`,
+`/actuator/health*`), `slow_request` WARN from 2 s, and `admin_action actor=... action=POST /admin/x/:id path=...
+status=...` on the `audit` logger for every `/admin/**` mutation. Handlers read `LogContext.get("userId")`,
+`requestId`, `clientIp`, `deviceId`, `http.method`, `http.path`. Tests turn on `RequestObservability.startCapture()`
+and read the lines with `drainCapture()`.
+
+### Test support (`SecurityApp`, `SecurityFixtures`)
+
+```kotlin
+var app = SecurityApp.boot("name", mapOf("LOGIN_RATE_LIMIT", "3"), (s: HttpServer) -> wire(s))   // enforcement off
+SecurityFixtures.login(app.db(), "user_a", "tok-a-1234567890")        // verified user + live session
+SecurityFixtures.user(db, id, verified, admin)   session(db, id, token, ttlSeconds)   revoke(db, token)
+Check.filterError(res, 429, "RATE_LIMITED")      // filter answers have code + message and NO timestamp
+```
+
+One `SecurityApp` per test file: `Security.install` sets process-wide statics (`Auth`, `SessionCookies`).
 
 ## kernel.jobs
 
