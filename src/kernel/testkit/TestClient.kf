@@ -1,0 +1,211 @@
+package kernel.testkit
+
+import java.io.InputStream
+import java.lang.String
+import java.net.Socket
+import java.util.HashMap
+
+// A response as the test sees it: status, header lines, body.
+class TestResponse {
+    Int status
+    String body
+    List<String> headerNames = listOf<String>()
+    List<String> headerValues = listOf<String>()
+    public constructor(status: Int, body: String) {
+        this.status = status
+        this.body = body
+    }
+    // First value of a header (case-insensitive) or null.
+    String? headerOf(name: String) {
+        var i = 0
+        while (i < headerNames.size()) {
+            if (headerNames.get(i).toLowerCase() == name.toLowerCase()) {
+                return headerValues.get(i)
+            }
+            i = i + 1
+        }
+        return null
+    }
+    List<String> headersOf(name: String) {
+        var out = listOf<String>()
+        var i = 0
+        while (i < headerNames.size()) {
+            if (headerNames.get(i).toLowerCase() == name.toLowerCase()) {
+                out.add(headerValues.get(i))
+            }
+            i = i + 1
+        }
+        return out
+    }
+    List<String> setCookies() = headersOf("set-cookie")
+    // Value of a cookie set by this response (`name=value; ...`), or null.
+    String? cookieValue(name: String) {
+        for (var line in setCookies()) {
+            if (line.startsWith(name + "=")) {
+                var rest = line.substring(name.length() + 1)
+                var semi = rest.indexOf(";")
+                if (semi >= 0) {
+                    return rest.substring(0, semi)
+                }
+                return rest
+            }
+        }
+        return null
+    }
+    // The full Set-Cookie line of a cookie, or null.
+    String? setCookieLine(name: String) {
+        for (var line in setCookies()) {
+            if (line.startsWith(name + "=")) {
+                return line
+            }
+        }
+        return null
+    }
+    // Same as headerOf, "" when absent (handy in assertions).
+    String header(name: String) {
+        var v = headerOf(name)
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    String cookieLine(name: String) {
+        var v = setCookieLine(name)
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    String cookie(name: String) {
+        var v = cookieValue(name)
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    // JSON value as text, "" when absent or null.
+    String json(path: String) {
+        var v = jsonStr(path)
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    String? jsonStr(path: String) = JsonPath.str(body, path)
+    Bool jsonHas(path: String) = JsonPath.has(body, path)
+    Bool jsonIsNull(path: String) = JsonPath.isNull(body, path)
+    Int jsonSize(path: String) = JsonPath.size(body, path)
+}
+
+// HTTP/1.1 client over a raw socket (kof.http returns only the body, never the status or headers:
+// KOF_GAPS G15). Supports every method and header (Origin, Cookie, Idempotency-Key, ...).
+// Keeps a cookie jar when `jar` is on: cookies from Set-Cookie are sent back on later calls.
+class TestClient {
+    Int port
+    Map<String,String> jar = new HashMap<String, String>()
+    Bool useJar = false
+    public constructor(port: Int) {
+        this.port = port
+    }
+    TestClient withJar() {
+        this.useJar = true
+        return this
+    }
+    clearJar() {
+        jar.clear()
+    }
+    // `headers`: "Name: value" lines; `cookies`: "a=b; c=d" or "".
+    TestResponse send(method: String, path: String, headers: List<String>, cookies: String, body: String) {
+        var req = method + " " + path + " HTTP/1.1\r\nHost: localhost:" + port + "\r\nConnection: close\r\n"
+        for (var h in headers) {
+            req = req + h + "\r\n"
+        }
+        var cookieLine = cookies
+        if (useJar) {
+            for (var k in jar.keys()) {
+                var pair = k + "=" + jar.getOrDefault(k, "")
+                if (cookieLine.length() > 0) {
+                    cookieLine = cookieLine + "; " + pair
+                }
+                else {
+                    cookieLine = pair
+                }
+            }
+        }
+        if (cookieLine.length() > 0) {
+            req = req + "Cookie: " + cookieLine + "\r\n"
+        }
+        var payload = body.getBytes()
+        if (body.length() > 0) {
+            req = req + "Content-Length: " + payload.length + "\r\n"
+        }
+        req = req + "\r\n"
+        var socket = new Socket("127.0.0.1", port)
+        socket.setSoTimeout(15000)
+        var out = socket.getOutputStream()
+        out.write(req.getBytes())
+        if (body.length() > 0) {
+            out.write(payload)
+        }
+        out.flush()
+        var raw = TestClient.readAll(socket.getInputStream())
+        socket.close()
+        var res = TestClient.parse(raw)
+        if (useJar) {
+            for (var line in res.setCookies()) {
+                var semi = line.indexOf(";")
+                var pair = line
+                if (semi >= 0) {
+                    pair = line.substring(0, semi)
+                }
+                var eq = pair.indexOf("=")
+                if (eq > 0) {
+                    var name = pair.substring(0, eq)
+                    var value = pair.substring(eq + 1)
+                    if (value.length() == 0 || line.contains("Max-Age=0;") || line.endsWith("Max-Age=0")) {
+                        jar.remove(name)
+                    }
+                    else {
+                        jar.put(name, value)
+                    }
+                }
+            }
+        }
+        return res
+    }
+    static String readAll(s: InputStream?) {
+        if (s == null) {
+            return ""
+        }
+        var bytes = s.readAllBytes()
+        return new String(bytes, "UTF-8")
+    }
+    static TestResponse parse(raw: String) {
+        var split = raw.indexOf("\r\n\r\n")
+        var head = raw
+        var body = ""
+        if (split >= 0) {
+            head = raw.substring(0, split)
+            body = raw.substring(split + 4)
+        }
+        var lines = head.split("\r\n")
+        var statusLine = lines[0].split(" ")
+        var res = TestResponse(statusLine[1].toInt(), body)
+        var i = 1
+        while (i < lines.length) {
+            var colon = lines[i].indexOf(":")
+            if (colon > 0) {
+                res.headerNames.add(lines[i].substring(0, colon).trim())
+                res.headerValues.add(lines[i].substring(colon + 1).trim())
+            }
+            i = i + 1
+        }
+        return res
+    }
+    TestResponse get(path: String) = send("GET", path, listOf<String>(), "", "")
+    TestResponse getWith(path: String, headers: List<String>) = send("GET", path, headers, "", "")
+    TestResponse postJson(path: String, jsonBody: String) = send("POST", path, listOf("Content-Type: application/json"), "", jsonBody)
+    TestResponse putJson(path: String, jsonBody: String) = send("PUT", path, listOf("Content-Type: application/json"), "", jsonBody)
+    TestResponse patchJson(path: String, jsonBody: String) = send("PATCH", path, listOf("Content-Type: application/json"), "", jsonBody)
+    TestResponse remove(path: String) = send("DELETE", path, listOf<String>(), "", "")
+}

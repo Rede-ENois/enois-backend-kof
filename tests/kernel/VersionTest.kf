@@ -1,0 +1,35 @@
+import java.util.HashMap
+import kernel.*
+import kernel.testkit.*
+
+test "version is public by default" {
+    var app = TestApp.shared()
+    var res = app.client.get("/version")
+    Check.status(res, 200)
+    Check.eqStr("body", "{\"version\":\"desconhecida\",\"artefato\":null,\"status\":\"UP\"}", res.body)
+    Check.isTrue("alias", app.client.get("/v1/version").body == res.body)
+}
+
+test "version details need the diagnostics token" {
+    var o = new HashMap<String, String>()
+    o.put("APP_VERSION", "1.2.3")
+    o.put("APP_BUILD_TIME", "2026-11-04T10:00:00Z")
+    o.put("REDE_VERSION_DETAILS_TOKEN", "s3cret-token")
+    var app = TestApp.bootWith("versiondetails", o, (p: Platform) -> {
+})
+    var open = app.client.get("/version")
+    Check.eqStr("public body", "{\"version\":\"1.2.3\",\"artefato\":\"2026-11-04T10:00:00Z\",\"status\":\"UP\"}", open.body)
+    var wrong = app.client.getWith("/version", listOf("X-Version-Details: nope"))
+    Check.isTrue("wrong token stays public", wrong.body == open.body)
+    var full = app.client.getWith("/version", listOf("X-Version-Details: s3cret-token"))
+    Check.status(full, 200)
+    Check.jsonEq(full, "version", "1.2.3")
+    Check.isTrue("no status member with details", !full.jsonHas("status"))
+    Check.isTrue("bootEm", full.jsonHas("bootEm"))
+    Check.isTrue("uptime", full.jsonHas("uptimeSegundos"))
+    Check.jsonEq(full, "midia.storage", "imagekit")
+    Check.jsonEq(full, "flyway.aplicadas", "215")
+    Check.jsonEq(full, "flyway.pendentes", "0")
+    Check.jsonEq(full, "flyway.falhadas", "0")
+    app.stop()
+}

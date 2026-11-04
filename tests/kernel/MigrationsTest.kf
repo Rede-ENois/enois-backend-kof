@@ -1,0 +1,39 @@
+import kernel.db.*
+import kernel.testkit.*
+
+Int migrationFileCount() {
+    var n = 0
+    for (var name in Directory("resources/db/migration").list()) {
+        if (name.endsWith(".sql")) {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+test "every migration file is applied and recorded in flyway_schema_history" {
+    var app = TestApp.shared()
+    var files = migrationFileCount()
+    assert(files > 200)
+    var rows = app.db().queryLong("select count(*) from \"flyway_schema_history\" where \"version\" is not null and \"success\" = true", DbParams())
+    assert(rows == files.toLong())
+    var summary = app.platform.migrations
+    assert(summary.applied() == files)
+    assert(summary.pending() == 0)
+    assert(summary.failed() == 0)
+}
+
+test "schema is usable after migrating" {
+    var app = TestApp.shared()
+    assert(app.db().queryLong("select count(*) from users", DbParams()) == 0L)
+}
+
+test "each booted app gets its own database" {
+    var a = TestApp.boot("iso-a")
+    var b = TestApp.boot("iso-b")
+    a.db().execute("insert into blocked_ips (id, ip, reason, created_at) values (?, ?, ?, ?)", DbParams().bindStr("id-1").bindStr("203.0.113.1").bindStr("t").bindInstant("2026-11-04T16:05:00Z"))
+    assert(a.db().queryLong("select count(*) from blocked_ips", DbParams()) == 1L)
+    assert(b.db().queryLong("select count(*) from blocked_ips", DbParams()) == 0L)
+    a.stop()
+    b.stop()
+}

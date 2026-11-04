@@ -1,0 +1,60 @@
+package kernel.testkit
+
+import java.lang.System
+import java.util.HashMap
+import kernel.*
+import kernel.config.*
+import kernel.db.*
+import kernel.http.*
+
+// A booted platform for HTTP-level tests: fresh in-memory H2 (MySQL mode) with ALL migrations,
+// the kernel routes, an ephemeral port and a client.
+//
+//   test "x" {
+//       var app = TestApp.shared()            // one app per test file (process)
+//       var res = app.client.get("/health")
+//       Check.status(res, 200)
+//   }
+//
+// A domain registers its routes with TestApp.boot(name, wire) where `wire` receives the Platform
+// (platform.server / platform.db) before the server starts.
+class TestApp {
+    Platform platform
+    TestClient client
+    Int port
+    static TestApp? sharedApp = null
+    public constructor(platform: Platform, client: TestClient, port: Int) {
+        this.platform = platform
+        this.client = client
+        this.port = port
+    }
+    Db db() = platform.db
+    // Boots a new isolated app. `name` makes the in-memory database unique.
+    static TestApp boot(name: String) = TestApp.bootWith(name, new HashMap<String, String>(), (p: Platform) -> {
+})
+    static TestApp bootWire(name: String, wire: (Platform) -> void) = TestApp.bootWith(name, new HashMap<String, String>(), wire)
+    static TestApp bootWith(name: String, overrides: Map<String,String>, wire: (Platform) -> void) {
+        overrides.put("DB_URL", "jdbc:h2:mem:" + name + System.nanoTime() + ";MODE=MySQL;DB_CLOSE_DELAY=-1")
+        var cfg = Config.of(overrides)
+        var platform = Platform.create(cfg)
+        wire(platform)
+        var port = platform.startAsync(0)
+        if (port <= 0) {
+            throw "TestApp: server did not bind a port"
+        }
+        return TestApp(platform, TestClient(port), port)
+    }
+    // The per-process app (a test file is one process): booted on first use, no domain routes.
+    static TestApp shared() {
+        var cur = TestApp.sharedApp
+        if (cur != null) {
+            return cur
+        }
+        var created = TestApp.boot("shared")
+        TestApp.sharedApp = created
+        return created
+    }
+    stop() {
+        platform.stop()
+    }
+}

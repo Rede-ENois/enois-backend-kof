@@ -1,0 +1,218 @@
+import kernel.*
+import kernel.error.*
+import kernel.http.*
+import kernel.testkit.*
+
+record ProbeBody(String name, Int age)
+
+ProbeBody parseProbe() {
+    try {
+        return json.decode<ProbeBody>(Req.bodyText())
+    } catch (String e) {
+        throw Errors.badRequest()
+    }
+}
+
+wireProbes(p: Platform) {
+    var s = p.server
+    s.get("/probe/ok", () -> "{\"ok\":true}")
+    s.get("/probe/blocked", () -> "reached")
+    s.get("/probe/api-error", () -> probeApiError())
+    s.get("/probe/api-error-5xx", () -> probeApiError5xx())
+    s.get("/probe/retry", () -> probeRetry())
+    s.get("/probe/boom", () -> probeBoom())
+    s.get("/probe/q", () -> "n=" + Req.queryInt("n", 7) + " s=" + Req.queryStr("s", "dflt") + " b=" + Req.queryBool("b", false) + " l=" + Req.queryLong("l", 5L))
+    s.get("/probe/item/:id", () -> "id=" + Req.pathParam("id"))
+    s.post("/probe/body", () -> {
+    var b = parseProbe()
+    return json.encode(b)
+})
+    s.get("/probe/cookies", () -> "a=" + Req.cookie("a") + " b=" + Req.cookie("b"))
+    s.get("/probe/set-cookies", () -> {
+    Cookies.set("enois_session", "tok", 3600L, false, "Lax")
+    Cookies.set("enois_refresh", "ref", 7200L, true, "Strict")
+    Cookies.clear("old", false, "Lax")
+    return status(201, "{}")
+})
+    s.get("/probe/ip", () -> Req.clientIp())
+    s.get("/probe/envelope", () -> apiSuccess(ProbeBody("x", 1)))
+    s.get("/probe/envelope-empty", () -> apiSuccessEmpty())
+    s.get("/probe/envelope-error", () -> status(400, apiFailure("BAD", "ruim")))
+    s.use("probe-block", 10, () -> {
+    if (path() == "/probe/blocked") {
+        throw Errors.api(403, "BLOCKED", "Bloqueado.")
+    }
+    return Http.next()
+})
+}
+
+class ProbeHolder {
+    static TestApp? app = null
+}
+
+TestApp probeApp() {
+    var cur = ProbeHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = TestApp.bootWire("probe", (p: Platform) -> wireProbes(p))
+    ProbeHolder.app = created
+    return created
+}
+
+String probeApiError() {
+    throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+}
+
+String probeApiError5xx() {
+    throw Errors.api(503, "UPSTREAM_DOWN", "Indisponivel.")
+}
+
+String probeRetry() {
+    throw Errors.apiRetry(429, "RATE_LIMITED", "Muitas requisicoes.", 30L)
+}
+
+String probeBoom() {
+    throw "secret internal detail"
+}
+
+test "api error renders code, message and timestamp with its status" {
+    var app = probeApp()
+    var res = app.client.get("/probe/api-error")
+    Check.apiError(res, 404, "POST_NOT_FOUND")
+    Check.jsonEq(res, "message", "Post nao encontrado.")
+    var ts = res.json("timestamp")
+    assert(ts.endsWith("Z"))
+    assert(ts.contains("T"))
+    assert(res.body.startsWith("{\"code\":\"POST_NOT_FOUND\",\"message\":\"Post nao encontrado.\",\"timestamp\":\""))
+    assert(res.header("content-type").contains("application/json"))
+}
+
+test "retry-after is sent for rate limited errors" {
+    var app = probeApp()
+    var res = app.client.get("/probe/retry")
+    Check.apiError(res, 429, "RATE_LIMITED")
+    Check.eqStr("retry-after", "30", res.header("retry-after"))
+}
+
+test "unexpected failures are a generic 500 without internals" {
+    var app = probeApp()
+    var res = app.client.get("/probe/boom")
+    Check.apiError(res, 500, "INTERNAL_ERROR")
+    Check.jsonEq(res, "message", "Erro interno inesperado.")
+    assert(!res.body.contains("secret"))
+}
+
+test "5xx api errors keep their own code" {
+    var app = probeApp()
+    Check.apiError(app.client.get("/probe/api-error-5xx"), 503, "UPSTREAM_DOWN")
+}
+
+test "invalid query numbers and json bodies are 400 BAD_REQUEST" {
+    var app = probeApp()
+    var bad = app.client.get("/probe/q?n=abc")
+    Check.apiError(bad, 400, "BAD_REQUEST")
+    Check.jsonEq(bad, "message", "Requisicao invalida.")
+    Check.apiError(app.client.get("/probe/q?b=maybe"), 400, "BAD_REQUEST")
+    Check.apiError(app.client.postJson("/probe/body", "not json"), 400, "BAD_REQUEST")
+    Check.apiError(app.client.postJson("/probe/body", "{\"name\":\"x\",\"age\":\"old\"}"), 400, "BAD_REQUEST")
+}
+
+test "query params parse with defaults" {
+    var app = probeApp()
+    Check.eqStr("defaults", "n=7 s=dflt b=false l=5", app.client.get("/probe/q").body)
+    Check.eqStr("values", "n=3 s=a b b=true l=99", app.client.get("/probe/q?n=3&s=a%20b&b=true&l=99").body)
+}
+
+test "path params and json body round trip" {
+    var app = probeApp()
+    Check.eqStr("path param", "id=42", app.client.get("/probe/item/42").body)
+    var res = app.client.postJson("/probe/body", "{\"name\":\"Mel\",\"age\":30,\"ignored\":1}")
+    Check.status(res, 200)
+    Check.eqStr("echo", "{\"name\":\"Mel\",\"age\":30}", res.body)
+}
+
+test "cookies are parsed from the request" {
+    var app = probeApp()
+    var res = app.client.send("GET", "/probe/cookies", listOf<String>(), "a=1; b=two; a=ignored", "")
+    Check.eqStr("cookies", "a=1 b=two", res.body)
+}
+
+test "several response cookies are all delivered" {
+    var app = probeApp()
+    var res = app.client.get("/probe/set-cookies")
+    Check.status(res, 201)
+    Check.eqInt("cookie count", 3, res.setCookies().size())
+    var session = res.cookieLine("enois_session")
+    assert(session.contains("Path=/"))
+    assert(session.contains("Max-Age=3600"))
+    assert(session.contains("HttpOnly"))
+    assert(session.contains("SameSite=Lax"))
+    assert(!session.contains("Secure"))
+    var refresh = res.cookieLine("enois_refresh")
+    assert(refresh.contains("Secure"))
+    assert(refresh.contains("SameSite=Strict"))
+    var cleared = res.cookieLine("old")
+    assert(cleared.contains("Max-Age=0"))
+    Check.eqStr("session value", "tok", res.cookie("enois_session"))
+}
+
+test "client ip honours trusted proxy forwarding" {
+    var app = probeApp()
+    Check.eqStr("direct (loopback peer)", "127.0.0.1", app.client.get("/probe/ip").body)
+    var res = app.client.getWith("/probe/ip", listOf("X-Forwarded-For: 6.6.6.6, 198.51.100.7"))
+    Check.eqStr("forwarded", "198.51.100.7", res.body)
+}
+
+test "api response envelope omits null members" {
+    var app = probeApp()
+    var ok = app.client.get("/probe/envelope")
+    Check.status(ok, 200)
+    Check.jsonEq(ok, "success", "true")
+    Check.jsonEq(ok, "data.name", "x")
+    Check.isTrue("no error member", !ok.jsonHas("error"))
+    Check.isTrue("timestamp", ok.jsonHas("timestamp"))
+    var empty = app.client.get("/probe/envelope-empty")
+    Check.isTrue("no data member", !empty.jsonHas("data"))
+    var err = app.client.get("/probe/envelope-error")
+    Check.status(err, 400)
+    Check.jsonEq(err, "success", "false")
+    Check.jsonEq(err, "error.code", "BAD")
+    Check.jsonEq(err, "error.message", "ruim")
+    Check.isTrue("no data member on error", !err.jsonHas("data"))
+}
+
+test "filters run in order and can reject with an api error" {
+    var app = probeApp()
+    Check.apiError(app.client.get("/probe/blocked"), 403, "BLOCKED")
+}
+
+test "paths outside the surface answer 200 with an empty body" {
+    var app = probeApp()
+    var c = app.client
+    Check.eqStr("unknown", "", c.get("/definitely/not/here").body)
+    Check.status(c.get("/definitely/not/here"), 200)
+    Check.status(c.get("/openapi.json"), 200)
+    Check.eqStr("openapi body", "", c.get("/openapi.json").body)
+    Check.status(c.postJson("/nope", "{}"), 200)
+    Check.status(c.get("/health/"), 200)
+    Check.eqStr("trailing slash", "", c.get("/health/").body)
+    Check.status(c.get("/probe/item/"), 200)
+    Check.eqStr("empty segment", "", c.get("/probe/item/").body)
+    Check.status(c.get("/v1/not/here"), 200)
+}
+
+test "known path with another method is 405" {
+    var app = probeApp()
+    var res = app.client.send("DELETE", "/health", listOf<String>(), "", "")
+    Check.apiError(res, 405, "METHOD_NOT_ALLOWED")
+    Check.jsonEq(res, "message", "Metodo nao suportado para este recurso.")
+}
+
+test "v1 is an alias of every route" {
+    var app = probeApp()
+    Check.eqStr("health", "{\"status\":\"UP\"}", app.client.get("/v1/health").body)
+    Check.eqStr("param route", "id=7", app.client.get("/v1/probe/item/7").body)
+    Check.apiError(app.client.get("/v1/probe/api-error"), 404, "POST_NOT_FOUND")
+    Check.eqStr("post alias", "{\"name\":\"a\",\"age\":1}", app.client.postJson("/v1/probe/body", "{\"name\":\"a\",\"age\":1}").body)
+}
