@@ -1,0 +1,86 @@
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import profile.*
+
+class PresenceHolder {
+    static TestApp? cached = null
+}
+
+TestApp presenceApp() {
+    var cur = PresenceHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = ProfileTestApp.boot("presence", mapOf<String, String>())
+    PresenceHolder.cached = created
+    return created
+}
+
+List<String> presenceAuth(token: String) = listOf("X-Session-Token: " + token)
+
+// One verified account with a session; the user id is also the username (SecurityFixtures).
+String presenceLogin(id: String) {
+    var token = "tok-" + id + "-1234567890"
+    SecurityFixtures.login(presenceApp().db(), id, token)
+    return token
+}
+
+test "persists the selection and hides the invisible status from other users" {
+    var app = presenceApp()
+    var token = presenceLogin("presence_a")
+    var own = app.client.getWith("/me/presence", presenceAuth(token))
+    Check.status(own, 200)
+    Check.jsonEq(own, "status", "AVAILABLE")
+    var put = app.client.send("PUT", "/me/presence", presenceAuth(token), "", "{\"status\":\"INVISIBLE\"}")
+    Check.status(put, 200)
+    Check.jsonEq(put, "status", "INVISIBLE")
+    Check.status(app.client.send("POST", "/me/presence/heartbeat", presenceAuth(token), "", ""), 204)
+    Check.jsonEq(app.client.getWith("/me/presence", presenceAuth(token)), "status", "INVISIBLE")
+    var publicRead = app.client.get("/users/presence_a/presence")
+    Check.status(publicRead, 200)
+    Check.jsonEq(publicRead, "status", "OFFLINE")
+}
+
+test "rejects a missing session and an invalid status" {
+    var app = presenceApp()
+    var token = presenceLogin("presence_invalid")
+    Check.status(app.client.get("/me/presence"), 401)
+    Check.status(app.client.send("POST", "/me/presence/heartbeat", listOf<String>(), "", ""), 401)
+    Check.status(app.client.send("PUT", "/me/presence", listOf("Content-Type: application/json"), "", "{\"status\":\"AWAY\"}"), 401)
+    Check.apiError(app.client.send("PUT", "/me/presence", presenceAuth(token), "", "{\"status\":null}"), 400, "INVALID_PRESENCE_STATUS")
+    Check.apiError(app.client.send("PUT", "/me/presence", presenceAuth(token), "", "{\"status\":\"OFFLINE\"}"), 400, "BAD_REQUEST")
+    Check.apiError(app.client.send("PUT", "/me/presence", presenceAuth(token), "", "not json"), 400, "BAD_REQUEST")
+}
+
+test "a heartbeat creates the available presence and preserves the selection" {
+    var app = presenceApp()
+    var token = presenceLogin("presence_states")
+    Check.jsonEq(app.client.get("/users/presence_states/presence"), "status", "OFFLINE")
+    Check.status(app.client.send("POST", "/me/presence/heartbeat", presenceAuth(token), "", ""), 204)
+    Check.jsonEq(app.client.get("/users/presence_states/presence"), "status", "AVAILABLE")
+    for (var selection in listOf("AWAY", "DO_NOT_DISTURB", "AVAILABLE")) {
+        Check.status(app.client.send("PUT", "/me/presence", presenceAuth(token), "", "{\"status\":\"" + selection + "\"}"), 200)
+        Check.status(app.client.send("POST", "/me/presence/heartbeat", presenceAuth(token), "", ""), 204)
+        var res = app.client.get("/users/presence_states/presence")
+        Check.status(res, 200)
+        Check.jsonEq(res, "status", selection)
+    }
+    // Three minutes without activity: offline for everybody else.
+    app.db().execute("update user_presence set last_seen_at = ? where user_id = ?", DbParams().bindInstant(Time.plusSeconds(Time.nowIso(), -180L)).bindStr("presence_states"))
+    var stale = app.client.get("/users/presence_states/presence")
+    Check.status(stale, 200)
+    Check.jsonEq(stale, "status", "OFFLINE")
+}
+
+test "an unknown or banned user has no presence" {
+    var app = presenceApp()
+    presenceLogin("presence_banned")
+    Check.apiError(app.client.get("/users/presence_nobody/presence"), 404, "USER_NOT_FOUND")
+    app.db().execute("insert into user_sanctions (id, user_id, type, reason, status, created_at) values (?, ?, ?, ?, ?, ?)", DbParams().bindStr("sanc_presence_banned").bindStr("presence_banned").bindStr("BAN").bindStr("spam").bindStr("ACTIVE").bindInstant(Time.nowIso()))
+    Check.apiError(app.client.get("/users/presence_banned/presence"), 404, "USER_NOT_FOUND")
+}
+
+test "zz stops the background jobs" {
+    ProfileTestApp.finish()
+}

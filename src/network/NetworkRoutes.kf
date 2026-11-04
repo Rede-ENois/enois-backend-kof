@@ -1,0 +1,430 @@
+package network
+
+import kernel.blocks.*
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+import kernel.text.*
+import kernel.url.*
+import profile.*
+
+// HTTP adapter of the network domain (NetworkContractController) plus the two public people lists of the
+// profile controller (`/users/{username}/connections` and `/followers`, which need the connection graph).
+class NetworkRoutes {
+    static String removedPrefix() = "removed-"
+    static NetworkMuteBody? muteBody() {
+        var text = Req.bodyText()
+        if (text.trim().length() == 0) {
+            return null
+        }
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<NetworkMuteBody>(text)
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static NetworkUserView userView(p: ProfileRecord, connected: Bool, mutual: Int?) = NetworkUserView(p.id, p.username, p.name, p.headline, p.avatar, 0, 0, connected, p.avatarFrame, ProfileDirectory.nameStyle(p), mutual)
+    static Map<String,ProfileRecord> byId(profiles: List<ProfileRecord>) {
+        var m = mapOf<String, ProfileRecord>()
+        for (var p in profiles) {
+            m.put(p.id, p)
+        }
+        return m
+    }
+    static List<String> blockedIds(list: List<NetworkBlock>) {
+        var out = listOf<String>()
+        for (var b in list) {
+            out.add(b.blockedId)
+        }
+        return out
+    }
+    static List<String> mutedIds(list: List<NetworkMute>) {
+        var out = listOf<String>()
+        for (var m in list) {
+            out.add(m.mutedId)
+        }
+        return out
+    }
+    static String peerOf(c: NetworkConnection, userId: String) {
+        if (c.requesterUserId == userId) {
+            return c.receiverUserId
+        }
+        return c.requesterUserId
+    }
+    // Pending requests in both directions, newest first, each with the person on the other side. A request
+    // whose other side is hidden (block) or whose account was removed cannot be answered: it is left out.
+    static List<NetworkRequestView> visibleRequests(userId: String, network: NetworkStore, directory: ProfileDirectory, blocked: BlockedUsers) {
+        var hidden = blocked.blockedBetween(userId)
+        var pending = listOf<NetworkConnection>()
+        var peers = listOf<String>()
+        for (var c in network.pending(userId)) {
+            var peer = NetworkRoutes.peerOf(c, userId)
+            if (!hidden.contains(peer)) {
+                pending.add(c)
+                peers.add(peer)
+            }
+        }
+        var profiles = NetworkRoutes.byId(directory.findAllByIds(peers))
+        var out = listOf<NetworkRequestView>()
+        for (var c in pending) {
+            var p = profiles.get(NetworkRoutes.peerOf(c, userId))
+            if (p != null && !p.username.startsWith(NetworkRoutes.removedPrefix())) {
+                var direction = "INCOMING"
+                if (c.requesterUserId == userId) {
+                    direction = "OUTGOING"
+                }
+                out.add(NetworkRequestView("" + c.id, c.requesterUserId, c.receiverUserId, c.status, c.createdAt, direction, NetworkRoutes.userView(p, false, null)))
+            }
+        }
+        return out
+    }
+    // Mute terms: 24h, 72h, 7d, 1w ... or "forever"/"sempre"/"until-unmute" (null), or ISO-8601 (PT24H).
+    // Unknown text is a 400, never a silent forever-mute. Seconds, or null for no term.
+    static Long? muteSeconds(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        var value = raw.trim().toLowerCase()
+        if (value == "forever" || value == "sempre" || value == "until-unmute") {
+            return null
+        }
+        var seconds = 0L
+        var shorthand = NetworkRoutes.shorthandSeconds(value)
+        if (shorthand != null) {
+            seconds = shorthand
+        }
+        else {
+            seconds = NetworkRoutes.isoSeconds(raw.trim().toUpperCase())
+        }
+        if (seconds <= 0L) {
+            throw Errors.api(400, "MUTE_DURATION_INVALID", "Prazo de silenciamento invalido.")
+        }
+        if (seconds > 31536000L) {
+            throw Errors.api(400, "MUTE_DURATION_TOO_LONG", "Prazo de silenciamento longo demais.")
+        }
+        return seconds
+    }
+    // `^(\d{1,5})([mhdw])$`
+    static Long? shorthandSeconds(value: String) {
+        if (value.length() < 2 || value.length() > 6) {
+            return null
+        }
+        var digits = value.substring(0, value.length() - 1)
+        var unit = value.substring(value.length() - 1)
+        if (!Dates.digits(digits)) {
+            return null
+        }
+        var amount = digits.toLong()
+        if (unit == "m") {
+            return amount * 60L
+        }
+        if (unit == "h") {
+            return amount * 3600L
+        }
+        if (unit == "d") {
+            return amount * 86400L
+        }
+        if (unit == "w") {
+            return amount * 604800L
+        }
+        return null
+    }
+    // Duration.parse: [-]P[nD][T[nH][nM][n[.n]S]], at least one component.
+    static Long isoSeconds(text: String) {
+        var s = text
+        var sign = 1L
+        if (s.startsWith("-")) {
+            sign = -1L
+            s = s.substring(1)
+        }
+        else 
+            if (s.startsWith("+")) {
+                s = s.substring(1)
+            }
+        if (!s.startsWith("P") || s.length() < 3) {
+            throw Errors.api(400, "MUTE_DURATION_INVALID", "Prazo de silenciamento invalido.")
+        }
+        s = s.substring(1)
+        var total = 0L
+        var inTime = false
+        var number = ""
+        var parts = 0
+        var i = 0
+        while (i < s.length()) {
+            var c = s.substring(i, i + 1)
+            if (c == "T" && !inTime && number.length() == 0) {
+                inTime = true
+            }
+            else 
+                if (Dates.digits(c) || c == "." && inTime) {
+                    number = number + c
+                }
+                else {
+                    if (number.length() == 0 || number.length() > 12) {
+                        throw Errors.api(400, "MUTE_DURATION_INVALID", "Prazo de silenciamento invalido.")
+                    }
+                    var whole = number
+                    if (number.contains(".")) {
+                        if (c != "S") {
+                            throw Errors.api(400, "MUTE_DURATION_INVALID", "Prazo de silenciamento invalido.")
+                        }
+                        whole = number.substring(0, number.indexOf("."))
+                        if (whole.length() == 0) {
+                            throw Errors.api(400, "MUTE_DURATION_INVALID", "Prazo de silenciamento invalido.")
+                        }
+                    }
+                    var n = whole.toLong()
+                    if (c == "D" && !inTime) {
+                        total = total + n * 86400L
+                    }
+                    else 
+                        if (c == "H" && inTime) {
+                            total = total + n * 3600L
+                        }
+                        else 
+                            if (c == "M" && inTime) {
+                                total = total + n * 60L
+                            }
+                            else 
+                                if (c == "S" && inTime) {
+                                    total = total + n
+                                }
+                                else {
+                                    throw Errors.api(400, "MUTE_DURATION_INVALID", "Prazo de silenciamento invalido.")
+                                }
+                    parts = parts + 1
+                    number = ""
+                }
+            i = i + 1
+        }
+        if (number.length() > 0 || parts == 0) {
+            throw Errors.api(400, "MUTE_DURATION_INVALID", "Prazo de silenciamento invalido.")
+        }
+        return sign * total
+    }
+    static Int clamp(v: Int, lo: Int, hi: Int) {
+        if (v < lo) {
+            return lo
+        }
+        if (v > hi) {
+            return hi
+        }
+        return v
+    }
+    // Public people lists of a profile: only accepted connections; followers are who sent one TO the profile.
+    static String publicPeople(username: String, followers: Bool, limit: Int, service: NetworkService, directory: ProfileDirectory) {
+        var capped = NetworkRoutes.clamp(limit, 1, 100)
+        var profile = directory.findByUsername(username)
+        if (profile == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        var ids = listOf<String>()
+        for (var c in service.connections(profile.id)) {
+            if ((!followers || c.receiverUserId == profile.id) && ids.size() < capped) {
+                var peer = NetworkRoutes.peerOf(c, profile.id)
+                if (!ids.contains(peer)) {
+                    ids.add(peer)
+                }
+            }
+        }
+        var profiles = NetworkRoutes.byId(directory.findAllByIds(ids))
+        var out = listOf<ProfilePublicNetworkUser>()
+        for (var id in ids) {
+            var p = profiles.get(id)
+            if (p != null) {
+                out.add(ProfilePublicNetworkUser(p.id, p.username, p.displayWithNickname(), p.headline, p.avatar, p.avatarFrame, ProfileDirectory.nameStyle(p)))
+            }
+        }
+        return json.encode(out)
+    }
+    static String command(idem: Idempotency, userId: String, method: String, route: String, targetUserId: String, successStatus: Int, action: () -> String) = idem.handle(userId, method, route, Idempotency.hash("{\"targetUserId\":" + json.encode(targetUserId) + "}"), successStatus, action)
+    static String answer(targetUserId: String, status: String) = json.encode(NetworkStatusAnswer(targetUserId, status))
+    static register(server: HttpServer, service: NetworkService, blocks: NetworkBlockService, mutes: NetworkMuteService, network: NetworkStore, directory: ProfileDirectory, blocked: BlockedUsers, idem: Idempotency) {
+        server.get("/users/:username/connections", () -> NetworkRoutes.publicPeople(Req.pathParam("username"), false, Req.queryInt("limit", 100), service, directory))
+        server.get("/users/:username/followers", () -> NetworkRoutes.publicPeople(Req.pathParam("username"), true, Req.queryInt("limit", 100), service, directory))
+        server.get("/network/users", () -> {
+    var userId = Auth.requireUser()
+    var query = Req.queryStr("query", "")
+    var hidden = blocked.blockedBetween(userId)
+    var connected = listOf<String>()
+    for (var c in service.connections(userId)) {
+        var peer = NetworkRoutes.peerOf(c, userId)
+        if (!hidden.contains(peer)) {
+            connected.add(peer)
+        }
+    }
+    var ordered = HashOrder.of(connected)
+    var profiles = NetworkRoutes.byId(directory.findAllByIds(ordered))
+    var q = query.toLowerCase()
+    var items = listOf<NetworkUserView>()
+    for (var id in ordered) {
+        var p = profiles.get(id)
+        if (q.length() == 0) {
+            if (p == null) {
+                items.add(NetworkUserView(id, null, null, null, null, 0, 0, true, null, null, null))
+            }
+            else {
+                items.add(NetworkRoutes.userView(p, true, null))
+            }
+        }
+        else 
+            if (p != null && (p.name.toLowerCase().contains(q) || p.username.toLowerCase().contains(q))) {
+                items.add(NetworkRoutes.userView(p, true, null))
+            }
+    }
+    return json.encode(NetworkPage(items, null))
+})
+        // Java answered from a HashSet: same ids, hash order.
+        server.get("/network/suggestions", () -> {
+    var userId = Auth.requireUser()
+    var limit = Req.queryInt("limit", 4)
+    var hidden = blocked.blockedBetween(userId)
+    var suggestions = listOf<NetworkSuggestion>()
+    var suggestedIds = listOf<String>()
+    for (var s in network.suggestions(userId, limit)) {
+        if (!hidden.contains(s.userId)) {
+            suggestions.add(s)
+            suggestedIds.add(s.userId)
+        }
+    }
+    var profiles = NetworkRoutes.byId(directory.findAllByIds(suggestedIds))
+    var out = listOf<NetworkUserView>()
+    for (var s in suggestions) {
+        var p = profiles.get(s.userId)
+        if (p != null && !p.username.startsWith(NetworkRoutes.removedPrefix())) {
+            out.add(NetworkRoutes.userView(p, false, s.mutualConnections))
+        }
+    }
+    return json.encode(out)
+})
+        server.get("/network/summary", () -> {
+    var userId = Auth.requireUser()
+    var connections = network.countAccepted(userId)
+    var incoming = 0
+    for (var r in NetworkRoutes.visibleRequests(userId, network, directory, blocked)) {
+        if (r.direction == "INCOMING") {
+            incoming = incoming + 1
+        }
+    }
+    return json.encode(NetworkSummaryView(userId, connections, 0, incoming))
+})
+        server.get("/network/requests", () -> {
+    var userId = Auth.requireUser()
+    return json.encode(NetworkRequestPage(NetworkRoutes.visibleRequests(userId, network, directory, blocked), null))
+})
+        server.post("/network/connections/:targetUserId", () -> {
+    var userId = Auth.requireUser()
+    var target = Req.pathParam("targetUserId")
+    return NetworkRoutes.command(idem, userId, "POST", "/api/network/connections/{userId}", target, 202, () -> {
+    service.requestConnection(userId, target)
+    return NetworkRoutes.answer(target, "REQUESTED")
+})
+})
+        server.put("/network/connections/:targetUserId/accept", () -> {
+    var userId = Auth.requireUser()
+    var target = Req.pathParam("targetUserId")
+    return NetworkRoutes.command(idem, userId, "PUT", "/api/network/connections/{userId}/accept", target, 200, () -> {
+    service.acceptConnection(target, userId)
+    return NetworkRoutes.answer(target, "ACCEPTED")
+})
+})
+        server.get("/network/connections/:targetUserId/status", () -> {
+    var userId = Auth.requireUser()
+    var target = Req.pathParam("targetUserId")
+    var state = service.state(userId, target)
+    var mute = mutes.activeMute(userId, target)
+    var expires = Nulls.str()
+    if (mute != null) {
+        expires = mute.expiresAt
+    }
+    return json.encode(NetworkStatusView(target, state.status, state.requestedByMe, network.blockExists(userId, target), mute != null, expires))
+})
+        server.delete("/network/connections/:targetUserId", () -> {
+    var userId = Auth.requireUser()
+    var target = Req.pathParam("targetUserId")
+    return NetworkRoutes.command(idem, userId, "DELETE", "/api/network/connections/{userId}", target, 200, () -> {
+    service.removeConnection(target, userId)
+    return NetworkRoutes.answer(target, "REMOVED")
+})
+})
+        server.post("/network/blocks/:targetUserId", () -> {
+    var userId = Auth.requireUser()
+    var target = Req.pathParam("targetUserId")
+    return NetworkRoutes.command(idem, userId, "POST", "/api/network/blocks/{userId}", target, 201, () -> {
+    blocks.block(userId, target)
+    return NetworkRoutes.answer(target, "BLOCKED")
+})
+})
+        server.delete("/network/blocks/:targetUserId", () -> {
+    var userId = Auth.requireUser()
+    var target = Req.pathParam("targetUserId")
+    return NetworkRoutes.command(idem, userId, "DELETE", "/api/network/blocks/{userId}", target, 200, () -> {
+    blocks.unblock(userId, target)
+    return NetworkRoutes.answer(target, "UNBLOCKED")
+})
+})
+        server.get("/network/blocks", () -> {
+    var userId = Auth.requireUser()
+    var list = network.blocksOf(userId)
+    var profiles = NetworkRoutes.byId(directory.findAllByIds(NetworkRoutes.blockedIds(list)))
+    var out = listOf<NetworkBlockedUserView>()
+    for (var b in list) {
+        var p = profiles.get(b.blockedId)
+        if (p == null) {
+            out.add(NetworkBlockedUserView(b.blockedId, null, null, null, b.createdAt))
+        }
+        else {
+            out.add(NetworkBlockedUserView(b.blockedId, p.username, p.name, p.avatar, b.createdAt))
+        }
+    }
+    return json.encode(out)
+})
+        server.post("/network/mutes/:targetUserId", () -> {
+    var userId = Auth.requireUser()
+    var target = Req.pathParam("targetUserId")
+    var body = NetworkRoutes.muteBody()
+    var raw = Nulls.str()
+    if (body != null) {
+        raw = body.duration()
+    }
+    var seconds = NetworkRoutes.muteSeconds(raw)
+    var term = "forever"
+    if (seconds != null) {
+        term = "" + seconds
+    }
+    return idem.handle(userId, "POST", "/api/network/mutes/{userId}", Idempotency.hash("{\"targetUserId\":" + json.encode(target) + ",\"duration\":" + json.encode(term) + "}"), 201, () -> {
+    mutes.mute(userId, target, seconds)
+    return NetworkRoutes.answer(target, "MUTED")
+})
+})
+        server.delete("/network/mutes/:targetUserId", () -> {
+    var userId = Auth.requireUser()
+    var target = Req.pathParam("targetUserId")
+    return NetworkRoutes.command(idem, userId, "DELETE", "/api/network/mutes/{userId}", target, 200, () -> {
+    mutes.unmute(userId, target)
+    return NetworkRoutes.answer(target, "UNMUTED")
+})
+})
+        server.get("/network/mutes", () -> {
+    var userId = Auth.requireUser()
+    var list = mutes.listMuted(userId)
+    var profiles = NetworkRoutes.byId(directory.findAllByIds(NetworkRoutes.mutedIds(list)))
+    var out = listOf<NetworkMutedUserView>()
+    for (var m in list) {
+        var p = profiles.get(m.mutedId)
+        if (p == null) {
+            out.add(NetworkMutedUserView(m.mutedId, null, null, null, m.createdAt, m.expiresAt))
+        }
+        else {
+            out.add(NetworkMutedUserView(m.mutedId, p.username, p.name, p.avatar, m.createdAt, m.expiresAt))
+        }
+    }
+    return json.encode(out)
+})
+    }
+}

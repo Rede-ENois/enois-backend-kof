@@ -1,0 +1,574 @@
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import profile.*
+
+class ProfileApiHolder {
+    static TestApp? cached = null
+}
+
+TestApp pApp() {
+    var cur = ProfileApiHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = ProfileTestApp.boot("profileapi", mapOf<String, String>())
+    ProfileApiHolder.cached = created
+    return created
+}
+
+ProfileCaller pUser(id: String) = ProfileTestApp.login(pApp(), id)
+
+ban(userId: String) {
+    pApp().db().execute("insert into user_sanctions (id, user_id, type, reason, status, created_at) values (?, ?, ?, ?, ?, ?)", DbParams().bindStr("sanc_" + userId).bindStr(userId).bindStr("BAN").bindStr("Cadastro em série na triagem de contas.").bindStr("ACTIVE").bindInstant(Time.nowIso()))
+}
+
+// ProfileControllerTests -----------------------------------------------------------------------
+test "rejects a field over the limit with a clear message" {
+    var user = pUser("prof_limit")
+    var res = user.callKey("PATCH", "/me/profile", "profile-bio-too-long", "{\"bio\":\"" + strings.repeat("a", 2000) + "\"}")
+    Check.apiError(res, 400, "FIELD_TOO_LONG")
+    Check.isTrue("names the field", res.json("message").contains("bio"))
+    Check.isTrue("names the limit", res.json("message").contains("1024"))
+    Check.jsonEq(res, "message", "O campo bio pode ter no maximo 1024 caracteres.")
+}
+
+test "updates the profile" {
+    var user = pUser("prof_update")
+    var res = user.callKey("PATCH", "/me/profile", "prof-update-1", "{\"headline\":\"Senior Engineer\",\"company\":\"Connect Grow\",\"location\":\"Remoto\",\"bio\":\"Fullstack developer\",\"skills\":[\"Java\",\"Spring\"],\"openToWork\":true}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "headline", "Senior Engineer")
+    Check.jsonEq(res, "company", "Connect Grow")
+    Check.jsonEq(res, "skills.0", "Java")
+    Check.jsonEq(res, "openToWork", "true")
+    var me = user.get("/me")
+    Check.status(me, 200)
+    Check.jsonEq(me, "headline", "Senior Engineer")
+    Check.jsonEq(me, "skills.1", "Spring")
+    Check.jsonEq(me, "email", "prof_update@test.invalid")
+}
+
+test "managed experiences live in the database, not only in the answer" {
+    var user = pUser("prof_exp")
+    var created = user.callKey("POST", "/me/experiences", "prof-exp-create-1", "{\"title\":\"Software Engineer\",\"company\":\"Tech Co\",\"startDate\":\"2020-01-01\"}")
+    Check.status(created, 201)
+    Check.jsonEq(created, "title", "Software Engineer")
+    Check.jsonEq(created, "currentlyHere", "true")
+    var id = created.json("id")
+    var updated = user.callKey("PUT", "/me/experiences/" + id, "prof-exp-update-1", "{\"title\":\"Senior Software Engineer\",\"company\":\"Tech Co\",\"startDate\":\"2020-01-01\"}")
+    Check.status(updated, 200)
+    Check.jsonEq(updated, "title", "Senior Software Engineer")
+    // The edit has to be in the DATABASE: a fresh GET brings the new title.
+    Check.jsonEq(user.get("/me/experiences"), "0.title", "Senior Software Engineer")
+    Check.status(user.callKey("DELETE", "/me/experiences/" + id, "prof-exp-delete-1", ""), 200)
+    Check.eqStr("empty after delete", "[]", user.get("/me/experiences").body)
+}
+
+test "public experiences are ordered most recent first" {
+    var user = pUser("prof_exp_public")
+    Check.status(user.post("/me/experiences", "{\"title\":\"Software Engineer\",\"company\":\"Tech Co\",\"location\":\"Remoto\",\"description\":\"APIs em Java e Spring.\",\"startDate\":\"2018-01-01\",\"endDate\":\"2020-12-31\"}"), 201)
+    Check.status(user.post("/me/experiences", "{\"title\":\"Tech Lead\",\"company\":\"É Nóis\",\"startDate\":\"2024-03-01\"}"), 201)
+    var anon = ProfileTestApp.anonymous(pApp())
+    var res = anon.get("/users/prof_exp_public/experiences")
+    Check.status(res, 200)
+    Check.eqInt("size", 2, res.jsonSize(""))
+    Check.jsonEq(res, "0.title", "Tech Lead")
+    Check.jsonEq(res, "0.currentlyHere", "true")
+    Check.jsonEq(res, "1.title", "Software Engineer")
+    Check.jsonEq(res, "1.location", "Remoto")
+    Check.jsonEq(res, "1.description", "APIs em Java e Spring.")
+    Check.jsonEq(res, "1.endDate", "2020-12-31")
+    Check.jsonEq(res, "1.startDate", "2018-01-01")
+    Check.status(anon.get("/users/perfil-que-nao-existe-1/experiences"), 404)
+    Check.apiError(anon.get("/users/perfil-que-nao-existe-1/experiences"), 404, "PROFILE_NOT_FOUND")
+}
+
+test "manages education" {
+    var user = pUser("prof_edu")
+    var created = user.callKey("POST", "/me/education", "prof-edu-create-1", "{\"school\":\"USP\",\"degree\":\"BS\",\"field\":\"Computer Science\",\"startDate\":\"2015-01-01\",\"endDate\":\"2019-12-31\"}")
+    Check.status(created, 201)
+    Check.jsonEq(created, "school", "USP")
+    Check.jsonEq(created, "currentlyHere", "false")
+    var id = created.json("id")
+    var updated = user.callKey("PUT", "/me/education/" + id, "prof-edu-update-1", "{\"school\":\"USP\",\"degree\":\"MS\",\"field\":\"Computer Science\",\"startDate\":\"2015-01-01\",\"endDate\":\"2019-12-31\"}")
+    Check.status(updated, 200)
+    Check.jsonEq(updated, "degree", "MS")
+    Check.jsonEq(user.get("/me/education"), "0.degree", "MS")
+    Check.status(user.callKey("DELETE", "/me/education/" + id, "prof-edu-delete-1", ""), 200)
+    Check.eqStr("empty", "[]", user.get("/me/education").body)
+}
+
+test "manages certifications" {
+    var user = pUser("prof_cert")
+    var created = user.callKey("POST", "/me/certifications", "prof-cert-create-1", "{\"name\":\"AWS Certified\",\"issuer\":\"Amazon\",\"issueDate\":\"2023-06-01\"}")
+    Check.status(created, 201)
+    Check.jsonEq(created, "name", "AWS Certified")
+    var id = created.json("id")
+    var updated = user.callKey("PUT", "/me/certifications/" + id, "prof-cert-update-1", "{\"name\":\"AWS Certified Solutions Architect\",\"issuer\":\"Amazon\",\"issueDate\":\"2023-06-01\",\"credentialUrl\":\"https://aws.example/cred/1\"}")
+    Check.status(updated, 200)
+    Check.jsonEq(updated, "name", "AWS Certified Solutions Architect")
+    Check.jsonEq(updated, "credentialUrl", "https://aws.example/cred/1")
+    Check.jsonEq(user.get("/me/certifications"), "0.name", "AWS Certified Solutions Architect")
+    Check.status(user.callKey("DELETE", "/me/certifications/" + id, "prof-cert-delete-1", ""), 200)
+    Check.eqStr("empty", "[]", user.get("/me/certifications").body)
+}
+
+test "extension rows are owned by the account and limited to ten per kind" {
+    var owner = pUser("prof_ext_owner")
+    var other = pUser("prof_ext_other")
+    var created = owner.post("/me/experiences", "{\"title\":\"Dev\",\"company\":\"X\",\"startDate\":\"2020-01-01\"}")
+    var id = created.json("id")
+    Check.apiError(other.put("/me/experiences/" + id, "{\"title\":\"Hack\",\"company\":\"X\",\"startDate\":\"2020-01-01\"}"), 404, "EXPERIENCE_NOT_FOUND")
+    Check.apiError(other.delete("/me/experiences/" + id), 404, "EXPERIENCE_NOT_FOUND")
+    Check.apiError(other.put("/me/education/" + id, "{\"school\":\"X\",\"degree\":\"Y\",\"startDate\":\"2020-01-01\"}"), 404, "EDUCATION_NOT_FOUND")
+    Check.apiError(other.put("/me/certifications/" + id, "{\"name\":\"X\",\"issuer\":\"Y\",\"issueDate\":\"2020-01-01\"}"), 404, "CERTIFICATION_NOT_FOUND")
+    var i = 1
+    while (i < 10) {
+        Check.status(owner.post("/me/experiences", "{\"title\":\"Dev " + i + "\",\"company\":\"X\",\"startDate\":\"2020-01-01\"}"), 201)
+        i = i + 1
+    }
+    var limit = owner.post("/me/experiences", "{\"title\":\"Eleven\",\"company\":\"X\",\"startDate\":\"2020-01-01\"}")
+    Check.apiError(limit, 409, "EXPERIENCES_LIMIT")
+    Check.jsonEq(limit, "message", "Você pode ter no máximo 10 experiências no perfil.")
+    // A malformed date is an unreadable body; a missing required column is a conflict.
+    Check.apiError(other.post("/me/experiences", "{\"title\":\"Dev\",\"company\":\"X\",\"startDate\":\"01/01/2020\"}"), 400, "BAD_REQUEST")
+    Check.apiError(other.post("/me/education", "{\"degree\":\"Y\",\"startDate\":\"2020-01-01\"}"), 409, "CONFLICT")
+    Check.apiError(other.post("/me/certifications", "{\"name\":\"X\",\"issuer\":\"Y\",\"issueDate\":\"2020-01-01\",\"credentialUrl\":\"javascript:alert(1)\"}"), 400, "INVALID_URL")
+}
+
+test "views the own profile" {
+    var user = pUser("prof_views")
+    var me = user.get("/me")
+    Check.status(me, 200)
+    Check.isTrue("username", me.json("username").length() > 0)
+    Check.jsonEq(me, "id", "prof_views")
+    Check.jsonEq(me, "showRanking", "true")
+    Check.jsonEq(me, "showCity", "false")
+    Check.isTrue("postsCount is a number", me.json("postsCount") == "0")
+    Check.jsonEq(me, "connectionsCount", "0")
+    Check.isTrue("garden", me.jsonHas("garden.trajectory") && me.jsonHas("garden.health"))
+    Check.isTrue("appearance", me.jsonIsNull("profileAppearance.social.theme") && me.jsonHas("profileAppearance.professional"))
+    Check.isTrue("badges", me.body.contains("\"badges\":[]"))
+    Check.apiError(ProfileTestApp.anonymous(pApp()).get("/me"), 401, "UNAUTHENTICATED")
+}
+
+test "the internal id is not a public identifier: by-id needs a session" {
+    var user = pUser("prof_byid")
+    var anon = ProfileTestApp.anonymous(pApp())
+    Check.status(anon.get("/users/by-id/prof_byid"), 401)
+    var res = user.get("/users/by-id/prof_byid")
+    Check.status(res, 200)
+    Check.jsonEq(res, "id", "prof_byid")
+    Check.apiError(user.get("/users/by-id/prof_nobody"), 404, "USER_NOT_FOUND")
+    Check.apiError(anon.get("/users/prof_nobody"), 404, "USER_NOT_FOUND")
+}
+
+test "the public profile never carries the e-mail or the owner-only fields" {
+    var user = pUser("prof_public_shape")
+    Check.status(user.patch("/me/profile", "{\"headline\":\"Dev\",\"birthDate\":\"1990-05-10\"}"), 200)
+    var res = ProfileTestApp.anonymous(pApp()).get("/users/prof_public_shape")
+    Check.status(res, 200)
+    Check.isTrue("no email", !res.jsonHas("email"))
+    Check.isTrue("no birth date", !res.jsonHas("birthDate"))
+    Check.isTrue("no resume", !res.jsonHas("resumeUrl"))
+    Check.isTrue("no showRanking", !res.jsonHas("showRanking"))
+    Check.jsonEq(res, "headline", "Dev")
+    Check.jsonEq(res, "isMentor", "false")
+    Check.isTrue("joinedAt", res.json("joinedAt").endsWith("Z"))
+    Check.jsonEq(res, "postsCount", "0")
+    Check.isTrue("garden computed on single reads", res.jsonHas("garden.tenure"))
+    Check.isTrue("look", res.body.contains("\"profileLook\":{\"theme\":null"))
+}
+
+// Ranking ---------------------------------------------------------------------------------------
+test "the ranking lists the newest profiles first" {
+    var older = pUser("rank_older")
+    time.sleep(30)
+    pUser("rank_newer")
+    var res = older.get("/profile/ranking?limit=50")
+    Check.status(res, 200)
+    var olderIndex = -1
+    var newerIndex = -1
+    var i = 0
+    while (i < res.jsonSize("")) {
+        var id = res.json("" + i + ".id")
+        if (id == "rank_older") {
+            olderIndex = i
+        }
+        if (id == "rank_newer") {
+            newerIndex = i
+        }
+        i = i + 1
+    }
+    Check.isTrue("older in the list", olderIndex >= 0)
+    Check.isTrue("newer in the list", newerIndex >= 0)
+    Check.isTrue("who arrived last comes first", newerIndex < olderIndex)
+    Check.isTrue("joinedAt shown", res.json("" + newerIndex + ".joinedAt").length() > 0)
+    // Lists do not compute counters or the garden, and carry no HTML.
+    Check.isTrue("no posts count in lists", res.jsonIsNull("" + newerIndex + ".postsCount"))
+    Check.isTrue("no garden in lists", res.jsonIsNull("" + newerIndex + ".garden"))
+    Check.eqStr("same list on /ranking", res.body, ProfileTestApp.anonymous(pApp()).get("/ranking?limit=50").body)
+}
+
+test "the ranking limit is capped between 1 and 50" {
+    var anon = ProfileTestApp.anonymous(pApp())
+    pUser("rank_cap_a")
+    pUser("rank_cap_b")
+    Check.eqInt("limit 1", 1, anon.get("/ranking?limit=1").jsonSize(""))
+    Check.eqInt("limit 0 is 1", 1, anon.get("/ranking?limit=0").jsonSize(""))
+    Check.eqInt("negative is 1", 1, anon.get("/ranking?limit=-5").jsonSize(""))
+    Check.isTrue("limit 1000000 is capped at 50", anon.get("/ranking?limit=1000000").jsonSize("") <= 50)
+    Check.apiError(anon.get("/ranking?limit=abc"), 400, "BAD_REQUEST")
+}
+
+test "a banned profile disappears from the public profile" {
+    pUser("gone_banned")
+    ban("gone_banned")
+    Check.apiError(ProfileTestApp.anonymous(pApp()).get("/users/gone_banned"), 404, "USER_NOT_FOUND")
+}
+
+test "a banned profile leaves the ranking" {
+    pUser("rank_banned")
+    pUser("rank_not_banned")
+    ban("rank_banned")
+    // The ranking is cached per limit (the moderation domain clears it on a sanction); own limit here.
+    var res = ProfileTestApp.anonymous(pApp()).get("/profile/ranking?limit=49")
+    Check.status(res, 200)
+    Check.isTrue("banned is out", !res.body.contains("\"id\":\"rank_banned\""))
+    Check.isTrue("others stay", res.body.contains("\"id\":\"rank_not_banned\""))
+}
+
+test "the ranking section is optional by account preference" {
+    var user = pUser("rank_pref")
+    Check.jsonEq(user.get("/me"), "showRanking", "true")
+    var off = user.callKey("PUT", "/me/ranking", "ranking-off-rank_pref", "{\"show\":false}")
+    Check.status(off, 200)
+    Check.jsonEq(off, "status", "RANKING_HIDDEN")
+    Check.jsonEq(off, "id", "rank_pref")
+    Check.jsonEq(user.get("/me"), "showRanking", "false")
+    Check.status(user.callKey("PUT", "/me/ranking", "ranking-on-rank_pref", "{\"show\":true}"), 200)
+    Check.jsonEq(user.get("/me"), "showRanking", "true")
+    var on = user.callKey("PUT", "/me/ranking", "ranking-on-rank_pref", "{\"show\":true}")
+    Check.jsonEq(on, "status", "RANKING_VISIBLE")
+    Check.apiError(ProfileTestApp.anonymous(pApp()).put("/me/ranking", "{\"show\":true}"), 401, "UNAUTHENTICATED")
+}
+
+test "search needs two characters, orders by reputation and skips banned accounts" {
+    var user = pUser("srch_user")
+    pUser("srch_target")
+    pUser("srch_hidden")
+    ban("srch_hidden")
+    Check.eqStr("empty query", "[]", user.get("/users/search?q=a").body)
+    Check.eqStr("blank query", "[]", user.get("/users/search?q=%20%20").body)
+    var res = user.get("/users/search?q=SRCH_")
+    Check.status(res, 200)
+    Check.isTrue("finds", res.body.contains("\"id\":\"srch_target\""))
+    Check.isTrue("skips banned", !res.body.contains("srch_hidden"))
+    Check.isTrue("no HTML in search results", res.jsonIsNull("0.bioHtml"))
+    // Escapes LIKE wildcards: "%" and "_" are literal.
+    Check.eqStr("percent is literal", "[]", user.get("/users/search?q=%25%25").body)
+    var anon = ProfileTestApp.anonymous(pApp())
+    Check.status(anon.get("/users/search?q=srch"), 200)
+}
+
+// AdminPromotionTests ---------------------------------------------------------------------------
+test "an admin promotes and revokes another admin" {
+    var app = pApp()
+    SecurityFixtures.user(app.db(), "admprom_admin", true, true)
+    SecurityFixtures.session(app.db(), "admprom_admin", "tok-admprom-admin-1234567890", 3600L)
+    var admin = ProfileCaller(app, "tok-admprom-admin-1234567890")
+    var promoted = pUser("admprom_promoted")
+    // Before: not an admin.
+    Check.status(promoted.get("/admin/admins"), 403)
+    var res = admin.post("/admin/admins", "{\"username\":\"admprom_promoted\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "username", "admprom_promoted")
+    Check.jsonEq(res, "id", "admprom_promoted")
+    // The new admin has access with the session they already had (the role is read per request).
+    Check.status(promoted.get("/admin/admins"), 200)
+    var list = admin.get("/admin/admins")
+    Check.status(list, 200)
+    Check.isTrue("listed", list.body.contains("\"username\":\"admprom_promoted\""))
+    // Promoting again is a conflict, not a silent error.
+    Check.apiError(admin.post("/admin/admins", "{\"username\":\"admprom_promoted\"}"), 409, "ALREADY_ADMIN")
+    // Revoking one's own account through the API is refused.
+    Check.apiError(admin.post("/admin/admins/admprom_admin/revoke", ""), 400, "CANNOT_REVOKE_SELF")
+    Check.apiError(admin.post("/admin/admins/admprom_nobody/revoke", ""), 404, "USER_NOT_FOUND")
+    // The promoted person was notified.
+    var note = app.db().queryOne("select title, href, cta_label from notifications where user_id = \'admprom_promoted\' and kind = \'MODERACAO\'", DbParams())
+    Check.eqStr("title", "Você agora é admin", note.getStr("title"))
+    Check.eqStr("href", "/moderador", note.getStr("href"))
+    Check.status(admin.post("/admin/admins/admprom_promoted/revoke", ""), 200)
+    Check.apiError(admin.post("/admin/admins/admprom_promoted/revoke", ""), 409, "NOT_ADMIN")
+    Check.status(promoted.get("/admin/admins"), 403)
+}
+
+test "who is not an admin cannot touch the admin role" {
+    var outsider = pUser("admprom_outsider")
+    Check.status(outsider.get("/admin/admins"), 403)
+    Check.status(outsider.post("/admin/admins", "{\"username\":\"admprom_outsider\"}"), 403)
+    Check.status(ProfileTestApp.anonymous(pApp()).get("/admin/admins"), 401)
+}
+
+// ProfileAppearanceTests + ProfileAppearanceServiceTests --------------------------------------
+String look(theme: String, accent: String, font: String, header: String, textures: String, borders: String, decoration: String) {
+    var parts = listOf<String>()
+    parts.add("\"theme\":" + theme)
+    parts.add("\"accent\":" + accent)
+    parts.add("\"font\":" + font)
+    parts.add("\"header\":" + header)
+    parts.add("\"textures\":" + textures)
+    parts.add("\"borders\":" + borders)
+    parts.add("\"decoration\":" + decoration)
+    return "{" + String.join(",", parts) + "}"
+}
+
+String appearanceBody(social: String, professional: String) = "{\"social\":" + social + ",\"professional\":" + professional + "}"
+
+test "saves both looks and reads them back in both views" {
+    var user = pUser("user_look1")
+    var res = user.callKey("PUT", "/me/profile-appearance", "look-1", appearanceBody(look("\"arcade-8bit\"", "\"#ff00aa\"", "\"mono\"", "\"solid\"", "true", "\"square\"", "2"), look("\"workbench\"", "null", "\"serif\"", "\"clean\"", "false", "\"rounded\"", "0")))
+    Check.status(res, 200)
+    Check.jsonEq(res, "social.theme", "arcade-8bit")
+    Check.jsonEq(res, "professional.theme", "workbench")
+    Check.jsonEq(res, "social.textures", "true")
+    Check.jsonEq(res, "professional.decoration", "0")
+    var mine = user.get("/me")
+    Check.jsonEq(mine, "profileAppearance.social.theme", "arcade-8bit")
+    Check.jsonEq(mine, "profileAppearance.professional.theme", "workbench")
+    // Public: the projection of the profile screen carries only the SOCIAL side.
+    var pub = ProfileTestApp.anonymous(pApp()).get("/users/user_look1")
+    Check.jsonEq(pub, "profileLook.theme", "arcade-8bit")
+    Check.jsonEq(pub, "profileLook.accent", "#ff00aa")
+    Check.isTrue("professional side stays private", !pub.body.contains("workbench"))
+}
+
+test "changing one side leaves the other alone" {
+    var user = pUser("user_look2")
+    Check.status(user.put("/me/profile-appearance", appearanceBody(look("\"swing-metal\"", "\"#123456\"", "\"sans\"", "\"gradient\"", "true", "\"rounded\"", "1"), look("\"terminal-green\"", "null", "\"mono\"", "\"solid\"", "false", "\"square\"", "2"))), 200)
+    var res = user.put("/me/profile-appearance", appearanceBody(look("\"web2000\"", "\"#abcdef\"", "\"sans\"", "\"solid\"", "true", "\"rounded\"", "0"), look("\"terminal-green\"", "null", "\"mono\"", "\"solid\"", "false", "\"square\"", "2")))
+    Check.status(res, 200)
+    Check.jsonEq(res, "social.theme", "web2000")
+    Check.jsonEq(res, "professional.theme", "terminal-green")
+    Check.jsonEq(res, "professional.font", "mono")
+}
+
+test "an empty body clears both looks" {
+    var user = pUser("user_look3")
+    Check.status(user.put("/me/profile-appearance", appearanceBody(look("\"win95\"", "\"#123456\"", "\"mono\"", "\"solid\"", "true", "\"square\"", "2"), "null")), 200)
+    var res = user.put("/me/profile-appearance", appearanceBody("null", "null"))
+    Check.status(res, 200)
+    Check.isTrue("social theme gone", res.jsonIsNull("social.theme"))
+    Check.isTrue("professional theme gone", res.jsonIsNull("professional.theme"))
+    Check.isTrue("stored as absence", pApp().db().queryOne("select profile_appearance from users where id = \'user_look3\'", DbParams()).getStrOrNull("profile_appearance") == null)
+    Check.isTrue("an empty JSON object clears too", user.put("/me/profile-appearance", "{}").jsonIsNull("social.theme"))
+}
+
+test "refuses a theme outside the catalog" {
+    var user = pUser("user_look4")
+    var res = user.put("/me/profile-appearance", appearanceBody(look("\"tema-inventado\"", "null", "null", "null", "null", "null", "null"), "null"))
+    Check.apiError(res, 400, "INVALID_PROFILE_THEME")
+    Check.jsonEq(res, "message", "Tema de perfil desconhecido: escolha um dos temas disponiveis.")
+}
+
+test "refuses an accent that is not hex" {
+    var user = pUser("user_look5")
+    var res = user.put("/me/profile-appearance", appearanceBody(look("null", "\"red; background:url(x)\"", "null", "null", "null", "null", "null"), "null"))
+    Check.apiError(res, 400, "INVALID_PROFILE_ACCENT")
+    Check.jsonEq(res, "message", "Cor do perfil precisa ser um hex como #7c3aed.")
+}
+
+test "the look endpoint requires a session" {
+    Check.status(ProfileTestApp.anonymous(pApp()).put("/me/profile-appearance", appearanceBody("null", "null")), 401)
+}
+
+test "the look is normalized and refuses unknown font, header, border and decoration" {
+    var user = pUser("user_look7")
+    var saved = user.put("/me/profile-appearance", appearanceBody(look("\" arcade-8bit \"", "\" #ABCDEF \"", "\" MONO \"", "\" solid \"", "true", "\" square \"", "1"), "null"))
+    Check.status(saved, 200)
+    Check.jsonEq(saved, "social.theme", "arcade-8bit")
+    Check.jsonEq(saved, "social.accent", "#abcdef")
+    Check.jsonEq(saved, "social.font", "mono")
+    Check.jsonEq(saved, "social.header", "solid")
+    Check.jsonEq(saved, "social.borders", "square")
+    Check.isTrue("professional empty", saved.jsonIsNull("professional.theme"))
+    Check.apiError(user.put("/me/profile-appearance", appearanceBody(look("null", "null", "\"comic-sans\"", "null", "null", "null", "null"), "null")), 400, "INVALID_PROFILE_APPEARANCE")
+    Check.apiError(user.put("/me/profile-appearance", appearanceBody(look("null", "null", "null", "\"floating\"", "null", "null", "null"), "null")), 400, "INVALID_PROFILE_APPEARANCE")
+    Check.apiError(user.put("/me/profile-appearance", appearanceBody(look("null", "null", "null", "null", "null", "\"blob\"", "null"), "null")), 400, "INVALID_PROFILE_APPEARANCE")
+    var level = user.put("/me/profile-appearance", appearanceBody(look("null", "null", "null", "null", "null", "null", "9"), "null"))
+    Check.apiError(level, 400, "INVALID_PROFILE_APPEARANCE")
+    Check.jsonEq(level, "message", "Decoracao do perfil vai de 0 a 2.")
+    // Nothing was stored by the refusals.
+    Check.jsonEq(user.get("/me"), "profileAppearance.social.font", "mono")
+}
+
+test "an unknown profile is not found when saving a look" {
+    // Service level: an HTTP session cannot outlive its user (foreign key), so the missing profile is
+    // reached through the service the route calls.
+    var store = pApp().db()
+    var service = ProfileAppearanceService(ProfileDirectory(store), ProfileStore(store))
+    var failure = ""
+    try {
+        service.update("sumiu", ProfileAppearanceBody(null, null))
+    } catch (String e) {
+        failure = e
+    }
+    Check.isTrue("404", failure.contains("\"status\":404"))
+    Check.isTrue("code", failure.contains("PROFILE_NOT_FOUND"))
+}
+
+// ProfileAppearanceJsonTests -----------------------------------------------------------------
+test "the appearance column round-trips both looks" {
+    var original = ProfileAppearance(ProfileLook("arcade-8bit", "#ff00aa", "mono", "solid", true, "square", 2), ProfileLook("workbench", ProfileNulls.none(), "serif", "clean", false, "rounded", 0))
+    var back = ProfileAppearances.decode(ProfileAppearances.encode(original))
+    Check.eqStr("social", json.encode(original.social), json.encode(back.social))
+    Check.eqStr("professional", json.encode(original.professional), json.encode(back.professional))
+}
+
+test "an empty choice is stored as absence" {
+    Check.isTrue("empty encodes to null", ProfileAppearances.encode(ProfileAppearances.empty()) == null)
+    Check.isTrue("null decodes to empty", ProfileAppearances.isEmpty(ProfileAppearances.decode(ProfileNulls.none())))
+    Check.isTrue("blank decodes to empty", ProfileAppearances.isEmpty(ProfileAppearances.decode("   ")))
+}
+
+test "a broken document falls back to the default" {
+    Check.isTrue("not json", ProfileAppearances.isEmpty(ProfileAppearances.decode("{isto nao e json")))
+    Check.isTrue("array", ProfileAppearances.isEmpty(ProfileAppearances.decode("[]")))
+}
+
+test "unknown keys are ignored and missing ones stay null" {
+    var back = ProfileAppearances.decode("{\"social\":{\"theme\":\"win95\",\"futuro\":\"?\"},\"corporativo\":{\"theme\":\"win95\"}}")
+    Check.isTrue("theme read", back.social.theme == "win95")
+    Check.isTrue("accent null", back.social.accent == null)
+    Check.isTrue("professional empty", ProfileAppearances.lookIsEmpty(back.professional))
+}
+
+// ProfilePostsCountTests ---------------------------------------------------------------------
+addPost(author: String, type: String, content: String, identity: String, channel: String?) {
+    pApp().db().execute("insert into posts (id, author_id, type, content, created_at, visibility, reactions, comments, saves, shares, status, author_identity, channel_id) values (?, ?, ?, ?, ?, \'PUBLIC\', 0, 0, 0, 0, \'ACTIVE\', ?, ?)", DbParams().bindStr("post_" + author + "_" + Time.nowMillis() + "_" + content.length() + type).bindStr(author).bindStr(type).bindStr(content).bindInstant(Time.nowIso()).bindStr(identity).bindStrOrNull(channel))
+}
+
+test "the posts count is the integer, not the page" {
+    pUser("pcount_autor")
+    var i = 1
+    while (i <= 12) {
+        addPost("pcount_autor", "INSIGHT", "Post numero " + i + " do autor.", "SOCIAL", ProfileNulls.none())
+        time.sleep(2)
+        i = i + 1
+    }
+    Check.jsonEq(ProfileTestApp.anonymous(pApp()).get("/users/pcount_autor"), "postsCount", "12")
+    Check.jsonEq(pUser("pcount_autor").get("/me"), "postsCount", "12")
+}
+
+test "the posts count follows the filters of the social listing" {
+    pUser("pcount_filtros")
+    addPost("pcount_filtros", "INSIGHT", "Social que entra na conta.", "SOCIAL", ProfileNulls.none())
+    time.sleep(2)
+    addPost("pcount_filtros", "QUESTION", "Outro social que entra.", "SOCIAL", ProfileNulls.none())
+    time.sleep(2)
+    // Business posts (corporate identity) only exist in the corporate feed: neither listed nor counted.
+    addPost("pcount_filtros", "BUSINESS", "Anuncio do alterego profissional.", "CORPORATE", ProfileNulls.none())
+    time.sleep(2)
+    addPost("pcount_filtros", "BLOG", "Blog nao conta.", "SOCIAL", ProfileNulls.none())
+    time.sleep(2)
+    addPost("pcount_filtros", "INSIGHT", "Post de canal nao conta.", "SOCIAL", "channel-x")
+    pApp().db().execute("update posts set status = \'DELETED\' where author_id = \'pcount_filtros\' and content = \'Outro social que entra.\'", DbParams())
+    pApp().db().execute("insert into posts (id, author_id, type, content, created_at, visibility, reactions, comments, saves, shares, status, author_identity) values (\'post_pcount_filtros_q\', \'pcount_filtros\', \'INSIGHT\', \'Em quarentena.\', ?, \'PUBLIC\', 0, 0, 0, 0, \'QUARANTINED\', \'SOCIAL\')", DbParams().bindInstant(Time.nowIso()))
+    Check.jsonEq(ProfileTestApp.anonymous(pApp()).get("/users/pcount_filtros"), "postsCount", "1")
+}
+
+test "a profile without posts counts zero" {
+    pUser("pcount_vazio")
+    Check.jsonEq(ProfileTestApp.anonymous(pApp()).get("/users/pcount_vazio"), "postsCount", "0")
+}
+
+// Recommendations ---------------------------------------------------------------------------
+test "recommends, lists, refuses duplicates and removes" {
+    var a = pUser("rec_a")
+    var b = pUser("rec_b")
+    var made = a.callKey("POST", "/recommendations/rec_b", "rec-1", "{\"comment\":\"Ótimo colega\"}")
+    Check.status(made, 201)
+    Check.jsonEq(made, "recommenderId", "rec_a")
+    Check.jsonEq(made, "recommendedId", "rec_b")
+    Check.jsonEq(made, "comment", "Ótimo colega")
+    Check.isTrue("id prefix", made.json("id").startsWith("rec_"))
+    Check.isTrue("createdAt", made.json("createdAt").endsWith("Z"))
+    var replay = a.callKey("POST", "/recommendations/rec_b", "rec-1", "{\"comment\":\"Ótimo colega\"}")
+    Check.status(replay, 201)
+    Check.eqStr("replay", made.body, replay.body)
+    Check.apiError(a.post("/recommendations/rec_b", "{\"comment\":\"de novo\"}"), 409, "ALREADY_RECOMMENDED")
+    Check.apiError(a.post("/recommendations/rec_a", ""), 400, "SELF_RECOMMENDATION")
+    var anon = ProfileTestApp.anonymous(pApp())
+    Check.jsonEq(anon.get("/recommendations/received/rec_b"), "0.recommenderId", "rec_a")
+    Check.jsonEq(anon.get("/recommendations/given/rec_a"), "0.recommendedId", "rec_b")
+    Check.eqStr("nothing received by a", "[]", anon.get("/recommendations/received/rec_a").body)
+    Check.apiError(b.delete("/recommendations/rec_a"), 404, "RECOMMENDATION_NOT_FOUND")
+    var removed = a.callKey("DELETE", "/recommendations/rec_b", "rec-del-1", "")
+    Check.status(removed, 200)
+    Check.eqStr("removed body", "{\"status\":\"REMOVED\"}", removed.body)
+    Check.eqStr("gone", "[]", anon.get("/recommendations/received/rec_b").body)
+    // A recommendation without a body is allowed (comment null).
+    var empty = a.post("/recommendations/rec_b", "")
+    Check.status(empty, 201)
+    Check.isTrue("comment null", empty.jsonIsNull("comment"))
+}
+
+// Age flow ----------------------------------------------------------------------------------
+test "the age state starts as BIRTH_DATE_REQUIRED and follows the declared date" {
+    var user = pUser("age_user")
+    var start = user.get("/me/age-state")
+    Check.status(start, 200)
+    Check.jsonEq(start, "state", "BIRTH_DATE_REQUIRED")
+    Check.jsonEq(start, "declared", "false")
+    Check.apiError(user.post("/me/birth-date", "{\"birthDate\":\"amanhã\"}"), 400, "INVALID_BIRTH_DATE")
+    Check.apiError(user.post("/me/birth-date", "{\"birthDate\":\"2999-01-01\"}"), 400, "INVALID_BIRTH_DATE")
+    Check.apiError(user.post("/me/birth-date", "{\"birthDate\":\"1800-01-01\"}"), 400, "INVALID_BIRTH_DATE")
+    Check.apiError(user.post("/me/birth-date", "{}"), 400, "BIRTH_DATE_REQUIRED")
+    Check.apiError(user.post("/me/birth-date", "{\"birthDate\":\"  \"}"), 400, "BIRTH_DATE_REQUIRED")
+    var adult = user.post("/me/birth-date", "{\"birthDate\":\"1990-05-10\"}")
+    Check.status(adult, 200)
+    Check.jsonEq(adult, "state", "ADULT_DECLARED")
+    Check.jsonEq(adult, "minor", "false")
+    Check.isTrue("the date never comes back", !adult.body.contains("1990"))
+    Check.jsonEq(user.get("/me"), "birthDate", "1990-05-10")
+    var year = Time.nowIso().substring(0, 4).toInt() - 10
+    var minor = user.post("/me/birth-date", "{\"birthDate\":\"" + year + "-01-01\"}")
+    Check.jsonEq(minor, "state", "MINOR_CONSENT_PENDING")
+    Check.jsonEq(minor, "minor", "true")
+    pApp().db().execute("insert into parental_links (id, minor_user_id, guardian_user_id, guardian_email, status, terms_version, created_at, expires_at) values (\'pl_age_user\', \'age_user\', \'age_guardian\', \'g@test.invalid\', \'ACTIVE\', \'v1\', ?, ?)", DbParams().bindInstant(Time.nowIso()).bindInstant(Time.plusSeconds(Time.nowIso(), 3600L)))
+    var supervised = user.get("/me/age-state")
+    Check.jsonEq(supervised, "state", "MINOR_SUPERVISED")
+    Check.jsonEq(supervised, "supervised", "true")
+}
+
+test "the profile edit accepts a birth date and refuses a malformed one" {
+    var user = pUser("age_patch")
+    Check.apiError(user.patch("/me/profile", "{\"birthDate\":\"10/05/1990\"}"), 400, "INVALID_BIRTH_DATE")
+    var ok = user.patch("/me/profile", "{\"birthDate\":\"1990-05-10\"}")
+    Check.status(ok, 200)
+    Check.jsonEq(ok, "birthDate", "1990-05-10")
+    // A blank date keeps the stored one.
+    Check.jsonEq(user.patch("/me/profile", "{\"birthDate\":\"\"}"), "birthDate", "1990-05-10")
+}
+
+// Username -------------------------------------------------------------------------------------
+test "a username change becomes a slug, is unique and cannot take a reserved name" {
+    var a = pUser("uname_a")
+    pUser("uname-b")
+    var res = a.patch("/me/profile", "{\"username\":\"  Novo Nome!! \"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "username", "novo-nome")
+    Check.status(ProfileTestApp.anonymous(pApp()).get("/users/novo-nome"), 200)
+    Check.apiError(a.patch("/me/profile", "{\"username\":\"uname-b\"}"), 409, "USERNAME_TAKEN")
+    var reserved = a.patch("/me/profile", "{\"username\":\"admin\"}")
+    Check.apiError(reserved, 409, "USERNAME_RESERVED")
+    Check.jsonEq(reserved, "message", "Este nome de usuario e reservado para a equipe.")
+    // A name with no letter or digit left keeps the current one.
+    Check.jsonEq(a.patch("/me/profile", "{\"username\":\"!!!\"}"), "username", "novo-nome")
+    // The old name no longer resolves, the new one does.
+    Check.status(ProfileTestApp.anonymous(pApp()).get("/users/uname_a"), 404)
+}
+
+test "zz stops the background jobs" {
+    ProfileTestApp.finish()
+}

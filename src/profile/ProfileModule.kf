@@ -1,0 +1,66 @@
+package profile
+
+import kernel.*
+import kernel.security.*
+import network.*
+import preferences.*
+import presence.*
+
+// Wires the four domains of the profile slice (profile, network, preferences, presence): stores, services,
+// routes and the reputation refresh job. Main.kf has one line for it, after Security.install:
+//
+//   var profiles = ProfileModule.install(platform, shared, hooks)
+//
+// What the other modules read (see docs/PORTING_STATUS.md, "profile"):
+//   profiles.directory       ProfileDirectory   read API: findById, findByUsername, findAllByIds, displayName, nameStyle...
+//   profiles.slots           ProfileSlots       cosmetic slot writes (frame, name style, card slots, garden, status, badges)
+//   profiles.reputation      ProfileReputation  countsFor(userId), reputationOf(userId)
+//   profiles.network         NetworkService     friendIds, friendsOfFriends, userTags, connections
+//   profiles.preferences     PreferencesService likedTopics(userId), blockedTopics(userId)
+//   profiles.presence        PresenceService    publicStatus(userId), allowPush(userId)
+class ProfileModule {
+    ProfileDirectory directory
+    ProfileSlots slots
+    ProfileReputation reputation
+    NetworkService network
+    PreferencesService preferences
+    PresenceService presence
+    public constructor(directory: ProfileDirectory, slots: ProfileSlots, reputation: ProfileReputation, network: NetworkService, preferences: PreferencesService, presence: PresenceService) {
+        this.directory = directory
+        this.slots = slots
+        this.reputation = reputation
+        this.network = network
+        this.preferences = preferences
+        this.presence = presence
+    }
+    // Default seams (each reads the owner's tables until the owner is ported).
+    static ProfileModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks) {
+        var store = platform.db
+        return ProfileModule.installWith(platform, shared, ProfileNotifier(store), ProfileBadgeOwnership(store), ProfileParentalLinks(store), ProfileForeignCounts(store), PreferencesThemeGallery(store))
+    }
+    // The owner of a seam passes its subclass here.
+    static ProfileModule installWith(platform: Platform, shared: SharedServices, notifier: ProfileNotifier, badges: ProfileBadgeOwnership, parental: ProfileParentalLinks, foreign: ProfileForeignCounts, gallery: PreferencesThemeGallery) {
+        var store = platform.db
+        var cfg = platform.cfg
+        var directory = ProfileDirectory(store)
+        var writes = ProfileStore(store)
+        var slots = ProfileSlots(store)
+        var extension = ProfileExtensionStore(store)
+        var throttle = ActionThrottle()
+        var reputation = ProfileReputation(store, directory, writes, extension, foreign)
+        var service = ProfileService(store, directory, writes, reputation, foreign, parental, badges, shared.sanctionReader, throttle, shared.caches, cfg)
+        var extensionService = ProfileExtensionService(store, extension, directory)
+        var recommendations = ProfileRecommendationService(extension, throttle, cfg)
+        var appearance = ProfileAppearanceService(directory, writes)
+        var identity = ProfileIdentityService(directory, writes, slots, badges)
+        var admins = ProfileAdminService(directory, writes, notifier)
+        ProfileRoutes.register(platform.server, service, extensionService, recommendations, appearance, identity, admins, shared.idempotency, directory)
+        reputation.schedule(shared.jobs, cfg.getLong("REDE_REPUTATION_REFRESH_DELAY_MS", 1800000L), cfg.getLong("REDE_REPUTATION_REFRESH_INITIAL_DELAY_MS", 60000L))
+        var networkStore = NetworkStore(store)
+        var networkService = NetworkService(store, networkStore, directory, notifier)
+        NetworkRoutes.register(platform.server, networkService, NetworkBlockService(store, networkStore, directory), NetworkMuteService(networkStore, directory), networkStore, directory, shared.blockedUsers, shared.idempotency)
+        var preferences = PreferencesModule.install(platform, gallery)
+        var presence = PresenceModule.install(platform, directory, shared.sanctionReader)
+        return ProfileModule(directory, slots, reputation, networkService, preferences.service, presence.service)
+    }
+}

@@ -1,0 +1,174 @@
+package profile
+
+import kernel.db.*
+import kernel.text.*
+
+// Read API of the profile hub. Feed, groups, messaging, notifications and the other domains read author
+// names, avatars, badges, cosmetic slots and reputation through this class (their seam defaults can be
+// switched to it). Reads only; slot writes live in ProfileSlots, profile edits in ProfileStore.
+//
+//   var directory = ProfileModule.directory          // or the instance Main.kf got from ProfileModule.install
+//   directory.findById(id)            // ProfileRecord? (every column the profile owns + skills, goals, links)
+//   directory.findByUsername(name)    // exact match
+//   directory.findAllByIds(ids)       // batch (3 extra queries, not 3 per profile)
+//   directory.displayName(id)         // social name, else registered name; "" when the account does not exist
+//   directory.nameStyle(profile)      // ProfileNameStyle? (null when nothing is customised)
+class ProfileDirectory {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // Same projection everywhere: all the columns the domain reads.
+    static String columns() = "id, username, email, name, headline, avatar_frame, name_theme, name_font, name_color, contributor_tag_color, card_theme, nameplate, banner_item, profile_effect, profile_appearance, garden_style, status_text, status_icon, company, location, city, state, city_key, show_city, avatar, banner, badge, bio, bio_html, banner_html, nickname, social_name, pronouns, aka, resume_url, resume_name, badges, availability, portfolio, open_to_work, is_mentor, is_admin, reputation, created_at, updated_at, show_ranking, birth_date, email_verified_at, totp_enabled_at, email_otp_enabled_at, federated_second_factor_at"
+    ProfileRecord? findById(id: String) {
+        var row = store.queryOptional("select " + ProfileDirectory.columns() + " from users where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return this.one(row)
+    }
+    ProfileRecord? findByUsername(username: String) {
+        var row = store.queryOptional("select " + ProfileDirectory.columns() + " from users where username = ?", DbParams().bindStr(username))
+        if (row == null) {
+            return null
+        }
+        return this.one(row)
+    }
+    Bool existsByUsername(username: String) = store.queryLong("select count(*) from users where username = ?", DbParams().bindStr(username)) > 0L
+    Bool exists(id: String) = store.queryLong("select count(*) from users where id = ?", DbParams().bindStr(id)) > 0L
+    // Profiles of these ids (missing ids are skipped); collections loaded in three batch queries.
+    List<ProfileRecord> findAllByIds(ids: List<String>) {
+        if (ids.size() == 0) {
+            return listOf<ProfileRecord>()
+        }
+        var rows = store.queryList("select " + ProfileDirectory.columns() + " from users where id in (" + ProfileDirectory.marks(ids.size()) + ")", ProfileDirectory.binds(ids))
+        return this.many(rows)
+    }
+    // The newest profiles first (the public "ranking" showcase).
+    List<ProfileRecord> findNewest(limit: Int) {
+        var rows = store.queryList("select " + ProfileDirectory.columns() + " from users order by created_at desc limit ?", DbParams().bindInt(limit))
+        return this.many(rows)
+    }
+    // Name/username/social-name search, best reputation first, at most 20.
+    List<ProfileRecord> search(query: String) {
+        var pattern = LikePattern.contains(query)
+        if (pattern == null) {
+            return listOf<ProfileRecord>()
+        }
+        var rows = store.queryList("select " + ProfileDirectory.columns() + " from users where lower(name) like ? escape \'!\' or lower(username) like ? escape \'!\' or lower(social_name) like ? escape \'!\' order by reputation desc limit 20", DbParams().bindStr(pattern).bindStr(pattern).bindStr(pattern))
+        return this.many(rows)
+    }
+    List<ProfileRecord> findAdmins() = this.many(store.queryList("select " + ProfileDirectory.columns() + " from users where is_admin = true", DbParams()))
+    // Ids in stable pages (reputation refresh job).
+    List<String> pageOfIds(offset: Int, limit: Int) = store.queryList("select id from users order by id limit ? offset ?", DbParams().bindInt(limit).bindInt(offset)).map((r: DbRow) -> r.getStr("id"))
+    String displayName(id: String) {
+        var p = this.findById(id)
+        if (p == null) {
+            return ""
+        }
+        return p.displayName()
+    }
+    // Style travelling with a name (ProfileNameStyle.from): null when nothing is set.
+    static ProfileNameStyle? nameStyle(p: ProfileRecord?) {
+        if (p == null) {
+            return null
+        }
+        if (p.nameTheme == null && p.nameFont == null && p.nameColor == null && p.nameplate == null) {
+            return null
+        }
+        return ProfileNameStyle(p.nameTheme, p.nameFont, p.nameColor, p.nameplate)
+    }
+    static String marks(n: Int) {
+        var parts = listOf<String>()
+        var i = 0
+        while (i < n) {
+            parts.add("?")
+            i = i + 1
+        }
+        return String.join(",", parts)
+    }
+    static DbParams binds(ids: List<String>) {
+        var p = DbParams()
+        for (var id in ids) {
+            p.bindStr(id)
+        }
+        return p
+    }
+    ProfileRecord one(row: DbRow) {
+        var ids = listOf(row.getStr("id"))
+        return this.build(row, this.collection("user_skills", "skill", ids), this.collection("user_goals", "goal", ids), this.collection("user_external_links", "external_link", ids))
+    }
+    List<ProfileRecord> many(rows: List<DbRow>) {
+        var ids = rows.map((r: DbRow) -> r.getStr("id"))
+        if (ids.size() == 0) {
+            return listOf<ProfileRecord>()
+        }
+        var skills = this.collection("user_skills", "skill", ids)
+        var goals = this.collection("user_goals", "goal", ids)
+        var links = this.collection("user_external_links", "external_link", ids)
+        var out = listOf<ProfileRecord>()
+        for (var r in rows) {
+            out.add(this.build(r, skills, goals, links))
+        }
+        return out
+    }
+    // user_id -> values of one element collection table.
+    Map<String,List<String>> collection(table: String, col: String, ids: List<String>) {
+        var out = mapOf<String, List<String>>()
+        var rows = store.queryList("select user_id, " + col + " from " + table + " where user_id in (" + ProfileDirectory.marks(ids.size()) + ")", ProfileDirectory.binds(ids))
+        for (var r in rows) {
+            var uid = r.getStr("user_id")
+            var cur = out.get(uid)
+            if (cur == null) {
+                var created = listOf<String>()
+                created.add(r.getStr(col))
+                out.put(uid, created)
+            }
+            else {
+                cur.add(r.getStr(col))
+            }
+        }
+        return out
+    }
+    static List<String> pick(m: Map<String,List<String>>, id: String) {
+        var v = m.get(id)
+        if (v == null) {
+            return listOf<String>()
+        }
+        return v
+    }
+    ProfileRecord build(r: DbRow, skills: Map<String,List<String>>, goals: Map<String,List<String>>, links: Map<String,List<String>>) {
+        var id = r.getStr("id")
+        var rawBadges = r.getStrOrNull("badges")
+        var badgeList = listOf<String>()
+        if (rawBadges != null && rawBadges.trim().length() > 0) {
+            for (var b in rawBadges.split("\n")) {
+                badgeList.add(b)
+            }
+        }
+        var city = r.getStrOrNull("city")
+        var state = r.getStrOrNull("state")
+        var place = city != null && state != null
+        var cityOut = Nulls.str()
+        var stateOut = Nulls.str()
+        var keyOut = Nulls.str()
+        if (place) {
+            cityOut = city
+            stateOut = state
+            keyOut = r.getStrOrNull("city_key")
+        }
+        return ProfileRecord(id, r.getStr("username"), r.getStr("email"), r.getStr("name"), r.getStrOrNull("headline"), r.getStrOrNull("avatar_frame"), r.getStrOrNull("name_theme"), r.getStrOrNull("name_font"), r.getStrOrNull("name_color"), r.getStrOrNull("contributor_tag_color"), r.getStrOrNull("card_theme"), r.getStrOrNull("nameplate"), r.getStrOrNull("banner_item"), r.getStrOrNull("profile_effect"), ProfileAppearances.decode(r.getStrOrNull("profile_appearance")), r.getStrOrNull("garden_style"), r.getStrOrNull("status_text"), r.getStrOrNull("status_icon"), r.getStrOrNull("company"), r.getStrOrNull("location"), cityOut, stateOut, keyOut, r.getBool("show_city"), r.getStrOrNull("avatar"), r.getStrOrNull("banner"), r.getStrOrNull("badge"), r.getStrOrNull("bio"), r.getStrOrNull("bio_html"), r.getStrOrNull("banner_html"), profileBlankNull(r.getStrOrNull("nickname")), profileBlankNull(r.getStrOrNull("social_name")), profileBlankNull(r.getStrOrNull("pronouns")), r.getStrOrNull("aka"), r.getStrOrNull("resume_url"), r.getStrOrNull("resume_name"), badgeList, ProfileDirectory.pick(skills, id), ProfileDirectory.pick(goals, id), r.getStrOrNull("availability"), r.getStrOrNull("portfolio"), ProfileDirectory.pick(links, id), r.getBool("open_to_work"), r.getBool("is_mentor"), r.getBool("is_admin"), r.getInt("reputation"), r.getInstant("created_at"), r.getInstant("updated_at"), r.getBool("show_ranking"), r.getDateOrNull("birth_date"), r.getInstantOrNull("email_verified_at"), r.getInstantOrNull("totp_enabled_at"), r.getInstantOrNull("email_otp_enabled_at"), r.getInstantOrNull("federated_second_factor_at"))
+    }
+}
+
+// Null for a missing or blank value (UserProfile.blankToNull without the trim of the stored text).
+String? profileBlankNull(v: String?) {
+    if (v == null) {
+        return null
+    }
+    var t = v.trim()
+    if (t.length() == 0) {
+        return null
+    }
+    return t
+}

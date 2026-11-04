@@ -1,0 +1,162 @@
+package profile
+
+import kernel.db.*
+import kernel.jobs.*
+import kernel.log.*
+import kernel.time.*
+
+// Credibility, component model (ReputationService): T trajectory, R relations, C contribution, K tenure,
+// I integrity. Computed on read, persisted in users.reputation by the refresh job so the search can order
+// by it. The garden is computed in the same pass for every account, verified or not.
+class ProfileReputation {
+    ProfileDirectory directory
+    ProfileStore writes
+    ProfileExtensionStore extension
+    ProfileForeignCounts foreign
+    Db store
+    Log log = Log("profile.reputation")
+    public constructor(store: Db, directory: ProfileDirectory, writes: ProfileStore, extension: ProfileExtensionStore, foreign: ProfileForeignCounts) {
+        this.store = store
+        this.directory = directory
+        this.writes = writes
+        this.extension = extension
+        this.foreign = foreign
+    }
+    Int connections(userId: String) = store.queryLong("select count(*) from user_connections where (requester_user_id = ? or receiver_user_id = ?) and status = \'ACCEPTED\'", DbParams().bindStr(userId).bindStr(userId)) as Int
+    Int followers(userId: String) = store.queryLong("select count(*) from user_connections where receiver_user_id = ? and status = \'ACCEPTED\'", DbParams().bindStr(userId)) as Int
+    static Double dmin(a: Double, b: Double) {
+        if (a < b) {
+            return a
+        }
+        return b
+    }
+    static Int imin(a: Int, b: Int) {
+        if (a < b) {
+            return a
+        }
+        return b
+    }
+    static Int stage(value: Double, cap: Int) {
+        var fraction = value / (cap * 1.0)
+        if (fraction < 0.10) {
+            return 0
+        }
+        if (fraction < 0.35) {
+            return 1
+        }
+        if (fraction < 0.70) {
+            return 2
+        }
+        return 3
+    }
+    static Int health(penalty: Int) {
+        if (penalty <= 0) {
+            return 2
+        }
+        if (penalty <= 150) {
+            return 1
+        }
+        return 0
+    }
+    // Full months of 30 days since the account was created (never negative).
+    Int months(createdAt: String) {
+        var days = (Time.nowMillis() - Time.toMillis(createdAt)) / 86400000L
+        if (days < 0L) {
+            return 0
+        }
+        return days / 30L as Int
+    }
+    ProfileCounts countsFor(userId: String) {
+        var profile = directory.findById(userId)
+        var connections = this.connections(userId)
+        var followers = this.followers(userId)
+        var experiences = extension.countExperiences(userId)
+        var educations = extension.countEducations(userId)
+        var certifications = extension.countCertifications(userId)
+        var engagers = foreign.uniqueEngagers(userId)
+        var communities = foreign.communitiesJoined(userId)
+        var events = foreign.eventsAttendedTotal(userId)
+        var mentoring = foreign.mentoringAsMentee(userId)
+        var confirmedFacts = foreign.confirmedReportFacts(userId)
+        var recommendations = extension.receivedCount(userId)
+        var reciprocal = extension.reciprocalRecommendations(userId)
+        var months = 0
+        var verified = false
+        if (profile != null) {
+            months = this.months(profile.createdAt)
+            verified = profile.identityVerified()
+        }
+        var trajectory = ProfileReputation.dmin(90.0, 15.0 * math.sqrt(experiences * 1.0)) + ProfileReputation.dmin(60.0, 12.0 * math.sqrt(educations * 1.0)) + ProfileReputation.dmin(45.0, 7.5 * math.sqrt(certifications * 1.0))
+        var validRecommendations = recommendations - reciprocal
+        if (validRecommendations < 0) {
+            validRecommendations = 0
+        }
+        var relations = ProfileReputation.dmin(180.0, 9.0 * math.sqrt(connections * 1.0)) + ProfileReputation.dmin(120.0, 30.0 * math.sqrt(validRecommendations * 1.0))
+        var contribution = ProfileReputation.dmin(225.0, 7.5 * math.sqrt(engagers * 1.0)) + ProfileReputation.dmin(90.0, 15.0 * math.sqrt(ProfileReputation.imin(communities, 25) * 1.0)) + ProfileReputation.dmin(45.0, 7.5 * math.sqrt(events * 1.0)) + ProfileReputation.dmin(60.0, 15.0 * math.sqrt(mentoring * 1.0))
+        var consistency = ProfileReputation.dmin(120.0, 6.0 * math.sqrt(ProfileReputation.imin(months, 48) * 4.0))
+        var jobAbandons = foreign.jobAbandons(userId)
+        var abandonPenalty = ProfileReputation.imin(150, 25 * jobAbandons * (jobAbandons + 1) / 2)
+        var denied = foreign.deniedNotes(userId)
+        var notePenalty = ProfileReputation.imin(150, 25 * denied * (denied + 1) / 2)
+        var approved = foreign.approvedNotes(userId)
+        var noteBonus = 5 * ProfileReputation.imin(approved, 5)
+        var penalty = ProfileReputation.imin(600, 60 * confirmedFacts * (confirmedFacts + 1) / 2 + abandonPenalty + notePenalty)
+        // Math.round(double) is floor(x + 0.5).
+        var rounded = math.floor(trajectory + relations + contribution + consistency + 0.5) as Int
+        var raw = rounded + noteBonus - penalty
+        var capped = raw
+        if (capped < 0) {
+            capped = 0
+        }
+        if (capped > 1000) {
+            capped = 1000
+        }
+        var garden = ProfileGarden(ProfileReputation.stage(trajectory, 195), ProfileReputation.stage(relations, 300), ProfileReputation.stage(contribution, 420), ProfileReputation.stage(consistency, 120), ProfileReputation.health(penalty))
+        var shown = 0
+        if (verified) {
+            shown = capped
+        }
+        return ProfileCounts(connections, followers, shown, verified, garden)
+    }
+    Int reputationOf(userId: String) = this.countsFor(userId).reputation()
+    // One pass of the ranking column refresh, in pages of 500. A profile that fails never stops the page.
+    Int refreshRankingColumn() {
+        var updated = 0
+        var offset = 0
+        var more = true
+        while (more) {
+            var ids = directory.pageOfIds(offset, 500)
+            if (ids.size() == 0) {
+                break
+            }
+            for (var id in ids) {
+                try {
+                    writes.updateReputation(id, this.reputationOf(id))
+                    updated = updated + 1
+                } catch (String perUser) {
+                }
+            }
+            // one problematic profile must not stop the whole page
+            if (ids.size() < 500) {
+                more = false
+            }
+            offset = offset + 500
+        }
+        if (updated > 0) {
+            log.info("reputation_ranking_refreshed profiles=" + updated)
+        }
+        return updated
+    }
+    // ReputationRefreshWorker: fixed delay REDE_REPUTATION_REFRESH_DELAY_MS (30 min), first run after
+    // REDE_REPUTATION_REFRESH_INITIAL_DELAY_MS (60 s).
+    schedule(jobs: Scheduler, delayMs: Long, initialDelayMs: Long) {
+        var self = this
+        jobs.fixedDelay("reputation-refresh", initialDelayMs, delayMs, () -> {
+    try {
+        self.refreshRankingColumn()
+    } catch (String e) {
+        self.log.warn("reputation_refresh_failed " + e)
+    }
+})
+    }
+}

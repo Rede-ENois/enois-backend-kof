@@ -1,0 +1,85 @@
+package profile
+
+import java.util.HashMap
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Test support for the profile slice: a booted platform with the shared services, the whole request
+// pipeline and ProfileModule (one per test file: Security.install sets process-wide statics).
+//
+//   var app = ProfileTestApp.boot("profile", new HashMap<String, String>())
+//   SecurityFixtures.login(app.db(), "prof_a", "tok-prof-a-1234567890")
+// A signed-in client: every call carries the session token, JSON content type and (by default) a fresh
+// Idempotency-Key, so a test reads like the MockMvc one.
+class ProfileCaller {
+    TestApp app
+    String token
+    public constructor(app: TestApp, token: String) {
+        this.app = app
+        this.token = token
+    }
+    TestResponse callKey(method: String, path: String, key: String, body: String) {
+        var headers = listOf("Content-Type: application/json")
+        if (token.length() > 0) {
+            headers.add("X-Session-Token: " + token)
+        }
+        if (key.length() > 0) {
+            headers.add("Idempotency-Key: " + key)
+        }
+        return app.client.send(method, path, headers, "", body)
+    }
+    TestResponse call(method: String, path: String, body: String) = this.callKey(method, path, ProfileTestApp.nextKey(), body)
+    TestResponse get(path: String) = this.callKey("GET", path, "", "")
+    TestResponse post(path: String, body: String) = this.call("POST", path, body)
+    TestResponse put(path: String, body: String) = this.call("PUT", path, body)
+    TestResponse patch(path: String, body: String) = this.call("PATCH", path, body)
+    TestResponse delete(path: String) = this.call("DELETE", path, "")
+}
+
+class ProfileTestApp {
+    static Int keyCounter = 0
+    static String nextKey() {
+        ProfileTestApp.keyCounter = ProfileTestApp.keyCounter + 1
+        return "test-key-" + ProfileTestApp.keyCounter + "-" + Time.nowMillis()
+    }
+    // A verified account (id = username = name) with a live session; returns its caller.
+    static ProfileCaller login(app: TestApp, id: String) {
+        var token = "tok-" + id + "-1234567890"
+        if (app.db().queryLong("select count(*) from users where id = ?", DbParams().bindStr(id)) == 0L) {
+            SecurityFixtures.user(app.db(), id, true, false)
+        }
+        if (app.db().queryLong("select count(*) from auth_sessions where user_id = ?", DbParams().bindStr(id)) == 0L) {
+            SecurityFixtures.session(app.db(), id, token, 3600L)
+        }
+        return ProfileCaller(app, token)
+    }
+    // Signed-out caller.
+    static ProfileCaller anonymous(app: TestApp) = ProfileCaller(app, "")
+    static SharedServices? sharedHandle = null
+    static TestApp boot(name: String, overrides: Map<String,String>) {
+        var merged = new HashMap<String, String>()
+        merged.put("REDE_ORIGINS_ENFORCE", "false")
+        for (var k in overrides.keys()) {
+            merged.put(k, overrides.getOrDefault(k, ""))
+        }
+        SecurityClock.reset()
+        return TestApp.bootWith(name, merged, (p: Platform) -> ProfileTestApp.wire(p))
+    }
+    static wire(p: Platform) {
+        var shared = SharedServices.create(p)
+        ProfileTestApp.sharedHandle = shared
+        var hooks = SecurityHooks.defaults(p.db)
+        Security.install(p, hooks)
+        ProfileModule.install(p, shared, hooks)
+    }
+    // Last test of a file: stops the background jobs (the outbox worker keeps the test process alive).
+    static finish() {
+        var shared = ProfileTestApp.sharedHandle
+        if (shared != null) {
+            shared.stop()
+        }
+    }
+}

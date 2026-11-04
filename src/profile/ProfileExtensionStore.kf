@@ -1,0 +1,119 @@
+package profile
+
+import kernel.db.*
+
+// user_experiences, user_education, user_certifications and user_recommendations (the profile extension
+// repositories). Rows come back as the JSON views directly.
+class ProfileExtensionStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static ProfileExperienceView experience(r: DbRow) = ProfileExperienceView(r.getStr("id"), r.getStr("title"), r.getStr("company"), r.getStrOrNull("location"), r.getStrOrNull("description"), r.getBool("currently_here"), r.getDate("start_date"), r.getDateOrNull("end_date"))
+    static ProfileEducationView education(r: DbRow) = ProfileEducationView(r.getStr("id"), r.getStr("school"), r.getStr("degree"), r.getStrOrNull("field"), r.getStrOrNull("description"), r.getBool("currently_here"), r.getDate("start_date"), r.getDateOrNull("end_date"))
+    static ProfileCertificationView certification(r: DbRow) = ProfileCertificationView(r.getStr("id"), r.getStr("name"), r.getStr("issuer"), r.getStrOrNull("description"), r.getDate("issue_date"), r.getDateOrNull("expiration_date"), r.getStrOrNull("credential_url"))
+    // Experiences in the order the owner arranged them; `recentFirst` is the public curriculum order.
+    List<ProfileExperienceView> experiences(userId: String, recentFirst: Bool) {
+        var order = "display_order asc"
+        if (recentFirst) {
+            order = "start_date desc, display_order asc"
+        }
+        var rows = store.queryList("select id, title, company, location, description, currently_here, start_date, end_date from user_experiences where user_id = ? order by " + order, DbParams().bindStr(userId))
+        var out = listOf<ProfileExperienceView>()
+        for (var r in rows) {
+            out.add(ProfileExtensionStore.experience(r))
+        }
+        return out
+    }
+    ProfileExperienceView? experienceOf(userId: String, id: String) {
+        var r = store.queryOptional("select id, title, company, location, description, currently_here, start_date, end_date from user_experiences where id = ? and user_id = ?", DbParams().bindStr(id).bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        return ProfileExtensionStore.experience(r)
+    }
+    Int countExperiences(userId: String) = store.queryLong("select count(*) from user_experiences where user_id = ?", DbParams().bindStr(userId)) as Int
+    insertExperience(id: String, userId: String, b: ProfileExperienceBody, start: String?, end: String?, order: Int, now: String) {
+        store.execute("insert into user_experiences (id, user_id, title, company, location, description, currently_here, start_date, end_date, display_order, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(userId).bindStrOrNull(b.title()).bindStrOrNull(b.company()).bindStrOrNull(b.location()).bindStrOrNull(b.description()).bindBool(end == null).bindDateOrNull(start).bindDateOrNull(end).bindInt(order).bindInstant(now).bindInstant(now))
+    }
+    updateExperience(id: String, b: ProfileExperienceBody, start: String?, end: String?, now: String) {
+        store.execute("update user_experiences set title = ?, company = ?, location = ?, description = ?, currently_here = ?, start_date = ?, end_date = ?, updated_at = ? where id = ?", DbParams().bindStrOrNull(b.title()).bindStrOrNull(b.company()).bindStrOrNull(b.location()).bindStrOrNull(b.description()).bindBool(end == null).bindDateOrNull(start).bindDateOrNull(end).bindInstant(now).bindStr(id))
+    }
+    deleteExperience(userId: String, id: String) {
+        store.execute("delete from user_experiences where user_id = ? and id = ?", DbParams().bindStr(userId).bindStr(id))
+    }
+    List<ProfileEducationView> educations(userId: String) {
+        var out = listOf<ProfileEducationView>()
+        for (var r in store.queryList("select id, school, degree, field, description, currently_here, start_date, end_date from user_education where user_id = ? order by display_order asc", DbParams().bindStr(userId))) {
+            out.add(ProfileExtensionStore.education(r))
+        }
+        return out
+    }
+    ProfileEducationView? educationOf(userId: String, id: String) {
+        var r = store.queryOptional("select id, school, degree, field, description, currently_here, start_date, end_date from user_education where id = ? and user_id = ?", DbParams().bindStr(id).bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        return ProfileExtensionStore.education(r)
+    }
+    Int countEducations(userId: String) = store.queryLong("select count(*) from user_education where user_id = ?", DbParams().bindStr(userId)) as Int
+    insertEducation(id: String, userId: String, b: ProfileEducationBody, start: String?, end: String?, order: Int, now: String) {
+        store.execute("insert into user_education (id, user_id, school, degree, field, description, currently_here, start_date, end_date, display_order, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(userId).bindStrOrNull(b.school()).bindStrOrNull(b.degree()).bindStrOrNull(b.field()).bindStrOrNull(b.description()).bindBool(end == null).bindDateOrNull(start).bindDateOrNull(end).bindInt(order).bindInstant(now).bindInstant(now))
+    }
+    updateEducation(id: String, b: ProfileEducationBody, start: String?, end: String?, now: String) {
+        store.execute("update user_education set school = ?, degree = ?, field = ?, description = ?, currently_here = ?, start_date = ?, end_date = ?, updated_at = ? where id = ?", DbParams().bindStrOrNull(b.school()).bindStrOrNull(b.degree()).bindStrOrNull(b.field()).bindStrOrNull(b.description()).bindBool(end == null).bindDateOrNull(start).bindDateOrNull(end).bindInstant(now).bindStr(id))
+    }
+    deleteEducation(userId: String, id: String) {
+        store.execute("delete from user_education where user_id = ? and id = ?", DbParams().bindStr(userId).bindStr(id))
+    }
+    List<ProfileCertificationView> certifications(userId: String) {
+        var out = listOf<ProfileCertificationView>()
+        for (var r in store.queryList("select id, name, issuer, description, issue_date, expiration_date, credential_url from user_certifications where user_id = ? order by issue_date desc", DbParams().bindStr(userId))) {
+            out.add(ProfileExtensionStore.certification(r))
+        }
+        return out
+    }
+    ProfileCertificationView? certificationOf(userId: String, id: String) {
+        var r = store.queryOptional("select id, name, issuer, description, issue_date, expiration_date, credential_url from user_certifications where id = ? and user_id = ?", DbParams().bindStr(id).bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        return ProfileExtensionStore.certification(r)
+    }
+    Int countCertifications(userId: String) = store.queryLong("select count(*) from user_certifications where user_id = ?", DbParams().bindStr(userId)) as Int
+    insertCertification(id: String, userId: String, b: ProfileCertificationBody, issue: String?, expiration: String?, credentialUrl: String?, now: String) {
+        store.execute("insert into user_certifications (id, user_id, name, issuer, description, issue_date, expiration_date, credential_url, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(userId).bindStrOrNull(b.name()).bindStrOrNull(b.issuer()).bindStrOrNull(b.description()).bindDateOrNull(issue).bindDateOrNull(expiration).bindStrOrNull(credentialUrl).bindInstant(now).bindInstant(now))
+    }
+    updateCertification(id: String, b: ProfileCertificationBody, issue: String?, expiration: String?, credentialUrl: String?, now: String) {
+        store.execute("update user_certifications set name = ?, issuer = ?, description = ?, issue_date = ?, expiration_date = ?, credential_url = ?, updated_at = ? where id = ?", DbParams().bindStrOrNull(b.name()).bindStrOrNull(b.issuer()).bindStrOrNull(b.description()).bindDateOrNull(issue).bindDateOrNull(expiration).bindStrOrNull(credentialUrl).bindInstant(now).bindStr(id))
+    }
+    deleteCertification(userId: String, id: String) {
+        store.execute("delete from user_certifications where user_id = ? and id = ?", DbParams().bindStr(userId).bindStr(id))
+    }
+    // user_recommendations
+    static ProfileRecommendationView recommendation(r: DbRow) = ProfileRecommendationView(r.getStr("id"), r.getStr("recommender_id"), r.getStr("recommended_id"), r.getStrOrNull("comment"), r.getInstant("created_at"))
+    List<ProfileRecommendationView> received(userId: String) {
+        var out = listOf<ProfileRecommendationView>()
+        for (var r in store.queryList("select id, recommender_id, recommended_id, comment, created_at from user_recommendations where recommended_id = ? order by created_at desc", DbParams().bindStr(userId))) {
+            out.add(ProfileExtensionStore.recommendation(r))
+        }
+        return out
+    }
+    List<ProfileRecommendationView> given(userId: String) {
+        var out = listOf<ProfileRecommendationView>()
+        for (var r in store.queryList("select id, recommender_id, recommended_id, comment, created_at from user_recommendations where recommender_id = ? order by created_at desc", DbParams().bindStr(userId))) {
+            out.add(ProfileExtensionStore.recommendation(r))
+        }
+        return out
+    }
+    Bool recommended(recommenderId: String, recommendedId: String) = store.queryLong("select count(*) from user_recommendations where recommender_id = ? and recommended_id = ?", DbParams().bindStr(recommenderId).bindStr(recommendedId)) > 0L
+    insertRecommendation(id: String, recommenderId: String, recommendedId: String, comment: String?, now: String) {
+        store.execute("insert into user_recommendations (id, recommender_id, recommended_id, comment, created_at) values (?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(recommenderId).bindStr(recommendedId).bindStrOrNull(comment).bindInstant(now))
+    }
+    deleteRecommendation(id: String) {
+        store.execute("delete from user_recommendations where id = ?", DbParams().bindStr(id))
+    }
+    // Received recommendations that have a return (mutual pair): trade, not trust.
+    Int reciprocalRecommendations(userId: String) = store.queryLong("select count(*) from user_recommendations r where r.recommended_id = ? and exists (select 1 from user_recommendations x where x.recommender_id = ? and x.recommended_id = r.recommender_id)", DbParams().bindStr(userId).bindStr(userId)) as Int
+    Int receivedCount(userId: String) = store.queryLong("select count(*) from user_recommendations where recommended_id = ?", DbParams().bindStr(userId)) as Int
+}

@@ -1,0 +1,86 @@
+package profile
+
+import kernel.db.*
+import kernel.id.*
+import kernel.time.*
+
+// Cross-domain seams owned by the profile domain. Each one is a concrete class with a default that reads the
+// owner's tables read-only with the SQL the Java adapter uses (or does the single insert the Java code does
+// directly), so behaviour and tests are real before the owner is ported. When the owner lands it extends the
+// class, overrides the methods and Main.kf passes the subclass to ProfileModule.install.
+// Notifications written by profile and network (connection request/accepted, admin role changes).
+// pending-port: notifications. NotificationService.create inserts one `notifications` row and publishes
+// NotificationCreatedEvent (push delivery after commit); the default does the insert and logs nothing else,
+// the push listener belongs to the notifications port.
+class ProfileNotifier {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    notify(userId: String, kind: String, actorId: String, title: String, body: String, href: String, ctaLabel: String) {
+        store.execute("insert into notifications (id, user_id, kind, actor_id, title, body, href, cta_label, is_read, created_at, actor_count) values (?, ?, ?, ?, ?, ?, ?, ?, false, ?, 1)", DbParams().bindStr(Ids.prefixed("notification_")).bindStr(userId).bindStr(kind).bindStr(actorId).bindStr(title).bindStr(body).bindStr(href).bindStr(ctaLabel).bindInstant(Time.nowIso()))
+    }
+}
+
+// Official badges (`emblema-*` catalog ids) can only be shown by who owns them (OfficialBadgeReader,
+// implemented by CosmeticsService). pending-port: cosmetics. The default reads ownership like
+// CosmeticsService.ownedItemIds (cosmetic_grants + PURCHASE entries `cosmetico:<user>:<item>`) and cannot
+// check the catalog kind, so any owned `emblema-` id passes.
+class ProfileBadgeOwnership {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    Bool ownsAllOfficial(userId: String, badges: List<String>) {
+        for (var b in badges) {
+            if (b.startsWith("emblema-") && !this.owns(userId, b)) {
+                return false
+            }
+        }
+        return true
+    }
+    Bool owns(userId: String, itemId: String) {
+        if (store.queryLong("select count(*) from cosmetic_grants where user_id = ? and item_id = ?", DbParams().bindStr(userId).bindStr(itemId)) > 0L) {
+            return true
+        }
+        return store.queryLong("select count(*) from coin_entries where kind = \'PURCHASE\' and ref_id = ?", DbParams().bindStr("cosmetico:" + userId + ":" + itemId)) > 0L
+    }
+}
+
+// Parental supervision (age domain: ParentalLinkRepository.findActiveByMinor). pending-port: age.
+class ProfileParentalLinks {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    Bool activeForMinor(minorUserId: String) = store.queryLong("select count(*) from parental_links where minor_user_id = ? and status = \'ACTIVE\'", DbParams().bindStr(minorUserId)) > 0L
+}
+
+// Numbers other domains own that feed the profile: the posts card and the reputation components
+// (SocialPostCountReader, NoteCredibilityReader, JobAbandonPenaltyReader and the native queries the Java
+// profile adapter ran on communities, events, mentoring and reports). Every method is a read-only default;
+// an owner overrides its own method(s) once ported.
+class ProfileForeignCounts {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static Int n(v: Long) = v as Int
+    // pending-port: feed. What the social profile lists: active, social, not a blog, not in a channel.
+    Int socialPosts(userId: String) = ProfileForeignCounts.n(store.queryLong("select count(*) from posts where author_id = ? and status = \'ACTIVE\' and author_identity = \'SOCIAL\' and type <> \'BLOG\' and channel_id is null", DbParams().bindStr(userId)))
+    // pending-port: feed. Distinct people (never the author) who reacted or commented on live posts.
+    Int uniqueEngagers(userId: String) = ProfileForeignCounts.n(store.queryLong("select count(*) from (select r.user_id as actor from reactions r join posts p on p.id = r.post_id where p.author_id = ? and p.status not in (\'DELETED\', \'QUARANTINED\') union select c.author_id as actor from comments c join posts p2 on p2.id = c.post_id where p2.author_id = ? and p2.status not in (\'DELETED\', \'QUARANTINED\') and c.status <> \'DELETED\') engagers where engagers.actor <> ?", DbParams().bindStr(userId).bindStr(userId).bindStr(userId)))
+    // pending-port: communities.
+    Int communitiesJoined(userId: String) = ProfileForeignCounts.n(store.queryLong("select count(*) from community_members where user_id = ?", DbParams().bindStr(userId)))
+    // pending-port: events. Attendances still present plus the aggregate kept before the purge.
+    Int eventsAttendedTotal(userId: String) = ProfileForeignCounts.n(store.queryLong("select (select count(*) from event_attendees where user_id = ?) + coalesce((select total from user_event_attendance_totals where user_id = ?), 0)", DbParams().bindStr(userId).bindStr(userId)))
+    // pending-port: mentoring.
+    Int mentoringAsMentee(userId: String) = ProfileForeignCounts.n(store.queryLong("select count(*) from mentor_sessions where mentee_id = ? and status = \'COMPLETED\'", DbParams().bindStr(userId)))
+    // pending-port: moderation. Confirmed facts, one per reported content (post, comment, job).
+    Int confirmedReportFacts(userId: String) = ProfileForeignCounts.n(store.queryLong("select count(distinct target_id) from reports where status in (\'APPROVED\', \'AUTO_PENALIZED\') and (target_id in (select id from posts where author_id = ?) or target_id in (select id from comments where author_id = ?) or target_id in (select id from jobs where posted_by = ?))", DbParams().bindStr(userId).bindStr(userId).bindStr(userId)))
+    // pending-port: feed (post notes).
+    Int deniedNotes(userId: String) = ProfileForeignCounts.n(store.queryLong("select count(*) from post_notes where author_id = ? and status = \'DENIED\'", DbParams().bindStr(userId)))
+    Int approvedNotes(userId: String) = ProfileForeignCounts.n(store.queryLong("select count(*) from post_notes where author_id = ? and status = \'APPROVED\'", DbParams().bindStr(userId)))
+    // pending-port: jobs. Deleted jobs that still had unanswered candidates.
+    Int jobAbandons(userId: String) = ProfileForeignCounts.n(store.queryLong("select count(*) from job_abandon_penalties where user_id = ?", DbParams().bindStr(userId)))
+}
