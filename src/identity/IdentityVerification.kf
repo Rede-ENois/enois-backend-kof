@@ -1,0 +1,359 @@
+package identity
+
+import kernel.config.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.log.*
+import kernel.security.*
+import kernel.time.*
+import kernel.url.*
+
+record IdentityVerificationRow(String id, String userId, String? provider, String state, String? attemptId, String? reasonCode, String? startedAt, String? completedAt, String? expiresAt, String? lastValidatedAt, String? consentVersion, String updatedAt)
+record IdentityProviderStart(String attemptId, String redirectUrl)
+record IdentityProviderOutcome(String status, String? reasonCode)
+record IdentityStatusView(String state, Bool verified, Bool providerAvailable, String? provider, String? reasonCode, String? completedAt)
+record IdentityStartBody(String attemptId, String redirectUrl)
+record IdentityStartRequest(String? consentVersion)
+record IdentityEligibilityBody(Bool allowed, Int reputation, Int requiredReputation, Bool identityVerified, Bool identityEnforced, String? reason)
+
+// A civil identity provider (IdentityVerificationProvider). The rules never know the vendor: they use the
+// registered provider. With none available the verification is UNAVAILABLE (fail-safe): the state never goes to
+// VERIFIED by a technical failure or a missing integration. A concrete provider subclasses this and overrides.
+class IdentityVerificationProvider {
+    public constructor() {
+    }
+    // False until the credentials are present.
+    Bool available() {
+        return false
+    }
+    String name() {
+        return "none"
+    }
+    IdentityProviderStart start(userId: String, consentVersion: String?) {
+        throw Errors.api(503, "IDENTITY_PROVIDER_UNAVAILABLE", "A verificacao de identidade ainda nao esta disponivel.")
+    }
+    // The outcome the provider confirmed for an attempt (never what the browser claims); null while undecided.
+    IdentityProviderOutcome? fetchOutcome(attemptId: String) {
+        return null
+    }
+    IdentityProviderOutcome? handleCallback(state: String, code: String) {
+        return null
+    }
+}
+
+// Login Unico do gov.br (OAuth 2.0 / OpenID Connect, authorization code). Only ACTIVE with credentials
+// configured (REDE_IDENTITY_GOVBR_*): without them the registry sees it as unavailable and the app shows the
+// verification as unavailable, never approved by simulation.
+class IdentityGovBrProvider extends IdentityVerificationProvider {
+    Log log = Log("identity.govbr")
+    String baseUrl
+    String clientId
+    String clientSecret
+    String redirectUri
+    IdentityOAuthTransport transport
+    public constructor(cfg: Config, transport: IdentityOAuthTransport) {
+        this.baseUrl = IdentityOAuthConfig.clean(cfg.getStr("REDE_IDENTITY_GOVBR_BASE_URL", "https://sso.staging.acesso.gov.br"))
+        this.clientId = cfg.getStr("REDE_IDENTITY_GOVBR_CLIENT_ID", "")
+        this.clientSecret = cfg.getStr("REDE_IDENTITY_GOVBR_CLIENT_SECRET", "")
+        this.redirectUri = cfg.getStr("REDE_IDENTITY_GOVBR_REDIRECT_URI", "")
+        this.transport = transport
+    }
+    Bool available() {
+        return clientId.trim().length() > 0 && clientSecret.trim().length() > 0 && redirectUri.trim().length() > 0
+    }
+    String name() {
+        return "govbr"
+    }
+    IdentityProviderStart start(userId: String, consentVersion: String?) {
+        // An unpredictable, single-use `state`: it is what ties the return to the right attempt.
+        var state = Ids.uuid().replace("-", "") + Ids.uuid().replace("-", "")
+        var url = baseUrl + "/authorize?response_type=code&client_id=" + UrlCodec.encode(clientId) + "&redirect_uri=" + UrlCodec.encode(redirectUri) + "&scope=" + UrlCodec.encode("openid email profile") + "&state=" + UrlCodec.encode(state) + "&nonce=" + UrlCodec.encode(state)
+        return IdentityProviderStart(state, url)
+    }
+    // The Login Unico answers by callback, not by query: there is no polling.
+    IdentityProviderOutcome? fetchOutcome(attemptId: String) {
+        return null
+    }
+    IdentityProviderOutcome? handleCallback(state: String, code: String) {
+        var form = "grant_type=authorization_code&code=" + UrlCodec.encode(code) + "&redirect_uri=" + UrlCodec.encode(redirectUri)
+        var basic = Tokens.base64Encode(clientId + ":" + clientSecret)
+        var token = transport.post(baseUrl + "/token", listOf("Authorization: Basic " + basic), form)
+        // A technical failure never becomes an approval: it stays ERROR (a new attempt is allowed).
+        if (token.status() == 0) {
+            return IdentityProviderOutcome("ERROR", "PROVIDER_UNAVAILABLE")
+        }
+        if (token.status() / 100 != 2) {
+            return IdentityProviderOutcome("ERROR", "PROVIDER_TOKEN_FAILED")
+        }
+        var accessToken = IdentityOAuthValidator.claim(token.body(), "access_token")
+        if (accessToken.length() == 0) {
+            return IdentityProviderOutcome("ERROR", "PROVIDER_TOKEN_FAILED")
+        }
+        var info = transport.get(baseUrl + "/userinfo", listOf("Authorization: Bearer " + accessToken))
+        if (info.status() == 0) {
+            return IdentityProviderOutcome("ERROR", "PROVIDER_UNAVAILABLE")
+        }
+        if (info.status() / 100 != 2) {
+            return IdentityProviderOutcome("ERROR", "PROVIDER_USERINFO_FAILED")
+        }
+        // Only enough to know the identity was confirmed: the provider's `sub`.
+        if (IdentityOAuthValidator.claim(info.body(), "sub").trim().length() > 0) {
+            return IdentityProviderOutcome("VERIFIED", IdentityText.none())
+        }
+        return IdentityProviderOutcome("ERROR", "PROVIDER_EMPTY_SUB")
+    }
+}
+
+// identity_verifications: one row per user (unique), the state machine lives in IdentityVerifications.
+class IdentityVerificationStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    IdentityVerificationRow? row(r: DbRow?) {
+        if (r == null) {
+            return null
+        }
+        return IdentityVerificationRow(r.getStr("id"), r.getStr("user_id"), r.getStrOrNull("provider"), r.getStr("state"), r.getStrOrNull("attempt_id"), r.getStrOrNull("reason_code"), r.getInstantOrNull("started_at"), r.getInstantOrNull("completed_at"), r.getInstantOrNull("expires_at"), r.getInstantOrNull("last_validated_at"), r.getStrOrNull("consent_version"), r.getInstant("updated_at"))
+    }
+    String columns() = "id, user_id, provider, state, attempt_id, reason_code, started_at, completed_at, expires_at, last_validated_at, consent_version, updated_at"
+    IdentityVerificationRow? byUser(userId: String) = row(store.queryOptional("select " + columns() + " from identity_verifications where user_id = ?", DbParams().bindStr(userId)))
+    IdentityVerificationRow? byAttempt(attemptId: String) = row(store.queryOptional("select " + columns() + " from identity_verifications where attempt_id = ?", DbParams().bindStr(attemptId)))
+    save(v: IdentityVerificationRow) {
+        var n = store.execute("update identity_verifications set provider = ?, state = ?, attempt_id = ?, reason_code = ?, started_at = ?, completed_at = ?, expires_at = ?, last_validated_at = ?, consent_version = ?, updated_at = ? where id = ?", DbParams().bindStrOrNull(v.provider()).bindStr(v.state()).bindStrOrNull(v.attemptId()).bindStrOrNull(v.reasonCode()).bindInstantOrNull(v.startedAt()).bindInstantOrNull(v.completedAt()).bindInstantOrNull(v.expiresAt()).bindInstantOrNull(v.lastValidatedAt()).bindStrOrNull(v.consentVersion()).bindInstant(v.updatedAt()).bindStr(v.id()))
+        if (n == 0) {
+            store.execute("insert into identity_verifications (id, user_id, provider, state, attempt_id, reason_code, started_at, completed_at, expires_at, last_validated_at, consent_version, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(v.id()).bindStr(v.userId()).bindStrOrNull(v.provider()).bindStr(v.state()).bindStrOrNull(v.attemptId()).bindStrOrNull(v.reasonCode()).bindInstantOrNull(v.startedAt()).bindInstantOrNull(v.completedAt()).bindInstantOrNull(v.expiresAt()).bindInstantOrNull(v.lastValidatedAt()).bindStrOrNull(v.consentVersion()).bindInstant(v.updatedAt()))
+        }
+    }
+}
+
+// Orchestrates the civil identity verification (IdentityVerificationService + the IdentityVerification entity).
+// Explicit states and controlled transitions: nothing here sets VERIFIED except the processing of a legitimate
+// provider return.
+class IdentityVerifications {
+    Db db
+    IdentityVerificationStore store
+    List<IdentityVerificationProvider> providers
+    public constructor(db: Db, store: IdentityVerificationStore, providers: List<IdentityVerificationProvider>) {
+        this.db = db
+        this.store = store
+        this.providers = providers
+    }
+    static Set<String> allowed() = setOf("NOT_VERIFIED>PENDING", "PENDING>VERIFIED", "PENDING>REJECTED", "PENDING>EXPIRED", "PENDING>ERROR", "PENDING>REVOKED", "VERIFIED>EXPIRED", "VERIFIED>REVOKED", "REJECTED>PENDING", "EXPIRED>PENDING", "ERROR>PENDING", "REVOKED>PENDING")
+    IdentityVerificationProvider? active() {
+        for (var p in providers) {
+            if (p.available()) {
+                return p
+            }
+        }
+        return null
+    }
+    Bool providerAvailable() {
+        return active() != null
+    }
+    IdentityVerificationProvider requireActive(message: String) {
+        var p = active()
+        if (p == null) {
+            throw Errors.api(503, "IDENTITY_PROVIDER_UNAVAILABLE", message)
+        }
+        return p
+    }
+    // IdentityVerification.transitionTo: a state change outside the table is a 409.
+    static IdentityVerificationRow transition(v: IdentityVerificationRow, next: String, provider: String?, attemptId: String?, now: String) {
+        if (!IdentityVerifications.allowed().contains(v.state() + ">" + next)) {
+            throw Errors.api(409, "INVALID_IDENTITY_TRANSITION", "Transicao de estado de verificacao invalida.")
+        }
+        var completed = v.completedAt()
+        if (next == "VERIFIED" || next == "REJECTED") {
+            completed = now
+        }
+        var validated = v.lastValidatedAt()
+        if (next == "VERIFIED") {
+            validated = now
+        }
+        var started = v.startedAt()
+        if (next == "PENDING") {
+            started = now
+        }
+        var nextProvider = v.provider()
+        if (provider != null) {
+            nextProvider = provider
+        }
+        var nextAttempt = v.attemptId()
+        if (attemptId != null) {
+            nextAttempt = attemptId
+        }
+        return IdentityVerificationRow(v.id(), v.userId(), nextProvider, next, nextAttempt, v.reasonCode(), started, completed, v.expiresAt(), validated, v.consentVersion(), now)
+    }
+    static IdentityVerificationRow withReason(v: IdentityVerificationRow, reason: String?, now: String) = IdentityVerificationRow(v.id(), v.userId(), v.provider(), v.state(), v.attemptId(), reason, v.startedAt(), v.completedAt(), v.expiresAt(), v.lastValidatedAt(), v.consentVersion(), now)
+    // Continuity of the link: expired when the window is over.
+    static Bool validAt(v: IdentityVerificationRow, nowMillis: Long) {
+        if (v.state() != "VERIFIED") {
+            return false
+        }
+        var exp = v.expiresAt()
+        if (exp == null) {
+            return true
+        }
+        return Time.toMillis(exp) > nowMillis
+    }
+    IdentityVerificationRow current(userId: String) {
+        var self = this
+        var out = IdentityVerificationRow("", userId, IdentityText.none(), "NOT_VERIFIED", IdentityText.none(), IdentityText.none(), IdentityText.none(), IdentityText.none(), IdentityText.none(), IdentityText.none(), IdentityText.none(), Time.nowIso())
+        db.transaction(() -> {
+            out = self.currentTx(userId)
+        })
+        return out
+    }
+    IdentityVerificationRow currentTx(userId: String) {
+        var now = Time.nowIso()
+        var existing = store.byUser(userId)
+        if (existing == null) {
+            return IdentityVerificationRow(Ids.prefixed("ident_"), userId, IdentityText.none(), "NOT_VERIFIED", IdentityText.none(), IdentityText.none(), IdentityText.none(), IdentityText.none(), IdentityText.none(), IdentityText.none(), IdentityText.none(), now)
+        }
+        // An expired link stops counting (it expires on read, with no external report).
+        if (existing.state() == "VERIFIED" && !IdentityVerifications.validAt(existing, Time.nowMillis())) {
+            var expired = IdentityVerifications.transition(existing, "EXPIRED", IdentityText.none(), IdentityText.none(), now)
+            store.save(expired)
+            return expired
+        }
+        return existing
+    }
+    Bool isVerified(userId: String) = IdentityVerifications.validAt(current(userId), Time.nowMillis())
+    String statusOf(userId: String) = current(userId).state()
+    IdentityProviderStart start(userId: String, consentVersion: String?) {
+        var self = this
+        var out = IdentityProviderStart("", "")
+        db.transaction(() -> {
+            out = self.startTx(userId, consentVersion)
+        })
+        return out
+    }
+    IdentityProviderStart startTx(userId: String, consentVersion: String?) {
+        var provider = requireActive("A verificacao de identidade ainda nao esta disponivel.")
+        var verification = current(userId)
+        var started = provider.start(userId, consentVersion)
+        var pending = IdentityVerifications.transition(verification, "PENDING", provider.name(), started.attemptId(), Time.nowIso())
+        store.save(pending)
+        return started
+    }
+    // Asks the provider and applies the confirmed outcome (the browser decides nothing).
+    IdentityVerificationRow refresh(userId: String) {
+        var self = this
+        var out = current(userId)
+        db.transaction(() -> {
+            out = self.refreshTx(userId)
+        })
+        return out
+    }
+    IdentityVerificationRow refreshTx(userId: String) {
+        var provider = requireActive("A verificacao de identidade ainda nao esta disponivel.")
+        var verification = current(userId)
+        var attempt = verification.attemptId()
+        if (verification.state() != "PENDING") {
+            return verification
+        }
+        if (attempt == null) {
+            return verification
+        }
+        var outcome = provider.fetchOutcome(attempt)
+        if (outcome == null) {
+            return verification
+        }
+        return apply(verification, outcome)
+    }
+    IdentityVerificationRow apply(verification: IdentityVerificationRow, outcome: IdentityProviderOutcome) {
+        var now = Time.nowIso()
+        var moved = IdentityVerifications.transition(verification, outcome.status(), IdentityText.none(), IdentityText.none(), now)
+        var updated = IdentityVerifications.withReason(moved, outcome.reasonCode(), now)
+        store.save(updated)
+        return updated
+    }
+    // Concludes a callback return (OAuth/OIDC): finds the attempt by its single-use state, exchanges the code on the
+    // backend and applies the outcome. The browser decides nothing.
+    IdentityVerificationRow completeCallback(state: String?, code: String?) {
+        var self = this
+        var out = current("")
+        db.transaction(() -> {
+            out = self.completeCallbackTx(state, code)
+        })
+        return out
+    }
+    IdentityVerificationRow completeCallbackTx(state: String?, code: String?) {
+        if (IdentityText.blank(state) || IdentityText.blank(code)) {
+            throw Errors.api(400, "INVALID_IDENTITY_CALLBACK", "Retorno de verificacao invalido.")
+        }
+        var attempt = IdentityText.orEmpty(state)
+        var verification = store.byAttempt(attempt)
+        if (verification == null) {
+            throw Errors.api(404, "IDENTITY_ATTEMPT_NOT_FOUND", "Verificacao nao encontrada ou ja concluida.")
+        }
+        // Single use: only valid from PENDING.
+        if (verification.state() != "PENDING") {
+            throw Errors.api(409, "IDENTITY_ATTEMPT_USED", "Esta verificacao ja foi concluida.")
+        }
+        var provider = requireActive("A verificacao de identidade nao esta disponivel.")
+        var outcome = provider.handleCallback(attempt, IdentityText.orEmpty(code))
+        if (outcome == null) {
+            throw Errors.api(502, "IDENTITY_PROVIDER_ERROR", "Nao foi possivel confirmar a verificacao com o provedor.")
+        }
+        return apply(verification, outcome)
+    }
+    // Unlinks the identity: the account goes back to unverified (no sensitive history is erased).
+    IdentityVerificationRow revoke(userId: String) {
+        var self = this
+        var out = current(userId)
+        db.transaction(() -> {
+            out = self.revokeTx(userId)
+        })
+        return out
+    }
+    IdentityVerificationRow revokeTx(userId: String) {
+        var verification = current(userId)
+        if (verification.state() == "NOT_VERIFIED") {
+            return verification
+        }
+        var revoked = IdentityVerifications.transition(verification, "REVOKED", IdentityText.none(), IdentityText.none(), Time.nowIso())
+        store.save(revoked)
+        return revoked
+    }
+}
+
+// JobPublishingPolicy.evaluate, the one place that decides whether an account may publish a job. pending-port:
+// jobs owns the policy (and the reputation), so Main.kf replaces this seam with the jobs domain; the default reads
+// users.reputation. Rule: reputation > 150 AND (when identity is enforced) a verified identity.
+class IdentityEligibility {
+    static Int requiredReputation = 150
+    Db db
+    IdentityVerifications verifications
+    Bool identityEnforced
+    public constructor(db: Db, verifications: IdentityVerifications, identityEnforced: Bool) {
+        this.db = db
+        this.verifications = verifications
+        this.identityEnforced = identityEnforced
+    }
+    Int reputationOf(userId: String) {
+        var r = db.queryOptional("select reputation from users where id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return 0
+        }
+        return r.getInt("reputation")
+    }
+    IdentityEligibilityBody evaluate(userId: String) {
+        var reputation = reputationOf(userId)
+        // "More than 150", as JobService.create and the front: exactly 150 still does not publish.
+        var reputationOk = reputation > IdentityEligibility.requiredReputation
+        var verified = verifications.isVerified(userId)
+        var allowed = reputationOk && (!identityEnforced || verified)
+        var reason = IdentityText.none()
+        if (!reputationOk) {
+            reason = "LOW_REPUTATION"
+        }
+        else 
+            if (!allowed) {
+                reason = "IDENTITY_REQUIRED"
+            }
+        return IdentityEligibilityBody(allowed, reputation, IdentityEligibility.requiredReputation, verified, identityEnforced, reason)
+    }
+}

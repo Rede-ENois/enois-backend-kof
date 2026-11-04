@@ -1,0 +1,82 @@
+package identity
+
+import kernel.config.*
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+
+// /identity/** (IdentityContractController). The state only changes by the provider's return: no route lets the
+// front declare itself VERIFIED.
+class IdentityVerificationRoutes {
+    IdentityVerifications verifications
+    IdentityEligibility eligibility
+    Idempotency idem
+    Config cfg
+    public constructor(cfg: Config, verifications: IdentityVerifications, eligibility: IdentityEligibility, idem: Idempotency) {
+        this.cfg = cfg
+        this.verifications = verifications
+        this.eligibility = eligibility
+        this.idem = idem
+    }
+    register(server: HttpServer) {
+        var self = this
+        server.get("/identity", () -> self.status())
+        server.post("/identity/verification", () -> self.start())
+        server.post("/identity/verification/refresh", () -> self.refresh())
+        server.delete("/identity/verification", () -> self.revoke())
+        server.get("/identity/eligibility", () -> json.encode(self.eligibility.evaluate(Auth.requireUser())))
+        server.get("/identity/govbr/callback", () -> self.govbrCallback())
+    }
+    IdentityStatusView view(v: IdentityVerificationRow) {
+        var completed = v.completedAt()
+        return IdentityStatusView(v.state(), v.state() == "VERIFIED", verifications.providerAvailable(), v.provider(), v.reasonCode(), completed)
+    }
+    String status() = json.encode(view(verifications.current(Auth.requireUser())))
+    String start() {
+        var userId = Auth.requireUser()
+        var consent = IdentityText.none()
+        var text = Req.bodyText()
+        if (text.trim().length() > 0) {
+            try {
+                consent = json.decode<IdentityStartRequest>(text).consentVersion
+            } catch (String e) {
+                throw Errors.badRequest()
+            }
+        }
+        var hash = Idempotency.hash("consent:" + IdentityText.orEmpty(consent))
+        var self = this
+        return idem.handle(userId, "POST", "/api/identity/verification", hash, 200, () -> self.startAction(userId, consent))
+    }
+    String startAction(userId: String, consent: String?) {
+        var started = verifications.start(userId, consent)
+        return json.encode(IdentityStartBody(started.attemptId(), started.redirectUrl()))
+    }
+    String refresh() = json.encode(view(verifications.refresh(Auth.requireUser())))
+    String revoke() {
+        var userId = Auth.requireUser()
+        var hash = Idempotency.hash("op:revoke-identity")
+        var self = this
+        return idem.handle(userId, "DELETE", "/api/identity/verification", hash, 200, () -> json.encode(self.view(self.verifications.revoke(userId))))
+    }
+    // The provider's return (gov.br): PUBLIC on purpose, the browser arrives redirected with no session. The attempt
+    // is identified by the single-use `state`, never by the client.
+    String govbrCallback() {
+        var outcome = "ok"
+        var failed = false
+        try {
+            verifications.completeCallback(Req.queryStr("state", ""), Req.queryStr("code", ""))
+        } catch (String e) {
+            failed = true
+        }
+        if (failed) {
+            outcome = "erro"
+        }
+        var frontend = cfg.getStr("REDE_FRONTEND_URL", "")
+        if (frontend.trim().length() > 0) {
+            ResponseHeaders.set("Location", IdentityOAuthConfig.clean(frontend) + "/seguranca?identidade=" + outcome)
+            return status(302, "")
+        }
+        return status(200, "")
+    }
+}

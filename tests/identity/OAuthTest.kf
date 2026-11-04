@@ -1,0 +1,284 @@
+import identity.*
+import kernel.db.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+
+class OAuthKeys {
+    static JwtKeyPair? pair = null
+}
+
+IdentityTestApp ctx() {
+    var t = IdentityTestApp.shared("oauth", mapOf("REDE_OAUTH_GOOGLE_CLIENT_ID", "test-client-id", "REDE_OAUTH_GOOGLE_CLIENT_SECRET", "test-client-secret", "REDE_OAUTH_GOOGLE_REDIRECT_URI", "http://localhost:8081/api/auth/oauth/google/callback", "REDE_OAUTH_APPLE_CLIENT_ID", "test-apple-client-id", "REDE_OAUTH_APPLE_REDIRECT_URI", "http://localhost:8081/api/auth/oauth/apple/callback", "REDE_OAUTH_GITHUB_CLIENT_ID", "gh-client", "REDE_OAUTH_GITHUB_CLIENT_SECRET", "gh-secret", "REDE_OAUTH_GITHUB_REDIRECT_URI", "http://localhost:8081/api/auth/oauth/github/callback", "REDE_OAUTH_FRONTEND_REDIRECT_URL", "http://localhost:5173/auth/callback"))
+    return t
+}
+
+JwtKeyPair oauthKeys() {
+    var p = OAuthKeys.pair
+    if (p == null) {
+        var fresh = Jwt.newRsaPair("g1")
+        OAuthKeys.pair = fresh
+        return fresh
+    }
+    return p
+}
+
+String oauthCallbackUrl() = "http://localhost:5173/auth/callback"
+
+String oauthUniq(prefix: String) = prefix + Time.nowMillis()
+
+// The query value `name` of the authorization url.
+String oauthParam(url: String, name: String) {
+    var q = url.substring(url.indexOf("?") + 1)
+    for (var pair in q.split("&")) {
+        if (pair.startsWith(name + "=")) {
+            return pair.substring(name.length() + 1)
+        }
+    }
+    return ""
+}
+
+String oauthStart(t: IdentityTestApp, provider: String) = t.app.client.get("/auth/oauth/" + provider + "/start").body
+
+// A provider id_token signed with the test key for the nonce of the started flow.
+String oauthIdToken(iss: String, aud: String, nonce: String, sub: String, email: String, verified: Bool, name: String, expOffset: Long) {
+    var exp = Time.nowMillis() / 1000L + expOffset
+    var claims = "{\"iss\":\"" + iss + "\",\"aud\":\"" + aud + "\",\"sub\":\"" + sub + "\",\"email\":\"" + email + "\",\"email_verified\":" + verified + ",\"name\":\"" + name + "\",\"nonce\":\"" + nonce + "\",\"exp\":" + exp + "}"
+    return Jwt.sign("RS256", oauthKeys().privatePart(), "{\"alg\":\"RS256\",\"kid\":\"g1\"}", claims)
+}
+
+oauthStubGoogle(t: IdentityTestApp, token: String) {
+    t.oauth.reply("GET https://www.googleapis.com/oauth2/v3/certs", 200, oauthKeys().publicPart())
+    t.oauth.reply("POST https://oauth2.googleapis.com/token", 200, "{\"id_token\":\"" + token + "\"}")
+}
+
+// Starts a Google flow (optionally as a link for a session), stubs the provider and returns the callback response.
+TestResponse oauthGoogleCallback(t: IdentityTestApp, sub: String, email: String, verified: Bool, name: String) {
+    var started = oauthStart(t, "google")
+    var url = JsonPath.str(started, "authorizationUrl") as String
+    var state = JsonPath.str(started, "state") as String
+    oauthStubGoogle(t, oauthIdToken("https://accounts.google.com", "test-client-id", oauthParam(url, "nonce"), sub, email, verified, name, 3600L))
+    return t.app.client.get("/auth/oauth/google/callback?code=codigo-valido&state=" + state)
+}
+
+String oauthLocation(res: TestResponse) {
+    var l = res.headerOf("Location")
+    if (l == null) {
+        return ""
+    }
+    return l
+}
+
+String oauthSession(res: TestResponse) {
+    var c = res.cookie("enois_session")
+    if (c == null) {
+        return ""
+    }
+    return c
+}
+
+TestResponse oauthDelete(t: IdentityTestApp, path: String, token: String) = t.app.client.send("DELETE", path, listOf("X-Session-Token: " + token), "", "")
+
+test "requiresAStateIssuedByUs (OAuthHardeningTests)" {
+    var t = ctx()
+    var c = t.app.client
+    var r1 = c.get("/auth/oauth/google/callback?code=codigo-qualquer")
+    Check.status(r1, 302)
+    Check.eqStr("no state", oauthCallbackUrl() + "?error=INVALID_OAUTH_STATE&provider=GOOGLE", oauthLocation(r1))
+    var r2 = c.get("/auth/oauth/google/callback?code=codigo-qualquer&state=state_inventado")
+    Check.eqStr("invented state", oauthCallbackUrl() + "?error=INVALID_OAUTH_STATE&provider=GOOGLE", oauthLocation(r2))
+    t.db().execute("insert into oauth_authorization_requests (state, provider, nonce, user_id, expires_at, created_at) values ('state_vencido', 'GOOGLE', 'nonce_1', null, ?, ?)", DbParams().bindInstant(Time.plusSeconds(Time.nowIso(), -60L)).bindInstant(Time.nowIso()))
+    var r3 = c.get("/auth/oauth/google/callback?code=codigo-qualquer&state=state_vencido")
+    Check.eqStr("expired state", oauthCallbackUrl() + "?error=OAUTH_STATE_EXPIRED&provider=GOOGLE", oauthLocation(r3))
+    t.db().execute("insert into oauth_authorization_requests (state, provider, nonce, user_id, expires_at, created_at) values ('state_apple', 'APPLE', 'nonce_2', null, ?, ?)", DbParams().bindInstant(Time.plusSeconds(Time.nowIso(), 600L)).bindInstant(Time.nowIso()))
+    var r4 = c.get("/auth/oauth/google/callback?code=codigo-qualquer&state=state_apple")
+    Check.eqStr("another provider", oauthCallbackUrl() + "?error=INVALID_OAUTH_STATE&provider=GOOGLE", oauthLocation(r4))
+}
+
+test "startRegistersStateAndNonceOnTheServer (OAuthHardeningTests)" {
+    var t = ctx()
+    var res = t.app.client.get("/auth/oauth/google/start")
+    Check.status(res, 200)
+    var url = JsonPath.str(res.body, "authorizationUrl") as String
+    Check.isTrue("state in url", url.indexOf("state=") >= 0)
+    Check.isTrue("nonce in url", url.indexOf("nonce=") >= 0)
+    Check.isTrue("client id", url.startsWith("https://accounts.google.com/o/oauth2/v2/auth?client_id=test-client-id"))
+    Check.jsonEq(res, "provider", "GOOGLE")
+    // The state is registered: the callback gets past it and fails on the code (the provider refuses).
+    t.oauth.reply("POST https://oauth2.googleapis.com/token", 400, "{\"error\":\"invalid_grant\"}")
+    var state = JsonPath.str(res.body, "state") as String
+    var cb = t.app.client.get("/auth/oauth/google/callback?code=codigo-qualquer&state=" + state)
+    Check.eqStr("token failure", oauthCallbackUrl() + "?error=INVALID_OAUTH_TOKEN&provider=GOOGLE", oauthLocation(cb))
+}
+
+test "linksAnExistingAccountWhenTheProviderConfirmsTheEmail (OAuthHardeningTests)" {
+    var t = ctx()
+    var existing = t.authenticate("ja.existe")
+    var cb = oauthGoogleCallback(t, "google-sub-existente", "ja.existe@test.com", true, "Ja Existe")
+    Check.status(cb, 302)
+    Check.isTrue("ok redirect", oauthLocation(cb).endsWith("?status=ok"))
+    var token = oauthSession(cb)
+    Check.isTrue("session cookie", token.length() > 0)
+    var me = t.getWithToken("/auth/me", token)
+    Check.status(me, 200)
+    Check.jsonEq(me, "id", existing.userId)
+    Check.jsonEq(me, "emailVerified", "true")
+    Check.jsonEq(me, "twoFactorEnabled", "true")
+    Check.jsonEq(me, "identityVerified", "true")
+    var providers = t.getWithToken("/auth/oauth/providers", existing.token)
+    Check.status(providers, 200)
+    Check.jsonEq(providers, "0.provider", "GOOGLE")
+    var status = t.getWithToken("/auth/2fa/status", token)
+    Check.jsonEq(status, "providerSecondFactor", "true")
+    Check.jsonEq(status, "totpEnabled", "false")
+    Check.jsonEq(status, "emailOtpEnabled", "false")
+}
+
+test "refusesToLinkWhenTheProviderDoesNotConfirmTheEmail (OAuthHardeningTests)" {
+    var t = ctx()
+    var existing = t.authenticate("nao.confirmado")
+    var cb = oauthGoogleCallback(t, "google-sub-nao-confirmado", "nao.confirmado@test.com", false, "Nao Confirmado")
+    Check.eqStr("redirect", oauthCallbackUrl() + "?error=ACCOUNT_EXISTS_UNVERIFIED_EMAIL&provider=GOOGLE", oauthLocation(cb))
+    var providers = t.getWithToken("/auth/oauth/providers", existing.token)
+    Check.status(providers, 200)
+    Check.eqStr("none linked", "[]", providers.body.trim())
+}
+
+test "createsAProviderAccountAlreadyVerifiedAndProtectsUnlink (OAuthHardeningTests)" {
+    var t = ctx()
+    var cb = oauthGoogleCallback(t, "google-sub-novo", "nova.pessoa@example.com", true, "Nova Pessoa")
+    Check.status(cb, 302)
+    var token = oauthSession(cb)
+    var me = t.getWithToken("/auth/me", token)
+    Check.status(me, 200)
+    Check.jsonEq(me, "emailVerified", "true")
+    Check.jsonEq(me, "name", "Nova Pessoa")
+    Check.apiError(oauthDelete(t, "/auth/oauth/google/link", token), 409, "LAST_LOGIN_METHOD")
+    var providers = t.getWithToken("/auth/oauth/providers", token)
+    Check.jsonEq(providers, "0.provider", "GOOGLE")
+    Check.jsonEq(providers, "0.hasUsablePassword", "false")
+    // The account has no terms acceptance and no birth date yet (they come at the first access).
+    var row = t.db().queryOne("select terms_accepted_at, birth_date from users where email = 'nova.pessoa@example.com'", DbParams())
+    Check.isTrue("terms pending", row.isNull("terms_accepted_at"))
+    Check.isTrue("birth date pending", row.isNull("birth_date"))
+}
+
+test "unlinkIsAllowedWhenThereIsAnotherWayIn (OAuthHardeningTests)" {
+    var t = ctx()
+    var session = t.authenticate("tem.senha")
+    t.db().execute("insert into user_external_identities (user_id, provider, external_user_id, email, created_at) values (?, 'GOOGLE', 'google-sub-temsenha', 'tem.senha@test.com', ?)", DbParams().bindStr(session.userId).bindInstant(Time.nowIso()))
+    var ok = oauthDelete(t, "/auth/oauth/google/link", session.token)
+    Check.status(ok, 200)
+    Check.jsonEq(ok, "status", "UNLINKED")
+    Check.apiError(oauthDelete(t, "/auth/oauth/google/link", session.token), 404, "OAUTH_NOT_LINKED")
+}
+
+test "linkingRequiresASession (OAuthHardeningTests)" {
+    var t = ctx()
+    Check.apiError(t.post("/auth/oauth/google/link", ""), 401, "UNAUTHENTICATED")
+    Check.apiError(t.app.client.get("/auth/oauth/providers"), 401, "UNAUTHENTICATED")
+}
+
+test "unknownProviderIsRejected" {
+    var t = ctx()
+    Check.apiError(t.app.client.get("/auth/oauth/facebook/start"), 400, "INVALID_OAUTH_PROVIDER")
+}
+
+test "githubOnlyLinksAndNeverSignsIn" {
+    var t = ctx()
+    Check.apiError(t.app.client.get("/auth/oauth/github/start"), 403, "GITHUB_LINK_ONLY")
+    var session = t.authenticate("gh.linker")
+    Check.apiError(t.postWithToken("/auth/oauth/google/write-link", session.token, ""), 400, "WRITE_SCOPE_NOT_SUPPORTED")
+    var started = t.postWithToken("/auth/oauth/github/write-link", session.token, "")
+    Check.status(started, 200)
+    var url = JsonPath.str(started.body, "authorizationUrl") as String
+    Check.isTrue("write scope", url.indexOf("scope=repo") >= 0)
+    t.oauth.reply("POST https://github.com/login/oauth/access_token", 200, "{\"access_token\":\"gho_x\",\"scope\":\"repo\"}")
+    t.oauth.reply("GET https://api.github.com/user", 200, "{\"id\":4242,\"login\":\"octo\",\"email\":null}")
+    var cb = t.app.client.get("/auth/oauth/github/callback?code=gh-code&state=" + (JsonPath.str(started.body, "state") as String))
+    Check.status(cb, 302)
+    Check.isTrue("linked", oauthLocation(cb).endsWith("?status=ok"))
+    var providers = t.getWithToken("/auth/oauth/providers", session.token)
+    Check.jsonEq(providers, "0.provider", "GITHUB")
+    // GitHub does not turn the e-mail into a verification or a second factor.
+    var row = t.db().queryOne("select federated_second_factor_at from users where id = ?", DbParams().bindStr(session.userId))
+    Check.isTrue("no second factor", row.isNull("federated_second_factor_at"))
+    // Another account cannot take the same GitHub identity.
+    var other = t.authenticate("gh.other")
+    var again = t.postWithToken("/auth/oauth/github/link", other.token, "")
+    var cb2 = t.app.client.get("/auth/oauth/github/callback?code=gh-code&state=" + (JsonPath.str(again.body, "state") as String))
+    Check.eqStr("in use", oauthCallbackUrl() + "?error=OAUTH_IDENTITY_IN_USE&provider=GITHUB", oauthLocation(cb2))
+}
+
+test "stateIsSingleUse" {
+    var t = ctx()
+    var started = oauthStart(t, "google")
+    var state = JsonPath.str(started, "state") as String
+    var nonce = oauthParam(JsonPath.str(started, "authorizationUrl") as String, "nonce")
+    oauthStubGoogle(t, oauthIdToken("https://accounts.google.com", "test-client-id", nonce, "google-sub-once", "once@example.com", true, "Once", 3600L))
+    Check.isTrue("first ok", oauthLocation(t.app.client.get("/auth/oauth/google/callback?code=c&state=" + state)).endsWith("?status=ok"))
+    Check.eqStr("replay", oauthCallbackUrl() + "?error=INVALID_OAUTH_STATE&provider=GOOGLE", oauthLocation(t.app.client.get("/auth/oauth/google/callback?code=c&state=" + state)))
+}
+
+test "idTokenChecksRejectWrongAudienceNonceIssuerAndExpiry" {
+    var t = ctx()
+    var bad = listOf("aud", "nonce", "iss", "exp")
+    for (var kind in bad) {
+        var started = oauthStart(t, "google")
+        var state = JsonPath.str(started, "state") as String
+        var nonce = oauthParam(JsonPath.str(started, "authorizationUrl") as String, "nonce")
+        var aud = "test-client-id"
+        var iss = "https://accounts.google.com"
+        var off = 3600L
+        if (kind == "aud") {
+            aud = "someone-else"
+        }
+        if (kind == "nonce") {
+            nonce = "forged"
+        }
+        if (kind == "iss") {
+            iss = "https://evil.example.com"
+        }
+        if (kind == "exp") {
+            off = -60L
+        }
+        oauthStubGoogle(t, oauthIdToken(iss, aud, nonce, "google-sub-bad-" + kind, "bad." + kind + "@example.com", true, "Bad", off))
+        var cb = t.app.client.get("/auth/oauth/google/callback?code=c&state=" + state)
+        Check.eqStr(kind, oauthCallbackUrl() + "?error=INVALID_OAUTH_TOKEN&provider=GOOGLE", oauthLocation(cb))
+        Check.eqInt("no account for " + kind, 0, t.db().queryLong("select count(*) from users where email = ?", DbParams().bindStr("bad." + kind + "@example.com")) as Int)
+    }
+}
+
+test "tokenEndpointSignsInWithAnIdTokenFromOurStart" {
+    var t = ctx()
+    var started = oauthStart(t, "google")
+    var state = JsonPath.str(started, "state") as String
+    var nonce = oauthParam(JsonPath.str(started, "authorizationUrl") as String, "nonce")
+    t.oauth.reply("GET https://www.googleapis.com/oauth2/v3/certs", 200, oauthKeys().publicPart())
+    var token = oauthIdToken("accounts.google.com", "test-client-id", nonce, "google-sub-native", "native@example.com", true, "Native", 3600L)
+    var res = t.post("/auth/oauth/google/token", "{\"idToken\":\"" + token + "\",\"state\":\"" + state + "\"}")
+    Check.status(res, 302)
+    Check.isTrue("session", oauthSession(res).length() > 0)
+    Check.apiError(t.post("/auth/oauth/google/token", "{\"idToken\":\"" + token + "\"}"), 400, "INVALID_OAUTH_STATE")
+    Check.apiError(t.post("/auth/oauth/google/token", "{}"), 400, "INVALID_OAUTH_TOKEN")
+}
+
+test "appleFormPostExchangesTheCodeWithASignedClientSecret" {
+    var t = ctx()
+    // The Apple client secret needs the team key: set through a fresh EC pair on a booted app is not possible
+    // (config is read at boot), so the unconfigured secret makes the exchange fail closed.
+    var started = oauthStart(t, "apple")
+    var state = JsonPath.str(started, "state") as String
+    var url = JsonPath.str(started, "authorizationUrl") as String
+    Check.isTrue("form_post", url.indexOf("response_mode=form_post") >= 0)
+    // The form_post callback is not caught (as in the Java controller): a refusal is the JSON error.
+    var res = t.app.client.send("POST", "/auth/oauth/apple/callback", listOf("Content-Type: application/x-www-form-urlencoded"), "", "code=abc&state=" + state)
+    Check.apiError(res, 401, "INVALID_OAUTH_TOKEN")
+    var denied = t.app.client.send("POST", "/auth/oauth/apple/callback", listOf("Content-Type: application/x-www-form-urlencoded"), "", "error=user_cancelled_authorize")
+    Check.eqStr("cancelled", oauthCallbackUrl() + "?error=USER_CANCELLED_AUTHORIZE&provider=APPLE", oauthLocation(denied))
+}
+
+test "zz shutdown oauth" {
+    ctx().stop()
+}

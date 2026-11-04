@@ -1,0 +1,394 @@
+package identity
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.security.*
+import kernel.time.*
+import kernel.url.*
+
+// Login and linking by Google, Apple, LinkedIn and GitHub (SocialLoginService). Rules worth keeping in mind:
+//  - every flow starts in start / startLink, which register `state` + `nonce` on the server; the callback only
+//    accepts a state that exists, once;
+//  - the id_token is validated for signature, issuer, audience, expiry and nonce (IdentityOAuthValidator);
+//  - an identity is NEVER linked to an existing account just because the declared e-mail matches: an e-mail is
+//    not proof of ownership. If the account exists the owner signs in and links on purpose, except when the
+//    provider itself states the e-mail is verified.
+class IdentityOAuth {
+    static Long stateTtlSeconds = 900L
+    Db db
+    IdentityOAuthConfig oauthConfig
+    IdentityOAuthStore oauth
+    IdentityStore identity
+    IdentityUsers users
+    IdentityService service
+    IdentityOAuthValidator validator
+    IdentityOAuthLinks links
+    Bool signupEnabled
+    public constructor(db: Db, oauthConfig: IdentityOAuthConfig, oauth: IdentityOAuthStore, identity: IdentityStore, users: IdentityUsers, service: IdentityService, validator: IdentityOAuthValidator, links: IdentityOAuthLinks, signupEnabled: Bool) {
+        this.db = db
+        this.oauthConfig = oauthConfig
+        this.oauth = oauth
+        this.identity = identity
+        this.users = users
+        this.service = service
+        this.validator = validator
+        this.links = links
+        this.signupEnabled = signupEnabled
+    }
+    static String? parseProvider(value: String) {
+        var p = value.toUpperCase()
+        if (p == "GOOGLE" || p == "APPLE" || p == "LINKEDIN" || p == "GITHUB") {
+            return p
+        }
+        return null
+    }
+    static String invalidState() = "INVALID_OAUTH_STATE"
+
+    // ---- start
+    IdentityOAuthStartBody start(provider: String, linkUserId: String?, writeScope: Bool) {
+        var linking = !IdentityText.blank(linkUserId)
+        if (provider == "GITHUB" && !linking) {
+            throw Errors.api(403, "GITHUB_LINK_ONLY", "Entre com e-mail e senha e vincule o GitHub no seu perfil.")
+        }
+        requireConfigured(provider)
+        var url = ""
+        var state = Tokens.random(32)
+        var nonce = Tokens.random(32)
+        url = authorizationUrl(provider, state, nonce, linking, writeScope)
+        var now = Time.nowIso()
+        var self = this
+        var ownerId = IdentityText.none()
+        if (linking) {
+            ownerId = IdentityText.orEmpty(linkUserId)
+        }
+        db.transaction(() -> {
+            self.oauth.saveRequest(IdentityOAuthRequest(state, provider, nonce, ownerId, Time.plusSeconds(now, IdentityOAuth.stateTtlSeconds), now))
+            // Opportunistic cleanup: the state does not need to outlive its expiry.
+            self.oauth.deleteExpired(now)
+        })
+        return IdentityOAuthStartBody(provider, state, url)
+    }
+    requireConfigured(provider: String) {
+        if (!oauthConfig.configured(provider)) {
+            throw Errors.api(501, "OAUTH_NOT_CONFIGURED", IdentityOAuth.notConfiguredMessage(provider))
+        }
+    }
+    static String notConfiguredMessage(provider: String) {
+        if (provider == "GOOGLE") {
+            return "Login com Google nao configurado. Configure GOOGLE_CLIENT_ID."
+        }
+        if (provider == "APPLE") {
+            return "Login com Apple nao configurado. Configure APPLE_CLIENT_ID."
+        }
+        if (provider == "GITHUB") {
+            return "Vinculo com GitHub nao configurado. Configure GITHUB_CLIENT_ID."
+        }
+        return "Login com LinkedIn nao configurado. Configure LINKEDIN_CLIENT_ID."
+    }
+    String authorizationUrl(provider: String, state: String, nonce: String, includePosting: Bool, writeScope: Bool) {
+        var common = "?client_id=" + UrlCodec.encode(oauthConfig.clientId(provider)) + "&redirect_uri=" + UrlCodec.encode(oauthConfig.redirectUri(provider))
+        var stateParam = "&state=" + UrlCodec.encode(state)
+        var nonceParam = "&nonce=" + UrlCodec.encode(nonce)
+        return IdentityOAuth.endpoint(provider) + common + IdentityOAuth.scopes(provider, includePosting, writeScope) + stateParam + IdentityOAuth.nonceFor(provider, nonceParam)
+    }
+    static String endpoint(provider: String) {
+        if (provider == "GOOGLE") {
+            return "https://accounts.google.com/o/oauth2/v2/auth"
+        }
+        if (provider == "APPLE") {
+            return "https://appleid.apple.com/auth/authorize"
+        }
+        if (provider == "GITHUB") {
+            return "https://github.com/login/oauth/authorize"
+        }
+        return "https://www.linkedin.com/oauth/v2/authorization"
+    }
+    // OIDC of LinkedIn: openid/profile/email are automatic approval. The link also asks w_member_social
+    // ("Share on LinkedIn"); a plain login does not, so people who only want in are not scared. GitHub asks
+    // `repo` only for the moderation (write) link.
+    static String scopes(provider: String, includePosting: Bool, writeScope: Bool) {
+        if (provider == "GOOGLE") {
+            return "&response_type=code&scope=openid+email+profile"
+        }
+        if (provider == "APPLE") {
+            return "&response_type=code&scope=name+email&response_mode=form_post"
+        }
+        if (provider == "GITHUB") {
+            if (writeScope) {
+                return "&response_type=code&scope=repo"
+            }
+            return "&response_type=code&scope=read:user"
+        }
+        if (includePosting) {
+            return "&response_type=code&scope=openid+profile+email+w_member_social"
+        }
+        return "&response_type=code&scope=openid+profile+email"
+    }
+    // GitHub's flow has no id_token, so no nonce parameter.
+    static String nonceFor(provider: String, nonceParam: String) {
+        if (provider == "GITHUB") {
+            return ""
+        }
+        return nonceParam
+    }
+    IdentityOAuthStartBody startLink(userId: String, provider: String) = start(provider, userId, false)
+    IdentityOAuthStartBody startLinkWithWrite(userId: String, provider: String) {
+        if (provider != "GITHUB") {
+            throw Errors.api(400, "WRITE_SCOPE_NOT_SUPPORTED", "Somente o GitHub tem vínculo com permissão de escrita.")
+        }
+        return start(provider, userId, true)
+    }
+
+    // ---- callback
+    IdentityIssued callback(provider: String, code: String?, state: String?, applePayload: String?) {
+        if (IdentityText.blank(code)) {
+            throw Errors.api(400, "INVALID_OAUTH_CODE", "Codigo de autorizacao obrigatorio.")
+        }
+        return finish(provider, IdentityText.orEmpty(code).trim(), state, applePayload)
+    }
+    IdentityIssued tokenLogin(provider: String, idToken: String?, state: String?) {
+        if (IdentityText.blank(idToken)) {
+            throw Errors.api(400, "INVALID_OAUTH_TOKEN", "id_token obrigatorio.")
+        }
+        // Without a state there is no nonce to check: a loose id_token may have been issued for another request.
+        return finish(provider, IdentityText.orEmpty(idToken).trim(), state, IdentityText.none())
+    }
+    // One transaction: a refusal anywhere rolls back, state consumption included (as the Java @Transactional).
+    IdentityIssued finish(provider: String, credential: String, state: String?, applePayload: String?) {
+        var self = this
+        var out = IdentityIssued("", "", "", "", IdentityUserView("", "", "", IdentityText.none(), "", false, false, false, false, false))
+        db.transaction(() -> {
+            out = self.finishTx(provider, credential, state, applePayload)
+        })
+        return out
+    }
+    IdentityIssued finishTx(provider: String, credential: String, state: String?, applePayload: String?) {
+        var request = consumeRequest(provider, state)
+        var claims = validator.validate(provider, credential, request.nonce())
+        if (claims == null) {
+            throw Errors.api(401, "INVALID_OAUTH_TOKEN", "Nao foi possivel validar sua conta " + provider + ". Tente novamente.")
+        }
+        var issued = IdentityText.noSession()
+        if (!IdentityText.blank(request.userId())) {
+            issued = attachIdentity(IdentityText.orEmpty(request.userId()), provider, claims)
+        }
+        else {
+            issued = login(provider, claims, applePayload)
+        }
+        if (issued == null) {
+            throw Errors.api(500, "INTERNAL_ERROR", "Erro interno inesperado.")
+        }
+        var accessToken = claims.accessToken()
+        if (provider == "LINKEDIN" && accessToken != null && accessToken.length() > 0) {
+            links.rememberLinkedIn(issued.user().id(), claims.externalUserId(), accessToken, claims.accessTokenExpiresAt())
+        }
+        return issued
+    }
+    // The state must exist, belong to the same provider and be in date; the row is deleted in the same
+    // transaction (single use), which also rules out a replay.
+    IdentityOAuthRequest consumeRequest(provider: String, state: String?) {
+        if (IdentityText.blank(state)) {
+            throw Errors.api(400, IdentityOAuth.invalidState(), "Requisicao de login invalida ou expirada.")
+        }
+        var request = oauth.findRequest(IdentityText.orEmpty(state).trim())
+        if (request == null) {
+            throw Errors.api(400, IdentityOAuth.invalidState(), "Requisicao de login invalida ou expirada.")
+        }
+        oauth.deleteRequest(request.state())
+        if (request.provider() != provider) {
+            throw Errors.api(400, IdentityOAuth.invalidState(), "Requisicao de login invalida ou expirada.")
+        }
+        if (Time.toMillis(request.expiresAt()) < Time.nowMillis()) {
+            throw Errors.api(410, "OAUTH_STATE_EXPIRED", "Esta tentativa de login expirou. Tente de novo.")
+        }
+        return request
+    }
+
+    // ---- sign in / sign up by provider
+    IdentityIssued login(provider: String, claims: IdentityOAuthClaims, applePayload: String?) {
+        var userId = oauth.userIdByExternal(provider, claims.externalUserId())
+        var id = IdentityText.orEmpty(userId)
+        if (userId == null) {
+            id = resolveOrCreate(provider, claims, applePayload)
+        }
+        // The provider confirms the e-mail and answers for the second step: the account enters verified with the
+        // second factor delegated (no invented TOTP).
+        markVerifiedByProvider(id)
+        return sessionFor(id)
+    }
+    static String normalizeEmail(email: String) = email.trim().toLowerCase()
+    // An account with this e-mail exists: link instead of refusing, but ONLY when the provider states the e-mail is
+    // verified. A merely declared e-mail never links by itself: that would hand the account to whoever typed it.
+    String resolveOrCreate(provider: String, claims: IdentityOAuthClaims, applePayload: String?) {
+        var email = IdentityOAuth.normalizeEmail(claims.email())
+        if (email.length() > 0 && (users.existsByEmail(email) || identity.credentialEmailExists(email))) {
+            if (!claims.emailVerified()) {
+                throw Errors.api(409, "ACCOUNT_EXISTS_UNVERIFIED_EMAIL", "Ja existe uma conta com este e-mail e o " + provider + " nao confirmou que ele e seu. Entre com e-mail e senha e vincule depois.")
+            }
+            var existing = ""
+            var byProfile = users.findByEmail(email)
+            if (byProfile != null) {
+                existing = byProfile.id()
+            }
+            else {
+                var credential = identity.credentialByEmail(email)
+                if (credential == null) {
+                    throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+                }
+                existing = credential.userId()
+            }
+            oauth.saveIdentity(existing, provider, claims.externalUserId(), email, Time.nowIso())
+            return existing
+        }
+        return createAccount(provider, claims, applePayload)
+    }
+    String createAccount(provider: String, claims: IdentityOAuthClaims, applePayload: String?) {
+        // Signing in with an existing account goes on; what closes here is creating a NEW account by provider
+        // (the same gate as POST /auth/signup).
+        if (!signupEnabled) {
+            throw Errors.api(403, "SIGNUP_DISABLED", "Os cadastros estao fechados no momento. Se voce ja tem conta, entre com e-mail e senha.")
+        }
+        var email = IdentityOAuth.normalizeEmail(claims.email())
+        if (email.length() == 0) {
+            throw Errors.api(409, "OAUTH_EMAIL_REQUIRED", "O provedor nao informou um e-mail. Entre com e-mail e senha e vincule a conta depois.")
+        }
+        if (users.existsByEmail(email) || identity.credentialEmailExists(email)) {
+            throw Errors.api(409, "ACCOUNT_EXISTS_LINK_REQUIRED", "Ja existe uma conta com este e-mail. Entre com e-mail e senha e vincule o " + provider + " no seu perfil.")
+        }
+        var now = Time.nowIso()
+        var userId = Ids.prefixed("user_")
+        var name = claims.name().trim()
+        if (name.length() == 0) {
+            name = nameFromApplePayload(applePayload)
+        }
+        var source = name
+        if (name.length() == 0) {
+            source = email
+        }
+        var username = service.uniqueUsername(source, email)
+        var displayName = name
+        if (name.length() == 0) {
+            displayName = "Pessoa"
+        }
+        users.createFederated(userId, username, email, displayName, now)
+        // A random password the person does not know: `password_usable = false` stops unlinking the provider from
+        // leaving the account unreachable.
+        identity.saveCredential(userId, email, Passwords.hash(Tokens.random(32)), false, now)
+        oauth.saveIdentity(userId, provider, claims.externalUserId(), email, now)
+        return userId
+    }
+    // Apple only sends the name on the first authorization, as a JSON `user` form field.
+    String nameFromApplePayload(payload: String?) {
+        var text = IdentityText.orEmpty(payload).trim()
+        if (text.length() == 0) {
+            return ""
+        }
+        var first = IdentityOAuthValidator.claim(text, "name.firstName")
+        if (first.length() == 0) {
+            return ""
+        }
+        var last = IdentityOAuthValidator.claim(text, "name.lastName")
+        if (last.length() > 0) {
+            return first + " " + last
+        }
+        return first
+    }
+    // The signed-in person asked to link a provider to their account.
+    IdentityIssued attachIdentity(userId: String, provider: String, claims: IdentityOAuthClaims) {
+        var owner = oauth.userIdByExternal(provider, claims.externalUserId())
+        if (owner != null) {
+            if (IdentityText.orEmpty(owner) != userId) {
+                throw Errors.api(409, "OAUTH_IDENTITY_IN_USE", "Esta conta " + provider + " ja esta vinculada a outro usuario.")
+            }
+            // Already linked to this same account: GitHub refreshes the login (the id never changes).
+            if (provider == "GITHUB") {
+                rememberGithub(userId, claims)
+            }
+            return sessionFor(userId)
+        }
+        for (var linked in oauth.identitiesOf(userId)) {
+            if (linked.provider() == provider) {
+                throw Errors.api(409, "OAUTH_ALREADY_LINKED", "Voce ja tem uma conta " + provider + " vinculada.")
+            }
+        }
+        oauth.saveIdentity(userId, provider, claims.externalUserId(), IdentityOAuth.normalizeEmail(claims.email()), Time.nowIso())
+        if (provider == "GITHUB") {
+            // GitHub links contributions: it is neither civil identity proof nor a second factor.
+            rememberGithub(userId, claims)
+        }
+        else {
+            markVerifiedByProvider(userId)
+        }
+        return sessionFor(userId)
+    }
+    rememberGithub(userId: String, claims: IdentityOAuthClaims) {
+        links.rememberGithub(userId, claims.externalUserId(), claims.name(), claims.accessToken(), claims.scope())
+    }
+    // E-mail confirmed and second factor delegated: whoever comes in by Google/Apple needs neither our
+    // confirmation link nor a 2FA of their own.
+    markVerifiedByProvider(userId: String) {
+        var profile = users.findById(userId)
+        if (profile == null) {
+            return
+        }
+        var now = Time.nowIso()
+        if (!profile.emailVerified()) {
+            users.markEmailVerified(userId, now)
+        }
+        if (!profile.federatedSecondFactor()) {
+            users.markFederated(userId, now)
+        }
+    }
+    IdentityIssued sessionFor(userId: String) {
+        var profile = users.findById(userId)
+        if (profile == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        return service.createSession(profile, null)
+    }
+
+    // ---- unlink / list
+    unlink(userId: String, provider: String) {
+        var self = this
+        db.transaction(() -> {
+            self.unlinkTx(userId, provider)
+        })
+    }
+    unlinkTx(userId: String, provider: String) {
+        var linked = oauth.identitiesOf(userId)
+        var hasProvider = false
+        var hasAnother = false
+        for (var l in linked) {
+            if (l.provider() == provider) {
+                hasProvider = true
+            }
+            else {
+                hasAnother = true
+            }
+        }
+        if (!hasProvider) {
+            throw Errors.api(404, "OAUTH_NOT_LINKED", "Sua conta nao esta vinculada ao " + provider + ".")
+        }
+        // Protection against losing access: another way in must remain.
+        if (!hasAnother && !service.hasUsablePassword(userId)) {
+            throw Errors.api(409, "LAST_LOGIN_METHOD", "Este e o unico jeito de entrar na sua conta. Defina uma senha antes de desvincular.")
+        }
+        oauth.deleteIdentity(userId, provider)
+        if (provider == "LINKEDIN") {
+            // No link, no posting: the "Share on LinkedIn" token goes with it.
+            links.removeLinkedIn(userId)
+        }
+        if (provider == "GITHUB") {
+            links.unlinkGithub(userId)
+        }
+    }
+    List<IdentityLinkedProviderBody> linkedProviders(userId: String) {
+        var hasPassword = service.hasUsablePassword(userId)
+        var out = listOf<IdentityLinkedProviderBody>()
+        for (var l in oauth.identitiesOf(userId)) {
+            out.add(IdentityLinkedProviderBody(l.provider(), l.email(), l.createdAt(), hasPassword))
+        }
+        return out
+    }
+}

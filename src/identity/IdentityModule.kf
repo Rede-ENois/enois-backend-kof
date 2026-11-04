@@ -17,6 +17,11 @@ class IdentitySeams {
     IdentityIpBlocks ipBlocks
     IdentitySignupGuard signupGuard
     IdentityNotifier notifier
+    // The wire to the OAuth providers and the hooks to the linkedin / contributions domains (see IdentityOAuthLinks).
+    IdentityOAuthTransport oauthTransport = IdentityOAuthTransport()
+    IdentityOAuthLinks oauthLinks = IdentityOAuthLinks()
+    // Civil identity providers (gov.br by default). Empty or unconfigured: the verification is unavailable.
+    List<IdentityVerificationProvider>? verificationProviders = null
     public constructor(users: IdentityUsers, mailer: IdentityMailer, turnstile: IdentityTurnstileTransport, ipBlocks: IdentityIpBlocks, signupGuard: IdentitySignupGuard, notifier: IdentityNotifier) {
         this.users = users
         this.mailer = mailer
@@ -56,6 +61,20 @@ class IdentityModule {
         var challenge = IdentitySignupChallenge(cfg, store)
         var turnstile = IdentityTurnstile(cfg, seams.turnstile)
         IdentityRoutes(cfg, service, twoFactor, store, seams.users, challenge, turnstile, seams.ipBlocks, seams.signupGuard, seams.notifier, shared.idempotency, parts).register(platform.server)
+        var oauthConfig = IdentityOAuthConfig(cfg)
+        var oauth = IdentityOAuth(platform.db, oauthConfig, IdentityOAuthStore(platform.db), store, seams.users, service, IdentityOAuthValidator(oauthConfig, seams.oauthTransport), seams.oauthLinks, cfg.getBool("REDE_AUTH_SIGNUP_ENABLED", true))
+        IdentityOAuthRoutes(cfg, oauth, service, oauthConfig, parts).register(platform.server)
+        var providers = listOf<IdentityVerificationProvider>()
+        var configured = seams.verificationProviders
+        if (configured == null) {
+            providers.add(IdentityGovBrProvider(cfg, seams.oauthTransport))
+        }
+        else {
+            providers = configured
+        }
+        var verifications = IdentityVerifications(platform.db, IdentityVerificationStore(platform.db), providers)
+        var eligibility = IdentityEligibility(platform.db, verifications, cfg.getBool("REDE_IDENTITY_ENFORCEMENT_ENABLED", false))
+        IdentityVerificationRoutes(cfg, verifications, eligibility, shared.idempotency).register(platform.server)
         IdentityModule.schedule(shared, cfg, store, service)
         return IdentityModule(service, twoFactor, store, seams.mailer)
     }

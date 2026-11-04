@@ -23,6 +23,65 @@ class IdentityStubTurnstile extends IdentityTurnstileTransport {
     }
 }
 
+// The OAuth providers without the network: a canned reply per "METHOD url" (status 404 when none is set), and
+// every call remembered with its form body, so tests assert what went out.
+class IdentityStubOAuth extends IdentityOAuthTransport {
+    Map<String,String> replyBodies = mapOf()
+    Map<String,Int> replyStatuses = mapOf()
+    List<String> calls = listOf<String>()
+    reply(key: String, status: Int, body: String) {
+        replyBodies.put(key, body)
+        replyStatuses.put(key, status)
+    }
+    OutboundReply answer(key: String) {
+        calls.add(key)
+        var body = replyBodies.get(key)
+        if (body == null) {
+            return OutboundReply(404, "")
+        }
+        return OutboundReply(replyStatuses.getOrDefault(key, 404), body)
+    }
+    OutboundReply post(url: String, headers: List<String>, body: String) {
+        calls.add("BODY " + body)
+        return answer("POST " + url)
+    }
+    OutboundReply get(url: String, headers: List<String>) = answer("GET " + url)
+    Int count(prefix: String) {
+        var n = 0
+        for (var c in calls) {
+            if (c.startsWith(prefix)) {
+                n = n + 1
+            }
+        }
+        return n
+    }
+}
+
+// The civil identity provider of the tests (the Java FakeProvider): it exists only here, never in production.
+// `up` turns availability off; the outcomes are what the "provider" confirms.
+class IdentityVerificationFake extends IdentityVerificationProvider {
+    static IdentityVerificationFake? identityVerificationFakeSlot = null
+    Bool up = true
+    IdentityProviderStart startResult = IdentityProviderStart("attempt-x", "https://provedor/exemplo")
+    IdentityProviderOutcome? outcome = null
+    IdentityProviderOutcome? callbackOutcome = null
+    Bool available() {
+        return up
+    }
+    String name() {
+        return "fake-test-provider"
+    }
+    IdentityProviderStart start(userId: String, consentVersion: String?) {
+        return startResult
+    }
+    IdentityProviderOutcome? fetchOutcome(attemptId: String) {
+        return outcome
+    }
+    IdentityProviderOutcome? handleCallback(state: String, code: String) {
+        return callbackOutcome
+    }
+}
+
 // Holds what the wiring built, so tests reach the mailer, the limiters and the stubs.
 // A signed-up and confirmed account with its live session.
 record IdentityTestSession(String token, String refreshToken, String userId, String email, String password)
@@ -36,7 +95,9 @@ class IdentityTestApp {
     IdentityStubTurnstile turnstile
     SharedServices services
     AgeModule age
-    public constructor(app: TestApp, module: IdentityModule, parts: SecurityParts, mailer: IdentityMailer, turnstile: IdentityStubTurnstile, services: SharedServices, age: AgeModule) {
+    IdentityStubOAuth oauth
+    public constructor(app: TestApp, module: IdentityModule, parts: SecurityParts, mailer: IdentityMailer, turnstile: IdentityStubTurnstile, services: SharedServices, age: AgeModule, oauth: IdentityStubOAuth) {
+        this.oauth = oauth
         this.age = age
         this.services = services
         this.app = app
@@ -175,7 +236,7 @@ class IdentityTestApp {
         var holder = IdentityWiring()
         holder.probes = probes
         var app = TestApp.bootWith(name, merged, (p: Platform) -> holder.wire(p))
-        return IdentityTestApp(app, holder.module(), holder.parts(), holder.mailer(), holder.turnstile(), holder.services(), holder.ageModule())
+        return IdentityTestApp(app, holder.module(), holder.parts(), holder.mailer(), holder.turnstile(), holder.services(), holder.ageModule(), holder.oauthStub())
     }
 }
 
@@ -188,6 +249,7 @@ class IdentityWiring {
     IdentityStubTurnstile? stub = null
     SharedServices? sharedServices = null
     AgeModule? agePart = null
+    IdentityStubOAuth? oauthPart = null
     wire(p: Platform) {
         var shared = SharedServices.create(p)
         sharedServices = shared
@@ -199,6 +261,12 @@ class IdentityWiring {
         var turnstile = IdentityStubTurnstile()
         seams.mailer = mailer
         seams.turnstile = turnstile
+        var oauthStub = IdentityStubOAuth()
+        seams.oauthTransport = oauthStub
+        var fakeProvider = IdentityVerificationFake()
+        IdentityVerificationFake.identityVerificationFakeSlot = fakeProvider
+        seams.verificationProviders = listOf(fakeProvider)
+        oauthPart = oauthStub
         built = IdentityModule.installWith(p, shared, hooks, parts, seams)
         var ageMod = AgeModule.install(p, mailer)
         agePart = ageMod
@@ -208,6 +276,13 @@ class IdentityWiring {
         stub = turnstile
         var register = probes
         register(p.server)
+    }
+    IdentityStubOAuth oauthStub() {
+        var m = oauthPart
+        if (m == null) {
+            throw "IdentityWiring: not wired"
+        }
+        return m
     }
     AgeModule ageModule() {
         var m = agePart
