@@ -4,7 +4,7 @@ import kernel.jobs.*
 import kernel.testkit.*
 
 // Port of EmoteControllerTest at HTTP level. The image route (`GET /emotes/image/{provider}/{id}`) serves raw
-// bytes and waits for the binary lane: its service half (`EmotesModule.image`) is asserted here instead.
+// bytes through the binary lane, so its tests use BinaryClient.
 class ErtSource extends EmoteSource {
     List<Emote> emotes
     public constructor(emotes: List<Emote>) {
@@ -155,48 +155,62 @@ EmotesModule ertModule(catalog: List<Emote>, fetcher: ErtFetcher) {
     return EmotesModule(service, EmoteImageCache(fetcher))
 }
 
-test "image: it comes from the cache with the content type of the CDN" {
-    var module = ertModule(listOf(ertKekw()), ErtFetcher())
-    var image = module.image("BTTV", "abc", "thumb")
-    assert(image != null)
-    if (image != null) {
-        assert(image.contentType() == "image/png")
-        assert(image.bytes().length == 2)
+// The image route runs behind the binary lane: a booted app per catalog, with the module and a counting fetcher.
+class ErtImageHolder {
+    static Map<String, TestApp> apps = mapOf<String, TestApp>()
+    static ErtFetcher fetcher = ErtFetcher()
+    static TestApp get(name: String, catalog: List<Emote>) {
+        var cur = ErtImageHolder.apps.get(name)
+        if (cur != null) {
+            return cur
+        }
+        var made = TestApp.bootWire(name, (p: Platform) -> {
+            var service = EmoteCatalogService(listOf<EmoteSource>(), ErtSource(catalog))
+            ErtImageHolder.fetcher = ErtFetcher()
+            EmoteRoutes.registerImage(p.server, EmotesModule(service, EmoteImageCache(ErtImageHolder.fetcher)))
+        })
+        ErtImageHolder.apps.put(name, made)
+        return made
     }
 }
 
+BinaryClient ertImage(name: String, catalog: List<Emote>) = BinaryClient(ErtImageHolder.get(name, catalog).port)
+
+test "image: it comes from the cache with the content type of the CDN" {
+    var res = ertImage("ertimg1", listOf(ertKekw())).get("/emotes/image/BTTV/abc?variant=thumb", listOf<String>())
+    Check.eqInt("status", 200, res.status)
+    Check.eqStr("type", "image/png", res.header("Content-Type"))
+    Check.eqStr("nosniff", "nosniff", res.header("X-Content-Type-Options"))
+    Check.eqStr("cache", "max-age=604800, public, immutable", res.header("Cache-Control"))
+    Check.eqInt("bytes", 2, res.body.length)
+}
+
 test "image: an animated sticker asks for the moving file" {
-    var fetcher = ErtFetcher()
-    var module = ertModule(listOf(ertCatJam()), fetcher)
-    assert(module.image("FFZ", "777171", "full") != null)
-    assert(fetcher.urls.size() == 1)
-    assert(fetcher.urls.get(0) == "https://cdn.frankerfacez.com/emote/777171/animated/2")
+    var res = ertImage("ertimg2", listOf(ertCatJam())).get("/emotes/image/FFZ/777171?variant=full", listOf<String>())
+    Check.eqInt("status", 200, res.status)
+    Check.eqInt("fetches", 1, ErtImageHolder.fetcher.urls.size())
+    Check.eqStr("url", "https://cdn.frankerfacez.com/emote/777171/animated/2", ErtImageHolder.fetcher.urls.get(0))
 }
 
 test "image: an unknown sticker does not try the animated file" {
     // regression: the animated address of a static one on FFZ hangs (no 404) until the timeout
-    var fetcher = ErtFetcher()
-    var module = ertModule(listOf(ertKekw()), fetcher)
-    var image = module.image("FFZ", "999", "full")
-    assert(image != null)
-    if (image != null) {
-        assert(image.contentType() == "image/png")
-    }
-    assert(fetcher.urls.size() == 1)
-    assert(fetcher.urls.get(0) == "https://cdn.frankerfacez.com/emote/999/2")
+    var res = ertImage("ertimg3", listOf(ertKekw())).get("/emotes/image/FFZ/999?variant=full", listOf<String>())
+    Check.eqInt("status", 200, res.status)
+    Check.eqStr("type", "image/png", res.header("Content-Type"))
+    Check.eqInt("fetches", 1, ErtImageHolder.fetcher.urls.size())
+    Check.eqStr("url", "https://cdn.frankerfacez.com/emote/999/2", ErtImageHolder.fetcher.urls.get(0))
 }
 
 test "image: an unknown provider or a path-like id answers nothing (404)" {
-    var module = ertModule(listOf(ertKekw()), ErtFetcher())
-    assert(module.image("SEILA", "abc", "full") == null)
-    assert(module.image("FFZ", "../../etc", "full") == null)
+    var client = ertImage("ertimg4", listOf(ertKekw()))
+    Check.eqInt("provider", 404, client.get("/emotes/image/SEILA/abc?variant=full", listOf<String>()).status)
+    Check.eqInt("id", 404, client.get("/emotes/image/FFZ/..%2F..%2Fetc?variant=full", listOf<String>()).status)
 }
 
 test "image: a blocked artwork dies before the cache and the fetch" {
-    var fetcher = ErtFetcher()
-    var module = ertModule(listOf(ertEmote("booty", "FFZ", "999010", false, 1)), fetcher)
-    assert(module.image("FFZ", "999010", "full") == null)
-    assert(fetcher.urls.size() == 0)
+    var res = ertImage("ertimg5", listOf(ertEmote("booty", "FFZ", "999010", false, 1))).get("/emotes/image/FFZ/999010?variant=full", listOf<String>())
+    Check.eqInt("status", 404, res.status)
+    Check.eqInt("fetches", 0, ErtImageHolder.fetcher.urls.size())
 }
 
 test "the module wires the routes and boots from the embedded snapshot with the refresh off" {

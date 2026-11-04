@@ -367,16 +367,16 @@ Seams (defaults in `LinkedInModule.install`):
 | Seam | Default | Owner / what it needs |
 |---|---|---|
 | `LinkedInPostLookup.findById` | reads `posts` (id, author_id, content, status, type, author_identity) read-only | feed: `// pending-port: feed`; extend it when the feed store exists |
-| `LinkedInShareClient.share` | `LinkedInHttpShareClient` (POST `https://api.linkedin.com/v2/ugcPosts` via `kernel.http.HttpPostClient`) | tests extend it with a stub; the endpoint is a constructor argument |
+| `LinkedInShareClient.share` | `LinkedInHttpShareClient` (POST `https://api.linkedin.com/v2/ugcPosts` via `kernel.http.HttpFetch.send`) | tests extend it with a stub; the endpoint is a constructor argument |
 | `LinkedInClock.nowIso` | `Time.nowIso()` | tests extend it to fix the clock (Java `Clock.fixed`) |
 
-Kernel: one NEW file, `src/kernel/http/HttpPostClient.kf` (outbound POST with status, G178). Base URL of the share link: `REDE_FRONTEND_BASE_URL` (default `https://enois.ia.br`, the Java `rede.frontend.base-url`).
+Kernel: outbound POST with status goes through the shared `kernel.http.HttpFetch.send` (G178). Base URL of the share link: `REDE_FRONTEND_BASE_URL` (default `https://enois.ia.br`, the Java `rede.frontend.base-url`).
 
 ## emotes
 
 | Domain | Endpoints ported / total | Tests ported / total | Gaps |
 |---|---|---|---|
-| emotes (`src/emotes/`) | 2 / 3 (`GET /emotes`, `GET /emotes/index`; `GET /emotes/image/{provider}/{id}` pending the binary lane) | 55 / 55 Java tests (67 Kof tests in `tests/emotes/`, 6 in `tests/kernel/OutboundHttpTest.kf`) | G173 to G175 |
+| emotes (`src/emotes/`) | 3 / 3 (`GET /emotes`, `GET /emotes/index`, `GET /emotes/image/{provider}/{id}` through the binary lane) | 55 / 55 Java tests (67 Kof tests in `tests/emotes/`, 6 in `tests/kernel/HttpFetchBytesTest.kf`) | G173 to G175 |
 
 Ported: the sticker catalog built in memory (`EmoteCatalogService`: last good copy per source, priority merge,
 popular rank, animated flag, name policy and the blocked-artwork gate), the four live sources (BTTV global, FFZ
@@ -396,7 +396,7 @@ Behaviour notes:
 - The image cache is a plain in-process map with a 48 MB budget (oldest entries go first) and a 7 day expiry, not
   Caffeine. `EmoteCatalog.etag()` is a hash of the content plus the build second (the Java value was
   `hashCode()` based); only the `W/"..."` shape is part of the contract.
-- A refresh that starts while another one runs is skipped (`kernel.sync.Mutex.tryLock`); Java's `synchronized`
+- A refresh that starts while another one runs is skipped (`kernel.concurrent.Gate.tryEnter`); Java's `synchronized`
   made it wait and then repeat the same work.
 - `OutboundUrlGuard` is not used: every upstream address is a constant plus an id validated against
   `[A-Za-z0-9]{1,40}` (as in Java), so no user text becomes a host.
@@ -406,7 +406,7 @@ Behaviour notes:
 
 | Seam | Default | Notes |
 |---|---|---|
-| `EmoteFeed` (provider JSON GET) | real HTTP through `kernel.http.OutboundHttp` | tests subclass it |
+| `EmoteFeed` (provider JSON GET) | real HTTP through `kernel.http.HttpFetch.getBytes` | tests subclass it |
 | `EmoteImageFetcher` (CDN image GET) | real HTTP, 4 s connect / 6 s read, `image/*` only, 1 MB cap | tests subclass it |
 | binary route `GET /emotes/image/{provider}/{id}` | not registered | media port (binary lane) calls `EmotesModule.image` |
 

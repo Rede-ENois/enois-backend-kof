@@ -1,7 +1,7 @@
 package emotes
 
 import kernel.http.*
-import kernel.sync.*
+import kernel.concurrent.*
 import kernel.time.*
 
 // Fetches the bytes of one image from the provider CDN, behind a seam so tests answer from memory.
@@ -12,7 +12,7 @@ class EmoteImageFetcher {
     static String notFoundTag() = "IMAGE_NOT_FOUND"
     // The image, or throws: `IMAGE_NOT_FOUND: ...` for a definitive 404/410, anything else is transient.
     EmoteStoredImage fetch(url: String) {
-        var res = OutboundHttp.get(url, listOf("User-Agent: enois/1.0 (+https://enois.ia.br)", "Accept: image/*"), 4000, 6000, 1048576)
+        var res = HttpFetch.getBytes(url, listOf("User-Agent: enois/1.0 (+https://enois.ia.br)", "Accept: image/*"), 4000, 6000, 1048576)
         if (res.status == 404 || res.status == 410) {
             throw EmoteImageFetcher.notFoundTag() + ": CDN de figurinha respondeu " + res.status
         }
@@ -38,7 +38,7 @@ class EmoteImageFetcher {
 // most 1 MB is kept. Nothing the caller sends becomes the destination host.
 class EmoteImageCache {
     EmoteImageFetcher fetcher
-    Mutex gate = Mutex()
+    Gate gate = Gate()
     Map<String,EmoteStoredImage> items = mapOf<String, EmoteStoredImage>()
     Map<String,Long> storedAt = mapOf<String, Long>()
     List<String> order = listOf<String>()
@@ -77,19 +77,19 @@ class EmoteImageCache {
         return fetched
     }
     EmoteStoredImage? lookup(key: String) {
-        gate.lock()
+        gate.enter()
         var hit = items.get(key)
         var at = storedAt.get(key)
         if (hit != null && at != null && Time.nowMillis() - at > EmoteImageCache.ttlMillis()) {
             this.dropLocked(key)
-            gate.unlock()
+            gate.leave()
             return null
         }
-        gate.unlock()
+        gate.leave()
         return hit
     }
     store(key: String, image: EmoteStoredImage) {
-        gate.lock()
+        gate.enter()
         this.dropLocked(key)
         items.put(key, image)
         storedAt.put(key, Time.nowMillis())
@@ -99,7 +99,7 @@ class EmoteImageCache {
         while (weight > EmoteImageCache.maxWeight() && order.size() > 1) {
             this.dropLocked(order.get(0))
         }
-        gate.unlock()
+        gate.leave()
     }
     dropLocked(key: String) {
         var old = items.get(key)

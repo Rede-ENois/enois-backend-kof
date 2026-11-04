@@ -1,9 +1,9 @@
 import kernel.*
 import kernel.http.*
-import kernel.sync.*
+import kernel.concurrent.*
 import kernel.testkit.*
 
-// OutboundHttp and Mutex: the adapters load, run and map status, content type, size and failures.
+// HttpFetch.getBytes and Gate: the adapters load, run and map status, content type, size and failures.
 class OhtHolder {
     static TestApp? cached = null
     static TestApp app() {
@@ -27,7 +27,7 @@ class OhtHolder {
 }
 
 test "get returns status, lower-cased content type and the body bytes" {
-    var res = OutboundHttp.get(OhtHolder.url("/ok"), listOf("Accept: */*", "User-Agent: probe"), 2000, 2000, 1000)
+    var res = HttpFetch.getBytes(OhtHolder.url("/ok"), listOf("Accept: */*", "User-Agent: probe"), 2000, 2000, 1000)
     assert(res.status == 200)
     assert(res.contentType.startsWith("text/plain"))
     assert(res.size() == 3)
@@ -35,38 +35,38 @@ test "get returns status, lower-cased content type and the body bytes" {
 }
 
 test "an error status still returns its body and does not throw" {
-    var res = OutboundHttp.get(OhtHolder.url("/gone"), listOf<String>(), 2000, 2000, 1000)
+    var res = HttpFetch.getBytes(OhtHolder.url("/gone"), listOf<String>(), 2000, 2000, 1000)
     assert(res.status == 404)
     assert(res.text() == "nope")
 }
 
 test "the body is read at most maxBytes plus one so a caller sees it is too large" {
-    var res = OutboundHttp.get(OhtHolder.url("/big"), listOf<String>(), 2000, 2000, 4)
+    var res = HttpFetch.getBytes(OhtHolder.url("/big"), listOf<String>(), 2000, 2000, 4)
     assert(res.status == 200)
     assert(res.size() == 5)
 }
 
 test "redirects are not followed" {
-    var res = OutboundHttp.get(OhtHolder.url("/moved"), listOf<String>(), 2000, 2000, 1000)
+    var res = HttpFetch.getBytes(OhtHolder.url("/moved"), listOf<String>(), 2000, 2000, 1000)
     assert(res.status == 302)
 }
 
 test "a network failure throws OUTBOUND_FAILED" {
     var failed = ""
     try {
-        OutboundHttp.get("http://127.0.0.1:1/x", listOf<String>(), 500, 500, 10)
+        HttpFetch.getBytes("http://127.0.0.1:1/x", listOf<String>(), 500, 500, 10)
     } catch (String e) {
         failed = e
     }
     assert(failed.startsWith("OUTBOUND_FAILED"))
 }
 
-test "mutex lock, unlock and tryLock work (the cross-thread skip is asserted in the emotes catalog test)" {
-    var gate = Mutex()
-    assert(gate.tryLock())
-    gate.unlock()
-    gate.lock()
-    gate.unlock()
-    assert(gate.tryLock())
-    gate.unlock()
+test "gate enter, leave and tryEnter work (the cross-thread skip is asserted in the emotes catalog test)" {
+    var gate = Gate()
+    assert(gate.tryEnter())
+    gate.leave()
+    gate.enter()
+    gate.leave()
+    assert(gate.tryEnter())
+    gate.leave()
 }

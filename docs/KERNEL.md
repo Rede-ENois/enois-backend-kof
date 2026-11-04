@@ -870,22 +870,37 @@ dropped). `REDE_BINARY_MAX_BODY_BYTES` (default 545259520) caps one upload. Why 
 a verified account (once) with a live session and returns a `ProfileCaller` (token, JSON content type and a fresh
 `Idempotency-Key` on every write). `ProfileTestApp.finish()` must be the last test of every file: the shared
 jobs keep the test process alive otherwise (G124).
-## kernel.http.OutboundHttp and kernel.sync.Mutex
+## kernel.http.HttpFetch (the one outbound HTTP client) and kernel.concurrent.Gate
 
 ```kotlin
 import kernel.http.*
-var res = OutboundHttp.get(url, listOf("Accept: image/*"), 4000, 6000, 1048576)   // connect ms, read ms, max bytes
+var res = HttpFetch.getBytes(url, listOf("Accept: image/*"), 4000, 6000, 1048576)   // connect ms, read ms, max bytes
 res.status   res.contentType   res.body: Byte[]   res.size()   res.text()
+var posted = HttpFetch.send("POST", url, listOf("Content-Type: application/json"), "{}", 15000)   // posted.status (0 = unreachable), posted.body
 ```
 
-Outbound GET for adapters that need what `kof.http` hides (status, content type, bytes, request headers: G15).
-Redirects are not followed. An error status (4xx/5xx) returns its body; a network failure throws
-`OUTBOUND_FAILED: ...`. The body is read up to `maxBytes + 1` so the caller can detect "too large".
+Outbound calls for adapters that need what `kof.http` hides (status, content type, bytes, request headers: G15).
+Redirects are not followed by `getBytes`. An error status (4xx/5xx) returns its body; `getBytes` throws
+`OUTBOUND_FAILED: ...` on a network failure, `send` answers status 0. `getBytes` reads up to `maxBytes + 1` so the
+caller can detect "too large". `probe` and `download` (media workers) live in the same class.
 
 ```kotlin
-import kernel.sync.*
-var gate = Mutex()      gate.lock()   gate.unlock()   gate.tryLock(): Bool    // reentrant ReentrantLock
+import kernel.concurrent.*
+var gate = Gate()      gate.enter()   gate.leave()   gate.tryEnter(): Bool    // reentrant ReentrantLock
 ```
 
-Domain code cannot import `java.util.concurrent`; use `Mutex`. `tryLock` is the "skip if another thread is already
-doing it" form used by the emotes refresh.
+Domain code cannot import `java.util.concurrent`; use `Gate`. `tryEnter` is the "skip if another thread is already
+doing it" form used by the emotes refresh (call `leave()` after a true).
+
+### BinaryFront: design, cost and the rule about its port
+
+Active only when a module called `BinaryLane.claim(prefix)` before `Platform.start`. With no claimed prefix
+`Platform` runs the web runtime directly on the public port (no front, no extra hop; asserted by
+`tests/kernel/BinaryLaneTest.kf`). With a claim, the web runtime listens on a loopback port chosen at boot and the
+front owns the public one: every request is parsed up to its head and piped byte for byte, except `PUT` and `GET`
+under a claimed prefix (two internal calls for an upload, a stream swap for a download). Cost: one loopback hop per
+request, one temp file per upload (`java.io.tmpdir`), and a thread per connection.
+
+**The internal port must never be published or routed to** (docker `ports:`, a Traefik/Cloudflare route, a
+firewall rule): it trusts `X-Kernel-Peer`, `X-Kernel-Binary` and ticket headers that only the front sets. The front
+drops client-sent `X-Kernel-*` headers, and `Req.peerAddress()` honours `X-Kernel-Peer` only from a loopback peer.

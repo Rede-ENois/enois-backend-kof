@@ -3,7 +3,23 @@ package kernel.http
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.io.InputStream
 import kernel.files.*
+
+// A finished outbound GET: status, lower-cased Content-Type ("" when absent) and the body bytes
+// (at most `maxBytes + 1` of them, so a caller detects "too large" without reading the rest).
+class OutboundResponse {
+    Int status
+    String contentType
+    Byte[] body
+    public constructor(status: Int, contentType: String, body: Byte[]) {
+        this.status = status
+        this.contentType = contentType
+        this.body = body
+    }
+    Int size() = body.length
+    String text() = new String(body, "UTF-8")
+}
 
 // Status (0 = unreachable) and text body of a call.
 record HttpReply(Int status, String body)
@@ -14,6 +30,54 @@ record FetchProbe(Int status, String contentType)
 // Outbound HTTP for the media workers: a public-URL probe and a size-capped download to a temp file.
 // The caller checks the URL with OutboundUrlGuard first; nothing here follows a redirect on download.
 class HttpFetch {
+    // GET returning status, lower-cased Content-Type and raw bytes (at most `maxBytes + 1`), for adapters that need
+    // what `kof.http` hides (KOF_GAPS G15). Redirects are NOT followed. A network failure throws `OUTBOUND_FAILED: ...`.
+    //   var res = HttpFetch.getBytes("https://cdn.example/x.png", listOf("Accept: image/*"), 4000, 6000, 1048576)
+    static OutboundResponse getBytes(url: String, headers: List<String>, connectTimeoutMs: Int, readTimeoutMs: Int, maxBytes: Int) {
+        var failure = ""
+        var out = OutboundResponse(0, "", new Byte[0])
+        try {
+            var conn = new URL(url).openConnection() as HttpURLConnection
+            conn.setRequestMethod("GET")
+            conn.setInstanceFollowRedirects(false)
+            conn.setConnectTimeout(connectTimeoutMs)
+            conn.setReadTimeout(readTimeoutMs)
+            for (var h in headers) {
+                var colon = h.indexOf(":")
+                conn.setRequestProperty(h.substring(0, colon).trim(), h.substring(colon + 1).trim())
+            }
+            var status = conn.getResponseCode()
+            var type = conn.getContentType()
+            var kind = ""
+            if (type != null) {
+                kind = type.toLowerCase()
+            }
+            var bytes = new Byte[0]
+            if (status >= 400) {
+                var errors = conn.getErrorStream()
+                if (errors != null) {
+                    bytes = errors.readNBytes(maxBytes + 1)
+                    errors.close()
+                }
+            }
+            else {
+                var stream = conn.getInputStream()
+                bytes = stream.readNBytes(maxBytes + 1)
+                stream.close()
+            }
+            conn.disconnect()
+            out = OutboundResponse(status, kind, bytes)
+        } catch (IOException e) {
+            failure = "OUTBOUND_FAILED: " + e.getMessage()
+        } catch (String e) {
+            failure = "OUTBOUND_FAILED: " + e
+        }
+        if (failure.length() > 0) {
+            throw failure
+        }
+        return out
+    }
+    // POST and friends: see `send` (status 0 = unreachable).
     // A request with text body and "Name: value" headers; the reply body is read for any status.
     static HttpReply send(method: String, url: String, headers: List<String>, body: String?, timeoutMs: Int) {
         try {

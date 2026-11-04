@@ -1,7 +1,7 @@
 package emotes
 
 import kernel.log.*
-import kernel.sync.*
+import kernel.concurrent.*
 import kernel.time.*
 
 // What the name policy dropped from one or more rounds, plus the artwork of the dropped ones: the image
@@ -40,7 +40,7 @@ class EmoteCatalogService {
     Set<String> artsAnimated = setOf<String>()
     Set<String> artsBlocked = setOf<String>()
     Bool liveDone = false
-    Mutex refreshGate = Mutex()
+    Gate refreshGate = Gate()
     public constructor(liveSources: List<EmoteSource>, embedded: EmoteSource) {
         // A copy, like Java's List.copyOf: the caller changing its list later does not change the sources.
         this.liveSources = listOf<EmoteSource>()
@@ -79,7 +79,7 @@ class EmoteCatalogService {
     // Every source keeps its LAST good answer: a failing one does not erase what it brought, so the catalog
     // only grows. Two refreshes never run at once: the second one is skipped (the first is doing the same job).
     refresh() {
-        if (!refreshGate.tryLock()) {
+        if (!refreshGate.tryEnter()) {
             log.info("emote_refresh_skipped another refresh is running")
             return
         }
@@ -101,7 +101,7 @@ class EmoteCatalogService {
         } catch (String e) {
             failure = e
         }
-        refreshGate.unlock()
+        refreshGate.leave()
         if (failure.length() > 0) {
             throw failure
         }
