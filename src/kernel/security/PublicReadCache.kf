@@ -1,0 +1,110 @@
+package kernel.security
+
+import java.security.MessageDigest
+import java.util.HexFormat
+import kernel.http.*
+
+// HTTP cache of the PUBLIC reads (PublicReadCacheConfig). The API already caches the result in process;
+// this lets the browser not download again a body it just received. Two pieces:
+//  - a weak ETag of the JSON body: the browser sends If-None-Match and gets 304 without a body when
+//    nothing changed;
+//  - `Cache-Control: public, max-age=0, must-revalidate`: the body may be kept but is never served without
+//    asking. It is max-age=0 that stops the screen from showing stale data after the user's own action;
+//    the saving comes from the 304, not from serving without asking.
+// It does NOT apply to a request with a session: an authenticated answer has personal data and carries
+// Cache-Control: no-store (SecurityHeadersFilter); not even the ETag shows up then, and a public policy
+// is never written over it. Streaming, uploads, media and every write route stay out of the list.
+class PublicReadCache {
+    static List<String> paths() = listOf("/feed", "/feed/posts/*", "/users/*", "/users/by-id/*", "/ranking", "/profile/ranking", "/communities", "/communities/*", "/events", "/events/*", "/jobs", "/jobs/*", "/stats/community")
+    static String policy() = "public, max-age=0, must-revalidate"
+    // Cache-Control side (the MVC interceptor): `*` is one segment (AntPathMatcher).
+    static Bool listed(p: String) {
+        for (var pattern in PublicReadCache.paths()) {
+            if (WriteGate.matchesPattern(pattern, p)) {
+                return true
+            }
+        }
+        return false
+    }
+    // ETag side (the servlet filter): `/x/*` is a prefix (servlet url-pattern), so it covers deeper paths.
+    static Bool etagListed(p: String) {
+        for (var pattern in PublicReadCache.paths()) {
+            if (pattern.endsWith("/*")) {
+                var base = pattern.substring(0, pattern.length() - 2)
+                if (p == base || p.startsWith(base + "/")) {
+                    return true
+                }
+            }
+            else 
+                if (p == pattern) {
+                    return true
+                }
+        }
+        return false
+    }
+    // Order 5, registered after the security headers: only an anonymous GET/HEAD of a listed path that
+    // nobody has given a Cache-Control yet (an authenticated answer already carries no-store).
+    String filter() {
+        var m = method().toUpperCase()
+        if (m != "GET" && m != "HEAD") {
+            return Http.next()
+        }
+        if (ResponseHeaders.has("Cache-Control") || Req.headerOrNull("x-session-token") != null) {
+            return Http.next()
+        }
+        if (PublicReadCache.listed(RequestPath.current())) {
+            ResponseHeaders.set("Cache-Control", PublicReadCache.policy())
+        }
+        return Http.next()
+    }
+    // The ETag filter: a 200 JSON body of a listed path for a GET gets a weak ETag, and a matching
+    // If-None-Match turns it into a 304 with no body. Skipped under no-store.
+    String transform(body: String) {
+        if (method().toUpperCase() != "GET" || Http.currentStatus() != 200) {
+            return body
+        }
+        if (!PublicReadCache.etagListed(RequestPath.current())) {
+            return body
+        }
+        var cache = ResponseHeaders.get("Cache-Control")
+        if (cache != null) {
+            if (cache.contains("no-store")) {
+                return body
+            }
+        }
+        var tag = PublicReadCache.etagOf(body)
+        ResponseHeaders.set("ETag", tag)
+        var sent = Req.headerOrNull("if-none-match")
+        if (sent != null) {
+            if (PublicReadCache.matches(sent, tag)) {
+                return status(304, "")
+            }
+        }
+        return body
+    }
+    // W/"0<md5 of the body>", what Spring's ShallowEtagHeaderFilter writes in weak mode.
+    static String etagOf(body: String) {
+        var digest = MessageDigest.getInstance("MD5").digest(body.getBytes())
+        return "W/\"0" + HexFormat.of().formatHex(digest) + "\""
+    }
+    // If-None-Match is a list of tags (or *); comparison is weak, so the W/ prefix is ignored.
+    static Bool matches(header: String, tag: String) {
+        if (header.trim() == "*") {
+            return true
+        }
+        var want = PublicReadCache.opaque(tag)
+        for (var part in header.split(",")) {
+            if (PublicReadCache.opaque(part) == want) {
+                return true
+            }
+        }
+        return false
+    }
+    static String opaque(tag: String) {
+        var t = tag.trim()
+        if (t.startsWith("W/")) {
+            t = t.substring(2)
+        }
+        return t
+    }
+}

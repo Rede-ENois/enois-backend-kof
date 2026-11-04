@@ -27,6 +27,17 @@ class HttpAfter {
     }
 }
 
+// A step that may rewrite the answer of a ROUTE (status, headers, body) before it is sent: ETag and
+// 304 for the public reads. It never sees the answers of filters.
+class HttpTransform {
+    String name
+    (String) -> String run
+    public constructor(name: String, run: (String) -> String) {
+        this.name = name
+        this.run = run
+    }
+}
+
 // One registered route (method + pattern with `:param` segments), used for the unknown-route
 // fallback and the 405 answer.
 record HttpRoute(String method, String pattern)
@@ -41,6 +52,7 @@ class HttpServer {
     kof.web.App app
     List<HttpFilter> filters = listOf<HttpFilter>()
     List<HttpAfter> afters = listOf<HttpAfter>()
+    List<HttpTransform> transforms = listOf<HttpTransform>()
     List<HttpRoute> routes = listOf<HttpRoute>()
     Log log = Log("kernel.http")
     public constructor() {
@@ -58,6 +70,10 @@ class HttpServer {
     // and never changes the response.
     useAfter(name: String, run: (Int, String) -> void) {
         afters.add(HttpAfter(name, run))
+    }
+    // Registers a transform of route answers (see HttpTransform). Applied in registration order.
+    useTransform(name: String, run: (String) -> String) {
+        transforms.add(HttpTransform(name, run))
     }
     runAfter(body: String) {
         var code = Http.currentStatus()
@@ -121,6 +137,14 @@ class HttpServer {
             out = handler()
         } catch (String e) {
             out = Http.render(e)
+        }
+        for (var t in transforms) {
+            var step = t.run
+            try {
+                out = step(out)
+            } catch (String e) {
+                log.warn("transform_failed name=" + t.name)
+            }
         }
         runAfter(out)
         return out

@@ -81,19 +81,24 @@ class RequestObservability {
         fields.put("durationMs", "" + durationMs)
         fields.put("userAgent", userAgentOf())
         var line = "http_request requestId=" + requestId + " method=" + m + " path=" + uri + " status=" + code + " durationMs=" + durationMs + " clientIp=" + ip + " userId=" + userId + " deviceId=" + device
+        var level = "INFO"
         if (probe) {
+            level = "DEBUG"
             access.debugWith(line, fields)
         }
         else 
             if (code >= 500) {
+                level = "ERROR"
                 access.errorWith(line, fields)
             }
             else {
                 access.infoWith(line, fields)
             }
-        note("http_request", line)
+        note("http_request", level, line)
         if (!probe && durationMs >= RequestObservability.slowRequestMs()) {
-            access.warn("slow_request requestId=" + requestId + " method=" + m + " route=" + route + " status=" + code + " durationMs=" + durationMs)
+            var slow = "slow_request requestId=" + requestId + " method=" + m + " route=" + route + " status=" + code + " durationMs=" + durationMs
+            access.warn(slow)
+            note("slow_request", "WARN", slow)
         }
         if (tracked(uri)) {
             try {
@@ -104,13 +109,13 @@ class RequestObservability {
         if (RequestObservability.isAdminMutation(m, uri)) {
             var auditLine = "admin_action actor=" + userId + " action=" + m + " " + route + " path=" + uri + " status=" + code
             audit.info(auditLine)
-            note("audit", auditLine)
+            note("audit", "INFO", auditLine)
         }
         LogContext.reset()
     }
-    note(logger: String, line: String) {
+    note(kind: String, level: String, line: String) {
         if (RequestObservability.capturing) {
-            RequestObservability.captured.add(logger + "|" + line)
+            RequestObservability.captured.add(kind + "|" + level + "|" + line)
         }
     }
     Bool tracked(uri: String) = !RequestObservability.isProbe(uri) && !uri.startsWith("/admin/monitoring")
@@ -136,6 +141,9 @@ class RequestObservability {
         if (v == null) {
             return ""
         }
+        return RequestObservability.cleanUserAgent(v)
+    }
+    static String cleanUserAgent(v: String) {
         var clean = v.replaceAll("\\p{Cntrl}", "")
         if (clean.length() > RequestObservability.maxUserAgent()) {
             return clean.substring(0, RequestObservability.maxUserAgent())
