@@ -1,0 +1,129 @@
+package groups
+
+import kernel.db.*
+import kernel.text.*
+
+// SQL of the group aggregate: `groups`, `group_members`, `group_join_requests` (GroupPersistenceAdapter).
+// The tables carry no foreign keys on purpose (V81): integrity lives in the services.
+class GroupStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String groupColumns() = "id, slug, name, description, topic, avatar, banner, banner_html, join_mode, status, owner_id, created_at, updated_at, suspended_at"
+    static GroupRow toGroup(r: DbRow) = GroupRow(r.getStr("id"), r.getStr("slug"), r.getStr("name"), r.getStrOrNull("description"), r.getStrOrNull("topic"), r.getStrOrNull("avatar"), r.getStrOrNull("banner"), r.getStrOrNull("banner_html"), r.getStr("join_mode"), r.getStr("status"), r.getStr("owner_id"), r.getInstant("created_at"), r.getInstant("updated_at"), r.getInstantOrNull("suspended_at"))
+    static GroupMemberRow toMember(r: DbRow) = GroupMemberRow(r.getStr("group_id"), r.getStr("user_id"), r.getStr("role"), r.getInstant("joined_at"))
+    static GroupJoinRow toJoin(r: DbRow) = GroupJoinRow(r.getStr("id"), r.getStr("group_id"), r.getStr("user_id"), r.getStrOrNull("message"), r.getStr("status"), r.getInstant("created_at"), r.getStrOrNull("decided_by"), r.getInstantOrNull("decided_at"))
+    // Row lists are mapped by loops: a lambda returning a record of the own package fails at run time
+    // (KOF_GAPS G195, same family as G19/G33).
+    static List<GroupRow> groups(rows: List<DbRow>) {
+        var out = listOf<GroupRow>()
+        for (var r in rows) {
+            out.add(GroupStore.toGroup(r))
+        }
+        return out
+    }
+    static List<GroupMemberRow> members(rows: List<DbRow>) {
+        var out = listOf<GroupMemberRow>()
+        for (var r in rows) {
+            out.add(GroupStore.toMember(r))
+        }
+        return out
+    }
+    static List<GroupJoinRow> joins(rows: List<DbRow>) {
+        var out = listOf<GroupJoinRow>()
+        for (var r in rows) {
+            out.add(GroupStore.toJoin(r))
+        }
+        return out
+    }
+    // Insert of a new group (member_count and post_count start at zero).
+    insertGroup(g: GroupRow) {
+        store.execute("insert into groups (id, slug, name, description, topic, avatar, banner, banner_html, join_mode, status, owner_id, member_count, post_count, created_at, updated_at, suspended_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)", DbParams().bindStr(g.id()).bindStr(g.slug()).bindStr(g.name()).bindStrOrNull(g.description()).bindStrOrNull(g.topic()).bindStrOrNull(g.avatar()).bindStrOrNull(g.banner()).bindStrOrNull(g.bannerHtml()).bindStr(g.joinMode()).bindStr(g.status()).bindStr(g.ownerId()).bindInstant(g.createdAt()).bindInstant(g.updatedAt()).bindInstantOrNull(g.suspendedAt()))
+    }
+    // Update of the mutable columns. The Java save() merged a detached entity and reset the
+    // denormalised member_count to 0 (nothing reads it: the views count the rows); here it is untouched.
+    updateGroup(g: GroupRow) {
+        store.execute("update groups set name = ?, description = ?, topic = ?, avatar = ?, banner = ?, banner_html = ?, join_mode = ?, status = ?, owner_id = ?, updated_at = ?, suspended_at = ? where id = ?", DbParams().bindStr(g.name()).bindStrOrNull(g.description()).bindStrOrNull(g.topic()).bindStrOrNull(g.avatar()).bindStrOrNull(g.banner()).bindStrOrNull(g.bannerHtml()).bindStr(g.joinMode()).bindStr(g.status()).bindStr(g.ownerId()).bindInstant(g.updatedAt()).bindInstantOrNull(g.suspendedAt()).bindStr(g.id()))
+    }
+    GroupRow? findById(id: String) {
+        var row = store.queryOptional("select " + GroupStore.groupColumns() + " from groups where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return GroupStore.toGroup(row)
+    }
+    GroupRow? findBySlug(slug: String) {
+        var row = store.queryOptional("select " + GroupStore.groupColumns() + " from groups where slug = ?", DbParams().bindStr(slug))
+        if (row == null) {
+            return null
+        }
+        return GroupStore.toGroup(row)
+    }
+    Bool existsBySlug(slug: String) = store.queryLong("select count(*) from groups where slug = ?", DbParams().bindStr(slug)) > 0L
+    // Discovery: only ACTIVE and RESTRICTED groups, optional search on name or description (public
+    // metadata only: posts, members and topics never enter this query).
+    List<GroupRow> listVisible(query: String?, before: String?, limit: Int) {
+        var like = LikePattern.contains(query)
+        var sql = "select " + GroupStore.groupColumns() + " from groups where status in (\'ACTIVE\', \'RESTRICTED\')"
+        var params = DbParams()
+        if (before != null) {
+            sql = sql + " and created_at < ?"
+            params = params.bindInstant(before)
+        }
+        if (like != null) {
+            sql = sql + " and (lower(name) like ? escape \'!\' or lower(description) like ? escape \'!\')"
+            params = params.bindStr(like).bindStr(like)
+        }
+        sql = sql + " order by created_at desc limit " + limit
+        return GroupStore.groups(store.queryList(sql, params))
+    }
+    // Insert or role change of the (group, user) pair; the unique key keeps it one row.
+    saveMember(m: GroupMemberRow, id: String) {
+        var changed = store.execute("update group_members set role = ? where group_id = ? and user_id = ?", DbParams().bindStr(m.role()).bindStr(m.groupId()).bindStr(m.userId()))
+        if (changed == 0) {
+            store.execute("insert into group_members (id, group_id, user_id, role, joined_at) values (?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(m.groupId()).bindStr(m.userId()).bindStr(m.role()).bindInstant(m.joinedAt()))
+        }
+    }
+    GroupMemberRow? findMember(groupId: String, userId: String) {
+        var row = store.queryOptional("select group_id, user_id, role, joined_at from group_members where group_id = ? and user_id = ?", DbParams().bindStr(groupId).bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return GroupStore.toMember(row)
+    }
+    List<GroupMemberRow> listMembers(groupId: String) = GroupStore.members(store.queryList("select group_id, user_id, role, joined_at from group_members where group_id = ? order by joined_at asc", DbParams().bindStr(groupId)))
+    Long countMembers(groupId: String) = store.queryLong("select count(*) from group_members where group_id = ?", DbParams().bindStr(groupId))
+    removeMember(groupId: String, userId: String) {
+        store.execute("delete from group_members where group_id = ? and user_id = ?", DbParams().bindStr(groupId).bindStr(userId))
+    }
+    // The denormalised counter never goes below zero, even on a repeated removal.
+    adjustMemberCount(groupId: String, delta: Int) {
+        store.execute("update groups set member_count = greatest(0, member_count + ?) where id = ?", DbParams().bindInt(delta).bindStr(groupId))
+    }
+    insertJoinRequest(r: GroupJoinRow) {
+        var slot = GroupNil.str()
+        if (r.status() == "PENDING") {
+            slot = r.userId()
+        }
+        store.execute("insert into group_join_requests (id, group_id, user_id, message, status, pending_slot, created_at, decided_by, decided_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(r.id()).bindStr(r.groupId()).bindStr(r.userId()).bindStrOrNull(r.message()).bindStr(r.status()).bindStrOrNull(slot).bindInstant(r.createdAt()).bindStrOrNull(r.decidedBy()).bindInstantOrNull(r.decidedAt()))
+    }
+    static String requestColumns() = "id, group_id, user_id, message, status, created_at, decided_by, decided_at"
+    GroupJoinRow? findPendingRequest(groupId: String, userId: String) {
+        var row = store.queryOptional("select " + GroupStore.requestColumns() + " from group_join_requests where group_id = ? and user_id = ? and status = \'PENDING\'", DbParams().bindStr(groupId).bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return GroupStore.toJoin(row)
+    }
+    GroupJoinRow? findRequestById(id: String) {
+        var row = store.queryOptional("select " + GroupStore.requestColumns() + " from group_join_requests where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return GroupStore.toJoin(row)
+    }
+    List<GroupJoinRow> listPendingRequests(groupId: String) = GroupStore.joins(store.queryList("select " + GroupStore.requestColumns() + " from group_join_requests where group_id = ? and status = \'PENDING\' order by created_at asc", DbParams().bindStr(groupId)))
+    // Decides only what is still PENDING: the WHERE is the guard against two simultaneous approvals.
+    Int markDecided(requestId: String, status: String, actorId: String, now: String) = store.execute("update group_join_requests set status = ?, pending_slot = null, decided_by = ?, decided_at = ? where id = ? and status = \'PENDING\'", DbParams().bindStr(status).bindStr(actorId).bindInstant(now).bindStr(requestId))
+}

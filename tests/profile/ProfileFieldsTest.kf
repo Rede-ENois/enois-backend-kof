@@ -1,0 +1,379 @@
+import kernel.db.*
+import kernel.testkit.*
+import profile.*
+
+class ProfileFieldsHolder {
+    static TestApp? cached = null
+}
+
+TestApp fApp() {
+    var cur = ProfileFieldsHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = ProfileTestApp.boot("profilefields", mapOf<String, String>())
+    ProfileFieldsHolder.cached = created
+    return created
+}
+
+ProfileCaller fUser(id: String) = ProfileTestApp.login(fApp(), id)
+
+String fPatch(user: ProfileCaller, key: String, body: String) {
+    var res = user.callKey("PATCH", "/me/profile", key, body)
+    Check.status(res, 200)
+    return res.body
+}
+
+String jsonQuote(v: String) = json.encode(v)
+
+String quoted(v: String) = jsonQuote(v)
+
+String repeatChar(c: String, n: Int) = strings.repeat(c, n)
+
+// ProfileBioHtmlTests ----------------------------------------------------------------------------
+test "sanitizes the bio html on save and keeps it out of the write response" {
+    var user = fUser("user_bio_html1")
+    var html = "<style>.capa{color:#c00}</style><div class=\"capa\" style=\"font-weight:600\">Ola</div>\n<script>fetch(\'https://malicioso.test\')</script><p onclick=\"alert(1)\">corpo</p>"
+    var saved = user.callKey("PATCH", "/me/profile", "bio-html-1", "{\"bio\":\"Bio de texto\",\"bioHtml\":" + quoted(html) + "}")
+    Check.status(saved, 200)
+    Check.isTrue("write answer has no html", saved.jsonStr("bioHtml") == null)
+    var stored = user.get("/me").json("bioHtml")
+    Check.isTrue("keeps text", stored.contains("Ola") && stored.contains("corpo"))
+    Check.isTrue("keeps style", stored.contains("#c00"))
+    Check.isTrue("no script", !stored.contains("<script"))
+    Check.isTrue("no handler", !stored.contains("onclick"))
+    Check.isTrue("no url from the script", !stored.contains("malicioso.test"))
+    var pub = ProfileTestApp.anonymous(fApp()).get("/users/" + saved.json("username"))
+    Check.eqStr("public shows the same sanitized html", stored, pub.json("bioHtml"))
+}
+
+test "an empty bio html clears the page and keeps the plain bio" {
+    var user = fUser("user_bio_html2")
+    fPatch(user, "bio-html-clear-a", "{\"bio\":\"Texto do perfil\",\"bioHtml\":\"<b>negrito</b>\"}")
+    Check.eqStr("stored", "<b>negrito</b>", user.get("/me").json("bioHtml"))
+    fPatch(user, "bio-html-clear-b", "{\"bioHtml\":\"\"}")
+    var me = user.get("/me")
+    Check.isTrue("cleared", me.jsonStr("bioHtml") == null)
+    Check.jsonEq(me, "bio", "Texto do perfil")
+}
+
+test "a partial update without bio html keeps the existing one" {
+    var user = fUser("user_bio_html3")
+    fPatch(user, "bio-html-keep-a", "{\"bioHtml\":\"<b>fica</b>\"}")
+    fPatch(user, "bio-html-keep-b", "{\"name\":\"Nome Novo\"}")
+    Check.eqStr("kept", "<b>fica</b>", user.get("/me").json("bioHtml"))
+}
+
+test "a bio html without usable content is rejected" {
+    var user = fUser("user_bio_html4")
+    Check.apiError(user.callKey("PATCH", "/me/profile", "bio-html-bad", "{\"bioHtml\":\"<script>alert(1)</script>\"}"), 400, "INVALID_PROFILE_HTML")
+}
+
+test "an oversized bio html is rejected" {
+    var user = fUser("user_bio_html5")
+    var big = "<p>" + repeatChar("a", 200000) + "</p>"
+    Check.apiError(user.callKey("PATCH", "/me/profile", "bio-html-big", "{\"bioHtml\":" + quoted(big) + "}"), 400, "PROFILE_HTML_TOO_LONG")
+}
+
+// ProfileBannerHtmlTests ---------------------------------------------------------------------------
+test "sanitizes the banner html and keeps the photo too" {
+    var user = fUser("user_banner_html1")
+    var html = "<div style=\"background:linear-gradient(90deg,#7c3aed,#ec4899)\">capa</div><script>alert(1)</script>"
+    var saved = user.callKey("PATCH", "/me/profile", "banner-1", "{\"banner\":\"https://ik.imagekit.io/x/capa.jpg\",\"bannerHtml\":" + quoted(html) + "}")
+    Check.status(saved, 200)
+    Check.jsonEq(saved, "banner", "https://ik.imagekit.io/x/capa.jpg")
+    Check.isTrue("write answer has no html", saved.jsonStr("bannerHtml") == null)
+    var stored = user.get("/me").json("bannerHtml")
+    Check.isTrue("keeps content", stored.contains("capa") && stored.contains("#7c3aed"))
+    Check.isTrue("no script", !stored.contains("<script") && !stored.contains("alert("))
+    Check.eqStr("public same", stored, ProfileTestApp.anonymous(fApp()).get("/users/" + saved.json("username")).json("bannerHtml"))
+}
+
+test "an empty banner html clears it and keeps the photo" {
+    var user = fUser("user_banner_html2")
+    fPatch(user, "banner-2a", "{\"banner\":\"https://ik.imagekit.io/x/foto.jpg\",\"bannerHtml\":\"<b>capa html</b>\"}")
+    Check.eqStr("stored", "<b>capa html</b>", user.get("/me").json("bannerHtml"))
+    fPatch(user, "banner-2b", "{\"bannerHtml\":\"\"}")
+    var me = user.get("/me")
+    Check.isTrue("cleared", me.jsonStr("bannerHtml") == null)
+    Check.jsonEq(me, "banner", "https://ik.imagekit.io/x/foto.jpg")
+}
+
+test "a partial update keeps the banner html" {
+    var user = fUser("user_banner_html3")
+    fPatch(user, "banner-3a", "{\"bannerHtml\":\"<i>fica</i>\"}")
+    fPatch(user, "banner-3b", "{\"name\":\"Nome Novo\"}")
+    Check.eqStr("kept", "<i>fica</i>", user.get("/me").json("bannerHtml"))
+}
+
+// ProfileAkaTests --------------------------------------------------------------------------------
+test "saves the aka and reads it back in both views" {
+    var user = fUser("user_aka1")
+    var res = user.callKey("PATCH", "/me/profile", "aka-1", "{\"aka\":\"Java\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "aka", "Java")
+    var mine = user.get("/me")
+    Check.jsonEq(mine, "aka", "Java")
+    var pub = ProfileTestApp.anonymous(fApp()).get("/users/" + mine.json("username"))
+    Check.status(pub, 200)
+    Check.jsonEq(pub, "aka", "Java")
+}
+
+test "clears the aka with an empty string" {
+    var user = fUser("user_aka2")
+    fPatch(user, "aka-2a", "{\"aka\":\"Java\"}")
+    var res = user.callKey("PATCH", "/me/profile", "aka-2b", "{\"aka\":\"\"}")
+    Check.status(res, 200)
+    Check.eqStr("empty string back", "", res.json("aka"))
+    Check.isTrue("present and empty", res.jsonHas("aka") && !res.jsonIsNull("aka"))
+}
+
+test "refuses an aka above the column limit" {
+    var user = fUser("user_aka3")
+    Check.apiError(user.callKey("PATCH", "/me/profile", "aka-3", "{\"aka\":\"" + repeatChar("a", 61) + "\"}"), 400, "FIELD_TOO_LONG")
+}
+
+// ProfileBadgeTests (the single emblem column) ------------------------------------------------------
+test "saves a badge and reads it back" {
+    var user = fUser("user_badge1")
+    var url = "https://ik.imagekit.io/x/emblema.png"
+    var res = user.callKey("PATCH", "/me/profile", "badge-1", "{\"badge\":\"" + url + "\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "badge", url)
+    Check.jsonEq(user.get("/me"), "badge", url)
+}
+
+test "clears the badge with an empty string" {
+    var user = fUser("user_badge2")
+    fPatch(user, "badge-2a", "{\"badge\":\"https://ik.imagekit.io/x/e.png\"}")
+    fPatch(user, "badge-2b", "{\"badge\":\"\"}")
+    Check.eqStr("empty", "", user.get("/me").json("badge"))
+}
+
+test "keeps the badge when the field is absent" {
+    var user = fUser("user_badge3")
+    var url = "https://ik.imagekit.io/x/fica.png"
+    fPatch(user, "badge-3a", "{\"badge\":\"" + url + "\"}")
+    fPatch(user, "badge-3b", "{\"headline\":\"Mudou so a headline\"}")
+    Check.jsonEq(user.get("/me"), "badge", url)
+}
+
+test "rejects a badge above the column limit" {
+    var user = fUser("user_badge4")
+    var res = user.callKey("PATCH", "/me/profile", "badge-4", "{\"badge\":\"" + repeatChar("a", 501) + "\"}")
+    Check.apiError(res, 400, "FIELD_TOO_LONG")
+    Check.isTrue("names the limit", res.json("message").contains("500"))
+}
+
+// ProfileResumeTests ------------------------------------------------------------------------------
+test "saves the resume and reads it back only for the owner" {
+    var user = fUser("user_resume1")
+    var url = "https://ik.imagekit.io/x/curriculo-ana.pdf"
+    var res = user.callKey("PATCH", "/me/profile", "resume-1", "{\"resumeUrl\":\"" + url + "\",\"resumeName\":\"curriculo-ana.pdf\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "resumeUrl", url)
+    Check.jsonEq(res, "resumeName", "curriculo-ana.pdf")
+    var mine = user.get("/me")
+    Check.jsonEq(mine, "resumeUrl", url)
+    var pub = ProfileTestApp.anonymous(fApp()).get("/users/" + mine.json("username"))
+    Check.status(pub, 200)
+    Check.isTrue("no resume url", pub.jsonStr("resumeUrl") == null)
+    Check.isTrue("no resume name", pub.jsonStr("resumeName") == null)
+}
+
+test "keeps the resume when the field is absent and clears with an empty string" {
+    var user = fUser("user_resume2")
+    fPatch(user, "resume-2a", "{\"resumeUrl\":\"https://ik.imagekit.io/x/cv.pdf\",\"resumeName\":\"cv.pdf\"}")
+    var kept = user.callKey("PATCH", "/me/profile", "resume-2b", "{\"headline\":\"Back-end\"}")
+    Check.status(kept, 200)
+    Check.jsonEq(kept, "resumeUrl", "https://ik.imagekit.io/x/cv.pdf")
+    var cleared = user.callKey("PATCH", "/me/profile", "resume-2c", "{\"resumeUrl\":\"\",\"resumeName\":\"\"}")
+    Check.status(cleared, 200)
+    Check.isTrue("url gone", cleared.jsonStr("resumeUrl") == null)
+    Check.isTrue("name gone", cleared.jsonStr("resumeName") == null)
+}
+
+test "refuses a resume url above the column limit" {
+    var user = fUser("user_resume3")
+    Check.apiError(user.callKey("PATCH", "/me/profile", "resume-3", "{\"resumeUrl\":\"" + repeatChar("a", 501) + "\"}"), 400, "FIELD_TOO_LONG")
+}
+
+// ProfileTextFieldsLengthTests --------------------------------------------------------------------
+test "accepts a skill with up to the field limit" {
+    var user = fUser("user_skills_length1")
+    fPatch(user, "skills-1600", "{\"skills\":[\"" + repeatChar("a", 1600) + "\"]}")
+    Check.eqInt("length", 1600, user.get("/me").json("skills.0").length())
+}
+
+test "rejects above the limit with a field message" {
+    var user = fUser("user_skills_length2")
+    var res = user.callKey("PATCH", "/me/profile", "skills-1601", "{\"skills\":[\"" + repeatChar("a", 1601) + "\"]}")
+    Check.apiError(res, 400, "FIELD_TOO_LONG")
+    Check.isTrue("names the limit", res.json("message").contains("1600"))
+}
+
+test "accepts a goal with up to the same limit" {
+    var user = fUser("user_goals_length1")
+    fPatch(user, "goals-1600", "{\"goals\":[\"" + repeatChar("b", 1600) + "\"]}")
+    Check.eqInt("length", 1600, user.get("/me").json("goals.0").length())
+}
+
+// ProfileCityPrivacyTests ------------------------------------------------------------------------------
+test "the city is private until the owner opts in" {
+    var user = fUser("pcity-1")
+    fPatch(user, "pcity-1a", "{\"city\":\"Belo Horizonte\",\"state\":\"MG\"}")
+    var anon = ProfileTestApp.anonymous(fApp())
+    var mine = user.get("/me")
+    Check.jsonEq(mine, "city", "Belo Horizonte")
+    Check.jsonEq(mine, "state", "MG")
+    Check.jsonEq(mine, "showCity", "false")
+    var username = mine.json("username")
+    var hidden = anon.get("/users/" + username)
+    Check.status(hidden, 200)
+    Check.isTrue("no city", hidden.jsonStr("city") == null)
+    Check.isTrue("no state", hidden.jsonStr("state") == null)
+    fPatch(user, "pcity-1b", "{\"showCity\":true}")
+    var shown = anon.get("/users/" + username)
+    Check.jsonEq(shown, "city", "Belo Horizonte")
+    Check.jsonEq(shown, "state", "MG")
+    fPatch(user, "pcity-1c", "{\"showCity\":false}")
+    Check.isTrue("hidden again", anon.get("/users/" + username).jsonStr("city") == null)
+}
+
+test "refuses a city without a state and clears with empty strings" {
+    var user = fUser("pcity-2")
+    Check.apiError(user.callKey("PATCH", "/me/profile", "pcity-2a", "{\"state\":\"SP\"}"), 400, "CITY_STATE_INCOMPLETE")
+    fPatch(user, "pcity-2b", "{\"city\":\"Recife\",\"state\":\"PE\"}")
+    fPatch(user, "pcity-2c", "{\"city\":\"\",\"state\":\"\"}")
+    Check.isTrue("cleared", user.get("/me").jsonStr("city") == null)
+}
+
+// IdentityDisplayTests --------------------------------------------------------------------------------
+test "the social name replaces the registered name for everyone and the nickname appends" {
+    var user = fUser("user_identity_a")
+    var res = user.callKey("PUT", "/me/identity", "ident-a", "{\"nickname\":\"Bia\",\"socialName\":\"Beatriz Sol\",\"pronouns\":\"ela/dela\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "name", "Beatriz Sol (Bia)")
+    Check.jsonEq(res, "pronouns", "ela/dela")
+    var me = user.get("/me")
+    var pub = ProfileTestApp.anonymous(fApp()).get("/users/" + me.json("username"))
+    Check.status(pub, 200)
+    Check.jsonEq(pub, "name", "Beatriz Sol (Bia)")
+    Check.jsonEq(pub, "pronouns", "ela/dela")
+    Check.isTrue("no social name field in the public view", pub.jsonStr("socialName") == null)
+}
+
+test "clearing the identity fields goes back to the registered name" {
+    var user = fUser("user_identity_b")
+    var first = user.callKey("PUT", "/me/identity", "ident-b1", "{\"nickname\":\"Bibi\",\"socialName\":\"B. Sol\"}")
+    Check.status(first, 200)
+    Check.jsonEq(first, "name", "B. Sol (Bibi)")
+    var cleared = user.callKey("PUT", "/me/identity", "ident-b2", "{\"nickname\":null,\"socialName\":null,\"pronouns\":null}")
+    Check.status(cleared, 200)
+    Check.jsonEq(cleared, "name", "user_identity_b")
+    Check.isTrue("no pronouns", cleared.jsonStr("pronouns") == null)
+}
+
+test "the owner sees everything on me" {
+    var user = fUser("user_identity_c")
+    Check.status(user.callKey("PUT", "/me/identity", "ident-c", "{\"nickname\":\"Bi\",\"socialName\":\"B. Sol\",\"pronouns\":\"elu/delu\"}"), 200)
+    var me = user.get("/me")
+    Check.status(me, 200)
+    Check.jsonEq(me, "name", "user_identity_c")
+    Check.jsonEq(me, "socialName", "B. Sol")
+    Check.jsonEq(me, "nickname", "Bi")
+    Check.jsonEq(me, "pronouns", "elu/delu")
+}
+
+test "refuses too long identity fields" {
+    var user = fUser("user_identity_d")
+    Check.apiError(user.callKey("PUT", "/me/identity", "ident-d", "{\"nickname\":\"" + repeatChar("a", 61) + "\"}"), 400, "FIELD_TOO_LONG")
+}
+
+test "the identity endpoint requires a session" {
+    Check.status(ProfileTestApp.anonymous(fApp()).put("/me/identity", "{}"), 401)
+}
+
+test "accepts up to five badges and refuses six" {
+    var user = fUser("user_badge_a")
+    var five = "{\"badges\":[\"https://cdn.enois.ia.br/b1.png\",\"https://cdn.enois.ia.br/b2.png\",\"https://cdn.enois.ia.br/b3.png\",\"https://cdn.enois.ia.br/b4.png\",\"https://cdn.enois.ia.br/b5.png\"]}"
+    var ok = user.callKey("PUT", "/me/badges", "badges-five", five)
+    Check.status(ok, 200)
+    Check.eqInt("five", 5, ok.jsonSize("badges"))
+    var six = "{\"badges\":[\"https://cdn.enois.ia.br/b1.png\",\"https://cdn.enois.ia.br/b2.png\",\"https://cdn.enois.ia.br/b3.png\",\"https://cdn.enois.ia.br/b4.png\",\"https://cdn.enois.ia.br/b5.png\",\"https://cdn.enois.ia.br/b6.png\"]}"
+    Check.apiError(user.callKey("PUT", "/me/badges", "badges-six", six), 400, "MAX_BADGES")
+}
+
+test "clearing badges is an empty list" {
+    var user = fUser("user_badge_b")
+    var one = user.callKey("PUT", "/me/badges", "badges-b1", "{\"badges\":[\"https://cdn.enois.ia.br/b1.png\"]}")
+    Check.status(one, 200)
+    Check.eqInt("one", 1, one.jsonSize("badges"))
+    var none = user.callKey("PUT", "/me/badges", "badges-b2", "{\"badges\":null}")
+    Check.status(none, 200)
+    Check.eqInt("none", 0, none.jsonSize("badges"))
+}
+
+test "the old single badge follows the list" {
+    var user = fUser("user_badge_c")
+    var two = user.callKey("PUT", "/me/badges", "badges-c1", "{\"badges\":[\"https://cdn.enois.ia.br/b1.png\",\"https://cdn.enois.ia.br/b2.png\"]}")
+    Check.status(two, 200)
+    Check.eqInt("two", 2, two.jsonSize("badges"))
+    Check.jsonEq(two, "badge", "https://cdn.enois.ia.br/b1.png")
+    var none = user.callKey("PUT", "/me/badges", "badges-c2", "{\"badges\":[]}")
+    Check.status(none, 200)
+    Check.eqInt("none", 0, none.jsonSize("badges"))
+    Check.isTrue("single column cleared too", none.jsonStr("badge") == null)
+}
+
+// ProfilePublicCacheTests ----------------------------------------------------------------------------------
+// Observed through the database: a direct SQL change is invisible while the entry is cached, an edit
+// through the API drops exactly the entries of that account (and the old name on a rename).
+setName(id: String, name: String) {
+    fApp().db().execute("update users set name = ? where id = ?", DbParams().bindStr(name).bindStr(id))
+}
+
+test "the same public profile is not rebuilt on every read" {
+    var anon = ProfileTestApp.anonymous(fApp())
+    fUser("cache_mel")
+    var first = anon.get("/users/cache_mel")
+    Check.status(first, 200)
+    setName("cache_mel", "Changed Behind The Cache")
+    var second = anon.get("/users/cache_mel")
+    Check.eqStr("served from the cache", first.json("name"), second.json("name"))
+    // The key normalizes the name: /users/Cache_Mel is the same read.
+    Check.eqStr("same entry for another case", first.json("name"), anon.get("/users/Cache_Mel").json("name"))
+}
+
+test "editing the profile shows up on the next read" {
+    var anon = ProfileTestApp.anonymous(fApp())
+    var user = fUser("cache_edit")
+    Check.jsonEq(anon.get("/users/cache_edit"), "name", "cache_edit")
+    fPatch(user, "cache-edit-1", "{\"name\":\"Mel Nome Novo\"}")
+    Check.jsonEq(anon.get("/users/cache_edit"), "name", "Mel Nome Novo")
+}
+
+test "editing one profile keeps everybody else's entry" {
+    var anon = ProfileTestApp.anonymous(fApp())
+    var mel = fUser("cache_keep_mel")
+    fUser("cache_keep_ana")
+    anon.get("/users/cache_keep_mel")
+    var ana = anon.get("/users/cache_keep_ana")
+    setName("cache_keep_ana", "Ana Behind The Cache")
+    fPatch(mel, "cache-keep-1", "{\"name\":\"Mel Editada\"}")
+    Check.jsonEq(anon.get("/users/cache_keep_mel"), "name", "Mel Editada")
+    Check.eqStr("ana still cached", ana.json("name"), anon.get("/users/cache_keep_ana").json("name"))
+}
+
+test "renaming the user drops the entry under the old name too" {
+    var anon = ProfileTestApp.anonymous(fApp())
+    var user = fUser("cache_rename")
+    Check.status(anon.get("/users/cache_rename"), 200)
+    fPatch(user, "cache-rename-1", "{\"username\":\"cache-renamed\"}")
+    Check.apiError(anon.get("/users/cache_rename"), 404, "USER_NOT_FOUND")
+    Check.status(anon.get("/users/cache-renamed"), 200)
+}
+
+test "zz stops the background jobs" {
+    ProfileTestApp.finish()
+}

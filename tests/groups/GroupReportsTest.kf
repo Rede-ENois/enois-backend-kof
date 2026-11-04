@@ -1,0 +1,31 @@
+import kernel.testkit.*
+import groups.*
+
+// Port of GroupReportsTests, adapted: the moderation panel (/reports, /admin/reports) belongs to the
+// moderation domain. What this domain owes it is the reader of group content: a GROUP_POST /
+// GROUP_COMMENT report must arrive with the text and the author, otherwise the triage judges by id.
+// That reader (GroupReportReader, exposed by GroupsModule.reports) is asserted here.
+test "the report reader returns text and author of a group post and comment" {
+    var owner = GroupsTestKit.login("grep-dono")
+    var reporter = GroupsTestKit.login("grep-denunciante")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Denuncia", "OPEN")
+    GroupsTestKit.joinOk(reporter, groupId)
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    var postId = GroupsTestKit.publish(owner, groupId, topicId, "Conteudo denunciavel do grupo")
+    var commentId = GroupsTestKit.comment(reporter, groupId, postId, "Comentario denunciavel", null)
+    var reader = GroupsTestKit.module().reports
+    var post = reader.read("GROUP_POST", postId)
+    assert(post != null)
+    if (post != null) {
+        Check.eqStr("post content", "Conteudo denunciavel do grupo", post.content())
+        Check.eqStr("post author", owner, post.authorId())
+    }
+    var comment = reader.read("GROUP_COMMENT", commentId)
+    assert(comment != null)
+    if (comment != null) {
+        Check.eqStr("comment content", "Comentario denunciavel", comment.content())
+        Check.eqStr("comment author", reporter, comment.authorId())
+    }
+    assert(reader.read("GROUP_POST", "nope") == null)
+    assert(reader.read("USER", postId) == null)
+}

@@ -1,0 +1,208 @@
+package network
+
+import kernel.db.*
+import kernel.error.*
+import kernel.text.*
+import kernel.time.*
+import profile.*
+
+// Connections between people (NetworkService): request, accept, remove, state, suggestions. Also the read
+// API other domains use: `friendIds`, `friendsOfFriends`, `userTags` (ConnectionGraphRepository for the feed)
+// and `blockedBetween`/`hiddenBetween` through kernel.blocks.BlockedUsers.
+class NetworkService {
+    Db store
+    NetworkStore network
+    ProfileDirectory directory
+    ProfileNotifier notifier
+    public constructor(store: Db, network: NetworkStore, directory: ProfileDirectory, notifier: ProfileNotifier) {
+        this.store = store
+        this.network = network
+        this.directory = directory
+        this.notifier = notifier
+    }
+    // Block in either direction: no new request and no notification for a blocked person, ever.
+    Bool blockedBetween(a: String, b: String) = network.blockExists(a, b) || network.blockExists(b, a)
+    requestConnection(requesterId: String, receiverId: String) {
+        if (requesterId == receiverId) {
+            throw Errors.api(400, "SELF_CONNECTION", "Nao e possivel conectar consigo mesmo.")
+        }
+        if (this.blockedBetween(requesterId, receiverId)) {
+            throw Errors.api(403, "BLOCKED", "Esta conexao nao esta disponivel.")
+        }
+        // Without this an unknown id left a pending request (and a notification) for nobody.
+        if (!directory.exists(receiverId)) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        var self = this
+        store.transaction(() -> {
+    var existing = self.network.findBetween(requesterId, receiverId)
+    if (existing == null) {
+        self.network.insertRequest(requesterId, receiverId, Time.nowIso())
+        self.notifyRequest(requesterId, receiverId)
+        return
+    }
+    if (existing.status == "REMOVED" || existing.status == "BLOCKED") {
+        self.network.reopen(existing.id, requesterId, receiverId, Time.nowIso())
+        self.notifyRequest(requesterId, receiverId)
+    }
+})
+    }
+    notifyRequest(requesterId: String, receiverId: String) {
+        var requester = directory.findById(requesterId)
+        if (requester != null) {
+            notifier.notify(receiverId, "CONNECTION_REQUEST", requesterId, "Solicitação de conexão", requester.name + " quer se conectar com você.", "/api/network/connections/" + requesterId + "/accept", "Aceitar")
+        }
+    }
+    // `targetUserId` is who asked, `currentUserId` who accepts.
+    acceptConnection(targetUserId: String, currentUserId: String) {
+        var self = this
+        store.transaction(() -> {
+    var conn = self.network.findBetween(targetUserId, currentUserId)
+    if (conn == null) {
+        throw Errors.api(404, "CONNECTION_NOT_FOUND", "Solicitacao de conexao nao encontrada.")
+    }
+    if (conn.status == "ACCEPTED") {
+        return
+    }
+    if (conn.status != "PENDING") {
+        throw Errors.api(409, "INVALID_STATUS", "Solicitacao de conexao nao esta pendente.")
+    }
+    if (conn.requesterUserId != targetUserId) {
+        throw Errors.api(403, "FORBIDDEN", "Voce nao pode aceitar essa solicitacao.")
+    }
+    if (self.blockedBetween(targetUserId, currentUserId)) {
+        throw Errors.api(403, "BLOCKED", "Esta conexao nao esta disponivel.")
+    }
+    if (self.network.markAccepted(conn.id, Time.nowIso()) == 0) {
+        var current = self.network.findBetween(targetUserId, currentUserId)
+        if (current == null) {
+            throw Errors.api(409, "INVALID_STATUS", "Solicitacao de conexao nao esta mais pendente.")
+        }
+        if (current.status != "ACCEPTED") {
+            throw Errors.api(409, "INVALID_STATUS", "Solicitacao de conexao nao esta mais pendente.")
+        }
+        return
+    }
+    var accepter = self.directory.findById(currentUserId)
+    if (accepter != null) {
+        self.notifier.notify(targetUserId, "CONNECTION_ACCEPTED", currentUserId, "Conexão aceita", accepter.name + " aceitou sua solicitação de conexão.", "/api/network/connections/" + currentUserId, "Ver")
+    }
+})
+    }
+    // Another call accepted (or removed) the same request first: no repeated notification.
+    removeConnection(targetUserId: String, currentUserId: String) {
+        var conn = network.findBetween(currentUserId, targetUserId)
+        if (conn == null) {
+            throw Errors.api(404, "CONNECTION_NOT_FOUND", "Conexao nao encontrada.")
+        }
+        if (conn.status == "REMOVED") {
+            return
+        }
+        network.markRemoved(conn.id, Time.nowIso())
+    }
+    // State seen by who asks: requestedByMe tells the sender ("cancel") from the receiver ("accept").
+    NetworkConnectionState state(currentUserId: String, targetUserId: String) {
+        var c = network.findBetween(currentUserId, targetUserId)
+        if (c == null) {
+            return NetworkConnectionState("NONE", false)
+        }
+        return NetworkConnectionState(c.status, c.status == "PENDING" && c.requesterUserId == currentUserId)
+    }
+    List<NetworkConnection> connections(userId: String) = network.accepted(userId)
+    // The other side of every accepted connection (the ids of the friends).
+    List<String> friendIds(userId: String) = network.friendIds(userId)
+    List<String> friendsOfFriends(userId: String) {
+        var out = listOf<String>()
+        for (var friend in network.friendIds(userId)) {
+            for (var id in network.friendIds(friend)) {
+                if (id != userId && !out.contains(id)) {
+                    out.add(id)
+                }
+            }
+        }
+        return out
+    }
+    // The person's skills as lower-case tags.
+    List<String> userTags(userId: String) {
+        var p = directory.findById(userId)
+        var out = listOf<String>()
+        if (p == null) {
+            return out
+        }
+        for (var s in p.skills) {
+            var t = s.toLowerCase()
+            if (!out.contains(t)) {
+                out.add(t)
+            }
+        }
+        return out
+    }
+}
+
+// Definitive block (BlockService): the blocked person disappears from the feed, comments, notifications,
+// search and suggestions of who blocked, and vice versa.
+class NetworkBlockService {
+    Db store
+    NetworkStore network
+    ProfileDirectory directory
+    public constructor(store: Db, network: NetworkStore, directory: ProfileDirectory) {
+        this.store = store
+        this.network = network
+        this.directory = directory
+    }
+    block(blockerId: String, targetUserId: String) {
+        if (blockerId == targetUserId) {
+            throw Errors.api(400, "SELF_BLOCK", "Nao e possivel bloquear a si mesmo.")
+        }
+        if (!directory.exists(targetUserId)) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        var self = this
+        store.transaction(() -> {
+    if (!self.network.blockExists(blockerId, targetUserId)) {
+        self.network.insertBlock(blockerId, targetUserId, Time.nowIso())
+    }
+    var conn = self.network.findBetween(blockerId, targetUserId)
+    if (conn != null && (conn.status == "PENDING" || conn.status == "ACCEPTED")) {
+        self.network.markRemoved(conn.id, Time.nowIso())
+    }
+})
+    }
+    // A block cannot keep showing as an active connection.
+    unblock(blockerId: String, targetUserId: String) {
+        network.deleteBlock(blockerId, targetUserId)
+    }
+}
+
+// Mute (MuteService): one-way, with an optional term; an expired mute never hides anyone again even if the
+// row stays in the table.
+class NetworkMuteService {
+    NetworkStore network
+    ProfileDirectory directory
+    public constructor(network: NetworkStore, directory: ProfileDirectory) {
+        this.network = network
+        this.directory = directory
+    }
+    // `seconds` null (or <= 0) means until the person turns it off.
+    mute(muterId: String, targetUserId: String, seconds: Long?) {
+        if (muterId == targetUserId) {
+            throw Errors.api(400, "SELF_MUTE", "Nao e possivel silenciar a si mesmo.")
+        }
+        if (!directory.exists(targetUserId)) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        var now = Time.nowIso()
+        var expires = Nulls.str()
+        if (seconds != null) {
+            if (seconds > 0L) {
+                expires = Time.plusSeconds(now, seconds)
+            }
+        }
+        network.saveMute(muterId, targetUserId, now, expires)
+    }
+    unmute(muterId: String, targetUserId: String) {
+        network.deleteMute(muterId, targetUserId)
+    }
+    List<NetworkMute> listMuted(muterId: String) = network.activeMutes(muterId, Time.nowIso())
+    NetworkMute? activeMute(muterId: String, targetUserId: String) = network.findActiveMute(muterId, targetUserId, Time.nowIso())
+}

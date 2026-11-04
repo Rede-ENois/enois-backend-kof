@@ -1,0 +1,91 @@
+import groups.*
+
+// Port of GroupDomainTests: what each state allows, how the address is born, edits and ownership.
+String now0() = "2026-10-18T12:00:00Z"
+
+GroupRow sample(joinMode: String) = GroupRow("group_1", "turma", "Turma", "descrição", "TECNOLOGIA", "avatar.png", "capa.png", null, joinMode, "ACTIVE", "user_dono", now0(), now0(), null)
+
+test "each state says what it allows" {
+    assert(GroupStatuses.acceptsNewMembers("ACTIVE"))
+    assert(GroupStatuses.acceptsNewContent("ACTIVE"))
+    assert(GroupStatuses.visibleInDiscovery("ACTIVE"))
+    assert(GroupStatuses.readableByMembers("ACTIVE"))
+    // Restricted stops people entering but the content goes on.
+    assert(!GroupStatuses.acceptsNewMembers("RESTRICTED"))
+    assert(GroupStatuses.acceptsNewContent("RESTRICTED"))
+    assert(!GroupStatuses.acceptsNewMembers("SUSPENDED"))
+    assert(!GroupStatuses.acceptsNewContent("SUSPENDED"))
+    assert(!GroupStatuses.visibleInDiscovery("SUSPENDED"))
+    // Suspended freezes, does not erase: who was a member keeps reading.
+    assert(GroupStatuses.readableByMembers("SUSPENDED"))
+    assert(!GroupStatuses.acceptsNewMembers("CLOSED"))
+    assert(!GroupStatuses.acceptsNewContent("CLOSED"))
+    assert(!GroupStatuses.visibleInDiscovery("CLOSED"))
+    assert(!GroupStatuses.readableByMembers("CLOSED"))
+}
+
+test "a group is born active and without an HTML header" {
+    var group = sample("APPROVAL")
+    assert(group.status() == "ACTIVE")
+    assert(group.bannerHtml() == null)
+    assert(group.joinMode() == "APPROVAL")
+    assert(group.suspendedAt() == null)
+    assert(group.ownerId() == "user_dono")
+    assert(group.createdAt() == now0())
+    assert(group.updatedAt() == now0())
+}
+
+test "open entry does not ask for approval" {
+    assert(sample("OPEN").joinMode() == "OPEN")
+}
+
+test "edit keeps what did not come and clears what came empty" {
+    var group = sample("OPEN")
+    var later = "2026-10-18T12:01:00Z"
+    var blankHeader = GroupRules.update(group, null, null, null, null, null, "   ", null, later)
+    assert(blankHeader.name() == "Turma")
+    assert(blankHeader.description() == "descrição")
+    assert(blankHeader.joinMode() == "OPEN")
+    assert(blankHeader.bannerHtml() == "")
+    assert(blankHeader.updatedAt() == later)
+    var full = GroupRules.update(group, "Outro nome", "outra", "JOGOS", "novo-avatar.png", "nova-capa.png", "<div>oi</div>", "APPROVAL", "2026-10-18T12:02:00Z")
+    assert(full.name() == "Outro nome")
+    assert(full.topic() == "JOGOS")
+    assert(full.avatar() == "novo-avatar.png")
+    assert(full.bannerHtml() == "<div>oi</div>")
+    assert(full.joinMode() == "APPROVAL")
+    // The address does not change after creation.
+    assert(full.slug() == "turma")
+    // Blank image clears it.
+    var cleared = GroupRules.update(group, null, null, null, "", "", null, null, later)
+    assert(cleared.avatar() == null)
+    assert(cleared.banner() == null)
+}
+
+test "suspending stamps the date and coming back clears it" {
+    var group = sample("OPEN")
+    var suspended = GroupRules.withStatus(group, "SUSPENDED", "2026-10-18T13:00:00Z")
+    assert(suspended.status() == "SUSPENDED")
+    assert(suspended.suspendedAt() == "2026-10-18T13:00:00Z")
+    assert(suspended.createdAt() == now0())
+    var reactivated = GroupRules.withStatus(suspended, "ACTIVE", "2026-10-18T14:00:00Z")
+    assert(reactivated.status() == "ACTIVE")
+    assert(reactivated.suspendedAt() == null)
+}
+
+test "handing the ownership over changes who answers" {
+    var group = sample("OPEN")
+    var changed = GroupRules.withOwner(group, "user_novo", "2026-10-18T12:01:00Z")
+    assert(changed.ownerId() == "user_novo")
+    assert(changed.slug() == "turma")
+}
+
+test "the address keeps the accents as letters and is never empty" {
+    assert(GroupSlug.from("Café & Cia") == "cafe-cia")
+    assert(GroupSlug.from("Programação Funcional") == "programacao-funcional")
+    assert(GroupSlug.from("  Espaços   e Tabulações  ") == "espacos-e-tabulacoes")
+    // A name of only symbols does not become an empty address.
+    assert(GroupSlug.from("!!!") == "grupo")
+    assert(GroupSlug.from(GroupNil.str()) == "grupo")
+    assert(GroupSlug.from(strings.repeat("A", 200)).length() == 80)
+}

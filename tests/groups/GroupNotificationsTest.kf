@@ -1,0 +1,180 @@
+import kernel.db.*
+import kernel.testkit.*
+import groups.*
+
+// Port of GroupNotificationsTests. The Java tests read GET /notifications (notifications domain); here
+// the same facts are asserted on the `notifications` rows the domain writes, and the outbox worker is
+// run by hand (processPending) instead of waiting for its 5 s timer.
+String pendingRequestId(admin: String, groupId: String) = GroupsTestKit.get("/groups/" + groupId + "/requests", admin).json("items.0.id")
+
+drain() {
+    GroupsTestKit.shared().outbox.processPending()
+}
+
+test "new posts collapse into one notification per group while unread" {
+    var owner = GroupsTestKit.login("notif-newpost-owner")
+    var author = GroupsTestKit.login("notif-newpost-author")
+    var reader = GroupsTestKit.login("notif-newpost-reader")
+    var groupId = GroupsTestKit.createGroup(owner, "Notif Novas", "OPEN")
+    GroupsTestKit.joinOk(author, groupId)
+    GroupsTestKit.joinOk(reader, groupId)
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    GroupsTestKit.publish(author, groupId, topicId, "texto privado do grupo")
+    drain()
+    var first = GroupsTestKit.notifications(reader, "GROUP_NEW_POST")
+    Check.eqInt("one for the reader", 1, first.size())
+    Check.eqStr("body", "notif-newpost-author publicou em Notif Novas.", first.get(0).getStr("body"))
+    assert(!first.get(0).getStr("body").contains("texto privado"))
+    Check.eqStr("title", "Novas publicações em Notif Novas", first.get(0).getStr("title"))
+    Check.eqStr("href", "/grupos/notif-novas", first.get(0).getStr("href"))
+    Check.eqInt("one for the owner", 1, GroupsTestKit.notifications(owner, "GROUP_NEW_POST").size())
+    GroupsTestKit.publish(author, groupId, topicId, "segunda")
+    drain()
+    var collapsed = GroupsTestKit.notifications(reader, "GROUP_NEW_POST")
+    Check.eqInt("still one", 1, collapsed.size())
+    Check.eqInt("count", 2, collapsed.get(0).getInt("actor_count"))
+    Check.eqStr("same notification", first.get(0).getStr("id"), collapsed.get(0).getStr("id"))
+    Check.eqStr("collapsed body", "2 novas publicações em Notif Novas.", collapsed.get(0).getStr("body"))
+    // After reading, a new one starts.
+    GroupsTestKit.db().execute("update notifications set is_read = true where id = ?", DbParams().bindStr(collapsed.get(0).getStr("id")))
+    GroupsTestKit.publish(author, groupId, topicId, "terceira")
+    drain()
+    var fresh = GroupsTestKit.notifications(reader, "GROUP_NEW_POST")
+    Check.eqInt("two now", 2, fresh.size())
+    assert(!fresh.get(0).getBool("is_read"))
+    Check.eqInt("fresh count", 1, fresh.get(0).getInt("actor_count"))
+    Check.eqStr("fresh body", "notif-newpost-author publicou em Notif Novas.", fresh.get(0).getStr("body"))
+    // The owner never read: three posts, still one notification.
+    var ownerItems = GroupsTestKit.notifications(owner, "GROUP_NEW_POST")
+    Check.eqInt("owner has one", 1, ownerItems.size())
+    Check.eqInt("owner count", 3, ownerItems.get(0).getInt("actor_count"))
+    // The author is never told about their own posts.
+    Check.eqInt("author nothing", 0, GroupsTestKit.notifications(author, "GROUP_NEW_POST").size())
+}
+
+test "a pending request warns the administration and not the requester" {
+    var owner = GroupsTestKit.login("notif-pedido-dono")
+    var person = GroupsTestKit.login("notif-pedido-pessoa")
+    var groupId = GroupsTestKit.createGroup(owner, "Notif Pedido", "APPROVAL")
+    GroupsTestKit.joinOk(person, groupId)
+    var requests = GroupsTestKit.notifications(owner, "GROUP_JOIN_REQUEST")
+    Check.eqInt("owner warned", 1, requests.size())
+    Check.eqStr("actor", person, requests.get(0).getStr("actor_id"))
+    Check.eqStr("href", "/grupos/notif-pedido", requests.get(0).getStr("href"))
+    assert(requests.get(0).getStr("body").contains("notif-pedido-pessoa"))
+    // The requester is not a member yet: no notification of their own request.
+    Check.eqInt("requester nothing", 0, GroupsTestKit.notifications(person, "GROUP_JOIN_REQUEST").size())
+}
+
+test "approval and rejection warn the requester" {
+    var owner = GroupsTestKit.login("notif-decisao-dono")
+    var approved = GroupsTestKit.login("notif-decisao-aprovada")
+    var rejected = GroupsTestKit.login("notif-decisao-recusada")
+    var groupId = GroupsTestKit.createGroup(owner, "Notif Decisao", "APPROVAL")
+    GroupsTestKit.joinOk(approved, groupId)
+    var requestApproved = pendingRequestId(owner, groupId)
+    Check.status(GroupsTestKit.post("/groups/" + groupId + "/requests/" + requestApproved + "/approve", owner, ""), 200)
+    var ok = GroupsTestKit.notifications(approved, "GROUP_JOIN_APPROVED")
+    Check.eqInt("approved warned", 1, ok.size())
+    Check.eqStr("href", "/grupos/notif-decisao", ok.get(0).getStr("href"))
+    GroupsTestKit.joinOk(rejected, groupId)
+    var requestRejected = pendingRequestId(owner, groupId)
+    Check.status(GroupsTestKit.post("/groups/" + groupId + "/requests/" + requestRejected + "/reject", owner, ""), 200)
+    Check.eqInt("rejected warned", 1, GroupsTestKit.notifications(rejected, "GROUP_JOIN_REJECTED").size())
+    Check.eqInt("not approved", 0, GroupsTestKit.notifications(rejected, "GROUP_JOIN_APPROVED").size())
+}
+
+test "an open join warns the administration" {
+    var owner = GroupsTestKit.login("notif-aberto-dono")
+    var person = GroupsTestKit.login("notif-aberto-pessoa")
+    var groupId = GroupsTestKit.createGroup(owner, "Notif Aberto", "OPEN")
+    GroupsTestKit.joinOk(person, groupId)
+    var joined = GroupsTestKit.notifications(owner, "GROUP_MEMBER_JOINED")
+    Check.eqInt("owner warned", 1, joined.size())
+    Check.eqStr("actor", person, joined.get(0).getStr("actor_id"))
+}
+
+test "a removal warns the removed and takes them out of the content" {
+    var owner = GroupsTestKit.login("notif-remocao-dono")
+    var person = GroupsTestKit.login("notif-remocao-pessoa")
+    var groupId = GroupsTestKit.createGroup(owner, "Notif Remocao", "OPEN")
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    GroupsTestKit.publish(owner, groupId, topicId, "conteudo interno")
+    GroupsTestKit.joinOk(person, groupId)
+    Check.status(GroupsTestKit.delete("/groups/" + groupId + "/members/" + person, owner), 200)
+    var removed = GroupsTestKit.notifications(person, "GROUP_MEMBER_REMOVED")
+    Check.eqInt("removed warned", 1, removed.size())
+    Check.eqStr("href", "/grupos/notif-remocao", removed.get(0).getStr("href"))
+    // The href keeps demanding authorization: the removed does not read the group feed.
+    Check.status(GroupsTestKit.get("/groups/" + groupId + "/posts", person), 403)
+}
+
+test "a comment warns the author without carrying the text" {
+    var owner = GroupsTestKit.login("notif-coment-dono")
+    var person = GroupsTestKit.login("notif-coment-pessoa")
+    var groupId = GroupsTestKit.createGroup(owner, "Notif Comentario", "OPEN")
+    GroupsTestKit.joinOk(person, groupId)
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    var postId = GroupsTestKit.publish(owner, groupId, topicId, "publicacao do dono")
+    GroupsTestKit.comment(person, groupId, postId, "segredo que nao deve vazar", null)
+    var warned = GroupsTestKit.notifications(owner, "NEW_GROUP_COMMENT")
+    Check.eqInt("owner warned", 1, warned.size())
+    Check.eqStr("actor", person, warned.get(0).getStr("actor_id"))
+    assert(!warned.get(0).getStr("body").contains("segredo que nao deve vazar"))
+    assert(warned.get(0).getStr("body").contains("comentou na sua publicação"))
+    // Who commented does not get the notice of their own comment.
+    Check.eqInt("commenter nothing", 0, GroupsTestKit.notifications(person, "NEW_GROUP_COMMENT").size())
+}
+
+test "a reply warns the author of the parent comment" {
+    var owner = GroupsTestKit.login("notif-reply-dono")
+    var parentAuthor = GroupsTestKit.login("notif-reply-pai")
+    var replyAuthor = GroupsTestKit.login("notif-reply-resposta")
+    var groupId = GroupsTestKit.createGroup(owner, "Notif Resposta", "OPEN")
+    GroupsTestKit.joinOk(parentAuthor, groupId)
+    GroupsTestKit.joinOk(replyAuthor, groupId)
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    var postId = GroupsTestKit.publish(owner, groupId, topicId, "publicacao")
+    var parentId = GroupsTestKit.comment(parentAuthor, groupId, postId, "comentario pai", null)
+    GroupsTestKit.comment(replyAuthor, groupId, postId, "resposta", parentId)
+    Check.eqInt("parent warned", 1, GroupsTestKit.notifications(parentAuthor, "NEW_GROUP_REPLY").size())
+    // The owner (post author) gets the comment; who replied gets none of their own.
+    assert(GroupsTestKit.notifications(owner, "NEW_GROUP_COMMENT").size() >= 1)
+    Check.eqInt("replier no comment", 0, GroupsTestKit.notifications(replyAuthor, "NEW_GROUP_COMMENT").size())
+    Check.eqInt("replier no reply", 0, GroupsTestKit.notifications(replyAuthor, "NEW_GROUP_REPLY").size())
+}
+
+test "a transfer warns the new owner" {
+    var owner = GroupsTestKit.login("notif-transfer-dono")
+    var newOwner = GroupsTestKit.login("notif-transfer-novo")
+    var groupId = GroupsTestKit.createGroup(owner, "Notif Transfer", "OPEN")
+    GroupsTestKit.joinOk(newOwner, groupId)
+    Check.status(GroupsTestKit.post("/groups/" + groupId + "/transfer", owner, "{\"userId\":\"" + newOwner + "\"}"), 200)
+    var warned = GroupsTestKit.notifications(newOwner, "GROUP_OWNERSHIP_TRANSFERRED")
+    Check.eqInt("new owner warned", 1, warned.size())
+    assert(warned.get(0).getStr("body").contains("propriedade"))
+}
+
+test "a state change by the platform warns the owner" {
+    var owner = GroupsTestKit.login("notif-status-dono")
+    var admin = GroupsTestKit.loginAdmin("group-admin")
+    var groupId = GroupsTestKit.createGroup(owner, "Notif Status", "OPEN")
+    Check.status(GroupsTestKit.post("/groups/" + groupId + "/status", admin, "{\"status\":\"SUSPENDED\",\"reason\":\"investigacao\"}"), 200)
+    var warned = GroupsTestKit.notifications(owner, "GROUP_STATUS_CHANGED")
+    Check.eqInt("owner warned", 1, warned.size())
+    assert(warned.get(0).getStr("body").contains("SUSPENDED"))
+    assert(warned.get(0).getStr("body").contains("investigacao"))
+}
+
+test "a content removal by the moderation warns the author" {
+    var owner = GroupsTestKit.login("notif-mod-dono")
+    var person = GroupsTestKit.login("notif-mod-pessoa")
+    var groupId = GroupsTestKit.createGroup(owner, "Notif Moderacao", "OPEN")
+    GroupsTestKit.joinOk(person, groupId)
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    var postId = GroupsTestKit.publish(person, groupId, topicId, "publicacao da pessoa")
+    Check.status(GroupsTestKit.delete("/groups/" + groupId + "/posts/" + postId, owner), 200)
+    var warned = GroupsTestKit.notifications(person, "GROUP_CONTENT_REMOVED")
+    Check.eqInt("author warned", 1, warned.size())
+    assert(warned.get(0).getStr("body").contains("publicação"))
+}

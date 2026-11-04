@@ -1,0 +1,56 @@
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import groups.*
+
+// Port of the group half of WriteGateCoverageTests (shared/sanctions): every write path of the group
+// goes through the same gates as the feed, the moderation sanction and the age gate (ECA Digital).
+// The private-message test belongs to the messaging port.
+restrict(userId: String) {
+    GroupsTestKit.db().execute("insert into user_sanctions (id, user_id, type, reason, status, created_at) values (?, ?, \'RESTRICTION\', \'Teste do portao de escrita.\', \'ACTIVE\', ?)", DbParams().bindStr("sanc_" + userId).bindStr(userId).bindInstant(Time.nowIso()))
+}
+
+test "a restricted account does not publish in a group" {
+    var author = GroupsTestKit.login("portao-restrita-grupo")
+    var groupId = GroupsTestKit.createGroup(author, "Grupo do portao (restrita)", "OPEN")
+    var topicId = GroupsTestKit.createTopic(author, groupId, "Geral")
+    restrict(author)
+    Check.apiError(GroupsTestKit.publishRaw(author, groupId, topicId, "publicacao de conta restrita"), 403, "ACCOUNT_RESTRICTED")
+}
+
+test "a restricted account does not comment in a group" {
+    var author = GroupsTestKit.login("portao-restrita-comentario")
+    var groupId = GroupsTestKit.createGroup(author, "Grupo do portao (comentario)", "OPEN")
+    var topicId = GroupsTestKit.createTopic(author, groupId, "Geral")
+    var postId = GroupsTestKit.publish(author, groupId, topicId, "publicacao antes da restricao")
+    restrict(author)
+    // The gate answers before the body is looked at (the Java test sends a body without `content`).
+    var res = GroupsTestKit.post("/groups/" + groupId + "/posts/" + postId + "/comments", author, "{\"text\":\"comentario de conta restrita\"}")
+    Check.apiError(res, 403, "ACCOUNT_RESTRICTED")
+}
+
+test "a minor without authorization does not publish in a group" {
+    var author = GroupsTestKit.login("portao-menor-grupo")
+    var groupId = GroupsTestKit.createGroup(author, "Grupo do portao (menor)", "OPEN")
+    var topicId = GroupsTestKit.createTopic(author, groupId, "Geral")
+    // The account becomes under 18 in the database; without the guardian's authorization the age gate
+    // stops the write, as it already does for the feed post and comment.
+    var year = Time.todayIso().substring(0, 4).toInt() - 15
+    GroupsTestKit.db().execute("update users set birth_date = ? where id = ?", DbParams().bindDate(year + Time.todayIso().substring(4)).bindStr(author))
+    Check.apiError(GroupsTestKit.publishRaw(author, groupId, topicId, "publicacao de menor sem autorizacao"), 403, "PARENTAL_CONSENT_REQUIRED")
+}
+
+test "an account with nothing against it keeps writing" {
+    var author = GroupsTestKit.login("portao-livre")
+    var groupId = GroupsTestKit.createGroup(author, "Grupo do portao (livre)", "OPEN")
+    var topicId = GroupsTestKit.createTopic(author, groupId, "Geral")
+    Check.status(GroupsTestKit.publishRaw(author, groupId, topicId, "publicacao de quem nao tem nada contra ela"), 201)
+}
+
+test "an account without a declared birth date is sent to regularise" {
+    var author = GroupsTestKit.login("portao-sem-data")
+    var groupId = GroupsTestKit.createGroup(author, "Grupo do portao (sem data)", "OPEN")
+    var topicId = GroupsTestKit.createTopic(author, groupId, "Geral")
+    GroupsTestKit.db().execute("update users set birth_date = null where id = ?", DbParams().bindStr(author))
+    Check.apiError(GroupsTestKit.publishRaw(author, groupId, topicId, "sem data de nascimento"), 403, "BIRTH_DATE_REQUIRED")
+}

@@ -1,0 +1,288 @@
+package groups
+
+import kernel.audit.*
+import kernel.error.*
+import kernel.html.*
+import kernel.id.*
+import kernel.time.*
+
+// Group life cycle: create, edit, join, leave, manage members and decide requests (GroupService).
+//
+// Authorization is never compared here: each operation asks GroupPermissions for a capability, so the
+// rule lives in one place and the screen is not the authority.
+class GroupService {
+    GroupStore repository
+    Audit audit
+    GroupNotifier notifier
+    GroupCoins coins
+    public constructor(repository: GroupStore, audit: Audit, notifier: GroupNotifier, coins: GroupCoins) {
+        this.repository = repository
+        this.audit = audit
+        this.notifier = notifier
+        this.coins = coins
+    }
+    static Int nameMax() = 120
+    static Int slugMax() = 80
+    static Int maxPage() = 50
+    GroupRow create(name: String?, description: String?, topic: String?, avatar: String?, banner: String?, joinMode: String?, ownerId: String) {
+        if (name == null) {
+            throw Errors.api(400, "INVALID_NAME", "Nome do grupo e obrigatorio.")
+        }
+        var finalName = name.trim()
+        if (finalName.length() == 0) {
+            throw Errors.api(400, "INVALID_NAME", "Nome do grupo e obrigatorio.")
+        }
+        if (finalName.length() > GroupService.nameMax()) {
+            throw Errors.api(400, "INVALID_NAME", "Nome do grupo deve ter ate 120 caracteres.")
+        }
+        var now = Time.nowIso()
+        var mode = "APPROVAL"
+        if (joinMode != null) {
+            mode = joinMode
+        }
+        var group = GroupRow(Ids.prefixed("group_"), this.uniqueSlug(GroupSlug.from(finalName)), finalName, GroupRules.trimToNull(description), GroupRules.trimToNull(topic), GroupRules.trimToNull(avatar), GroupRules.trimToNull(banner), null, mode, "ACTIVE", ownerId, now, now, null)
+        repository.insertGroup(group)
+        repository.saveMember(GroupMemberRow(group.id(), ownerId, "OWNER", now), Ids.prefixed("group_member_"))
+        repository.adjustMemberCount(group.id(), 1)
+        return group
+    }
+    GroupRow update(groupId: String, name: String?, description: String?, topic: String?, avatar: String?, banner: String?, bannerHtml: String?, joinMode: String?, actorId: String) {
+        var group = this.requireGroup(groupId)
+        this.require(this.roleOf(groupId, actorId), "EDIT_GROUP")
+        // Same rule as the profile and community cover: null keeps, blank clears, text is sanitised.
+        // A header of spaces is not a header. Avatar and banner follow the same rule (blank removes).
+        var finalBannerHtml = GroupNil.str()
+        if (bannerHtml != null) {
+            if (bannerHtml.trim().length() > 0) {
+                finalBannerHtml = SafeHtml.requireProfileHtml(bannerHtml)
+            }
+            else {
+                finalBannerHtml = ""
+            }
+        }
+        var finalAvatar = GroupNil.str()
+        if (avatar != null) {
+            finalAvatar = avatar.trim()
+        }
+        var finalBanner = GroupNil.str()
+        if (banner != null) {
+            finalBanner = banner.trim()
+        }
+        var updated = GroupRules.update(group, GroupRules.trimToNull(name), GroupRules.trimToNull(description), GroupRules.trimToNull(topic), finalAvatar, finalBanner, finalBannerHtml, joinMode, Time.nowIso())
+        repository.updateGroup(updated)
+        return updated
+    }
+    // Public: the group page opens by slug; internal actions use the id.
+    GroupRow resolve(slugOrId: String) {
+        var bySlug = repository.findBySlug(slugOrId)
+        if (bySlug != null) {
+            return bySlug
+        }
+        var byId = repository.findById(slugOrId)
+        if (byId != null) {
+            return byId
+        }
+        throw Errors.api(404, "GROUP_NOT_FOUND", "Grupo nao encontrado.")
+    }
+    List<GroupRow> list(query: String?, before: String?, limit: Int) {
+        var q = GroupNil.str()
+        if (!GroupRules.blank(query)) {
+            q = GroupRules.orEmpty(query).trim()
+        }
+        var size = limit
+        if (size < 1) {
+            size = 1
+        }
+        if (size > GroupService.maxPage()) {
+            size = GroupService.maxPage()
+        }
+        return repository.listVisible(q, before, size)
+    }
+    // Role of someone in the group; null = visitor (not a member).
+    String? roleOf(groupId: String, userId: String) {
+        var member = repository.findMember(groupId, userId)
+        if (member == null) {
+            return null
+        }
+        return member.role()
+    }
+    List<GroupMemberRow> listMembers(groupId: String, actorId: String) {
+        this.require(this.roleOf(groupId, actorId), "VIEW_PRIVATE_CONTENT")
+        return repository.listMembers(groupId)
+    }
+    // Member ids without an administrative permission (internal use; not a public listing).
+    List<String> memberIds(groupId: String) = repository.listMembers(groupId).map((m: GroupMemberRow) -> m.userId())
+    Long countMembers(groupId: String) = repository.countMembers(groupId)
+    Bool hasPendingRequest(groupId: String, userId: String) = repository.findPendingRequest(groupId, userId) != null
+    // OPEN creates the membership at once and answers MEMBER; APPROVAL leaves a pending request (PENDING).
+    String join(groupId: String, userId: String) {
+        var group = this.requireGroup(groupId)
+        if (!GroupStatuses.acceptsNewMembers(group.status())) {
+            throw Errors.api(409, "GROUP_NOT_ACCEPTING_MEMBERS", "Este grupo nao esta aceitando novos membros.")
+        }
+        if (repository.findMember(groupId, userId) != null) {
+            throw Errors.api(409, "ALREADY_MEMBER", "Voce ja e membro deste grupo.")
+        }
+        if (group.joinMode() == "OPEN") {
+            repository.saveMember(GroupMemberRow(groupId, userId, "MEMBER", Time.nowIso()), Ids.prefixed("group_member_"))
+            repository.adjustMemberCount(groupId, 1)
+            notifier.memberJoined(group, userId)
+            coins.recordPresence(userId)
+            return "MEMBER"
+        }
+        // Approval entry: one pending per person and group (the database also guarantees it).
+        if (repository.findPendingRequest(groupId, userId) != null) {
+            throw Errors.api(409, "REQUEST_ALREADY_PENDING", "Seu pedido de entrada ja esta pendente.")
+        }
+        repository.insertJoinRequest(GroupJoinRow(Ids.prefixed("group_request_"), groupId, userId, null, "PENDING", Time.nowIso(), null, null))
+        notifier.joinRequested(group, userId)
+        coins.recordPresence(userId)
+        return "PENDING"
+    }
+    leave(groupId: String, userId: String) {
+        var member = repository.findMember(groupId, userId)
+        if (member == null) {
+            throw Errors.api(404, "NOT_MEMBER", "Voce nao e membro deste grupo.")
+        }
+        if (member.role() == "OWNER") {
+            throw Errors.api(409, "OWNERSHIP_TRANSFER_REQUIRED", "Transfira a propriedade para outro membro antes de sair.")
+        }
+        repository.removeMember(groupId, userId)
+        repository.adjustMemberCount(groupId, -1)
+    }
+    removeMember(groupId: String, actorId: String, targetUserId: String) {
+        this.require(this.roleOf(groupId, actorId), "MANAGE_MEMBERS")
+        var group = this.requireGroup(groupId)
+        var target = repository.findMember(groupId, targetUserId)
+        if (target == null) {
+            throw Errors.api(404, "NOT_MEMBER", "Essa pessoa nao e membro do grupo.")
+        }
+        if (target.role() == "OWNER") {
+            throw Errors.api(409, "CANNOT_REMOVE_OWNER", "O dono do grupo nao pode ser removido.")
+        }
+        repository.removeMember(groupId, targetUserId)
+        repository.adjustMemberCount(groupId, -1)
+        notifier.memberRemoved(group, targetUserId, actorId)
+    }
+    // State change by the PLATFORM (restricted, suspended, reactivation). The platform-admin
+    // authorization is the route's; here the decision is recorded with the reason. Closing is the
+    // owner's action and has its own path.
+    GroupRow changeStatus(groupId: String, status: String, reason: String?, actorId: String) {
+        var group = this.requireGroup(groupId)
+        if (status == "CLOSED") {
+            throw Errors.api(400, "INVALID_STATUS", "Encerrar o grupo e acao do dono.")
+        }
+        var updated = GroupRules.withStatus(group, status, Time.nowIso())
+        repository.updateGroup(updated)
+        audit.write(actorId, "GROUP_STATUS_CHANGED", groupId, "{\"from\":\"" + group.status() + "\",\"to\":\"" + status + "\",\"reason\":\"" + GroupService.jsonSafe(reason) + "\"}")
+        notifier.statusChanged(updated, status, reason, actorId)
+        return updated
+    }
+    // Closes the group (owner only). Leaves discovery and the content stops being readable.
+    GroupRow close(groupId: String, actorId: String) {
+        var group = this.requireGroup(groupId)
+        this.require(this.roleOf(groupId, actorId), "CLOSE_GROUP")
+        var closed = GroupRules.withStatus(group, "CLOSED", Time.nowIso())
+        repository.updateGroup(closed)
+        audit.write(actorId, "GROUP_CLOSED", groupId, "{\"slug\":\"" + group.slug() + "\"}")
+        return closed
+    }
+    // Hands the ownership over: the new owner becomes OWNER and the old one stays as ADMIN.
+    transferOwnership(groupId: String, actorId: String, targetUserId: String) {
+        var group = this.requireGroup(groupId)
+        this.require(this.roleOf(groupId, actorId), "TRANSFER_OWNERSHIP")
+        var target = repository.findMember(groupId, targetUserId)
+        if (target == null) {
+            throw Errors.api(404, "NOT_MEMBER", "Essa pessoa nao e membro do grupo.")
+        }
+        if (target.userId() == group.ownerId()) {
+            throw Errors.api(409, "ALREADY_OWNER", "Essa pessoa ja e a dona do grupo.")
+        }
+        var current = repository.findMember(groupId, actorId)
+        if (current == null) {
+            throw Errors.api(404, "NOT_MEMBER", "Voce nao e membro deste grupo.")
+        }
+        repository.updateGroup(GroupRules.withOwner(group, targetUserId, Time.nowIso()))
+        repository.saveMember(GroupMemberRow(groupId, target.userId(), "OWNER", target.joinedAt()), Ids.prefixed("group_member_"))
+        repository.saveMember(GroupMemberRow(groupId, current.userId(), "ADMIN", current.joinedAt()), Ids.prefixed("group_member_"))
+        notifier.ownershipTransferred(group, targetUserId, actorId)
+    }
+    List<GroupJoinRow> listPendingRequests(groupId: String, actorId: String) {
+        this.require(this.roleOf(groupId, actorId), "VIEW_JOIN_REQUESTS")
+        return repository.listPendingRequests(groupId)
+    }
+    // Approves or rejects a request. The decision is atomic (only what is still PENDING changes): two
+    // simultaneous approvals do not become two memberships, the second gets 409. The member is only
+    // created when the person is not one yet, so the counter does not inflate.
+    GroupJoinRow decideRequest(groupId: String, requestId: String, actorId: String, approve: Bool) {
+        this.require(this.roleOf(groupId, actorId), "DECIDE_JOIN_REQUESTS")
+        var group = this.requireGroup(groupId)
+        var found = repository.findRequestById(requestId)
+        if (found == null) {
+            throw Errors.api(404, "REQUEST_NOT_FOUND", "Solicitacao nao encontrada.")
+        }
+        if (found.groupId() != groupId) {
+            throw Errors.api(404, "REQUEST_NOT_FOUND", "Solicitacao nao encontrada.")
+        }
+        if (approve && !GroupStatuses.acceptsNewMembers(group.status())) {
+            throw Errors.api(409, "GROUP_NOT_ACCEPTING_MEMBERS", "Este grupo nao esta aceitando novos membros.")
+        }
+        var now = Time.nowIso()
+        var decidedStatus = "REJECTED"
+        if (approve) {
+            decidedStatus = "APPROVED"
+        }
+        var changed = repository.markDecided(requestId, decidedStatus, actorId, now)
+        if (changed == 0) {
+            throw Errors.api(409, "REQUEST_ALREADY_DECIDED", "Essa solicitacao ja foi decidida.")
+        }
+        if (approve && repository.findMember(groupId, found.userId()) == null) {
+            repository.saveMember(GroupMemberRow(groupId, found.userId(), "MEMBER", now), Ids.prefixed("group_member_"))
+            repository.adjustMemberCount(groupId, 1)
+        }
+        notifier.requestDecided(group, found.userId(), actorId, approve)
+        var after = repository.findRequestById(requestId)
+        if (after == null) {
+            return found
+        }
+        return after
+    }
+    GroupRow requireGroup(groupId: String) {
+        var group = repository.findById(groupId)
+        if (group == null) {
+            throw Errors.api(404, "GROUP_NOT_FOUND", "Grupo nao encontrado.")
+        }
+        return group
+    }
+    require(role: String?, capability: String) {
+        if (!GroupPermissions.can(role, capability)) {
+            throw Errors.api(403, "FORBIDDEN", "Voce nao tem permissao para isso neste grupo.")
+        }
+    }
+    // The suffix must fit the column ceiling: the base is shortened before numbering.
+    String uniqueSlug(slug: String) {
+        if (!repository.existsBySlug(slug)) {
+            return slug
+        }
+        var base = slug
+        if (slug.length() > GroupService.slugMax() - 4) {
+            base = slug.substring(0, GroupService.slugMax() - 4).replaceAll("-+$", "")
+        }
+        var n = 2
+        while (n < 1000) {
+            var candidate = base + "-" + n
+            if (!repository.existsBySlug(candidate)) {
+                return candidate
+            }
+            n = n + 1
+        }
+        throw Errors.api(409, "SLUG_UNAVAILABLE", "Nao foi possivel gerar um endereco para o grupo.")
+    }
+    // The reason goes into the audit metadata (plain JSON): drop what would break the quote.
+    static String jsonSafe(value: String?) {
+        if (value == null) {
+            return ""
+        }
+        return value.replace("\"", "\'").replace("\n", " ").trim()
+    }
+}

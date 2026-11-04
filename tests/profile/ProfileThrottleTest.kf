@@ -1,0 +1,48 @@
+import kernel.testkit.*
+import profile.*
+
+class ProfileThrottleHolder {
+    static TestApp? cached = null
+}
+
+TestApp tApp() {
+    var cur = ProfileThrottleHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var overrides = mapOf<String, String>()
+    overrides.put("REDE_PROFILE_UPDATES_PER_HOUR", "3")
+    var created = ProfileTestApp.boot("profilethrottle", overrides)
+    ProfileThrottleHolder.cached = created
+    return created
+}
+
+// ProfileUpdateThrottleTests -------------------------------------------------------------------------
+test "a burst of edits gets a cap per account" {
+    var user = ProfileTestApp.login(tApp(), "thr_burst")
+    var i = 1
+    while (i <= 3) {
+        Check.status(user.patch("/me/profile", "{\"headline\":\"Edicao " + i + "\"}"), 200)
+        i = i + 1
+    }
+    var burst = user.patch("/me/profile", "{\"headline\":\"Edicao 4\"}")
+    Check.apiError(burst, 429, "ACTION_THROTTLED")
+    // The refused edit changed nothing.
+    Check.jsonEq(user.get("/me"), "headline", "Edicao 3")
+}
+
+test "different accounts do not share the cap" {
+    var first = ProfileTestApp.login(tApp(), "thr_first")
+    var second = ProfileTestApp.login(tApp(), "thr_second")
+    var i = 1
+    while (i <= 3) {
+        Check.status(first.patch("/me/profile", "{\"headline\":\"A" + i + "\"}"), 200)
+        i = i + 1
+    }
+    Check.apiError(first.patch("/me/profile", "{\"headline\":\"A4\"}"), 429, "ACTION_THROTTLED")
+    Check.status(second.patch("/me/profile", "{\"headline\":\"B1\"}"), 200)
+}
+
+test "zz stops the background jobs" {
+    ProfileTestApp.finish()
+}
