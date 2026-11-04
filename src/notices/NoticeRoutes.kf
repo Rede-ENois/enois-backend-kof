@@ -1,0 +1,51 @@
+package notices
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+
+// GET /avisos/ativo is public and answers 204 when there is no notice (a "no notice" is not an error).
+// PUT and DELETE live under /admin/**: the route guard already closes them, and requireAdmin is the
+// defence in depth.
+class NoticeRoutes {
+    static register(server: HttpServer, service: NoticeService) {
+        server.get("/avisos/ativo", () -> NoticeRoutes.active(service))
+        server.put("/admin/avisos", () -> NoticeRoutes.publish(service))
+        server.delete("/admin/avisos", () -> NoticeRoutes.retire(service))
+    }
+    static String active(service: NoticeService) {
+        var notice = service.current()
+        if (notice == null) {
+            return status(204, "")
+        }
+        return json.encode(notice)
+    }
+    static String publish(service: NoticeService) {
+        Auth.requireAdmin()
+        var request = NoticeRoutes.parse()
+        if (request == null) {
+            return json.encode(service.publish(null, null, null))
+        }
+        // The surface is parsed (and an unknown one refused) before the service looks at the title.
+        return json.encode(service.publish(request.title(), request.bodyHtml(), NoticeSurfaces.parse(request.surface())))
+    }
+    static String retire(service: NoticeService) {
+        Auth.requireAdmin()
+        service.retire()
+        return status(204, "")
+    }
+    // The body is optional (an empty one is a missing request); a malformed one is a 400.
+    static NoticePublishRequest? parse() {
+        SafeLinks.checkRequest()
+        var text = Req.bodyText()
+        if (text.trim().length() == 0) {
+            return null
+        }
+        try {
+            return json.decode<NoticePublishRequest>(text)
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

@@ -1,0 +1,47 @@
+package notices
+
+import kernel.error.*
+import kernel.html.*
+import kernel.time.*
+
+// The single platform notice: publishing replaces, clearing removes. No draft or schedule on purpose:
+// the panel is an operations surface and the simplest rule that serves "the admin writes and it shows".
+class NoticeService {
+    NoticeStore notices
+    public constructor(notices: NoticeStore) {
+        this.notices = notices
+    }
+    static Int maxTitle() = 140
+    NoticeView? current() = notices.findCurrent()
+    // Publishes (or rewrites) the current notice. `publishedAt` of the previous version is kept: it says
+    // since when the platform has been on that notice. `updatedAt` is always now and reopens the popup
+    // for whoever closed the old version.
+    NoticeView publish(rawTitle: String?, rawBodyHtml: String?, surface: String?) {
+        var title = ""
+        if (rawTitle != null) {
+            title = rawTitle.trim()
+        }
+        if (title.length() == 0) {
+            throw Errors.api(400, "INVALID_NOTICE_TITLE", "O aviso precisa de um titulo.")
+        }
+        if (title.length() > NoticeService.maxTitle()) {
+            throw Errors.api(400, "NOTICE_TITLE_TOO_LONG", "O titulo do aviso tem no maximo " + NoticeService.maxTitle() + " caracteres.")
+        }
+        if (surface == null) {
+            throw Errors.api(400, "INVALID_NOTICE_SURFACE", "Escolha onde o aviso aparece: banner, modal ou os dois.")
+        }
+        var now = Time.nowIso()
+        var publishedAt = now
+        var previous = notices.findCurrent()
+        if (previous != null) {
+            publishedAt = previous.publishedAt()
+        }
+        // The same sieve as a page post, CSS of the <style> included: the admin editor is not trusted.
+        var notice = NoticeView(NoticeStore.rowId(), title, SafeHtml.requirePageHtml(rawBodyHtml), surface, publishedAt, now)
+        notices.save(notice)
+        return notice
+    }
+    retire() {
+        notices.clear()
+    }
+}

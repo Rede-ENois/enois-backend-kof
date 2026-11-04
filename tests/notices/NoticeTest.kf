@@ -1,0 +1,129 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import leaves.*
+
+// Port of AdminNoticeTests (HTTP): the public reads, the admin writes, and the HTML goes through the
+// sanitiser before it reaches the screen (the panel editor is not a trusted source).
+class NoticeHolder {
+    static TestApp? app = null
+}
+
+TestApp noticeApp() {
+    var cur = NoticeHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = LeavesApp.boot("notices", mapOf("X", "1"))
+    NoticeHolder.app = created
+    return created
+}
+
+List<String> asToken(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+
+String noticeAdmin(app: TestApp) {
+    if (app.db().queryLong("select count(*) from users where id = 'notice_admin'", DbParams()) == 0L) {
+        SecurityFixtures.login(app.db(), "notice_admin", "tok-notice-admin-12")
+        app.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr("notice_admin"))
+    }
+    return "tok-notice-admin-12"
+}
+
+reset(app: TestApp) {
+    app.db().execute("delete from admin_notice", DbParams())
+}
+
+String noticeBody(title: String, html: String, surface: String) = "{\"title\":" + json.encode(title) + ",\"bodyHtml\":" + json.encode(html) + ",\"surface\":" + json.encode(surface) + "}"
+
+TestResponse put(app: TestApp, token: String, body: String) = app.client.send("PUT", "/admin/avisos", asToken(token), "", body)
+
+test "without a notice the front gets an empty answer, read without a session" {
+    var app = noticeApp()
+    reset(app)
+    var res = app.client.get("/avisos/ativo")
+    Check.status(res, 204)
+    Check.eqStr("empty body", "", res.body)
+}
+
+test "an admin publishes and any visitor reads" {
+    var app = noticeApp()
+    reset(app)
+    var token = noticeAdmin(app)
+    var res = put(app, token, noticeBody("Manutencao no fim da semana", "<p>O mercado fecha sabado.</p>", "both"))
+    Check.status(res, 200)
+    Check.jsonEq(res, "title", "Manutencao no fim da semana")
+    Check.jsonEq(res, "surface", "BOTH")
+    Check.jsonEq(res, "id", "ativo")
+    var read = app.client.get("/avisos/ativo")
+    Check.status(read, 200)
+    Check.jsonEq(read, "bodyHtml", "<p>O mercado fecha sabado.</p>")
+    Check.isTrue("publishedAt", read.jsonHas("publishedAt"))
+    Check.isTrue("updatedAt", read.jsonHas("updatedAt"))
+    Check.status(app.client.get("/v1/avisos/ativo"), 200)
+}
+
+test "a regular account neither publishes nor takes it down" {
+    var app = noticeApp()
+    SecurityFixtures.login(app.db(), "notice_plain_pessoa", "tok-notice-plain-123")
+    Check.apiError(put(app, "tok-notice-plain-123", noticeBody("Titulo", "<p>corpo</p>", "banner")), 403, "FORBIDDEN")
+    Check.apiError(app.client.send("DELETE", "/admin/avisos", asToken("tok-notice-plain-123"), "", ""), 403, "FORBIDDEN")
+}
+
+test "the panel HTML leaves sanitised" {
+    var app = noticeApp()
+    reset(app)
+    var token = noticeAdmin(app)
+    Check.status(put(app, token, noticeBody("Aviso limpo", "<p>aviso</p><script>alert(1)</script>", "modal")), 200)
+    var saved = app.client.get("/avisos/ativo")
+    Check.status(saved, 200)
+    Check.isTrue("no script", !saved.body.contains("<script"))
+}
+
+test "a dangerous link is refused at the border" {
+    var app = noticeApp()
+    reset(app)
+    var token = noticeAdmin(app)
+    var res = put(app, token, noticeBody("Aviso limpo", "<p>aviso</p><a href=\"javascript:alert(1)\">clique</a>", "modal"))
+    Check.apiError(res, 400, "UNSAFE_LINK")
+}
+
+test "editing replaces the notice and keeps the first publication" {
+    var app = noticeApp()
+    reset(app)
+    var token = noticeAdmin(app)
+    Check.status(put(app, token, noticeBody("Aviso", "<p>versao 1</p>", "banner")), 200)
+    // publishedAt read from the database (not the first answer) to compare with the second edit: MySQL
+    // timestamps have second precision and the two sources differ.
+    var firstRead = app.client.get("/avisos/ativo")
+    Check.status(firstRead, 200)
+    var second = put(app, token, noticeBody("Aviso corrigido", "<p>versao 2</p>", "banner"))
+    Check.status(second, 200)
+    Check.eqStr("publishedAt kept", "" + firstRead.jsonStr("publishedAt"), "" + second.jsonStr("publishedAt"))
+    Check.isTrue("new text only", second.body.contains("versao 2") && !second.body.contains("versao 1"))
+    Check.eqStr("single row", "1", "" + app.db().queryLong("select count(*) from admin_notice", DbParams()))
+}
+
+test "retiring takes it down and is idempotent" {
+    var app = noticeApp()
+    reset(app)
+    var token = noticeAdmin(app)
+    Check.status(put(app, token, noticeBody("Aviso", "<p>no ar</p>", "both")), 200)
+    Check.status(app.client.send("DELETE", "/admin/avisos", asToken(token), "", ""), 204)
+    Check.status(app.client.get("/avisos/ativo"), 204)
+    Check.status(app.client.send("DELETE", "/admin/avisos", asToken(token), "", ""), 204)
+}
+
+test "an empty title or an unknown surface fail with 400" {
+    var app = noticeApp()
+    reset(app)
+    var token = noticeAdmin(app)
+    Check.apiError(put(app, token, noticeBody("   ", "<p>corpo</p>", "banner")), 400, "INVALID_NOTICE_TITLE")
+    Check.apiError(put(app, token, noticeBody("Aviso", "<p>corpo</p>", "lateral")), 400, "INVALID_NOTICE_SURFACE")
+    // Without a surface the admin cannot publish "by accident" a banner the screen would turn into a modal.
+    Check.apiError(put(app, token, "{\"title\":\"Aviso\",\"bodyHtml\":\"<p>corpo</p>\"}"), 400, "INVALID_NOTICE_SURFACE")
+    Check.apiError(put(app, token, noticeBody(strings.repeat("a", 141), "<p>corpo</p>", "banner")), 400, "NOTICE_TITLE_TOO_LONG")
+    Check.apiError(put(app, token, ""), 400, "INVALID_NOTICE_TITLE")
+    Check.apiError(put(app, token, "not json"), 400, "BAD_REQUEST")
+    Check.status(put(app, token, noticeBody(strings.repeat("a", 140), "<p>corpo</p>", " BOTH ")), 200)
+}
