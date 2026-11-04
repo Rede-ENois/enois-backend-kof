@@ -1,0 +1,52 @@
+package kernel.http
+
+import java.io.IOException
+import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
+
+// Outcome of an outbound POST: the status code (0 when the request never got an answer) and the body
+// text (best effort, possibly empty). kof.http returns only the body (KOF_GAPS G15), so a caller that
+// needs the status (the LinkedIn share API answers 201 on success) goes through this adapter.
+record HttpPostResult(Int status, String body)
+
+// Outbound JSON POST over HttpURLConnection. Java interop lives here, never in a domain. Callers that
+// take user-controlled URLs must check them with kernel.url.OutboundUrlGuard first.
+class HttpPostClient {
+    // `headers` are "Name: value" lines. Never throws: a transport failure is status 0 with the reason as body.
+    static HttpPostResult post(url: String, headers: List<String>, body: String, timeoutMs: Int) {
+        try {
+            var conn = new URL(url).openConnection() as HttpURLConnection
+            conn.setRequestMethod("POST")
+            conn.setConnectTimeout(5000)
+            conn.setReadTimeout(timeoutMs)
+            conn.setDoOutput(true)
+            for (var h in headers) {
+                var colon = h.indexOf(":")
+                conn.setRequestProperty(h.substring(0, colon).trim(), h.substring(colon + 1).trim())
+            }
+            var payload = body.getBytes()
+            conn.setFixedLengthStreamingMode(payload.length)
+            var out = conn.getOutputStream()
+            out.write(payload)
+            out.flush()
+            out.close()
+            var code = conn.getResponseCode()
+            InputStream? stream = conn.getErrorStream() as InputStream
+            if (code < 400) {
+                stream = conn.getInputStream() as InputStream
+            }
+            var text = ""
+            if (stream != null) {
+                var bytes = stream.readAllBytes()
+                text = new String(bytes as Byte[], "UTF-8")
+            }
+            conn.disconnect()
+            return HttpPostResult(code, text)
+        } catch (IOException e) {
+            return HttpPostResult(0, "transport failure")
+        } catch (String e) {
+            return HttpPostResult(0, e)
+        }
+    }
+}

@@ -1,0 +1,30 @@
+package linkedin
+
+import kernel.db.*
+
+// linkedin_connections (V86 + V103).
+class LinkedInStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static LinkedInConnection fromRow(r: DbRow) = LinkedInConnection(r.getStr("user_id"), r.getStr("member_sub"), r.getStr("access_token_enc"), r.getInstant("token_expires_at"), r.getBool("post_sync"), r.getInstant("created_at"), r.getInstant("updated_at"), r.getStrOrNull("last_share_status"), r.getInstantOrNull("last_share_at"))
+    LinkedInConnection? findByUserId(userId: String) {
+        var row = store.queryOptional("select user_id, member_sub, access_token_enc, token_expires_at, post_sync, created_at, updated_at, last_share_status, last_share_at from linkedin_connections where user_id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return LinkedInStore.fromRow(row)
+    }
+    // Insert or replace the row of the person (JPA `save` on an assigned id).
+    save(c: LinkedInConnection) {
+        var params = DbParams().bindStr(c.memberSub).bindStr(c.accessTokenEnc).bindInstant(c.tokenExpiresAt).bindBool(c.postSync).bindInstant(c.createdAt).bindInstant(c.updatedAt).bindStrOrNull(c.lastShareStatus).bindInstantOrNull(c.lastShareAt).bindStr(c.userId)
+        var n = store.execute("update linkedin_connections set member_sub = ?, access_token_enc = ?, token_expires_at = ?, post_sync = ?, created_at = ?, updated_at = ?, last_share_status = ?, last_share_at = ? where user_id = ?", params)
+        if (n == 0) {
+            store.execute("insert into linkedin_connections (member_sub, access_token_enc, token_expires_at, post_sync, created_at, updated_at, last_share_status, last_share_at, user_id) values (?, ?, ?, ?, ?, ?, ?, ?, ?)", params)
+        }
+    }
+    deleteByUserId(userId: String) {
+        store.execute("delete from linkedin_connections where user_id = ?", DbParams().bindStr(userId))
+    }
+}
