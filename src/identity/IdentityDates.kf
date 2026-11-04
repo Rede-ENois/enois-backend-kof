@@ -1,0 +1,79 @@
+package identity
+
+import kernel.error.*
+import kernel.time.*
+
+// Calendar rules on yyyy-MM-dd strings (LocalDate without java.time): validation, comparison and age.
+// "Today" is the São Paulo date (UTC-3 all year since the DST ended in 2019), like the Java
+// LocalDate.now(ZoneId.of("America/Sao_Paulo")).
+class IdentityDates {
+    static String today() = Time.fromMillis(Time.nowMillis() - 10800000L).substring(0, 10)
+    static Bool leap(y: Int) = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+    static Int daysIn(y: Int, m: Int) {
+        if (m == 2) {
+            if (IdentityDates.leap(y)) {
+                return 29
+            }
+            return 28
+        }
+        if (m == 4 || m == 6 || m == 9 || m == 11) {
+            return 30
+        }
+        return 31
+    }
+    // The strict ISO-8601 date LocalDate.parse accepts, or null.
+    static String? parse(raw: String) {
+        var v = raw.trim()
+        if (v.length() != 10 || v.substring(4, 5) != "-" || v.substring(7, 8) != "-") {
+            return null
+        }
+        var digits = "0123456789"
+        var i = 0
+        while (i < 10) {
+            if (i != 4 && i != 7 && digits.indexOf(v.substring(i, i + 1)) < 0) {
+                return null
+            }
+            i = i + 1
+        }
+        var y = v.substring(0, 4).toInt()
+        var m = v.substring(5, 7).toInt()
+        var d = v.substring(8, 10).toInt()
+        if (m < 1 || m > 12 || d < 1 || d > IdentityDates.daysIn(y, m)) {
+            return null
+        }
+        return v
+    }
+    // Completed years between two valid dates (Period.between(birth, today).getYears()).
+    static Int yearsBetween(birth: String, today: String) {
+        var by = birth.substring(0, 4).toInt()
+        var bm = birth.substring(5, 7).toInt()
+        var bd = birth.substring(8, 10).toInt()
+        var ty = today.substring(0, 4).toInt()
+        var tm = today.substring(5, 7).toInt()
+        var td = today.substring(8, 10).toInt()
+        var years = ty - by
+        if (tm < bm || tm == bm && td < bd) {
+            years = years - 1
+        }
+        return years
+    }
+    // AuthService.parseBirthDate (ECA Digital): ISO format, a real date, not in the future, 0 to 120 years.
+    static String parseBirthDate(value: String?) {
+        if (IdentityText.blank(value)) {
+            throw Errors.api(400, "BIRTH_DATE_REQUIRED", "Informe a data de nascimento para criar a conta.")
+        }
+        var date = IdentityDates.parse(IdentityText.orEmpty(value))
+        if (date == null) {
+            throw Errors.api(400, "INVALID_BIRTH_DATE", "Data de nascimento invalida (use aaaa-mm-dd).")
+        }
+        var today = IdentityDates.today()
+        if (date.compareTo(today) > 0) {
+            throw Errors.api(400, "INVALID_BIRTH_DATE", "A data de nascimento nao pode ser no futuro.")
+        }
+        var age = IdentityDates.yearsBetween(date, today)
+        if (age < 0 || age > 120) {
+            throw Errors.api(400, "INVALID_BIRTH_DATE", "A data de nascimento nao parece real.")
+        }
+        return date
+    }
+}

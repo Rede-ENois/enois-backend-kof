@@ -1,0 +1,162 @@
+import identity.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+
+IdentityTestApp ctx() = IdentityTestApp.shared("sessions", mapOf())
+
+Bool anyLine(lines: List<String>, prefix: String, parts: List<String>) {
+    for (var line in lines) {
+        if (line.startsWith(prefix)) {
+            var all = true
+            for (var p in parts) {
+                if (line.indexOf(p) < 0) {
+                    all = false
+                }
+            }
+            if (all) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// ---- SessionCookieTests
+test "loginSetsHardenedCookiesAndKeepsTokensOutOfTheBody (SessionCookieTests)" {
+    var t = ctx()
+    t.authenticate("cookie_login")
+    var login = t.login("cookie_login@test.com", "Test1234!")
+    Check.status(login, 200)
+    Check.isTrue("no token in the body", login.body.indexOf("\"token\"") < 0 && login.body.indexOf("refreshToken") < 0)
+    var lines = login.setCookies()
+    Check.isTrue("session cookie", anyLine(lines, "enois_session=", listOf("HttpOnly", "Secure", "SameSite=Lax", "Path=/", "Max-Age=")))
+    Check.isTrue("refresh cookie", anyLine(lines, "enois_refresh=", listOf("HttpOnly", "Secure", "SameSite=Strict", "Path=/", "Max-Age=")))
+}
+
+test "cookieAuthenticatesReadsAndWritesNeedTheCsrfHeader (SessionCookieTests)" {
+    var t = ctx()
+    t.authenticate("cookie_csrf")
+    var session = "enois_session=" + t.login("cookie_csrf@test.com", "Test1234!").cookie("enois_session")
+    Check.status(t.app.client.send("GET", "/auth/me", listOf<String>(), session, ""), 200)
+    var noCsrf = t.app.client.send("POST", "/auth/logout", listOf<String>(), session, "")
+    Check.filterError(noCsrf, 403, "CSRF_REQUIRED")
+    // The browser must be able to read the refusal from the app's own origin, and only from it.
+    var own = t.app.client.send("POST", "/auth/logout", listOf("Origin: https://enois.ia.br"), session, "")
+    Check.status(own, 403)
+    Check.eqStr("allow-origin", "https://enois.ia.br", own.header("access-control-allow-origin"))
+    Check.eqStr("allow-credentials", "true", own.header("access-control-allow-credentials"))
+    var attacker = t.app.client.send("POST", "/auth/logout", listOf("Origin: https://attacker.example"), session, "")
+    Check.status(attacker, 403)
+    Check.eqStr("no allow-origin", "", attacker.header("access-control-allow-origin"))
+    Check.eqStr("no allow-credentials", "", attacker.header("access-control-allow-credentials"))
+    var logout = t.app.client.send("POST", "/auth/logout", listOf("X-CSRF-Protection: 1", "Idempotency-Key: cookie-logout"), session, "")
+    Check.status(logout, 200)
+    Check.isTrue("session cookie cleared", anyLine(logout.setCookies(), "enois_session=;", listOf("Max-Age=0")))
+    Check.isTrue("refresh cookie cleared", anyLine(logout.setCookies(), "enois_refresh=;", listOf("Max-Age=0")))
+    Check.status(t.app.client.send("GET", "/auth/me", listOf<String>(), session, ""), 401)
+}
+
+test "refreshReadsTheRefreshCookieWhenTheBodyIsEmpty (SessionCookieTests)" {
+    var t = ctx()
+    t.authenticate("cookie_refresh")
+    var refresh = "enois_refresh=" + t.login("cookie_refresh@test.com", "Test1234!").cookie("enois_refresh")
+    Check.status(t.app.client.send("POST", "/auth/refresh", listOf<String>(), refresh, ""), 403)
+    var refreshed = t.app.client.send("POST", "/auth/refresh", listOf("X-CSRF-Protection: 1"), refresh, "")
+    Check.status(refreshed, 200)
+    Check.isTrue("no token", !refreshed.jsonHas("token"))
+    var newSession = refreshed.cookie("enois_session")
+    Check.status(t.app.client.send("GET", "/auth/me", listOf<String>(), "enois_session=" + newSession, ""), 200)
+}
+
+test "logoutWithOnlyTheRefreshCookieRevokesTheSession (SessionCookieTests)" {
+    var t = ctx()
+    t.authenticate("cookie_refresh_logout")
+    var refresh = "enois_refresh=" + t.login("cookie_refresh_logout@test.com", "Test1234!").cookie("enois_refresh")
+    // The access cookie has expired: only the refresh cookie is sent.
+    Check.status(t.app.client.send("POST", "/auth/logout", listOf("X-CSRF-Protection: 1", "Idempotency-Key: cookie-refresh-logout"), refresh, ""), 200)
+    Check.status(t.app.client.send("POST", "/auth/refresh", listOf("X-CSRF-Protection: 1"), refresh, ""), 401)
+}
+
+test "anExplicitSessionHeaderNeedsNoCsrfHeader (SessionCookieTests)" {
+    var t = ctx()
+    var session = t.authenticate("cookie_header_client")
+    Check.status(t.postWith("/auth/logout", listOf("X-Session-Token: " + session.token(), "Idempotency-Key: header-logout"), ""), 200)
+}
+
+// ---- SessionRefreshTests
+test "refreshWorksAfterAccessTokenExpires (SessionRefreshTests)" {
+    var t = ctx()
+    var session = t.authenticate("user_refresh_alive")
+    // The access token expired, but the refresh is still inside its 30 day window.
+    t.db().execute("update auth_sessions set expires_at = ? where token = ?", DbParams().bindInstant("2020-01-01T00:00:00Z").bindStr(Hashes.sha256Hex(session.token())))
+    Check.status(t.getWithToken("/auth/me", session.token()), 401)
+    var refreshed = t.post("/auth/refresh", "{\"refreshToken\":\"" + session.refreshToken() + "\"}")
+    Check.status(refreshed, 200)
+    Check.isTrue("no token", !refreshed.jsonHas("token"))
+    Check.isTrue("no refreshToken", !refreshed.jsonHas("refreshToken"))
+    var newToken = refreshed.cookie("enois_session")
+    Check.isTrue("a new session", newToken != session.token())
+    Check.status(t.getWithToken("/auth/me", newToken), 200)
+}
+
+test "refreshRejectedWhenRefreshTokenExpired (SessionRefreshTests)" {
+    var t = ctx()
+    var session = t.authenticate("user_refresh_dead")
+    t.db().execute("update auth_sessions set refresh_expires_at = ? where refresh_token = ?", DbParams().bindInstant("2020-01-01T00:00:00Z").bindStr(Hashes.sha256Hex(session.refreshToken())))
+    Check.apiError(t.post("/auth/refresh", "{\"refreshToken\":\"" + session.refreshToken() + "\"}"), 401, "INVALID_REFRESH_TOKEN")
+}
+
+test "refreshRotatesTokenAndRejectsTheOldOne (SessionRefreshTests)" {
+    var t = ctx()
+    var session = t.authenticate("user_refresh_rotate")
+    var first = t.post("/auth/refresh", "{\"refreshToken\":\"" + session.refreshToken() + "\"}")
+    Check.status(first, 200)
+    var rotated = first.cookie("enois_refresh")
+    // The old refresh token was revoked by the rotation and cannot be reused.
+    Check.apiError(t.post("/auth/refresh", "{\"refreshToken\":\"" + session.refreshToken() + "\"}"), 401, "INVALID_REFRESH_TOKEN")
+    // The new one stays valid.
+    Check.status(t.post("/auth/refresh", "{\"refreshToken\":\"" + rotated + "\"}"), 200)
+}
+
+test "refresh without any token is a 400 INVALID_REFRESH_TOKEN" {
+    var t = ctx()
+    Check.apiError(t.app.client.postJson("/auth/refresh", ""), 400, "INVALID_REFRESH_TOKEN")
+}
+
+// ---- SessionTokenHashingTests (HTTP level)
+test "the table keeps only the hash of both tokens" {
+    var t = ctx()
+    var session = t.authenticate("hash_only")
+    var rows = t.db().queryLong("select count(*) from auth_sessions where token = ? or refresh_token = ?", DbParams().bindStr(session.token()).bindStr(session.refreshToken()))
+    Check.eqInt("clear tokens stored", 0, rows as Int)
+    var hashed = t.db().queryLong("select count(*) from auth_sessions where token = ? and refresh_token = ?", DbParams().bindStr(Hashes.sha256Hex(session.token())).bindStr(Hashes.sha256Hex(session.refreshToken())))
+    Check.eqInt("hashed row", 1, hashed as Int)
+}
+
+test "aHashCopiedFromTheTableDoesNotAuthenticate (SessionTokenHashingTests)" {
+    var t = ctx()
+    var session = t.authenticate("hash_copy")
+    var row = t.db().queryOne("select token, refresh_token from auth_sessions where user_id = ?", DbParams().bindStr(session.userId()))
+    Check.apiError(t.getWithToken("/auth/me", row.getStr("token")), 401, "UNAUTHENTICATED")
+    Check.apiError(t.post("/auth/refresh", "{\"refreshToken\":\"" + row.getStr("refresh_token") + "\"}"), 401, "INVALID_REFRESH_TOKEN")
+}
+
+test "migratesLegacyRawSessionWithoutInvalidatingTheClient (SessionTokenHashingTests)" {
+    var t = ctx()
+    var user = t.authenticate("hash_legacy")
+    var now = "2026-11-04T12:00:00Z"
+    var later = "2099-01-01T00:00:00Z"
+    t.db().execute("insert into auth_sessions (token, refresh_token, user_id, created_at, expires_at, refresh_expires_at, ip) values (\'legacy-access-1\', \'legacy-refresh-1\', ?, ?, ?, ?, \'127.0.0.1\')", DbParams().bindStr(user.userId()).bindInstant(now).bindInstant(later).bindInstant(later))
+    // During a rolling update an old pod may create the session in the clear: the fallback keeps the person in.
+    Check.status(t.getWithToken("/auth/me", "legacy-access-1"), 200)
+    Check.eqInt("rehashed", 1, t.module.store.rehashLegacySessions())
+    var clear = t.db().queryLong("select count(*) from auth_sessions where token = \'legacy-access-1\'", DbParams())
+    Check.eqInt("clear row gone", 0, clear as Int)
+    Check.eqInt("hashed row", 1, t.db().queryLong("select count(*) from auth_sessions where token = ? and refresh_token = ?", DbParams().bindStr(Hashes.sha256Hex("legacy-access-1")).bindStr(Hashes.sha256Hex("legacy-refresh-1"))) as Int)
+    Check.status(t.getWithToken("/auth/me", "legacy-access-1"), 200)
+}
+
+test "zz shutdown" {
+    ctx().stop()
+}

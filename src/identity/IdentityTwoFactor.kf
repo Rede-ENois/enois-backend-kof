@@ -1,0 +1,435 @@
+package identity
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.log.*
+import kernel.security.*
+import kernel.time.*
+
+// Second factor: authenticator app (TOTP) or an e-mail code (TwoFactorService + TwoFactorPersistenceAdapter).
+// Rules worth keeping in mind:
+//  - a TOTP secret is only activated after a checked code (the setup alone switches nothing on);
+//  - e-mail codes and recovery codes are stored as hashes and are single use;
+//  - login with a second factor answers a CHALLENGE (opaque id), never a session: the session only comes out of
+//    verifyChallenge with the right code, inside the TTL and before the attempt limit;
+//  - switching a factor on or off asks for the password (or a valid code), and revokes every other session.
+class IdentityTwoFactor {
+    Log log = Log("identity.two-factor")
+    Db store
+    IdentityStore identity
+    IdentityUsers users
+    IdentityMailer mailer
+    IdentityNotifier notifier
+    SecretCipher cipher
+    public constructor(store: Db, identity: IdentityStore, users: IdentityUsers, mailer: IdentityMailer, notifier: IdentityNotifier, cipher: SecretCipher) {
+        this.store = store
+        this.identity = identity
+        this.users = users
+        this.mailer = mailer
+        this.notifier = notifier
+        this.cipher = cipher
+    }
+    static Long challengeTtlSeconds() = 600L
+    static Long pendingSecretTtlSeconds() = 900L
+    static Int backupCodeCount() = 8
+    static Int maxAttempts() = 5
+    static String issuer() = "Énóis"
+    // ---- status
+    IdentityTwoFactorStatusBody status(userId: String) {
+        var user = requireUser(userId)
+        var twoFactor = user.totpEnabled() || user.emailOtpEnabled() || user.federatedSecondFactor()
+        return IdentityTwoFactorStatusBody(user.emailVerified(), user.totpEnabled(), user.emailOtpEnabled(), user.federatedSecondFactor(), twoFactor, user.emailVerified() || twoFactor, countUnusedBackupCodes(userId), cipher.isEnabled())
+    }
+    // Method the login must challenge, or null when the account has no second factor.
+    String? requiredMethod(userId: String) {
+        var user = requireUser(userId)
+        if (user.totpEnabled()) {
+            return "TOTP"
+        }
+        if (user.emailOtpEnabled()) {
+            return "EMAIL"
+        }
+        return null
+    }
+    // ---- TOTP
+    IdentityTotpSetupBody startTotpSetup(userId: String, password: String?) {
+        requirePassword(userId, password)
+        cipher.requireEnabled()
+        var user = requireUser(userId)
+        if (user.totpEnabled()) {
+            throw Errors.api(409, "TOTP_ALREADY_ENABLED", "O segundo fator por aplicativo ja esta ativo.")
+        }
+        var now = Time.nowIso()
+        var secret = Totp.generateSecret()
+        savePendingSecret(userId, cipher.encrypt(secret), now)
+        return IdentityTotpSetupBody(secret, Totp.otpauthUri(IdentityTwoFactor.issuer(), user.email(), secret))
+    }
+    // Confirms the setup with an app code and returns the recovery codes (shown once).
+    List<String> enableTotp(userId: String, code: String?, password: String?, sessionToken: String?) {
+        requirePassword(userId, password)
+        cipher.requireEnabled()
+        var pending = findPendingSecret(userId)
+        if (pending == null) {
+            throw Errors.api(400, "TOTP_SETUP_NOT_STARTED", "Comece a configuracao do aplicativo authenticator antes de confirmar o codigo.")
+        }
+        var now = Time.nowIso()
+        var createdAt = findPendingCreatedAt(userId)
+        if (createdAt != null && Time.toMillis(Time.plusSeconds(createdAt, IdentityTwoFactor.pendingSecretTtlSeconds())) < Time.toMillis(now)) {
+            throw Errors.api(410, "TOTP_SETUP_EXPIRED", "A configuracao expirou. Gere um novo codigo no aplicativo.")
+        }
+        var secret = cipher.decrypt(pending)
+        var step = -1L
+        if (code != null) {
+            step = Totp.matchingStep(secret, code, Time.toMillis(now) / 1000L, 1)
+        }
+        if (step < 0L) {
+            throw Errors.api(400, "INVALID_TWO_FACTOR_CODE", "Codigo invalido. Confira o app e tente de novo.")
+        }
+        var codes = listOf<String>()
+        var self = this
+        store.transaction(() -> {
+    self.users.setTotp(userId, true, now)
+    self.activateSecret(userId, pending, now)
+    self.markTotpStepUsed(userId, step)
+    self.identity.revokeOthersByUser(userId, sessionToken, now)
+    codes = self.issueBackupCodes(userId, now)
+})
+        // The enrollment code is spent: it cannot complete a login inside the same window.
+        return codes
+    }
+    disableTotp(userId: String, password: String?, sessionToken: String?) {
+        requireUser(userId)
+        requirePassword(userId, password)
+        var self = this
+        store.transaction(() -> {
+    var now = Time.nowIso()
+    self.users.setTotp(userId, false, now)
+    self.clearSecrets(userId)
+    self.deleteBackupCodes(userId)
+    self.identity.revokeOthersByUser(userId, sessionToken, now)
+})
+    }
+    // Emergency reset (incident of 23/10): the TOTP secrets that no longer decrypt are cleared so the
+    // account signs in with e-mail + password again; recovery codes (hashes) stay. Returns the count.
+    Int resetBrokenTotp() {
+        var reset = 0
+        for (var row in store.queryList("select user_id from user_two_factor_secrets where totp_secret_encrypted is not null", DbParams())) {
+            var userId = row.getStr("user_id")
+            var secret = findActiveSecret(userId)
+            if (secret == null) {
+                continue
+            }
+            var readable = true
+            try {
+                cipher.decrypt(secret)
+            } catch (String e) {
+                readable = false
+            }
+            if (readable) {
+                continue
+            }
+            var done = true
+            try {
+                users.setTotp(userId, false, Time.nowIso())
+                clearSecrets(userId)
+                notifier.notifySecurity(userId, "Seu 2FA foi redefinido", "Uma troca de infraestrutura invalidou o segundo fator por aplicativo. Reative em Seguranca e verificacao quando entrar.", "/seguranca", "Seguranca")
+            } catch (String e) {
+                done = false
+            }
+            if (done) {
+                reset = reset + 1
+            }
+        }
+        return reset
+    }
+    // ---- e-mail code
+    requestEmailOtpSetup(userId: String) {
+        var user = requireUser(userId)
+        if (!user.emailVerified()) {
+            throw Errors.api(409, "EMAIL_NOT_VERIFIED", "Confirme seu e-mail antes de ativar o segundo fator por e-mail.")
+        }
+        if (user.emailOtpEnabled()) {
+            throw Errors.api(409, "EMAIL_OTP_ALREADY_ENABLED", "O segundo fator por e-mail ja esta ativo.")
+        }
+        var now = Time.nowIso()
+        var code = numericCode()
+        saveChallenge(IdentityChallenge(newChallengeId(), userId, "EMAIL", Hashes.sha256Hex(code), 0, Time.plusSeconds(now, IdentityTwoFactor.challengeTtlSeconds()), null, now))
+        if (!mailer.sendTwoFactorCode(user.email(), user.name(), code)) {
+            throw emailSendFailed()
+        }
+    }
+    confirmEmailOtpSetup(userId: String, code: String?, sessionToken: String?) {
+        if (IdentityText.blank(code)) {
+            throw Errors.api(400, "INVALID_TWO_FACTOR_CODE", "Informe o codigo enviado por e-mail.")
+        }
+        var codeText = IdentityText.orEmpty(code).trim()
+        var now = Time.nowIso()
+        var challenge = findLatestChallenge(userId, "EMAIL")
+        if (challenge == null) {
+            throw Errors.api(400, "TWO_FACTOR_CHALLENGE_NOT_FOUND", "Peca um novo codigo por e-mail.")
+        }
+        if (isExpired(challenge, now)) {
+            throw Errors.api(410, "TWO_FACTOR_CHALLENGE_EXPIRED", "O codigo expirou. Peca um novo.")
+        }
+        requireClaim(challenge.id(), "Este codigo ja foi usado. Peca um novo.", "Tentativas demais. Peca um novo codigo.")
+        if (Hashes.sha256Hex(codeText) != challenge.codeHash()) {
+            throw Errors.api(400, "INVALID_TWO_FACTOR_CODE", "Codigo incorreto.")
+        }
+        var self = this
+        store.transaction(() -> {
+    if (!self.consumeChallenge(challenge.id(), now)) {
+        throw self.alreadyUsed("Este codigo ja foi usado. Peca um novo.")
+    }
+    self.users.setEmailOtp(userId, true, now)
+    self.identity.revokeOthersByUser(userId, sessionToken, now)
+})
+    }
+    disableEmailOtp(userId: String, password: String?, sessionToken: String?) {
+        requireUser(userId)
+        requirePassword(userId, password)
+        var now = Time.nowIso()
+        users.setEmailOtp(userId, false, now)
+        identity.revokeOthersByUser(userId, sessionToken, now)
+    }
+    // ---- login challenge
+    // E-mail: the code leaves now. TOTP: nothing is sent, the code comes from the user's app.
+    IdentityChallenge startChallenge(userId: String, method: String) {
+        var now = Time.nowIso()
+        store.execute("delete from two_factor_challenges where expires_at < ?", DbParams().bindInstant(now))
+        var code = ""
+        var hash = IdentityText.none()
+        if (method == "EMAIL") {
+            code = numericCode()
+            hash = Hashes.sha256Hex(code)
+        }
+        var challenge = IdentityChallenge(newChallengeId(), userId, method, hash, 0, Time.plusSeconds(now, IdentityTwoFactor.challengeTtlSeconds()), null, now)
+        saveChallenge(challenge)
+        if (method == "EMAIL") {
+            var user = requireUser(userId)
+            if (!mailer.sendTwoFactorCode(user.email(), user.name(), code)) {
+                throw emailSendFailed()
+            }
+        }
+        return challenge
+    }
+    // A new code for the same challenge (e-mail method only).
+    resendTwoFactorCode(challengeId: String?) {
+        var now = Time.nowIso()
+        var challenge = findChallenge(IdentityText.orEmpty(challengeId))
+        if (challenge == null) {
+            throw Errors.api(404, "TWO_FACTOR_CHALLENGE_NOT_FOUND", "Este login expirou. Entre com sua senha novamente.")
+        }
+        if (challenge.method() != "EMAIL") {
+            throw Errors.api(400, "TWO_FACTOR_RESEND_NOT_APPLICABLE", "Use o codigo do seu aplicativo authenticator.")
+        }
+        if (challenge.consumedAt() != null || isExpired(challenge, now)) {
+            throw Errors.api(410, "TWO_FACTOR_CHALLENGE_EXPIRED", "Este login expirou. Entre com sua senha novamente.")
+        }
+        var code = numericCode()
+        var replaced = store.execute("update two_factor_challenges set code_hash = ?, attempts = 0, expires_at = ? where id = ? and consumed_at is null", DbParams().bindStr(Hashes.sha256Hex(code)).bindInstant(Time.plusSeconds(now, IdentityTwoFactor.challengeTtlSeconds())).bindStr(challenge.id())) == 1
+        if (!replaced) {
+            throw Errors.api(410, "TWO_FACTOR_CHALLENGE_EXPIRED", "Este login expirou. Entre com sua senha novamente.")
+        }
+        var user = requireUser(challenge.userId())
+        if (!mailer.sendTwoFactorCode(user.email(), user.name(), code)) {
+            throw emailSendFailed()
+        }
+    }
+    // Checks the login code and returns the user id. Accepts an app code (TOTP) or a recovery code. A wrong
+    // code counts as an attempt of the same challenge: the attempt is claimed (and committed) BEFORE the code
+    // is checked, outside any transaction the caller rolls back, so parallel guesses share one counter.
+    String verifyChallenge(challengeId: String, code: String?) {
+        var now = Time.nowIso()
+        var challenge = findChallenge(challengeId)
+        if (challenge == null) {
+            throw Errors.api(404, "TWO_FACTOR_CHALLENGE_NOT_FOUND", "Este login expirou. Entre com sua senha novamente.")
+        }
+        if (challenge.consumedAt() != null) {
+            throw Errors.api(409, "TWO_FACTOR_CHALLENGE_ALREADY_USED", "Este login ja foi concluido. Entre novamente.")
+        }
+        if (isExpired(challenge, now)) {
+            throw Errors.api(410, "TWO_FACTOR_CHALLENGE_EXPIRED", "Este login expirou. Entre com sua senha novamente.")
+        }
+        if (IdentityText.blank(code)) {
+            throw Errors.api(400, "INVALID_TWO_FACTOR_CODE", "Informe o codigo do segundo fator.")
+        }
+        var codeText = IdentityText.orEmpty(code)
+        requireClaim(challenge.id(), "Este login ja foi concluido. Entre novamente.", "Tentativas demais. Entre com sua senha novamente.")
+        var method = challenge.method()
+        if (method == null) {
+            // A row without a method (legacy / corrupted) cannot be validated: an explicit error.
+            log.warn("two_factor_challenge without a method")
+            throw Errors.api(409, "TWO_FACTOR_CHALLENGE_INVALID", "Este login nao pode ser concluido. Entre com sua senha novamente.")
+        }
+        var valid = false
+        if (method == "EMAIL") {
+            valid = Hashes.sha256Hex(codeText.trim()) == challenge.codeHash()
+        }
+        else {
+            // Each time step is good once: a repeated code fails like a wrong one.
+            valid = totpMatches(challenge.userId(), codeText, now)
+        }
+        if (!valid) {
+            // A recovery code is an alternative (single use) in any method.
+            var recovered = store.execute("update two_factor_backup_codes set used_at = ? where code_hash = ? and user_id = ? and used_at is null", DbParams().bindInstant(now).bindStr(Hashes.sha256Hex(normalizeBackup(codeText))).bindStr(challenge.userId())) > 0
+            if (!recovered) {
+                throw Errors.api(400, "INVALID_TWO_FACTOR_CODE", "Codigo incorreto.")
+            }
+        }
+        // Atomic: of two parallel requests with a valid code, only one completes the login.
+        if (!consumeChallenge(challenge.id(), now)) {
+            throw alreadyUsed("Este login ja foi concluido. Entre novamente.")
+        }
+        return challenge.userId()
+    }
+    // ---- helpers
+    Bool totpMatches(userId: String, code: String, now: String) {
+        var secret = findActiveSecret(userId)
+        if (secret == null) {
+            return false
+        }
+        var plain = ""
+        var unreadable = false
+        try {
+            plain = cipher.decrypt(secret)
+        } catch (String e) {
+            unreadable = true
+        }
+        if (unreadable) {
+            log.warn("totp secret unreadable")
+            throw Errors.api(409, "TWO_FACTOR_SECRET_UNREADABLE", "O segundo fator desta conta precisa ser reconfigurado. Fale com o suporte.")
+        }
+        var step = Totp.matchingStep(plain, code, Time.toMillis(now) / 1000L, 1)
+        return step >= 0L && markTotpStepUsed(userId, step)
+    }
+    // A refused claim on a challenge another request just consumed reads as "already used", not 429.
+    requireClaim(challengeId: String, alreadyUsedMessage: String, tooManyMessage: String) {
+        var claimed = store.execute("update two_factor_challenges set attempts = attempts + 1 where id = ? and attempts < ? and consumed_at is null", DbParams().bindStr(challengeId).bindInt(IdentityTwoFactor.maxAttempts())) == 1
+        if (claimed) {
+            return
+        }
+        var consumed = store.queryLong("select count(*) from two_factor_challenges where id = ? and consumed_at is not null", DbParams().bindStr(challengeId)) > 0L
+        if (consumed) {
+            throw alreadyUsed(alreadyUsedMessage)
+        }
+        throw Errors.api(429, "TOO_MANY_ATTEMPTS", tooManyMessage)
+    }
+    String alreadyUsed(message: String) = Errors.api(409, "TWO_FACTOR_CHALLENGE_ALREADY_USED", message)
+    String emailSendFailed() = Errors.api(503, "EMAIL_SEND_FAILED", "Nao foi possivel enviar o codigo por e-mail agora. Use um codigo de recuperacao ou tente de novo em alguns minutos.")
+    IdentityUserRow requireUser(userId: String) {
+        var user = users.findById(userId)
+        if (user == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        return user
+    }
+    requirePassword(userId: String, password: String?) {
+        var credential = identity.credentialByUser(userId)
+        if (credential == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        if (!credential.passwordUsable()) {
+            // An account with social login only: there is no password to confirm.
+            throw Errors.api(409, "PASSWORD_NOT_SET", "Defina uma senha (em “Trocar senha”) antes de mexer no segundo fator.")
+        }
+        if (IdentityText.blank(password) || !Passwords.matches(IdentityText.orEmpty(password), credential.passwordHash())) {
+            throw Errors.api(401, "INVALID_CREDENTIALS", "Senha incorreta.")
+        }
+    }
+    Bool isExpired(c: IdentityChallenge, now: String) = Time.toMillis(now) > Time.toMillis(c.expiresAt())
+    String numericCode() {
+        var n = Tokens.randomInt(1000000)
+        var text = "" + n
+        while (text.length() < 6) {
+            text = "0" + text
+        }
+        return text
+    }
+    // Recovery code: 10 characters in two blocks, easy to write down.
+    String backupCode() {
+        var alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        var code = ""
+        var i = 0
+        while (i < 10) {
+            var at = Tokens.randomInt(alphabet.length())
+            code = code + alphabet.substring(at, at + 1)
+            i = i + 1
+        }
+        return code.substring(0, 5) + "-" + code.substring(5)
+    }
+    String normalizeBackup(code: String) = code.trim().toUpperCase()
+    String newChallengeId() = Ids.prefixed("2fa_")
+    List<String> issueBackupCodes(userId: String, now: String) {
+        var codes = listOf<String>()
+        deleteBackupCodes(userId)
+        var i = 0
+        while (i < IdentityTwoFactor.backupCodeCount()) {
+            var code = backupCode()
+            codes.add(code)
+            store.execute("insert into two_factor_backup_codes (code_hash, user_id, used_at, created_at) values (?, ?, null, ?)", DbParams().bindStr(Hashes.sha256Hex(normalizeBackup(code))).bindStr(userId).bindInstant(now))
+            i = i + 1
+        }
+        return codes
+    }
+    // ---- persistence
+    saveChallenge(c: IdentityChallenge) {
+        store.execute("insert into two_factor_challenges (id, user_id, method, code_hash, attempts, expires_at, consumed_at, created_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(c.id()).bindStr(c.userId()).bindStrOrNull(c.method()).bindStrOrNull(c.codeHash()).bindInt(c.attempts()).bindInstant(c.expiresAt()).bindInstantOrNull(c.consumedAt()).bindInstant(c.createdAt()))
+    }
+    IdentityChallenge? findChallenge(id: String) = challenge(store.queryOptional("select id, user_id, method, code_hash, attempts, expires_at, consumed_at, created_at from two_factor_challenges where id = ?", DbParams().bindStr(id)))
+    IdentityChallenge? findLatestChallenge(userId: String, method: String) = challenge(store.queryOptional("select id, user_id, method, code_hash, attempts, expires_at, consumed_at, created_at from two_factor_challenges where user_id = ? and method = ? and consumed_at is null order by created_at desc limit 1", DbParams().bindStr(userId).bindStr(method)))
+    IdentityChallenge? challenge(r: DbRow?) {
+        if (r == null) {
+            return null
+        }
+        // A blank method is "no method" (legacy / corrupted row), like the Java mapper.
+        var method = r.getStrOrNull("method")
+        if (method != null && method.trim().length() == 0) {
+            method = IdentityText.none()
+        }
+        else 
+            if (method != null) {
+                method = method.trim().toUpperCase()
+            }
+        return IdentityChallenge(r.getStr("id"), r.getStr("user_id"), method, r.getStrOrNull("code_hash"), r.getInt("attempts"), r.getInstant("expires_at"), r.getInstantOrNull("consumed_at"), r.getInstant("created_at"))
+    }
+    Bool consumeChallenge(id: String, now: String) = store.execute("update two_factor_challenges set consumed_at = ? where id = ? and consumed_at is null", DbParams().bindInstant(now).bindStr(id)) == 1
+    Bool markTotpStepUsed(userId: String, step: Long) = store.execute("update user_two_factor_secrets set totp_last_step = ? where user_id = ? and (totp_last_step is null or totp_last_step < ?)", DbParams().bindLong(step).bindStr(userId).bindLong(step)) > 0
+    savePendingSecret(userId: String, encrypted: String, now: String) {
+        var updated = store.execute("update user_two_factor_secrets set pending_secret_encrypted = ?, pending_created_at = ?, updated_at = ? where user_id = ?", DbParams().bindStr(encrypted).bindInstant(now).bindInstant(now).bindStr(userId))
+        if (updated == 0) {
+            store.execute("insert into user_two_factor_secrets (user_id, totp_secret_encrypted, pending_secret_encrypted, pending_created_at, updated_at) values (?, null, ?, ?, ?)", DbParams().bindStr(userId).bindStr(encrypted).bindInstant(now).bindInstant(now))
+        }
+    }
+    String? findPendingSecret(userId: String) {
+        var r = store.queryOptional("select pending_secret_encrypted from user_two_factor_secrets where user_id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        return r.getStrOrNull("pending_secret_encrypted")
+    }
+    String? findPendingCreatedAt(userId: String) {
+        var r = store.queryOptional("select pending_created_at from user_two_factor_secrets where user_id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        return r.getInstantOrNull("pending_created_at")
+    }
+    activateSecret(userId: String, encrypted: String, now: String) {
+        store.execute("update user_two_factor_secrets set totp_secret_encrypted = ?, pending_secret_encrypted = null, pending_created_at = null, updated_at = ? where user_id = ?", DbParams().bindStr(encrypted).bindInstant(now).bindStr(userId))
+    }
+    String? findActiveSecret(userId: String) {
+        var r = store.queryOptional("select totp_secret_encrypted from user_two_factor_secrets where user_id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        return r.getStrOrNull("totp_secret_encrypted")
+    }
+    clearSecrets(userId: String) {
+        store.execute("delete from user_two_factor_secrets where user_id = ?", DbParams().bindStr(userId))
+    }
+    deleteBackupCodes(userId: String) {
+        store.execute("delete from two_factor_backup_codes where user_id = ?", DbParams().bindStr(userId))
+    }
+    Int countUnusedBackupCodes(userId: String) = store.queryLong("select count(*) from two_factor_backup_codes where user_id = ? and used_at is null", DbParams().bindStr(userId)) as Int
+}

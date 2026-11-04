@@ -1,0 +1,70 @@
+package kernel.http
+
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.lang.String
+import java.net.HttpURLConnection
+import java.net.URL
+
+record OutboundReply(Int status, String body)
+
+// Outgoing HTTP for the integrations (Turnstile, OAuth providers, Gov.br): one blocking call with
+// timeouts, any method and headers, status and body back (kof.http returns only the body, G15).
+// A failure to connect or read is thrown as "OUTBOUND_FAILED: ..." so callers map it to their own 503.
+// Callers that must be testable wrap this in a small overridable class and stub it: tests never hit the
+// network.
+class Outbound {
+    // headers: "Name: value" lines. body "" sends no payload.
+    static OutboundReply request(method: String, url: String, headers: List<String>, body: String, timeoutMs: Int) {
+        var status = 0
+        var text = ""
+        var failure = ""
+        try {
+            var conn = new URL(url).openConnection() as HttpURLConnection
+            conn.setRequestMethod(method)
+            conn.setConnectTimeout(timeoutMs)
+            conn.setReadTimeout(timeoutMs)
+            conn.setInstanceFollowRedirects(false)
+            for (var h in headers) {
+                var colon = h.indexOf(":")
+                if (colon > 0) {
+                    conn.setRequestProperty(h.substring(0, colon).trim(), h.substring(colon + 1).trim())
+                }
+            }
+            if (body.length() > 0) {
+                conn.setDoOutput(true)
+                var payload = body.getBytes()
+                var out = conn.getOutputStream()
+                out.write(payload, 0, body.getBytes().length)
+                out.flush()
+                out.close()
+            }
+            status = conn.getResponseCode()
+            if (status >= 400) {
+                text = Outbound.readAll(conn.getErrorStream())
+            }
+            else {
+                text = Outbound.readAll(conn.getInputStream())
+            }
+            conn.disconnect()
+        } catch (String e) {
+            failure = e
+        } catch (IOException e) {
+            failure = "io error"
+        }
+        if (failure.length() > 0) {
+            throw "OUTBOUND_FAILED: " + failure
+        }
+        return OutboundReply(status, text)
+    }
+    static OutboundReply postForm(url: String, form: String, timeoutMs: Int) = Outbound.request("POST", url, listOf("Content-Type: application/x-www-form-urlencoded"), form, timeoutMs)
+    static OutboundReply get(url: String, headers: List<String>, timeoutMs: Int) = Outbound.request("GET", url, headers, "", timeoutMs)
+    static String readAll(s: InputStream?) {
+        if (s == null) {
+            return ""
+        }
+        var bytes = s.readAllBytes()
+        return new String(bytes, "UTF-8")
+    }
+}

@@ -1,0 +1,27 @@
+import kernel.security.*
+import kernel.testkit.*
+
+test "rs256TokenVerifiesAgainstTheJwksAndTamperingFails" {
+    var pair = Jwt.newRsaPair("k1")
+    var token = Jwt.sign("RS256", pair.privatePart(), "{\"alg\":\"RS256\",\"kid\":\"k1\"}", "{\"sub\":\"abc\",\"email_verified\":\"true\"}")
+    var payload = Jwt.verifyRs256(token, pair.publicPart())
+    Check.isTrue("verified", payload != null)
+    Check.eqStr("sub", "abc", "" + JsonPath.str(payload as String, "sub"))
+    var forged = Jwt.segment(token, 0) + "." + Tokens.base64UrlEncode("{\"sub\":\"evil\"}") + "." + Jwt.segment(token, 2)
+    Check.isTrue("tampered payload", Jwt.verifyRs256(forged, pair.publicPart()) == null)
+    var other = Jwt.newRsaPair("k1")
+    Check.isTrue("other key", Jwt.verifyRs256(token, other.publicPart()) == null)
+    var unknownKid = Jwt.sign("RS256", pair.privatePart(), "{\"alg\":\"RS256\",\"kid\":\"zz\"}", "{\"sub\":\"abc\"}")
+    Check.isTrue("unknown kid", Jwt.verifyRs256(unknownKid, pair.publicPart()) == null)
+    var none = Tokens.base64UrlEncode("{\"alg\":\"none\"}") + "." + Tokens.base64UrlEncode("{\"sub\":\"abc\"}") + "."
+    Check.isTrue("alg none", Jwt.verifyRs256(none, pair.publicPart()) == null)
+    Check.isTrue("garbage", Jwt.verifyRs256("a.b", pair.publicPart()) == null)
+}
+
+test "es256ClientSecretIsSignedInRawForm" {
+    var pair = Jwt.newEcPair()
+    var token = Jwt.sign("ES256", pair.privatePart(), "{\"alg\":\"ES256\",\"kid\":\"K\"}", "{\"iss\":\"team\"}")
+    Check.isTrue("verifies", Jwt.verifyEs256(token, pair.publicPart()))
+    Check.isTrue("looks like jwt", Jwt.looksLikeJwt(token))
+    Check.isTrue("not a code", !Jwt.looksLikeJwt("4/0AX4XfWh-code"))
+}

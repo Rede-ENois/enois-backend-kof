@@ -1,0 +1,266 @@
+import identity.*
+import kernel.*
+import kernel.db.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+
+wireProbes(s: HttpServer) {
+    s.get("/probe/needs-session", () -> "user=" + Auth.requireUser())
+}
+
+IdentityTestApp ctx() = IdentityTestApp.sharedWith("account", mapOf(), (s: HttpServer) -> wireProbes(s))
+
+String changeBody(current: String, next: String) = "{\"currentPassword\":\"" + current + "\",\"newPassword\":\"" + next + "\"}"
+
+makePasswordUnusable(t: IdentityTestApp, userId: String) {
+    t.db().execute("update user_credentials set password_usable = false where user_id = ?", DbParams().bindStr(userId))
+}
+
+// ---- AccountHardeningTests
+test "signupWithARegisteredEmailLooksLikeANewSignup (AccountHardeningTests)" {
+    var t = ctx()
+    t.authenticate("acch_existing")
+    var existing = t.signup("acch_existing@test.com", "Test1234!", "acch-existing")
+    var fresh = t.signup("acch_fresh@test.com", "Test1234!", "acch-fresh")
+    Check.status(existing, 201)
+    Check.status(fresh, 201)
+    Check.eqStr("verificationRequired", fresh.json("verificationRequired"), existing.json("verificationRequired"))
+    Check.eqStr("emailSent", fresh.json("emailSent"), existing.json("emailSent"))
+    Check.jsonEq(existing, "email", "acch_existing@test.com")
+    Check.eqInt("same properties", fresh.jsonSize(""), existing.jsonSize(""))
+    Check.eqInt("owner notice", 1, t.mailCount("HTML", "acch_existing@test.com"))
+    Check.eqInt("no pending", 0, t.pendingCount("acch_existing@test.com"))
+}
+
+test "honeypotResponseIsValidJson (AccountHardeningTests)" {
+    var t = ctx()
+    var body = "{\"name\":\"Account Hardening\",\"role\":\"USER\",\"email\":\"acch\\\"hp@test.com\",\"password\":\"Test1234!\",\"acceptedTerms\":true,\"birthDate\":\"1990-05-10\",\"website\":\"http://spam.example\"}"
+    var res = t.postWith("/auth/signup", listOf("Idempotency-Key: acch-honeypot"), body)
+    Check.status(res, 201)
+    Check.eqStr("email echoed", "acch\"hp@test.com", res.json("email"))
+    Check.eqInt("nothing stored", 0, t.pendingCount("acch\"hp@test.com"))
+}
+
+test "pendingSignupIsOnlyRevealedToTheRightPassword (AccountHardeningTests)" {
+    var t = ctx()
+    Check.status(t.signup("acch_pending@test.com", "Test1234!", "acch-pending"), 201)
+    Check.apiError(t.login("acch_pending@test.com", "Wrong1234!"), 401, "INVALID_CREDENTIALS")
+    Check.apiError(t.login("acch_pending@test.com", "Test1234!"), 403, "EMAIL_NOT_VERIFIED")
+}
+
+test "reusedResetTokenSaysItWasUsed (AccountHardeningTests)" {
+    var t = ctx()
+    t.authenticate("acch_reset")
+    var email = "acch_reset@test.com"
+    Check.status(t.postWith("/auth/password/forgot", listOf("Idempotency-Key: acch-forgot"), "{\"email\":\"" + email + "\"}"), 202)
+    Check.eqInt("one reset mail", 1, t.mailCount("PASSWORD_RESET", email))
+    var token = t.mailToken("PASSWORD_RESET", email)
+    Check.status(t.postWith("/auth/password/reset", listOf("Idempotency-Key: acch-reset-1"), "{\"token\":\"" + token + "\",\"password\":\"Another123!\"}"), 200)
+    Check.apiError(t.postWith("/auth/password/reset", listOf("Idempotency-Key: acch-reset-2"), "{\"token\":\"" + token + "\",\"password\":\"Another456!\"}"), 409, "TOKEN_ALREADY_USED")
+}
+
+test "maintenanceTwoFactorResetRequiresAnAdmin (AccountHardeningTests)" {
+    var t = ctx()
+    var session = t.authenticate("acch_nonadmin")
+    var res = t.postWithToken("/auth/admin/two-factor/reset-broken", session.token(), "")
+    Check.apiError(res, 403, "FORBIDDEN")
+    Check.isTrue("no reset field", !res.jsonHas("reset"))
+}
+
+test "unconfirmedEmailChangeKeepsRecoveryOnTheConfirmedAddress (AccountHardeningTests)" {
+    var t = ctx()
+    var session = t.authenticate("acch_mail")
+    Check.status(t.postWithToken("/auth/email/change", session.token(), "{\"email\":\"acch_mail_new@test.com\",\"password\":\"Test1234!\"}"), 202)
+    var me = t.getWithToken("/auth/me", session.token())
+    Check.status(me, 200)
+    Check.jsonEq(me, "email", "acch_mail@test.com")
+    Check.status(t.postWith("/auth/password/forgot", listOf("Idempotency-Key: acch-forgot-new"), "{\"email\":\"acch_mail_new@test.com\"}"), 202)
+    Check.eqInt("no reset mail to the unconfirmed address", 0, t.mailCount("PASSWORD_RESET", "acch_mail_new@test.com"))
+}
+
+test "weakOrOversizedPasswordsAreRejected (AccountHardeningTests)" {
+    var t = ctx()
+    var tooLong = strings.repeat("a", 129)
+    Check.eqInt("129 characters", 129, tooLong.length())
+    Check.apiError(t.signup("acch_weak@test.com", "Senha123", "acch-weak-8"), 400, "WEAK_PASSWORD")
+    Check.apiError(t.signup("acch_weak@test.com", tooLong, "acch-weak-129"), 400, "WEAK_PASSWORD")
+}
+
+// ---- FirstPasswordTests
+test "contaDeLoginSocialCriaAPrimeiraSenhaSemInformarAAtual (FirstPasswordTests)" {
+    var t = ctx()
+    var session = t.authenticate("primeira-senha-social")
+    makePasswordUnusable(t, session.userId())
+    Check.status(t.postWithToken("/auth/password/change", session.token(), changeBody("", "NovaSenha123")), 200)
+    // The created password is real: the account signs in with it.
+    Check.status(t.login("primeira-senha-social@test.com", "NovaSenha123"), 200)
+}
+
+test "contaComSenhaContinuaExigindoAAtual (FirstPasswordTests)" {
+    var t = ctx()
+    var session = t.authenticate("senha-existente")
+    Check.apiError(t.postWithToken("/auth/password/change", session.token(), changeBody("", "NovaSenha123")), 401, "INVALID_CREDENTIALS")
+    Check.apiError(t.postWithToken("/auth/password/change", session.token(), changeBody("senha-errada", "NovaSenha123")), 401, "INVALID_CREDENTIALS")
+    Check.status(t.postWithToken("/auth/password/change", session.token(), changeBody("Test1234!", "NovaSenha123")), 200)
+}
+
+test "aTelaSabeSeAContaTemSenha (FirstPasswordTests)" {
+    var t = ctx()
+    var session = t.authenticate("diz-se-tem-senha")
+    makePasswordUnusable(t, session.userId())
+    var before = t.getWithToken("/auth/me", session.token())
+    Check.status(before, 200)
+    Check.jsonEq(before, "hasPassword", "false")
+    Check.status(t.postWithToken("/auth/password/change", session.token(), changeBody("", "NovaSenha123")), 200)
+    // The change ends the sessions (the rule): the next read uses a new session.
+    var login = t.login("diz-se-tem-senha@test.com", "NovaSenha123")
+    Check.status(login, 200)
+    var me = t.getWithToken("/auth/me", login.cookie("enois_session"))
+    Check.status(me, 200)
+    Check.jsonEq(me, "hasPassword", "true")
+}
+
+// ---- PasswordChangeEndsSessionTests (the e2e keypair upload is replaced by a session-guarded probe route)
+test "trocarASenhaEncerraASessaoQueEstaEmUso (PasswordChangeEndsSessionTests)" {
+    var t = ctx()
+    var session = t.authenticate("sessao-derrubada-pela-senha")
+    Check.status(t.postWithToken("/auth/password/change", session.token(), changeBody("Test1234!", "NovaSenha123")), 200)
+    Check.status(t.getWithToken("/auth/me", session.token()), 401)
+}
+
+test "oUploadDoKeypairE2eSoFuncionaComSessaoViva (PasswordChangeEndsSessionTests)" {
+    var t = ctx()
+    var session = t.authenticate("e2e-upload-sem-sessao")
+    // With a live session the protected call passes.
+    Check.status(t.getWithToken("/probe/needs-session", session.token()), 200)
+    Check.status(t.postWithToken("/auth/password/change", session.token(), changeBody("Test1234!", "NovaSenha123")), 200)
+    // The same call afterwards is refused: exactly what the e2e banner hit.
+    Check.status(t.getWithToken("/probe/needs-session", session.token()), 401)
+}
+
+test "contaSemSenhaCriaAprimeiraEASessaoMorre (PasswordChangeEndsSessionTests)" {
+    var t = ctx()
+    var session = t.authenticate("e2e-conta-social-sem-senha")
+    makePasswordUnusable(t, session.userId())
+    Check.status(t.postWithToken("/auth/password/change", session.token(), changeBody("", "NovaSenha123")), 200)
+    Check.status(t.getWithToken("/auth/me", session.token()), 401)
+    Check.status(t.login("e2e-conta-social-sem-senha@test.com", "NovaSenha123"), 200)
+}
+
+// ---- AuthProfileFlowTests (the identity half: sign up, replay, login, confirm, /auth/me)
+test "signsUpLogsInAndReadsTheProfileWithSession (AuthProfileFlowTests)" {
+    var t = ctx()
+    var email = "ana.flow@example.com"
+    var signup = t.postWith("/auth/signup", listOf("Idempotency-Key: auth-signup-flow-1"), "{\"name\":\"Ana Souza\",\"role\":\"Product Manager\",\"email\":\"" + email + "\",\"password\":\"senha-segura\",\"acceptedTerms\":true,\"birthDate\":\"1990-05-10\"}")
+    Check.status(signup, 201)
+    Check.jsonEq(signup, "email", email)
+    Check.jsonEq(signup, "verificationRequired", "true")
+    Check.isTrue("no token", signup.body.indexOf("token") < 0)
+    var replay = t.postWith("/auth/signup", listOf("Idempotency-Key: auth-signup-flow-1"), "{\"name\":\"Ana Souza\",\"role\":\"Product Manager\",\"email\":\"" + email + "\",\"password\":\"senha-segura\",\"acceptedTerms\":true,\"birthDate\":\"1990-05-10\"}")
+    Check.status(replay, 201)
+    Check.eqStr("replay is the same answer", signup.body, replay.body)
+    Check.apiError(t.login(email, "senha-segura"), 403, "EMAIL_NOT_VERIFIED")
+    Check.status(t.post("/auth/email/verify", "{\"token\":\"" + t.mailToken("EMAIL_VERIFICATION", email) + "\"}"), 200)
+    var login = t.login(email, "senha-segura")
+    Check.status(login, 200)
+    Check.jsonEq(login, "user.email", email)
+    Check.jsonEq(login, "user.emailVerified", "true")
+    var token = login.cookie("enois_session")
+    Check.isTrue("session token", token.length() > 0)
+    var me = t.getWithToken("/auth/me", token)
+    Check.status(me, 200)
+    Check.jsonEq(me, "username", "ana-souza")
+}
+
+// ---- SignupDisabled is in SignupGateTest; extra flows below
+test "login of an unknown account is a 401 and never reveals pending signups" {
+    var t = ctx()
+    Check.apiError(t.login("quem.nao.existe@example.com", "senha-segura"), 401, "INVALID_CREDENTIALS")
+}
+
+test "forgot and reset replay through the idempotency key, an expired-password reset hands out no cookies" {
+    var t = ctx()
+    t.authenticate("flow_forgot")
+    var email = "flow_forgot@test.com"
+    var first = t.postWith("/auth/password/forgot", listOf("Idempotency-Key: flow-forgot-1"), "{\"email\":\"" + email + "\"}")
+    var again = t.postWith("/auth/password/forgot", listOf("Idempotency-Key: flow-forgot-1"), "{\"email\":\"" + email + "\"}")
+    Check.status(first, 202)
+    Check.status(again, 202)
+    Check.jsonEq(first, "status", "RESET_REQUEST_ACCEPTED")
+    Check.eqInt("replay sent no second mail", 1, t.mailCount("PASSWORD_RESET", email))
+    Check.apiError(t.post("/auth/password/forgot", "{\"email\":\"" + email + "\"}"), 400, "IDEMPOTENCY_KEY_REQUIRED")
+    var token = t.mailToken("PASSWORD_RESET", email)
+    Check.apiError(t.postWith("/auth/password/reset", listOf("Idempotency-Key: flow-reset-weak"), "{\"token\":\"" + token + "\",\"password\":\"123\"}"), 400, "WEAK_PASSWORD")
+    var done = t.postWith("/auth/password/reset", listOf("Idempotency-Key: flow-reset-ok"), "{\"token\":\"" + token + "\",\"password\":\"Another123!\"}")
+    Check.status(done, 200)
+    Check.jsonEq(done, "status", "PASSWORD_RESET_ACCEPTED")
+    Check.status(t.login(email, "Another123!"), 200)
+    Check.apiError(t.login(email, "Test1234!"), 401, "INVALID_CREDENTIALS")
+    // A password flagged expired: the login answers passwordExpired + a reset token, and the reset serialises
+    // the session without tokens (the Java idempotent answer carries no cookies).
+    var id = t.userId(email)
+    t.db().execute("update user_credentials set reset_needed = true where user_id = ?", DbParams().bindStr(id))
+    var expired = t.login(email, "Another123!")
+    Check.status(expired, 200)
+    Check.jsonEq(expired, "passwordExpired", "true")
+    var resetToken = expired.json("resetToken")
+    var reset = t.postWith("/auth/password/reset", listOf("Idempotency-Key: flow-reset-expired"), "{\"token\":\"" + resetToken + "\",\"password\":\"Third12345!\"}")
+    Check.status(reset, 200)
+    Check.jsonEq(reset, "user.email", email)
+    Check.eqInt("no cookies", 0, reset.setCookies().size())
+    Check.status(t.login(email, "Third12345!"), 200)
+}
+
+test "changing the e-mail needs the password and the link, the link ends every session" {
+    var t = ctx()
+    var session = t.authenticate("flow_mail")
+    var bad = t.postWithToken("/auth/email/change", session.token(), "{\"email\":\"flow_mail_new@test.com\",\"password\":\"nope\"}")
+    Check.apiError(bad, 401, "INVALID_CREDENTIALS")
+    Check.apiError(t.postWithToken("/auth/email/change", session.token(), "{\"email\":\"sem-arroba\",\"password\":\"Test1234!\"}"), 400, "INVALID_EMAIL")
+    Check.apiError(t.postWithToken("/auth/email/change", session.token(), "{\"email\":\"flow_forgot@test.com\",\"password\":\"Test1234!\"}"), 409, "EMAIL_ALREADY_REGISTERED")
+    var ok = t.postWithToken("/auth/email/change", session.token(), "{\"email\":\"flow_mail_new@test.com\",\"password\":\"Test1234!\"}")
+    Check.status(ok, 202)
+    Check.jsonEq(ok, "status", "EMAIL_CONFIRMATION_SENT")
+    Check.jsonEq(ok, "id", "me")
+    var link = t.mailToken("HTML", "flow_mail_new@test.com")
+    var page = t.app.client.get("/auth/email/change/confirm?token=" + link)
+    Check.status(page, 200)
+    Check.isTrue("html page", page.body.indexOf("E-mail alterado") >= 0)
+    Check.eqStr("content type", "text/html;charset=UTF-8", page.header("content-type"))
+    // Every session of the account is gone and the new address signs in.
+    Check.status(t.getWithToken("/auth/me", session.token()), 401)
+    Check.status(t.login("flow_mail_new@test.com", "Test1234!"), 200)
+    Check.eqInt("old address notified", 1, t.mailCount("HTML", "flow_mail@test.com"))
+    var again = t.app.client.get("/auth/email/change/confirm?token=" + link)
+    Check.status(again, 404)
+    Check.isTrue("generic failure page", again.body.indexOf("Link inválido ou expirado.") >= 0)
+}
+
+test "deleting the account asks for the password, anonymises the user and frees the sessions" {
+    var t = ctx()
+    var session = t.authenticate("flow_delete")
+    Check.apiError(t.postWithToken("/auth/account/delete", session.token(), "{\"password\":\"errada\"}"), 401, "INVALID_CREDENTIALS")
+    var done = t.postWithToken("/auth/account/delete", session.token(), "{\"password\":\"Test1234!\"}")
+    Check.status(done, 200)
+    Check.jsonEq(done, "status", "ACCOUNT_DELETED")
+    Check.status(t.getWithToken("/auth/me", session.token()), 401)
+    var row = t.db().queryOne("select email, username, name from users where id = ?", DbParams().bindStr(session.userId()))
+    Check.isTrue("anonymised e-mail", row.getStr("email").startsWith("removed+") && row.getStr("email").endsWith("@enois.invalid"))
+    Check.eqStr("name", "Usuario removido", row.getStr("name"))
+    Check.apiError(t.login("flow_delete@test.com", "Test1234!"), 401, "INVALID_CREDENTIALS")
+}
+
+test "logout is idempotent per session and /auth/me needs a live session" {
+    var t = ctx()
+    var session = t.authenticate("flow_logout")
+    var out = t.postWith("/auth/logout", listOf("X-Session-Token: " + session.token(), "Idempotency-Key: flow-logout"), "")
+    Check.status(out, 200)
+    Check.jsonEq(out, "status", "LOGGED_OUT")
+    Check.status(t.getWithToken("/auth/me", session.token()), 401)
+    Check.apiError(t.app.client.get("/auth/me"), 401, "UNAUTHENTICATED")
+}
+
+test "zz shutdown" {
+    ctx().stop()
+}

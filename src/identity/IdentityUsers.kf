@@ -1,0 +1,74 @@
+package identity
+
+import kernel.db.*
+
+// The users table as identity needs it (create at e-mail confirmation, verify, change e-mail, anonymise).
+// pending-port: profile. The profile domain owns `users`; until it is ported this default runs the same
+// statements the Java UserProfileRepository ends up issuing for these use cases. When profile lands it
+// subclasses this seam and Main.kf passes the subclass to IdentityModule.install.
+class IdentityUsers {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    String columns() = "id, username, name, headline, email, email_verified_at, totp_enabled_at, email_otp_enabled_at, federated_second_factor_at, onboarding_completed_at, birth_date"
+    IdentityUserRow? findById(id: String) = row(store.queryOptional("select " + columns() + " from users where id = ?", DbParams().bindStr(id)))
+    IdentityUserRow? findByEmail(email: String) = row(store.queryOptional("select " + columns() + " from users where email = ?", DbParams().bindStr(email)))
+    IdentityUserRow? row(r: DbRow?) {
+        if (r == null) {
+            return null
+        }
+        return IdentityUserRow(r.getStr("id"), r.getStr("username"), r.getStr("name"), r.getStrOrNull("headline"), r.getStr("email"), !r.isNull("email_verified_at"), !r.isNull("totp_enabled_at"), !r.isNull("email_otp_enabled_at"), !r.isNull("federated_second_factor_at"), !r.isNull("onboarding_completed_at"), r.getDateOrNull("birth_date"))
+    }
+    Bool existsByEmail(email: String) = store.queryLong("select count(*) from users where email = ?", DbParams().bindStr(email)) > 0L
+    Bool existsByUsername(username: String) = store.queryLong("select count(*) from users where username = ?", DbParams().bindStr(username)) > 0L
+    // A new account born verified (the confirmation link proved the mailbox): terms accepted, birth date
+    // declared (ECA Digital), reputation 0 and every flag at its column default.
+    create(id: String, username: String, email: String, name: String, createdAt: String, now: String, birthDate: String) {
+        store.execute("insert into users (id, username, email, name, headline, open_to_work, is_mentor, reputation, is_admin, created_at, updated_at, terms_accepted_at, email_verified_at, birth_date) values (?, ?, ?, ?, null, false, false, 0, false, ?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(username).bindStr(email).bindStr(name).bindInstant(createdAt).bindInstant(now).bindInstant(now).bindInstant(now).bindDate(birthDate))
+    }
+    // An account born by a social provider: no terms acceptance (it comes at the first access) and no birth date
+    // yet; the provider vouches for the mailbox, so markVerifiedByProvider stamps the verification right after.
+    createFederated(id: String, username: String, email: String, name: String, now: String) {
+        store.execute("insert into users (id, username, email, name, headline, open_to_work, is_mentor, reputation, is_admin, created_at, updated_at) values (?, ?, ?, ?, null, false, false, 0, false, ?, ?)", DbParams().bindStr(id).bindStr(username).bindStr(email).bindStr(name).bindInstant(now).bindInstant(now))
+    }
+    // UserProfile.enableFederatedSecondFactor: the provider answers for the second step.
+    markFederated(id: String, now: String) {
+        store.execute("update users set federated_second_factor_at = ? where id = ? and federated_second_factor_at is null", DbParams().bindInstant(now).bindStr(id))
+    }
+    markEmailVerified(id: String, now: String) {
+        store.execute("update users set email_verified_at = ? where id = ? and email_verified_at is null", DbParams().bindInstant(now).bindStr(id))
+    }
+    changeEmail(id: String, email: String, now: String) {
+        store.execute("update users set email = ?, updated_at = ? where id = ?", DbParams().bindStr(email).bindInstant(now).bindStr(id))
+    }
+    // UserProfile.anonymize: personal data gone, the id kept so published content stays consistent.
+    anonymize(id: String, email: String, username: String, now: String) {
+        store.execute("update users set email = ?, username = ?, name = \'Usuario removido\', headline = null, company = null, location = null, city = null, state = null, city_key = null, show_city = false, avatar = null, banner = null, bio = null, availability = null, portfolio = null, open_to_work = false, is_mentor = false, badges = null, nickname = null, social_name = null, pronouns = null, updated_at = ? where id = ?", DbParams().bindStr(email).bindStr(username).bindInstant(now).bindStr(id))
+        store.execute("delete from user_skills where user_id = ?", DbParams().bindStr(id))
+        store.execute("delete from user_goals where user_id = ?", DbParams().bindStr(id))
+        store.execute("delete from user_external_links where user_id = ?", DbParams().bindStr(id))
+    }
+    Bool isAdmin(id: String) {
+        var r = store.queryOptional("select is_admin from users where id = ?", DbParams().bindStr(id))
+        if (r == null) {
+            return false
+        }
+        return r.getBool("is_admin")
+    }
+    // UserProfile.enableTotp / disableTotp, enableEmailOtp / disableEmailOtp: one timestamp column each.
+    setTotp(id: String, on: Bool, now: String) {
+        var at = IdentityText.none()
+        if (on) {
+            at = now
+        }
+        store.execute("update users set totp_enabled_at = ?, updated_at = ? where id = ?", DbParams().bindInstantOrNull(at).bindInstant(now).bindStr(id))
+    }
+    setEmailOtp(id: String, on: Bool, now: String) {
+        var at = IdentityText.none()
+        if (on) {
+            at = now
+        }
+        store.execute("update users set email_otp_enabled_at = ?, updated_at = ? where id = ?", DbParams().bindInstantOrNull(at).bindInstant(now).bindStr(id))
+    }
+}

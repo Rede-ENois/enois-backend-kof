@@ -267,3 +267,64 @@ Tests changed trigger, assertion kept: preferences seeded in `user_preferences` 
 push-off test checks only the in-app row; the reminder schedule test uses `Cron.next` plus the registered job instead of
 reflection on `@Scheduled`. The topic list is copied from `ContentTaxonomy` into `StudyPairRules.topics()` (and into
 `CommunityRules.topics()`): preferences owns it upstream.
+
+## identity (identity, age, onboarding)
+
+Slug `identity`, branch `port/identity`, gaps G100 to G109. Code in `src/identity`, `src/age`, `src/onboarding`; tests in
+`tests/identity` (one H2 app per file, real migrations, no network).
+
+- **Endpoints: 47 of 47** (`/auth/**` 33 including the 8 OAuth routes, `/identity/**` 6, `/age/parental/**` 5,
+  `/me/onboarding/**` 3), same paths, status codes, JSON and pt-BR codes and messages.
+- **Tests: about 90 of the 98 Java `@Test`s ported** (167 Kof tests in `tests/identity`, the rest are extra edge cases and
+  the kernel adapters: Tokens, Outbound, Jwt). Each Java test name appears in the Kof test name.
+- **Jobs on `kernel.jobs`:** `identity-session-rehash` (every 60 s, SessionTokenHashMigration) and
+  `identity-pending-signup-cleanup` (15 s then 180 s, PendingSignupCleanupWorker).
+
+### Kernel files added (no existing kernel file changed in behaviour)
+
+`kernel/security/Tokens.kf` (random tokens, HMAC-SHA256, base64), `kernel/security/Jwt.kf` (RS256 verify against a JWKS,
+RS256 and ES256 signing, plain `java.security`, no third-party jar), `kernel/http/Outbound.kf` (one HTTP call with timeouts
+and any method), `kernel/url/UrlCodec.kf`. The jose4j/nimbus jars were not needed.
+
+### Seams owned by this slice (concrete classes with overridable methods, defaults wired in `Main.kf`)
+
+| Seam | Default | Replaced by |
+| --- | --- | --- |
+| `IdentityUsers` (profile reads and writes of `users`) | direct SQL on `users` | profile |
+| `IdentityMailer` (mail transport) | renders the Thymeleaf template text, logs metadata only, writes `email_log`, `deliver()` true. **SMTP is not ported** | the mail owner |
+| `IdentityTurnstileTransport` | `Outbound.postForm` to siteverify, fail-closed | tests stub it |
+| `IdentityIpBlocks`, `IdentitySignupGuard` | read `blocked_ips` (5 s cache); per-pod name pattern and cooldown guard | moderation |
+| `IdentityNotifier` | logging no-op (new device, parental events) | notifications |
+| `IdentityOAuthTransport` | `Outbound` to the providers and their JWKS | tests stub it |
+| `IdentityOAuthLinks` | logging no-op for the LinkedIn posting token and the GitHub identity and token | linkedin, contributions |
+| `IdentityVerificationProvider` list | gov.br (only active with `REDE_IDENTITY_GOVBR_*`), so the verification is unavailable by default | a legitimate private provider |
+| `IdentityEligibility` (JobPublishingPolicy) | reads `users.reputation`, rule `> 150` and, when enforced, a verified identity | jobs |
+| `OnboardingActions` | liked topics and skills merged by SQL; community, group and connection joins only report what is already in place (logged `pending-port`) | preferences, communities, groups, network |
+| `AgePolicyReader` and `AgeGate` | owned here: other domains (feed, messaging) call `requireDeclared` / `requireCanWrite` | n/a |
+
+### Seams expected from other domains
+
+`/me/age-state` and `/me/birth-date` stay in profile (already ported). Feed and conversations must call `AgeGate`. The
+onboarding joins need the real communities, groups and network services (`OnboardingActions` subclass).
+
+### Java tests not ported
+
+- `AgePolicyTests.regularizationUnlocksWriting` and `strangerCannotMessageMinorButConnectionCan`: need `/feed/posts` and
+  `/conversations`. The gate itself is covered with a probe route in `ParentalTest` and by `minorIds` in the policy reader.
+- `AuthProfileFlowTests` profile and feed parts, `AccountHardening` rename-to-admin (profile PATCH).
+- `PasswordChangeEndsSessionTests` end-to-end keypair and `TwoFactorFlowTests` `/notifications`: replaced by probe routes.
+- `AuthThrottleKeyTests`: already ported in the security `LimitersTest`.
+- `EmailServiceListUnsubscribeTests` (List-Unsubscribe header): needs the SMTP sender, which is not ported.
+- `OnboardingFlowTests.completeFollowsTheManualJoinRules`, `connectionRequestsSkipInvalidTargetsAndAreNotDuplicated`,
+  `manualJoinOfUnknownCommunityIs404`: need communities, groups and network. Ported with seeded rows: only what is already
+  in place counts as joined, self and unknown ids are skipped, an approval group is never joined.
+- `SessionTokenHashingTests.savesOnlyHashesAndStillLooksUpByRawToken`: covered at HTTP level (the table keeps only hashes).
+
+### Differences from the Java service
+
+- The POST `/auth/oauth/{provider}/callback` (Apple form_post) keeps the Java behaviour: a refusal is the JSON error, only
+  the GET callback redirects.
+- OAuth account creation sets no terms acceptance and no birth date (as Java); `users.create` and
+  `createFederated` write every column default explicitly because the Kof insert has no JPA defaults.
+- Provider env names: property style (`REDE_OAUTH_GOOGLE_CLIENT_ID`) first, then the short ones the Java profiles read
+  (`GOOGLE_CLIENT_ID`).

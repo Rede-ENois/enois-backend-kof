@@ -1,0 +1,24 @@
+import identity.*
+import kernel.db.*
+import kernel.testkit.*
+
+// rede.auth.signup-enabled=false (qa/prd): signup is refused and NO account is born.
+IdentityTestApp closed() = IdentityTestApp.shared("signupgate", mapOf("REDE_AUTH_SIGNUP_ENABLED", "false"))
+
+test "signupIsRefusedAndDoesNotCreateTheAccount (SignupDisabledTests)" {
+    var t = closed()
+    var res = t.post("/auth/signup", "{\"name\":\"Conta Fechada\",\"email\":\"conta.fechada@example.com\",\"password\":\"senha-segura\",\"acceptedTerms\":true}")
+    Check.apiError(res, 403, "SIGNUP_DISABLED")
+    Check.isTrue("no account", !t.userExists("conta.fechada@example.com"))
+    Check.eqInt("no pending", 0, t.pendingCount("conta.fechada@example.com"))
+}
+
+test "loginKeepsWorkingForExistingAccounts (SignupDisabledTests)" {
+    var t = closed()
+    // The answer is the invalid credentials one (401), never the signup 403: the gate only closes creation.
+    Check.apiError(t.postWith("/auth/login", listOf("Idempotency-Key: signup-disabled-login-1"), t.loginJson("quem.nao.existe@example.com", "senha-segura")), 401, "INVALID_CREDENTIALS")
+}
+
+test "zz shutdown" {
+    closed().stop()
+}
