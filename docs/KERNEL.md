@@ -382,3 +382,41 @@ audit.write(actorId, "USER_BANNED", targetId, "{\"reason\":\"spam\"}")      // m
 
 `audit_logs` is append-only and joins the caller's transaction. `Ids.uuid()` / `Ids.prefixed("risk_")`
 (`kernel.id`) mint the string ids of those tables.
+
+## kernel.security: hashes, secrets, passwords, TOTP
+
+```kotlin
+import kernel.security.*
+
+Hashes.sha256Hex(token)                       // lower-case hex of the UTF-8 bytes (only hashes are persisted)
+
+var cipher = SecretCipher.fromConfig(platform.cfg)   // REDE_SECURITY_ENCRYPTION_KEY (32 bytes, base64)
+cipher.encrypt(secret)  cipher.decrypt(stored)  cipher.isEnabled()  cipher.requireEnabled()
+SecretCipher.generateKeyBase64()
+```
+
+`SecretCipher` is byte-compatible with the Java class: AES-256-GCM, `base64(iv12 || ciphertext || tag16)`
+(tested against a ciphertext produced by the Java algorithm). The key is required at boot outside the
+`dev` profile (`SPRING_PROFILES_ACTIVE`; override `REDE_SECURITY_ENCRYPTION_KEY_REQUIRED`), failing with
+`CONFIG_MISSING`/`CONFIG_INVALID`. Without a key `encrypt/decrypt` throw `503 SECURITY_KEY_NOT_CONFIGURED`.
+A wrong key or corrupted value throws `SECRET_CIPHER_FAILURE` (a 500 at the edge).
+
+```kotlin
+Passwords.hash(password)                       // "120000:base64(salt):base64(key)", PBKDF2WithHmacSHA256
+Passwords.matches(password, stored)            // verifies Java hashes; malformed -> false, constant-time compare
+Passwords.validateStrength(password)           // 400 WEAK_PASSWORD: 8..128 chars, not in the common list
+Passwords.isCommon(password)                   // resources/security/common-passwords.txt (SECURITY_RESOURCES_DIR)
+```
+
+```kotlin
+var secret = Totp.generateSecret()                         // base32, 32 chars
+Totp.verifyDefault(secret, code, epochSecond)              // +-1 step; spaces in the code are ignored
+Totp.matchingStep(secret, code, epochSecond, 1): Long      // the step, or -1: persist it to refuse replays
+Totp.codeAt(secret, step)   Totp.otpauthUri(issuer, account, secret)
+```
+
+TOTP is RFC 6238 (HMAC-SHA1, 6 digits, 30 s) and passes the RFC vectors. Times are epoch seconds
+(`Time.nowMillis() / 1000L`), not `Instant`.
+
+Java checked exceptions (`GeneralSecurityException`, `SQLException`) are not caught by `catch (String)`:
+catch them by type (see `SecretCipher`).
