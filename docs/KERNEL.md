@@ -536,3 +536,57 @@ guard.isDuplicate(userId, text)                        // pure query; `require` 
 before parsing a JSON DTO (JSON content types only; raw payloads a handler verifies as is, such as a
 webhook HMAC, must not go through it). The Kof JSON reader behind it (`JsonStrings`) collects decoded
 string values with their property name because Kof cannot walk a Jackson tree.
+
+## kernel.blocks, kernel.sanctions, kernel.risk
+
+Read-only ports of the shared readers, on their own tables, plus the risk engine.
+
+```kotlin
+import kernel.blocks.*
+BlockedUsers(database).hiddenIdsFor(viewerId): HashSet<String>   // blocks in both directions + unexpired mutes
+.blockedBetween(userId)   .hiddenBetween(a, b)                    // blocks only (network module)
+BlockedUsers.none()                                               // no database: nothing hidden
+```
+
+```kotlin
+import kernel.sanctions.*
+var reader = SanctionGateReader(database)      // user_sanctions: the latest ACTIVE row of the account
+reader.restricted(id)  reader.banned(id)  reader.bannedAmong(listOf(...))  reader.activeReason(id): String?
+SanctionGate(reader).requireNotRestricted(userId)      // 403 ACCOUNT_RESTRICTED in every write path
+```
+
+`banned` = active SUSPENDED, BAN or PERMABAN; `restricted` = any active sanction. The moderation domain
+owns the writes and may extend `SanctionGateReader` (override a method) before wiring it in `Main.kf`.
+
+```kotlin
+import kernel.risk.*
+var engine = RiskEngine.fromConfig(cfg, RiskSubjectReader(db, sanctionReader), RiskAssessmentWriter(db),
+                                   timing, duplicationGuard, escalation)
+var a = engine.assess(userId, "publish", content): RiskAssessment?    // null without signal; never throws
+a.level  a.score  a.signals  a.decision  a.ruleVersion  a.action  a.id
+```
+
+Signals `ROBOTIC_CADENCE`, `DUPLICATE_CONTENT`, `NEW_ACCOUNT`, `ACTIVE_SANCTION` (`RiskSignals.*`), weights
+3/2/1/3, thresholds MEDIUM 2 / HIGH 5 / CRITICAL 8, decision ALLOW, MONITOR, ESCALATE or RESTRICT (RESTRICT
+only for CRITICAL with `REDE_RISK_ENFORCE=true`; default is observation mode). Env:
+`REDE_RISK_WEIGHTS_*`, `REDE_RISK_THRESHOLDS_*`, `REDE_RISK_NEW_ACCOUNT_HOURS` (24), `REDE_RISK_ENFORCE`.
+Assessments are stored in `risk_assessments`; a non-LOW level opens a moderation case once per hour per
+account through `RiskEscalation.escalate(userId, description)` (default: log only). The cadence signal
+comes from `RiskTimingSignals.looksAutomated(userId)` (default: false): wire the `BehavioralTimingGuard`
+of the security module there. Levels, signals and decisions are String constants (enums do not cross
+packages safely, G43).
+
+## SharedServices (composition)
+
+`SharedServices.create(platform)` builds everything above in one call (fail-fast config first, then the
+outbox worker) and `Main.kf` calls it after `Platform.create`:
+
+```kotlin
+var shared = SharedServices.create(platform)
+shared.idempotency  shared.outbox  shared.audit  shared.cipher  shared.caches  shared.blockedUsers
+shared.sanctionReader  shared.sanctionGate  shared.suspiciousText  shared.duplication  shared.risk
+shared.jobs  shared.stop()
+```
+
+`TestApp.bootWith/bootWire` now stop the platform when the `wire` callback throws (the open pool kept the
+test process from exiting).
