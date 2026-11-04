@@ -1,0 +1,80 @@
+package kernel.security
+
+import java.util.HashMap
+import kernel.config.*
+import kernel.error.*
+import kernel.log.*
+
+// Moderation seam: a guard that wants a human to look at an account reports it here. The default does
+// nothing; the moderation domain extends it and Main.kf wires its subclass. (A concrete class with a
+// no-op body: an abstract class cannot be instantiated for the default, KOF_GAPS G30.)
+class SecurityAutoReports {
+    report(userId: String, reason: String, description: String);
+}
+
+// Per-user action limits inside the app (publish, comment, apply, message, ...): complements the
+// per-IP limiter. Sliding window in memory, per pod. Three rejections in an hour report the user for
+// moderation. Env: REDE_RATE_POST_LIMIT (10) / _WINDOW_MINUTES (60), REDE_RATE_COMMENT_* (30/60),
+// REDE_RATE_JOB_APPLY_* (100/30), REDE_RATE_MESSAGE_* (60/1), REDE_RATE_GITHUB_SYNC_* (3/60),
+// REDE_CALL_START_LIMIT / REDE_CALL_START_WINDOW_MINUTES (20/60).
+class UserRateLimiter {
+    Map<String,SlidingWindows> windows = new HashMap<String, SlidingWindows>()
+    Map<String,Int> limits = new HashMap<String, Int>()
+    SlidingWindows rejections = SlidingWindows(50000, 3600000L)
+    SecurityAutoReports reports
+    Log log = Log("kernel.security.user-rate-limiter")
+    public constructor(cfg: Config, reports: SecurityAutoReports) {
+        this.reports = reports
+        define(cfg, "create_post", "REDE_RATE_POST_LIMIT", 10, "REDE_RATE_POST_WINDOW_MINUTES", 60L)
+        define(cfg, "create_comment", "REDE_RATE_COMMENT_LIMIT", 30, "REDE_RATE_COMMENT_WINDOW_MINUTES", 60L)
+        define(cfg, "apply_job", "REDE_RATE_JOB_APPLY_LIMIT", 100, "REDE_RATE_JOB_APPLY_WINDOW_MINUTES", 30L)
+        define(cfg, "send_message", "REDE_RATE_MESSAGE_LIMIT", 60, "REDE_RATE_MESSAGE_WINDOW_MINUTES", 1L)
+        define(cfg, "sync_github", "REDE_RATE_GITHUB_SYNC_LIMIT", 3, "REDE_RATE_GITHUB_SYNC_WINDOW_MINUTES", 60L)
+        define(cfg, "start_call", "REDE_CALL_START_LIMIT", 20, "REDE_CALL_START_WINDOW_MINUTES", 60L)
+    }
+    define(cfg: Config, action: String, limitEnv: String, limitDefault: Int, windowEnv: String, windowDefaultMinutes: Long) {
+        limits.put(action, cfg.getInt(limitEnv, limitDefault))
+        windows.put(action, SlidingWindows(50000, cfg.getLong(windowEnv, windowDefaultMinutes) * 60000L))
+    }
+    static String createPost() = "create_post"
+    static String createComment() = "create_comment"
+    static String applyJob() = "apply_job"
+    static String sendMessage() = "send_message"
+    static String syncGithub() = "sync_github"
+    static String startCall() = "start_call"
+    // Throws 429 RATE_LIMIT_EXCEEDED when the user is over the limit of the action.
+    require(userId: String, action: String) {
+        if (!tryAcquire(userId, action)) {
+            trackRejection(userId, action)
+            throw Errors.api(429, "RATE_LIMIT_EXCEEDED", "Voce atingiu o limite desta acao. Tente novamente em alguns minutos.")
+        }
+    }
+    Bool tryAcquire(userId: String, action: String) {
+        var w = windows.get(action)
+        var limit = limits.get(action)
+        if (w == null) {
+            return true
+        }
+        if (limit == null) {
+            return true
+        }
+        if (limit <= 0) {
+            return true
+        }
+        if (w.windowMs <= 0L) {
+            return true
+        }
+        return w.tryAcquire(action + "|" + userId, SecurityClock.nowMillis(), limit)
+    }
+    trackRejection(userId: String, action: String) {
+        var count = rejections.add(userId, SecurityClock.nowMillis())
+        if (count == 3) {
+            log.warn("rate_limit_rejections user=" + userId + " count=" + count + " action=" + action)
+            try {
+                reports.report(userId, "SPAM", "[auto] Usuario rejeitado pelo rate limiter " + count + " vezes em 1 hora (ultima acao: " + action + ").")
+            } catch (String e) {
+                log.debug("auto_report_failed user=" + userId)
+            }
+        }
+    }
+}

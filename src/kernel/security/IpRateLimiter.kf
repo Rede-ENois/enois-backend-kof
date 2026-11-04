@@ -1,0 +1,55 @@
+package kernel.security
+
+import java.util.HashMap
+import kernel.config.*
+
+// Per-IP, per-action request limit: the deterministic layer of the anti-fraud. A global limit would let
+// one attacker spend everyone's quota; a per-origin one does not. Sliding window in memory, so the
+// limit is per pod (N replicas = N x the ceiling). The IP lives only in this process' memory.
+// Env: SIGNUP_RATE_LIMIT (10/60min), LOGIN_RATE_LIMIT (60/15), PASSWORD_RATE_LIMIT (5/15),
+// EMAIL_RATE_LIMIT (5/15), TWO_FACTOR_RATE_LIMIT (20/15), CONTRIBUTION_RATE_LIMIT (5/60),
+// REFRESH_RATE_LIMIT (120/15); windows: REDE_SECURITY_RATE_LIMIT_<ACTION>_WINDOW_MINUTES.
+class IpRateLimiter {
+    Map<String,SlidingWindows> windows = new HashMap<String, SlidingWindows>()
+    Map<String,Int> limits = new HashMap<String, Int>()
+    public constructor(cfg: Config) {
+        define(cfg, "signup", "SIGNUP_RATE_LIMIT", 10, "SIGNUP", 60L)
+        define(cfg, "login", "LOGIN_RATE_LIMIT", 60, "LOGIN", 15L)
+        define(cfg, "password", "PASSWORD_RATE_LIMIT", 5, "PASSWORD", 15L)
+        define(cfg, "email", "EMAIL_RATE_LIMIT", 5, "EMAIL", 15L)
+        define(cfg, "2fa", "TWO_FACTOR_RATE_LIMIT", 20, "2FA", 15L)
+        define(cfg, "contribution", "CONTRIBUTION_RATE_LIMIT", 5, "CONTRIBUTION", 60L)
+        define(cfg, "refresh", "REFRESH_RATE_LIMIT", 120, "REFRESH", 15L)
+    }
+    define(cfg: Config, action: String, limitEnv: String, limitDefault: Int, windowName: String, windowDefaultMinutes: Long) {
+        var minutes = cfg.getLong("REDE_SECURITY_RATE_LIMIT_" + windowName + "_WINDOW_MINUTES", windowDefaultMinutes)
+        limits.put(action, cfg.getInt(limitEnv, limitDefault))
+        windows.put(action, SlidingWindows(20000, minutes * 60000L))
+    }
+    static String signup() = "signup"
+    static String login() = "login"
+    static String password() = "password"
+    static String email() = "email"
+    static String twoFactor() = "2fa"
+    static String contribution() = "contribution"
+    static String refresh() = "refresh"
+    // Registers the attempt and says whether it passes; a rejected one is not counted. Unknown actions,
+    // limits and windows <= 0 never limit.
+    Bool tryAcquire(action: String, ip: String) {
+        var w = windows.get(action)
+        var limit = limits.get(action)
+        if (w == null) {
+            return true
+        }
+        if (limit == null) {
+            return true
+        }
+        if (limit <= 0) {
+            return true
+        }
+        if (w.windowMs <= 0L) {
+            return true
+        }
+        return w.tryAcquire(ip, SecurityClock.nowMillis(), limit)
+    }
+}

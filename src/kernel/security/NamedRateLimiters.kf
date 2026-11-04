@@ -1,0 +1,95 @@
+package kernel.security
+
+import java.util.HashMap
+import java.util.concurrent.locks.ReentrantLock
+import kernel.config.*
+import kernel.error.*
+
+// The resilience4j rate limiters of application.properties (the @RateLimiter(name=...) annotations):
+// `limit` permits per refresh period, no waiting (timeout 0): over it the call fails at once with
+// 429 RATE_LIMITED "Limite de requisicoes excedido." and Retry-After 60. Each limiter is one global
+// bucket per pod, a safety net; the real limits are per IP / per account (IpRateLimiter, AuthThrottle).
+// Defaults: auth 300/1m, twofa 60/1m, refresh 120/1m, search 120/1m, email-sending 200/15m. Env (Spring
+// relaxed names): RESILIENCE4J_RATELIMITER_INSTANCES_<NAME>_LIMIT_FOR_PERIOD and _LIMIT_REFRESH_PERIOD
+// (`1m`, `15m`, `30s`, `1h`, `500ms`); `email-sending` is EMAIL_SENDING.
+class NamedRateLimiters {
+    Map<String,Int> limits = new HashMap<String, Int>()
+    Map<String,Long> periods = new HashMap<String, Long>()
+    Map<String,Long> cycles = new HashMap<String, Long>()
+    Map<String,Int> used = new HashMap<String, Int>()
+    ReentrantLock gate = new ReentrantLock()
+    Long startedAt
+    public constructor(cfg: Config) {
+        this.startedAt = SecurityClock.nowMillis()
+        define(cfg, "auth", "AUTH", 300, "1m")
+        define(cfg, "twofa", "TWOFA", 60, "1m")
+        define(cfg, "refresh", "REFRESH", 120, "1m")
+        define(cfg, "search", "SEARCH", 120, "1m")
+        define(cfg, "email-sending", "EMAIL_SENDING", 200, "15m")
+    }
+    define(cfg: Config, name: String, envName: String, limit: Int, period: String) {
+        var base = "RESILIENCE4J_RATELIMITER_INSTANCES_" + envName
+        limits.put(name, cfg.getInt(base + "_LIMIT_FOR_PERIOD", limit))
+        periods.put(name, NamedRateLimiters.parsePeriod(cfg.getStr(base + "_LIMIT_REFRESH_PERIOD", period)))
+        cycles.put(name, -1L)
+        used.put(name, 0)
+    }
+    // `15m` -> 900000 ms. Unknown suffixes are a boot error.
+    static Long parsePeriod(raw: String) {
+        var t = raw.trim().toLowerCase()
+        var n = 0L
+        var unit = 0L
+        if (t.endsWith("ms")) {
+            n = t.substring(0, t.length() - 2).toLong()
+            unit = 1L
+        }
+        else 
+            if (t.endsWith("s")) {
+                n = t.substring(0, t.length() - 1).toLong()
+                unit = 1000L
+            }
+            else 
+                if (t.endsWith("m")) {
+                    n = t.substring(0, t.length() - 1).toLong()
+                    unit = 60000L
+                }
+                else 
+                    if (t.endsWith("h")) {
+                        n = t.substring(0, t.length() - 1).toLong()
+                        unit = 3600000L
+                    }
+                    else {
+                        throw "CONFIG_INVALID: rate limiter period " + raw + " must end in ms, s, m or h"
+                    }
+        return n * unit
+    }
+    // Takes one permit of the named limiter; false when the period's permits are spent.
+    Bool tryAcquire(name: String) {
+        var limit = limits.get(name)
+        var period = periods.get(name)
+        if (limit == null || period == null) {
+            throw "RATE_LIMITER_UNKNOWN: " + name
+        }
+        gate.lock()
+        var cycle = (SecurityClock.nowMillis() - startedAt) / period
+        var current = cycles.get(name)
+        if (current == null || current != cycle) {
+            cycles.put(name, cycle)
+            used.put(name, 0)
+        }
+        var n = used.get(name)
+        if (n == null || n >= limit) {
+            gate.unlock()
+            return false
+        }
+        used.put(name, n + 1)
+        gate.unlock()
+        return true
+    }
+    // The annotation's behaviour: 429 RATE_LIMITED + Retry-After 60 when spent.
+    require(name: String) {
+        if (!tryAcquire(name)) {
+            throw Errors.apiRetry(429, "RATE_LIMITED", "Limite de requisicoes excedido.", 60L)
+        }
+    }
+}
