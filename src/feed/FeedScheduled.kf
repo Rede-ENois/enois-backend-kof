@@ -1,0 +1,199 @@
+package feed
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.log.*
+import kernel.time.*
+
+record FeedScheduleBody(String? type, String? content, String? pageHtml, String? articleBody, List<String>? tags, List<String>? mediaIds, List<String>? mentionedUserIds, String? communityId, String? topic, String? scheduledAt)
+
+record FeedScheduledView(String id, String type, String? content, String? pageHtml, String? communityId, String? topic, String scheduledAt, String createdAt, String? lastError, Int attempts)
+
+record FeedScheduledRow(String id, String userId, String type, String? content, String? pageHtml, String? articleBody, List<String> tags, List<String> mediaIds, List<String> mentionedIds, String? communityId, String? topic, String scheduledAt, String createdAt, String? lastError, Int attempts)
+
+record FeedCancelResult(String id, String status)
+
+// ScheduledPostService + ScheduledPostPersistenceAdapter + ScheduledPostPublishWorker. A scheduled post lives in
+// `scheduled_posts` (never in `posts`) until its time; the worker publishes it through the normal use case.
+class FeedScheduled {
+    Db store
+    FeedService svc
+    Log log = Log("feed.scheduled")
+    public constructor(store: Db, svc: FeedService) {
+        this.store = store
+        this.svc = svc
+    }
+    static Int maxAttempts() = 3
+    static Int maxPending() = 50
+    static String columns() = "id, user_id, post_type, content, page_html, article_body, tags, media_ids, mentioned_ids, community_id, topic, scheduled_at, created_at, last_error, attempts"
+    static List<String> splitCsv(raw: String?) {
+        var out = listOf<String>()
+        if (raw == null) {
+            return out
+        }
+        for (var item in raw.split(",")) {
+            if (item.trim().length() > 0) {
+                out.add(item.trim())
+            }
+        }
+        return out
+    }
+    static String? joinCsv(values: List<String>) {
+        if (values.size() == 0) {
+            return null
+        }
+        return String.join(",", values)
+    }
+    static FeedScheduledRow rowOf(r: DbRow) = FeedScheduledRow(r.getStr("id"), r.getStr("user_id"), r.getStr("post_type"), r.getStrOrNull("content"), r.getStrOrNull("page_html"), r.getStrOrNull("article_body"), FeedScheduled.splitCsv(r.getStrOrNull("tags")), FeedScheduled.splitCsv(r.getStrOrNull("media_ids")), FeedScheduled.splitCsv(r.getStrOrNull("mentioned_ids")), r.getStrOrNull("community_id"), r.getStrOrNull("topic"), r.getInstant("scheduled_at"), r.getInstant("created_at"), r.getStrOrNull("last_error"), r.getInt("attempts"))
+    static FeedScheduledView viewOf(p: FeedScheduledRow) = FeedScheduledView(p.id(), p.type(), p.content(), p.pageHtml(), p.communityId(), p.topic(), p.scheduledAt(), p.createdAt(), p.lastError(), p.attempts())
+    static String invalid(code: String, message: String) = Errors.api(400, code, message)
+    static Bool hasContent(type: String, content: String?, pageHtml: String?, articleBody: String?) {
+        if (type == "PAGE") {
+            return FeedRules.hasText(pageHtml)
+        }
+        if (type == "ARTICLE") {
+            return FeedRules.hasText(content) && FeedRules.hasText(articleBody)
+        }
+        return FeedRules.hasText(content)
+    }
+    // The type spelling of the body: blank means missing (TIPO_OBRIGATORIO), unknown is TIPO_INVALIDO.
+    static String typeOf(raw: String?) {
+        if (!FeedRules.hasText(raw)) {
+            throw FeedScheduled.invalid("TIPO_OBRIGATORIO", "Escolha o tipo da publicação.")
+        }
+        var t = FeedRules.trimmed(raw).toUpperCase()
+        if (!FeedRules.postTypes().contains(t)) {
+            throw Errors.api(400, "TIPO_INVALIDO", "Tipo de publicação desconhecido.")
+        }
+        return t
+    }
+    // Blank is missing (DATA_OBRIGATORIA), malformed is DATA_INVALIDA.
+    static String instantOf(raw: String?) {
+        if (!FeedRules.hasText(raw)) {
+            throw FeedScheduled.invalid("DATA_OBRIGATORIA", "Escolha a data e a hora da publicação.")
+        }
+        var text = FeedRules.trimmed(raw)
+        try {
+            var ms = Time.toMillis(text)
+            return text
+        } catch (String e) {
+            throw Errors.api(400, "DATA_INVALIDA", "Data do agendamento inválida (use ISO 8601).")
+        }
+    }
+    // Same rule as a direct publication, early: a community post inherits its topic, a standalone one declares it.
+    static String? topicOf(communityId: String?, topicRaw: String?) {
+        if (FeedRules.hasText(communityId) && FeedRules.hasText(topicRaw)) {
+            throw FeedScheduled.invalid("TOPIC_FROM_COMMUNITY", "Post em comunidade herda o assunto dela.")
+        }
+        if (FeedRules.hasText(topicRaw)) {
+            var declared = FeedRules.trimmed(topicRaw).toUpperCase()
+            if (!FeedRules.topics().contains(declared)) {
+                throw FeedScheduled.invalid("INVALID_TOPIC", "Assunto inválido: escolha um da lista.")
+            }
+            return declared
+        }
+        if (FeedRules.hasText(communityId)) {
+            return null
+        }
+        throw FeedScheduled.invalid("TOPIC_REQUIRED", "Escolha o assunto da publicação.")
+    }
+    FeedScheduledView schedule(userId: String, b: FeedScheduleBody) {
+        var type = FeedScheduled.typeOf(b.type())
+        var scheduledAt = FeedScheduled.instantOf(b.scheduledAt())
+        var now = Time.nowIso()
+        var at = Time.toMillis(scheduledAt)
+        if (at < Time.toMillis(now) + 60000L) {
+            throw FeedScheduled.invalid("DATA_NO_PASSADO", "Escolha um horário pelo menos 1 minuto à frente.")
+        }
+        if (at > Time.toMillis(now) + 365L * 86400000L) {
+            throw FeedScheduled.invalid("DATA_MUITO_DISTANTE", "O agendamento vai até 1 ano à frente.")
+        }
+        if (!FeedScheduled.hasContent(type, b.content(), b.pageHtml(), b.articleBody())) {
+            throw FeedScheduled.invalid("CONTEUDO_OBRIGATORIO", "O post agendado não tem conteúdo.")
+        }
+        if (this.rowsOf(userId).size() >= FeedScheduled.maxPending()) {
+            throw Errors.api(409, "TOO_MANY_SCHEDULED", "Você já tem 50 posts agendados. Cancele algum para criar outro.")
+        }
+        var topic = FeedScheduled.topicOf(b.communityId(), b.topic())
+        var id = "sched_" + Ids.uuid().replace("-", "")
+        store.execute("insert into scheduled_posts (id, user_id, post_type, content, page_html, article_body, tags, media_ids, mentioned_ids, community_id, topic, scheduled_at, created_at, last_error, attempts) values (?,?,?,?,?,?,?,?,?,?,?,?,?,null,0)", DbParams().bindStr(id).bindStr(userId).bindStr(type).bindStrOrNull(b.content()).bindStrOrNull(b.pageHtml()).bindStrOrNull(b.articleBody()).bindStrOrNull(FeedScheduled.joinCsv(FeedRules.orEmpty(b.tags()))).bindStrOrNull(FeedScheduled.joinCsv(FeedRules.orEmpty(b.mediaIds()))).bindStrOrNull(FeedScheduled.joinCsv(FeedRules.orEmpty(b.mentionedUserIds()))).bindStrOrNull(b.communityId()).bindStrOrNull(topic).bindInstant(scheduledAt).bindInstant(now))
+        // Scheduling is the person's action today; the later automatic publication is not presence.
+        svc.coins.recordPresence(userId)
+        return FeedScheduled.viewOf(this.require(id))
+    }
+    FeedScheduledRow require(id: String) {
+        var r = store.queryOptional("select " + FeedScheduled.columns() + " from scheduled_posts where id = ?", DbParams().bindStr(id))
+        if (r == null) {
+            throw Errors.api(404, "SCHEDULED_POST_NOT_FOUND", "Post agendado não encontrado.")
+        }
+        return FeedScheduled.rowOf(r)
+    }
+    List<FeedScheduledRow> rowsOf(userId: String) {
+        var out = listOf<FeedScheduledRow>()
+        for (var r in store.queryList("select " + FeedScheduled.columns() + " from scheduled_posts where user_id = ? order by scheduled_at asc", DbParams().bindStr(userId))) {
+            out.add(FeedScheduled.rowOf(r))
+        }
+        return out
+    }
+    List<FeedScheduledView> list(userId: String) {
+        var out = listOf<FeedScheduledView>()
+        for (var p in this.rowsOf(userId)) {
+            out.add(FeedScheduled.viewOf(p))
+        }
+        return out
+    }
+    FeedCancelResult cancel(userId: String, id: String) {
+        var p = this.require(id)
+        if (p.userId() != userId) {
+            throw Errors.api(403, "NOT_OWNER", "Este post agendado não é seu.")
+        }
+        store.execute("delete from scheduled_posts where id = ?", DbParams().bindStr(id))
+        return FeedCancelResult(id, "CANCELLED")
+    }
+    // Publishes what is due. Each item has its own try: one refusal never blocks the queue.
+    Int publishDue() {
+        var due = listOf<FeedScheduledRow>()
+        for (var r in store.queryList("select " + FeedScheduled.columns() + " from scheduled_posts where scheduled_at <= ? and attempts < ? order by scheduled_at asc limit 20", DbParams().bindInstant(Time.nowIso()).bindInt(FeedScheduled.maxAttempts()))) {
+            due.add(FeedScheduled.rowOf(r))
+        }
+        var published = 0
+        for (var p in due) {
+            var failure = this.tryPublish(p)
+            if (failure == null) {
+                store.execute("delete from scheduled_posts where id = ?", DbParams().bindStr(p.id()))
+                published = published + 1
+            } else {
+                var reason = FeedScheduled.limited(failure)
+                store.execute("update scheduled_posts set last_error = ?, attempts = attempts + 1 where id = ?", DbParams().bindStr(reason).bindStr(p.id()))
+                log.warn("scheduled post refused id=" + p.id() + " attempt=" + (p.attempts() + 1))
+            }
+        }
+        return published
+    }
+    static String limited(reason: String) {
+        if (reason.length() > 500) {
+            return reason.substring(0, 500)
+        }
+        return reason
+    }
+    // Mentions count at publication time: whoever is tagged is told when the post goes live.
+    String? tryPublish(p: FeedScheduledRow) {
+        try {
+            var body = FeedPublishBody(p.type(), p.content(), p.pageHtml(), p.articleBody(), p.tags(), p.mediaIds(), p.communityId(), p.mentionedIds(), p.topic(), null, false, null, null)
+            svc.publish(p.userId(), body)
+            return null
+        } catch (String e) {
+            return FeedScheduled.reasonOf(e)
+        }
+    }
+    static String reasonOf(e: String) {
+        if (Errors.isApi(e)) {
+            var m = Errors.parse(e).message()
+            if (m.trim().length() > 0) {
+                return m
+            }
+        }
+        return "Não foi possível publicar no horário marcado."
+    }
+}

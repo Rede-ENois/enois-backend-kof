@@ -1,0 +1,87 @@
+import feed.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Port of ReportedContentAdapterTests, PostAuthorIdentityTests, the domain PostContentLimitsTests and
+// UserContentPurgeServiceTests (the domain rules are asserted through the HTTP contract or the static rules).
+test "reads the post text" {
+    var author = FeedTestSupport.user("user_reported_content1")
+    var postId = FeedFixtures.publish(author, "content-post-1", "Compre seguidores barato no meu site")
+    var text = FeedTestSupport.module().moderation.contentOf("POST", postId)
+    Check.isTrue("post text", FeedRules.nz(text).contains("Compre seguidores barato no meu site"))
+}
+
+test "reads the page html too" {
+    var author = FeedTestSupport.user("user_reported_content2")
+    var res = FeedTestSupport.post(author, "content-post-2", "{\"topic\":\"TECNOLOGIA\",\"type\":\"PAGE\",\"content\":\"Titulo da pagina\",\"pageHtml\":\"<h1>corpo da pagina denunciada</h1>\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(res, 201)
+    var text = FeedRules.nz(FeedTestSupport.module().moderation.contentOf("POST", FeedTestSupport.field(res, "id")))
+    Check.isTrue("html", text.contains("corpo da pagina denunciada"))
+    Check.isTrue("title", text.contains("Titulo da pagina"))
+}
+
+test "reads the comment text" {
+    var author = FeedTestSupport.user("user_reported_content3")
+    var postId = FeedFixtures.publish(author, "content-post-3", "post com comentario denunciado")
+    var commentId = FeedFixtures.comment(author, postId, "seu idiota, some daqui", "content-comment-1")
+    Check.isTrue("comment text", FeedRules.nz(FeedTestSupport.module().moderation.contentOf("COMMENT", commentId)).contains("seu idiota"))
+}
+
+test "reads what a profile shows" {
+    FeedTestSupport.user("perfil_denunciado_spam")
+    Check.isTrue("profile text", FeedRules.nz(FeedTestSupport.module().moderation.contentOf("USER", "perfil_denunciado_spam")).contains("perfil_denunciado_spam"))
+}
+
+test "is empty for targets without text" {
+    var moderation = FeedTestSupport.module().moderation
+    Check.isTrue("job", moderation.contentOf("JOB", "job_inexistente") == null)
+    Check.isTrue("missing post", moderation.contentOf("POST", "post_inexistente") == null)
+    Check.isTrue("no kind", moderation.contentOf(null, "qualquer") == null)
+}
+
+test "the author of a reported target is who the sanction falls on" {
+    var author = FeedTestSupport.user("user_reported_author")
+    var postId = FeedFixtures.publish(author, "content-post-4", "post denunciado com autor")
+    var commentId = FeedFixtures.comment(author, postId, "comentario denunciado", "content-comment-2")
+    var moderation = FeedTestSupport.module().moderation
+    Check.eqStr("post", "user_reported_author", FeedRules.nz(moderation.authorOf("POST", postId)))
+    Check.eqStr("comment", "user_reported_author", FeedRules.nz(moderation.authorOf("COMMENT", commentId)))
+    Check.eqStr("user", "someone", FeedRules.nz(moderation.authorOf("USER", "someone")))
+    Check.isTrue("other kinds", moderation.authorOf("JOB", "job_x") == null)
+}
+
+test "publishing defaults to the social identity and an edit never swaps it" {
+    var author = FeedTestSupport.user("identity_author")
+    var postId = FeedFixtures.publish(author, "identity-1", "texto de identidade social")
+    Check.jsonEq(FeedTestSupport.app().client.getWith("/feed/posts/" + postId, FeedTestSupport.read(author)), "authorIdentity", "SOCIAL")
+    var edited = FeedTestSupport.send("PATCH", "/feed/posts/" + postId, author, "identity-edit-1", "{\"content\":\"novo texto\",\"tags\":[]}")
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "authorIdentity", "SOCIAL")
+}
+
+test "the content limits of each type" {
+    Check.eqInt("question", 1200, FeedRules.contentLimit("QUESTION"))
+    Check.eqInt("tutorial", 5000, FeedRules.contentLimit("TUTORIAL"))
+    Check.eqInt("insight", 1200, FeedRules.contentLimit("INSIGHT"))
+}
+
+test "a purge removes posts and comments and detaches foreign replies" {
+    FeedTestSupport.user("user_purge_spammer")
+    FeedTestSupport.user("user_purge_victim")
+    var at = "2026-10-29T12:00:00Z"
+    FeedRows.insert("post_purge_spam", "user_purge_spammer", at)
+    FeedRows.insert("post_purge_victim", "user_purge_victim", at)
+    FeedRows.comment("comment_purge_own", "post_purge_spam", "user_purge_spammer", at)
+    FeedRows.comment("comment_purge_foreign", "post_purge_victim", "user_purge_spammer", at)
+    FeedTestSupport.module().store.insertComment(FeedCommentRow("comment_purge_reply", "post_purge_victim", "user_purge_victim", "comment_purge_foreign", "resposta legitima", at, "ACTIVE", null, false, false), listOf<String>())
+    var result = FeedTestSupport.module().moderation.purgeAllByAuthor("user_purge_victim", "user_purge_spammer", "teste de purga")
+    Check.eqInt("posts", 1, result.posts())
+    Check.eqInt("comments", 2, result.comments())
+    var db = FeedTestSupport.app().db()
+    Check.eqInt("spam post gone", 0, db.queryLong("select count(*) from posts where id = 'post_purge_spam'", DbParams()) as Int)
+    Check.eqStr("victim post stays active", "ACTIVE", db.queryOne("select status from posts where id = 'post_purge_victim'", DbParams()).getStr("status"))
+    Check.eqInt("own comment gone", 0, db.queryLong("select count(*) from comments where id = 'comment_purge_own'", DbParams()) as Int)
+    Check.eqInt("foreign comment gone", 0, db.queryLong("select count(*) from comments where id = 'comment_purge_foreign'", DbParams()) as Int)
+    var reply = db.queryOne("select parent_comment_id from comments where id = 'comment_purge_reply'", DbParams())
+    Check.isTrue("reply detached", reply.isNull("parent_comment_id"))
+}

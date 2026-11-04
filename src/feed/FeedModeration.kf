@@ -1,0 +1,266 @@
+package feed
+
+import kernel.audit.*
+import kernel.db.*
+import kernel.error.*
+import kernel.outbox.*
+import kernel.time.*
+
+record FeedPurgeResult(Int posts, Int comments, Int otherRows)
+
+// The moderation-facing use cases of the feed (DeletePostService.removeAsModerator/quarantine/release,
+// DeleteCommentService.removeAsModerator, UserContentPurgeService). The moderation domain calls these through
+// FeedModule.moderation; nothing here is reachable over HTTP.
+class FeedModeration {
+    Db store
+    FeedStore posts
+    FeedService svc
+    Outbox outbox
+    Audit audit
+    public constructor(store: Db, posts: FeedStore, svc: FeedService, outbox: Outbox, audit: Audit) {
+        this.store = store
+        this.posts = posts
+        this.svc = svc
+        this.outbox = outbox
+        this.audit = audit
+    }
+    // Moderation removes a post (an ACTIVE or QUARANTINED one: confirmed violation), reposts included.
+    removeAsModerator(moderatorId: String, postId: String, reason: String?) {
+        var p = posts.post(postId)
+        if (p == null) {
+            return
+        }
+        if (p.status() != "ACTIVE" && p.status() != "QUARANTINED") {
+            return
+        }
+        var self = this
+        store.transaction(() -> {
+    self.removePost(p)
+    self.audit.write(moderatorId, "POST_DELETED_BY_MODERATION", p.id(), FeedRules.trimmedOrNull(reason))
+})
+    }
+    removePost(p: FeedPostRow) {
+        var now = Time.nowIso()
+        posts.markDeleted(p.id(), now)
+        for (var rid in posts.activeRepostIds(p.id())) {
+            posts.markDeleted(rid, now)
+        }
+        outbox.append("PostDeleted", p.id(), "{\"postId\":\"" + p.id() + "\"}")
+        svc.releaseMedia(p)
+    }
+    // Takes an ACTIVE post off the air without deleting it (precaution, not punishment); true when it moved.
+    Bool quarantine(actorId: String, postId: String, reason: String?) {
+        var changed = store.execute("update posts set status = 'QUARANTINED', deleted_at = null where id = ? and status = 'ACTIVE'", DbParams().bindStr(postId))
+        if (changed == 0) {
+            return false
+        }
+        audit.write(actorId, "POST_QUARANTINED", postId, FeedRules.trimmedOrNull(reason))
+        return true
+    }
+    Bool release(actorId: String, postId: String) {
+        var changed = store.execute("update posts set status = 'ACTIVE', deleted_at = null where id = ? and status = 'QUARANTINED'", DbParams().bindStr(postId))
+        if (changed == 0) {
+            return false
+        }
+        audit.write(actorId, "POST_QUARANTINE_RELEASED", postId, null)
+        return true
+    }
+    // Moderation removes a comment (soft delete: it leaves every list, the row stays for audit and appeals).
+    removeCommentAsModerator(moderatorId: String, commentId: String, reason: String?) {
+        var c = posts.comment(commentId)
+        if (c == null) {
+            return
+        }
+        if (c.status() != "ACTIVE") {
+            return
+        }
+        var self = this
+        store.transaction(() -> {
+    self.markCommentDeleted(c)
+    self.audit.write(moderatorId, "COMMENT_DELETED_BY_MODERATION", commentId, FeedRules.trimmedOrNull(reason))
+})
+    }
+    markCommentDeleted(c: FeedCommentRow) {
+        store.execute("update posts set accepted_comment_id = null, resolved_at = null where accepted_comment_id = ?", DbParams().bindStr(c.id()))
+        store.execute("update comments set status = 'DELETED', pinned = false where id = ?", DbParams().bindStr(c.id()))
+        posts.bump(c.postId(), "comments", false)
+    }
+    // Total purge of an author's content, deleting ROWS (banned spam accounts). Order matters: foreign keys
+    // point at posts and comments at themselves.
+    FeedPurgeResult purgeAllByAuthor(actorId: String?, authorId: String, reason: String?) {
+        var self = this
+        var result = FeedPurgeResult(0, 0, 0)
+        var counts = listOf<Int>()
+        store.transaction(() -> {
+    var r = self.purgeRows(authorId)
+    counts.add(r.posts())
+    counts.add(r.comments())
+    counts.add(r.otherRows())
+    self.audit.write(FeedRules.actorOr(actorId, authorId), "USER_CONTENT_PURGED", authorId, FeedRules.nz(reason) + " | posts=" + r.posts() + " comments=" + r.comments())
+})
+        result = FeedPurgeResult(counts.get(0), counts.get(1), counts.get(2))
+        return result
+    }
+    List<String> idsOf(sql: String, params: DbParams) {
+        var out = listOf<String>()
+        for (var r in store.queryList(sql, params)) {
+            out.add(r.getStr("id"))
+        }
+        return out
+    }
+    FeedPurgeResult purgeRows(authorId: String) {
+        var postIds = this.idsOf("select id from posts where author_id = ?", DbParams().bindStr(authorId))
+        for (var id in postIds) {
+            var p = posts.post(id)
+            if (p != null) {
+                svc.releaseMedia(p)
+            }
+            outbox.append("PostDeleted", id, "{\"postId\":\"" + id + "\",\"reason\":\"USER_PURGED\"}")
+        }
+        var commentIds = this.idsOf("select id from comments where author_id = ?", DbParams().bindStr(authorId))
+        if (postIds.size() > 0) {
+            for (var cid in this.idsOf("select id from comments where post_id in (" + FeedStore.marks(postIds.size()) + ")", FeedStore.withList(DbParams(), postIds))) {
+                if (!commentIds.contains(cid)) {
+                    commentIds.add(cid)
+                }
+            }
+        }
+        var other = 0
+        if (commentIds.size() > 0) {
+            // Replies of other people to a removed comment become top-level; their reactions go; questions whose
+            // accepted answer was the spammer's reopen.
+            other = other + this.run("update comments set parent_comment_id = null where parent_comment_id in (%)", commentIds)
+            other = other + this.run("delete from comment_reactions where comment_id in (%)", commentIds)
+            other = other + this.run("update posts set accepted_comment_id = null, resolved_at = null where accepted_comment_id in (%)", commentIds)
+            other = other + this.run("delete from comment_media where comment_id in (%)", commentIds)
+        }
+        var commentCount = this.run("delete from comments where post_id in (%)", postIds)
+        commentCount = commentCount + store.execute("delete from comments where author_id = ?", DbParams().bindStr(authorId))
+        other = other + this.run("delete from reactions where post_id in (%)", postIds)
+        other = other + this.run("delete from saved_posts where post_id in (%)", postIds)
+        other = other + this.run("delete from post_shares where post_id in (%)", postIds)
+        other = other + this.run("delete from post_tags where post_id in (%)", postIds)
+        other = other + this.run("delete from post_media where post_id in (%)", postIds)
+        other = other + this.run("delete from post_seals where post_id in (%)", postIds)
+        other = other + this.run("delete from articles where post_id in (%)", postIds)
+        other = other + this.run("delete from post_notes where post_id in (%)", postIds)
+        // Beyond the Java list: rows that point at the posts through a foreign key or by id.
+        other = other + this.run("delete from post_reposts where post_id in (%)", postIds)
+        other = other + this.run("delete from poll_votes where post_id in (%)", postIds)
+        other = other + this.run("delete from poll_options where post_id in (%)", postIds)
+        var postCount = this.run("delete from posts where id in (%)", postIds)
+        other = other + store.execute("delete from post_notes where author_id = ?", DbParams().bindStr(authorId))
+        // Safety net: posts created after the SELECT (an active spammer during the purge).
+        postCount = postCount + store.execute("delete from posts where author_id = ?", DbParams().bindStr(authorId))
+        return FeedPurgeResult(postCount, commentCount, other)
+    }
+    // One statement with the list as an IN clause, chunked at 1000 ids.
+    Int run(sql: String, ids: List<String>) {
+        var total = 0
+        var start = 0
+        while (start < ids.size()) {
+            var end = start + 1000
+            if (end > ids.size()) {
+                end = ids.size()
+            }
+            var chunk = listOf<String>()
+            var i = start
+            while (i < end) {
+                chunk.add(ids.get(i))
+                i = i + 1
+            }
+            total = total + store.execute(sql.replace("%", FeedStore.marks(chunk.size())), FeedStore.withList(DbParams(), chunk))
+            start = end
+        }
+        return total
+    }
+    // ReportedContentAdapter: the text of a reported target for the AI triage. A page is its html (the post text is
+    // only the title), so both enter, html first. A profile is what the person wrote about themselves.
+    // pending-port: groups (GROUP_POST / GROUP_COMMENT belong to the groups domain).
+    String? contentOf(kind: String?, targetId: String) = FeedModeration.shorten(this.rawContent(kind, targetId))
+    String? rawContent(kind: String?, targetId: String) {
+        if (FeedRules.same(kind, "POST")) {
+            return this.postText(targetId)
+        }
+        if (FeedRules.same(kind, "COMMENT")) {
+            return this.commentText(targetId)
+        }
+        if (FeedRules.same(kind, "USER")) {
+            return this.profileText(targetId)
+        }
+        return null
+    }
+    String? postText(postId: String) {
+        var p = posts.post(postId)
+        if (p == null) {
+            return null
+        }
+        return FeedModeration.joined(p.pageHtml(), p.content(), "\n\n")
+    }
+    String? commentText(commentId: String) {
+        var c = posts.comment(commentId)
+        if (c == null) {
+            return null
+        }
+        return c.content()
+    }
+    String? profileText(userId: String) {
+        var r = store.queryOptional("select name, headline, company, location, bio from users where id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        var out = listOf<String>()
+        for (var col in listOf("name", "headline", "company", "location", "bio")) {
+            var v = r.getStrOrNull(col)
+            if (v != null && v.trim().length() > 0) {
+                out.add(v)
+            }
+        }
+        return String.join("\n", out)
+    }
+    static String joined(first: String?, second: String?, separator: String) {
+        var out = listOf<String>()
+        if (FeedRules.hasText(first)) {
+            out.add(FeedRules.nz(first))
+        }
+        if (FeedRules.hasText(second)) {
+            out.add(FeedRules.nz(second))
+        }
+        return String.join(separator, out)
+    }
+    // At most 4000 characters (enough to judge, not enough to blow the prompt); blank is no content.
+    static String? shorten(text: String?) {
+        if (text == null) {
+            return null
+        }
+        var t = text.trim()
+        if (t.length() == 0) {
+            return null
+        }
+        if (t.length() > 4000) {
+            return t.substring(0, 4000)
+        }
+        return t
+    }
+    // ReportedContentAuthorAdapter: who a sanction on the reported target falls on.
+    String? authorOf(kind: String, targetId: String) {
+        if (kind == "POST") {
+            var p = posts.post(targetId)
+            if (p == null) {
+                return null
+            }
+            return p.authorId()
+        }
+        if (kind == "COMMENT") {
+            var c = posts.comment(targetId)
+            if (c == null) {
+                return null
+            }
+            return c.authorId()
+        }
+        if (kind == "USER") {
+            return targetId
+        }
+        return null
+    }
+}

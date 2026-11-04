@@ -1,0 +1,71 @@
+import feed.*
+import kernel.html.*
+import kernel.testkit.*
+
+// Port of CommunityOnPostTests and CommunityPagePostTests (communities are rows of the owner's tables).
+TestResponse publishPage(token: String, communityId: String, html: String, key: String) = FeedTestSupport.post(token, key, "{\"type\":\"PAGE\",\"content\":\"\",\"pageHtml\":\"" + html + "\",\"tags\":[],\"mediaIds\":[],\"communityId\":\"" + communityId + "\"}")
+
+test "a post carries the community name and the viewer membership" {
+    var author = FeedTestSupport.user("user_comm_author")
+    var viewer = FeedTestSupport.user("user_comm_viewer")
+    FeedWorld.community("comm_on_post_java", "Comunidade Java do Vale", "TECNOLOGIA", "user_comm_author")
+    var postId = FeedWorld.publishIn(author, "comm-post-1", "comm_on_post_java", "Primeira publicacao dentro da comunidade.")
+    var c = FeedTestSupport.app().client
+    var mine = c.getWith("/feed/posts/" + postId, FeedTestSupport.read(author))
+    Check.status(mine, 200)
+    Check.jsonEq(mine, "community.id", "comm_on_post_java")
+    Check.jsonEq(mine, "community.name", "Comunidade Java do Vale")
+    Check.jsonEq(mine, "community.joined", "true")
+    var other = c.getWith("/feed/posts/" + postId, FeedTestSupport.read(viewer))
+    Check.jsonEq(other, "community.name", "Comunidade Java do Vale")
+    Check.jsonEq(other, "community.joined", "false")
+    FeedWorld.join("comm_on_post_java", "user_comm_viewer", "MEMBER")
+    Check.jsonEq(c.getWith("/feed/posts/" + postId, FeedTestSupport.read(viewer)), "community.joined", "true")
+}
+
+test "a post outside a community has no community" {
+    var author = FeedTestSupport.user("user_comm_plain")
+    var postId = FeedWorld.publishTopic(author, "plain-post-1", "TECNOLOGIA", "Post solto no feed, sem comunidade.")
+    Check.isTrue("no community", FeedTestSupport.app().client.getWith("/feed/posts/" + postId, FeedTestSupport.read(author)).jsonIsNull("community"))
+}
+
+test "publishes a small page inside a community" {
+    var author = FeedTestSupport.user("user_com_page1")
+    FeedWorld.community("comm_page_small", "Comunidade da pagina pequena", "TECNOLOGIA", "user_com_page1")
+    var res = publishPage(author, "comm_page_small", "<h1>Pagina</h1><p>corpo da pagina</p>", "com-page-small")
+    Check.status(res, 201)
+    Check.jsonEq(res, "type", "PAGE")
+    Check.jsonEq(res, "communityId", "comm_page_small")
+}
+
+test "publishes a big page inside a community" {
+    var author = FeedTestSupport.user("user_com_page2")
+    FeedWorld.community("comm_page_big", "Comunidade da pagina grande", "TECNOLOGIA", "user_com_page2")
+    var big = "<div class=\\\"bloco\\\"><h2>Secao</h2><p>" + strings.repeat("conteudo da pagina com texto suficiente para pesar. ", 250) + "</p></div>"
+    var res = publishPage(author, "comm_page_big", big, "com-page-big")
+    Check.status(res, 201)
+    Check.jsonEq(res, "type", "PAGE")
+    Check.jsonEq(res, "communityId", "comm_page_big")
+}
+
+test "rejects a page above the limit with a clear message" {
+    var author = FeedTestSupport.user("user_com_page3")
+    FeedWorld.community("comm_page_limit", "Comunidade da pagina no limite", "TECNOLOGIA", "user_com_page3")
+    var html = "<div><p>" + strings.repeat("a", SafeHtml.maxPageHtml()) + "</p></div>"
+    Check.apiError(publishPage(author, "comm_page_limit", html, "com-page-limit"), 400, "PAGE_HTML_TOO_LONG")
+}
+
+test "publishes a page with emoji and control characters" {
+    var author = FeedTestSupport.user("user_com_page4")
+    FeedWorld.community("comm_page_emoji", "Comunidade da pagina com emoji", "TECNOLOGIA", "user_com_page4")
+    var html = "<h1>Minha pagina 🫵🚀</h1><p>texto com emoji e acentuacao</p><p>tab\\tcarriage\\rnull\\u0000char</p>"
+    var res = publishPage(author, "comm_page_emoji", html, "com-page-emoji")
+    Check.status(res, 201)
+    Check.jsonEq(res, "type", "PAGE")
+}
+
+test "publishes a page with a NUL byte only" {
+    var author = FeedTestSupport.user("user_com_page5")
+    FeedWorld.community("comm_page_nul", "Comunidade da pagina com nul", "TECNOLOGIA", "user_com_page5")
+    Check.status(publishPage(author, "comm_page_nul", "<p>antes\\u0000depois</p>", "com-page-nul"), 201)
+}

@@ -692,6 +692,8 @@ other pods, the TTL is the guarantee. Caches: `publicProfiles` (20 s, 5000), `pu
 ```kotlin
 import kernel.text.*
 
+Base64Url.encode(text)  Base64Url.decode(encoded)   // URL-safe Base64 without padding (opaque cursors); decode throws on bad input
+
 PlainText.defuse(raw): String?                 // bidi/zero-width removed, <=5 combining marks, runs capped at 12 ("travazap")
 TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "nome", value, 160)   // 400 "O campo nome aceita no máximo 160 caracteres."
 LikePattern.contains(q)  LikePattern.startsWith(q)  LikePattern.escape(t) // null for blank; SQL must say `escape '!'`

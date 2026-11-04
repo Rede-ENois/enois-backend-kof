@@ -36,7 +36,8 @@ class FeedService {
     UserRateLimiter limiter
     NewAccountCooldown cooldown
     BehavioralTimingGuard timing
-    public constructor(store: Db, posts: FeedStore, authors: FeedAuthors, media: FeedMedia, communities: FeedCommunities, notifier: FeedNotifier, ageGate: FeedAgeGate, coins: FeedCoins, corporate: FeedCorporate, blocked: BlockedUsers, sanctions: SanctionGate, risk: RiskEngine, duplication: ContentDuplicationGuard, outbox: Outbox, audit: Audit, parts: SecurityParts) {
+    FeedNotes notes
+    public constructor(store: Db, posts: FeedStore, authors: FeedAuthors, media: FeedMedia, communities: FeedCommunities, notifier: FeedNotifier, ageGate: FeedAgeGate, coins: FeedCoins, corporate: FeedCorporate, blocked: BlockedUsers, sanctions: SanctionGate, risk: RiskEngine, duplication: ContentDuplicationGuard, outbox: Outbox, audit: Audit, parts: SecurityParts, notes: FeedNotes) {
         this.store = store
         this.posts = posts
         this.authors = authors
@@ -55,6 +56,7 @@ class FeedService {
         this.limiter = parts.userLimiter
         this.cooldown = parts.newAccountCooldown
         this.timing = parts.timingGuard
+        this.notes = notes
     }
     // ---- shared guards ----
     guardWrite(userId: String, action: String) {
@@ -102,27 +104,8 @@ class FeedService {
         }
         return communities.byId(communityId, viewerId)
     }
-    FeedNameStyle? styleOf(a: FeedAuthor?, social: Bool) {
-        if (a == null) {
-            return null
-        }
-        if (!social) {
-            return null
-        }
-        if (a.nameTheme() == null && a.nameFont() == null && a.nameColor() == null && a.nameplate() == null) {
-            return null
-        }
-        return FeedNameStyle(a.nameTheme(), a.nameFont(), a.nameColor(), a.nameplate())
-    }
-    FeedContributorTag? tagOf(a: FeedAuthor?, social: Bool, contributor: Bool) {
-        if (a == null) {
-            return null
-        }
-        if (!social || !contributor) {
-            return null
-        }
-        return FeedContributorTag(a.contributorTagColor())
-    }
+    FeedNameStyle? styleOf(a: FeedAuthor?, social: Bool) = FeedViews.styleOf(a, social)
+    FeedContributorTag? tagOf(a: FeedAuthor?, social: Bool, contributor: Bool) = FeedViews.tagOf(a, social, contributor)
     FeedCommunityView? communityViewOf(ref: FeedCommunityRef?) {
         if (ref == null) {
             return null
@@ -157,7 +140,7 @@ class FeedService {
         if (author != null) {
             badges = author.badges()
         }
-        return FeedPostView(p.id(), p.authorId(), this.usernameOf(author), this.nameOf(author, p.authorId()), this.avatarOf(author), this.firstOf(badges), badges, p.type(), p.content(), null, null, tags, mediaIds, p.createdAt(), FeedRules.counters(p), null, p.communityId(), null, p.editedAt(), p.expiresAt(), p.authorIdentity(), this.frameOf(author), p.topic(), p.repostOf(), p.repostOfAuthor(), p.repostWithOpinion(), null, listOf<String>(), null, p.mediaSpoiler(), this.styleOf(author, social), this.tagOf(author, social, contributor), listOf<String>(), null, p.acceptedCommentId(), null, null, false, listOf<FeedMediaSummary>(), p.acceptedCommentId() != null)
+        return FeedPostView(p.id(), p.authorId(), this.usernameOf(author), this.nameOf(author, p.authorId()), this.avatarOf(author), this.firstOf(badges), badges, p.type(), p.content(), null, null, tags, mediaIds, p.createdAt(), FeedRules.counters(p), null, p.communityId(), null, p.editedAt(), p.expiresAt(), p.authorIdentity(), this.frameOf(author), p.topic(), p.repostOf(), p.repostOfAuthor(), p.repostWithOpinion(), null, listOf<String>(), null, p.mediaSpoiler(), this.styleOf(author, social), this.tagOf(author, social, contributor), listOf<FeedNoteView>(), null, p.acceptedCommentId(), null, null, false, listOf<FeedMediaSummary>(), p.acceptedCommentId() != null)
     }
     String? usernameOf(a: FeedAuthor?) {
         if (a == null) {
@@ -217,8 +200,10 @@ class FeedService {
         }
         return FeedPollView(options, per, myVote, total)
     }
-    // GetFeedService.enrich for a page: author, reaction pills, viewer reaction, community, poll, media.
-    List<FeedPostView> enrich(rows: List<FeedPostRow>, viewerId: String?) {
+    // GetFeedService.enrich for a page: author, reaction pills, viewer reaction, community, poll, media, notes,
+    // repost quote and flag. `reposters` marks pure reposts ("X republicou") by post id.
+    List<FeedPostView> enrich(rows: List<FeedPostRow>, viewerId: String?) = this.enrichWith(rows, viewerId, new HashMap<String, FeedRepostedBy>())
+    List<FeedPostView> enrichWith(rows: List<FeedPostRow>, viewerId: String?, reposters: Map<String,FeedRepostedBy>) {
         var out = listOf<FeedPostView>()
         if (rows.size() == 0) {
             return out
@@ -236,6 +221,7 @@ class FeedService {
         var ids = listOf<String>()
         var authorIds = listOf<String>()
         var communityIds = listOf<String>()
+        var quotedIds = listOf<String>()
         for (var r in visible) {
             ids.add(r.id())
             if (!authorIds.contains(r.authorId())) {
@@ -244,6 +230,10 @@ class FeedService {
             var cid = r.communityId()
             if (cid != null && !communityIds.contains(cid)) {
                 communityIds.add(cid)
+            }
+            var source = r.repostOf()
+            if (source != null && r.repostWithOpinion() && !quotedIds.contains(source)) {
+                quotedIds.add(source)
             }
         }
         var profiles = authors.byIds(authorIds)
@@ -262,9 +252,14 @@ class FeedService {
         }
         var mediaById = media.visibleByIds(mediaFlat)
         var reactions = new HashMap<String, String>()
+        var reposted = new ArrayList<String>()
+        var mine = new HashMap<String, FeedMyNote>()
         if (viewerId != null) {
             reactions = posts.userReactions(viewerId, ids)
+            reposted = new ArrayList<String>(posts.repostedAmong(viewerId, ids))
+            mine = notes.mineByPost(viewerId, ids)
         }
+        var noteViews = notes.viewsByPost(ids, hidden)
         var summaries = posts.reactionSummaries(ids, hidden)
         var optionsByPost = posts.pollOptions(ids)
         var pollIds = listOf<String>()
@@ -283,6 +278,11 @@ class FeedService {
                 refs.put(cid, ref)
             }
         }
+        var quoted = new HashMap<String, FeedPostRow>()
+        for (var q in posts.posts(quotedIds)) {
+            quoted.put(q.id(), q)
+        }
+        var quotedMedia = posts.mediaOf(quotedIds)
         for (var r in visible) {
             var t = FeedRules.orEmpty(tags.get(r.id()))
             var m = FeedRules.orEmpty(medias.get(r.id()))
@@ -296,7 +296,8 @@ class FeedService {
             var summary = FeedRules.orNone(summaries.get(r.id()))
             var community = this.communityViewOf(this.refIn(refs, r.communityId()))
             var poll = this.pollOf(optionsByPost.get(r.id()), pollCounts.get(r.id()), myVotes.get(r.id()))
-            out.add(FeedPostView(v.id(), v.authorId(), v.authorUsername(), v.authorName(), v.authorAvatar(), v.authorBadge(), v.authorBadges(), v.type(), v.content(), null, null, v.tags(), v.mediaIds(), v.createdAt(), v.counters(), reactions.get(r.id()), v.communityId(), community, v.editedAt(), v.expiresAt(), v.authorIdentity(), v.authorAvatarFrame(), v.topic(), v.repostOf(), v.repostOfAuthor(), v.repostWithOpinion(), null, listOf<String>(), summary, v.mediaSpoiler(), v.authorStyle(), v.authorContributor(), listOf<String>(), null, v.acceptedCommentId(), poll, null, false, this.mediaIn(m, mediaById), v.resolved()))
+            var quote = FeedRules.quoteOf(quoted, r.repostOf(), r.repostWithOpinion())
+            out.add(FeedPostView(v.id(), v.authorId(), v.authorUsername(), v.authorName(), v.authorAvatar(), v.authorBadge(), v.authorBadges(), v.type(), v.content(), null, null, v.tags(), v.mediaIds(), v.createdAt(), v.counters(), reactions.get(r.id()), v.communityId(), community, v.editedAt(), v.expiresAt(), v.authorIdentity(), v.authorAvatarFrame(), v.topic(), v.repostOf(), v.repostOfAuthor(), v.repostWithOpinion(), FeedRules.quoteContent(quote), FeedRules.quoteMedia(quote, quotedMedia), summary, v.mediaSpoiler(), v.authorStyle(), v.authorContributor(), FeedViews.notesOrEmpty(noteViews.get(r.id())), mine.get(r.id()), v.acceptedCommentId(), poll, reposters.get(r.id()), reposted.contains(r.id()), this.mediaIn(m, mediaById), v.resolved()))
         }
         return out
     }
@@ -422,7 +423,7 @@ class FeedService {
         var isContributor = authors.contributorIds(listOf(userId)).contains(userId)
         var view = this.baseView(row, tags, mediaIds, author, isContributor)
         var summaries = media.visibleByIds(mediaIds)
-        return FeedPostView(view.id(), view.authorId(), view.authorUsername(), view.authorName(), view.authorAvatar(), view.authorBadge(), view.authorBadges(), view.type(), view.content(), null, null, view.tags(), view.mediaIds(), view.createdAt(), view.counters(), null, view.communityId(), null, view.editedAt(), view.expiresAt(), view.authorIdentity(), view.authorAvatarFrame(), view.topic(), null, null, false, null, listOf<String>(), null, view.mediaSpoiler(), view.authorStyle(), view.authorContributor(), listOf<String>(), null, null, null, null, false, this.mediaIn(mediaIds, summaries), false)
+        return FeedPostView(view.id(), view.authorId(), view.authorUsername(), view.authorName(), view.authorAvatar(), view.authorBadge(), view.authorBadges(), view.type(), view.content(), null, null, view.tags(), view.mediaIds(), view.createdAt(), view.counters(), null, view.communityId(), null, view.editedAt(), view.expiresAt(), view.authorIdentity(), view.authorAvatarFrame(), view.topic(), null, null, false, null, listOf<String>(), null, view.mediaSpoiler(), view.authorStyle(), view.authorContributor(), listOf<FeedNoteView>(), null, null, null, null, false, this.mediaIn(mediaIds, summaries), false)
     }
     String? expiryOf(type: String, now: String) {
         if (type == "MOMENT") {
@@ -613,7 +614,7 @@ class FeedService {
         var author = authors.byIds(listOf(p.authorId())).get(p.authorId())
         var contributor = authors.contributorIds(listOf(p.authorId())).contains(p.authorId())
         var view = this.baseView(p, tags, mediaIds, author, contributor)
-        return FeedPostView(view.id(), view.authorId(), view.authorUsername(), view.authorName(), view.authorAvatar(), view.authorBadge(), view.authorBadges(), view.type(), view.content(), null, null, view.tags(), view.mediaIds(), view.createdAt(), view.counters(), null, view.communityId(), null, view.editedAt(), view.expiresAt(), view.authorIdentity(), view.authorAvatarFrame(), view.topic(), view.repostOf(), view.repostOfAuthor(), view.repostWithOpinion(), null, listOf<String>(), null, view.mediaSpoiler(), view.authorStyle(), view.authorContributor(), listOf<String>(), null, view.acceptedCommentId(), null, null, false, this.mediaIn(mediaIds, media.visibleByIds(mediaIds)), view.resolved())
+        return FeedPostView(view.id(), view.authorId(), view.authorUsername(), view.authorName(), view.authorAvatar(), view.authorBadge(), view.authorBadges(), view.type(), view.content(), null, null, view.tags(), view.mediaIds(), view.createdAt(), view.counters(), null, view.communityId(), null, view.editedAt(), view.expiresAt(), view.authorIdentity(), view.authorAvatarFrame(), view.topic(), view.repostOf(), view.repostOfAuthor(), view.repostWithOpinion(), null, listOf<String>(), null, view.mediaSpoiler(), view.authorStyle(), view.authorContributor(), listOf<FeedNoteView>(), null, view.acceptedCommentId(), null, null, false, this.mediaIn(mediaIds, media.visibleByIds(mediaIds)), view.resolved())
     }
     FeedPostView edit(userId: String, postId: String, b: FeedEditBody, newType: String?) {
         var p = posts.post(postId)

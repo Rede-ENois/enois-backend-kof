@@ -1,0 +1,67 @@
+import feed.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of ScheduledPostTests.
+String inSeconds(s: Long) = Time.fromMillis(Time.nowMillis() + s * 1000L)
+
+String schedule(token: String, key: String, content: String, at: String, communityId: String?) {
+    var body = "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"" + content + "\",\"scheduledAt\":\"" + at + "\"}"
+    if (communityId != null) {
+        body = "{\"type\":\"INSIGHT\",\"content\":\"" + content + "\",\"scheduledAt\":\"" + at + "\",\"communityId\":\"" + communityId + "\"}"
+    }
+    var res = FeedTestSupport.send("POST", "/feed/scheduled", token, key, body)
+    Check.status(res, 201)
+    Check.jsonEq(res, "scheduledAt", at)
+    return FeedTestSupport.field(res, "id")
+}
+
+backdate(id: String) {
+    FeedTestSupport.app().db().execute("update scheduled_posts set scheduled_at = ?, last_error = null, attempts = 0 where id = ?", DbParams().bindInstant(Time.fromMillis(Time.nowMillis() - 5000L)).bindStr(id))
+}
+
+test "schedule, list and cancel" {
+    var owner = FeedTestSupport.user("user_sched_owner")
+    var id = schedule(owner, "sched-owner-1", "Post agendado de teste.", inSeconds(600L), null)
+    var list = FeedTestSupport.app().client.getWith("/feed/scheduled", FeedTestSupport.read(owner))
+    Check.status(list, 200)
+    Check.jsonEq(list, "0.id", id)
+    Check.jsonEq(list, "0.content", "Post agendado de teste.")
+    var del = FeedTestSupport.send("DELETE", "/feed/scheduled/" + id, owner, "sched-del-1", "")
+    Check.status(del, 200)
+    Check.jsonEq(del, "status", "CANCELLED")
+    Check.eqInt("empty", 0, FeedTestSupport.app().client.getWith("/feed/scheduled", FeedTestSupport.read(owner)).jsonSize(""))
+}
+
+test "a past date is rejected" {
+    var owner = FeedTestSupport.user("user_sched_past")
+    var res = FeedTestSupport.send("POST", "/feed/scheduled", owner, "sched-past-1", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"texto\",\"scheduledAt\":\"" + inSeconds(-60L) + "\"}")
+    Check.apiError(res, 400, "DATA_NO_PASSADO")
+}
+
+test "a standalone post without a topic is rejected" {
+    var owner = FeedTestSupport.user("user_sched_no_topic")
+    var res = FeedTestSupport.send("POST", "/feed/scheduled", owner, "sched-no-topic-1", "{\"type\":\"INSIGHT\",\"content\":\"texto\",\"scheduledAt\":\"" + inSeconds(600L) + "\"}")
+    Check.apiError(res, 400, "TOPIC_REQUIRED")
+}
+
+test "a due post is published by the normal use case and leaves the queue" {
+    var owner = FeedTestSupport.user("user_sched_due")
+    var id = schedule(owner, "sched-due-1", "Post agendado devido.", inSeconds(600L), null)
+    backdate(id)
+    FeedTestSupport.module().scheduled.publishDue()
+    var db = FeedTestSupport.app().db()
+    Check.eqInt("left the queue", 0, db.queryLong("select count(*) from scheduled_posts where id = ?", DbParams().bindStr(id)) as Int)
+    Check.eqInt("published", 1, db.queryLong("select count(*) from posts where author_id = ? and content = ? and status = 'ACTIVE'", DbParams().bindStr("user_sched_due").bindStr("Post agendado devido.")) as Int)
+}
+
+test "a refused publication keeps the row with the reason" {
+    var owner = FeedTestSupport.user("user_sched_refused")
+    var id = schedule(owner, "sched-refused-1", "Post para comunidade inexistente.", inSeconds(600L), "community_nao_existe")
+    backdate(id)
+    FeedTestSupport.module().scheduled.publishDue()
+    var row = FeedTestSupport.app().db().queryOne("select attempts, last_error from scheduled_posts where id = ?", DbParams().bindStr(id))
+    Check.eqInt("attempts", 1, row.getInt("attempts"))
+    Check.isTrue("reason", FeedRules.nz(row.getStrOrNull("last_error")).contains("Comunidade"))
+}

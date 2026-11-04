@@ -1,0 +1,74 @@
+import feed.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of BadgesEverywhereTests, ContributorTagEverywhereTests and NameStyleEverywhereTests. Badges, name style and
+// the contributor seal are columns/rows of the profile, cosmetics and contributions ports: the fixtures write them.
+// The notification actorStyle test is not ported (see docs/PORTING_STATUS.md: it reads GET /notifications).
+test "a post and a comment carry the five badges" {
+    var autor = FeedTestSupport.user("badges-autor")
+    var badges = "https://cdn.test/emblema-1.png\nhttps://cdn.test/emblema-2.png\nhttps://cdn.test/emblema-3.png\nhttps://cdn.test/emblema-4.png\nhttps://cdn.test/emblema-5.png"
+    FeedTestSupport.app().db().execute("update users set badges = ? where id = ?", DbParams().bindStr(badges).bindStr("badges-autor"))
+    var published = FeedTestSupport.post(autor, "badges-pub-1", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Post com cinco emblemas.\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(published, 201)
+    Check.eqInt("five badges", 5, published.jsonSize("authorBadges"))
+    Check.jsonEq(published, "authorBadges.0", "https://cdn.test/emblema-1.png")
+    Check.jsonEq(published, "authorBadges.4", "https://cdn.test/emblema-5.png")
+    Check.jsonEq(published, "authorBadge", "https://cdn.test/emblema-1.png")
+    var comment = FeedTestSupport.send("POST", "/feed/posts/" + FeedTestSupport.field(published, "id") + "/comments", autor, "badges-comment-1", "{\"content\":\"Comentario com os mesmos emblemas.\",\"mediaIds\":[],\"mentionedUserIds\":[]}")
+    Check.status(comment, 201)
+    Check.eqInt("five badges on the comment", 5, comment.jsonSize("authorBadges"))
+    var sem = FeedTestSupport.user("badges-sem")
+    var plain = FeedTestSupport.post(sem, "badges-pub-2", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Sem emblema nenhum.\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(plain, 201)
+    Check.eqInt("no badges", 0, plain.jsonSize("authorBadges"))
+    Check.isTrue("no legacy badge", plain.jsonIsNull("authorBadge"))
+}
+
+test "publication, read and comment carry the contributor tag" {
+    var autor = FeedTestSupport.user("contrib_tag_autor")
+    FeedTestSupport.app().db().execute("insert into user_seals (id, user_id, seal_type, category, status, granted_at, evidence_count) values (?, ?, 'AJUDANTE', 'CODE', 'ACTIVE', ?, 1)", DbParams().bindStr("seal_tag_1").bindStr("contrib_tag_autor").bindInstant(Time.nowIso()))
+    var published = FeedTestSupport.post(autor, "contrib-tag-pub-1", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Post de contribuinte.\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(published, 201)
+    Check.isTrue("tag on the publication", !published.jsonIsNull("authorContributor"))
+    var postId = FeedTestSupport.field(published, "id")
+    Check.isTrue("tag on the read", !FeedTestSupport.app().client.getWith("/feed/posts/" + postId, FeedTestSupport.read(autor)).jsonIsNull("authorContributor"))
+    var comment = FeedTestSupport.send("POST", "/feed/posts/" + postId + "/comments", autor, "contrib-tag-comment-1", "{\"content\":\"Comentario de contribuinte.\",\"mediaIds\":[],\"mentionedUserIds\":[]}")
+    Check.status(comment, 201)
+    Check.isTrue("tag on the comment", !comment.jsonIsNull("authorContributor"))
+    var list = FeedTestSupport.app().client.getWith("/feed/posts/" + postId + "/comments", FeedTestSupport.read(autor))
+    Check.isTrue("tag on the listed comment", !list.jsonIsNull("items.0.authorContributor"))
+}
+
+test "who has no active seal gets no tag" {
+    var autor = FeedTestSupport.user("contrib_tag_sem")
+    var published = FeedTestSupport.post(autor, "contrib-tag-sem-pub", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Post sem selo.\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(published, 201)
+    Check.isTrue("no tag", published.jsonIsNull("authorContributor"))
+}
+
+test "publication, comment and read carry the name personalization" {
+    var autor = FeedTestSupport.user("name_style_autor")
+    FeedTestSupport.app().db().execute("update users set name_theme = 'NEON', name_font = 'DISPLAY', name_color = '#ff4fa3' where id = ?", DbParams().bindStr("name_style_autor"))
+    var published = FeedTestSupport.post(autor, "name-style-pub-1", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Post com nome personalizado.\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(published, 201)
+    Check.jsonEq(published, "authorStyle.theme", "NEON")
+    Check.jsonEq(published, "authorStyle.font", "DISPLAY")
+    Check.jsonEq(published, "authorStyle.color", "#ff4fa3")
+    var postId = FeedTestSupport.field(published, "id")
+    var read = FeedTestSupport.app().client.getWith("/feed/posts/" + postId, FeedTestSupport.read(autor))
+    Check.jsonEq(read, "authorStyle.theme", "NEON")
+    Check.jsonEq(read, "authorStyle.color", "#ff4fa3")
+    var comment = FeedTestSupport.send("POST", "/feed/posts/" + postId + "/comments", autor, "name-style-comment-1", "{\"content\":\"Comentario com o mesmo estilo.\",\"mediaIds\":[],\"mentionedUserIds\":[]}")
+    Check.status(comment, 201)
+    Check.jsonEq(comment, "authorStyle.theme", "NEON")
+    Check.jsonEq(comment, "authorStyle.font", "DISPLAY")
+}
+
+test "who did not personalize sends no style" {
+    var autor = FeedTestSupport.user("name_style_sem")
+    var published = FeedTestSupport.post(autor, "name-style-sem-pub", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Post sem personalizacao.\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(published, 201)
+    Check.isTrue("no style", published.jsonIsNull("authorStyle"))
+}

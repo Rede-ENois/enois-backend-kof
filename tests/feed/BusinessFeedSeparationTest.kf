@@ -1,0 +1,63 @@
+import feed.*
+import kernel.testkit.*
+
+// Port of BusinessFeedSeparationTests (the professional profile is a row of `corporate_profiles` until the
+// corporate port: its endpoints are not part of the feed).
+String publishType(token: String, key: String, type: String, content: String) {
+    var res = FeedTestSupport.post(token, key, "{\"topic\":\"TECNOLOGIA\",\"type\":\"" + type + "\",\"content\":\"" + content + "\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(res, 201)
+    return FeedTestSupport.field(res, "id")
+}
+
+test "social and business of the same account stay apart" {
+    var author = FeedTestSupport.user("bizsep_author")
+    FeedWorld.setUsername("bizsep_author", "bizsep-author")
+    var denied = FeedTestSupport.post(author, "biz-sem-perfil", "{\"topic\":\"TECNOLOGIA\",\"type\":\"BUSINESS\",\"content\":\"Anuncio corporativo.\",\"tags\":[],\"mediaIds\":[]}")
+    Check.apiError(denied, 403, "NO_ACTIVE_CORPORATE_PROFILE")
+    FeedWorld.corporate("bizsep_author", "bizsep.pro", "Autor Profissional", "ACTIVE")
+    var socialId = publishType(author, "biz-INSIGHT-1", "INSIGHT", "Post social da mesma pessoa.")
+    var businessId = publishType(author, "biz-BUSINESS-1", "BUSINESS", "Post corporativo da mesma pessoa.")
+    var c = FeedTestSupport.app().client
+    var all = c.getWith("/feed?tab=ALL&limit=50", FeedTestSupport.read(author))
+    Check.status(all, 200)
+    var ids = FeedWorld.feedIds(author, "tab=ALL&limit=50")
+    Check.isTrue("social in all", FeedWorld.listed(ids, socialId))
+    Check.isTrue("business out of all", !FeedWorld.listed(ids, businessId))
+    Check.eqStr("identity", "SOCIAL", FeedRows.fieldOf(all, socialId, "authorIdentity"))
+    for (var tab in listOf("DISCUSSIONS", "PROJECTS")) {
+        Check.isTrue("business out of " + tab, !FeedWorld.listed(FeedWorld.feedIds(author, "tab=" + tab), businessId))
+    }
+    var corporate = c.getWith("/feed/corporate", FeedTestSupport.read(author))
+    Check.status(corporate, 200)
+    Check.eqStr("corporate identity", "CORPORATE", FeedRows.fieldOf(corporate, businessId, "authorIdentity"))
+    Check.eqStr("corporate name", "Autor Profissional", FeedRows.fieldOf(corporate, businessId, "authorName"))
+    Check.eqStr("corporate username", "bizsep.pro", FeedRows.fieldOf(corporate, businessId, "authorUsername"))
+    Check.isTrue("social not on the corporate feed", !FeedRows.ids(corporate).contains(socialId))
+    var profile = c.get("/users/bizsep-author/posts")
+    Check.status(profile, 200)
+    Check.isTrue("social on the profile", FeedRows.ids(profile).contains(socialId))
+    Check.isTrue("business not on the social profile", !FeedRows.ids(profile).contains(businessId))
+    var page = c.get("/corporate/bizsep.pro/posts")
+    Check.status(page, 200)
+    Check.eqStr("page name", "Autor Profissional", FeedRows.fieldOf(page, businessId, "authorName"))
+    Check.eqStr("page identity", "CORPORATE", FeedRows.fieldOf(page, businessId, "authorIdentity"))
+    Check.isTrue("social not on the corporate page", !FeedRows.ids(page).contains(socialId))
+}
+
+test "editing does not swap the identity" {
+    var author = FeedTestSupport.user("bizsep_editor")
+    FeedWorld.corporate("bizsep_editor", "bizsep.ed", "Editor Profissional", "ACTIVE")
+    var businessId = publishType(author, "biz-BUSINESS-2", "BUSINESS", "Corporativo original.")
+    var swap = FeedTestSupport.send("PATCH", "/feed/posts/" + businessId, author, "biz-edit-troca", "{\"type\":\"INSIGHT\",\"content\":\"tentativa de virar social\",\"tags\":[]}")
+    Check.apiError(swap, 400, "IDENTITY_TYPE_MISMATCH")
+    var ok = FeedTestSupport.send("PATCH", "/feed/posts/" + businessId, author, "biz-edit-ok", "{\"type\":\"BUSINESS\",\"content\":\"Corporativo editado.\",\"tags\":[]}")
+    Check.status(ok, 200)
+    var corporate = FeedTestSupport.app().client.getWith("/feed/corporate", FeedTestSupport.read(author))
+    Check.eqStr("edited", "Corporativo editado.", FeedRows.fieldOf(corporate, businessId, "content"))
+}
+
+test "an inactive professional profile has no page" {
+    var author = FeedTestSupport.user("bizsep_inativo")
+    FeedWorld.corporate("bizsep_inativo", "bizsep.off", "Perfil em Construcao", "INACTIVE")
+    Check.apiError(FeedTestSupport.app().client.get("/corporate/bizsep.off/posts"), 404, "PROFILE_NOT_FOUND")
+}

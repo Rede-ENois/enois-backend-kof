@@ -1,0 +1,168 @@
+import feed.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of QuestionAcceptedAnswerTests. The coin ledger is replaced by FeedRecordingCoins (one reward per
+// `resposta:<post>` reference), the BanCleanupService test belongs to the moderation port.
+String veteran(id: String) {
+    var token = FeedTestSupport.user(id)
+    FeedTestSupport.app().db().execute("update users set created_at = ? where id = ?", DbParams().bindInstant(Time.fromMillis(Time.nowMillis() - 30L * 86400000L)).bindStr(id))
+    return token
+}
+
+String ask(token: String, key: String, type: String, content: String) {
+    var res = FeedTestSupport.post(token, key, "{\"topic\":\"TECNOLOGIA\",\"type\":\"" + type + "\",\"content\":\"" + content + "\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(res, 201)
+    return FeedTestSupport.field(res, "id")
+}
+
+TestResponse accept(token: String, postId: String, commentId: String) = FeedTestSupport.app().client.send("POST", "/feed/posts/" + postId + "/accepted-answer", listOf("X-Session-Token: " + token, "Content-Type: application/json"), "", "{\"commentId\":\"" + commentId + "\"}")
+
+TestResponse unaccept(token: String, postId: String) = FeedTestSupport.send("DELETE", "/feed/posts/" + postId + "/accepted-answer", token, "unaccept-" + postId, "")
+
+assertOpen(questionId: String) {
+    var read = FeedTestSupport.app().client.get("/feed/posts/" + questionId)
+    Check.isTrue("no accepted comment", read.jsonIsNull("acceptedCommentId"))
+    Check.jsonEq(read, "resolved", "false")
+    Check.eqInt("resolved_at is null", 1, FeedTestSupport.app().db().queryLong("select count(*) from posts where id = ? and resolved_at is null", DbParams().bindStr(questionId)) as Int)
+}
+
+test "the asker accepts the answer, it resolves, pays and notifies" {
+    var asker = veteran("qaa_asker1")
+    var helper = veteran("qaa_helper1")
+    var questionId = ask(asker, "qaa-1", "QUESTION", "Como rodo um teste so no maven?")
+    var answerId = FeedFixtures.comment(helper, questionId, "Usa -Dtest=NomeDaClasse", "qaa-c-1")
+    var res = accept(asker, questionId, answerId)
+    Check.status(res, 200)
+    Check.jsonEq(res, "acceptedCommentId", answerId)
+    Check.jsonEq(res, "resolved", "true")
+    var read = FeedTestSupport.app().client.get("/feed/posts/" + questionId)
+    Check.jsonEq(read, "acceptedCommentId", answerId)
+    Check.jsonEq(read, "resolved", "true")
+    Check.jsonEq(FeedTestSupport.app().client.get("/feed/posts/" + questionId + "/comments"), "items.0.accepted", "true")
+    Check.eqInt("paid once", 1, FeedRecordingCoins.rewardsOf(questionId, "qaa_helper1"))
+    var hrefs = FeedTestSupport.app().db().queryList("select href from notifications where user_id = ? and kind = 'ANSWER_ACCEPTED'", DbParams().bindStr("qaa_helper1"))
+    Check.eqInt("one notification", 1, hrefs.size())
+    Check.eqStr("href", "/api/feed/posts/" + questionId, hrefs.get(0).getStr("href"))
+}
+
+test "only the asker accepts" {
+    var asker = veteran("qaa_asker2")
+    var helper = veteran("qaa_helper2")
+    var questionId = ask(asker, "qaa-2", "QUESTION", "Duvida que so a dona resolve")
+    var answerId = FeedFixtures.comment(helper, questionId, "Resposta da helper2", "qaa-c-2")
+    Check.apiError(accept(helper, questionId, answerId), 403, "NOT_QUESTION_AUTHOR")
+}
+
+test "an own comment cannot be accepted" {
+    var asker = veteran("qaa_asker3")
+    var questionId = ask(asker, "qaa-3", "QUESTION", "Duvida com auto resposta")
+    var ownId = FeedFixtures.comment(asker, questionId, "Eu mesma respondo", "qaa-c-3")
+    Check.apiError(accept(asker, questionId, ownId), 400, "OWN_ANSWER")
+    Check.eqInt("not paid", 0, FeedRecordingCoins.rewardsOf(questionId, "qaa_asker3"))
+}
+
+test "a comment from another post is refused" {
+    var asker = veteran("qaa_asker4")
+    var helper = veteran("qaa_helper4")
+    var questionId = ask(asker, "qaa-4a", "QUESTION", "Duvida A do asker4")
+    var otherId = ask(asker, "qaa-4b", "QUESTION", "Duvida B do asker4")
+    var foreignAnswer = FeedFixtures.comment(helper, otherId, "Resposta da duvida B", "qaa-c-4")
+    Check.apiError(accept(asker, questionId, foreignAnswer), 400, "INVALID_ANSWER_COMMENT")
+}
+
+test "only questions have accepted answers" {
+    var asker = veteran("qaa_asker5")
+    var helper = veteran("qaa_helper5")
+    var insightId = ask(asker, "qaa-5", "INSIGHT", "Isto nao e uma duvida")
+    var commentId = FeedFixtures.comment(helper, insightId, "Comentario num insight", "qaa-c-5")
+    Check.apiError(accept(asker, insightId, commentId), 400, "NOT_A_QUESTION")
+}
+
+test "changing the accepted answer never pays twice" {
+    var asker = veteran("qaa_asker6")
+    var first = veteran("qaa_helper6a")
+    var second = veteran("qaa_helper6b")
+    var questionId = ask(asker, "qaa-6", "QUESTION", "Duvida com duas respostas")
+    var firstAnswer = FeedFixtures.comment(first, questionId, "Primeira resposta", "qaa-c-6a")
+    var secondAnswer = FeedFixtures.comment(second, questionId, "Segunda resposta", "qaa-c-6b")
+    Check.status(accept(asker, questionId, firstAnswer), 200)
+    var swapped = accept(asker, questionId, secondAnswer)
+    Check.status(swapped, 200)
+    Check.jsonEq(swapped, "acceptedCommentId", secondAnswer)
+    Check.status(unaccept(asker, questionId), 200)
+    Check.status(accept(asker, questionId, firstAnswer), 200)
+    Check.eqInt("first paid once", 1, FeedRecordingCoins.rewardsOf(questionId, "qaa_helper6a"))
+    Check.eqInt("second never paid", 0, FeedRecordingCoins.rewardsOf(questionId, "qaa_helper6b"))
+}
+
+test "unaccept reopens the question" {
+    var asker = veteran("qaa_asker7")
+    var helper = veteran("qaa_helper7")
+    var questionId = ask(asker, "qaa-7", "QUESTION", "Duvida que volta a ficar aberta")
+    var answerId = FeedFixtures.comment(helper, questionId, "Resposta que deixa de valer", "qaa-c-7")
+    Check.status(accept(asker, questionId, answerId), 200)
+    var res = unaccept(asker, questionId)
+    Check.status(res, 200)
+    Check.jsonEq(res, "resolved", "false")
+    var read = FeedTestSupport.app().client.get("/feed/posts/" + questionId)
+    Check.isTrue("no accepted comment", read.jsonIsNull("acceptedCommentId"))
+    Check.jsonEq(read, "resolved", "false")
+    Check.jsonEq(FeedTestSupport.app().client.get("/feed/posts/" + questionId + "/comments"), "items.0.accepted", "false")
+}
+
+test "the feed filters questions by resolved" {
+    var asker = veteran("qaa_asker8")
+    var helper = veteran("qaa_helper8")
+    var resolvedId = ask(asker, "qaa-8a", "QUESTION", "Duvida resolvida do filtro")
+    var openId = ask(asker, "qaa-8b", "QUESTION", "Duvida aberta do filtro")
+    Check.status(accept(asker, resolvedId, FeedFixtures.comment(helper, resolvedId, "Resposta do filtro", "qaa-c-8")), 200)
+    var answered = FeedWorld.feedIds(asker, "tab=ALL&type=QUESTION&resolved=true&limit=50")
+    var open = FeedWorld.feedIds(asker, "tab=ALL&type=QUESTION&resolved=false&limit=50")
+    Check.isTrue("answered has the resolved", FeedWorld.listed(answered, resolvedId))
+    Check.isTrue("answered lacks the open", !FeedWorld.listed(answered, openId))
+    Check.isTrue("open has the open", FeedWorld.listed(open, openId))
+    Check.isTrue("open lacks the resolved", !FeedWorld.listed(open, resolvedId))
+}
+
+test "a reward failure keeps the acceptance" {
+    var asker = veteran("qaa_asker9")
+    var helper = veteran("qaa_helper9")
+    var questionId = ask(asker, "qaa-9", "QUESTION", "Duvida com o cofre fora do ar")
+    var answerId = FeedFixtures.comment(helper, questionId, "Resposta sem faisca", "qaa-c-9")
+    FeedRecordingCoins.failNextPayment = true
+    Check.status(accept(asker, questionId, answerId), 200)
+    Check.jsonEq(FeedTestSupport.app().client.get("/feed/posts/" + questionId), "acceptedCommentId", answerId)
+    Check.eqInt("not paid", 0, FeedRecordingCoins.rewardsOf(questionId, "qaa_helper9"))
+}
+
+test "a new account answer is accepted but not paid" {
+    var asker = veteran("qaa_asker10")
+    var newcomer = FeedTestSupport.user("qaa_newcomer10")
+    var questionId = ask(asker, "qaa-10", "QUESTION", "Duvida respondida por conta nova")
+    var answerId = FeedFixtures.comment(newcomer, questionId, "Resposta de quem acabou de chegar", "qaa-c-10")
+    Check.status(accept(asker, questionId, answerId), 200)
+    Check.eqInt("not paid", 0, FeedRecordingCoins.rewardsOf(questionId, "qaa_newcomer10"))
+}
+
+test "the author deleting the accepted answer reopens the question" {
+    var asker = veteran("qaa_asker11")
+    var helper = veteran("qaa_helper11")
+    var questionId = ask(asker, "qaa-11", "QUESTION", "Duvida cuja resposta some")
+    var answerId = FeedFixtures.comment(helper, questionId, "Resposta que o autor apaga", "qaa-c-11")
+    Check.status(accept(asker, questionId, answerId), 200)
+    Check.status(FeedTestSupport.send("DELETE", "/feed/posts/" + questionId + "/comments/" + answerId, helper, "qaa-del-11", ""), 200)
+    assertOpen(questionId)
+    Check.eqInt("the payment stays", 1, FeedRecordingCoins.rewardsOf(questionId, "qaa_helper11"))
+}
+
+test "a spam purge removing the accepted answer reopens the question" {
+    var asker = veteran("qaa_asker13")
+    var helper = veteran("qaa_helper13")
+    var questionId = ask(asker, "qaa-13", "QUESTION", "Duvida respondida por spammer")
+    var answerId = FeedFixtures.comment(helper, questionId, "Resposta de quem vai ser purgado", "qaa-c-13")
+    Check.status(accept(asker, questionId, answerId), 200)
+    FeedTestSupport.module().moderation.purgeAllByAuthor("admin_qaa13", "qaa_helper13", "teste")
+    assertOpen(questionId)
+}

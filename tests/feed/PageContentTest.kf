@@ -1,0 +1,59 @@
+import feed.*
+import kernel.testkit.*
+
+// Port of PageContentTests. The preview card (og.png) tests are in PagePreviewCardTest.
+String publishKind(token: String, key: String, type: String, html: String) {
+    var body = "{\"topic\":\"TECNOLOGIA\",\"type\":\"" + type + "\",\"content\":\"texto\",\"tags\":[],\"mediaIds\":[]}"
+    if (type == "PAGE") {
+        body = "{\"topic\":\"TECNOLOGIA\",\"type\":\"PAGE\",\"content\":\"texto\",\"pageHtml\":\"" + html + "\",\"tags\":[],\"mediaIds\":[]}"
+    }
+    var res = FeedTestSupport.post(token, key, body)
+    Check.status(res, 201)
+    return FeedTestSupport.field(res, "id")
+}
+
+test "serves the sanitized page with the policy in headers" {
+    var author = FeedTestSupport.user("user_page_content1")
+    var postId = publishKind(author, "page-content-1", "PAGE", "<h1>Minha pagina</h1><script>alert(1)</script><p onclick=\\\"x()\\\">corpo</p>")
+    var res = FeedTestSupport.app().client.get("/pages/" + postId)
+    Check.status(res, 200)
+    Check.isTrue("html content type", FeedRules.nz(res.header("Content-Type")).contains("text/html"))
+    Check.eqStr("nosniff", "nosniff", FeedRules.nz(res.header("X-Content-Type-Options")))
+    Check.eqStr("referrer", "no-referrer", FeedRules.nz(res.header("Referrer-Policy")))
+    var csp = FeedRules.nz(res.header("Content-Security-Policy"))
+    Check.isTrue("no script", csp.contains("script-src 'none'"))
+    Check.isTrue("frame ancestors", csp.contains("frame-ancestors"))
+    Check.isTrue("frame src", csp.contains("frame-src"))
+    Check.isTrue("title kept", res.body.contains("Minha pagina"))
+    Check.isTrue("text kept", res.body.contains("corpo"))
+    Check.isTrue("no script tag", !res.body.contains("<script"))
+    Check.isTrue("no handler", !res.body.contains("onclick"))
+    Check.isTrue("no payload", !res.body.contains("alert("))
+}
+
+test "only published pages are served" {
+    var author = FeedTestSupport.user("user_page_content2")
+    var insight = publishKind(author, "page-content-2", "INSIGHT", "")
+    var page = publishKind(author, "page-content-3", "PAGE", "<p>pagina que sera apagada</p>")
+    var c = FeedTestSupport.app().client
+    Check.apiError(c.get("/pages/" + insight), 404, "PAGE_NOT_FOUND")
+    Check.apiError(c.get("/pages/post_inexistente_123"), 404, "PAGE_NOT_FOUND")
+    Check.status(FeedTestSupport.send("DELETE", "/feed/posts/" + page, author, "page-content-del", ""), 200)
+    Check.apiError(c.get("/pages/" + page), 404, "PAGE_NOT_FOUND")
+}
+
+// Port of previewCardForSomethingThatIsNotAPageIsNotFound. A real page answers 501 until the runtime can write a
+// binary body (docs/KOF_GAPS.md G145): previewCardShowsThePageText and PagePreviewCardServiceTests are not ported.
+test "the preview card of something that is not a page is not found" {
+    var author = FeedTestSupport.user("user_page_card2")
+    var insight = publishKind(author, "page-card-2", "INSIGHT", "")
+    var c = FeedTestSupport.app().client
+    Check.apiError(c.get("/pages/" + insight + "/og.png"), 404, "PAGE_NOT_FOUND")
+    Check.apiError(c.get("/pages/post_inexistente_999/og.png"), 404, "PAGE_NOT_FOUND")
+}
+
+test "the preview card of a real page is unavailable while the runtime cannot write bytes" {
+    var author = FeedTestSupport.user("user_page_card")
+    var page = publishKind(author, "page-card-1", "PAGE", "<h1>Meu portfolio de dados</h1>")
+    Check.apiError(FeedTestSupport.app().client.get("/pages/" + page + "/og.png"), 501, "PAGE_CARD_UNAVAILABLE")
+}

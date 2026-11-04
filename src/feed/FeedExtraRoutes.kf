@@ -1,0 +1,177 @@
+package feed
+
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+
+// HTTP adapter of the rest of the feed controllers: FeedController (GET /feed, profile posts, repost), FeedSeenController,
+// ScheduledPostController, PostSealContractController, FeedCorporateController, PostNoteController,
+// AdminPostNoteController and QuestionAnswerController.
+class FeedExtraRoutes {
+    // Default policy of the page document: `script-src 'none'` on the page, known video providers as frames, only the
+    // app may embed it (REDE_PAGES_CONTENT_SECURITY_POLICY overrides it per environment).
+    static String defaultCsp() = "default-src 'none'; img-src https: data:; media-src https: data:; font-src data:; style-src 'unsafe-inline'; frame-src https://www.youtube-nocookie.com https://www.youtube.com https://player.vimeo.com https://www.dailymotion.com https://player.twitch.tv https://open.spotify.com https://w.soundcloud.com; script-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self' https://enois.ia.br https://*.enois.ia.br"
+    // Spring Boolean conversion of `resolved`: blank is unset (-1), anything unknown is a 400.
+    static Int resolvedOf(raw: String?) {
+        if (raw == null) {
+            return -1
+        }
+        var t = raw.trim().toLowerCase()
+        if (t.length() == 0) {
+            return -1
+        }
+        if (t == "true" || t == "1" || t == "on" || t == "yes") {
+            return 1
+        }
+        if (t == "false" || t == "0" || t == "off" || t == "no") {
+            return 0
+        }
+        throw Errors.badRequest()
+    }
+    // The preview card is a PNG and a Kof 0.7.1 handler answers a String that the runtime writes as UTF-8, so no
+    // binary body can leave the server (docs/KOF_GAPS.md G145): a real page answers 501 until the runtime can.
+    static String cardUnavailable() {
+        throw Errors.api(501, "PAGE_CARD_UNAVAILABLE", "O cartao de previa da pagina esta indisponivel.")
+    }
+    static FeedSeenBody seenBody() {
+        try {
+            return json.decode<FeedSeenBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static FeedRepostBody repostBody() {
+        var text = Req.bodyText()
+        if (text.trim().length() == 0) {
+            return FeedRepostBody(null)
+        }
+        try {
+            return json.decode<FeedRepostBody>(text)
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static FeedScheduleBody scheduleBody() {
+        try {
+            return json.decode<FeedScheduleBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static FeedSealBody sealBody() {
+        try {
+            return json.decode<FeedSealBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static FeedNoteBody noteBody() {
+        try {
+            return json.decode<FeedNoteBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static FeedNoteReviewBody reviewBody() {
+        try {
+            return json.decode<FeedNoteReviewBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static FeedAcceptBody acceptBody() {
+        try {
+            return json.decode<FeedAcceptBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    // The batch read of seals shares its prefix with GET /feed/posts/:postId and the runtime serves the first match: it
+    // is registered before FeedRoutes (Spring prefers the literal path by itself).
+    static registerLiteralRoutes(server: HttpServer, seals: FeedSeals) {
+        server.get("/feed/posts/seals", () -> seals.forIds(query("ids"), Auth.viewerIdOrNull()))
+    }
+    static register(server: HttpServer, idem: Idempotency, svc: FeedService, reader: FeedReader, reposts: FeedReposts, scheduled: FeedScheduled, seals: FeedSeals, notes: FeedNotes, answers: FeedAnswers, csp: String) {
+        server.get("/feed", () -> {
+    var userId = Auth.requireUser()
+    var cursor = query("cursor")
+    var tab = Req.queryStr("tab", "FOR_YOU")
+    var resolved = FeedExtraRoutes.resolvedOf(query("resolved"))
+    return json.encode(reader.feed(userId, cursor, Req.queryInt("limit", 20), tab, FeedReader.typesOf(Req.rawQuery()), resolved, cursor))
+})
+        server.get("/users/:username/posts", () -> json.encode(reader.profilePosts(Auth.viewerIdOrNull(), Req.pathParam("username"), query("cursor"), Req.queryInt("limit", 20))))
+        server.post("/feed/seen", () -> {
+    var userId = Auth.requireUser()
+    var b = FeedExtraRoutes.seenBody()
+    reader.markSeen(userId, b.seenUntil())
+    return status(204, "")
+})
+        server.post("/feed/posts/:postId/repost", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    svc.requireVisible(postId, userId)
+    var b = FeedExtraRoutes.repostBody()
+    return status(201, json.encode(reposts.repost(userId, postId, b.opinion())))
+})
+        server.delete("/feed/posts/:postId/repost", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    svc.requireVisible(postId, userId)
+    reposts.undo(userId, postId)
+    return json.encode(FeedRemovedStatus("REMOVED"))
+})
+        server.post("/feed/scheduled", () -> {
+    var userId = Auth.requireUser()
+    var b = FeedExtraRoutes.scheduleBody()
+    return idem.handle(userId, "POST", "/api/feed/scheduled", FeedRoutes.hashOf(json.encode(b)), 201, () -> json.encode(scheduled.schedule(userId, b)))
+})
+        server.get("/feed/scheduled", () -> json.encode(scheduled.list(Auth.requireUser())))
+        server.delete("/feed/scheduled/:id", () -> json.encode(scheduled.cancel(Auth.requireUser(), Req.pathParam("id"))))
+        server.get("/feed/posts/:postId/seals/people", () -> json.encode(seals.people(Req.pathParam("postId"), svc.hiddenFor(Auth.viewerIdOrNull()))))
+        server.post("/feed/posts/:postId/seals", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    var b = FeedExtraRoutes.sealBody()
+    return json.encode(seals.toggle(userId, postId, FeedSeals.sealOf(b.seal())))
+})
+        server.delete("/feed/posts/:postId/seals", () -> json.encode(seals.remove(Auth.requireUser(), Req.pathParam("postId"))))
+        server.get("/feed/corporate", () -> json.encode(reader.corporateFeed(Auth.requireUser(), query("cursor"), Req.queryInt("limit", 20))))
+        server.get("/corporate/:profileUsername/posts", () -> json.encode(reader.corporateProfilePosts(Req.pathParam("profileUsername"), query("cursor"), Req.queryInt("limit", 20), Auth.viewerIdOrNull())))
+        server.post("/feed/posts/:postId/notes", () -> {
+    var userId = Auth.requireUser()
+    var b = FeedExtraRoutes.noteBody()
+    return status(201, json.encode(notes.create(Req.pathParam("postId"), userId, b.body())))
+})
+        server.get("/feed/posts/:postId/notes", () -> json.encode(notes.list(Req.pathParam("postId"), Auth.viewerIdOrNull())))
+        server.get("/admin/notes", () -> {
+    var moderator = Auth.requireModerator()
+    return json.encode(notes.pendingForUi(Req.queryInt("limit", 100), moderator))
+})
+        server.patch("/admin/notes/:id", () -> {
+    var moderator = Auth.requireModerator()
+    var b = FeedExtraRoutes.reviewBody()
+    return json.encode(notes.review(Req.pathParam("id"), moderator, b.status(), b.reason()))
+})
+        server.post("/feed/posts/:postId/accepted-answer", () -> {
+    var userId = Auth.requireUser()
+    var b = FeedExtraRoutes.acceptBody()
+    return json.encode(answers.accept(Req.pathParam("postId"), userId, b.commentId()))
+})
+        server.get("/pages/:postId", () -> {
+    var doc = reader.pageDocument(Req.pathParam("postId"))
+    // The policy travels in headers, never in a <meta> inside the document: the content cannot alter or drop it.
+    ResponseHeaders.set("Content-Type", "text/html;charset=UTF-8")
+    ResponseHeaders.set("Content-Security-Policy", csp)
+    ResponseHeaders.set("X-Content-Type-Options", "nosniff")
+    ResponseHeaders.set("Referrer-Policy", "no-referrer")
+    ResponseHeaders.set("Cache-Control", "no-cache")
+    return doc.html()
+})
+        server.get("/pages/:postId/og.png", () -> {
+    reader.pageDocument(Req.pathParam("postId"))
+    return FeedExtraRoutes.cardUnavailable()
+})
+        server.delete("/feed/posts/:postId/accepted-answer", () -> json.encode(answers.unaccept(Req.pathParam("postId"), Auth.requireUser())))
+    }
+}

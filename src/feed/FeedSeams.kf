@@ -66,6 +66,37 @@ class FeedAuthors {
         }
         return out
     }
+    // CoinService.NEW_ACCOUNT_WINDOW (7 days): an account younger than that never earns the answer reward.
+    Bool isNewAccount(userId: String) {
+        var r = store.queryOptional("select created_at from users where id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return true
+        }
+        var created = r.getInstantOrNull("created_at")
+        if (created == null) {
+            return true
+        }
+        return Time.toMillis(created) > Time.nowMillis() - 7L * 86400000L
+    }
+    // GET /users/{username}/posts: the path takes a username or an id; the content stores author_id.
+    String idOfUsername(usernameOrId: String) {
+        var r = store.queryOptional("select id from users where username = ?", DbParams().bindStr(usernameOrId))
+        if (r == null) {
+            return usernameOrId
+        }
+        return r.getStr("id")
+    }
+    // The registered `name` of each user (what a repost badge shows in For you).
+    Map<String,String> plainNames(ids: List<String>) {
+        var out = new HashMap<String, String>()
+        if (ids.size() == 0) {
+            return out
+        }
+        for (var r in store.queryList("select id, name from users where id in (" + FeedStore.marks(ids.size()) + ")", FeedStore.withList(DbParams(), ids))) {
+            out.put(r.getStr("id"), r.getStr("name"))
+        }
+        return out
+    }
     // Users with an ACTIVE contributor seal (user_seals).
     List<String> contributorIds(ids: List<String>) {
         var out = listOf<String>()
@@ -179,6 +210,8 @@ class FeedHoneypot {
 // pending-port: coins (CoinService.recordPresence).
 class FeedCoins {
     recordPresence(userId: String);
+    // QuestionAnswerService.rewardAfterCommit: pays who answered, once per question, never to new accounts.
+    rewardAnswer(answererId: String, askerId: String, postId: String);
 }
 
 // pending-port: corporate (CorporateProfileRepository.findByUserId(...).active()).
@@ -187,5 +220,70 @@ class FeedCorporate {
     public constructor(store: Db) {
         this.store = store
     }
+    // GetFeedService.getCorporateProfilePosts: the active profile behind an address, null when missing or deactivated.
+    String? activeUserIdOf(username: String) {
+        var r = store.queryOptional("select user_id from corporate_profiles where username = ? and status = 'ACTIVE'", DbParams().bindStr(username.trim().toLowerCase()))
+        if (r == null) {
+            return null
+        }
+        return r.getStr("user_id")
+    }
     Bool hasActiveProfile(userId: String) = store.queryLong("select count(*) from corporate_profiles where user_id = ? and status = \'ACTIVE\'", DbParams().bindStr(userId)) > 0L
 }
+
+// pending-port: network (NetworkService.findFriends: accepted user_connections in either direction).
+class FeedGraph {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    List<String> friendIds(userId: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select receiver_user_id as other from user_connections where requester_user_id = ? and status = 'ACCEPTED' union select requester_user_id as other from user_connections where receiver_user_id = ? and status = 'ACCEPTED'", DbParams().bindStr(userId).bindStr(userId))) {
+            out.add(r.getStr("other"))
+        }
+        return out
+    }
+}
+
+// pending-port: blog (SubscribedBlogAuthorsAdapter: owners of the blogs the reader subscribed to).
+class FeedBlogs {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    List<String> authorsFollowedBy(userId: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select b.user_id from blog_subscriptions s join blogs b on b.id = s.blog_id where s.user_id = ?", DbParams().bindStr(userId))) {
+            var owner = r.getStr("user_id")
+            if (!out.contains(owner)) {
+                out.add(owner)
+            }
+        }
+        return out
+    }
+}
+
+// pending-port: preferences (PersonalizationService: user_preferences.liked_topics / blocked_topics, CSV).
+class FeedReaderPrefs {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    List<String> csv(userId: String, column: String) {
+        var out = listOf<String>()
+        var r = store.queryOptional("select " + column + " from user_preferences where user_id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return out
+        }
+        for (var item in FeedRules.nz(r.getStrOrNull(column)).split(",")) {
+            if (item.trim().length() > 0) {
+                out.add(item.trim())
+            }
+        }
+        return out
+    }
+    List<String> blockedTopics(userId: String) = this.csv(userId, "blocked_topics")
+    List<String> likedTopics(userId: String) = this.csv(userId, "liked_topics")
+}
+

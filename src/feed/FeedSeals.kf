@@ -1,0 +1,186 @@
+package feed
+
+import kernel.blocks.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.time.*
+
+record FeedSealCount(String seal, Int count)
+
+record FeedSealsView(List<FeedSealCount> seals, List<String> mySeals)
+
+record FeedPersonSeal(String userId, String seal, String createdAt)
+
+record FeedSealPeople(String postId, List<FeedSealCount> seals, List<FeedPersonSeal> people)
+
+record FeedSealBody(String? seal)
+
+record FeedSealRow(String postId, String userId, String seal, String createdAt)
+
+// SealService + PostSealPersistenceAdapter: the community's marks at the top of a post. Each (person, seal) pair is
+// independent: the same seal again removes it, another one adds.
+class FeedSeals {
+    Db store
+    FeedStore posts
+    public constructor(store: Db, posts: FeedStore) {
+        this.store = store
+        this.posts = posts
+    }
+    static List<String> sealTypes() = listOf("IMPORTANTE", "INTERESSANTE", "DICA", "AJUDA", "DUPLICADO", "FANFIC", "MASSANTE", "BOA_PERGUNTA", "INSPIRADOR")
+    static FeedSealsView empty() = FeedSealsView(listOf<FeedSealCount>(), listOf<String>())
+    requirePost(postId: String) {
+        if (postId.trim().length() == 0 || posts.post(postId) == null) {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+        }
+    }
+    // The seal of the body: null is INVALID_SEAL, an unknown spelling is the Jackson 400.
+    static String sealOf(raw: String?) {
+        if (raw == null) {
+            throw Errors.api(400, "INVALID_SEAL", "Selo invalido.")
+        }
+        if (!FeedSeals.sealTypes().contains(raw)) {
+            throw Errors.badRequest()
+        }
+        return raw
+    }
+    FeedSealsView toggle(userId: String, postId: String, seal: String) {
+        this.requirePost(postId)
+        var found = store.queryLong("select count(*) from post_seals where post_id = ? and user_id = ? and seal = ?", DbParams().bindStr(postId).bindStr(userId).bindStr(seal))
+        if (found > 0L) {
+            store.execute("delete from post_seals where post_id = ? and user_id = ? and seal = ?", DbParams().bindStr(postId).bindStr(userId).bindStr(seal))
+        } else {
+            store.execute("insert into post_seals (id, post_id, user_id, seal, created_at) values (?, ?, ?, ?, ?)", DbParams().bindStr(Ids.prefixed("seal_")).bindStr(postId).bindStr(userId).bindStr(seal).bindInstant(Time.nowIso()))
+        }
+        return this.viewFor(postId, userId)
+    }
+    FeedSealsView remove(userId: String, postId: String) {
+        this.requirePost(postId)
+        store.execute("delete from post_seals where post_id = ? and user_id = ?", DbParams().bindStr(postId).bindStr(userId))
+        return this.viewFor(postId, userId)
+    }
+    FeedSealsView viewFor(postId: String, viewerId: String?) {
+        var v = this.sealsFor(listOf(postId), viewerId).get(postId)
+        if (v == null) {
+            return FeedSeals.empty()
+        }
+        return v
+    }
+    List<FeedSealRow> rowsOf(postIds: List<String>) {
+        var out = listOf<FeedSealRow>()
+        if (postIds.size() == 0) {
+            return out
+        }
+        for (var r in store.queryList("select post_id, user_id, seal, created_at from post_seals where post_id in (" + FeedStore.marks(postIds.size()) + ") order by created_at asc", FeedStore.withList(DbParams(), postIds))) {
+            out.add(FeedSealRow(r.getStr("post_id"), r.getStr("user_id"), r.getStr("seal"), r.getInstant("created_at")))
+        }
+        return out
+    }
+    // Seals of a list of posts (one query) plus the reader's own on each.
+    Map<String,FeedSealsView> sealsFor(postIds: List<String>, viewerId: String?) {
+        var out = new HashMap<String, FeedSealsView>()
+        var ids = listOf<String>()
+        for (var id in postIds) {
+            if (!ids.contains(id)) {
+                ids.add(id)
+            }
+        }
+        var rows = this.rowsOf(ids)
+        for (var id in ids) {
+            var mine = listOf<String>()
+            var of = listOf<FeedSealRow>()
+            for (var r in rows) {
+                if (r.postId() == id) {
+                    of.add(r)
+                    if (FeedRules.same(viewerId, r.userId())) {
+                        mine.add(r.seal())
+                    }
+                }
+            }
+            out.put(id, FeedSealsView(FeedSeals.counts(of), mine))
+        }
+        return out
+    }
+    // Per seal, biggest first; ties by name so the order does not dance.
+    static List<FeedSealCount> counts(rows: List<FeedSealRow>) {
+        var names = listOf<String>()
+        var totals = listOf<Int>()
+        for (var r in rows) {
+            var at = names.indexOf(r.seal())
+            if (at < 0) {
+                names.add(r.seal())
+                totals.add(1)
+            } else {
+                totals.set(at, totals.get(at) + 1)
+            }
+        }
+        var out = listOf<FeedSealCount>()
+        var taken = listOf<Int>()
+        var round = 0
+        while (round < names.size()) {
+            var best = -1
+            var i = 0
+            while (i < names.size()) {
+                if (!taken.contains(i) && FeedSeals.before(names, totals, i, best)) {
+                    best = i
+                }
+                i = i + 1
+            }
+            taken.add(best)
+            out.add(FeedSealCount(names.get(best), totals.get(best)))
+            round = round + 1
+        }
+        return out
+    }
+    static Bool before(names: List<String>, totals: List<Int>, i: Int, best: Int) {
+        if (best < 0) {
+            return true
+        }
+        if (totals.get(i) > totals.get(best)) {
+            return true
+        }
+        if (totals.get(i) == totals.get(best) && names.get(i).compareTo(names.get(best)) < 0) {
+            return true
+        }
+        return false
+    }
+    // Who marked the post and with what, minus the people the viewer hides; the counts come from the same list.
+    FeedSealPeople people(postId: String, hidden: List<String>) {
+        var visible = listOf<FeedSealRow>()
+        for (var r in this.rowsOf(listOf(postId))) {
+            if (!hidden.contains(r.userId())) {
+                visible.add(r)
+            }
+        }
+        var people = listOf<FeedPersonSeal>()
+        for (var r in visible) {
+            people.add(FeedPersonSeal(r.userId(), r.seal(), r.createdAt()))
+        }
+        return FeedSealPeople(postId, FeedSeals.counts(visible), people)
+    }
+    // GET /feed/posts/seals?ids=a,b: a JSON object with every requested id as a key (in request order), even
+    // without marks; capped at 100 ids. Written by hand: the encoder keeps no order for a map.
+    String forIds(rawIds: String?, viewerId: String?) {
+        var ids = listOf<String>()
+        if (rawIds != null) {
+            for (var part in rawIds.split(",")) {
+                var t = part.trim()
+                if (t.length() > 0 && !ids.contains(t) && ids.size() < 100) {
+                    ids.add(t)
+                }
+            }
+        }
+        var found = this.sealsFor(ids, viewerId)
+        var members = listOf<String>()
+        for (var id in ids) {
+            members.add(json.encode(id) + ":" + json.encode(this.viewOrEmpty(found.get(id))))
+        }
+        return "{" + String.join(",", members) + "}"
+    }
+    FeedSealsView viewOrEmpty(v: FeedSealsView?) {
+        if (v == null) {
+            return FeedSeals.empty()
+        }
+        return v
+    }
+}

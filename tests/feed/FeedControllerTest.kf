@@ -1,5 +1,6 @@
 import feed.*
 import kernel.testkit.*
+import kernel.time.*
 
 // Port of FeedControllerTests (publish replay, idempotency conflict, delete, interactions).
 String insightBody(content: String) = "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"" + content + "\",\"tags\":[\"Arquitetura\",\"Java\"],\"mediaIds\":[]}"
@@ -75,4 +76,14 @@ test "handles post interactions with counters and idempotency" {
     var unsave = c.send("DELETE", path + "/saves", FeedTestSupport.write(saver, "feed-save-delete-1"), "", "")
     Check.jsonEq(unsave, "status", "SAVE_REMOVED")
     Check.jsonEq(unsave, "counters.saves", "0")
+}
+
+test "the trending feed takes its own cursor and rejects a timestamp cursor" {
+    var t = FeedTestSupport.user("user_feed_trending_cursor")
+    var c = FeedTestSupport.app().client
+    var until = Time.fromMillis(Time.nowMillis() - 60000L)
+    var cursor = FeedTrending.encode(FeedTrendingCursor(until, 0, Time.plusSeconds(until, -1L), "synthetic_cursor_post"))
+    Check.status(c.getWith("/feed?tab=TRENDING&cursor=" + cursor, FeedTestSupport.read(t)), 200)
+    Check.status(c.getWith("/feed?tab=ALL&cursor=" + until, FeedTestSupport.read(t)), 200)
+    Check.apiError(c.getWith("/feed?tab=TRENDING&cursor=" + until, FeedTestSupport.read(t)), 400, "INVALID_CURSOR")
 }

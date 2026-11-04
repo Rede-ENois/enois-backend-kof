@@ -1,0 +1,96 @@
+import feed.*
+import kernel.testkit.*
+
+// Port of PostSealTests.
+TestResponse seal(token: String, postId: String, name: String) = FeedTestSupport.app().client.send("POST", "/feed/posts/" + postId + "/seals", listOf("X-Session-Token: " + token, "Content-Type: application/json"), "", "{\"seal\":\"" + name + "\"}")
+
+String sealNames(res: TestResponse, path: String) {
+    var out = listOf<String>()
+    var n = res.jsonSize(path)
+    var i = 0
+    while (i < n) {
+        out.add(FeedTestSupport.field(res, path + "." + i + ".seal"))
+        i = i + 1
+    }
+    return String.join(",", out)
+}
+
+Int sealTotal(res: TestResponse, path: String) {
+    var total = 0
+    var n = res.jsonSize(path)
+    var i = 0
+    while (i < n) {
+        total = total + res.json(path + "." + i + ".count").toInt()
+        i = i + 1
+    }
+    return total
+}
+
+String names(res: TestResponse, path: String) {
+    var out = listOf<String>()
+    var n = res.jsonSize(path)
+    var i = 0
+    while (i < n) {
+        out.add(FeedTestSupport.field(res, path + "." + i))
+        i = i + 1
+    }
+    return String.join(",", out)
+}
+
+test "many seals per person and counts in the batch read" {
+    var author = FeedTestSupport.user("seal_author1")
+    var first = FeedTestSupport.user("seal_first1")
+    var second = FeedTestSupport.user("seal_second1")
+    var postId = FeedFixtures.publish(author, "seal-post-1", "Post que vai receber selos")
+    var c = FeedTestSupport.app().client
+    Check.status(seal(first, postId, "IMPORTANTE"), 200)
+    Check.status(seal(second, postId, "IMPORTANTE"), 200)
+    Check.status(seal(first, postId, "DICA"), 200)
+    var batch = c.get("/feed/posts/seals?ids=" + postId)
+    Check.status(batch, 200)
+    Check.eqStr("order", "IMPORTANTE,DICA", sealNames(batch, postId + ".seals"))
+    Check.eqInt("total", 3, sealTotal(batch, postId + ".seals"))
+    Check.eqInt("no session, no own seals", 0, batch.jsonSize(postId + ".mySeals"))
+    var mine = c.getWith("/feed/posts/seals?ids=" + postId, FeedTestSupport.read(first))
+    var own = names(mine, postId + ".mySeals")
+    Check.isTrue("own seals", own == "IMPORTANTE,DICA" || own == "DICA,IMPORTANTE")
+    Check.status(seal(first, postId, "DICA"), 200)
+    var after = c.getWith("/feed/posts/seals?ids=" + postId, FeedTestSupport.read(first))
+    Check.eqStr("after toggling DICA off", "IMPORTANTE", sealNames(after, postId + ".seals"))
+    Check.eqInt("total after", 2, sealTotal(after, postId + ".seals"))
+    Check.eqStr("mine after", "IMPORTANTE", names(after, postId + ".mySeals"))
+    Check.status(FeedTestSupport.send("DELETE", "/feed/posts/" + postId + "/seals", second, "seal-del-1", ""), 200)
+    var last = c.get("/feed/posts/seals?ids=" + postId)
+    Check.jsonEq(last, postId + ".seals.0.seal", "IMPORTANTE")
+    Check.jsonEq(last, postId + ".seals.0.count", "1")
+}
+
+test "lists who sealed with their seal" {
+    var author = FeedTestSupport.user("seal_author3")
+    var first = FeedTestSupport.user("seal_first3")
+    var second = FeedTestSupport.user("seal_second3")
+    var postId = FeedFixtures.publish(author, "seal-post-3", "Post para a lista de quem marcou")
+    Check.status(seal(first, postId, "DICA"), 200)
+    Check.status(seal(first, postId, "INSPIRADOR"), 200)
+    Check.status(seal(second, postId, "DICA"), 200)
+    var res = FeedTestSupport.app().client.get("/feed/posts/" + postId + "/seals/people")
+    Check.status(res, 200)
+    Check.eqStr("seals", "DICA,INSPIRADOR", sealNames(res, "seals"))
+    Check.jsonEq(res, "seals.0.count", "2")
+    var users = listOf<String>()
+    var kinds = listOf<String>()
+    var i = 0
+    while (i < res.jsonSize("people")) {
+        users.add(FeedTestSupport.field(res, "people." + i + ".userId"))
+        kinds.add(FeedTestSupport.field(res, "people." + i + ".seal"))
+        i = i + 1
+    }
+    Check.eqStr("people", "seal_first3,seal_first3,seal_second3", String.join(",", users))
+    Check.eqStr("people seals", "DICA,INSPIRADOR,DICA", String.join(",", kinds))
+}
+
+test "an unknown seal is rejected" {
+    var author = FeedTestSupport.user("seal_author2")
+    var postId = FeedFixtures.publish(author, "seal-post-2", "Post com selo invalido")
+    Check.status(seal(author, postId, "NAO_EXISTE"), 400)
+}

@@ -1,0 +1,127 @@
+package feed
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+
+record FeedRepostBody(String? opinion)
+
+record FeedRemovedStatus(String status)
+
+// RepostPostService: a pure repost is a pointer (post_reposts) to the original; a repost with an opinion is a new
+// post of the reposter quoting the original.
+class FeedReposts {
+    Db store
+    FeedStore posts
+    FeedService svc
+    ActionThrottle throttle
+    public constructor(store: Db, posts: FeedStore, svc: FeedService, throttle: ActionThrottle) {
+        this.store = store
+        this.posts = posts
+        this.svc = svc
+        this.throttle = throttle
+    }
+    // PostView.from(post): the bare view the repost endpoint answers with (no author presentation).
+    static FeedPostView bareView(p: FeedPostRow, tags: List<String>, mediaIds: List<String>) = FeedPostView(p.id(), p.authorId(), null, null, null, null, listOf<String>(), p.type(), p.content(), null, null, tags, mediaIds, p.createdAt(), FeedRules.counters(p), null, p.communityId(), null, p.editedAt(), p.expiresAt(), p.authorIdentity(), null, p.topic(), p.repostOf(), p.repostOfAuthor(), p.repostWithOpinion(), null, listOf<String>(), null, p.mediaSpoiler(), null, null, listOf<FeedNoteView>(), null, p.acceptedCommentId(), null, null, false, listOf<FeedMediaSummary>(), p.acceptedCommentId() != null)
+    FeedPostView viewOf(p: FeedPostRow) = FeedReposts.bareView(p, FeedRules.orEmpty(posts.tagsOf(listOf(p.id())).get(p.id())), svc.mediaIdsOf(p.id()))
+    // The original behind a post (a repost of a repost points at the root); inactive means gone.
+    FeedPostRow resolveRoot(postId: String) {
+        var original = posts.post(postId)
+        if (original == null) {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+        }
+        if (original.status() != "ACTIVE") {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+        }
+        var source = original.repostOf()
+        if (source != null) {
+            var root = posts.post(source)
+            if (root == null) {
+                throw Errors.api(404, "POST_NOT_FOUND", "Post original nao encontrado.")
+            }
+            if (root.status() != "ACTIVE") {
+                throw Errors.api(404, "POST_NOT_FOUND", "Post original nao encontrado.")
+            }
+            return root
+        }
+        return original
+    }
+    validateRepostable(root: FeedPostRow) {
+        if (root.communityId() != null || root.channelId() != null) {
+            throw Errors.api(400, "PRIVATE_POST", "Posts de comunidades e canais privados nao podem ser republicados no feed.")
+        }
+        if (root.type() == "BUSINESS" || root.type() == "MOMENT") {
+            throw Errors.api(400, "NOT_REPOSTABLE", "Este tipo de publicacao nao pode ser republicado.")
+        }
+    }
+    guard(userId: String) {
+        svc.ageGate.requireCanWrite(userId)
+        throttle.requireAllowed("repost", userId, 30, 3600000L)
+    }
+    // POST /feed/posts/{id}/repost: no (or blank) opinion is a pure repost, otherwise a quoting post.
+    FeedPostView repost(userId: String, postId: String, opinion: String?) {
+        var self = this
+        var out = listOf<FeedPostView>()
+        store.transaction(() -> {
+    if (FeedRules.trimmed(opinion).length() == 0) {
+        out.add(self.repostPure(userId, postId))
+    } else {
+        out.add(self.repostWithOpinion(userId, postId, opinion))
+    }
+})
+        return out.get(0)
+    }
+    FeedPostView repostPure(userId: String, postId: String) {
+        this.guard(userId)
+        var root = this.resolveRoot(postId)
+        this.validateRepostable(root)
+        if (posts.repostExists(userId, root.id())) {
+            throw Errors.api(409, "ALREADY_REPOSTED", "Voce ja republicou este post.")
+        }
+        if (posts.activeRepostCopyId(userId, root.id()) != null) {
+            throw Errors.api(409, "ALREADY_REPOSTED", "Voce ja republicou este post.")
+        }
+        posts.insertRepost(userId, root.id(), Time.nowIso())
+        posts.bump(root.id(), "reposts", true)
+        return this.viewOf(this.resolveRoot(postId))
+    }
+    FeedPostView repostWithOpinion(userId: String, postId: String, opinion: String?) {
+        this.guard(userId)
+        var root = this.resolveRoot(postId)
+        this.validateRepostable(root)
+        if (posts.activeRepostCopyId(userId, root.id()) != null) {
+            throw Errors.api(409, "ALREADY_REPOSTED", "Voce ja republicou este post.")
+        }
+        var clean = FeedRules.nz(PlainText.defuse(FeedRules.trimmed(opinion)))
+        if (clean.trim().length() == 0) {
+            throw Errors.api(400, "OPINION_REQUIRED", "Escreva um comentario para republicar com opiniao.")
+        }
+        if (clean.length() > 600) {
+            throw Errors.api(400, "OPINION_TOO_LONG", "A opiniao do repost deve ter no maximo 600 caracteres.")
+        }
+        var owner = svc.authors.byIds(listOf(root.authorId())).get(root.authorId())
+        var type = root.type()
+        if (type == "ARTICLE" || type == "BLOG" || type == "PAGE") {
+            type = "INSIGHT"
+        }
+        var copy = FeedPostRow(Ids.prefixed("post_"), userId, type, clean, null, null, null, root.id(), FeedViews.usernameOf(owner), true, null, Time.nowIso(), "PUBLIC", 0, 0, 0, 0, 0, "ACTIVE", null, null, null, "SOCIAL", null, false)
+        posts.insertPost(copy, listOf<String>(), listOf<String>())
+        return this.viewOf(copy)
+    }
+    // DELETE /feed/posts/{id}/repost: removes the pointer, never the original.
+    undo(userId: String, postId: String) {
+        if (!posts.repostExists(userId, postId)) {
+            return
+        }
+        var self = this
+        store.transaction(() -> {
+    self.posts.deleteRepost(userId, postId)
+    if (self.posts.post(postId) != null) {
+        self.posts.bump(postId, "reposts", false)
+    }
+})
+    }
+}

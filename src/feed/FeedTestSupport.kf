@@ -4,6 +4,7 @@ import kernel.*
 import kernel.audit.*
 import kernel.blocks.*
 import kernel.cache.*
+import kernel.db.*
 import kernel.idempotency.*
 import kernel.jobs.*
 import kernel.outbox.*
@@ -11,6 +12,7 @@ import kernel.risk.*
 import kernel.sanctions.*
 import kernel.security.*
 import kernel.testkit.*
+import kernel.time.*
 
 // Test support: one booted app per test file (a file is a process) with the feed wired on the full
 // security pipeline, limits relaxed so a suite can write freely.
@@ -21,7 +23,7 @@ class FeedTestSupport {
         if (cur != null) {
             return cur
         }
-        var created = TestApp.bootWith("feed", mapOf("REDE_ORIGINS_ENFORCE", "false", "REDE_SECURITY_NEW_ACCOUNT_COOLDOWN_SECONDS", "0", "REDE_RATE_POST_LIMIT", "1000", "REDE_RATE_COMMENT_LIMIT", "1000", "POST_USER_RATE_LIMIT", "100000", "GLOBAL_RATE_LIMIT_PER_MINUTE", "0", "REDE_SECURITY_DUPLICATE_POST_ENABLED", "false", "REDE_RATE_DUPLICATE_WINDOW_MINUTES", "0", "REDE_FEED_WORKERS_ENABLED", "false"), (p: Platform) -> FeedTestSupport.wire(p))
+        var created = TestApp.bootWith("feed", mapOf("REDE_OUTBOX_WORKER_DELAY_MS", "86400000", "REDE_ORIGINS_ENFORCE", "false", "REDE_SECURITY_NEW_ACCOUNT_COOLDOWN_SECONDS", "0", "REDE_RATE_POST_LIMIT", "1000", "REDE_RATE_COMMENT_LIMIT", "1000", "POST_USER_RATE_LIMIT", "100000", "GLOBAL_RATE_LIMIT_PER_MINUTE", "0", "REDE_SECURITY_DUPLICATE_POST_ENABLED", "false", "REDE_RATE_DUPLICATE_WINDOW_MINUTES", "0", "REDE_FEED_WORKERS_ENABLED", "false"), (p: Platform) -> FeedTestSupport.wire(p))
         FeedTestSupport.cachedApp = created
         return created
     }
@@ -38,24 +40,27 @@ class FeedTestSupport {
         return m
     }
     static wire(p: Platform) {
-        var shared = FeedTestSupport.sharedWithoutWorker(p)
+        var shared = SharedServices.create(p)
         var hooks = SecurityHooks.defaults(p.db)
         Security.install(p, hooks)
-        FeedTestSupport.installed = FeedModule.install(p, shared, hooks)
-    }
-    // SharedServices.create minus the outbox worker thread (it keeps the test process alive); tests call
-    // shared.outbox.processPending() themselves.
-    static SharedServices sharedWithoutWorker(p: Platform) {
-        var cfg = p.cfg
-        var database = p.db
-        var sanctionReader = SanctionGateReader(database)
-        var duplication = ContentDuplicationGuard.fromConfig(cfg)
-        var risk = RiskEngine.fromConfig(cfg, RiskSubjectReader(database, sanctionReader), RiskAssessmentWriter(database), RiskTimingSignals(), duplication, RiskEscalation())
-        return SharedServices(p, Scheduler(), Idempotency(database), Outbox(database), Audit(database), SecretCipher.fromConfig(cfg), Caches.create(cfg), BlockedUsers(database), sanctionReader, SanctionGate(sanctionReader), SuspiciousText.fromConfig(cfg), duplication, risk)
+        FeedTestSupport.installed = FeedModule.installWith(p, shared, hooks, FeedRecordingCoins())
     }
     // A verified user with a live session; returns the token.
+    // Asking again for the same id answers the same session (a test may fetch its actors more than once).
     static String user(id: String) {
-        SecurityFixtures.login(FeedTestSupport.app().db(), id, "tok-" + id + "-1234567890")
+        var db = FeedTestSupport.app().db()
+        if (db.queryLong("select count(*) from users where id = ?", DbParams().bindStr(id)) == 0L) {
+            SecurityFixtures.login(db, id, "tok-" + id + "-1234567890")
+        }
+        return "tok-" + id + "-1234567890"
+    }
+    // A verified administrator with a live session; returns the token.
+    static String admin(id: String) {
+        var db = FeedTestSupport.app().db()
+        if (db.queryLong("select count(*) from users where id = ?", DbParams().bindStr(id)) == 0L) {
+            SecurityFixtures.user(db, id, true, true)
+            SecurityFixtures.session(db, id, "tok-" + id + "-1234567890", 3600L)
+        }
         return "tok-" + id + "-1234567890"
     }
     // A string field of a response (the test fails when it is missing).
@@ -100,5 +105,179 @@ class FeedReactions {
         var res = FeedTestSupport.send("DELETE", "/feed/posts/" + postId + "/reactions", token, key, "")
         Check.status(res, 200)
         return res.json("counters.reactions").toInt()
+    }
+}
+
+// Direct fixtures for the feed read suites: rows written through the store, like the Java tests that saved
+// entities straight through the repositories.
+class FeedRows {
+    static FeedPostRow post(id: String, authorId: String, type: String, createdAt: String, reactions: Int) = FeedPostRow(id, authorId, type, "Synthetic pagination fixture", null, null, null, null, null, false, null, createdAt, "PUBLIC", reactions, 0, 0, 0, 0, "ACTIVE", null, null, null, "SOCIAL", null, false)
+    static FeedPostRow insert(id: String, authorId: String, createdAt: String) {
+        var row = FeedRows.post(id, authorId, "INSIGHT", createdAt, 0)
+        FeedTestSupport.module().store.insertPost(row, listOf<String>(), listOf<String>())
+        return row
+    }
+    static insertRow(row: FeedPostRow) {
+        FeedTestSupport.module().store.insertPost(row, listOf<String>(), listOf<String>())
+    }
+    static react(id: String, postId: String, userId: String, at: String) {
+        FeedTestSupport.module().store.insertReaction(id, postId, userId, "LIKE", at)
+    }
+    static comment(id: String, postId: String, authorId: String, at: String) {
+        FeedTestSupport.module().store.insertComment(FeedCommentRow(id, postId, authorId, null, "Synthetic comment", at, "ACTIVE", null, false, false), listOf<String>())
+    }
+    // Ids of one feed page for `path` (a /feed query), and the cursor it answers with (null when it ends).
+    static List<String> ids(res: TestResponse) {
+        var out = listOf<String>()
+        var n = res.jsonSize("items")
+        var i = 0
+        while (i < n) {
+            out.add(FeedTestSupport.field(res, "items." + i + ".id"))
+            i = i + 1
+        }
+        return out
+    }
+    // A string field of the item with this id in a feed page (the test fails when the item is missing).
+    static String fieldOf(res: TestResponse, id: String, field: String) {
+        var n = res.jsonSize("items")
+        var i = 0
+        while (i < n) {
+            if (FeedTestSupport.field(res, "items." + i + ".id") == id) {
+                return FeedTestSupport.field(res, "items." + i + "." + field)
+            }
+            i = i + 1
+        }
+        throw "item " + id + " is not on the page"
+    }
+    // Every page of a tab, never repeating a post, until the cursor ends (10 pages at most).
+    static List<String> readAll(token: String, tab: String, cursorStart: String?, limit: Int) {
+        var all = listOf<String>()
+        var cursor = cursorStart
+        var page = 0
+        while (page < 10) {
+            var path = "/feed?tab=" + tab + "&limit=" + limit
+            if (cursor != null) {
+                path = path + "&cursor=" + cursor
+            }
+            var res = FeedTestSupport.app().client.getWith(path, FeedTestSupport.read(token))
+            Check.status(res, 200)
+            var current = FeedRows.ids(res)
+            for (var id in current) {
+                Check.isTrue("no repeated post " + id, !all.contains(id))
+                all.add(id)
+            }
+            var next = res.jsonStr("nextCursor")
+            if (next == null) {
+                return all
+            }
+            Check.isTrue("cursor moves", !FeedRules.same(next, cursor))
+            cursor = next
+            page = page + 1
+        }
+        throw "pagination did not finish within the fixture's page count"
+    }
+}
+
+// Rows of the other domains that the Java tests created through their endpoints (network, communities,
+// preferences): written straight into the owner's tables until those domains are ported.
+class FeedWorld {
+    static befriend(requester: String, receiver: String) {
+        var now = Time.nowIso()
+        FeedTestSupport.app().db().execute("insert into user_connections (requester_user_id, receiver_user_id, status, created_at, accepted_at) values (?, ?, 'ACCEPTED', ?, ?)", DbParams().bindStr(requester).bindStr(receiver).bindInstant(now).bindInstant(now))
+    }
+    static community(id: String, name: String, topic: String, owner: String) {
+        var now = Time.nowIso()
+        FeedTestSupport.app().db().execute("insert into communities (id, name, description, topic, created_by, created_at, updated_at) values (?, ?, 'Comunidade de teste', ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(name).bindStr(topic).bindStr(owner).bindInstant(now).bindInstant(now))
+        FeedWorld.join(id, owner, "OWNER")
+    }
+    static join(communityId: String, userId: String, role: String) {
+        FeedTestSupport.app().db().execute("insert into community_members (community_id, user_id, role, joined_at) values (?, ?, ?, ?)", DbParams().bindStr(communityId).bindStr(userId).bindStr(role).bindInstant(Time.nowIso()))
+    }
+    // A professional (corporate) profile row, ACTIVE or not.
+    static corporate(userId: String, username: String, name: String, status: String) {
+        var now = Time.nowIso()
+        FeedTestSupport.app().db().execute("insert into corporate_profiles (user_id, username, name, headline, status, created_at, updated_at) values (?, ?, ?, 'Headline profissional', ?, ?, ?)", DbParams().bindStr(userId).bindStr(username).bindStr(name).bindStr(status).bindInstant(now).bindInstant(now))
+    }
+    // A READY image of a user (media_assets), as the media port would leave it after an upload.
+    static media(mediaId: String, ownerId: String) {
+        var now = Time.nowIso()
+        FeedTestSupport.app().db().execute("insert into media_assets (id, owner_id, file_name, mime_type, size_bytes, purpose, object_key, cdn_url, status, delete_status, created_at, expires_at) values (?, ?, 'media/x/foto.png', 'image/png', 1024, 'POST_IMAGE', 'media/x/foto.png', 'https://cdn.test/foto.png', 'READY', 'NONE', ?, ?)", DbParams().bindStr(mediaId).bindStr(ownerId).bindInstant(now).bindInstant(Time.plusSeconds(now, 3600L)))
+    }
+    // A media asset with its own mime type, pixel size (0 = unknown) and a cdn address ending in /<id>/file.
+    static mediaSized(mediaId: String, ownerId: String, mime: String, width: Int, height: Int) {
+        var now = Time.nowIso()
+        var db = FeedTestSupport.app().db()
+        db.execute("insert into media_assets (id, owner_id, file_name, mime_type, size_bytes, purpose, object_key, cdn_url, status, delete_status, created_at, expires_at) values (?, ?, 'file', ?, 10, 'POST_IMAGE', ?, ?, 'READY', 'NONE', ?, ?)", DbParams().bindStr(mediaId).bindStr(ownerId).bindStr(mime).bindStr("uploads/" + mediaId + "/file").bindStr("https://enois.exemplo.com/api/storage/uploads/" + mediaId + "/file").bindInstant(now).bindInstant(Time.plusSeconds(now, 3600L)))
+        if (width > 0) {
+            db.execute("update media_assets set width = ?, height = ? where id = ?", DbParams().bindInt(width).bindInt(height).bindStr(mediaId))
+        }
+    }
+    static removeMedia(mediaId: String) {
+        FeedTestSupport.app().db().execute("update media_assets set delete_status = 'DELETED' where id = ?", DbParams().bindStr(mediaId))
+    }
+    static setUsername(userId: String, username: String) {
+        FeedTestSupport.app().db().execute("update users set username = ? where id = ?", DbParams().bindStr(username).bindStr(userId))
+    }
+    // user_preferences: liked/blocked topics as the CSV the personalization service writes ("" clears).
+    static preferences(userId: String, liked: String, blocked: String) {
+        var db = FeedTestSupport.app().db()
+        db.execute("delete from user_preferences where user_id = ?", DbParams().bindStr(userId))
+        db.execute("insert into user_preferences (user_id, theme_id, updated_at, liked_topics, blocked_topics) values (?, 'default', ?, ?, ?)", DbParams().bindStr(userId).bindInstant(Time.nowIso()).bindStrOrNull(FeedTestHelpers.blankToNull(liked)).bindStrOrNull(FeedTestHelpers.blankToNull(blocked)))
+    }
+    // Ids of a feed page as ",a,b," so a test can check membership with contains.
+    static String feedIds(token: String, query: String) {
+        var res = FeedTestSupport.app().client.getWith("/feed?" + query, FeedTestSupport.read(token))
+        Check.status(res, 200)
+        return "," + String.join(",", FeedRows.ids(res)) + ","
+    }
+    static String publishIn(token: String, key: String, communityId: String, content: String) {
+        var res = FeedTestSupport.post(token, key, "{\"type\":\"INSIGHT\",\"content\":\"" + content + "\",\"tags\":[],\"mediaIds\":[],\"communityId\":\"" + communityId + "\"}")
+        Check.status(res, 201)
+        return FeedTestSupport.field(res, "id")
+    }
+    static String publishTopic(token: String, key: String, topic: String, content: String) {
+        var res = FeedTestSupport.post(token, key, "{\"topic\":\"" + topic + "\",\"type\":\"INSIGHT\",\"content\":\"" + content + "\",\"tags\":[],\"mediaIds\":[]}")
+        Check.status(res, 201)
+        return FeedTestSupport.field(res, "id")
+    }
+    static Bool listed(csv: String, id: String) = csv.contains("," + id + ",")
+}
+
+class FeedTestHelpers {
+    static String? blankToNull(s: String) {
+        if (s.trim().length() == 0) {
+            return null
+        }
+        return s
+    }
+}
+
+// A FeedCoins that records the answer rewards like the coin ledger does: one reward per reference
+// (`resposta:<post>`) for good, whoever the account is. `failNext` makes the next payment fail.
+class FeedRecordingCoins extends FeedCoins {
+    static List<String> paidRefs = listOf<String>()
+    static List<String> paidAccounts = listOf<String>()
+    static Bool failNextPayment = false
+    static Int rewardsOf(postId: String, accountId: String) {
+        var n = 0
+        var i = 0
+        while (i < FeedRecordingCoins.paidRefs.size()) {
+            if (FeedRecordingCoins.paidRefs.get(i) == "resposta:" + postId && FeedRecordingCoins.paidAccounts.get(i) == accountId) {
+                n = n + 1
+            }
+            i = i + 1
+        }
+        return n
+    }
+    rewardAnswer(answererId: String, askerId: String, postId: String) {
+        if (FeedRecordingCoins.failNextPayment) {
+            FeedRecordingCoins.failNextPayment = false
+            throw "treasury down"
+        }
+        var ref = "resposta:" + postId
+        if (!FeedRecordingCoins.paidRefs.contains(ref)) {
+            FeedRecordingCoins.paidRefs.add(ref)
+            FeedRecordingCoins.paidAccounts.add(answererId)
+        }
     }
 }

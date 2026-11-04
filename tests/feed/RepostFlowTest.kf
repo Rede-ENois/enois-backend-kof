@@ -1,0 +1,144 @@
+import feed.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Port of RepostFlowTests.
+String repostPath(id: String) = "/feed/posts/" + id + "/repost"
+
+TestResponse sendRepost(token: String, id: String, body: String) = FeedTestSupport.app().client.send("POST", repostPath(id), listOf("X-Session-Token: " + token, "Content-Type: application/json"), "", body)
+
+String quote(token: String, id: String, opinion: String) {
+    var res = sendRepost(token, id, "{\"opinion\":\"" + opinion + "\"}")
+    Check.status(res, 201)
+    return FeedTestSupport.field(res, "id")
+}
+
+String publishBody(token: String, key: String, body: String) {
+    var res = FeedTestSupport.post(token, key, body)
+    Check.status(res, 201)
+    return FeedTestSupport.field(res, "id")
+}
+
+setUsername(userId: String, username: String) {
+    FeedTestSupport.app().db().execute("update users set username = ? where id = ?", DbParams().bindStr(username).bindStr(userId))
+}
+
+test "a pure repost points at the original, blocks duplicates and can be undone" {
+    var author = FeedTestSupport.user("repost_author_1")
+    var reposter = FeedTestSupport.user("repost_user_1")
+    var quoter = FeedTestSupport.user("repost_quoter_1")
+    var other = FeedTestSupport.user("repost_other_1")
+    var originalId = FeedFixtures.publish(author, "rp-1", "Conteudo original que vale republicar.")
+    var first = sendRepost(reposter, originalId, "")
+    Check.status(first, 201)
+    Check.jsonEq(first, "id", originalId)
+    Check.isTrue("not a quote", first.jsonIsNull("repostOf"))
+    Check.jsonEq(first, "content", "Conteudo original que vale republicar.")
+    Check.apiError(sendRepost(reposter, originalId, ""), 409, "ALREADY_REPOSTED")
+    var quoteId = quote(quoter, originalId, "Assino embaixo.")
+    var viaQuote = sendRepost(other, quoteId, "")
+    Check.status(viaQuote, 201)
+    Check.jsonEq(viaQuote, "id", originalId)
+    Check.status(FeedTestSupport.send("DELETE", repostPath(originalId), reposter, "rp-undo-1", ""), 200)
+    Check.status(sendRepost(reposter, originalId, ""), 201)
+}
+
+test "a repost with opinion carries the comment and quotes the original" {
+    var author = FeedTestSupport.user("repost_quote_author")
+    var reposter = FeedTestSupport.user("repost_quote_user")
+    var originalId = FeedFixtures.publish(author, "rp-2", "Texto original que sera citado no repost com opiniao.")
+    var opinion = "Discordo em parte: o ponto principal e bom, mas o contexto muda tudo."
+    var created = sendRepost(reposter, originalId, "{\"opinion\":\"" + opinion + "\"}")
+    Check.status(created, 201)
+    Check.jsonEq(created, "repostOf", originalId)
+    Check.jsonEq(created, "repostWithOpinion", "true")
+    Check.jsonEq(created, "content", opinion)
+    var read = FeedTestSupport.app().client.get("/feed/posts/" + FeedTestSupport.field(created, "id"))
+    Check.status(read, 200)
+    Check.jsonEq(read, "repostWithOpinion", "true")
+    Check.jsonEq(read, "repostOfContent", "Texto original que sera citado no repost com opiniao.")
+    Check.eqInt("media ids", 0, read.jsonSize("repostOfMediaIds"))
+    var another = FeedTestSupport.user("repost_quote_long")
+    var longOpinion = strings.repeat("Esta e uma opiniao longa sobre o post e o contexto. ", 20).substring(0, 601)
+    Check.apiError(sendRepost(another, originalId, "{\"opinion\":\"" + longOpinion + "\"}"), 400, "OPINION_TOO_LONG")
+}
+
+test "editing a repost with opinion keeps the quoted original" {
+    var author = FeedTestSupport.user("repost_edit_author")
+    var reposter = FeedTestSupport.user("repost_edit_user")
+    setUsername("repost_edit_author", "repost-edit-author")
+    var originalContent = "Texto original que continua citado depois da edicao."
+    var originalId = FeedFixtures.publish(author, "rp-3", originalContent)
+    var repostId = quote(reposter, originalId, "Comentario antes de editar.")
+    var edited = FeedTestSupport.send("PATCH", "/feed/posts/" + repostId, reposter, "rp-edit-1", "{\"content\":\"Comentario depois de editar.\"}")
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "content", "Comentario depois de editar.")
+    Check.jsonEq(edited, "repostOf", originalId)
+    Check.jsonEq(edited, "repostOfAuthor", "repost-edit-author")
+    Check.jsonEq(edited, "repostWithOpinion", "true")
+    var read = FeedTestSupport.app().client.get("/feed/posts/" + repostId)
+    Check.jsonEq(read, "content", "Comentario depois de editar.")
+    Check.jsonEq(read, "repostOf", originalId)
+    Check.jsonEq(read, "repostWithOpinion", "true")
+    Check.jsonEq(read, "repostOfContent", originalContent)
+}
+
+test "ephemeral posts cannot be reposted" {
+    var author = FeedTestSupport.user("repost_moment")
+    var reposter = FeedTestSupport.user("repost_moment_user")
+    var momentId = publishBody(author, "rp-moment", "{\"topic\":\"TECNOLOGIA\",\"type\":\"MOMENT\",\"content\":\"Um momento que some em 24h.\",\"tags\":[],\"mediaIds\":[]}")
+    Check.apiError(sendRepost(reposter, momentId, ""), 400, "NOT_REPOSTABLE")
+}
+
+test "articles circulate as pointers or as quotes saved as insight" {
+    var author = FeedTestSupport.user("repost_article")
+    var reposter = FeedTestSupport.user("repost_article_user")
+    var other = FeedTestSupport.user("repost_article_other")
+    var articleId = publishBody(author, "rp-article", "{\"topic\":\"TECNOLOGIA\",\"type\":\"ARTICLE\",\"content\":\"Titulo do artigo citado\",\"articleBody\":\"Corpo que mora em outra tabela.\",\"tags\":[],\"mediaIds\":[]}")
+    var pointer = sendRepost(reposter, articleId, "")
+    Check.status(pointer, 201)
+    Check.jsonEq(pointer, "id", articleId)
+    var quoteId = quote(reposter, articleId, "Vale a leitura.")
+    var read = FeedTestSupport.app().client.get("/feed/posts/" + quoteId)
+    Check.status(read, 200)
+    Check.jsonEq(read, "type", "INSIGHT")
+    Check.jsonEq(read, "content", "Vale a leitura.")
+    Check.jsonEq(read, "repostOf", articleId)
+    Check.jsonEq(read, "repostOfContent", "Titulo do artigo citado")
+    Check.apiError(sendRepost(reposter, articleId, "{\"opinion\":\"De novo.\"}"), 409, "ALREADY_REPOSTED")
+    var viaQuote = sendRepost(other, quoteId, "")
+    Check.status(viaQuote, 201)
+    Check.jsonEq(viaQuote, "id", articleId)
+}
+
+test "pages and blog pointers circulate as pointers or as quotes" {
+    var author = FeedTestSupport.user("repost_page")
+    var reposter = FeedTestSupport.user("repost_page_user")
+    var pageId = publishBody(author, "rp-page", "{\"topic\":\"TECNOLOGIA\",\"type\":\"PAGE\",\"content\":\"\",\"pageHtml\":\"<p>Mini pagina</p>\",\"tags\":[],\"mediaIds\":[]}")
+    var blogId = publishBody(author, "rp-blog", "{\"topic\":\"TECNOLOGIA\",\"type\":\"BLOG\",\"content\":\"Post do blog citado\",\"tags\":[],\"mediaIds\":[]}")
+    for (var id in listOf(pageId, blogId)) {
+        var pointer = sendRepost(reposter, id, "")
+        Check.status(pointer, 201)
+        Check.jsonEq(pointer, "id", id)
+        var quoteId = quote(reposter, id, "Olha isso aqui " + id)
+        var read = FeedTestSupport.app().client.get("/feed/posts/" + quoteId)
+        Check.status(read, 200)
+        Check.jsonEq(read, "type", "INSIGHT")
+        Check.jsonEq(read, "repostOf", id)
+    }
+}
+
+test "a pure repost appears at the top of the profile feed by repost date" {
+    var author = FeedTestSupport.user("repost_order_author")
+    var reposter = FeedTestSupport.user("repost_order_user")
+    setUsername("repost_order_user", "repost-order-user")
+    var oldPostId = FeedFixtures.publish(author, "rp-old", "Post antigo que sera republicado.")
+    var ownPostId = FeedFixtures.publish(reposter, "rp-own", "Meu post proprio, mais recente.")
+    Check.status(sendRepost(reposter, oldPostId, ""), 201)
+    var res = FeedTestSupport.app().client.getWith("/users/repost-order-user/posts", FeedTestSupport.read(reposter))
+    Check.status(res, 200)
+    Check.jsonEq(res, "items.0.id", oldPostId)
+    Check.isTrue("repostedBy", !res.jsonIsNull("items.0.repostedBy"))
+    Check.isTrue("repostedBy.at", !res.jsonIsNull("items.0.repostedBy.at"))
+    Check.jsonEq(res, "items.1.id", ownPostId)
+}

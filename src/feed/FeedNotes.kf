@@ -1,0 +1,295 @@
+package feed
+
+import kernel.blocks.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+
+record FeedNoteView(String id, String body, String createdAt, String? authorUsername, String? authorName, String? authorAvatar, List<String> authorBadges, FeedNameStyle? authorStyle, FeedContributorTag? authorContributor)
+
+record FeedMyNote(String id, String postId, String body, String status, String? reviewReason, String createdAt)
+
+record FeedNoteList(List<FeedNoteView> items, FeedMyNote? mine)
+
+record FeedAdminNote(String id, String postId, String body, String status, String createdAt, String authorId, String? authorUsername, String? authorName)
+
+record FeedNoteBody(String? body)
+
+record FeedNoteReviewBody(String? status, String? reason)
+
+record FeedStatusIdResult(String id, String status)
+
+record FeedNoteRow(String id, String postId, String authorId, String body, String status, String? reviewReason, String createdAt)
+
+// PostNoteService + its persistence adapter: a community footnote on a post, reviewed by moderation.
+class FeedNotes {
+    Db store
+    FeedStore posts
+    FeedAuthors authors
+    BlockedUsers blocked
+    UserRateLimiter limiter
+    public constructor(store: Db, posts: FeedStore, authors: FeedAuthors, blocked: BlockedUsers, limiter: UserRateLimiter) {
+        this.store = store
+        this.posts = posts
+        this.authors = authors
+        this.blocked = blocked
+        this.limiter = limiter
+    }
+    static String columns() = "id, post_id, author_id, body, status, review_reason, created_at"
+    static FeedNoteRow rowOf(r: DbRow) = FeedNoteRow(r.getStr("id"), r.getStr("post_id"), r.getStr("author_id"), r.getStr("body"), r.getStr("status"), r.getStrOrNull("review_reason"), r.getInstant("created_at"))
+    static FeedMyNote myOf(n: FeedNoteRow) = FeedMyNote(n.id(), n.postId(), n.body(), n.status(), n.reviewReason(), n.createdAt())
+    Bool hasApproved(postId: String) = store.queryLong("select count(*) from post_notes where post_id = ? and status = 'APPROVED'", DbParams().bindStr(postId)) > 0L
+    FeedNoteRow? latestBy(authorId: String, postId: String) {
+        var r = store.queryOptional("select " + FeedNotes.columns() + " from post_notes where author_id = ? and post_id = ? order by created_at desc limit 1", DbParams().bindStr(authorId).bindStr(postId))
+        if (r == null) {
+            return null
+        }
+        return FeedNotes.rowOf(r)
+    }
+    FeedMyNote create(postId: String, authorId: String, rawBody: String?) {
+        var post = posts.post(postId)
+        if (post == null) {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post não encontrado.")
+        }
+        if (post.status() != "ACTIVE") {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post não encontrado.")
+        }
+        if (post.authorId() == authorId) {
+            throw Errors.api(403, "NOTE_ON_OWN_POST", "Nota de rodapé é uma correção da comunidade; o autor não pode publicar no próprio post.")
+        }
+        var body = FeedRules.nz(PlainText.defuse(FeedRules.trimmed(rawBody)))
+        if (body.trim().length() < 10) {
+            throw Errors.api(400, "NOTE_TOO_SHORT", "A nota precisa ter pelo menos 10 caracteres.")
+        }
+        if (body.length() > 500) {
+            throw Errors.api(400, "NOTE_TOO_LONG", "A nota deve ter no máximo 500 caracteres.")
+        }
+        if (this.hasApproved(postId)) {
+            throw Errors.api(409, "NOTE_ALREADY_APPROVED", "Este post já tem uma nota aprovada pela comunidade.")
+        }
+        limiter.require(authorId, UserRateLimiter.createComment())
+        var existing = this.latestBy(authorId, postId)
+        if (existing != null) {
+            if (existing.status() == "PENDING") {
+                throw Errors.api(409, "NOTE_ALREADY_EXISTS", "Sua nota neste post já está em análise.")
+            }
+            throw Errors.api(409, "NOTE_ALREADY_EXISTS", "Você já enviou uma nota para este post.")
+        }
+        var id = Ids.prefixed("note_")
+        var now = Time.nowIso()
+        store.execute("insert into post_notes (id, post_id, author_id, body, status, created_at) values (?, ?, ?, ?, 'PENDING', ?)", DbParams().bindStr(id).bindStr(postId).bindStr(authorId).bindStr(body).bindInstant(now))
+        var saved = this.latestBy(authorId, postId)
+        if (saved == null) {
+            throw Errors.conflict()
+        }
+        return FeedNotes.myOf(saved)
+    }
+    // Approved notes of the page's posts, newest first, with the author's presentation.
+    Map<String,List<FeedNoteView>> viewsByPost(postIds: List<String>, hidden: List<String>) {
+        var out = new HashMap<String, List<FeedNoteView>>()
+        if (postIds.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        for (var id in postIds) {
+            p.bindStr(id)
+        }
+        var approved = listOf<FeedNoteRow>()
+        for (var r in store.queryList("select " + FeedNotes.columns() + " from post_notes where status = 'APPROVED' and post_id in (" + FeedStore.marks(postIds.size()) + ") order by created_at desc", p)) {
+            var n = FeedNotes.rowOf(r)
+            if (!hidden.contains(n.authorId())) {
+                approved.add(n)
+            }
+        }
+        if (approved.size() == 0) {
+            return out
+        }
+        var authorIds = listOf<String>()
+        for (var n in approved) {
+            if (!authorIds.contains(n.authorId())) {
+                authorIds.add(n.authorId())
+            }
+        }
+        var profiles = authors.byIds(authorIds)
+        var contributors = authors.contributorIds(authorIds)
+        for (var n in approved) {
+            var a = profiles.get(n.authorId())
+            var view = FeedNoteView(n.id(), n.body(), n.createdAt(), FeedViews.usernameOf(a), FeedViews.plainNameOf(a), FeedViews.avatarOf(a), FeedViews.badgesOf(a), FeedViews.styleOf(a, true), FeedViews.tagOf(a, true, contributors.contains(n.authorId())))
+            var list = out.get(n.postId())
+            if (list == null) {
+                var created = listOf<FeedNoteView>()
+                created.add(view)
+                out.put(n.postId(), created)
+            } else {
+                list.add(view)
+            }
+        }
+        return out
+    }
+    Map<String,FeedMyNote> mineByPost(userId: String, postIds: List<String>) {
+        var out = new HashMap<String, FeedMyNote>()
+        if (postIds.size() == 0) {
+            return out
+        }
+        var p = DbParams().bindStr(userId)
+        for (var id in postIds) {
+            p.bindStr(id)
+        }
+        for (var r in store.queryList("select " + FeedNotes.columns() + " from post_notes where author_id = ? and post_id in (" + FeedStore.marks(postIds.size()) + ")", p)) {
+            var n = FeedNotes.rowOf(r)
+            out.put(n.postId(), FeedNotes.myOf(n))
+        }
+        return out
+    }
+    FeedNoteList list(postId: String, viewerId: String?) {
+        var items = FeedViews.notesOrEmpty(this.viewsByPost(listOf(postId), listOf<String>()).get(postId))
+        return FeedNoteList(items, this.mineOrNull(viewerId, postId))
+    }
+    FeedMyNote? mineOrNull(viewerId: String?, postId: String) {
+        if (viewerId == null) {
+            return null
+        }
+        return this.mineByPost(viewerId, listOf(postId)).get(postId)
+    }
+    FeedNoteRow requireNote(noteId: String) {
+        var r = store.queryOptional("select " + FeedNotes.columns() + " from post_notes where id = ?", DbParams().bindStr(noteId))
+        if (r == null) {
+            throw Errors.api(404, "NOTE_NOT_FOUND", "Nota não encontrada.")
+        }
+        return FeedNotes.rowOf(r)
+    }
+    FeedStatusIdResult review(noteId: String, reviewerId: String, statusRaw: String?, rawReason: String?) {
+        var status = FeedRules.trimmed(statusRaw).toUpperCase()
+        if (status != "APPROVED" && status != "DENIED") {
+            throw Errors.api(400, "INVALID_NOTE_STATUS", "Use APPROVED ou DENIED.")
+        }
+        var reason = FeedRules.trimmedOrNull(PlainText.defuse(FeedRules.trimmed(rawReason)))
+        if (status == "DENIED") {
+            if (FeedRules.nz(reason).length() < 5) {
+                throw Errors.api(400, "NOTE_REASON_REQUIRED", "Explique por que a nota foi negada (pelo menos 5 caracteres).")
+            }
+        }
+        if (FeedRules.nz(reason).length() > 500) {
+            throw Errors.api(400, "NOTE_REASON_TOO_LONG", "O motivo deve ter no máximo 500 caracteres.")
+        }
+        var self = this
+        store.transaction(() -> {
+    self.applyReview(noteId, reviewerId, status, reason)
+})
+        return FeedStatusIdResult(noteId, status)
+    }
+    applyReview(noteId: String, reviewerId: String, status: String, reason: String?) {
+        var note = this.requireNote(noteId)
+        if (note.status() != "PENDING") {
+            throw Errors.api(409, "NOTE_ALREADY_REVIEWED", "Esta nota já foi revisada.")
+        }
+        var now = Time.nowIso()
+        if (status == "APPROVED" && this.hasApproved(note.postId())) {
+            throw Errors.api(409, "NOTE_ALREADY_APPROVED", "Este post já tem uma nota aprovada pela comunidade.")
+        }
+        var kept = FeedViews.reasonFor(status, reason)
+        store.execute("update post_notes set status = ?, reviewed_by = ?, reviewed_at = ?, review_reason = ? where id = ?", DbParams().bindStr(status).bindStr(reviewerId).bindInstant(now).bindStrOrNull(kept).bindStr(noteId))
+        if (status == "APPROVED") {
+            store.execute("update post_notes set status = 'DISCARDED', reviewed_by = ?, reviewed_at = ?, review_reason = null where post_id = ? and status = 'PENDING' and id <> ?", DbParams().bindStr(reviewerId).bindInstant(now).bindStr(note.postId()).bindStr(noteId))
+        }
+    }
+    // Moderation queue, oldest first, minus the authors the moderator hides.
+    List<FeedAdminNote> pendingForUi(limit: Int, userId: String) {
+        var cap = limit
+        if (cap < 1) {
+            cap = 1
+        }
+        if (cap > 200) {
+            cap = 200
+        }
+        var hidden = new ArrayList<String>(blocked.hiddenIdsFor(userId))
+        var pending = listOf<FeedNoteRow>()
+        for (var r in store.queryList("select " + FeedNotes.columns() + " from post_notes where status = 'PENDING' order by created_at asc limit " + cap, DbParams())) {
+            var n = FeedNotes.rowOf(r)
+            if (!hidden.contains(n.authorId())) {
+                pending.add(n)
+            }
+        }
+        var out = listOf<FeedAdminNote>()
+        if (pending.size() == 0) {
+            return out
+        }
+        var authorIds = listOf<String>()
+        for (var n in pending) {
+            if (!authorIds.contains(n.authorId())) {
+                authorIds.add(n.authorId())
+            }
+        }
+        var profiles = authors.byIds(authorIds)
+        for (var n in pending) {
+            var a = profiles.get(n.authorId())
+            out.add(FeedAdminNote(n.id(), n.postId(), n.body(), n.status(), n.createdAt(), n.authorId(), FeedViews.usernameOf(a), FeedViews.plainNameOf(a)))
+        }
+        return out
+    }
+    Int deniedCount(userId: String) = store.queryLong("select count(*) from post_notes where author_id = ? and status = 'DENIED'", DbParams().bindStr(userId)) as Int
+}
+
+// Presentation helpers shared by the views (an author may be missing: deleted account).
+class FeedViews {
+    static String? usernameOf(a: FeedAuthor?) {
+        if (a == null) {
+            return null
+        }
+        return a.username()
+    }
+    static String? plainNameOf(a: FeedAuthor?) {
+        if (a == null) {
+            return null
+        }
+        return a.name()
+    }
+    static String? avatarOf(a: FeedAuthor?) {
+        if (a == null) {
+            return null
+        }
+        return a.avatar()
+    }
+    static List<String> badgesOf(a: FeedAuthor?) {
+        if (a == null) {
+            return listOf<String>()
+        }
+        return a.badges()
+    }
+    static FeedNameStyle? styleOf(a: FeedAuthor?, social: Bool) {
+        if (a == null) {
+            return null
+        }
+        if (!social) {
+            return null
+        }
+        if (a.nameTheme() == null && a.nameFont() == null && a.nameColor() == null && a.nameplate() == null) {
+            return null
+        }
+        return FeedNameStyle(a.nameTheme(), a.nameFont(), a.nameColor(), a.nameplate())
+    }
+    static FeedContributorTag? tagOf(a: FeedAuthor?, social: Bool, contributor: Bool) {
+        if (a == null) {
+            return null
+        }
+        if (!social || !contributor) {
+            return null
+        }
+        return FeedContributorTag(a.contributorTagColor())
+    }
+    static List<FeedNoteView> notesOrEmpty(l: List<FeedNoteView>?) {
+        if (l == null) {
+            return listOf<FeedNoteView>()
+        }
+        return l
+    }
+    static String? reasonFor(status: String, reason: String?) {
+        if (status != "DENIED") {
+            return null
+        }
+        return reason
+    }
+}

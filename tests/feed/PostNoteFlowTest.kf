@@ -1,0 +1,68 @@
+import feed.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Port of PostNoteFlowTests (the credibility counters read the post_notes rows, as NoteCredibilityReader does).
+String publishCorrectable(token: String, key: String) = FeedFixtures.publish(token, key, "Post que sera corrigido pela comunidade.")
+
+TestResponse sendNote(token: String, postId: String, body: String, key: String) = FeedTestSupport.send("POST", "/feed/posts/" + postId + "/notes", token, key, "{\"body\":\"" + body + "\"}")
+
+String createNote(token: String, postId: String, body: String, key: String) {
+    var res = sendNote(token, postId, body, key)
+    Check.status(res, 201)
+    Check.jsonEq(res, "status", "PENDING")
+    return FeedTestSupport.field(res, "id")
+}
+
+Int countNotes(userId: String, status: String) = FeedTestSupport.app().db().queryLong("select count(*) from post_notes where author_id = ? and status = ?", DbParams().bindStr(userId).bindStr(status)) as Int
+
+test "an approved note shows on the post and discards the competitors without penalty" {
+    var autor = FeedTestSupport.user("note_autor_1")
+    var primeira = FeedTestSupport.user("note_comunidade_1")
+    var segunda = FeedTestSupport.user("note_concorrente_1")
+    var equipe = FeedTestSupport.admin("group-admin")
+    var postId = publishCorrectable(autor, "note-pub-1")
+    var vencedora = createNote(primeira, postId, "A informacao correta e 42%, conforme o relatorio oficial.", "note-create-1")
+    createNote(segunda, postId, "Na verdade o numero correto e 90% e ninguem prova o contrario.", "note-create-2")
+    var c = FeedTestSupport.app().client
+    Check.eqInt("nothing public yet", 0, c.get("/feed/posts/" + postId + "/notes").jsonSize("items"))
+    Check.eqInt("no denial", 0, countNotes("note_comunidade_1", "DENIED"))
+    var approved = FeedTestSupport.send("PATCH", "/admin/notes/" + vencedora, equipe, "note-approve-1", "{\"status\":\"APPROVED\"}")
+    Check.status(approved, 200)
+    var list = c.get("/feed/posts/" + postId + "/notes")
+    Check.status(list, 200)
+    Check.eqInt("one note", 1, list.jsonSize("items"))
+    Check.jsonEq(list, "items.0.body", "A informacao correta e 42%, conforme o relatorio oficial.")
+    Check.eqInt("on the post", 1, c.getWith("/feed/posts/" + postId, FeedTestSupport.read(autor)).jsonSize("communityNotes"))
+    var mine = c.getWith("/feed/posts/" + postId + "/notes", FeedTestSupport.read(segunda))
+    Check.jsonEq(mine, "mine.status", "DISCARDED")
+    Check.eqInt("discarded is not denied", 0, countNotes("note_concorrente_1", "DENIED"))
+    Check.eqInt("approved", 1, countNotes("note_comunidade_1", "APPROVED"))
+    var terceira = FeedTestSupport.user("note_depois_1")
+    Check.apiError(sendNote(terceira, postId, "Tentando mandar uma nota depois da aprovada.", "note-create-late"), 409, "NOTE_ALREADY_APPROVED")
+}
+
+test "a denied note does not show and weighs on the credibility" {
+    var autor = FeedTestSupport.user("note_autor_falso")
+    var pessoa = FeedTestSupport.user("note_falsa_1")
+    var equipe = FeedTestSupport.admin("group-admin")
+    var postId = publishCorrectable(autor, "note-pub-falso")
+    var negada = createNote(pessoa, postId, "Na verdade o numero correto e 90% e ninguem prova o contrario.", "note-create-falsa")
+    Check.apiError(FeedTestSupport.send("PATCH", "/admin/notes/" + negada, equipe, "note-deny-1", "{\"status\":\"DENIED\"}"), 400, "NOTE_REASON_REQUIRED")
+    Check.status(FeedTestSupport.send("PATCH", "/admin/notes/" + negada, equipe, "note-deny-2", "{\"status\":\"DENIED\",\"reason\":\"Numero inventado, sem fonte.\"}"), 200)
+    Check.eqInt("nothing public", 0, FeedTestSupport.app().client.get("/feed/posts/" + postId + "/notes").jsonSize("items"))
+    Check.eqInt("denied", 1, countNotes("note_falsa_1", "DENIED"))
+    Check.eqInt("denied counter", 1, FeedTestSupport.module().notes.deniedCount("note_falsa_1"))
+    Check.eqInt("not approved", 0, countNotes("note_falsa_1", "APPROVED"))
+}
+
+test "the author cannot annotate the own post and a duplicate note is refused" {
+    var autor = FeedTestSupport.user("note_dono_1")
+    var comunidade = FeedTestSupport.user("note_dup_1")
+    var postId = publishCorrectable(autor, "note-pub-2")
+    Check.apiError(sendNote(autor, postId, "Eu mesmo estou corrigindo meu post aqui.", "note-own-1"), 403, "NOTE_ON_OWN_POST")
+    createNote(comunidade, postId, "Faltou citar que o dado e de 2024, nao de 2023.", "note-create-3")
+    Check.apiError(sendNote(comunidade, postId, "Tentando mandar outra nota no mesmo post.", "note-dup-1"), 409, "NOTE_ALREADY_EXISTS")
+    var naoModerador = FeedTestSupport.user("note_nao_mod_1")
+    Check.status(FeedTestSupport.app().client.getWith("/admin/notes", FeedTestSupport.read(naoModerador)), 403)
+}

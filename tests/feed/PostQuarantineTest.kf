@@ -1,0 +1,94 @@
+import feed.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Port of PostQuarantineVisibilityTests and PostQuarantineTests (the moderation use cases are called through
+// FeedModule.moderation; the Mockito verifications read audit_logs and outbox_events instead).
+Int audited(action: String, target: String) = FeedTestSupport.app().db().queryLong("select count(*) from audit_logs where action = ? and target_id = ?", DbParams().bindStr(action).bindStr(target)) as Int
+
+Int outboxRows(target: String) = FeedTestSupport.app().db().queryLong("select count(*) from outbox_events where aggregate_id = ?", DbParams().bindStr(target)) as Int
+
+String status(postId: String) = FeedTestSupport.app().db().queryOne("select status from posts where id = ?", DbParams().bindStr(postId)).getStr("status")
+
+test "a quarantined post disappears from every read and comes back when released" {
+    var author = FeedTestSupport.user("quar_visibility_1")
+    var published = FeedTestSupport.post(author, "quar-1", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Post que vai entrar em revisao quar1\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(published, 201)
+    var postId = FeedTestSupport.field(published, "id")
+    var username = FeedTestSupport.field(published, "authorUsername")
+    var c = FeedTestSupport.app().client
+    Check.status(c.get("/feed/posts/" + postId), 200)
+    var moderation = FeedTestSupport.module().moderation
+    Check.isTrue("quarantined", moderation.quarantine("automod:conteudo", postId, "revisao automatica"))
+    Check.apiError(c.get("/feed/posts/" + postId), 404, "POST_NOT_FOUND")
+    Check.isTrue("off the profile", !FeedRows.ids(c.get("/users/" + username + "/posts")).contains(postId))
+    Check.isTrue("off the feed", !FeedRows.ids(c.getWith("/feed", FeedTestSupport.read(author))).contains(postId))
+    Check.isTrue("released", moderation.release("mod_revisao", postId))
+    Check.jsonEq(c.get("/feed/posts/" + postId), "id", postId)
+}
+
+test "the author can still delete a quarantined post" {
+    var author = FeedTestSupport.user("quar_visibility_2")
+    var postId = FeedFixtures.publish(author, "quar-2", "Post que o autor apaga durante a revisao")
+    FeedTestSupport.module().moderation.quarantine("automod:conteudo", postId, "revisao automatica")
+    Check.status(FeedTestSupport.send("DELETE", "/feed/posts/" + postId, author, "quar-del-1", ""), 200)
+    Check.status(FeedTestSupport.app().client.get("/feed/posts/" + postId), 404)
+}
+
+test "quarantine takes the post off the air without deleting it" {
+    var author = FeedTestSupport.user("quar_unit_1")
+    var postId = FeedFixtures.publish(author, "quar-3", "texto do post quarentena")
+    Check.isTrue("quarantined", FeedTestSupport.module().moderation.quarantine("automod:conteudo", postId, "revisao automatica"))
+    Check.eqStr("status", "QUARANTINED", status(postId))
+    Check.isTrue("not deleted", FeedTestSupport.app().db().queryOne("select deleted_at from posts where id = ?", DbParams().bindStr(postId)).isNull("deleted_at"))
+    Check.eqInt("no outbox event", 0, outboxRows(postId))
+    Check.eqInt("audited", 1, audited("POST_QUARANTINED", postId))
+}
+
+test "release puts it back exactly as it was" {
+    var author = FeedTestSupport.user("quar_unit_2")
+    var postId = FeedFixtures.publish(author, "quar-4", "texto do post liberado")
+    var moderation = FeedTestSupport.module().moderation
+    moderation.quarantine("automod:conteudo", postId, "revisao automatica")
+    Check.isTrue("released", moderation.release("mod_1", postId))
+    Check.eqStr("status", "ACTIVE", status(postId))
+    Check.eqInt("audited", 1, audited("POST_QUARANTINE_RELEASED", postId))
+}
+
+test "a quarantined post cannot be quarantined twice" {
+    var author = FeedTestSupport.user("quar_unit_3")
+    var postId = FeedFixtures.publish(author, "quar-5", "texto do post repetido")
+    var moderation = FeedTestSupport.module().moderation
+    Check.isTrue("first", moderation.quarantine("automod:conteudo", postId, "primeira"))
+    Check.isTrue("second is refused", !moderation.quarantine("automod:conteudo", postId, "repetido"))
+    Check.eqInt("audited once", 1, audited("POST_QUARANTINED", postId))
+}
+
+test "releasing a post that is not quarantined is a no-op" {
+    var author = FeedTestSupport.user("quar_unit_4")
+    var postId = FeedFixtures.publish(author, "quar-6", "texto do post ativo")
+    Check.isTrue("no-op", !FeedTestSupport.module().moderation.release("mod_1", postId))
+    Check.eqStr("status", "ACTIVE", status(postId))
+    Check.eqInt("not audited", 0, audited("POST_QUARANTINE_RELEASED", postId))
+}
+
+test "a quarantined post can still be removed by a moderator" {
+    var author = FeedTestSupport.user("quar_unit_5")
+    var postId = FeedFixtures.publish(author, "quar-7", "texto do post removido")
+    var moderation = FeedTestSupport.module().moderation
+    moderation.quarantine("automod:conteudo", postId, "revisao automatica")
+    moderation.removeAsModerator("mod_1", postId, "REVIEW: conteudo automatizado")
+    Check.eqStr("status", "DELETED", status(postId))
+    Check.eqInt("event", 1, outboxRows(postId))
+    Check.eqInt("audited", 1, audited("POST_DELETED_BY_MODERATION", postId))
+}
+
+test "the author can still delete their own quarantined post" {
+    var author = FeedTestSupport.user("quar_unit_6")
+    var postId = FeedFixtures.publish(author, "quar-8", "texto do post do autor")
+    FeedTestSupport.module().moderation.quarantine("automod:conteudo", postId, "revisao automatica")
+    var res = FeedTestSupport.send("DELETE", "/feed/posts/" + postId, author, "quar-del-2", "")
+    Check.status(res, 200)
+    Check.jsonEq(res, "status", "DELETED")
+    Check.eqStr("status", "DELETED", status(postId))
+}

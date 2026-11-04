@@ -1,0 +1,69 @@
+import feed.*
+import kernel.testkit.*
+
+// Port of TopicCategorizationTests and PostPublishingPolicyTests.
+String publishWith(token: String, key: String, topic: String?, content: String) {
+    var body = "{\"type\":\"INSIGHT\",\"content\":\"" + content + "\",\"tags\":[],\"mediaIds\":[]}"
+    if (topic != null) {
+        body = "{\"topic\":\"" + topic + "\",\"type\":\"INSIGHT\",\"content\":\"" + content + "\",\"tags\":[],\"mediaIds\":[]}"
+    }
+    var res = FeedTestSupport.post(token, key, body)
+    Check.status(res, 201)
+    return FeedTestSupport.field(res, "id")
+}
+
+test "a standalone post carries the declared topic" {
+    var t = FeedTestSupport.user("topic_author")
+    var postId = publishWith(t, "topic-1", "GAMES", "Post de jogos com assunto declarado.")
+    Check.jsonEq(FeedTestSupport.app().client.get("/feed/posts/" + postId), "topic", "GAMES")
+}
+
+test "a standalone post without topic is rejected" {
+    var t = FeedTestSupport.user("topic_author")
+    Check.apiError(FeedTestSupport.post(t, "topic-missing", "{\"type\":\"INSIGHT\",\"content\":\"post sem assunto.\",\"tags\":[],\"mediaIds\":[]}"), 400, "TOPIC_REQUIRED")
+}
+
+test "an invalid topic is rejected" {
+    var t = FeedTestSupport.user("topic_author")
+    Check.apiError(FeedTestSupport.post(t, "topic-invalid", "{\"type\":\"INSIGHT\",\"content\":\"conteudo\",\"tags\":[],\"mediaIds\":[],\"topic\":\"TECNOLOGIAS\"}"), 400, "INVALID_TOPIC")
+}
+
+test "a community post inherits the community topic" {
+    var owner = FeedTestSupport.user("topic_author")
+    FeedWorld.community("comm_topic_games", "Comunidade de Jogos", "GAMES", "topic_author")
+    var conflict = FeedTestSupport.post(owner, "topic-comm-conflict", "{\"type\":\"INSIGHT\",\"content\":\"conteudo\",\"tags\":[],\"mediaIds\":[],\"communityId\":\"comm_topic_games\",\"topic\":\"ART\"}")
+    Check.apiError(conflict, 400, "TOPIC_FROM_COMMUNITY")
+    var postId = FeedWorld.publishIn(owner, "topic-comm-inherit", "comm_topic_games", "post na comunidade")
+    Check.jsonEq(FeedTestSupport.app().client.get("/feed/posts/" + postId), "topic", "GAMES")
+}
+
+test "editing changes the topic of a standalone post only" {
+    var t = FeedTestSupport.user("topic_author")
+    var postId = publishWith(t, "topic-edit-post", "GAMES", "post para editar o assunto.")
+    var edit = "{\"type\":\"INSIGHT\",\"content\":\"post para editar o assunto.\",\"tags\":[],\"topic\":\"ART\"}"
+    Check.status(FeedTestSupport.send("PATCH", "/feed/posts/" + postId, t, "topic-edit-1", edit), 200)
+    Check.jsonEq(FeedTestSupport.app().client.get("/feed/posts/" + postId), "topic", "ART")
+    var invalid = FeedTestSupport.send("PATCH", "/feed/posts/" + postId, t, "topic-edit-invalid", "{\"type\":\"INSIGHT\",\"content\":\"post para editar o assunto.\",\"tags\":[],\"topic\":\"JOGOS\"}")
+    Check.apiError(invalid, 400, "INVALID_TOPIC")
+    Check.jsonEq(FeedTestSupport.app().client.get("/feed/posts/" + postId), "topic", "ART")
+}
+
+test "the new feed tabs show only their type" {
+    var t = FeedTestSupport.user("topic_author")
+    publishWith(t, "topic-note-1", "TECNOLOGIA", "noticia do dia.")
+    var news = FeedTestSupport.post(t, "topic-news-1", "{\"type\":\"NEWS\",\"content\":\"noticia classificada.\",\"tags\":[],\"mediaIds\":[],\"topic\":\"GAMES\"}")
+    Check.status(news, 201)
+    var newsId = FeedTestSupport.field(news, "id")
+    Check.isTrue("on NEWS", FeedWorld.listed(FeedWorld.feedIds(t, "tab=NEWS"), newsId))
+    Check.isTrue("not on FUN", !FeedWorld.listed(FeedWorld.feedIds(t, "tab=FUN"), newsId))
+}
+
+test "publishing without a user session is rejected" {
+    var anon = listOf("Idempotency-Key: policy-anon", "Content-Type: application/json")
+    Check.status(FeedTestSupport.app().client.send("POST", "/feed/posts", anon, "", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"tentativa automatica\",\"tags\":[],\"mediaIds\":[]}"), 401)
+}
+
+test "a service token header does not publish" {
+    var service = listOf("X-Integration-Token: fake-service-token", "Idempotency-Key: policy-service", "Content-Type: application/json")
+    Check.status(FeedTestSupport.app().client.send("POST", "/feed/posts", service, "", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"tentativa via integracao\",\"tags\":[],\"mediaIds\":[]}"), 401)
+}
