@@ -1,0 +1,121 @@
+package linkedin
+
+import kernel.db.*
+import kernel.error.*
+import kernel.log.*
+import kernel.security.*
+import kernel.time.*
+
+// Publishing of Enois posts on LinkedIn ("Share on LinkedIn"). The access token is stored ENCRYPTED
+// (SecretCipher); without REDE_SECURITY_ENCRYPTION_KEY the integration declares itself unavailable and
+// nothing is stored. Sharing is best effort and outside the publish transaction.
+class LinkedInService {
+    LinkedInStore connections
+    LinkedInShareClient shareClient
+    SecretCipher cipher
+    LinkedInClock clock
+    Db store
+    String baseUrl
+    Log log = Log("linkedin.service")
+    public constructor(store: Db, connections: LinkedInStore, shareClient: LinkedInShareClient, cipher: SecretCipher, clock: LinkedInClock, baseUrl: String) {
+        this.store = store
+        this.connections = connections
+        this.shareClient = shareClient
+        this.cipher = cipher
+        this.clock = clock
+        this.baseUrl = baseUrl
+    }
+    // Keeps (or renews) the token received by the OAuth callback. Called by identity on link and on
+    // login with LinkedIn; without the encryption key nothing is stored. `tokenExpiresAt` null = 1 day.
+    remember(userId: String, memberSub: String, accessToken: String, tokenExpiresAt: String?) {
+        if (userId.trim().length() == 0 || memberSub.trim().length() == 0 || accessToken.trim().length() == 0) {
+            return
+        }
+        if (!cipher.isEnabled()) {
+            log.info("linkedin token not stored: REDE_SECURITY_ENCRYPTION_KEY is not configured")
+            return
+        }
+        var now = clock.nowIso()
+        var expiresAt = Time.plusSeconds(now, 86400L)
+        if (tokenExpiresAt != null) {
+            expiresAt = tokenExpiresAt
+        }
+        var encrypted = cipher.encrypt(accessToken)
+        store.transaction(() -> {
+    var existing = connections.findByUserId(userId)
+    var createdAt = now
+    var postSync = false
+    if (existing != null) {
+        createdAt = existing.createdAt
+        postSync = existing.postSync
+    }
+    connections.save(LinkedInConnection(userId, memberSub, encrypted, expiresAt, postSync, createdAt, now, null, null))
+})
+    }
+    LinkedInStatus status(userId: String) {
+        var c = connections.findByUserId(userId)
+        if (c == null) {
+            return LinkedInStatus(false, false, false, null, "NOT_CONNECTED", null, null)
+        }
+        var canPost = cipher.isEnabled() && LinkedInRules.tokenValid(c.tokenExpiresAt, clock.nowIso())
+        var reason = "TOKEN_EXPIRED"
+        if (!cipher.isEnabled()) {
+            reason = "SERVER_KEY_MISSING"
+        }
+        if (canPost) {
+            return LinkedInStatus(true, c.postSync, true, c.tokenExpiresAt, null, c.lastShareStatus, c.lastShareAt)
+        }
+        return LinkedInStatus(true, c.postSync, false, c.tokenExpiresAt, reason, c.lastShareStatus, c.lastShareAt)
+    }
+    LinkedInStatus setPostSync(userId: String, enabled: Bool) {
+        var c = connections.findByUserId(userId)
+        if (c == null) {
+            throw Errors.api(409, "LINKEDIN_NOT_CONNECTED", "Vincule o LinkedIn antes de ativar a sincronizacao.")
+        }
+        var now = clock.nowIso()
+        if (enabled && (!cipher.isEnabled() || !LinkedInRules.tokenValid(c.tokenExpiresAt, now))) {
+            throw Errors.api(409, "LINKEDIN_NOT_READY", "Reconecte o LinkedIn para autorizar a publicacao em seu nome.")
+        }
+        connections.save(LinkedInConnection(c.userId, c.memberSub, c.accessTokenEnc, c.tokenExpiresAt, enabled, c.createdAt, now, c.lastShareStatus, c.lastShareAt))
+        return this.status(userId)
+    }
+    // Unlinking LinkedIn kills the publishing connection with it (identity calls this).
+    remove(userId: String) {
+        connections.deleteByUserId(userId)
+    }
+    // Best effort, called by the outbox handler after the publish. Silent on purpose: a LinkedIn failure
+    // never breaks (or delays) publishing on Enois.
+    sharePublishedPost(authorId: String, postId: String, content: String, title: String) {
+        var c = connections.findByUserId(authorId)
+        if (c == null) {
+            return
+        }
+        var now = clock.nowIso()
+        if (!c.postSync || !cipher.isEnabled() || !LinkedInRules.tokenValid(c.tokenExpiresAt, now)) {
+            return
+        }
+        var accessToken = ""
+        try {
+            accessToken = cipher.decrypt(c.accessTokenEnc)
+        } catch (String e) {
+            log.warn("linkedin token could not be decrypted")
+            return
+        }
+        var root = baseUrl
+        while (root.endsWith("/")) {
+            root = root.substring(0, root.length() - 1)
+        }
+        var url = root + "/post/" + postId
+        var outcome = shareClient.share(accessToken, c.memberSub, LinkedInRules.commentary(content, url), url, title)
+        // The outcome stays on the person's row so the panel shows what happened without the pod log.
+        var status = "OK"
+        var detail = outcome.detail
+        if (!outcome.accepted) {
+            status = "EXCEPTION"
+            if (detail != null) {
+                status = detail
+            }
+        }
+        connections.save(LinkedInConnection(c.userId, c.memberSub, c.accessTokenEnc, c.tokenExpiresAt, c.postSync, c.createdAt, now, status, now))
+    }
+}

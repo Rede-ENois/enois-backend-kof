@@ -1,0 +1,23 @@
+package linkedin
+
+import kernel.*
+import kernel.security.*
+import kernel.log.*
+
+// Wiring of the linkedin domain: store, service, routes and the PostPublished outbox handler.
+// Identity (OAuth link/login/unlink) calls `service.remember(...)` and `service.remove(userId)`.
+class LinkedInModule {
+    LinkedInService service
+    public constructor(service: LinkedInService) {
+        this.service = service
+    }
+    // `posts` defaults to the read-only SQL lookup (pending-port: feed); `client` to the real LinkedIn API.
+    static LinkedInModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks) = LinkedInModule.installWith(platform, shared, LinkedInPostLookup(platform.db), LinkedInHttpShareClient(LinkedInHttpShareClient.defaultEndpoint()), LinkedInClock())
+    static LinkedInModule installWith(platform: Platform, shared: SharedServices, posts: LinkedInPostLookup, client: LinkedInShareClient, clock: LinkedInClock) {
+        var baseUrl = platform.cfg.getStr("REDE_FRONTEND_BASE_URL", "https://enois.ia.br")
+        var service = LinkedInService(platform.db, LinkedInStore(platform.db), client, shared.cipher, clock, baseUrl)
+        LinkedInRoutes.register(platform.server, service)
+        shared.outbox.register("PostPublished", LinkedInShareOutboxHandler(posts, service))
+        return LinkedInModule(service)
+    }
+}

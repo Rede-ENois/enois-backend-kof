@@ -1,0 +1,65 @@
+package linkedin
+
+import kernel.time.*
+import kernel.db.*
+import kernel.http.*
+import kernel.log.*
+
+// Time source of the service; tests extend it to move the clock (Java `Clock.fixed`).
+class LinkedInClock {
+    String nowIso() = Time.nowIso()
+}
+
+// Seam to the feed domain: the post behind a PostPublished event. pending-port: feed.
+// Default reads `posts` read-only with the same columns the feed store uses.
+class LinkedInPostLookup {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    LinkedInPostRef? findById(postId: String) {
+        var row = store.queryOptional("select id, author_id, content, status, type, author_identity from posts where id = ?", DbParams().bindStr(postId))
+        if (row == null) {
+            return null
+        }
+        return LinkedInPostRef(row.getStr("id"), row.getStr("author_id"), row.getStr("content"), row.getStr("status"), row.getStr("type"), row.getStr("author_identity"))
+    }
+}
+
+// Seam to the LinkedIn API ("Share on LinkedIn", scope w_member_social). Tests extend it with a stub.
+class LinkedInShareClient {
+    LinkedInShareOutcome share(accessToken: String, memberSub: String, commentary: String, url: String, title: String) = LinkedInShareOutcome(false, "EXCEPTION")
+}
+
+// Real client: POST https://api.linkedin.com/v2/ugcPosts. Failure never reaches the caller as an exception.
+class LinkedInHttpShareClient extends LinkedInShareClient {
+    String endpoint
+    public constructor(endpoint: String) {
+        super()
+        this.endpoint = endpoint
+    }
+    static String defaultEndpoint() = "https://api.linkedin.com/v2/ugcPosts"
+    static String payload(memberSub: String, commentary: String, url: String, title: String) {
+        var media = "{\"status\":\"READY\",\"originalUrl\":" + json.encode(url) + ",\"title\":{\"text\":" + json.encode(title) + "}}"
+        var content = "{\"shareCommentary\":{\"text\":" + json.encode(commentary) + "},\"shareMediaCategory\":\"ARTICLE\",\"media\":[" + media + "]}"
+        return "{\"author\":" + json.encode("urn:li:person:" + memberSub) + ",\"lifecycleState\":\"PUBLISHED\",\"specificContent\":{\"com.linkedin.ugc.ShareContent\":" + content + "},\"visibility\":{\"com.linkedin.ugc.MemberNetworkVisibility\":\"PUBLIC\"}}"
+    }
+    LinkedInShareOutcome share(accessToken: String, memberSub: String, commentary: String, url: String, title: String) {
+        if (accessToken.trim().length() == 0 || memberSub.trim().length() == 0) {
+            return LinkedInShareOutcome(false, "SEM_TOKEN")
+        }
+        var headers = listOf("Authorization: Bearer " + accessToken, "Content-Type: application/json", "X-Restli-Protocol-Version: 2.0.0")
+        var res = HttpPostClient.post(endpoint, headers, LinkedInHttpShareClient.payload(memberSub, commentary, url, title), 15000)
+        if (res.status == 201) {
+            return LinkedInShareOutcome(true, null)
+        }
+        var log = Log("linkedin.share")
+        if (res.status == 0) {
+            log.warn("linkedin_share_failed transport")
+            return LinkedInShareOutcome(false, "EXCEPTION")
+        }
+        // 401/403: token without w_member_social or expired; 422: text/URL refused.
+        log.warn("linkedin_share_refused status=" + res.status)
+        return LinkedInShareOutcome(false, "HTTP_" + res.status)
+    }
+}
