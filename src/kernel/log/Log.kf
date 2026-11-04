@@ -1,6 +1,7 @@
 package kernel.log
 
 import java.lang.System
+import java.lang.ThreadLocal
 import java.time.Instant
 import java.util.regex.Pattern
 
@@ -16,9 +17,22 @@ class PiiMask {
     static String text(value: String) = Pattern.compile("[\\w.+-]+@[\\w.-]+\\.[A-Za-z]{2,}").matcher(value).replaceAll("***")
 }
 
+// Observer of every line a Log writes (ops/monitoring captures WARN/ERROR/audit for the admin panel). The base class
+// ignores everything; the owner installs a subclass with Log.installTap. A line logged WHILE the tap runs is not
+// tapped again, so a tap that logs can never loop.
+class LogTap {
+    accept(level: String, logger: String, message: String) {
+    }
+}
+
 // One JSON object per line on stdout: {"ts","level","logger","message", ...fields}.
 // Message and field values pass through PiiMask.text. Level comes from LOG_LEVEL (default INFO).
 class Log {
+    static LogTap logTapSlot = LogTap()
+    static ThreadLocal logTapActiveSlot = new ThreadLocal()
+    static installTap(tap: LogTap) {
+        Log.logTapSlot = tap
+    }
     String name
     Int threshold
     public constructor(name: String) {
@@ -84,5 +98,13 @@ class Log {
             return
         }
         println(render(level, message, fields))
+        if (Log.logTapActiveSlot.get() == null) {
+            Log.logTapActiveSlot.set("1")
+            try {
+                Log.logTapSlot.accept(level, name, message)
+            } catch (String ignored) {
+            }
+            Log.logTapActiveSlot.remove()
+        }
     }
 }

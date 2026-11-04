@@ -1,0 +1,243 @@
+package kernel.monitoring
+
+import java.lang.Runtime
+import java.lang.System
+import java.lang.management.GarbageCollectorMXBean
+import java.lang.management.ManagementFactory
+import javax.management.ObjectName
+import kernel.db.*
+
+record HostResourcesView(Long heapUsedBytes, Long heapCommittedBytes, Long heapMaxBytes, Long nonHeapUsedBytes, Long gcCount, Long gcTimeMs, Int threads, Int peakThreads, Int daemonThreads, Int loadedClasses, Double processCpuPercent, Double systemCpuPercent, Double loadAverage, Int processors, Long systemMemoryTotalBytes, Long systemMemoryFreeBytes, Long diskTotalBytes, Long diskFreeBytes, Long cgroupMemoryUsedBytes, Long cgroupMemoryMaxBytes, Double cgroupCpuCores, Double cgroupCpuPercent, DbPoolStats? dbPool)
+
+// What the host and the container are doing: JVM heap, threads, GC, CPU, system memory (MemAvailable, not MemFree),
+// disk, the cgroup limits of THIS container and the connection pool. The Java MonitoringService.resources().
+// Every probe is best effort: a missing /proc or cgroup file gives -1, never an error.
+class HostResources {
+    // The cgroup CPU percent is the delta between two samples: the last one lives here.
+    Long lastCpuUsageMicros = -1L
+    Long lastCpuSampleMillis = -1L
+    // Every field of the panel's resource card, sampled now.
+    HostResourcesView sample(db: Db?) {
+        var memory = ManagementFactory.getMemoryMXBean()
+        var heap = memory.getHeapMemoryUsage()
+        var threads = ManagementFactory.getThreadMXBean()
+        var gcCount = 0L
+        var gcTime = 0L
+        var collectors = ManagementFactory.getGarbageCollectorMXBeans()
+        var c = 0
+        while (c < collectors.size()) {
+            var gc = collectors.get(c) as GarbageCollectorMXBean
+            if (gc.getCollectionCount() > 0L) {
+                gcCount = gcCount + gc.getCollectionCount()
+            }
+            if (gc.getCollectionTime() > 0L) {
+                gcTime = gcTime + gc.getCollectionTime()
+            }
+            c = c + 1
+        }
+        var os = ManagementFactory.getOperatingSystemMXBean()
+        var loadAverage = os.getSystemLoadAverage()
+        var processCpu = HostResources.processCpuPercent()
+        var systemCpu = HostResources.osDouble("CpuLoad") * 100.0
+        if (systemCpu < 0.0) {
+            systemCpu = -1.0
+        }
+        var systemTotal = HostResources.osLong("TotalMemorySize")
+        var systemFree = HostResources.osLong("FreeMemorySize")
+        // The MXBean reports MEMFREE (near zero on a busy host: the cache counts as used). What is really left is
+        // MemAvailable from /proc/meminfo.
+        var meminfo = HostResources.memInfo()
+        if (meminfo.get(0) > 0L) {
+            systemTotal = meminfo.get(0)
+            systemFree = meminfo.get(1)
+        }
+        var workDir = System.getProperty("user.dir", "/app") as String
+        var disk = new java.io.File(workDir)
+        return HostResourcesView(heap.getUsed(), heap.getCommitted(), heap.getMax(), memory.getNonHeapMemoryUsage().getUsed(), gcCount, gcTime, threads.getThreadCount(), threads.getPeakThreadCount(), threads.getDaemonThreadCount(), ManagementFactory.getClassLoadingMXBean().getLoadedClassCount(), processCpu, systemCpu, loadAverage, Runtime.getRuntime().availableProcessors(), systemTotal, systemFree, disk.getTotalSpace(), disk.getUsableSpace(), HostResources.containerMemoryUsed(), HostResources.containerMemoryMax(), HostResources.cgroupCpu(), this.cgroupCpuPercent(), HostResources.poolOf(db))
+    }
+    static DbPoolStats? poolOf(db: Db?) {
+        if (db == null) {
+            return null
+        }
+        return db.poolStats()
+    }
+    // CPU of this process in percent, -1 when the JVM does not say.
+    static Double processCpuPercent() {
+        var value = HostResources.osDouble("ProcessCpuLoad") * 100.0
+        if (value < 0.0) {
+            return -1.0
+        }
+        return value
+    }
+    // The com.sun.management extension of the OS bean (not importable here) is read as MBean attributes.
+    static Object? osAttribute(name: String) {
+        try {
+            return ManagementFactory.getPlatformMBeanServer().getAttribute(new ObjectName("java.lang:type=OperatingSystem"), name)
+        } catch (String unavailable) {
+            return null
+        }
+    }
+    static Double osDouble(name: String) {
+        var value = HostResources.osAttribute(name)
+        if (value == null) {
+            return -1.0
+        }
+        return value as Double
+    }
+    static Long osLong(name: String) {
+        var value = HostResources.osAttribute(name)
+        if (value == null) {
+            return -1L
+        }
+        return value as Long
+    }
+    // Heap in use right now.
+    static Long heapUsedNow() = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()
+    // {MemTotal, MemAvailable} in bytes from /proc/meminfo, or {-1, -1}.
+    static List<Long> memInfo() {
+        var text = File("/proc/meminfo").readText()
+        if (text == null) {
+            return listOf(-1L, -1L)
+        }
+        var total = 0L
+        var available = 0L
+        for (var line in text.split("\n")) {
+            if (line.startsWith("MemTotal:")) {
+                total = HostResources.kib(line)
+            }
+            else 
+                if (line.startsWith("MemAvailable:")) {
+                    available = HostResources.kib(line)
+                }
+                else 
+                    if (line.startsWith("MemFree:") && available == 0L) {
+                        available = HostResources.kib(line)
+                    }
+        }
+        return listOf(total * 1024L, available * 1024L)
+    }
+    static Long kib(line: String) {
+        var digits = line.replaceAll("[^0-9]", "")
+        if (digits.length() == 0 || digits.length() > 18) {
+            return 0L
+        }
+        return digits.toLong()
+    }
+    // A number file (`max` means no limit = -1); null when the file is missing or not a number.
+    static Long? readLong(path: String) {
+        var text = File(path).readText()
+        if (text == null) {
+            return null
+        }
+        var value = text.trim()
+        if (value == "max") {
+            return -1L
+        }
+        if (value.length() == 0 || value.length() > 18 || !value.matches("-?[0-9]+")) {
+            return null
+        }
+        return value.toLong()
+    }
+    // The memory this CONTAINER uses: the cgroup of the process itself, not the root one (with a host cgroup
+    // namespace the root path would show the whole host).
+    static Long containerMemoryUsed() {
+        var direct = HostResources.readLong("/sys/fs/cgroup/memory.current")
+        if (direct != null && direct > 0L) {
+            var viaCgroup = HostResources.readLong(HostResources.cgroupPath() + "/memory.current")
+            if (viaCgroup != null && viaCgroup > 0L) {
+                return viaCgroup
+            }
+            return direct
+        }
+        return -1L
+    }
+    static Long containerMemoryMax() {
+        var direct = HostResources.readLong("/sys/fs/cgroup/memory.max")
+        var viaCgroup = HostResources.readLong(HostResources.cgroupPath() + "/memory.max")
+        var limit = -1L
+        if (viaCgroup != null) {
+            limit = viaCgroup
+        }
+        else 
+            if (direct != null) {
+                limit = direct
+            }
+        // No limit set ("max"): the real ceiling is the system memory.
+        if (limit > 0L) {
+            return limit
+        }
+        return HostResources.memInfo().get(0)
+    }
+    static String cgroupPath() {
+        var text = File("/proc/self/cgroup").readText()
+        if (text != null) {
+            for (var line in text.split("\n")) {
+                if (line.startsWith("0::")) {
+                    return "/sys/fs/cgroup" + line.substring(3).trim()
+                }
+            }
+        }
+        return "/sys/fs/cgroup"
+    }
+    // CPU cores granted to the container (cpu.max quota / period), or -1.
+    static Double cgroupCpu() {
+        var text = File("/sys/fs/cgroup/cpu.max").readText()
+        if (text != null) {
+            var parts = text.trim().split("\\s+")
+            if (parts.length >= 2 && parts[0] != "max" && parts[0].matches("[0-9.]+") && parts[1].matches("[0-9.]+")) {
+                return parts[0].toDouble() / parts[1].toDouble()
+            }
+        }
+        var quota = HostResources.readLong("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+        var period = HostResources.readLong("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+        if (quota != null && period != null && quota > 0L && period > 0L) {
+            // Copied into plain longs: toDouble() on a narrowed boxed Long breaks the verifier.
+            var q = 0L
+            q = quota
+            var p = 0L
+            p = period
+            return q.toDouble() / p.toDouble()
+        }
+        return -1.0
+    }
+    // Container CPU in percent: the delta of cpu.stat usage_usec between samples over the elapsed time and the
+    // cores. The first call has no earlier sample and answers -1.
+    Double cgroupCpuPercent() {
+        var text = File("/sys/fs/cgroup/cpu.stat").readText()
+        if (text == null) {
+            lastCpuUsageMicros = -1L
+            return -1.0
+        }
+        var usageNow = -1L
+        for (var line in text.split("\n")) {
+            if (line.startsWith("usage_usec ")) {
+                var raw = line.substring("usage_usec ".length()).trim()
+                if (raw.matches("[0-9]+") && raw.length() < 19) {
+                    usageNow = raw.toLong()
+                }
+            }
+        }
+        if (usageNow < 0L) {
+            return -1.0
+        }
+        var now = System.currentTimeMillis()
+        var percent = -1.0
+        if (lastCpuUsageMicros >= 0L && now > lastCpuSampleMillis) {
+            var consumedMillis = usageNow - lastCpuUsageMicros.toDouble() / 1000.0
+            var wallMillis = now - lastCpuSampleMillis.toDouble()
+            var cores = HostResources.cgroupCpu()
+            if (cores <= 0.0) {
+                cores = Runtime.getRuntime().availableProcessors().toDouble()
+            }
+            if (cores > 0.0 && wallMillis > 0.0) {
+                percent = consumedMillis / wallMillis / cores * 100.0
+            }
+        }
+        lastCpuUsageMicros = usageNow
+        lastCpuSampleMillis = now
+        if (percent > 100.0) {
+            return 100.0
+        }
+        return percent
+    }
+}
