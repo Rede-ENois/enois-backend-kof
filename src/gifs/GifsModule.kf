@@ -1,0 +1,28 @@
+package gifs
+
+import kernel.*
+import kernel.cache.*
+import kernel.config.*
+import kernel.http.*
+import kernel.security.*
+
+// Wiring of the gifs domain: Tenor first, GIPHY second (the Java bean order). Keys come from
+// REDE_GIFS_TENOR_KEY and REDE_GIFS_GIPHY_KEY; without any, the search answers `available: false`.
+class GifsModule {
+    GifSearchService service
+    public constructor(service: GifSearchService) {
+        this.service = service
+    }
+    static List<GifProvider> defaultProviders(cfg: Config, client: GifHttp) {
+        var out = listOf<GifProvider>()
+        out.add(TenorGifProvider(cfg.getStr("REDE_GIFS_TENOR_KEY", ""), client))
+        out.add(GiphyGifProvider(cfg.getStr("REDE_GIFS_GIPHY_KEY", ""), client))
+        return out
+    }
+    static GifsModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks) = GifsModule.installWith(platform.server, shared.caches.get("gifSearch"), GifsModule.defaultProviders(platform.cfg, GifHttp()))
+    static GifsModule installWith(server: HttpServer, cache: TtlCache, providers: List<GifProvider>) {
+        var service = GifSearchService(providers, cache)
+        GifsRoutes.register(server, service)
+        return GifsModule(service)
+    }
+}
