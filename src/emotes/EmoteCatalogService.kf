@@ -1,0 +1,201 @@
+package emotes
+
+import kernel.log.*
+import kernel.sync.*
+import kernel.time.*
+
+// What the name policy dropped from one or more rounds, plus the artwork of the dropped ones: the image
+// proxy refuses a blocked artwork even when it is asked by direct id.
+class EmoteGate {
+    Set<String> arts = setOf<String>()
+    List<Emote> allowed(emotes: List<Emote>) {
+        var out = listOf<Emote>()
+        for (var e in emotes) {
+            if (EmoteNamePolicy.blocked(e.code())) {
+                arts.add(EmoteRules.art(e.provider(), e.id()))
+            }
+            else {
+                out.add(e)
+            }
+        }
+        return out
+    }
+}
+
+// The sticker catalog of the site, built in the BACKEND and kept in memory. The old catalog was assembled in
+// the browser on every visit with three third-party calls (FFZ once answered 522 after 19.9 s and the picker
+// stayed on "loading"). Here the build runs in the background, the reader gets one page at a time and the
+// backend answers from memory.
+//
+// Merge rules: live artwork rules (the global collections are the provider's live source); a repeated code
+// stays with BTTV (sources come in priority order); the same sticker from two FFZ listings (popular and
+// animated) enters once, with the popular position of one and the animated flag of the other; a failing
+// source never empties the catalog: its last good copy keeps serving.
+class EmoteCatalogService {
+    List<EmoteSource> liveSources
+    EmoteSource embedded
+    Log log = Log("emotes.catalog")
+    Map<String,List<Emote>> lastGood = mapOf<String, List<Emote>>()
+    EmoteCatalog current = EmoteCatalog.empty()
+    Set<String> artsAnimated = setOf<String>()
+    Set<String> artsBlocked = setOf<String>()
+    Bool liveDone = false
+    Mutex refreshGate = Mutex()
+    public constructor(liveSources: List<EmoteSource>, embedded: EmoteSource) {
+        // A copy, like Java's List.copyOf: the caller changing its list later does not change the sources.
+        this.liveSources = listOf<EmoteSource>()
+        for (var source in liveSources) {
+            this.liveSources.add(source)
+        }
+        this.embedded = embedded
+        // Born with the embedded snapshot: no request ever finds an empty picker.
+        var gate = EmoteGate()
+        var snapshot = gate.allowed(this.loadEmbedded())
+        if (snapshot.size() > 0) {
+            this.current = EmoteCatalog(EmotePages.sortSelector(snapshot), Time.nowIso())
+        }
+        this.artsAnimated = EmoteCatalogService.animatedArts(this.current.emotes)
+        this.artsBlocked = gate.arts
+    }
+    EmoteCatalog catalog() = current
+    // True when at least one live provider answered since boot.
+    Bool liveLoaded() = liveDone
+    // True when the catalog knows this sticker as animated (the proxy then asks for the moving file).
+    Bool isAnimated(providerParam: String?, id: String?) {
+        var provider = EmoteRules.parseProvider(providerParam)
+        return provider != null && id != null && artsAnimated.contains(EmoteRules.art(provider, id))
+    }
+    // True when this artwork is BLOCKED. The proxy uses it as a gate: a blocked name is never downloaded from
+    // the third-party CDN, not even by direct id. The gate covers only blocked art, not "what is in the
+    // catalog": at boot the catalog holds just the snapshot and 404-ing everything else would break stickers
+    // that are already in old posts.
+    Bool isBlocked(providerParam: String?, id: String?) {
+        var provider = EmoteRules.parseProvider(providerParam)
+        return provider != null && id != null && artsBlocked.contains(EmoteRules.art(provider, id))
+    }
+    EmotePage page(page: Int, limit: Int, query: String?, provider: String?) = EmotePages.of(EmotePages.filter(current.emotes, query, provider), page, limit)
+    List<Emote> index() = current.emotes
+    // Rebuilds the catalog. Called by the scheduler, out of the request path (each FFZ listing takes seconds).
+    // Every source keeps its LAST good answer: a failing one does not erase what it brought, so the catalog
+    // only grows. Two refreshes never run at once: the second one is skipped (the first is doing the same job).
+    refresh() {
+        if (!refreshGate.tryLock()) {
+            log.info("emote_refresh_skipped another refresh is running")
+            return
+        }
+        var failure = ""
+        try {
+            for (var source in liveSources) {
+                try {
+                    lastGood.put(source.name(), source.load())
+                } catch (String e) {
+                    var kept = lastGood.get(source.name())
+                    var keptCount = 0
+                    if (kept != null) {
+                        keptCount = kept.size()
+                    }
+                    log.warn("emote_source_failed name=" + source.name() + " kept=" + keptCount + " cause=" + e)
+                }
+            }
+            this.rebuild()
+        } catch (String e) {
+            failure = e
+        }
+        refreshGate.unlock()
+        if (failure.length() > 0) {
+            throw failure
+        }
+    }
+    // The last copy of each source plus the embedded snapshot, without repeating a sticker or an artwork.
+    rebuild() {
+        var byCode = mapOf<String, Emote>()
+        var positions = mapOf<String, Int>()
+        var arts = setOf<String>()
+        var gate = EmoteGate()
+        var rounds = listOf<List<Emote>>()
+        var anyLive = false
+        for (var source in liveSources) {
+            var loaded = lastGood.get(source.name())
+            if (loaded == null) {
+                rounds.add(listOf<Emote>())
+            }
+            else {
+                if (loaded.size() > 0) {
+                    anyLive = true
+                }
+                rounds.add(loaded)
+            }
+        }
+        rounds.add(this.loadEmbedded())
+        var order = listOf<String>()
+        for (var round in rounds) {
+            // A blocked name is dropped at the door: what never enters the catalog is never downloaded.
+            for (var e in gate.allowed(round)) {
+                var existing = byCode.get(e.code())
+                if (existing != null) {
+                    // Same sticker in another round: the popular listing brings the position, the animated
+                    // one brings "has a moving version" (and publishes no position).
+                    if (existing.provider() == e.provider() && existing.id() == e.id()) {
+                        byCode.put(e.code(), EmoteCatalogService.merge(existing, e))
+                    }
+                    if (EmoteRules.popular(e) && positions.get(e.code()) == null) {
+                        positions.put(e.code(), e.popularRank())
+                    }
+                    continue
+                }
+                // Same artwork under two codes: enters once, with the code of whoever came first.
+                if (!arts.add(EmoteRules.art(e.provider(), e.id()))) {
+                    continue
+                }
+                byCode.put(e.code(), e)
+                order.add(e.code())
+                if (EmoteRules.popular(e) && positions.get(e.code()) == null) {
+                    positions.put(e.code(), e.popularRank())
+                }
+            }
+        }
+        if (order.size() == 0) {
+            log.warn("emote_catalog_empty no source answered, the catalog stays empty")
+            return
+        }
+        var built = listOf<Emote>()
+        for (var code in order) {
+            var e = byCode.get(code)
+            if (e == null) {
+                continue
+            }
+            var position = positions.get(code)
+            if (position == null) {
+                built.add(e)
+            }
+            else {
+                built.add(EmoteRules.popularAt(e, position))
+            }
+        }
+        var sorted = EmotePages.sortSelector(built)
+        this.current = EmoteCatalog(sorted, Time.nowIso())
+        this.artsAnimated = EmoteCatalogService.animatedArts(sorted)
+        this.artsBlocked = gate.arts
+        this.liveDone = liveDone || anyLive
+        log.info("emote_catalog_built total=" + sorted.size() + " animated=" + artsAnimated.size() + " blocked=" + artsBlocked.size())
+    }
+    // The first one rules artwork and code; the second only adds the animation.
+    static Emote merge(existing: Emote, other: Emote) = Emote(existing.code(), existing.provider(), existing.id(), existing.animated() || other.animated(), existing.popularRank())
+    static Set<String> animatedArts(emotes: List<Emote>) {
+        var arts = setOf<String>()
+        for (var e in emotes) {
+            if (e.animated()) {
+                arts.add(EmoteRules.art(e.provider(), e.id()))
+            }
+        }
+        return arts
+    }
+    List<Emote> loadEmbedded() {
+        try {
+            return embedded.load()
+        } catch (String e) {
+            log.error("emote_snapshot_unreadable cause=" + e)
+            return listOf<Emote>()
+        }
+    }
+}

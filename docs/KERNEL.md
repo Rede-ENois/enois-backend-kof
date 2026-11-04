@@ -870,3 +870,22 @@ dropped). `REDE_BINARY_MAX_BODY_BYTES` (default 545259520) caps one upload. Why 
 a verified account (once) with a live session and returns a `ProfileCaller` (token, JSON content type and a fresh
 `Idempotency-Key` on every write). `ProfileTestApp.finish()` must be the last test of every file: the shared
 jobs keep the test process alive otherwise (G124).
+## kernel.http.OutboundHttp and kernel.sync.Mutex
+
+```kotlin
+import kernel.http.*
+var res = OutboundHttp.get(url, listOf("Accept: image/*"), 4000, 6000, 1048576)   // connect ms, read ms, max bytes
+res.status   res.contentType   res.body: Byte[]   res.size()   res.text()
+```
+
+Outbound GET for adapters that need what `kof.http` hides (status, content type, bytes, request headers: G15).
+Redirects are not followed. An error status (4xx/5xx) returns its body; a network failure throws
+`OUTBOUND_FAILED: ...`. The body is read up to `maxBytes + 1` so the caller can detect "too large".
+
+```kotlin
+import kernel.sync.*
+var gate = Mutex()      gate.lock()   gate.unlock()   gate.tryLock(): Bool    // reentrant ReentrantLock
+```
+
+Domain code cannot import `java.util.concurrent`; use `Mutex`. `tryLock` is the "skip if another thread is already
+doing it" form used by the emotes refresh.

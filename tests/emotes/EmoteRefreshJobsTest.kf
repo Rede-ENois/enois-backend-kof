@@ -1,0 +1,88 @@
+import emotes.*
+import kernel.jobs.*
+import kernel.time.*
+
+// Port of EmoteCatalogSchedulerTest. The Java scheduler used a boot thread plus @Scheduled; here both are jobs of
+// kernel.jobs. Adaptation: an Error that is not an exception does not exist in Kof (everything thrown is a
+// String), so "the boot failure does not escape the thread" asserts the job survived (no failed run, no leak).
+class ErjService extends EmoteCatalogService {
+    Int calls = 0
+    Bool failing = false
+    public constructor() {
+        super(listOf<EmoteSource>(), EmoteSource())
+    }
+    refresh() {
+        calls = calls + 1
+        if (failing) {
+            throw "provedor fora do ar"
+        }
+    }
+}
+
+Bool erjWaitCalls(service: ErjService, expected: Int) {
+    var waited = 0
+    while (service.calls < expected && waited < 300) {
+        time.sleep(50)
+        waited = waited + 1
+    }
+    return service.calls >= expected
+}
+
+test "it builds at boot on another thread without holding the startup" {
+    var service = ErjService()
+    var jobs = Scheduler()
+    var t0 = Time.nowMillis()
+    EmoteRefreshJobs(service, true).warmUpOnBoot(jobs)
+    // the boot build must not make startup wait for the FFZ listings (seconds each)
+    assert(Time.nowMillis() - t0 < 1000L)
+    assert(erjWaitCalls(service, 1))
+    assert(jobs.runCount("emotes-boot") == 1)
+    jobs.stop()
+}
+
+test "a failure at boot does not escape and the job survives" {
+    var service = ErjService()
+    service.failing = true
+    var jobs = Scheduler()
+    EmoteRefreshJobs(service, true).warmUpOnBoot(jobs)
+    assert(erjWaitCalls(service, 1))
+    time.sleep(200)
+    assert(jobs.failureCount("emotes-boot") == 0)
+    assert(jobs.runCount("emotes-boot") == 1)
+    jobs.stop()
+}
+
+test "disabled does not build at boot nor on the round" {
+    var service = ErjService()
+    var jobs = Scheduler()
+    var disabled = EmoteRefreshJobs(service, false)
+    disabled.warmUpOnBoot(jobs)
+    disabled.refreshRound()
+    time.sleep(300)
+    assert(service.calls == 0)
+    assert(jobs.runCount("emotes-boot") == 0)
+    jobs.stop()
+}
+
+test "the scheduled round builds once and stays on its feet when it fails" {
+    var service = ErjService()
+    var jobs = EmoteRefreshJobs(service, true)
+    jobs.refreshRound()
+    assert(service.calls == 1)
+    service.failing = true
+    jobs.refreshRound()
+    assert(service.calls == 2)
+}
+
+test "the recurring round is a kernel job with the 3-hour cron by default" {
+    var service = ErjService()
+    var scheduler = Scheduler()
+    EmoteRefreshJobs(service, true).schedule(scheduler, "0 0 */3 * * *")
+    assert(scheduler.runCount("emotes-refresh") == 0)
+    scheduler.stop()
+    // "-" disables it, like Spring's CRON_DISABLED
+    var off = Scheduler()
+    EmoteRefreshJobs(service, true).schedule(off, "-")
+    assert(off.runCount("emotes-refresh") == 0)
+    off.stop()
+}

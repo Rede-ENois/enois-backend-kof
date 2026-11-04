@@ -1,0 +1,52 @@
+package emotes
+
+import kernel.jobs.*
+import kernel.log.*
+
+// Builds the catalog outside the request path: once at boot and then every 3 hours. The boot serves the
+// embedded snapshot at once; the full build (which asks the providers and takes seconds, because of the FFZ
+// listings) runs in the background so the readiness probe does not wait. A failure here takes nothing down:
+// the previous catalog keeps serving.
+class EmoteRefreshJobs {
+    EmoteCatalogService service
+    Bool enabled
+    Log log = Log("emotes.refresh")
+    public constructor(service: EmoteCatalogService, enabled: Bool) {
+        this.service = service
+        this.enabled = enabled
+    }
+    // `@EventListener(ApplicationReadyEvent)`: one run right away, on its own job thread (a period so long
+    // that it never fires again; the cron job below is the recurring one).
+    warmUpOnBoot(jobs: Scheduler) {
+        if (!enabled) {
+            return
+        }
+        log.info("emote_boot_build starting in the background")
+        var self = this
+        jobs.fixedRate("emotes-boot", 0L, 315360000000L, () -> self.buildOnBoot())
+    }
+    buildOnBoot() {
+        try {
+            service.refresh()
+            log.info("emote_boot_build done")
+        } catch (String e) {
+            log.warn("emote_boot_build_failed keeps the embedded snapshot cause=" + e)
+        }
+    }
+    // The recurring round (default every 3 hours). Each round ADDS what every source brought; a failing source
+    // keeps its previous copy, so a bad round takes no sticker from anybody.
+    refreshRound() {
+        if (!enabled) {
+            return
+        }
+        try {
+            service.refresh()
+        } catch (String e) {
+            log.warn("emote_refresh_failed keeps the previous catalog")
+        }
+    }
+    schedule(jobs: Scheduler, cron: String) {
+        var self = this
+        jobs.cron("emotes-refresh", cron, "America/Sao_Paulo", () -> self.refreshRound())
+    }
+}

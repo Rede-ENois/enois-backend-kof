@@ -1,0 +1,217 @@
+import emotes.*
+import kernel.jobs.*
+import kernel.time.*
+
+// Port of EmoteCatalogServiceTest.
+class EcsSource extends EmoteSource {
+    String label
+    List<Emote> emotes
+    Bool failing
+    public constructor(label: String, emotes: List<Emote>, failing: Bool) {
+        super()
+        this.label = label
+        this.emotes = emotes
+        this.failing = failing
+    }
+    String name() = label
+    List<Emote> load() {
+        if (failing) {
+            throw "provedor fora do ar"
+        }
+        return emotes
+    }
+}
+
+// The id derives from the code: the same code has the same artwork, different codes do not collide.
+Emote ecsEmote(code: String, provider: String, rank: Int) {
+    var h = code.hashCode()
+    if (h < 0) {
+        h = 0 - h
+    }
+    var e = EmoteRules.create(code, provider, "" + h, false, rank)
+    if (e == null) {
+        throw "invalid fixture " + code
+    }
+    return e
+}
+
+String ecsCodes(list: List<Emote>) {
+    var out = ""
+    for (var e in list) {
+        if (out.length() > 0) {
+            out = out + ","
+        }
+        out = out + e.code()
+    }
+    return out
+}
+
+EmoteSource ecsLive(label: String, emotes: List<Emote>) = EcsSource(label, emotes, false)
+
+EmoteSource ecsBroken(label: String) = EcsSource(label, listOf<Emote>(), true)
+
+EmoteSource ecsEmbedded(emotes: List<Emote>) = EcsSource("EMBARCADO", emotes, false)
+
+Emote? ecsFind(list: List<Emote>, code: String) {
+    for (var e in list) {
+        if (e.code() == code) {
+            return e
+        }
+    }
+    return null
+}
+
+test "it is born with the embedded snapshot without waiting for a provider" {
+    var service = EmoteCatalogService(listOf(ecsBroken("BTTV")), ecsEmbedded(listOf(ecsEmote("OMEGALUL", "FFZ", 1))))
+    assert(ecsCodes(service.catalog().emotes) == "OMEGALUL")
+    assert(!service.liveLoaded())
+}
+
+test "refresh joins live artwork with the popular position" {
+    var service = EmoteCatalogService(listOf(ecsLive("BTTV", listOf(ecsEmote("KEKW", "BTTV", -1))), ecsLive("FFZ-POPULAR", listOf(ecsEmote("KEKW", "FFZ", 3), ecsEmote("catJAM", "FFZ", 1)))), ecsEmbedded(listOf(ecsEmote("KEKW", "FFZ", 2), ecsEmote("OMEGALUL", "FFZ", 4))))
+    service.refresh()
+    var catalog = service.catalog().emotes
+    assert(ecsCodes(catalog) == "catJAM,KEKW,OMEGALUL")
+    // live artwork rules and the live popular position beats the embedded one
+    var kekw = ecsFind(catalog, "KEKW")
+    assert(kekw != null)
+    if (kekw != null) {
+        assert(kekw.provider() == "BTTV")
+        assert(kekw.popularRank() == 3)
+    }
+    assert(service.liveLoaded())
+}
+
+test "a failing source does not erase the built catalog" {
+    var healthy = listOf(ecsLive("BTTV", listOf(ecsEmote("KEKW", "BTTV", -1))))
+    var service = EmoteCatalogService(healthy, ecsEmbedded(listOf(ecsEmote("OMEGALUL", "FFZ", 1))))
+    service.refresh()
+    var before = service.catalog().emotes.size()
+    healthy.clear()
+    service.refresh()
+    assert(service.catalog().emotes.size() == before)
+}
+
+test "the catalog is empty only when nothing answers" {
+    var service = EmoteCatalogService(listOf(ecsBroken("BTTV")), ecsEmbedded(listOf<Emote>()))
+    service.refresh()
+    assert(service.catalog().emotes.size() == 0)
+    assert(service.catalog().generatedAt == "1970-01-01T00:00:00Z")
+}
+
+test "page and index come out of the same catalog" {
+    var service = EmoteCatalogService(listOf<EmoteSource>(), ecsEmbedded(listOf(ecsEmote("OMEGALUL", "FFZ", 2), ecsEmote("Pog", "FFZ", 1), ecsEmote("KEKW", "BTTV", -1))))
+    var popular = service.page(1, 1, null, "POPULAR")
+    assert(popular.total() == 2)
+    assert(ecsCodes(popular.items()) == "Pog")
+    assert(service.index().size() == 3)
+}
+
+test "the animated listing adds the animation without changing the popular position" {
+    // the popular listing does not publish `animated`; the animated one brings the same id without a position
+    var popular = EmoteRules.create("catJAM", "FFZ", "777171", false, 5)
+    var animated = EmoteRules.create("catJAM", "FFZ", "777171", true, -1)
+    assert(popular != null)
+    assert(animated != null)
+    if (popular != null && animated != null) {
+        var service = EmoteCatalogService(listOf(ecsLive("FFZ-POPULAR", listOf(popular)), ecsLive("FFZ-ANIMADAS", listOf(animated))), ecsEmbedded(listOf<Emote>()))
+        service.refresh()
+        var catalog = service.catalog().emotes
+        assert(catalog.size() == 1)
+        assert(catalog.get(0).animated())
+        assert(catalog.get(0).popularRank() == 5)
+        assert(service.isAnimated("FFZ", "777171"))
+        assert(service.isAnimated("ffz", "777171"))
+        assert(!service.isAnimated("BTTV", "777171"))
+        assert(!service.isAnimated("SEILA", "777171"))
+        assert(!service.isAnimated("FFZ", null))
+    }
+}
+
+test "a repeated code with different uploads keeps the artwork of the first source" {
+    // FFZ has several uploads with the same name: source order decides the artwork (animated before popular)
+    // and the usage position comes from the popular listing anyway
+    var animated = EmoteRules.create("catJAM", "FFZ", "777171", true, -1)
+    var plain = EmoteRules.create("catJAM", "FFZ", "564062", false, 7)
+    assert(animated != null)
+    assert(plain != null)
+    if (animated != null && plain != null) {
+        var service = EmoteCatalogService(listOf(ecsLive("FFZ-ANIMADAS", listOf(animated)), ecsLive("FFZ-POPULAR", listOf(plain))), ecsEmbedded(listOf<Emote>()))
+        service.refresh()
+        var catjam = service.catalog().emotes.get(0)
+        assert(catjam.id() == "777171")
+        assert(catjam.animated())
+        assert(catjam.popularRank() == 7)
+    }
+}
+
+test "a sticker with a blocked name does not enter the catalog" {
+    var blocked = EmoteRules.create("bigbutt", "FFZ", "999001", true, 1)
+    var clean = EmoteRules.create("KEKW", "BTTV", "999002", true, -1)
+    var embeddedBlocked = EmoteRules.create("dick", "FFZ", "999003", false, 2)
+    assert(blocked != null && clean != null && embeddedBlocked != null)
+    if (blocked != null && clean != null && embeddedBlocked != null) {
+        var service = EmoteCatalogService(listOf(ecsLive("FFZ-ANIMADAS", listOf(blocked, clean))), ecsEmbedded(listOf(embeddedBlocked)))
+        service.refresh()
+        assert(ecsCodes(service.catalog().emotes) == "KEKW")
+        assert(ecsCodes(service.index()) == "KEKW")
+        assert(service.page(1, 40, "butt", "ALL").total() == 0)
+    }
+}
+
+test "the blocked artwork is also refused by direct id" {
+    var blocked = ecsEmote("booty", "FFZ", 1)
+    var service = EmoteCatalogService(listOf<EmoteSource>(), ecsEmbedded(listOf(blocked)))
+    // out of the catalog ...
+    assert(service.catalog().emotes.size() == 0)
+    // ... and the id stays blocked, which is what stops the proxy from fetching the artwork from the CDN
+    assert(service.isBlocked("FFZ", blocked.id()))
+    assert(service.isBlocked("ffz", blocked.id()))
+    assert(!service.isBlocked("BTTV", blocked.id()))
+    assert(!service.isBlocked("FFZ", "999011"))
+    assert(!service.isBlocked("SEILA", blocked.id()))
+    assert(!service.isBlocked("FFZ", null))
+}
+
+test "a legitimate sticker keeps being served" {
+    var clean = ecsEmote("KEKW", "BTTV", -1)
+    var service = EmoteCatalogService(listOf<EmoteSource>(), ecsEmbedded(listOf(clean)))
+    assert(ecsCodes(service.catalog().emotes) == "KEKW")
+    assert(!service.isBlocked("BTTV", clean.id()))
+}
+
+class EcsSlow extends EmoteSource {
+    Bool started = false
+    List<Emote> emotes
+    public constructor(emotes: List<Emote>) {
+        super()
+        this.emotes = emotes
+    }
+    String name() = "SLOW"
+    List<Emote> load() {
+        started = true
+        time.sleep(600)
+        return emotes
+    }
+}
+
+test "two refreshes at once run one and skip the other" {
+    // refresh() takes a non-blocking gate: while a round runs, a second call returns at once without rebuilding.
+    var slow = EcsSlow(listOf(ecsEmote("KEKW", "BTTV", -1)))
+    var service = EmoteCatalogService(listOf<EmoteSource>(slow), ecsEmbedded(listOf<Emote>()))
+    var jobs = Scheduler()
+    jobs.fixedRate("ecs-first", 0L, 3600000L, () -> service.refresh())
+    var waited = 0
+    while (!slow.started && waited < 100) {
+        time.sleep(50)
+        waited = waited + 1
+    }
+    assert(slow.started)
+    var t0 = Time.nowMillis()
+    service.refresh()
+    assert(Time.nowMillis() - t0 < 300L)
+    assert(service.catalog().emotes.size() == 0)
+    time.sleep(900)
+    assert(service.catalog().emotes.size() == 1)
+    jobs.stop()
+}

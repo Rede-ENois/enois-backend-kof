@@ -372,3 +372,49 @@ Seams (defaults in `LinkedInModule.install`):
 
 Kernel: one NEW file, `src/kernel/http/HttpPostClient.kf` (outbound POST with status, G178). Base URL of the share link: `REDE_FRONTEND_BASE_URL` (default `https://enois.ia.br`, the Java `rede.frontend.base-url`).
 
+## emotes
+
+| Domain | Endpoints ported / total | Tests ported / total | Gaps |
+|---|---|---|---|
+| emotes (`src/emotes/`) | 2 / 3 (`GET /emotes`, `GET /emotes/index`; `GET /emotes/image/{provider}/{id}` pending the binary lane) | 55 / 55 Java tests (67 Kof tests in `tests/emotes/`, 6 in `tests/kernel/OutboundHttpTest.kf`) | G173 to G175 |
+
+Ported: the sticker catalog built in memory (`EmoteCatalogService`: last good copy per source, priority merge,
+popular rank, animated flag, name policy and the blocked-artwork gate), the four live sources (BTTV global, FFZ
+global, FFZ animated listing, FFZ popular listing) behind the `EmoteFeed` seam, the embedded snapshot
+(`resources/emotes/catalogo.json`, copied verbatim; override the path with `REDE_EMOTES_CATALOG_FILE`), the image
+cache with the CDN fetch behind the `EmoteImageFetcher` seam, the boot build and the 3-hourly refresh on
+`kernel.jobs` (`REDE_EMOTES_REFRESH_ENABLED`, `REDE_EMOTES_REFRESH_CRON` default `0 0 */3 * * *`,
+`REDE_EMOTES_POPULAR_PAGES` 3, `REDE_EMOTES_ANIMATED_PAGES` 2), and the two JSON reads with `ETag`, `Cache-Control`
+and `304`.
+
+Behaviour notes:
+
+- Image route pending: the runtime cannot send raw bytes (G175). `EmotesModule.image(provider, id, variant)` returns
+  the `EmoteStoredImage(bytes, contentType)` or null (404) with the Java rules (blocked artwork, animation known
+  from the catalog, cache, two tries, static fallback). The route must answer the content type of the image,
+  `X-Content-Type-Options: nosniff` and `Cache-Control: max-age=604800, public, immutable`.
+- The image cache is a plain in-process map with a 48 MB budget (oldest entries go first) and a 7 day expiry, not
+  Caffeine. `EmoteCatalog.etag()` is a hash of the content plus the build second (the Java value was
+  `hashCode()` based); only the `W/"..."` shape is part of the contract.
+- A refresh that starts while another one runs is skipped (`kernel.sync.Mutex.tryLock`); Java's `synchronized`
+  made it wait and then repeat the same work.
+- `OutboundUrlGuard` is not used: every upstream address is a constant plus an id validated against
+  `[A-Za-z0-9]{1,40}` (as in Java), so no user text becomes a host.
+- `popularRank` is `-1` inside the `Emote` record for "none" (a nullable `Integer` in Java) and `null` in the JSON.
+
+### Pending seams
+
+| Seam | Default | Notes |
+|---|---|---|
+| `EmoteFeed` (provider JSON GET) | real HTTP through `kernel.http.OutboundHttp` | tests subclass it |
+| `EmoteImageFetcher` (CDN image GET) | real HTTP, 4 s connect / 6 s read, `image/*` only, 1 MB cap | tests subclass it |
+| binary route `GET /emotes/image/{provider}/{id}` | not registered | media port (binary lane) calls `EmotesModule.image` |
+
+### Java tests that could not be ported as written (all 55 have a Kof counterpart)
+
+| Java test | Adaptation |
+|---|---|
+| `EmoteCatalogSchedulerTest.erroQueNaoEExcecaoNoBootNaoEscapaDaThread` | Kof throws only Strings (no `Error`): asserts the failing boot build is logged, not counted as a failed job run, and the job survives |
+| `EmoteCatalogSchedulerTest` (4) | the Java boot thread and `@Scheduled` are the kernel jobs `emotes-boot` (one run, then a 10 year period) and `emotes-refresh` (cron); the mock service is a subclass overriding `refresh()` |
+| `EmoteControllerTest.imagemVemDoCacheComCacheLongo`, `imagemDeFigurinhaAnimadaPedeOArquivoEmMovimento`, `imagemDeFigurinhaDesconhecidaNaoTentaOArquivoAnimado`, `imagemDeProvedorDesconhecidoResponde404` | asserted on `EmotesModule.image` (content type, URLs fetched, null for 404); the status and the `Cache-Control`/`nosniff` headers wait for the binary route |
+| `EmoteSourcesTest`, `EmoteImageCacheTest`, `EmoteImagesTest` | JSON is passed as text instead of a Jackson tree; the stubbed CDN is an `EmoteImageFetcher` subclass |

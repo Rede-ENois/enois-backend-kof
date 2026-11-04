@@ -1,0 +1,72 @@
+import kernel.*
+import kernel.http.*
+import kernel.sync.*
+import kernel.testkit.*
+
+// OutboundHttp and Mutex: the adapters load, run and map status, content type, size and failures.
+class OhtHolder {
+    static TestApp? cached = null
+    static TestApp app() {
+        var cur = OhtHolder.cached
+        if (cur != null) {
+            return cur
+        }
+        var created = TestApp.bootWire("outbound", (p: Platform) -> {
+    p.server.get("/ok", () -> status(200, "abc"))
+    p.server.get("/gone", () -> status(404, "nope"))
+    p.server.get("/big", () -> status(200, "0123456789"))
+    p.server.get("/moved", () -> {
+    ResponseHeaders.set("Location", "http://127.0.0.1:1/elsewhere")
+    return status(302, "")
+})
+})
+        OhtHolder.cached = created
+        return created
+    }
+    static String url(path: String) = "http://127.0.0.1:" + OhtHolder.app().port + path
+}
+
+test "get returns status, lower-cased content type and the body bytes" {
+    var res = OutboundHttp.get(OhtHolder.url("/ok"), listOf("Accept: */*", "User-Agent: probe"), 2000, 2000, 1000)
+    assert(res.status == 200)
+    assert(res.contentType.startsWith("text/plain"))
+    assert(res.size() == 3)
+    assert(res.text() == "abc")
+}
+
+test "an error status still returns its body and does not throw" {
+    var res = OutboundHttp.get(OhtHolder.url("/gone"), listOf<String>(), 2000, 2000, 1000)
+    assert(res.status == 404)
+    assert(res.text() == "nope")
+}
+
+test "the body is read at most maxBytes plus one so a caller sees it is too large" {
+    var res = OutboundHttp.get(OhtHolder.url("/big"), listOf<String>(), 2000, 2000, 4)
+    assert(res.status == 200)
+    assert(res.size() == 5)
+}
+
+test "redirects are not followed" {
+    var res = OutboundHttp.get(OhtHolder.url("/moved"), listOf<String>(), 2000, 2000, 1000)
+    assert(res.status == 302)
+}
+
+test "a network failure throws OUTBOUND_FAILED" {
+    var failed = ""
+    try {
+        OutboundHttp.get("http://127.0.0.1:1/x", listOf<String>(), 500, 500, 10)
+    } catch (String e) {
+        failed = e
+    }
+    assert(failed.startsWith("OUTBOUND_FAILED"))
+}
+
+test "mutex lock, unlock and tryLock work (the cross-thread skip is asserted in the emotes catalog test)" {
+    var gate = Mutex()
+    assert(gate.tryLock())
+    gate.unlock()
+    gate.lock()
+    gate.unlock()
+    assert(gate.tryLock())
+    gate.unlock()
+}
