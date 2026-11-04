@@ -1,6 +1,5 @@
 package kernel.security
 
-import java.net.URLEncoder
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.security.SecureRandom
@@ -61,10 +60,37 @@ class Totp {
         return padded.substring(padded.length() - 6)
     }
     static Int unsigned(b: Byte) = b as Int & 255
+    // application/x-www-form-urlencoded of the UTF-8 bytes (what URLEncoder.encode(s, "UTF-8") answers). Done by
+    // hand: the compiler picks the String or the Charset overload of URLEncoder.encode depending on the JDK.
+    static String formEncode(s: String) {
+        var out = ""
+        var safe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-*_"
+        var hex = "0123456789ABCDEF"
+        var i = 0
+        while (i < s.length()) {
+            var ch = s.substring(i, i + 1)
+            if (safe.contains(ch)) {
+                out = out + ch
+            }
+            else {
+                if (ch == " ") {
+                    out = out + "+"
+                }
+                else {
+                    for (var b in ch.getBytes()) {
+                        var c = Totp.unsigned(b)
+                        out = out + "%" + hex.substring(c / 16, c / 16 + 1) + hex.substring(c % 16, c % 16 + 1)
+                    }
+                }
+            }
+            i = i + 1
+        }
+        return out
+    }
     // Standard otpauth:// URI the apps read (Google Authenticator, 1Password, ...).
     static String otpauthUri(issuer: String, account: String, secretBase32: String) {
-        var label = URLEncoder.encode(issuer + ":" + account, "UTF-8")
-        return "otpauth://totp/" + label + "?secret=" + secretBase32 + "&issuer=" + URLEncoder.encode(issuer, "UTF-8") + "&algorithm=SHA1&digits=6&period=30"
+        var label = Totp.formEncode(issuer + ":" + account)
+        return "otpauth://totp/" + label + "?secret=" + secretBase32 + "&issuer=" + Totp.formEncode(issuer) + "&algorithm=SHA1&digits=6&period=30"
     }
     static String base32Encode(data: Byte[]) {
         var result = ""
