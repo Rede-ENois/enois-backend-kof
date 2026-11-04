@@ -1,0 +1,287 @@
+package media
+
+import kernel.config.*
+import kernel.error.*
+import kernel.files.*
+import kernel.http.*
+import kernel.log.*
+import kernel.storage.*
+import kernel.time.*
+import kernel.url.*
+
+// An object opened for reading: the body stream and the headers the proxy relays.
+class MediaStoredObject {
+    ByteStream body
+    Long length
+    String contentType
+    String? contentRange
+    String? eTag
+    public constructor(body: ByteStream, length: Long, contentType: String, contentRange: String?, eTag: String?) {
+        this.body = body
+        this.length = length
+        this.contentType = contentType
+        this.contentRange = contentRange
+        this.eTag = eTag
+    }
+}
+
+// Reads and writes the OBJECT itself (not the asset row). Seam: S3 in production, a directory in
+// tests and local development. `read` throws when the object is missing or the store fails.
+class MediaObjectStore {
+    public constructor() {}
+    MediaStoredObject read(key: String, range: String?) {
+        throw "MEDIA_STORE_NOT_IMPLEMENTED"
+    }
+    // Stores the file at `filePath` under `key`.
+    write(key: String, contentType: String, filePath: String) {
+        throw "MEDIA_STORE_NOT_IMPLEMENTED"
+    }
+    // Content length of the object, -1 when absent (the migration verifies copies with it).
+    Long length(key: String) {
+        throw "MEDIA_STORE_NOT_IMPLEMENTED"
+    }
+}
+
+// S3 or any S3-compatible gateway (kernel.storage.S3Rest).
+class MediaS3ObjectStore extends MediaObjectStore {
+    S3Rest rest
+    public constructor(rest: S3Rest) {
+        super()
+        this.rest = rest
+    }
+    MediaStoredObject read(key: String, range: String?) {
+        var o = rest.get(key, range)
+        return MediaStoredObject(o.body, o.length, o.contentType, o.contentRange, o.eTag)
+    }
+    write(key: String, contentType: String, filePath: String) {
+        rest.putFile(key, contentType, filePath)
+    }
+    Long length(key: String) = rest.head(key)
+}
+
+// Objects as files under a directory: what the tests and the local profile use (same seam).
+class MediaLocalObjectStore extends MediaObjectStore {
+    String dir
+    public constructor(dir: String) {
+        super()
+        this.dir = dir
+    }
+    String pathOf(key: String) {
+        if (key.contains("..")) {
+            throw "MEDIA_STORE_BAD_KEY"
+        }
+        return dir + "/" + key.replace("/", "__")
+    }
+    MediaStoredObject read(key: String, range: String?) {
+        var path = pathOf(key)
+        if (!TempFiles.exists(path)) {
+            throw "MEDIA_STORE_MISSING"
+        }
+        var data = TempFiles.readAll(path)
+        var total = data.length
+        if (range != null && range.startsWith("bytes=")) {
+            var spec = range.substring(6)
+            var dash = spec.indexOf("-")
+            var from = spec.substring(0, dash).toInt()
+            var to = total - 1
+            if (dash + 1 < spec.length()) {
+                to = spec.substring(dash + 1).toInt()
+            }
+            if (to > total - 1) {
+                to = total - 1
+            }
+            var slice = ByteStream.ofFile(path)
+            var skipped = slice.readUpTo(from)
+            var part = slice.readUpTo(to - from + 1)
+            return MediaStoredObject(ByteStream.ofBytes(part), to - from + 1 as Long, "application/octet-stream", "bytes " + from + "-" + to + "/" + total, "\"local\"")
+        }
+        return MediaStoredObject(ByteStream.ofBytes(data), total as Long, "application/octet-stream", null, "\"local\"")
+    }
+    write(key: String, contentType: String, filePath: String) {
+        var target = pathOf(key)
+        var input = ByteStream.ofFile(filePath)
+        input.copyToFile(target, 1024L * 1024L * 1024L)
+        input.close()
+    }
+    Long length(key: String) {
+        var path = pathOf(key)
+        if (!TempFiles.exists(path)) {
+            return -1L
+        }
+        return TempFiles.size(path)
+    }
+    Bool has(key: String) = TempFiles.exists(pathOf(key))
+    remove(key: String) {
+        TempFiles.delete(pathOf(key))
+    }
+}
+
+// Purge and delete at the storage provider (MediaStorageGateway). The default is a no-op (dev).
+class MediaStorageGateway {
+    public constructor() {}
+    // Which provider this gateway talks to ("none" for the no-op one); lets tests and logs name the mode.
+    String kind() = "none"
+    purgeCdn(asset: MediaAsset);
+    deleteObject(asset: MediaAsset);
+}
+
+// Deletes in the S3 bucket. The stored key may carry `%2F` (ImageKit kept the slash encoded) while the
+// bucket uses real slashes: decode before deleting. No CDN purge in this mode (stable address).
+class MediaS3Gateway extends MediaStorageGateway {
+    S3Rest rest
+    public constructor(rest: S3Rest) {
+        super()
+        this.rest = rest
+    }
+    deleteObject(asset: MediaAsset) {
+        rest.delete(Uris.decode(asset.objectKey))
+    }
+    static String s3Key(objectKey: String) = Uris.decode(objectKey)
+    String kind() = "s3"
+}
+
+// The legacy ImageKit account (purge and delete through its REST API), kept for the old archive.
+class MediaImageKitGateway extends MediaStorageGateway {
+    String basicAuth
+    Log log = Log("media.imagekit")
+    public constructor(privateKey: String) {
+        super()
+        this.basicAuth = "Basic " + Uris.base64(privateKey + ":")
+    }
+    String kind() = "imagekit"
+    purgeCdn(asset: MediaAsset) {
+        var body = "{\"filePath\":" + json.encode(asset.objectKey) + "}"
+        var reply = HttpFetch.send("POST", "https://api.imagekit.io/v1/files/purge", listOf("Authorization: " + basicAuth, "Content-Type: application/json"), body, 20000)
+        if (reply.status() < 200 || reply.status() >= 300) {
+            log.warn("CDN purge failed " + asset.objectKey + ": " + reply.status())
+            throw "IMAGEKIT_PURGE_FAILED " + reply.status()
+        }
+        log.info("CDN purge requested: " + asset.objectKey)
+    }
+    deleteObject(asset: MediaAsset) {
+        var reply = HttpFetch.send("DELETE", "https://api.imagekit.io/v1/files/by-path/" + asset.objectKey, listOf("Authorization: " + basicAuth), null, 20000)
+        if (reply.status() < 200 || reply.status() >= 300) {
+            log.warn("Object delete failed " + asset.objectKey + ": " + reply.status())
+            throw "IMAGEKIT_DELETE_FAILED " + reply.status()
+        }
+        log.info("Object deleted: " + asset.objectKey)
+    }
+}
+
+// The same gateway behind the `mediaStorage` retry / circuit breaker / bulkhead.
+class MediaGuardedGateway extends MediaStorageGateway {
+    MediaStorageGateway inner
+    MediaResilience resilience
+    public constructor(inner: MediaStorageGateway, resilience: MediaResilience) {
+        super()
+        this.inner = inner
+        this.resilience = resilience
+    }
+    String kind() = "guarded(" + inner.kind() + ")"
+    purgeCdn(asset: MediaAsset) {
+        var target = inner
+        resilience.run(() -> target.purgeCdn(asset))
+    }
+    deleteObject(asset: MediaAsset) {
+        var target = inner
+        resilience.run(() -> target.deleteObject(asset))
+    }
+}
+
+record MediaSignedUpload(String url, String method, Map<String,String> headers, String expiresAt)
+
+// Where and how the browser uploads (MediaUploadSigner). `sign` throws ApiErrors.
+class MediaUploadSigner {
+    public constructor() {}
+    MediaSignedUpload sign(objectKey: String, mimeType: String, contentLength: Long) {
+        throw "MEDIA_SIGNER_NOT_IMPLEMENTED"
+    }
+}
+
+// The upload goes through this app (`PUT {publicBaseUrl}{key}`, same origin as the API) or, with no proxy
+// base, straight to the bucket with a presigned URL.
+class MediaS3UploadSigner extends MediaUploadSigner {
+    S3Rest? rest
+    String proxyBaseUrl
+    // `proxyBaseUrl` blank = presign straight to the bucket.
+    public constructor(rest: S3Rest?, proxyBaseUrl: String) {
+        super()
+        this.rest = rest
+        if (proxyBaseUrl.trim().length() == 0) {
+            this.proxyBaseUrl = ""
+        }
+        else 
+            if (proxyBaseUrl.endsWith("/")) {
+                this.proxyBaseUrl = proxyBaseUrl
+            }
+            else {
+                this.proxyBaseUrl = proxyBaseUrl + "/"
+            }
+    }
+    // The key arrives with its prefix already (the URL factory composes it): signing it as is keeps the
+    // upload and the public address on the same path.
+    MediaSignedUpload sign(objectKey: String, mimeType: String, contentLength: Long) {
+        var expires = Time.plusSeconds(Time.nowIso(), 3600L)
+        var headers = mapOf("Content-Type", mimeType)
+        if (proxyBaseUrl.length() > 0) {
+            return MediaSignedUpload(proxyBaseUrl + objectKey, "PUT", headers, expires)
+        }
+        var direct = rest
+        if (direct == null) {
+            throw "MEDIA_SIGNER_NO_BUCKET_CLIENT"
+        }
+        return MediaSignedUpload(direct.presignPut(Uris.decode(objectKey), mimeType, 3600), "PUT", headers, expires)
+    }
+}
+
+// Moderation is on but the proxy address is missing: refusing is the only way not to fail open by
+// handing out a direct bucket URL that would skip the pre-storage check.
+class MediaRefusingSigner extends MediaUploadSigner {
+    public constructor() {
+        super()
+    }
+    MediaSignedUpload sign(objectKey: String, mimeType: String, contentLength: Long) {
+        throw Errors.api(503, "IMAGE_MODERATION_UNAVAILABLE", "O envio de mídia exige moderação pré-storage, mas a URL de proxy da API não está configurada.")
+    }
+}
+
+// Composition of the upload signer from settings (S3StorageConfig.mediaUploadSigner).
+class MediaSigners {
+    // `throughApiSet` false = the safe default: every upload goes through the app, where metadata is stripped.
+    static MediaUploadSigner forS3(rest: S3Rest?, publicBaseUrl: String, throughApiSet: Bool, throughApi: Bool, moderationEnabled: Bool) {
+        var viaApi = true
+        if (throughApiSet) {
+            viaApi = throughApi
+        }
+        if (moderationEnabled && !viaApi) {
+            Log("media.storage").warn("rede.media.s3.upload-through-api=false com moderação de imagens ativa; forçando a subida pelo app para que a verificação aconteça.")
+            viaApi = true
+        }
+        if (moderationEnabled && publicBaseUrl.trim().length() == 0) {
+            Log("media.storage").warn("rede.media.s3.public-base-url vazio com moderação de imagens ativa; bloqueando assinatura direta no bucket para impedir que a moderação seja contornada.")
+            return MediaRefusingSigner()
+        }
+        if (viaApi) {
+            return MediaS3UploadSigner(rest, publicBaseUrl)
+        }
+        return MediaS3UploadSigner(rest, "")
+    }
+}
+
+// Fast local classifier of image content (the ONNX OpenNSFW model of the Java service). Seam: until the
+// model runtime is ported there is none, and with moderation on an image upload answers 503.
+class MediaImageClassifier {
+    public constructor() {}
+    Bool available() = false
+    // Pornographic-content score from 0 to 1; throws "IMAGE_UNREADABLE" for an image it cannot decode.
+    Double pornographicScore(image: Byte[], mimeType: String) {
+        throw "MEDIA_CLASSIFIER_NOT_AVAILABLE"
+    }
+}
+
+// Second opinion for images the classifier flags (the moderation domain's reviewer). "SAFE",
+// "PROHIBITED" or "UNSURE"; "" = the semantic model returned nothing usable.
+class MediaImageReviewer {
+    public constructor() {}
+    String review(image: Byte[]) = ""
+}

@@ -1,0 +1,377 @@
+package media
+
+import kernel.bytes.*
+import kernel.files.*
+import kernel.image.*
+import kernel.log.*
+
+// Strips metadata (EXIF/GPS/XMP/IPTC, comments, text chunks) from media before it reaches the bucket
+// (MediaMetadataSanitizer). JPEG, PNG, GIF and WebP are rewritten without touching pixels; a JPEG whose EXIF
+// orientation rotates it is physically rotated first, or it would show lying down once the block is gone.
+// Video and audio go through ffmpeg (`-map_metadata -1 -c copy`). A parse failure never fails an upload:
+// the original comes back and the failure is logged. PDFs are cleaned by a seam (`MediaPdfCleaner`).
+class MediaSanitizer {
+    String ffmpegPath
+    MediaPdfCleaner pdf
+    Log log = Log("media.sanitizer")
+    public constructor(ffmpegPath: String, pdf: MediaPdfCleaner) {
+        this.ffmpegPath = ffmpegPath
+        this.pdf = pdf
+    }
+    // Above this the object is streamed as it came (the proxy cannot hold more in memory).
+    static Int maxInMemory() = 40 * 1024 * 1024
+    // Images and PDFs can be cleaned in memory without losing animation or streaming.
+    Bool supportsInMemory(contentType: String) {
+        var type = MediaRules.baseType(contentType)
+        return type.startsWith("image/") || type == "application/pdf"
+    }
+    Bool isMedia(contentType: String) {
+        var type = MediaRules.baseType(contentType)
+        return type.startsWith("image/") || type.startsWith("video/") || type.startsWith("audio/") || type == "application/pdf"
+    }
+    // The clean content, or the original on an error or an unknown type.
+    Byte[] sanitize(data: Byte[], contentType: String, fileName: String) {
+        if (data.length == 0 || data.length > MediaSanitizer.maxInMemory()) {
+            return data
+        }
+        var type = MediaRules.baseType(contentType)
+        try {
+            if (type.startsWith("image/jpeg") || type.startsWith("image/jpg")) {
+                return jpeg(data)
+            }
+            if (type.startsWith("image/png")) {
+                return png(data)
+            }
+            if (type.startsWith("image/gif")) {
+                return gif(data)
+            }
+            if (type.startsWith("image/webp")) {
+                return webp(data)
+            }
+            if (type == "application/pdf") {
+                return pdf.clean(data)
+            }
+            if (type.startsWith("video/") || type.startsWith("audio/")) {
+                return ffmpeg(data, fileName)
+            }
+        } catch (String e) {
+            log.warn("media_metadata_sanitize_failed type=" + type + " error=" + e)
+        }
+        return data
+    }
+    // For files above the in-memory ceiling: video and audio are cleaned with ffmpeg on disk and the path
+    // of the clean content is returned (the original `path` is deleted when a new file replaces it).
+    // Anything else, and any ffmpeg failure, keeps `path`. Best effort: never an upload error.
+    String sanitizeToFile(path: String, contentType: String, fileName: String) {
+        var type = MediaRules.baseType(contentType)
+        if (!type.startsWith("video/") && !type.startsWith("audio/")) {
+            return path
+        }
+        var output = TempFiles.create("media-clean-", MediaSanitizer.suffix(fileName))
+        var exit = ProcessRunner.run(listOf(ffmpegPath, "-hide_banner", "-loglevel", "error", "-y", "-i", path, "-map_metadata", "-1", "-map_chapters", "-1", "-c", "copy", output), 120L)
+        if (exit != 0 || TempFiles.size(output) == 0L) {
+            log.warn("media_ffmpeg_skipped exit=" + exit + " originalBytes=" + TempFiles.size(path))
+            TempFiles.delete(output)
+            return path
+        }
+        TempFiles.delete(path)
+        return output
+    }
+    Byte[] ffmpeg(data: Byte[], fileName: String) {
+        var input = TempFiles.create("media-in-", MediaSanitizer.suffix(fileName))
+        var output = TempFiles.create("media-out-", MediaSanitizer.suffix(fileName))
+        var result = data
+        TempFiles.write(input, data)
+        var exit = ProcessRunner.run(listOf(ffmpegPath, "-hide_banner", "-loglevel", "error", "-y", "-i", input, "-map_metadata", "-1", "-map_chapters", "-1", "-c", "copy", output), 30L)
+        if (exit != 0 || TempFiles.size(output) == 0L) {
+            log.warn("media_ffmpeg_skipped exit=" + exit + " originalBytes=" + data.length)
+        }
+        else {
+            result = TempFiles.readAll(output)
+        }
+        TempFiles.delete(input)
+        TempFiles.delete(output)
+        return result
+    }
+    // ------------------------------------------------------------------ JPEG
+    Byte[] jpeg(data: Byte[]) {
+        var orientation = MediaSanitizer.jpegOrientation(data)
+        if (orientation > 1) {
+            // A failed rotation (too many pixels, undecodable) propagates: the caller keeps the original.
+            return Images.rotateJpeg(data, orientation)
+        }
+        return stripJpegSegments(data)
+    }
+    // The Orientation tag (0x0112) of the APP1/EXIF block, read without a library; 1 when there is none.
+    static Int jpegOrientation(data: Byte[]) {
+        if (data.length < 4 || Bytes.at(data, 0) != 255 || Bytes.at(data, 1) != 216) {
+            return 1
+        }
+        var index = 2
+        while (index + 4 < data.length) {
+            if (Bytes.at(data, index) != 255) {
+                return 1
+            }
+            var marker = Bytes.at(data, index + 1)
+            if (marker == 218 || marker == 217) {
+                return 1
+            }
+            var length = Bytes.bigShort(data, index + 2)
+            if (length < 2 || index + 2 + length > data.length) {
+                return 1
+            }
+            var start = index + 4
+            if (marker == 225 && length >= 8 && Bytes.ascii(data, start, 4) == "Exif" && Bytes.at(data, start + 4) == 0 && Bytes.at(data, start + 5) == 0) {
+                return MediaSanitizer.exifOrientation(data, start + 6, index + 2 + length)
+            }
+            index = index + 2 + length
+        }
+        return 1
+    }
+    static Int exifOrientation(data: Byte[], tiff: Int, end: Int) {
+        if (tiff + 8 > end) {
+            return 1
+        }
+        var little = Bytes.at(data, tiff) == 73 && Bytes.at(data, tiff + 1) == 73
+        var big = Bytes.at(data, tiff) == 77 && Bytes.at(data, tiff + 1) == 77
+        if (!little && !big) {
+            return 1
+        }
+        if (MediaSanitizer.shortAt(data, tiff + 2, little) != 42) {
+            return 1
+        }
+        var ifd = tiff + MediaSanitizer.intAt(data, tiff + 4, little)
+        if (ifd < tiff || ifd + 2 > end) {
+            return 1
+        }
+        var entries = MediaSanitizer.shortAt(data, ifd, little)
+        var i = 0
+        while (i < entries) {
+            var entry = ifd + 2 + i * 12
+            if (entry + 12 > end) {
+                return 1
+            }
+            if (MediaSanitizer.shortAt(data, entry, little) == 274) {
+                // Type SHORT, count 1: the value sits in the first two bytes of the four-byte field.
+                return MediaSanitizer.shortAt(data, entry + 8, little)
+            }
+            i = i + 1
+        }
+        return 1
+    }
+    static Int shortAt(data: Byte[], offset: Int, little: Bool) {
+        if (little) {
+            return Bytes.littleShort(data, offset)
+        }
+        return Bytes.bigShort(data, offset)
+    }
+    static Int intAt(data: Byte[], offset: Int, little: Bool) {
+        if (little) {
+            return Bytes.littleInt(data, offset)
+        }
+        return Bytes.bigInt(data, offset)
+    }
+    // Drops EXIF/XMP (APP1), IPTC (APP13), comments and exotic APPn; keeps JFIF, ICC and Adobe.
+    Byte[] stripJpegSegments(data: Byte[]) {
+        if (data.length < 4 || Bytes.at(data, 0) != 255 || Bytes.at(data, 1) != 216) {
+            return data
+        }
+        var out = ByteSink()
+        out.add(data, 0, 2)
+        var index = 2
+        while (index + 3 < data.length) {
+            if (Bytes.at(data, index) != 255) {
+                break
+            }
+            var marker = Bytes.at(data, index + 1)
+            var start = index
+            index = index + 2
+            if (marker == 217) {
+                out.add(data, start, 2)
+                return out.toBytes()
+            }
+            if (marker == 1 || marker >= 208 && marker <= 215) {
+                out.add(data, start, 2)
+                continue
+            }
+            if (index + 1 >= data.length) {
+                break
+            }
+            var length = Bytes.bigShort(data, index)
+            if (length < 2 || index + length > data.length) {
+                out.add(data, start, data.length - start)
+                return out.toBytes()
+            }
+            var drop = marker == 225 || marker == 237 || marker == 254 || marker >= 227 && marker <= 236 || marker == 239
+            if (!drop) {
+                out.add(data, start, length + 2)
+            }
+            index = index + length
+            if (marker == 218) {
+                // SOS: the rest is the compressed stream, copied untouched.
+                out.add(data, index, data.length - index)
+                return out.toBytes()
+            }
+        }
+        out.add(data, index, data.length - index)
+        return out.toBytes()
+    }
+    // ------------------------------------------------------------------ PNG
+    Byte[] png(data: Byte[]) {
+        var signature = listOf(137, 80, 78, 71, 13, 10, 26, 10)
+        if (data.length < 8) {
+            return data
+        }
+        var i = 0
+        while (i < 8) {
+            if (Bytes.at(data, i) != signature.get(i)) {
+                return data
+            }
+            i = i + 1
+        }
+        var out = ByteSink()
+        out.add(data, 0, 8)
+        var index = 8
+        while (index + 12 <= data.length) {
+            var length = Bytes.bigInt(data, index)
+            if (length < 0 || index + 12 + length > data.length) {
+                out.add(data, index, data.length - index)
+                index = data.length
+                break
+            }
+            var type = Bytes.ascii(data, index + 4, 4)
+            var total = 12 + length
+            if (type != "tEXt" && type != "zTXt" && type != "iTXt" && type != "eXIf" && type != "tIME") {
+                out.add(data, index, total)
+            }
+            index = index + total
+            if (type == "IEND") {
+                break
+            }
+        }
+        if (index < data.length) {
+            out.add(data, index, data.length - index)
+        }
+        return out.toBytes()
+    }
+    // ------------------------------------------------------------------ GIF
+    Byte[] gif(data: Byte[]) {
+        if (data.length < 13 || Bytes.ascii(data, 0, 3) != "GIF") {
+            return data
+        }
+        var out = ByteSink()
+        var packed = Bytes.at(data, 10)
+        var headerEnd = 13
+        if ((packed & 128) != 0) {
+            headerEnd = headerEnd + 3 * (1 << (packed & 7) + 1)
+        }
+        if (headerEnd > data.length) {
+            return data
+        }
+        out.add(data, 0, headerEnd)
+        var index = headerEnd
+        while (index < data.length) {
+            var block = Bytes.at(data, index)
+            if (block == 59) {
+                out.add(data, index, data.length - index)
+                break
+            }
+            if (block == 33 && index + 2 < data.length) {
+                var label = Bytes.at(data, index + 1)
+                var start = index
+                index = index + 2
+                if (label == 255 && index < data.length) {
+                    var size = Bytes.at(data, index)
+                    var id = ""
+                    if (index + 1 + size <= data.length) {
+                        var take = size
+                        if (take > 11) {
+                            take = 11
+                        }
+                        id = Bytes.ascii(data, index + 1, take)
+                    }
+                    index = skipSubBlocks(data, index)
+                    if (!id.startsWith("XMP")) {
+                        out.add(data, start, index - start)
+                    }
+                    continue
+                }
+                index = skipSubBlocks(data, index)
+                if (label != 254) {
+                    out.add(data, start, index - start)
+                }
+                continue
+            }
+            if (block == 44 && index + 10 <= data.length) {
+                var start = index
+                var localPacked = Bytes.at(data, index + 9)
+                index = index + 10
+                if ((localPacked & 128) != 0) {
+                    index = index + 3 * (1 << (localPacked & 7) + 1)
+                }
+                // One byte of LZW minimum code size before the image sub-blocks.
+                index = index + 1
+                index = skipSubBlocks(data, index)
+                if (index > data.length) {
+                    return data
+                }
+                out.add(data, start, index - start)
+                continue
+            }
+            return data
+        }
+        return out.toBytes()
+    }
+    static Int skipSubBlocks(data: Byte[], from: Int) {
+        var index = from
+        while (index < data.length) {
+            var size = Bytes.at(data, index)
+            index = index + 1
+            if (size == 0) {
+                return index
+            }
+            index = index + size
+        }
+        return data.length
+    }
+    // ------------------------------------------------------------------ WebP
+    Byte[] webp(data: Byte[]) {
+        if (data.length < 12 || Bytes.ascii(data, 0, 4) != "RIFF" || Bytes.ascii(data, 8, 4) != "WEBP") {
+            return data
+        }
+        var payload = ByteSink()
+        var index = 12
+        while (index + 8 <= data.length) {
+            var type = Bytes.ascii(data, index, 4)
+            var size = Bytes.littleInt(data, index + 4)
+            var total = 8 + size + (size & 1)
+            if (index + total > data.length) {
+                break
+            }
+            if (type != "EXIF" && type != "XMP ") {
+                payload.add(data, index, total)
+            }
+            index = index + total
+        }
+        var out = ByteSink()
+        out.addAscii("RIFF")
+        out.addLittleInt(payload.size() + 4)
+        out.addAscii("WEBP")
+        out.addAll(payload.toBytes())
+        return out.toBytes()
+    }
+    static String suffix(fileName: String) {
+        var dot = fileName.lastIndexOf(".")
+        if (dot >= 0 && fileName.length() - dot <= 8) {
+            return fileName.substring(dot)
+        }
+        return ".bin"
+    }
+}
+
+// PDF document information and catalog metadata (PDFBox in the Java service). Seam: the default passes the
+// bytes through, because no PDF library is reachable from Kof yet (KOF_GAPS G164); a cleaner replaces it.
+class MediaPdfCleaner {
+    public constructor() {}
+    Byte[] clean(data: Byte[]) = data
+}

@@ -1,0 +1,194 @@
+package media
+
+import kernel.error.*
+import kernel.id.*
+import kernel.log.*
+import kernel.time.*
+
+// On access the old archive migrates itself to S3 (LazyMediaCopyTrigger). A seam: the default does
+// nothing, the module installs the real one when REDE_MEDIA_MIGRATION_ENABLED is on.
+class MediaLazyCopy {
+    public constructor() {}
+    copySoon(asset: MediaAsset);
+}
+
+// Use cases of the media domain (MediaService), and the lookups other domains call:
+// visibleByIds (feed, groups, profile cards), validateOwnedBy (post/comment creation),
+// requestPostMediaDeletion (post deletion).
+class MediaService {
+    MediaStore assets
+    MediaUrlFactory urls
+    MediaUploadSigner? signer
+    MediaLazyCopy lazyCopy
+    Log log = Log("media.service")
+    public constructor(assets: MediaStore, urls: MediaUrlFactory, signer: MediaUploadSigner?, lazyCopy: MediaLazyCopy) {
+        this.assets = assets
+        this.urls = urls
+        this.signer = signer
+        this.lazyCopy = lazyCopy
+    }
+    MediaUploadView createUpload(ownerId: String, fileName: String, mimeType: String, size: Long, purpose: String) {
+        var mime = validate(fileName, mimeType, size, purpose)
+        // Uploads exist only with S3 configured: without it the answer is 503, on purpose, never a write
+        // path to the old provider (it no longer accepts files).
+        var activeSigner = signer
+        if (activeSigner == null) {
+            throw Errors.api(503, "UPLOADS_DISABLED", "O envio de midia esta temporariamente desativado enquanto o armazenamento e migrado.")
+        }
+        var ext = MediaRules.extensionOf(mime)
+        var mediaId = newId("media")
+        var now = Time.nowIso()
+        var length = size
+        var name = fileName
+        if (ext == null) {
+            throw Errors.badRequest()
+        }
+        // The object name is generated here: the client file name is metadata only and never becomes part
+        // of the storage key or the public URL.
+        var objectKey = urls.objectKey(mediaId, "file" + ext)
+        var provider = urls.provider()
+        var cdn = urls.cdnUrl(objectKey)
+        var onS3 = provider == "S3"
+        var s3Url = MediaService.onlyIf(onS3, cdn)
+        var s3At = MediaService.onlyIf(onS3, now)
+        var asset = MediaAsset(mediaId, ownerId, name.trim(), mime, length, MediaService.normalize(purpose), objectKey, cdn, "PENDING", "NONE", now, Time.plusSeconds(now, MediaRules.uploadWindowSeconds()), null, provider, s3Url, s3At, 0, null, null, null, 0)
+        assets.save(asset)
+        var signed = signUpload(activeSigner, asset)
+        // Upload metadata (never the content), to tie a media id seen in a post to who sent what.
+        log.info("media_upload_signed mediaId=" + asset.id + " ownerId=" + ownerId + " mime=" + mime + " bytes=" + length + " purpose=" + asset.purpose + " provider=" + provider)
+        if (onS3) {
+            return MediaUploadView(asset.id, asset.ownerId, asset.fileName, asset.mimeType, asset.size, asset.purpose, asset.objectKey, asset.cdnUrl, signed.url(), signed.method(), signed.headers(), "S3", asset.status, asset.deleteStatus, asset.expiresAt)
+        }
+        return MediaUploadView(asset.id, asset.ownerId, asset.fileName, asset.mimeType, asset.size, asset.purpose, asset.objectKey, asset.cdnUrl, signed.url(), null, mapOf<String, String>(), "IMAGEKIT", asset.status, asset.deleteStatus, asset.expiresAt)
+    }
+    MediaSignedUpload signUpload(activeSigner: MediaUploadSigner, asset: MediaAsset) {
+        try {
+            return activeSigner.sign(asset.objectKey, asset.mimeType, asset.size)
+        } catch (String e) {
+            if (Errors.isApi(e)) {
+                throw e
+            }
+            // A bad storage credential used to be a generic 500 with nothing to act on.
+            log.error("media_upload_signing_failed ownerId=" + asset.ownerId + " mime=" + asset.mimeType + " bytes=" + asset.size)
+            throw Errors.api(503, "STORAGE_UNAVAILABLE", "O armazenamento de midia esta indisponivel no momento. Tente novamente em instantes.")
+        }
+    }
+    MediaAssetView getMedia(mediaId: String) {
+        var asset = findMedia(mediaId)
+        // A read is a chance to migrate: whoever asks for the asset schedules its copy, nothing blocks.
+        lazyCopy.copySoon(asset)
+        return MediaRules.view(asset)
+    }
+    // Visible (not deleted) assets by id, as card summaries.
+    Map<String,MediaSummaryView> visibleByIds(mediaIds: List<String>) = MediaService.fillVisible(assets, mediaIds, mapOf<String, MediaSummaryView>())
+    MediaStatusResponse requestDeletion(ownerId: String, mediaId: String) {
+        var asset = findMedia(mediaId)
+        if (asset.ownerId != ownerId) {
+            throw Errors.api(403, "MEDIA_OWNER_MISMATCH", "Midia nao pertence ao usuario autenticado.")
+        }
+        requestAssetDeletion(asset, null)
+        return MediaStatusResponse(asset.id, "DELETE_REQUESTED")
+    }
+    // Post deletion: the owner's assets among `mediaIds` go to deletion; returns their ids.
+    List<String> requestPostMediaDeletion(ownerId: String, postId: String, mediaIds: List<String>) {
+        var done = listOf<String>()
+        if (mediaIds.isEmpty()) {
+            return done
+        }
+        for (var asset in assets.findByIds(mediaIds)) {
+            if (asset.ownerId == ownerId) {
+                requestAssetDeletion(asset, postId)
+                done.add(asset.id)
+            }
+        }
+        return done
+    }
+    // 404 when one of the assets is missing, 403 when one belongs to someone else.
+    validateOwnedBy(ownerId: String, mediaIds: List<String>) {
+        if (mediaIds.isEmpty()) {
+            return
+        }
+        var normalized = listOf<String>()
+        for (var raw in mediaIds) {
+            var id = raw.trim()
+            if (id.length() > 0 && !normalized.contains(id)) {
+                normalized.add(id)
+            }
+        }
+        var found = assets.findByIds(normalized)
+        if (found.size() != normalized.size()) {
+            throw Errors.api(404, "MEDIA_NOT_FOUND", "Uma ou mais midias nao foram encontradas.")
+        }
+        for (var asset in found) {
+            if (asset.ownerId != ownerId) {
+                throw Errors.api(403, "MEDIA_OWNER_MISMATCH", "Todas as midias precisam pertencer ao autor do post.")
+            }
+        }
+    }
+    requestAssetDeletion(asset: MediaAsset, postId: String?) {
+        var now = Time.nowIso()
+        // REQUESTED only from NONE or FAILED; anything past that is already on its way out.
+        assets.markDeleteRequested(asset.id, now)
+        assets.requestDeletionJob(newId("media_deletion_job"), asset.id, postId, asset.ownerId, now)
+    }
+    MediaAsset findMedia(mediaId: String) {
+        if (mediaId.trim().length() == 0) {
+            throw Errors.api(400, "INVALID_MEDIA_ID", "Identificador de midia obrigatorio.")
+        }
+        var asset = assets.findById(mediaId.trim())
+        if (asset == null) {
+            throw Errors.api(404, "MEDIA_NOT_FOUND", "Midia nao encontrada.")
+        }
+        return asset
+    }
+    // Returns the normalised MIME type that gets signed and stored.
+    String validate(fileName: String, mimeType: String, size: Long, purpose: String) {
+        if (fileName.trim().length() == 0) {
+            throw Errors.api(400, "INVALID_FILE_NAME", "Nome do arquivo obrigatorio.")
+        }
+        if (mimeType.trim().length() == 0) {
+            throw Errors.api(400, "INVALID_MIME_TYPE", "Tipo de midia obrigatorio.")
+        }
+        var mime = MediaRules.baseType(mimeType)
+        if (MediaRules.extensionOf(mime) == null) {
+            throw Errors.api(400, "MEDIA_TYPE_NOT_ALLOWED", "Tipo de arquivo nao permitido. Envie imagem, video, audio ou PDF.")
+        }
+        if (!MediaRules.purposeAllows(purpose.trim().toUpperCase(), mime)) {
+            throw Errors.api(400, "MEDIA_TYPE_NOT_ALLOWED", "Tipo de arquivo nao permitido para este envio.")
+        }
+        if (size <= 0L) {
+            throw Errors.api(400, "INVALID_MEDIA_SIZE", "Tamanho da midia deve ser maior que zero.")
+        }
+        if (size > MediaRules.maxBytes()) {
+            throw Errors.api(400, "MEDIA_TOO_LARGE", "Mídia deve ter no máximo " + MediaRules.maxBytes() / (1024L * 1024L) + "MB.")
+        }
+        return mime
+    }
+    static String? normalize(value: String) {
+        if (value.trim().length() == 0) {
+            return null
+        }
+        return value.trim()
+    }
+    static String? onlyIf(condition: Bool, value: String) {
+        if (condition) {
+            return value
+        }
+        return null
+    }
+    static String newId(prefix: String) = Ids.prefixed(prefix + "_")
+    static Map<String,MediaSummaryView> fillVisible(store: MediaStore, mediaIds: List<String>, out: Map<String,MediaSummaryView>) {
+        var ids = listOf<String>()
+        for (var raw in mediaIds) {
+            if (raw.trim().length() > 0 && !ids.contains(raw)) {
+                ids.add(raw)
+            }
+        }
+        for (var asset in store.findByIds(ids)) {
+            if (MediaRules.isVisible(asset)) {
+                out.put(asset.id, MediaRules.summary(asset))
+            }
+        }
+        return out
+    }
+}

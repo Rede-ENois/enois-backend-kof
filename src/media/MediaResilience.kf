@@ -1,0 +1,120 @@
+package media
+
+import kernel.concurrent.*
+import kernel.time.*
+
+// resilience4j `mediaStorage` (retry 3 x 250 ms, circuit breaker over 10 calls / 5 minimum / 50 %
+// failures, bulkhead of 4 concurrent calls with no waiting) as one small helper. Nesting as the Spring
+// aspects: retry( circuit( bulkhead( call ))).
+//
+//   resilience.run(() -> gateway.deleteObject(asset))
+//
+// A call refused by the open circuit or the full bulkhead throws CALL_NOT_PERMITTED / BULKHEAD_FULL.
+class MediaResilience {
+    Int maxAttempts
+    Long waitMs
+    Int windowSize
+    Int minimumCalls
+    Int failurePercent
+    Long openMs
+    Permits bulkhead
+    Gate gate = Gate()
+    // Ring of the last `windowSize` outcomes (true = failure), the circuit state and when it opened.
+    List<Bool> outcomes = listOf<Bool>()
+    Bool open = false
+    Long openedAt = 0L
+    // Tests move the clock and skip the real sleep between attempts.
+    Long clockSkewMs = 0L
+    Bool sleeps = true
+    public constructor(maxAttempts: Int, waitMs: Long, windowSize: Int, minimumCalls: Int, failurePercent: Int, openMs: Long, maxConcurrent: Int) {
+        this.maxAttempts = maxAttempts
+        this.waitMs = waitMs
+        this.windowSize = windowSize
+        this.minimumCalls = minimumCalls
+        this.failurePercent = failurePercent
+        this.openMs = openMs
+        this.bulkhead = Permits(maxConcurrent)
+    }
+    // The values of application.properties for `mediaStorage` (open state lasts 60 s, the library default).
+    static MediaResilience standard() = MediaResilience(3, 250L, 10, 5, 50, 60000L, 4)
+    Long clockMillis() = Time.nowMillis() + clockSkewMs
+    run(action: () -> void) {
+        var attempt = 1
+        var failure = ""
+        var done = false
+        while (!done) {
+            failure = ""
+            try {
+                this.guarded(action)
+                done = true
+            } catch (String e) {
+                failure = e
+            }
+            if (!done) {
+                if (attempt >= maxAttempts) {
+                    throw failure
+                }
+                attempt = attempt + 1
+                if (sleeps) {
+                    time.sleep(waitMs as Int)
+                }
+            }
+        }
+    }
+    guarded(action: () -> void) {
+        if (!this.permitted()) {
+            throw "CALL_NOT_PERMITTED"
+        }
+        if (!bulkhead.tryAcquire()) {
+            throw "BULKHEAD_FULL"
+        }
+        var failure = ""
+        try {
+            action()
+        } catch (String e) {
+            failure = e
+        }
+        bulkhead.release()
+        this.note(failure.length() > 0)
+        if (failure.length() > 0) {
+            throw failure
+        }
+    }
+    // Closed, or open long enough to probe again (half-open: the next outcome decides).
+    Bool permitted() {
+        gate.enter()
+        var ok = true
+        if (open) {
+            if (this.clockMillis() - openedAt >= openMs) {
+                open = false
+                outcomes = listOf<Bool>()
+            }
+            else {
+                ok = false
+            }
+        }
+        gate.leave()
+        return ok
+    }
+    note(failed: Bool) {
+        gate.enter()
+        outcomes.add(failed)
+        if (outcomes.size() > windowSize) {
+            outcomes.remove(0)
+        }
+        if (outcomes.size() >= minimumCalls) {
+            var bad = 0
+            for (var o in outcomes) {
+                if (o) {
+                    bad = bad + 1
+                }
+            }
+            if (bad * 100 >= failurePercent * outcomes.size()) {
+                open = true
+                openedAt = this.clockMillis()
+            }
+        }
+        gate.leave()
+    }
+    Bool isOpen() = open
+}
