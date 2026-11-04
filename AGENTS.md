@@ -75,7 +75,7 @@ Measured limits (each one has a minimal repro in `docs/KOF_GAPS.md`):
    `== true`.
 5. Qualified Java names are not receivers: `import java.x.Y` then `Y.call()`.
 6. **One `main()` per module directory.** Probes and scratch programs live outside `src/`.
-7. `kof check` does not see `kofdeps` jars; validate with `kof test`/`kof run --deps`.
+7. `kof check` does not see `kofdeps` jars; validate with `scripts/kof-test`/`scripts/kof-run`.
 
 When you hit a new compiler/runtime bug: write the smallest repro, add it to `docs/KOF_GAPS.md`
 (symptom, repro, workaround), apply the workaround **inside the kernel when possible**, move on.
@@ -86,11 +86,14 @@ Never silence a failure.
 ```bash
 export PATH="$HOME/.local/kof:$PATH"          # kof 0.7.1 (java -jar wrapper)
 kof deps resolve                               # after editing kofdeps
-kof test --module-root src tests/              # whole suite (H2, no network)
-kof test --module-root src tests/feed          # one domain
-kof run src/Main.kf --deps                     # boot locally (H2 by default)
+scripts/kof-test                               # whole suite (H2, no network)
+scripts/kof-test tests/feed                    # one domain
+scripts/kof-run                                # boot locally (H2 by default, PORT=8081)
 kof fmt src -w && kof fmt tests -w             # canonical formatting before commit
 ```
+
+`kof test` and `kof run` 0.7.1 cannot see the kofdeps jars or `src/` (KOF_GAPS G9/G10), so the
+scripts drive the same compiler through its API. The kernel API is documented in `docs/KERNEL.md`.
 
 Tests never touch the network or a real database: H2 in MySQL mode with the real migrations,
 unique-prefix fixtures, an ephemeral port per suite.
