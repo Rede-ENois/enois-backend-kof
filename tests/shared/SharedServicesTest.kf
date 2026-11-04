@@ -1,0 +1,63 @@
+import kernel.*
+import kernel.config.*
+import kernel.db.*
+import kernel.outbox.*
+import kernel.testkit.*
+
+class SharedHandler extends OutboxEventHandler {
+    List<String> seen = listOf<String>()
+    public constructor() {
+        super()
+    }
+    handle(eventType: String, aggregateId: String, payload: String) {
+        seen.add(aggregateId)
+    }
+}
+
+test "the shared services wire up and the outbox worker runs" {
+    var app = TestApp.shared()
+    var shared = SharedServices.create(app.platform)
+    var handler = SharedHandler()
+    shared.outbox.register("SHARED_WIRING", handler)
+    shared.outbox.append("SHARED_WIRING", "shared_agg_1", "{}")
+    var waited = 0
+    while (handler.seen.size() == 0 && waited < 80) {
+        time.sleep(100)
+        waited = waited + 1
+    }
+    shared.stop()
+    assert(handler.seen.size() == 1)
+    assert(shared.jobs.runCount("outbox-worker") >= 1)
+    assert(!shared.cipher.isEnabled())
+    assert(shared.caches.get("publicProfiles").maxEntries == 5000)
+    assert(shared.blockedUsers.hiddenIdsFor("shared_nobody").size() == 0)
+    shared.sanctionGate.requireNotRestricted("shared_nobody")
+    assert(shared.risk.assess("shared_nobody", "publish", "texto") == null)
+}
+
+test "outside the dev profile the encryption key is required at boot" {
+    var overrides = mapOf("SPRING_PROFILES_ACTIVE", "prd", "DB_URL", "jdbc:h2:mem:sharedprd;MODE=MySQL;DB_CLOSE_DELAY=-1")
+    var platform = Platform.create(Config.of(overrides))
+    var failed = ""
+    try {
+        SharedServices.create(platform)
+    } catch (String e) {
+        failed = e
+    }
+    platform.stop()
+    assert(failed.startsWith("CONFIG_MISSING"))
+}
+
+test "a wire that throws stops the platform instead of leaking the pool" {
+    var failed = ""
+    try {
+        TestApp.bootWire("wirefail", (p: Platform) -> {
+            var s = SharedServices.create(p)
+            s.stop()
+            throw "wire failed"
+        })
+    } catch (String e) {
+        failed = e
+    }
+    assert(failed == "wire failed")
+}
