@@ -1,0 +1,50 @@
+package themes
+
+import kernel.db.*
+
+// theme_gallery: the published themes. Counters move in one atomic UPDATE.
+class ThemeStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, author_id, name, description, package_json, mode_default, installs, status, reported, created_at"
+    static ThemePackage mapRow(r: DbRow) = ThemePackage(r.getStr("id"), r.getStr("author_id"), r.getStr("name"), r.getStrOrNull("description"), r.getStr("package_json"), r.getStr("mode_default"), r.getInt("installs"), r.getStr("status"), r.getInt("reported"), r.getInstant("created_at"))
+    insert(t: ThemePackage) {
+        store.execute("insert into theme_gallery (" + ThemeStore.columns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(t.id()).bindStr(t.authorId()).bindStr(t.name()).bindStrOrNull(t.description()).bindStr(t.packageJson()).bindStr(t.modeDefault()).bindInt(t.installs()).bindStr(t.status()).bindInt(t.reported()).bindInstant(t.createdAt()))
+    }
+    // The author's edit: identity, installs, reports and the publication date stay where they are.
+    updateContent(t: ThemePackage) {
+        store.execute("update theme_gallery set name = ?, description = ?, package_json = ?, mode_default = ? where id = ?", DbParams().bindStr(t.name()).bindStrOrNull(t.description()).bindStr(t.packageJson()).bindStr(t.modeDefault()).bindStr(t.id()))
+    }
+    ThemePackage? findById(id: String) {
+        var row = store.queryOptional("select " + ThemeStore.columns() + " from theme_gallery where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return ThemeStore.mapRow(row)
+    }
+    List<ThemePackage> findPublished(limit: Int) {
+        var out = listOf<ThemePackage>()
+        for (var r in store.queryList("select " + ThemeStore.columns() + " from theme_gallery where status = 'PUBLISHED' order by created_at desc limit ?", DbParams().bindInt(limit))) {
+            out.add(ThemeStore.mapRow(r))
+        }
+        return out
+    }
+    List<ThemePackage> findByAuthor(authorId: String) {
+        var out = listOf<ThemePackage>()
+        for (var r in store.queryList("select " + ThemeStore.columns() + " from theme_gallery where author_id = ? order by created_at desc limit 50", DbParams().bindStr(authorId))) {
+            out.add(ThemeStore.mapRow(r))
+        }
+        return out
+    }
+    addInstall(id: String) {
+        store.execute("update theme_gallery set installs = installs + 1 where id = ?", DbParams().bindStr(id))
+    }
+    addReport(id: String) {
+        store.execute("update theme_gallery set reported = reported + 1 where id = ?", DbParams().bindStr(id))
+    }
+    hide(id: String) {
+        store.execute("update theme_gallery set status = 'HIDDEN' where id = ?", DbParams().bindStr(id))
+    }
+}
