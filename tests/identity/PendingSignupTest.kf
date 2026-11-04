@@ -1,0 +1,67 @@
+import identity.*
+import kernel.db.*
+import kernel.testkit.*
+
+IdentityTestApp ctx() = IdentityTestApp.shared("pending", mapOf())
+
+test "accountOnlyExistsAfterTheEmailIsConfirmed (PendingSignupFlowTests)" {
+    var t = ctx()
+    var email = "pendente.flow@example.com"
+    var res = t.signup(email, "senha-segura", "pending-signup-1")
+    Check.status(res, 201)
+    Check.jsonEq(res, "verificationRequired", "true")
+    // No account: only the pending row with the password hash.
+    Check.isTrue("no user yet", !t.userExists(email))
+    Check.eqInt("pending rows", 1, t.pendingCount(email))
+    var token = t.mailToken("EMAIL_VERIFICATION", email)
+    var body = "{\"token\":\"" + token + "\"}"
+    var verified = t.post("/auth/email/verify", body)
+    Check.status(verified, 200)
+    Check.isTrue("token never in the body", !verified.jsonHas("token"))
+    Check.jsonEq(verified, "user.emailVerified", "true")
+    Check.isTrue("account exists", t.userExists(email))
+    Check.eqInt("pending gone", 0, t.pendingCount(email))
+    // Single use: the same link does not create a second account.
+    Check.apiError(t.post("/auth/email/verify", body), 404, "INVALID_TOKEN")
+}
+
+test "expiredLinkDoesNotCreateTheAccount (PendingSignupFlowTests)" {
+    var t = ctx()
+    var email = "pendente.expirado@example.com"
+    Check.status(t.signup(email, "senha-segura", "pending-signup-exp-1"), 201)
+    var token = t.mailToken("EMAIL_VERIFICATION", email)
+    t.db().execute("update pending_signups set expires_at = ? where email = ?", DbParams().bindInstant("2020-01-01T00:00:00Z").bindStr(email))
+    Check.apiError(t.post("/auth/email/verify", "{\"token\":\"" + token + "\"}"), 410, "TOKEN_EXPIRED")
+    Check.isTrue("no account", !t.userExists(email))
+}
+
+test "signingUpAgainReplacesThePendingInsteadOfFailing (PendingSignupFlowTests)" {
+    var t = ctx()
+    var email = "pendente.repetido@example.com"
+    Check.status(t.signup(email, "senha-segura", "pending-again-1"), 201)
+    var oldToken = t.mailToken("EMAIL_VERIFICATION", email)
+    // Redoing the signup with the same e-mail must NOT be a 409: it replaces the pending.
+    Check.status(t.signup(email, "senha-segura", "pending-again-2"), 201)
+    Check.eqInt("one pending", 1, t.pendingCount(email))
+    // The previous link stopped working.
+    Check.status(t.post("/auth/email/verify", "{\"token\":\"" + oldToken + "\"}"), 404)
+    Check.isTrue("no account", !t.userExists(email))
+}
+
+test "signupForAnEmailThatAlreadyHasAnAccountIsRefused (PendingSignupFlowTests)" {
+    var t = ctx()
+    var email = "pendente.ja-existe@example.com"
+    Check.status(t.signup(email, "senha-segura", "pending-signup-dup-1"), 201)
+    Check.status(t.post("/auth/email/verify", "{\"token\":\"" + t.mailToken("EMAIL_VERIFICATION", email) + "\"}"), 200)
+    var again = t.signup(email, "senha-segura", "pending-signup-dup-2")
+    // A duplicate answers like a new signup (it does not reveal that the e-mail exists); emailSent reflects
+    // the real send of the owner notice.
+    Check.status(again, 201)
+    Check.jsonEq(again, "verificationRequired", "true")
+    Check.jsonEq(again, "emailSent", "true")
+    Check.eqInt("owner notice", 1, t.mailCount("HTML", email))
+}
+
+test "zz shutdown" {
+    ctx().stop()
+}

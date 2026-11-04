@@ -1,0 +1,149 @@
+package identity
+
+import kernel.db.*
+import kernel.error.*
+import kernel.log.*
+import kernel.time.*
+
+// Seams identity calls and other domains own. Concrete classes with overridable methods (a Kof interface
+// from another package cannot be implemented, G30); the owner subclasses one and Main.kf passes it to
+// IdentityModule.install.
+
+// The moderation block list (V131 `blocked_ips`): a blocked IP creates no account, logs nobody in and gets
+// no session. pending-port: moderation. The default reads the table with the same lookup as the Java
+// IpBlockAdapter, cached 5 s per IP because every auth call asks.
+class IdentityIpBlocks {
+    Db store
+    // ip -> "<expiresAtMillis>|<1 blocked, 0 free>", bounded: it is cleared when it outgrows maxEntries.
+    Map<String,String> entries = mapOf()
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static Long ttlMs() = 5000L
+    static Int maxEntries() = 5000
+    Bool blocked(ip: String?) {
+        if (IdentityText.blank(ip)) {
+            return false
+        }
+        var key = IdentityText.orEmpty(ip).trim()
+        var now = Time.nowMillis()
+        var cached = entries.get(key)
+        if (cached != null) {
+            var bar = cached.indexOf("|")
+            if (cached.substring(0, bar).toLong() > now) {
+                return cached.substring(bar + 1) == "1"
+            }
+        }
+        var hit = store.queryLong("select count(*) from blocked_ips where ip = ?", DbParams().bindStr(key)) > 0L
+        if (entries.size() >= IdentityIpBlocks.maxEntries()) {
+            entries.clear()
+        }
+        var flag = "0"
+        if (hit) {
+            flag = "1"
+        }
+        entries.put(key, "" + (now + IdentityIpBlocks.ttlMs()) + "|" + flag)
+        return hit
+    }
+    requireNotBlocked(ip: String) {
+        if (blocked(ip)) {
+            throw Errors.api(403, "IP_BLOCKED", "Este endereco de rede esta bloqueado pela moderacao. Fale com o suporte se for um erro.")
+        }
+    }
+}
+
+// The signup attack-pattern gate (SuspiciousSignupGuard): a name carrying a configured pattern creates no
+// account, and repeated hits pause signups from that IP for an hour (never login, never a permanent block).
+// pending-port: moderation (owner of the rule). The default is the same rule in per-pod memory.
+class IdentitySignupGuard {
+    Log log = Log("identity.signup-guard")
+    Bool enabled
+    List<String> patterns
+    Int maxKeys
+    Map<String,List<Long>> strikes = mapOf()
+    Map<String,Long> cooldownUntil = mapOf()
+    public constructor(enabled: Bool, patternsCsv: String, maxKeys: Int) {
+        this.enabled = enabled
+        this.maxKeys = maxKeys
+        this.patterns = listOf<String>()
+        for (var p in patternsCsv.split(",")) {
+            var t = p.trim().toLowerCase()
+            if (t.length() > 0) {
+                patterns.add(t)
+            }
+        }
+    }
+    static Long strikeWindowMs() = 600000L
+    static Long cooldownMs() = 3600000L
+    static Int strikesToBlock() = 3
+    // 403 SIGNUP_REFUSED when the name hits the pattern or the IP is cooling down.
+    checkSignup(name: String?, email: String?, ip: String) {
+        if (!enabled || patterns.size() == 0) {
+            return
+        }
+        var now = Time.nowMillis()
+        var until = cooldownUntil.get(ip)
+        if (until != null && until > now) {
+            throw refused()
+        }
+        if (IdentityText.blank(name)) {
+            return
+        }
+        var typed = IdentityText.lower(name)
+        var hit = false
+        for (var p in patterns) {
+            if (typed.contains(p)) {
+                hit = true
+            }
+        }
+        if (!hit) {
+            return
+        }
+        if (registerStrike(ip, now)) {
+            startCooldown(ip, now)
+        }
+        log.warn("signup_refused_by_pattern")
+        throw refused()
+    }
+    String refused() = Errors.api(403, "SIGNUP_REFUSED", "Não foi possível criar a conta agora. Tente novamente mais tarde.")
+    Bool registerStrike(ip: String, now: Long) {
+        if (ip.trim().length() == 0 || ip == "desconhecido") {
+            return false
+        }
+        if (strikes.size() >= maxKeys) {
+            strikes.clear()
+        }
+        var kept = listOf<Long>()
+        var list = strikes.get(ip)
+        if (list != null) {
+            for (var t in list) {
+                if (now - t <= IdentitySignupGuard.strikeWindowMs()) {
+                    kept.add(t)
+                }
+            }
+        }
+        kept.add(now)
+        if (kept.size() < IdentitySignupGuard.strikesToBlock()) {
+            strikes.put(ip, kept)
+            return false
+        }
+        strikes.remove(ip)
+        return true
+    }
+    startCooldown(ip: String, now: Long) {
+        if (cooldownUntil.size() >= maxKeys) {
+            cooldownUntil.clear()
+        }
+        cooldownUntil.put(ip, now + IdentitySignupGuard.cooldownMs())
+        log.warn("signups_paused_for_ip")
+    }
+}
+
+// Notifications identity raises (a new device on login, a broken TOTP reset). pending-port: notifications.
+// The default only logs: NotificationService.create does more than one insert (preferences, push).
+class IdentityNotifier {
+    Log log = Log("identity.notifier")
+    notifySecurity(userId: String, title: String, body: String, link: String, label: String) {
+        log.info("security_notification_unhandled title=" + title)
+    }
+}

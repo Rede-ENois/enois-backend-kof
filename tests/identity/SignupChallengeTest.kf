@@ -1,0 +1,59 @@
+import identity.*
+import kernel.security.*
+import kernel.testkit.*
+
+// The own captcha: the question is issued by the server, the answer is checked in the backend, with expiry
+// and single use. No external service.
+IdentityTestApp ctx() = IdentityTestApp.shared("challenge", mapOf("SIGNUP_CAPTCHA_ENABLED", "true"))
+
+Int answerOf(question: String) {
+    // "Quanto é 3 + 7?"
+    var at = question.indexOf("é ") + 2
+    var plus = question.indexOf(" + ")
+    var end = question.indexOf("?")
+    return question.substring(at, plus).toInt() + question.substring(plus + 3, end).toInt()
+}
+
+String signupJson(prefix: String, challengeId: String, answer: Int) = "{\"name\":\"" + prefix + "\",\"role\":\"USER\",\"email\":\"" + prefix + "@test.com\",\"password\":\"Test1234!\",\"acceptedTerms\":true,\"birthDate\":\"1990-05-10\",\"challengeId\":\"" + challengeId + "\",\"challengeAnswer\":" + answer + "}"
+
+test "challengeIsRequiredAndCannotBeReused (SignupChallengeTests)" {
+    var t = ctx()
+    var config = t.app.client.get("/auth/config")
+    Check.status(config, 200)
+    Check.jsonEq(config, "captchaMode", "CHALLENGE")
+    // No answer: stopped before the account is created.
+    var none = t.postWith("/auth/signup", listOf("Idempotency-Key: captcha-none"), "{\"name\":\"cap_none\",\"role\":\"USER\",\"email\":\"cap_none@test.com\",\"password\":\"Test1234!\",\"acceptedTerms\":true,\"birthDate\":\"1990-05-10\"}")
+    Check.apiError(none, 400, "SIGNUP_CAPTCHA_REQUIRED")
+    var issued = t.app.client.get("/auth/signup-challenge")
+    Check.status(issued, 200)
+    var id = issued.json("challengeId")
+    // The token carries no answer-derived field: only issuedAt|expiresAt|nonce.
+    var payload = Tokens.base64UrlDecode(id.split("\\.")[0])
+    Check.eqInt("three fields", 3, ("" + payload).split("\\|").length)
+    var answer = answerOf(issued.json("question"))
+    time.sleep(1300)
+    var wrong = t.postWith("/auth/signup", listOf("Idempotency-Key: captcha-none"), signupJson("cap_wrong", id, answer + 1))
+    Check.apiError(wrong, 400, "SIGNUP_CAPTCHA_INVALID")
+    var valid = t.app.client.get("/auth/signup-challenge")
+    var validId = valid.json("challengeId")
+    var validAnswer = answerOf(valid.json("question"))
+    time.sleep(1300)
+    Check.status(t.postWith("/auth/signup", listOf("Idempotency-Key: captcha-none"), signupJson("cap_ok", validId, validAnswer)), 201)
+    // The same challenge does not create a second account.
+    Check.apiError(t.postWith("/auth/signup", listOf("Idempotency-Key: captcha-none"), signupJson("cap_replay", validId, validAnswer)), 400, "SIGNUP_CAPTCHA_REUSED")
+}
+
+test "too fast, expired and forged challenges" {
+    var t = ctx()
+    var issued = t.app.client.get("/auth/signup-challenge")
+    var id = issued.json("challengeId")
+    var answer = answerOf(issued.json("question"))
+    // Solved at once: a script, not a person.
+    Check.apiError(t.postWith("/auth/signup", listOf("Idempotency-Key: captcha-fast"), signupJson("cap_fast", id, answer)), 400, "SIGNUP_CAPTCHA_TOO_FAST")
+    Check.apiError(t.postWith("/auth/signup", listOf("Idempotency-Key: captcha-forged"), signupJson("cap_forged", "abc.def", 4)), 400, "SIGNUP_CAPTCHA_INVALID")
+    Check.apiError(t.postWith("/auth/signup", listOf("Idempotency-Key: captcha-garbage"), signupJson("cap_garbage", "no-dot", 4)), 400, "SIGNUP_CAPTCHA_INVALID")
+}
+
+test "zz shutdown" {
+    ctx().stop()
+}

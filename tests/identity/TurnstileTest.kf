@@ -1,0 +1,122 @@
+import identity.*
+import kernel.config.*
+import kernel.error.*
+import kernel.testkit.*
+
+// TurnstileValidatorTests: the keys decide whether the captcha is on; the network is a stub.
+String testSecret() = "1x0000000000000000000000000000000AA"
+String testSite() = "1x00000000000000000000AA"
+String realSecret() = "0x4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+String realSite() = "0x4AAAAAAAAAAAAAAA"
+
+IdentityTurnstile validator(secret: String, site: String, policy: String) = IdentityTurnstile(Config.of(mapOf("TURNSTILE_SECRET_KEY", secret, "TURNSTILE_SITE_KEY", site, "TURNSTILE_TEST_KEY_POLICY", policy)), IdentityStubTurnstile())
+
+test "testKeysNeverCountAsConfigured" {
+    var degraded = validator(testSecret(), testSite(), "degrade")
+    Check.isTrue("not configured", !degraded.isConfigured())
+    Check.isTrue("not available", !degraded.isAvailable())
+    // Inert by design: the signup is decided by the backend's own challenge.
+    degraded.require("")
+}
+
+test "degradePolicyKeepsTheSiteUp" {
+    validator(testSecret(), testSite(), "degrade")
+}
+
+test "fatalPolicyRefusesTestKeysAtBoot" {
+    var failure = ""
+    try {
+        validator(testSecret(), testSite(), "fatal")
+    } catch (String e) {
+        failure = e
+    }
+    Check.isTrue("refused: " + failure, failure.indexOf("test keys") >= 0)
+}
+
+test "unknownPolicyFallsBackToDegrade" {
+    validator(testSecret(), testSite(), "fata1")
+    Check.isTrue("not configured", !validator(testSecret(), testSite(), "fata1").isConfigured())
+}
+
+test "realKeysStayConfiguredAndAvailable" {
+    var prod = validator(realSecret(), realSite(), "fatal")
+    Check.isTrue("configured", prod.isConfigured())
+    Check.isTrue("available", prod.isAvailable())
+}
+
+test "emptyKeysAreNotConfigured" {
+    var dev = validator("", "", "fatal")
+    Check.isTrue("not configured", !dev.isConfigured())
+    Check.isTrue("not available", !dev.isAvailable())
+}
+
+// The verification itself, fail-closed (E-35).
+test "a missing token is 403 TURNSTILE_REQUIRED, a rejected one 403 TURNSTILE_FAILED" {
+    var stub = IdentityStubTurnstile()
+    var v = IdentityTurnstile(Config.of(mapOf("TURNSTILE_SECRET_KEY", realSecret(), "TURNSTILE_SITE_KEY", realSite())), stub)
+    var missing = ""
+    try {
+        v.require("  ")
+    } catch (String e) {
+        missing = e
+    }
+    Check.isTrue("required", Errors.hasCode(missing, "TURNSTILE_REQUIRED"))
+    stub.reply = "{\"success\":false,\"error-codes\":[\"invalid-input-response\"]}"
+    var rejected = ""
+    try {
+        v.require("bad-token")
+    } catch (String e) {
+        rejected = e
+    }
+    Check.isTrue("failed", Errors.hasCode(rejected, "TURNSTILE_FAILED"))
+    Check.eqInt("403", 403, Errors.parse(rejected).status())
+    stub.reply = "{\"success\":true}"
+    v.require("good-token")
+}
+
+test "a network failure or an unreadable answer never lets the signup through" {
+    var stub = IdentityStubTurnstile()
+    var v = IdentityTurnstile(Config.of(mapOf("TURNSTILE_SECRET_KEY", realSecret(), "TURNSTILE_SITE_KEY", realSite())), stub)
+    stub.down = true
+    var down = ""
+    try {
+        v.require("token")
+    } catch (String e) {
+        down = e
+    }
+    Check.isTrue("unavailable", Errors.hasCode(down, "TURNSTILE_UNAVAILABLE"))
+    Check.eqInt("503", 503, Errors.parse(down).status())
+    stub.down = false
+    stub.reply = "<html>gateway</html>"
+    var garbage = ""
+    try {
+        v.require("token")
+    } catch (String e) {
+        garbage = e
+    }
+    Check.isTrue("unreadable is unavailable", Errors.hasCode(garbage, "TURNSTILE_UNAVAILABLE"))
+}
+
+IdentityTestApp ctx() = IdentityTestApp.shared("turnstile", mapOf("TURNSTILE_SECRET_KEY", realSecret(), "TURNSTILE_SITE_KEY", realSite()))
+
+test "with real keys /auth/config advertises Turnstile and the signup checks the token inside the idempotent action" {
+    var t = ctx()
+    var config = t.app.client.get("/auth/config")
+    Check.jsonEq(config, "captchaMode", "TURNSTILE")
+    Check.jsonEq(config, "turnstileSiteKey", realSite())
+    var body = "{\"name\":\"Turnstile Ok\",\"role\":\"USER\",\"email\":\"turnstile.ok@test.com\",\"password\":\"Test1234!\",\"acceptedTerms\":true,\"birthDate\":\"1990-05-10\",\"turnstileToken\":\"tok-1\"}"
+    t.turnstile.reply = "{\"success\":false}"
+    Check.apiError(t.postWith("/auth/signup", listOf("Idempotency-Key: ts-1"), body), 403, "TURNSTILE_FAILED")
+    t.turnstile.reply = "{\"success\":true}"
+    Check.status(t.postWith("/auth/signup", listOf("Idempotency-Key: ts-1"), body), 201)
+    var calls = t.turnstile.tokens.size()
+    // The replay of the SAME request returns the cached answer without spending another token.
+    Check.status(t.postWith("/auth/signup", listOf("Idempotency-Key: ts-1"), body), 201)
+    Check.eqInt("no second verification", calls, t.turnstile.tokens.size())
+    var none = "{\"name\":\"Turnstile None\",\"role\":\"USER\",\"email\":\"turnstile.none@test.com\",\"password\":\"Test1234!\",\"acceptedTerms\":true,\"birthDate\":\"1990-05-10\"}"
+    Check.apiError(t.postWith("/auth/signup", listOf("Idempotency-Key: ts-2"), none), 403, "TURNSTILE_REQUIRED")
+}
+
+test "zz shutdown" {
+    ctx().stop()
+}

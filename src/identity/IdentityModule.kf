@@ -1,0 +1,74 @@
+package identity
+
+import kernel.*
+import kernel.cache.*
+import kernel.config.*
+import kernel.http.*
+import kernel.log.*
+import kernel.security.*
+
+// The seams of the identity module, each with its default. An owner (profile, moderation, notifications, the
+// mail transport) replaces its field before `IdentityModule.installWith`; tests replace the mailer and the
+// Turnstile transport. See docs/PORTING_STATUS.md, "identity".
+class IdentitySeams {
+    IdentityUsers users
+    IdentityMailer mailer
+    IdentityTurnstileTransport turnstile
+    IdentityIpBlocks ipBlocks
+    IdentitySignupGuard signupGuard
+    IdentityNotifier notifier
+    public constructor(users: IdentityUsers, mailer: IdentityMailer, turnstile: IdentityTurnstileTransport, ipBlocks: IdentityIpBlocks, signupGuard: IdentitySignupGuard, notifier: IdentityNotifier) {
+        this.users = users
+        this.mailer = mailer
+        this.turnstile = turnstile
+        this.ipBlocks = ipBlocks
+        this.signupGuard = signupGuard
+        this.notifier = notifier
+    }
+    static IdentitySeams defaults(platform: Platform, store: IdentityStore) {
+        var cfg = platform.cfg
+        return IdentitySeams(IdentityUsers(platform.db), IdentityMailer(cfg, store, false), IdentityTurnstileTransport(), IdentityIpBlocks(platform.db), IdentitySignupGuard(cfg.getBool("REDE_SECURITY_SIGNUP_GUARD_ENABLED", true), cfg.getStr("REDE_SECURITY_SUSPICIOUS_NAME_PATTERNS", "probe"), 20000), IdentityNotifier())
+    }
+}
+
+// identity + age + onboarding wiring (Main.kf calls IdentityModule.install once, after Security.install).
+class IdentityModule {
+    IdentityService service
+    IdentityTwoFactor twoFactor
+    IdentityStore store
+    IdentityMailer mailer
+    public constructor(service: IdentityService, twoFactor: IdentityTwoFactor, store: IdentityStore, mailer: IdentityMailer) {
+        this.service = service
+        this.twoFactor = twoFactor
+        this.store = store
+        this.mailer = mailer
+    }
+    static IdentityModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks, parts: SecurityParts) {
+        var store = IdentityStore(platform.db)
+        return IdentityModule.installWith(platform, shared, hooks, parts, IdentitySeams.defaults(platform, store))
+    }
+    static IdentityModule installWith(platform: Platform, shared: SharedServices, hooks: SecurityHooks, parts: SecurityParts, seams: IdentitySeams) {
+        var cfg = platform.cfg
+        var store = IdentityStore(platform.db)
+        var twoFactor = IdentityTwoFactor(platform.db, store, seams.users, seams.mailer, seams.notifier, shared.cipher)
+        var service = IdentityService(cfg, platform.db, store, seams.users, seams.mailer, twoFactor, shared.sanctionReader, parts.ipLimiter)
+        var challenge = IdentitySignupChallenge(cfg, store)
+        var turnstile = IdentityTurnstile(cfg, seams.turnstile)
+        IdentityRoutes(cfg, service, twoFactor, store, seams.users, challenge, turnstile, seams.ipBlocks, seams.signupGuard, seams.notifier, shared.idempotency, parts).register(platform.server)
+        IdentityModule.schedule(shared, cfg, store, service)
+        return IdentityModule(service, twoFactor, store, seams.mailer)
+    }
+    // PendingSignupCleanupWorker (15 s, then every 3 min) and SessionTokenHashMigration (raw sessions written by
+    // an old pod during a rolling deploy become hashed rows: at boot and every minute).
+    static schedule(shared: SharedServices, cfg: Config, store: IdentityStore, service: IdentityService) {
+        var log = Log("identity.jobs")
+        shared.jobs.fixedDelay("identity-session-rehash", 0L, 60000L, () -> {
+            store.rehashLegacySessions()
+        })
+        if (cfg.getBool("REDE_AUTH_PENDING_SIGNUP_CLEANUP_ENABLED", true)) {
+            shared.jobs.fixedDelay("identity-pending-signup-cleanup", cfg.getLong("REDE_AUTH_PENDING_SIGNUP_CLEANUP_INITIAL_DELAY_MS", 15000L), cfg.getLong("REDE_AUTH_PENDING_SIGNUP_CLEANUP_INTERVAL_MS", 180000L), () -> {
+            service.purgePending()
+        })
+        }
+    }
+}

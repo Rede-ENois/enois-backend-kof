@@ -1,0 +1,213 @@
+package identity
+
+import java.util.HashMap
+import kernel.*
+import kernel.db.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+
+// Turnstile siteverify without the network: answers `reply`, or fails like a dead network when `down`.
+class IdentityStubTurnstile extends IdentityTurnstileTransport {
+    String reply = "{\"success\":true}"
+    Bool down = false
+    List<String> tokens = listOf<String>()
+    String verify(secret: String, token: String) {
+        tokens.add(token)
+        if (down) {
+            throw "OUTBOUND_FAILED: stub network is down"
+        }
+        return reply
+    }
+}
+
+// Holds what the wiring built, so tests reach the mailer, the limiters and the stubs.
+// A signed-up and confirmed account with its live session.
+record IdentityTestSession(String token, String refreshToken, String userId, String email, String password)
+
+class IdentityTestApp {
+    static Map<String,IdentityTestApp> shared = mapOf()
+    TestApp app
+    IdentityModule module
+    SecurityParts parts
+    IdentityMailer mailer
+    IdentityStubTurnstile turnstile
+    SharedServices services
+    public constructor(app: TestApp, module: IdentityModule, parts: SecurityParts, mailer: IdentityMailer, turnstile: IdentityStubTurnstile, services: SharedServices) {
+        this.services = services
+        this.app = app
+        this.module = module
+        this.parts = parts
+        this.mailer = mailer
+        this.turnstile = turnstile
+    }
+    Db db() = app.db()
+    // Ends the background jobs and the platform: the last test of a file calls it (the job loops keep
+    // the process alive otherwise).
+    stop() {
+        services.stop()
+        app.stop()
+    }
+    TestResponse post(path: String, body: String) = app.client.postJson(path, body)
+    TestResponse postWith(path: String, headers: List<String>, body: String) {
+        var all = listOf("Content-Type: application/json")
+        for (var h in headers) {
+            all.add(h)
+        }
+        return app.client.send("POST", path, all, "", body)
+    }
+    TestResponse getWithToken(path: String, token: String) = app.client.getWith(path, listOf("X-Session-Token: " + token))
+    TestResponse postWithToken(path: String, token: String, body: String) = postWith(path, listOf("X-Session-Token: " + token), body)
+    // The link token of the last verification / reset e-mail sent to `to` (the clear value only lives in the mail).
+    String mailToken(kind: String, to: String) {
+        var found = ""
+        for (var m in mailer.sent()) {
+            if (m.kind() == kind && m.to() == to) {
+                var at = m.body().indexOf("token=")
+                var end = at + 6
+                var chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+                while (end < m.body().length() && chars.indexOf(m.body().substring(end, end + 1)) >= 0) {
+                    end = end + 1
+                }
+                found = m.body().substring(at + 6, end)
+            }
+        }
+        return found
+    }
+    Int mailCount(kind: String, to: String) {
+        var n = 0
+        for (var m in mailer.sent()) {
+            if (m.kind() == kind && m.to() == to) {
+                n = n + 1
+            }
+        }
+        return n
+    }
+    String signupJson(email: String, password: String) = "{\"name\":\"Pessoa Teste\",\"role\":\"USER\",\"email\":\"" + email + "\",\"password\":\"" + password + "\",\"acceptedTerms\":true,\"birthDate\":\"1990-05-10\"}"
+    String loginJson(email: String, password: String) = "{\"email\":\"" + email + "\",\"password\":\"" + password + "\"}"
+    TestResponse signup(email: String, password: String, key: String) = postWith("/auth/signup", listOf("Idempotency-Key: " + key), signupJson(email, password))
+    TestResponse login(email: String, password: String) = post("/auth/login", loginJson(email, password))
+    Bool userExists(email: String) = db().queryLong("select count(*) from users where email = ?", DbParams().bindStr(email)) > 0L
+    Int pendingCount(email: String) = db().queryLong("select count(*) from pending_signups where email = ?", DbParams().bindStr(email)) as Int
+    String userId(email: String) = db().queryOne("select id from users where email = ?", DbParams().bindStr(email)).getStr("id")
+    // TestAuthHelper.authenticate: signs up `<prefix>@test.com` / Test1234!, confirms through the link that
+    // went out by e-mail and returns the session issued by the confirmation (cookies).
+    IdentityTestSession authenticate(prefix: String) {
+        var email = prefix + "@test.com"
+        var password = "Test1234!"
+        var res = signup(email, password, "auth-" + prefix)
+        if (res.status != 201) {
+            throw "authenticate: signup answered " + res.status + " " + res.body
+        }
+        var verify = postWith("/auth/email/verify", listOf<String>(), "{\"token\":\"" + mailToken("EMAIL_VERIFICATION", email) + "\"}")
+        if (verify.status != 200) {
+            throw "authenticate: verify answered " + verify.status + " " + verify.body
+        }
+        return IdentityTestSession("" + verify.cookie("enois_session"), "" + verify.cookie("enois_refresh"), userId(email), email, password)
+    }
+    // One app per test file: Security.install sets process-wide statics. The whole pipeline is on, origin
+    // enforcement off (the client is not a browser), the signup captcha off unless a test turns it on, the
+    // login throttle at its production defaults, and an encryption key so the second factor works.
+    // The app of this test file (a file is one process), booted on first use.
+    static IdentityTestApp shared(name: String, overrides: Map<String,String>) = IdentityTestApp.sharedWith(name, overrides, (s: HttpServer) -> {
+})
+    static IdentityTestApp sharedWith(name: String, overrides: Map<String,String>, probes: (HttpServer) -> void) {
+        var cur = IdentityTestApp.shared.get(name)
+        if (cur != null) {
+            return cur
+        }
+        var created = IdentityTestApp.boot(name, overrides, probes)
+        IdentityTestApp.shared.put(name, created)
+        return created
+    }
+    static IdentityTestApp boot(name: String, overrides: Map<String,String>) = IdentityTestApp.boot(name, overrides, (s: HttpServer) -> {
+})
+    static IdentityTestApp boot(name: String, overrides: Map<String,String>, probes: (HttpServer) -> void) {
+        var merged = new HashMap<String, String>()
+        merged.put("REDE_ORIGINS_ENFORCE", "false")
+        merged.put("SIGNUP_CAPTCHA_ENABLED", "false")
+        merged.put("REDE_SECURITY_ENCRYPTION_KEY", SecretCipher.generateKeyBase64())
+        merged.put("SPRING_PROFILES_ACTIVE", "test")
+        merged.put("REDE_AUTH_COOKIE_SECURE", "true")
+        // The per-IP ceilings are the production defaults one test file at a time would exhaust; the tests
+        // that assert a limit set their own.
+        merged.put("SIGNUP_RATE_LIMIT", "100000")
+        merged.put("LOGIN_RATE_LIMIT", "100000")
+        merged.put("PASSWORD_RATE_LIMIT", "100000")
+        merged.put("EMAIL_RATE_LIMIT", "100000")
+        merged.put("TWO_FACTOR_RATE_LIMIT", "100000")
+        merged.put("REFRESH_RATE_LIMIT", "100000")
+        merged.put("REDE_AUTH_THROTTLE_SIGNUP_PER_HOUR", "100000")
+        for (var k in overrides.keys()) {
+            merged.put(k, overrides.getOrDefault(k, ""))
+        }
+        SecurityClock.reset()
+        var holder = IdentityWiring()
+        holder.probes = probes
+        var app = TestApp.bootWith(name, merged, (p: Platform) -> holder.wire(p))
+        return IdentityTestApp(app, holder.module(), holder.parts(), holder.mailer(), holder.turnstile(), holder.services())
+    }
+}
+
+class IdentityWiring {
+    (HttpServer) -> void probes = (s: HttpServer) -> {
+    }
+    IdentityModule? built = null
+    SecurityParts? securityParts = null
+    IdentityMailer? capturing = null
+    IdentityStubTurnstile? stub = null
+    SharedServices? sharedServices = null
+    wire(p: Platform) {
+        var shared = SharedServices.create(p)
+        sharedServices = shared
+        var hooks = SecurityHooks.defaults(p.db)
+        var parts = Security.install(p, hooks)
+        var store = IdentityStore(p.db)
+        var seams = IdentitySeams.defaults(p, store)
+        var mailer = IdentityMailer(p.cfg, store, true)
+        var turnstile = IdentityStubTurnstile()
+        seams.mailer = mailer
+        seams.turnstile = turnstile
+        built = IdentityModule.installWith(p, shared, hooks, parts, seams)
+        securityParts = parts
+        capturing = mailer
+        stub = turnstile
+        var register = probes
+        register(p.server)
+    }
+    SharedServices services() {
+        var m = sharedServices
+        if (m == null) {
+            throw "IdentityWiring: not wired"
+        }
+        return m
+    }
+    IdentityModule module() {
+        var m = built
+        if (m == null) {
+            throw "IdentityWiring: not wired"
+        }
+        return m
+    }
+    SecurityParts parts() {
+        var m = securityParts
+        if (m == null) {
+            throw "IdentityWiring: not wired"
+        }
+        return m
+    }
+    IdentityMailer mailer() {
+        var m = capturing
+        if (m == null) {
+            throw "IdentityWiring: not wired"
+        }
+        return m
+    }
+    IdentityStubTurnstile turnstile() {
+        var m = stub
+        if (m == null) {
+            throw "IdentityWiring: not wired"
+        }
+        return m
+    }
+}

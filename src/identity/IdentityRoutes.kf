@@ -1,0 +1,493 @@
+package identity
+
+import kernel.config.*
+import kernel.db.*
+import kernel.error.*
+import kernel.http.*
+import kernel.id.*
+import kernel.idempotency.*
+import kernel.log.*
+import kernel.security.*
+import kernel.time.*
+
+// HTTP adapter of /auth/** (AuthController + AuthCookieAdvice): paths, statuses, JSON, headers and cookies of
+// the Java controller. Tokens travel only in HttpOnly cookies, never in a body.
+class IdentityRoutes {
+    Log log = Log("identity.routes")
+    Config cfg
+    IdentityService service
+    IdentityTwoFactor twoFactor
+    IdentityStore identity
+    IdentityUsers users
+    IdentitySignupChallenge challenge
+    IdentityTurnstile turnstile
+    IdentityIpBlocks ipBlocks
+    IdentitySignupGuard signupGuard
+    IdentityNotifier notifier
+    Idempotency idem
+    SecurityParts parts
+    Bool signupEnabled
+    Bool googleLoginEnabled
+    public constructor(cfg: Config, service: IdentityService, twoFactor: IdentityTwoFactor, identity: IdentityStore, users: IdentityUsers, challenge: IdentitySignupChallenge, turnstile: IdentityTurnstile, ipBlocks: IdentityIpBlocks, signupGuard: IdentitySignupGuard, notifier: IdentityNotifier, idem: Idempotency, parts: SecurityParts) {
+        this.cfg = cfg
+        this.service = service
+        this.twoFactor = twoFactor
+        this.identity = identity
+        this.users = users
+        this.challenge = challenge
+        this.turnstile = turnstile
+        this.ipBlocks = ipBlocks
+        this.signupGuard = signupGuard
+        this.notifier = notifier
+        this.idem = idem
+        this.parts = parts
+        this.signupEnabled = cfg.getBool("REDE_AUTH_SIGNUP_ENABLED", true)
+        this.googleLoginEnabled = cfg.getBool("REDE_OAUTH_GOOGLE_ENABLED", true)
+    }
+    register(server: HttpServer) {
+        var self = this
+        server.get("/auth/config", () -> self.config())
+        server.get("/auth/signup-challenge", () -> json.encode(self.challenge.issue()))
+        server.post("/auth/signup", () -> self.signup())
+        server.post("/auth/email/verify", () -> self.verifyEmail())
+        server.post("/auth/email/resend", () -> self.resendVerification())
+        server.post("/auth/login", () -> self.login())
+        server.post("/auth/2fa/verify", () -> self.verifyTwoFactor())
+        server.post("/auth/2fa/resend", () -> self.resendTwoFactor())
+        server.post("/auth/logout", () -> self.logout())
+        server.get("/auth/me", () -> self.me())
+        server.post("/auth/refresh", () -> self.refresh())
+        server.post("/auth/password/forgot", () -> self.forgotPassword())
+        server.post("/auth/password/reset", () -> self.resetPassword())
+        server.post("/auth/password/change", () -> self.changePassword())
+        server.post("/auth/email/change", () -> self.changeEmail())
+        server.get("/auth/email/change/confirm", () -> self.confirmEmailChange())
+        server.post("/auth/account/delete", () -> self.deleteAccount())
+        server.get("/auth/2fa/status", () -> self.twoFactorStatus())
+        server.post("/auth/2fa/totp/setup", () -> self.startTotpSetup())
+        server.post("/auth/2fa/totp/enable", () -> self.enableTotp())
+        server.post("/auth/2fa/totp/disable", () -> self.disableTotp())
+        server.post("/auth/2fa/email/request", () -> self.requestEmailOtp())
+        server.post("/auth/2fa/email/confirm", () -> self.confirmEmailOtp())
+        server.post("/auth/2fa/email/disable", () -> self.disableEmailOtp())
+        server.post("/auth/admin/two-factor/reset-broken", () -> self.resetBrokenTwoFactor())
+    }
+
+    // ---- request helpers
+    // A body that is missing or malformed is a 400, like HttpMessageNotReadableException.
+    IdentitySignupRequest signupBody() {
+        try {
+            return json.decode<IdentitySignupRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    IdentityLoginRequest loginBody() {
+        try {
+            return json.decode<IdentityLoginRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    IdentityTokenRequest tokenBody() {
+        try {
+            return json.decode<IdentityTokenRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    IdentityEmailRequest emailBody() {
+        try {
+            return json.decode<IdentityEmailRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    IdentityEmailPasswordRequest emailPasswordBody() {
+        try {
+            return json.decode<IdentityEmailPasswordRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    IdentityResetRequest resetBody() {
+        try {
+            return json.decode<IdentityResetRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    IdentityPasswordChangeRequest passwordChangeBody() {
+        try {
+            return json.decode<IdentityPasswordChangeRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    IdentityPasswordRequest passwordBody() {
+        try {
+            return json.decode<IdentityPasswordRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    IdentityTwoFactorVerifyRequest verifyBody() {
+        try {
+            return json.decode<IdentityTwoFactorVerifyRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    IdentityChallengeRequest challengeBody() {
+        try {
+            return json.decode<IdentityChallengeRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    IdentityTotpEnableRequest enableBody() {
+        try {
+            return json.decode<IdentityTotpEnableRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    IdentityCodeRequest codeBody() {
+        try {
+            return json.decode<IdentityCodeRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    // @RequestBody(required = false): no body at all is allowed, a malformed one is not.
+    IdentityPasswordRequest optionalPasswordBody() {
+        if (Req.bodyText().trim().length() == 0) {
+            return IdentityPasswordRequest(null)
+        }
+        return passwordBody()
+    }
+    // X-Session-Token as the Java filter delivers it: the explicit header, else the session cookie.
+    String? token() = Auth.sessionToken()
+    String fingerprint() {
+        var f = Req.headerOrNull("x-device-fingerprint")
+        if (f == null) {
+            return ""
+        }
+        return f
+    }
+    Bool present(value: String?) = value != null && value.trim().length() > 0
+    String lower(value: String?) {
+        if (value == null) {
+            return ""
+        }
+        return value.trim().toLowerCase()
+    }
+    String authScope(email: String?) {
+        if (present(email)) {
+            return "auth:" + lower(email)
+        }
+        return "auth:anonymous"
+    }
+    String session(issued: IdentityIssued) {
+        SessionCookies.issue(issued.token(), issued.expiresAt(), issued.refreshToken(), issued.refreshExpiresAt())
+        return json.encode(IdentitySessionBody(issued.expiresAt(), issued.refreshExpiresAt(), issued.user()))
+    }
+    // ResponseEntity<AuthResponse> after the cookie advice: the body without tokens, the tokens as cookies.
+    String sessionBody(issued: IdentityIssued) = json.encode(IdentitySessionBody(issued.expiresAt(), issued.refreshExpiresAt(), issued.user()))
+
+    // ---- public
+    String config() {
+        var mode = "NONE"
+        var siteKey = IdentityText.none()
+        if (turnstile.isAvailable()) {
+            mode = "TURNSTILE"
+            siteKey = turnstile.siteKey()
+        }
+        else 
+            if (challenge.isEnabled()) {
+                mode = "CHALLENGE"
+            }
+        return json.encode(IdentityConfigBody(mode, siteKey, googleLoginEnabled))
+    }
+    String signup() {
+        var body = signupBody()
+        parts.namedLimiters.require("auth")
+        var ip = Req.clientIp()
+        ipBlocks.requireNotBlocked(ip)
+        // Immediate containment: a name with the attack pattern creates no account; repeated hits pause
+        // signups from the IP.
+        signupGuard.checkSignup(body.name, body.email, ip)
+        // Signups gate: operations may close account creation. Before the captcha and the throttle.
+        if (!signupEnabled) {
+            throw Errors.api(403, "SIGNUP_DISABLED", "Os cadastros estao fechados no momento. Se voce ja tem conta, entre normalmente.")
+        }
+        // Honeypot: bots fill the "website" field humans never see. A fake 201 gives the attacker no hint.
+        if (present(body.website)) {
+            return status(201, json.encode(IdentitySignupBody(lower(body.email), true, true)))
+        }
+        parts.authThrottle.requireSignupAllowed(ip, fingerprint())
+        var scope = authScope(body.email)
+        // A hash without the password: idempotency must not become a fast credential hash in the database.
+        var hash = Idempotency.hash("signup:" + lower(body.email))
+        var self = this
+        return idem.handle(scope, "POST", "/api/auth/signup", hash, 201, () -> self.signupAction(body))
+    }
+    // Inside the idempotent action: repeating the SAME request replays the cached answer without burning a
+    // new captcha (Turnstile and the challenge are single use).
+    String signupAction(body: IdentitySignupRequest) {
+        if (turnstile.isAvailable()) {
+            turnstile.require(body.turnstileToken)
+        }
+        else {
+            challenge.require(body.challengeId, body.challengeAnswer)
+        }
+        return json.encode(service.signup(body.name, "USER", body.email, body.password, body.acceptedTerms, body.birthDate))
+    }
+    String verifyEmail() {
+        var body = tokenBody()
+        parts.namedLimiters.require("auth")
+        return session(service.verifyEmail(body.token))
+    }
+    String resendVerification() {
+        var body = emailBody()
+        parts.namedLimiters.require("email-sending")
+        service.resendVerification(body.email)
+        return status(202, json.encode(IdentityStatusBody(null, "VERIFICATION_SENT")))
+    }
+    String login() {
+        var body = loginBody()
+        parts.namedLimiters.require("auth")
+        var ip = Req.clientIp()
+        ipBlocks.requireNotBlocked(ip)
+        // Login does NOT ask for Turnstile: the invisible widget does not produce a token in time and locked
+        // real people out. The door is closed by a blocked IP, the per-account limit and the attempt lock.
+        var email = lower(body.email)
+        parts.authThrottle.requireLoginAllowed(email, ip)
+        // NO persisted idempotency: the answer holds access/refresh tokens and the body hash would include
+        // the password. Repeating a login is safe: it makes another session.
+        var result = IdentityLoginResult("", null, null, null, null, null)
+        var failure = ""
+        try {
+            result = service.login(body.email, body.password, ip)
+        } catch (String e) {
+            failure = e
+        }
+        if (failure.length() > 0) {
+            if (Errors.isApi(failure) && Errors.parse(failure).status() == 401) {
+                parts.authThrottle.recordLoginFailure(email, ip)
+            }
+            throw failure
+        }
+        parts.authThrottle.clearLogin(email, ip)
+        if (result.kind() == "PASSWORD_EXPIRED") {
+            return json.encode(IdentityPasswordExpiredBody(true, "" + result.resetToken()))
+        }
+        if (result.kind() == "SESSION") {
+            var issued = result.session()
+            if (issued == null) {
+                throw Errors.api(500, "INTERNAL_ERROR", "Erro interno inesperado.")
+            }
+            checkDevice(issued.user().id(), fingerprint())
+            // Tokens go out as HttpOnly cookies, never in the body.
+            return session(issued)
+        }
+        return status(202, json.encode(IdentityLoginTwoFactorBody(true, "" + result.challengeId(), "" + result.method(), "" + result.expiresAt())))
+    }
+    String verifyTwoFactor() {
+        var body = verifyBody()
+        parts.namedLimiters.require("twofa")
+        ipBlocks.requireNotBlocked(Req.clientIp())
+        var issued = service.verifyTwoFactor(body.challengeId, body.code)
+        checkDevice(issued.user().id(), fingerprint())
+        return session(issued)
+    }
+    String resendTwoFactor() {
+        var body = challengeBody()
+        parts.namedLimiters.require("email-sending")
+        service.resendTwoFactorCode(body.challengeId)
+        return status(202, json.encode(IdentityStatusBody(null, "CODE_SENT")))
+    }
+    String logout() {
+        var token = Req.headerOrNull("x-session-token")
+        if (IdentityText.blank(token)) {
+            token = Auth.sessionToken()
+        }
+        var refreshCookie = Auth.cookieValue(SessionCookies.refresh())
+        SessionCookies.clear()
+        // The idempotency scope is a table key: it goes as the HASH of the token, never the live token in
+        // clear (whoever reads the table - backup, DBA - gets no session from it).
+        var credential = token
+        if (!present(token)) {
+            credential = refreshCookie
+        }
+        var scope = "session:anonymous"
+        if (credential != null) {
+            scope = "session:" + Idempotency.hash(credential.trim())
+        }
+        var hash = Idempotency.hash("logout:" + scope)
+        var self = this
+        return idem.handle(scope, "POST", "/api/auth/logout", hash, 200, () -> self.logoutAction(token, refreshCookie))
+    }
+    String logoutAction(token: String?, refreshCookie: String?) {
+        service.logout(token, refreshCookie)
+        return json.encode(IdentityStatusOnly("LOGGED_OUT"))
+    }
+    String me() = json.encode(service.authenticatedUser(token()))
+    String refresh() {
+        var raw = Req.bodyText()
+        var refreshToken = Auth.cookieValue(SessionCookies.refresh())
+        parts.namedLimiters.require("refresh")
+        if (raw.trim().length() > 0) {
+            var body = json.decode<IdentityRefreshRequest>(raw)
+            if (present(body.refreshToken)) {
+                refreshToken = body.refreshToken
+            }
+        }
+        return session(service.refresh(refreshToken))
+    }
+    String forgotPassword() {
+        var body = emailBody()
+        parts.namedLimiters.require("email-sending")
+        var scope = authScope(body.email)
+        var hash = Idempotency.hash("forgot:" + lower(body.email))
+        var self = this
+        return idem.handle(scope, "POST", "/api/auth/password/forgot", hash, 202, () -> self.forgotAction(body.email))
+    }
+    String forgotAction(email: String?) {
+        service.requestReset(email)
+        return json.encode(IdentityStatusOnly("RESET_REQUEST_ACCEPTED"))
+    }
+    String resetPassword() {
+        var body = resetBody()
+        parts.namedLimiters.require("email-sending")
+        var scope = "reset:anonymous"
+        if (!IdentityText.blank(body.token)) {
+            scope = "reset:" + Idempotency.hash(IdentityText.orEmpty(body.token).trim())
+        }
+        // Only the scope (hash of the token), never the new password.
+        var hash = Idempotency.hash(scope)
+        var self = this
+        return idem.handle(scope, "POST", "/api/auth/password/reset", hash, 200, () -> self.resetAction(body))
+    }
+    // The Java idempotent flow serialises the AuthResponse itself (no cookie advice on a String answer):
+    // the body without tokens, and the person signs in again.
+    String resetAction(body: IdentityResetRequest) {
+        var issued = service.reset(body.token, body.password)
+        if (issued != null) {
+            return sessionBody(issued)
+        }
+        return json.encode(IdentityStatusOnly("PASSWORD_RESET_ACCEPTED"))
+    }
+
+    // ---- account (session)
+    String changeEmail() {
+        var body = emailPasswordBody()
+        service.changeEmail(token(), body.email, body.password)
+        return status(202, json.encode(IdentityStatusBody("me", "EMAIL_CONFIRMATION_SENT")))
+    }
+    // The link of the e-mail sent to the NEW address: a navigation of the mail client (no Origin), so it
+    // answers HTML.
+    String confirmEmailChange() {
+        var failure = ""
+        try {
+            service.confirmEmailChange(Req.queryStr("token", ""))
+        } catch (String e) {
+            failure = e
+        }
+        ResponseHeaders.set("Content-Type", "text/html;charset=UTF-8")
+        if (failure.length() > 0) {
+            var code = 500
+            if (Errors.isApi(failure)) {
+                code = Errors.parse(failure).status()
+            }
+            return status(code, emailPage("Não foi possível confirmar", "Link inválido ou expirado."))
+        }
+        return status(200, emailPage("E-mail alterado", "Pronto! O novo endereço já é o da sua conta. Por segurança, entre novamente."))
+    }
+    String emailPage(title: String, message: String) {
+        var t = IdentityMailer.escapeHtml(title)
+        var m = IdentityMailer.escapeHtml(message)
+        return "<!DOCTYPE html><html lang=\"pt-BR\"><head><meta charset=\"UTF-8\">" + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><title>" + t + "</title></head>" + "<body style=\"margin:0;background:#f8f7ff;font-family:system-ui,sans-serif;display:grid;" + "place-items:center;min-height:100vh\"><div style=\"max-width:440px;background:#fff;" + "border-radius:16px;padding:32px;margin:16px;text-align:center\"><h1 style=\"font-size:20px\">" + t + "</h1><p style=\"color:#4b5563\">" + m + "</p>" + "<a href=\"https://enois.ia.br/seguranca\" style=\"color:#6366f1\">Ir para o Énóis</a>" + "</div></body></html>"
+    }
+    String changePassword() {
+        var body = passwordChangeBody()
+        parts.namedLimiters.require("auth")
+        service.changePassword(token(), body.currentPassword, body.newPassword)
+        return json.encode(IdentityStatusBody("me", "PASSWORD_CHANGED"))
+    }
+    String deleteAccount() {
+        var body = passwordBody()
+        service.deleteAccount(token(), body.password)
+        return json.encode(IdentityStatusBody("me", "ACCOUNT_DELETED"))
+    }
+
+    // ---- second factor (management)
+    String twoFactorStatus() = json.encode(twoFactor.status(service.requireUserId(token())))
+    String startTotpSetup() {
+        var body = optionalPasswordBody()
+        parts.namedLimiters.require("twofa")
+        return json.encode(twoFactor.startTotpSetup(service.requireUserId(token()), body.password))
+    }
+    String enableTotp() {
+        var body = enableBody()
+        parts.namedLimiters.require("twofa")
+        var current = token()
+        var codes = twoFactor.enableTotp(service.requireUserId(current), body.code, body.password, current)
+        return json.encode(IdentityBackupCodesBody("TOTP_ENABLED", codes))
+    }
+    String disableTotp() {
+        var body = passwordBody()
+        parts.namedLimiters.require("twofa")
+        var current = token()
+        twoFactor.disableTotp(service.requireUserId(current), body.password, current)
+        return json.encode(IdentityStatusBody("2fa", "TOTP_DISABLED"))
+    }
+    String requestEmailOtp() {
+        parts.namedLimiters.require("email-sending")
+        twoFactor.requestEmailOtpSetup(service.requireUserId(token()))
+        return status(202, json.encode(IdentityStatusBody("2fa", "CODE_SENT")))
+    }
+    String confirmEmailOtp() {
+        var body = codeBody()
+        parts.namedLimiters.require("twofa")
+        var current = token()
+        twoFactor.confirmEmailOtpSetup(service.requireUserId(current), body.code, current)
+        return json.encode(IdentityStatusBody("2fa", "EMAIL_OTP_ENABLED"))
+    }
+    String disableEmailOtp() {
+        var body = passwordBody()
+        parts.namedLimiters.require("twofa")
+        var current = token()
+        twoFactor.disableEmailOtp(service.requireUserId(current), body.password, current)
+        return json.encode(IdentityStatusBody("2fa", "EMAIL_OTP_DISABLED"))
+    }
+    // Emergency reset (23/10): clears the TOTP secrets the infra change left unreadable. Under /auth, so the
+    // /admin interceptor does not cover it: it asks for an admin itself (the users.is_admin flag).
+    String resetBrokenTwoFactor() {
+        var callerId = service.requireUserId(token())
+        if (!users.isAdmin(callerId)) {
+            log.warn("admin_two_factor_reset_denied")
+            throw Errors.api(403, "FORBIDDEN", "Acesso restrito a administradores.")
+        }
+        var reset = twoFactor.resetBrokenTotp()
+        log.warn("admin_two_factor_reset accounts=" + reset)
+        return json.encode(IdentityOk(true))
+    }
+
+    // NewDeviceNotifier: the first time a fingerprint shows up for the account it is remembered and the
+    // person is warned. Never blocks the login: failures are swallowed.
+    checkDevice(userId: String, fingerprint: String) {
+        if (fingerprint.trim().length() == 0) {
+            return
+        }
+        try {
+            if (identity.deviceKnown(userId, fingerprint)) {
+                return
+            }
+            identity.saveDevice(Ids.prefixed("device_"), userId, fingerprint, Time.nowIso())
+            notifier.notifySecurity(userId, "Novo dispositivo detectado", "Um novo dispositivo acessou sua conta. Se nao foi voce, troque sua senha imediatamente.", "/configuracoes/seguranca", "Ver seguranca")
+        } catch (String e) {
+            log.debug("new_device_check_failed")
+        }
+    }
+}
