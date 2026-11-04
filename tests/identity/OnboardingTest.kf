@@ -1,0 +1,186 @@
+import identity.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+
+IdentityTestApp ctx() = IdentityTestApp.shared("onboarding", mapOf())
+
+Bool completed(t: IdentityTestApp, token: String) {
+    var me = t.getWithToken("/auth/me", token)
+    Check.status(me, 200)
+    return JsonPath.raw(me.body, "onboardingCompleted") == "true"
+}
+
+TestResponse complete(t: IdentityTestApp, token: String, body: String) = t.postWithToken("/me/onboarding/complete", token, body)
+
+Long countOf(t: IdentityTestApp, sql: String, a: String) = t.db().queryLong(sql, DbParams().bindStr(a))
+
+String listOfIds(prefix: String, n: Int) {
+    var out = ""
+    var i = 0
+    while (i < n) {
+        if (i > 0) {
+            out = out + ","
+        }
+        out = out + "\"" + prefix + "-" + i + "\""
+        i = i + 1
+    }
+    return "[" + out + "]"
+}
+
+seedCommunity(t: IdentityTestApp, id: String, topic: String, owner: String) {
+    t.db().execute("insert into communities (id, name, description, topic, created_by, created_at, updated_at) values (?, ?, 'd', ?, ?, ?, ?)", DbParams().bindStr(id).bindStr("Comunidade " + id).bindStr(topic).bindStr(owner).bindInstant("2026-01-01T00:00:00Z").bindInstant("2026-01-01T00:00:00Z"))
+}
+
+seedMember(t: IdentityTestApp, communityId: String, userId: String) {
+    t.db().execute("insert into community_members (community_id, user_id, role, joined_at) values (?, ?, 'MEMBER', ?)", DbParams().bindStr(communityId).bindStr(userId).bindInstant("2026-01-01T00:00:00Z"))
+}
+
+seedGroup(t: IdentityTestApp, id: String, joinMode: String, topic: String, owner: String) {
+    t.db().execute("insert into groups (id, slug, name, topic, join_mode, status, owner_id, created_at, updated_at) values (?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)", DbParams().bindStr(id).bindStr("slug-" + id).bindStr("Grupo " + id).bindStr(topic).bindStr(joinMode).bindStr(owner).bindInstant("2026-01-01T00:00:00Z").bindInstant("2026-01-01T00:00:00Z"))
+}
+
+test "newAccountSeesOnboardingAndCompletingItIsIdempotent (OnboardingFlowTests)" {
+    var t = ctx()
+    var user = t.authenticate("onb_new")
+    Check.isTrue("starts pending", !completed(t, user.token))
+    var body = "{\"topics\":[\"pets\"],\"skills\":[\"onb-skill-a\"]}"
+    var first = complete(t, user.token, body)
+    Check.status(first, 200)
+    Check.jsonEq(first, "onboardingCompleted", "true")
+    Check.status(complete(t, user.token, body), 200)
+    Check.isTrue("completed", completed(t, user.token))
+    Check.eqInt("one skill row", 1, countOf(t, "select count(*) from user_skills where user_id = ? and skill = 'onb-skill-a'", user.userId) as Int)
+    Check.eqStr("liked", "PETS", t.db().queryOne("select liked_topics from user_preferences where user_id = ?", DbParams().bindStr(user.userId)).getStr("liked_topics"))
+}
+
+test "skipMarksCompletedWithoutChanges (OnboardingFlowTests)" {
+    var t = ctx()
+    var user = t.authenticate("onb_skip")
+    var res = t.postWithToken("/me/onboarding/skip", user.token, "")
+    Check.status(res, 200)
+    Check.jsonEq(res, "onboardingCompleted", "true")
+    Check.isTrue("completed", completed(t, user.token))
+    Check.eqInt("no preferences row", 0, countOf(t, "select count(*) from user_preferences where user_id = ?", user.userId) as Int)
+}
+
+test "accountsBackfilledAsCompletedSeeOnboardingAgainButRealCompletionsStay (OnboardingFlowTests)" {
+    var t = ctx()
+    var existing = t.authenticate("onb_old")
+    t.db().execute("update users set onboarding_completed_at = created_at where id = ?", DbParams().bindStr(existing.userId))
+    Check.isTrue("backfilled counts as completed", completed(t, existing.token))
+    var skipped = t.authenticate("onb_done")
+    Check.status(t.postWithToken("/me/onboarding/skip", skipped.token, ""), 200)
+    // The statement of V224__onboarding_for_existing_accounts.sql.
+    t.db().execute("update users set onboarding_completed_at = null where onboarding_completed_at = created_at", DbParams())
+    Check.isTrue("backfill sees it again", !completed(t, existing.token))
+    Check.isTrue("real completion stays", completed(t, skipped.token))
+}
+
+test "completeReportsWhatIsAlreadyInPlaceAndNeverJoinsApprovalGroups (OnboardingFlowTests)" {
+    var t = ctx()
+    var owner = t.authenticate("onb_owner")
+    var user = t.authenticate("onb_joiner")
+    seedCommunity(t, "onb-c1", "PETS", owner.userId)
+    seedMember(t, "onb-c1", user.userId)
+    seedGroup(t, "onb-g-open", "OPEN", "PETS", owner.userId)
+    seedGroup(t, "onb-g-appr", "APPROVAL", "PETS", owner.userId)
+    t.db().execute("insert into group_members (id, group_id, user_id, role, joined_at) values ('onb-gm1', 'onb-g-open', ?, 'MEMBER', ?)", DbParams().bindStr(user.userId).bindInstant("2026-01-01T00:00:00Z"))
+    var body = "{\"communityIds\":[\"onb-c1\",\"onb-c-unknown\"],\"groupIds\":[\"onb-g-open\",\"onb-g-appr\",\"onb-g-unknown\"]}"
+    var res = complete(t, user.token, body)
+    Check.status(res, 200)
+    Check.eqInt("communities", 1, JsonPath.size(res.body, "joinedCommunityIds"))
+    Check.jsonEq(res, "joinedCommunityIds.0", "onb-c1")
+    Check.eqInt("groups", 1, JsonPath.size(res.body, "joinedGroupIds"))
+    Check.jsonEq(res, "joinedGroupIds.0", "onb-g-open")
+    var again = complete(t, user.token, body)
+    Check.jsonEq(again, "joinedCommunityIds.0", "onb-c1")
+    Check.jsonEq(again, "joinedGroupIds.0", "onb-g-open")
+    Check.eqInt("approval group untouched", 0, countOf(t, "select count(*) from group_members where group_id = 'onb-g-appr' and user_id = ?", user.userId) as Int)
+}
+
+test "connectionRequestsSkipInvalidTargets (OnboardingFlowTests)" {
+    var t = ctx()
+    var user = t.authenticate("onb_conn")
+    var friend = t.authenticate("onb_friend")
+    t.db().execute("insert into user_connections (requester_user_id, receiver_user_id, status, created_at) values (?, ?, 'PENDING', ?)", DbParams().bindStr(user.userId).bindStr(friend.userId).bindInstant("2026-01-01T00:00:00Z"))
+    var body = "{\"connectUserIds\":[\"" + friend.userId + "\",\"" + user.userId + "\",\"user_unknown_x\"]}"
+    var res = complete(t, user.token, body)
+    Check.status(res, 200)
+    Check.eqInt("only the request already in place", 1, JsonPath.size(res.body, "requestedUserIds"))
+    Check.jsonEq(res, "requestedUserIds.0", friend.userId)
+    Check.eqInt("not duplicated", 1, countOf(t, "select count(*) from user_connections where requester_user_id = ?", user.userId) as Int)
+}
+
+test "capsAreEnforced (OnboardingFlowTests)" {
+    var t = ctx()
+    var user = t.authenticate("onb_caps")
+    var r1 = complete(t, user.token, "{\"communityIds\":" + listOfIds("c", 7) + "}")
+    Check.apiError(r1, 400, "TOO_MANY_COMMUNITIES")
+    Check.apiError(complete(t, user.token, "{\"groupIds\":" + listOfIds("g", 7) + "}"), 400, "TOO_MANY_GROUPS")
+    Check.apiError(complete(t, user.token, "{\"connectUserIds\":" + listOfIds("u", 9) + "}"), 400, "TOO_MANY_CONNECTIONS")
+    Check.apiError(complete(t, user.token, "{\"skills\":" + listOfIds("s", 21) + "}"), 400, "TOO_MANY_SKILLS")
+    Check.apiError(complete(t, user.token, "{\"topics\":[\"NOT_A_TOPIC\"]}"), 400, "INVALID_ASSUNTO")
+    Check.apiError(complete(t, user.token, "{\"skills\":[\"" + "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" + "\"]}"), 400, "SKILL_TOO_LONG")
+    Check.isTrue("a rejected call changes nothing", !completed(t, user.token))
+}
+
+test "starterPackExcludesJoinedConnectedBlockedMutedAndSelf (OnboardingFlowTests)" {
+    var t = ctx()
+    var viewer = t.authenticate("onb_viewer")
+    var match = t.authenticate("onb_match")
+    var pending = t.authenticate("onb_pending")
+    var blocker = t.authenticate("onb_blk")
+    var muted = t.authenticate("onb_mute")
+    var skill = "onb-pack-skill"
+    for (var person in listOf(viewer, match, pending, blocker, muted)) {
+        Check.status(complete(t, person.token, "{\"skills\":[\"" + skill + "\"]}"), 200)
+    }
+    t.db().execute("insert into user_connections (requester_user_id, receiver_user_id, status, created_at) values (?, ?, 'PENDING', ?)", DbParams().bindStr(viewer.userId).bindStr(pending.userId).bindInstant("2026-01-01T00:00:00Z"))
+    t.db().execute("insert into user_blocks (blocker_id, blocked_id, created_at) values (?, ?, ?)", DbParams().bindStr(blocker.userId).bindStr(viewer.userId).bindInstant("2026-01-01T00:00:00Z"))
+    t.db().execute("insert into user_mutes (muter_id, muted_id, created_at) values (?, ?, ?)", DbParams().bindStr(viewer.userId).bindStr(muted.userId).bindInstant("2026-01-01T00:00:00Z"))
+    seedCommunity(t, "onb-pack-joined", "RELIGIAO", match.userId)
+    seedCommunity(t, "onb-pack-fresh", "RELIGIAO", match.userId)
+    seedMember(t, "onb-pack-joined", viewer.userId)
+    seedGroup(t, "onb-pack-open", "OPEN", "RELIGIAO", match.userId)
+    seedGroup(t, "onb-pack-appr", "APPROVAL", "RELIGIAO", match.userId)
+    var res = t.getWithToken("/me/onboarding/starter-pack?topics=RELIGIAO&skills=" + skill.toUpperCase(), viewer.token)
+    Check.status(res, 200)
+    var communities = JsonPath.raw(res.body, "communities") as String
+    var groups = JsonPath.raw(res.body, "groups") as String
+    var people = JsonPath.raw(res.body, "people") as String
+    Check.isTrue("fresh community", communities.indexOf("onb-pack-fresh") >= 0)
+    Check.isTrue("joined community hidden", communities.indexOf("onb-pack-joined") < 0)
+    Check.isTrue("open group", groups.indexOf("onb-pack-open") >= 0)
+    Check.isTrue("approval group hidden", groups.indexOf("onb-pack-appr") < 0)
+    Check.isTrue("match listed", people.indexOf(match.userId) >= 0)
+    Check.isTrue("self hidden", people.indexOf(viewer.userId) < 0)
+    Check.isTrue("pending hidden", people.indexOf(pending.userId) < 0)
+    Check.isTrue("blocker hidden", people.indexOf(blocker.userId) < 0)
+    Check.isTrue("muted hidden", people.indexOf(muted.userId) < 0)
+    Check.isTrue("no email leaked", people.indexOf("\"email\"") < 0)
+    Check.isTrue("username present", people.indexOf("\"username\"") >= 0)
+}
+
+test "minorsAreNeverSuggestedStrangers (OnboardingFlowTests adult rule)" {
+    var t = ctx()
+    var adult = t.authenticate("onb_adult")
+    var minor = t.authenticate("onb_minor")
+    t.db().execute("update users set birth_date = ? where id = ?", DbParams().bindDate("2014-01-01").bindStr(minor.userId))
+    var forMinor = t.getWithToken("/me/onboarding/starter-pack", minor.token)
+    Check.status(forMinor, 200)
+    Check.eqInt("no people for a minor", 0, JsonPath.size(forMinor.body, "people"))
+    var forAdult = t.getWithToken("/me/onboarding/starter-pack", adult.token)
+    Check.isTrue("a minor is never suggested", (JsonPath.raw(forAdult.body, "people") as String).indexOf(minor.userId) < 0)
+}
+
+test "anonymousGets401 (OnboardingFlowTests)" {
+    var t = ctx()
+    Check.apiError(t.app.client.get("/me/onboarding/starter-pack"), 401, "UNAUTHENTICATED")
+    Check.apiError(t.post("/me/onboarding/complete", "{}"), 401, "UNAUTHENTICATED")
+    Check.apiError(t.post("/me/onboarding/skip", ""), 401, "UNAUTHENTICATED")
+}
+
+test "zz shutdown onboarding" {
+    ctx().stop()
+}

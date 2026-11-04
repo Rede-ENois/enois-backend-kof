@@ -1,0 +1,59 @@
+package onboarding
+
+import identity.*
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+
+// /me/onboarding/** (OnboardingController). Whether onboarding is still due comes in onboardingCompleted of
+// /auth/me; these routes serve the flow itself. Both writes are idempotent by design.
+class OnboardingRoutes {
+    OnboardingService service
+    public constructor(service: OnboardingService) {
+        this.service = service
+    }
+    register(server: HttpServer) {
+        var self = this
+        server.get("/me/onboarding/starter-pack", () -> self.starterPack())
+        server.post("/me/onboarding/complete", () -> self.complete())
+        server.post("/me/onboarding/skip", () -> self.skip())
+    }
+    // Spring binds List<String> from repeated params and from a comma-separated value.
+    static List<String> queryList(name: String) {
+        var out = listOf<String>()
+        for (var pair in Req.rawQuery().split("&")) {
+            var eq = pair.indexOf("=")
+            if (eq < 0) {
+                continue
+            }
+            if (UrlCodec.decode(pair.substring(0, eq)) != name) {
+                continue
+            }
+            for (var part in UrlCodec.decode(pair.substring(eq + 1)).split(",")) {
+                out.add(part)
+            }
+        }
+        return out
+    }
+    String starterPack() {
+        var userId = Auth.requireUser()
+        return json.encode(service.starterPack(userId, OnboardingRoutes.queryList("topics"), OnboardingRoutes.queryList("skills")))
+    }
+    String complete() {
+        var userId = Auth.requireUser()
+        var text = Req.bodyText()
+        var command = OnboardingCompleteRequest(null, null, null, null, null)
+        if (text.trim().length() > 0) {
+            try {
+                command = json.decode<OnboardingCompleteRequest>(text)
+            } catch (String e) {
+                throw Errors.badRequest()
+            }
+        }
+        return json.encode(service.complete(userId, command))
+    }
+    String skip() {
+        return json.encode(service.skip(Auth.requireUser()))
+    }
+}

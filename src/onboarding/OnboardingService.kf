@@ -1,0 +1,186 @@
+package onboarding
+
+import identity.*
+import kernel.db.*
+import kernel.error.*
+import kernel.time.*
+import age.*
+
+// First-run onboarding: suggests where to start (starter pack) and applies what the person picked.
+// Every choice goes through OnboardingActions (the seam to the services that own the manual action), so a
+// group that needs approval is never joined from here. The caps keep it a human choice in a short flow.
+// complete() is deliberately not one transaction: each join/request commits on its own and a retry skips
+// what is already in place, so the call is idempotent and one invalid id never rolls back the rest.
+class OnboardingService {
+    static Int maxCommunities = 6
+    static Int maxGroups = 6
+    static Int maxPeople = 8
+    static Int maxSkills = 20
+    static Int maxSkillLength = 60
+    static Int maxDescription = 160
+    Db store
+    OnboardingStore reader
+    OnboardingActions actions
+    AgePolicyReader age
+    public constructor(store: Db, reader: OnboardingStore, actions: OnboardingActions, age: AgePolicyReader) {
+        this.store = store
+        this.reader = reader
+        this.actions = actions
+        this.age = age
+    }
+    // pending-port: preferences owns ContentTaxonomy.TOPICS (copied here until that domain lands).
+    static List<String> knownTopics() = listOf("TECNOLOGIA", "ENGENHARIA", "DESIGN", "PRODUTO", "LIDERANCA", "CARREIRA", "FREELANCE", "OUTROS", "GAMES", "ART", "MUSIC", "EDUCACAO", "CIENCIA", "EMPREENDER", "FINANCAS", "MARKETING", "RH", "DADOS", "FUN", "QUALIDADE_VIDA", "SAUDE", "VIAGEM", "COMIDA", "ESPORTES", "CINEMA", "LIVROS", "FOTOGRAFIA", "CASA", "PETS", "PARENTALIDADE", "RELACIONAMENTOS", "MODA", "POLITICA", "RELIGIAO")
+
+    OnboardingStarterPack starterPack(userId: String, rawTopics: List<String>, rawSkills: List<String>) {
+        var topics = OnboardingService.topics(rawTopics)
+        var skills = listOf<String>()
+        for (var s in OnboardingService.skills(rawSkills)) {
+            skills.add(s.toLowerCase())
+        }
+        var communities = reader.communities(userId, topics, OnboardingService.maxCommunities)
+        var cards = listOf<OnboardingCommunityCard>()
+        for (var c in communities) {
+            cards.add(OnboardingCommunityCard(c.id, c.name, OnboardingService.shorten(c.description), c.topic, c.avatar, c.memberCount))
+        }
+        var groups = reader.openGroups(userId, topics, OnboardingService.maxGroups)
+        var groupCards = listOf<OnboardingGroupCard>()
+        for (var g in groups) {
+            groupCards.add(OnboardingGroupCard(g.id, g.slug, g.name, OnboardingService.shorten(g.description), g.topic, g.avatar, g.memberCount))
+        }
+        return OnboardingStarterPack(cards, groupCards, this.people(userId, topics, skills))
+    }
+    // People are suggested only between adults (ECA Digital): a minor gets no strangers suggested and is
+    // never suggested to anyone. The manual connection flow is unchanged.
+    List<OnboardingPersonCard> people(userId: String, topics: List<String>, skills: List<String>) {
+        var out = listOf<OnboardingPersonCard>()
+        if (!reader.userExists(userId)) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        if (age.isMinor(userId)) {
+            return out
+        }
+        var today = IdentityDates.today()
+        var monthDay = today.substring(4)
+        if (monthDay == "-02-29") {
+            monthDay = "-02-28"
+        }
+        var cutoff = (today.substring(0, 4).toInt() - 18) + monthDay
+        var ids = reader.people(userId, topics, skills, cutoff, Time.nowIso(), OnboardingService.maxPeople)
+        for (var id in ids) {
+            var card = reader.person(id)
+            if (card != null) {
+                out.add(card)
+            }
+        }
+        return out
+    }
+    OnboardingResult complete(userId: String, command: OnboardingCompleteRequest) {
+        var topics = OnboardingService.topics(command.topics)
+        var skills = OnboardingService.skills(command.skills)
+        var communityIds = OnboardingService.ids(command.communityIds, OnboardingService.maxCommunities, "COMMUNITIES")
+        var groupIds = OnboardingService.ids(command.groupIds, OnboardingService.maxGroups, "GROUPS")
+        var connectIds = OnboardingService.ids(command.connectUserIds, OnboardingService.maxPeople, "CONNECTIONS")
+        if (!reader.userExists(userId)) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        actions.mergeLikedTopics(userId, topics, Time.nowIso())
+        actions.mergeSkills(userId, skills)
+        var joinedCommunities = listOf<String>()
+        for (var id in communityIds) {
+            if (actions.joinCommunity(userId, id)) {
+                joinedCommunities.add(id)
+            }
+        }
+        var joinedGroups = listOf<String>()
+        for (var id in groupIds) {
+            if (actions.joinOpenGroup(userId, id)) {
+                joinedGroups.add(id)
+            }
+        }
+        var requested = listOf<String>()
+        for (var id in connectIds) {
+            if (actions.requestConnection(userId, id)) {
+                requested.add(id)
+            }
+        }
+        this.markCompleted(userId)
+        return OnboardingResult(true, joinedCommunities, joinedGroups, requested)
+    }
+    OnboardingResult skip(userId: String) {
+        if (!reader.userExists(userId)) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        this.markCompleted(userId)
+        return OnboardingResult(true, listOf(), listOf(), listOf())
+    }
+    markCompleted(userId: String) {
+        reader.markCompleted(userId, Time.nowIso())
+    }
+    static List<String> topics(raw: List<String>?) {
+        var out = listOf<String>()
+        if (raw == null) {
+            return out
+        }
+        var known = OnboardingService.knownTopics()
+        for (var value in raw) {
+            var topic = value.trim().toUpperCase()
+            if (topic.length() == 0) {
+                continue
+            }
+            if (!known.contains(topic)) {
+                throw Errors.api(400, "INVALID_ASSUNTO", "Valor desconhecido para assunto: " + topic)
+            }
+            if (!out.contains(topic)) {
+                out.add(topic)
+            }
+        }
+        return out
+    }
+    static List<String> skills(raw: List<String>?) {
+        var out = listOf<String>()
+        if (raw == null) {
+            return out
+        }
+        for (var value in raw) {
+            var skill = value.trim()
+            if (skill.length() == 0) {
+                continue
+            }
+            if (skill.length() > OnboardingService.maxSkillLength) {
+                throw Errors.api(400, "SKILL_TOO_LONG", "Cada habilidade pode ter ate 60 caracteres.")
+            }
+            if (!out.contains(skill)) {
+                out.add(skill)
+            }
+        }
+        if (out.size() > OnboardingService.maxSkills) {
+            throw Errors.api(400, "TOO_MANY_SKILLS", "Escolha ate 20 habilidades.")
+        }
+        return out
+    }
+    static List<String> ids(raw: List<String>?, max: Int, kind: String) {
+        var out = listOf<String>()
+        if (raw == null) {
+            return out
+        }
+        for (var value in raw) {
+            var id = value.trim()
+            if (id.length() > 0 && !out.contains(id)) {
+                out.add(id)
+            }
+        }
+        if (out.size() > max) {
+            throw Errors.api(400, "TOO_MANY_" + kind, "Escolha ate " + max + " itens de cada vez.")
+        }
+        return out
+    }
+    static String? shorten(text: String?) {
+        if (text == null) {
+            return null
+        }
+        if (text.length() <= OnboardingService.maxDescription) {
+            return text
+        }
+        return text.substring(0, OnboardingService.maxDescription - 3).trim() + "..."
+    }
+}

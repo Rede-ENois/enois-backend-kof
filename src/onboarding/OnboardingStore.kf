@@ -1,0 +1,99 @@
+package onboarding
+
+import kernel.db.*
+
+// The ranking lives in SQL: "matches first, then popular" is one `order by`, so the fallback for a person with
+// no topic is the same query (an empty list becomes a value no row has, since `in ()` is not valid SQL).
+// pending-port: communities / groups / network / preferences own the tables; these are the reads
+// JdbcStarterPackAdapter does.
+class OnboardingStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String marks(values: List<String>) {
+        var out = ""
+        var i = 0
+        while (i < values.size()) {
+            if (i > 0) {
+                out = out + ", "
+            }
+            out = out + "?"
+            i = i + 1
+        }
+        return out
+    }
+    static List<String> orNone(values: List<String>) {
+        if (values.size() == 0) {
+            return listOf("")
+        }
+        return values
+    }
+    static DbParams addAll(p: DbParams, values: List<String>) {
+        for (var v in values) {
+            p.bindStr(v)
+        }
+        return p
+    }
+    List<OnboardingCommunityCard> communities(userId: String, topics: List<String>, limit: Int) {
+        var t = OnboardingStore.orNone(topics)
+        var p = DbParams().bindStr(userId)
+        OnboardingStore.addAll(p, t)
+        p.bindInt(limit)
+        var out = listOf<OnboardingCommunityCard>()
+        for (var r in store.queryList("select c.id, c.name, c.description, c.topic, c.avatar, count(m.user_id) as member_count from communities c left join community_members m on m.community_id = c.id where c.id not in (select community_id from community_members where user_id = ?) group by c.id, c.name, c.description, c.topic, c.avatar order by case when c.topic in (" + OnboardingStore.marks(t) + ") then 0 else 1 end, member_count desc, c.id limit ?", p)) {
+            out.add(OnboardingCommunityCard(r.getStr("id"), r.getStr("name"), r.getStrOrNull("description"), r.getStrOrNull("topic"), r.getStrOrNull("avatar"), r.getInt("member_count")))
+        }
+        return out
+    }
+    List<OnboardingGroupCard> openGroups(userId: String, topics: List<String>, limit: Int) {
+        var t = OnboardingStore.orNone(topics)
+        var p = DbParams().bindStr(userId)
+        OnboardingStore.addAll(p, t)
+        p.bindInt(limit)
+        var out = listOf<OnboardingGroupCard>()
+        for (var r in store.queryList("select g.id, g.slug, g.name, g.description, g.topic, g.avatar, g.member_count from groups g where g.status = 'ACTIVE' and g.join_mode = 'OPEN' and g.id not in (select group_id from group_members where user_id = ?) order by case when g.topic in (" + OnboardingStore.marks(t) + ") then 0 else 1 end, g.member_count desc, g.id limit ?", p)) {
+            out.add(OnboardingGroupCard(r.getStr("id"), r.getStr("slug"), r.getStr("name"), r.getStrOrNull("description"), r.getStrOrNull("topic"), r.getStrOrNull("avatar"), r.getInt("member_count")))
+        }
+        return out
+    }
+    // Ids of active, verified, adult accounts with no connection, pending request or block with the user, and not
+    // muted by the user: most shared skills and liked topics first, then by reputation.
+    List<String> people(userId: String, topics: List<String>, skills: List<String>, adultBornOnOrBefore: String, now: String, limit: Int) {
+        var s = OnboardingStore.orNone(skills)
+        var topicScore = "0"
+        for (var topic in topics) {
+            topicScore = topicScore + " + case when concat(',', coalesce(p.liked_topics, ''), ',') like ? then 1 else 0 end"
+        }
+        var p = DbParams()
+        // Placeholders in SQL order: the score of the order by comes last, the where parts first.
+        p.bindStr(userId).bindDate(adultBornOnOrBefore).bindStr(userId).bindStr(userId).bindStr(userId).bindStr(userId).bindStr(userId).bindInstant(now)
+        OnboardingStore.addAll(p, s)
+        for (var topic in topics) {
+            p.bindStr("%," + topic + ",%")
+        }
+        p.bindInt(limit)
+        var ids = listOf<String>()
+        for (var r in store.queryList("select u.id from users u left join user_preferences p on p.user_id = u.id where u.id <> ? and u.email_verified_at is not null and (u.birth_date is null or u.birth_date <= ?) and exists (select 1 from user_credentials uc where uc.user_id = u.id) and not exists (select 1 from user_sanctions sa where sa.user_id = u.id and sa.status = 'ACTIVE' and sa.type in ('SUSPENDED', 'BAN', 'PERMABAN')) and not exists (select 1 from user_connections uc2 where uc2.status in ('PENDING', 'ACCEPTED') and ((uc2.requester_user_id = ? and uc2.receiver_user_id = u.id) or (uc2.receiver_user_id = ? and uc2.requester_user_id = u.id))) and not exists (select 1 from user_blocks b where (b.blocker_id = ? and b.blocked_id = u.id) or (b.blocker_id = u.id and b.blocked_id = ?)) and not exists (select 1 from user_mutes mu where mu.muter_id = ? and mu.muted_id = u.id and (mu.expires_at is null or mu.expires_at > ?)) order by (select count(*) from user_skills k where k.user_id = u.id and lower(k.skill) in (" + OnboardingStore.marks(s) + ")) + " + topicScore + " desc, u.reputation desc, u.created_at desc limit ?", p)) {
+            ids.add(r.getStr("id"))
+        }
+        return ids
+    }
+    OnboardingPersonCard? person(id: String) {
+        var r = store.queryOptional("select id, username, name, social_name, headline, avatar from users where id = ?", DbParams().bindStr(id))
+        if (r == null) {
+            return null
+        }
+        var name = r.getStr("name")
+        var social = r.getStrOrNull("social_name")
+        if (social != null && social.trim().length() > 0) {
+            name = social
+        }
+        return OnboardingPersonCard(r.getStr("id"), r.getStr("username"), name, r.getStrOrNull("headline"), r.getStrOrNull("avatar"))
+    }
+    // First marking wins (repeating it does not change the instant).
+    markCompleted(userId: String, now: String) {
+        store.execute("update users set onboarding_completed_at = ? where id = ? and onboarding_completed_at is null", DbParams().bindInstant(now).bindStr(userId))
+    }
+    Bool userExists(userId: String) = store.queryLong("select count(*) from users where id = ?", DbParams().bindStr(userId)) > 0L
+}

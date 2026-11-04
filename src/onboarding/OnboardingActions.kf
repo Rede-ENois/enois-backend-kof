@@ -1,0 +1,130 @@
+package onboarding
+
+import identity.*
+import kernel.db.*
+import kernel.error.*
+import kernel.log.*
+
+// What "complete" does for each choice. Every choice must go through the same service as the manual action
+// (join a community, join a group, ask to connect, edit the liked topics and skills), so the same rules
+// apply. Those services belong to other domains, so each action is a seam with a default:
+//   - mergeLikedTopics, mergeSkills: pending-port: preferences / profile. The default merges into
+//     user_preferences.liked_topics and user_skills with the validation the Java services share (known topic,
+//     a blocked topic is a 409, skills are never duplicated), without their other side effects.
+//   - joinCommunity, joinOpenGroup, requestConnection: pending-port: communities / groups / network. The
+//     default only recognises what is already in place (membership read from the tables) and skips the rest
+//     with a log line, so no join, request, counter or notification is half done here.
+class OnboardingActions {
+    Log log = Log("onboarding.actions")
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // Adds to "O que quero ver" keeping what was there; a topic the person blocked is a 409 CONFLICTING_PREFERENCE.
+    mergeLikedTopics(userId: String, topics: List<String>, now: String) {
+        if (topics.size() == 0) {
+            return
+        }
+        var row = store.queryOptional("select liked_topics, blocked_topics from user_preferences where user_id = ?", DbParams().bindStr(userId))
+        var liked = listOf<String>()
+        var blocked = listOf<String>()
+        if (row != null) {
+            liked = OnboardingActions.parse(row.getStrOrNull("liked_topics"))
+            blocked = OnboardingActions.parse(row.getStrOrNull("blocked_topics"))
+        }
+        var merged = listOf<String>()
+        for (var t in liked) {
+            merged.add(t)
+        }
+        for (var t in topics) {
+            if (!merged.contains(t)) {
+                merged.add(t)
+            }
+        }
+        if (merged.size() == liked.size()) {
+            return
+        }
+        for (var t in merged) {
+            if (blocked.contains(t)) {
+                throw Errors.api(409, "CONFLICTING_PREFERENCE", "O assunto " + t + " esta em \"nao quero ver\". Tire de la antes de curtir.")
+            }
+        }
+        var text = ""
+        for (var t in merged) {
+            if (text.length() > 0) {
+                text = text + ","
+            }
+            text = text + t
+        }
+        if (row == null) {
+            store.execute("insert into user_preferences (user_id, liked_topics, updated_at) values (?, ?, ?)", DbParams().bindStr(userId).bindStr(text).bindInstant(now))
+        }
+        else {
+            store.execute("update user_preferences set liked_topics = ?, updated_at = ? where user_id = ?", DbParams().bindStr(text).bindInstant(now).bindStr(userId))
+        }
+    }
+    static List<String> parse(raw: String?) {
+        var out = listOf<String>()
+        if (raw == null) {
+            return out
+        }
+        for (var part in raw.split(",")) {
+            var t = part.trim()
+            if (t.length() > 0) {
+                out.add(t)
+            }
+        }
+        return out
+    }
+    // Adds skills keeping the existing ones (case-insensitive duplicates are not added).
+    mergeSkills(userId: String, skills: List<String>) {
+        if (skills.size() == 0) {
+            return
+        }
+        var known = listOf<String>()
+        for (var r in store.queryList("select skill from user_skills where user_id = ?", DbParams().bindStr(userId))) {
+            known.add(r.getStr("skill").toLowerCase())
+        }
+        for (var s in skills) {
+            if (!known.contains(s.toLowerCase())) {
+                store.execute("insert into user_skills (user_id, skill) values (?, ?)", DbParams().bindStr(userId).bindStr(s))
+                known.add(s.toLowerCase())
+            }
+        }
+    }
+    // True when the person is in the community afterwards (already, or joined now).
+    Bool joinCommunity(userId: String, communityId: String) {
+        if (store.queryLong("select count(*) from community_members where community_id = ? and user_id = ?", DbParams().bindStr(communityId).bindStr(userId)) > 0L) {
+            return true
+        }
+        log.info("onboarding_join_community_pending_port")
+        return false
+    }
+    // Only groups with open entry: a group that needs approval is never joined (nor requested) from here.
+    Bool joinOpenGroup(userId: String, groupId: String) {
+        var row = store.queryOptional("select id, join_mode from groups where id = ?", DbParams().bindStr(groupId))
+        if (row == null) {
+            return false
+        }
+        if (row.getStr("join_mode") != "OPEN") {
+            return false
+        }
+        if (store.queryLong("select count(*) from group_members where group_id = ? and user_id = ?", DbParams().bindStr(groupId).bindStr(userId)) > 0L) {
+            return true
+        }
+        log.info("onboarding_join_group_pending_port")
+        return false
+    }
+    // Self, blocked and unknown accounts are skipped; a request already in place counts as done.
+    Bool requestConnection(userId: String, targetId: String) {
+        if (targetId == userId) {
+            return false
+        }
+        var exists = store.queryLong("select count(*) from user_connections where status in ('PENDING', 'ACCEPTED') and ((requester_user_id = ? and receiver_user_id = ?) or (requester_user_id = ? and receiver_user_id = ?))", DbParams().bindStr(userId).bindStr(targetId).bindStr(targetId).bindStr(userId)) > 0L
+        if (exists) {
+            return true
+        }
+        log.info("onboarding_connection_request_pending_port")
+        return false
+    }
+}
