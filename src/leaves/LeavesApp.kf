@@ -1,6 +1,8 @@
 package leaves
 
+import blog.*
 import java.util.HashMap
+import ops.*
 import kernel.*
 import kernel.security.*
 import kernel.testkit.*
@@ -20,6 +22,9 @@ class LeavesApp {
     static SecurityHooks? hooksSlot = null
     // A test that wants a fake GitHub gateway sets it before booting.
     static SuggestionIssueGateway? suggestionGatewaySlot = null
+    // A blog test sets these before booting to stand in for the feed and notifications domains.
+    static BlogFeedPointers? blogFeedSlot = null
+    static BlogNotifier? blogNotifierSlot = null
     // `jobs` false stops the shared scheduler right after wiring (the outbox worker and every module job
     // would otherwise keep the test process alive); tests then call the job bodies directly.
     static TestApp boot(name: String, overrides: Map<String,String>) = LeavesApp.bootJobs(name, overrides, false)
@@ -51,6 +56,17 @@ class LeavesApp {
         else {
             SuggestionsModule.withGateway(p, gateway)
         }
+        var feed = BlogFeedPointers()
+        var feedFake = LeavesApp.blogFeedSlot
+        if (feedFake != null) {
+            feed = feedFake
+        }
+        var notifier = BlogNotifier()
+        var notifierFake = LeavesApp.blogNotifierSlot
+        if (notifierFake != null) {
+            notifier = notifierFake
+        }
+        BlogModule.withSeams(p, shared, BlogProfiles(p.db), feed, notifier, BlogCoins(), BlogEmailSender(EmailLogStore(p.db)))
         if (!jobs) {
             shared.stop()
         }

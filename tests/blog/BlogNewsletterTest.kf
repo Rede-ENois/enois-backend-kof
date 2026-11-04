@@ -1,0 +1,171 @@
+import blog.*
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import leaves.*
+import ops.*
+
+// Port of BlogNewsletterTests and BlogUnsubscribeTokenTests (HTTP). The fan-out runs after the publish commit
+// on the outbox worker; the tests drain the outbox themselves (`processPending`). The default e-mail sender
+// cannot send and logs every attempt as FAILED in `email_log`, which is exactly what the Java tests count
+// (the log is the source of truth of the attempt, SENT or FAILED).
+class NewsletterHolder {
+    static TestApp? app = null
+}
+
+TestApp newsletterApp() {
+    var cur = NewsletterHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = LeavesApp.boot("blog-newsletter", mapOf("REDE_SECURITY_ENCRYPTION_KEY", SecretCipher.generateKeyBase64()))
+    NewsletterHolder.app = created
+    return created
+}
+
+String orEmpty(v: String?) {
+    if (v == null) {
+        return ""
+    }
+    return v
+}
+
+List<String> asToken(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+
+List<String> asTokenKey(token: String, key: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json", "Idempotency-Key: " + key)
+
+String newsUser(app: TestApp, id: String) {
+    var token = "tok-" + id + "-1234567890"
+    if (app.db().queryLong("select count(*) from users where id = ?", DbParams().bindStr(id)) == 0L) {
+        SecurityFixtures.login(app.db(), id, token)
+    }
+    return token
+}
+
+publishNews(app: TestApp, token: String, title: String, notify: Bool) {
+    var payload = "{\"title\":" + json.encode(title) + ",\"body\":\"Corpo do post da newsletter.\",\"format\":\"MARKDOWN\",\"notifySubscribers\":" + notify + "}"
+    Check.status(app.client.send("POST", "/blogs/me/posts", asTokenKey(token, "blog-news-" + title + "-" + notify), "", payload), 201)
+}
+
+subscribeTo(app: TestApp, slug: String, token: String) {
+    Check.status(app.client.send("POST", "/blogs/" + slug + "/subscription", asToken(token), "", ""), 200)
+}
+
+String blogIdOf(app: TestApp, slug: String) = app.db().queryOne("select id from blogs where slug = ?", DbParams().bindStr(slug)).getStr("id")
+
+Long sentTo(app: TestApp, toEmail: String) = app.db().queryLong("select count(*) from email_log where kind = 'BLOG_POST' and to_email = ?", DbParams().bindStr(toEmail))
+
+BlogNewsletterService service(app: TestApp) {
+    var db = app.db()
+    return BlogNewsletterService(BlogStore(db), BlogProfiles(db), BlogEmailSender(EmailLogStore(db)), LeavesApp.shared().cipher, "http://localhost:5173", "resources/templates")
+}
+
+Bool subscribed(app: TestApp, blogId: String, userId: String) = BlogStore(app.db()).isSubscribed(blogId, userId)
+
+test "newsletter goes only to verified subscribers and never to the author" {
+    var app = newsletterApp()
+    var author = newsUser(app, "blognews_autor")
+    var ok = newsUser(app, "blognews_assinante_ok")
+    var unverified = newsUser(app, "blognews_assinante_nv")
+    publishNews(app, author, "Primeiro post", false)
+    subscribeTo(app, "blognews_autor", ok)
+    subscribeTo(app, "blognews_autor", unverified)
+    app.db().execute("update users set email_verified_at = null where id = ?", DbParams().bindStr("blognews_assinante_nv"))
+
+    publishNews(app, author, "Post que vai por e-mail", true)
+    LeavesApp.shared().outbox.processPending()
+
+    Check.eqInt("verified subscriber got one", 1, sentTo(app, "blognews_assinante_ok@test.invalid") as Int)
+    Check.eqInt("unverified got none", 0, sentTo(app, "blognews_assinante_nv@test.invalid") as Int)
+    Check.eqInt("author got none", 0, sentTo(app, "blognews_autor@test.invalid") as Int)
+}
+
+test "switching the notice off sends no e-mail" {
+    var app = newsletterApp()
+    var author = newsUser(app, "blognews_toggle_autor")
+    var subscriber = newsUser(app, "blognews_toggle_assinante")
+    publishNews(app, author, "Primeiro post toggle", false)
+    subscribeTo(app, "blognews_toggle_autor", subscriber)
+
+    publishNews(app, author, "Post silencioso", false)
+    LeavesApp.shared().outbox.processPending()
+
+    Check.eqInt("nothing sent", 0, sentTo(app, "blognews_toggle_assinante@test.invalid") as Int)
+}
+
+test "unsubscribe by token removes the subscription and a forged token removes nothing" {
+    var app = newsletterApp()
+    var author = newsUser(app, "blognews_unsub_autor")
+    var subscriber = newsUser(app, "blognews_unsub_assinante")
+    publishNews(app, author, "Primeiro post unsub", false)
+    subscribeTo(app, "blognews_unsub_autor", subscriber)
+    var blogId = blogIdOf(app, "blognews_unsub_autor")
+    Check.isTrue("subscribed", subscribed(app, blogId, "blognews_unsub_assinante"))
+
+    var token = service(app).unsubscribeToken(blogId, "blognews_unsub_assinante")
+    var page = app.client.get("/blogs/descadastrar?token=" + token)
+    Check.status(page, 200)
+    Check.isTrue("confirmation page", page.body.contains("Inscrição cancelada"))
+    Check.isTrue("html content type", orEmpty(page.headerOf("Content-Type")).startsWith("text/html"))
+    Check.isTrue("subscription gone", !subscribed(app, blogId, "blognews_unsub_assinante"))
+
+    var forged = app.client.get("/blogs/descadastrar?token=nao-e-um-token")
+    Check.status(forged, 400)
+    Check.isTrue("invalid page", forged.body.contains("Link inválido"))
+}
+
+test "one click unsubscribe by POST from the mail client" {
+    var app = newsletterApp()
+    var author = newsUser(app, "blognews_oneclick_autor")
+    var subscriber = newsUser(app, "blognews_oneclick_assinante")
+    publishNews(app, author, "Primeiro post um clique", false)
+    subscribeTo(app, "blognews_oneclick_autor", subscriber)
+    var blogId = blogIdOf(app, "blognews_oneclick_autor")
+    var token = service(app).unsubscribeToken(blogId, "blognews_oneclick_assinante")
+    // Tampering with the middle always hits a whole base64 group (the last one carries ignored bits).
+    var middle = token.length() / 2
+    var current = token.substring(middle, middle + 1)
+    var swap = "A"
+    if (current == "A") {
+        swap = "B"
+    }
+    var tampered = token.substring(0, middle) + swap + token.substring(middle + 1)
+    var headers = listOf("Content-Type: application/x-www-form-urlencoded")
+
+    Check.status(app.client.send("POST", "/blogs/descadastrar?token=" + tampered, headers, "", "List-Unsubscribe=One-Click"), 400)
+    Check.isTrue("still subscribed", subscribed(app, blogId, "blognews_oneclick_assinante"))
+    Check.status(app.client.send("POST", "/blogs/descadastrar?token=" + token, headers, "", "List-Unsubscribe=One-Click"), 200)
+    Check.isTrue("gone", !subscribed(app, blogId, "blognews_oneclick_assinante"))
+}
+
+test "token round trip" {
+    var app = newsletterApp()
+    var author = newsUser(app, "blognews_rt_autor")
+    var subscriber = newsUser(app, "blognews_rt_assinante")
+    publishNews(app, author, "Post rt", false)
+    subscribeTo(app, "blognews_rt_autor", subscriber)
+    var blogId = blogIdOf(app, "blognews_rt_autor")
+    var svc = service(app)
+    var token = svc.unsubscribeToken(blogId, "blognews_rt_assinante")
+    Check.isTrue("url safe", !token.contains("+") && !token.contains("/") && !token.contains("="))
+    Check.isTrue("round trip", svc.unsubscribeByToken(token))
+}
+
+test "invalid tokens change nothing and another person's token removes nothing" {
+    var app = newsletterApp()
+    var svc = service(app)
+    Check.isTrue("garbage", !svc.unsubscribeByToken("nao-e-token"))
+    Check.isTrue("null", !svc.unsubscribeByToken(null))
+    Check.isTrue("empty", !svc.unsubscribeByToken(""))
+    Check.isTrue("unknown pair", !svc.unsubscribeByToken(svc.unsubscribeToken("blog_9", "user_9")))
+}
+
+test "preview strips tags and markdown and caps the length" {
+    Check.eqStr("html", "Ola corpo do post", BlogNewsletterService.previewOf("<h1>Ola</h1><p>corpo do <b>post</b></p>"))
+    Check.eqStr("markdown", "Titulo texto com negrito e link", BlogNewsletterService.previewOf("# Titulo\n\ntexto com **negrito** e [link](http://x.y)"))
+    Check.eqStr("empty", "", BlogNewsletterService.previewOf("   "))
+    var capped = BlogNewsletterService.previewOf(strings.repeat("palavra ", 100))
+    Check.eqInt("capped", 301, capped.length())
+    Check.isTrue("ellipsis", capped.endsWith("…"))
+}

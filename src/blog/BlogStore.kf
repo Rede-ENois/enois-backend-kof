@@ -1,0 +1,113 @@
+package blog
+
+import kernel.db.*
+import kernel.text.*
+
+// blogs, blog_posts and blog_subscriptions.
+class BlogStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String blogColumns() = "id, user_id, slug, title, description, theme_html, created_at, updated_at"
+    static BlogRecord mapBlog(r: DbRow) = BlogRecord(r.getStr("id"), r.getStr("user_id"), r.getStr("slug"), r.getStr("title"), r.getStrOrNull("description"), r.getStrOrNull("theme_html"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    BlogRecord? findById(id: String) = this.oneBlog("id = ?", id)
+    BlogRecord? findByUserId(userId: String) = this.oneBlog("user_id = ?", userId)
+    BlogRecord? findBySlug(slug: String) = this.oneBlog("slug = ?", slug)
+    BlogRecord? oneBlog(where: String, value: String) {
+        var row = store.queryOptional("select " + BlogStore.blogColumns() + " from blogs where " + where, DbParams().bindStr(value))
+        if (row == null) {
+            return null
+        }
+        return BlogStore.mapBlog(row)
+    }
+    // Showcase: newest first; `query` filters title and description (wildcards are literal text).
+    List<BlogRecord> findAll(query: String?, limit: Int) {
+        var like = LikePattern.contains(query)
+        var rows = listOf<DbRow>()
+        if (like == null) {
+            rows = store.queryList("select " + BlogStore.blogColumns() + " from blogs order by created_at desc limit ?", DbParams().bindInt(limit))
+        }
+        else {
+            rows = store.queryList("select " + BlogStore.blogColumns() + " from blogs where lower(title) like ? escape \'!\' or lower(description) like ? escape \'!\' order by created_at desc limit ?", DbParams().bindStr(like).bindStr(like).bindInt(limit))
+        }
+        var out = listOf<BlogRecord>()
+        for (var r in rows) {
+            out.add(BlogStore.mapBlog(r))
+        }
+        return out
+    }
+    insertBlog(b: BlogRecord) {
+        store.execute("insert into blogs (id, user_id, slug, title, description, theme_html, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(b.id()).bindStr(b.userId()).bindStr(b.slug()).bindStr(b.title()).bindStrOrNull(b.description()).bindStrOrNull(b.themeHtml()).bindInstant(b.createdAt()).bindInstant(b.updatedAt()))
+    }
+    updateBlog(b: BlogRecord) {
+        store.execute("update blogs set title = ?, description = ?, theme_html = ?, updated_at = ? where id = ?", DbParams().bindStr(b.title()).bindStrOrNull(b.description()).bindStrOrNull(b.themeHtml()).bindInstant(b.updatedAt()).bindStr(b.id()))
+    }
+    static String postColumns() = "id, blog_id, user_id, title, body, body_format, published_at, updated_at"
+    static BlogPostRecord mapPost(r: DbRow) = BlogPostRecord(r.getStr("id"), r.getStr("blog_id"), r.getStr("user_id"), r.getStr("title"), r.getStr("body"), r.getStr("body_format"), r.getInstant("published_at"), r.getInstant("updated_at"))
+    BlogPostRecord? findPost(id: String) {
+        var row = store.queryOptional("select " + BlogStore.postColumns() + " from blog_posts where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return BlogStore.mapPost(row)
+    }
+    // Newest first.
+    List<BlogPostRecord> findPosts(blogId: String, limit: Int) {
+        var out = listOf<BlogPostRecord>()
+        for (var r in store.queryList("select " + BlogStore.postColumns() + " from blog_posts where blog_id = ? order by published_at desc limit ?", DbParams().bindStr(blogId).bindInt(limit))) {
+            out.add(BlogStore.mapPost(r))
+        }
+        return out
+    }
+    // Post count per blog of a list in ONE query; a blog without posts is absent from the map.
+    Map<String,Int> countPosts(blogIds: List<String>) {
+        var counts = mapOf<String, Int>()
+        if (blogIds.size() == 0) {
+            return counts
+        }
+        var marks = "?"
+        var params = DbParams().bindStr(blogIds.get(0))
+        var i = 1
+        while (i < blogIds.size()) {
+            marks = marks + ", ?"
+            params = params.bindStr(blogIds.get(i))
+            i = i + 1
+        }
+        for (var r in store.queryList("select blog_id, count(*) as total from blog_posts where blog_id in (" + marks + ") group by blog_id", params)) {
+            counts.put(r.getStr("blog_id"), r.getInt("total"))
+        }
+        return counts
+    }
+    insertPost(p: BlogPostRecord) {
+        store.execute("insert into blog_posts (id, blog_id, user_id, title, body, body_format, published_at, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(p.id()).bindStr(p.blogId()).bindStr(p.userId()).bindStr(p.title()).bindStr(p.body()).bindStr(p.bodyFormat()).bindInstant(p.publishedAt()).bindInstant(p.publishedAt()).bindInstant(p.updatedAt()))
+    }
+    updatePost(p: BlogPostRecord) {
+        store.execute("update blog_posts set title = ?, body = ?, body_format = ?, updated_at = ? where id = ?", DbParams().bindStr(p.title()).bindStr(p.body()).bindStr(p.bodyFormat()).bindInstant(p.updatedAt()).bindStr(p.id()))
+    }
+    deletePost(id: String) {
+        store.execute("delete from blog_posts where id = ?", DbParams().bindStr(id))
+    }
+    Bool isSubscribed(blogId: String, userId: String) = store.queryLong("select count(*) from blog_subscriptions where blog_id = ? and user_id = ?", DbParams().bindStr(blogId).bindStr(userId)) > 0L
+    insertSubscription(id: String, blogId: String, userId: String, at: String) {
+        store.execute("insert into blog_subscriptions (id, blog_id, user_id, created_at) values (?, ?, ?, ?)", DbParams().bindStr(id).bindStr(blogId).bindStr(userId).bindInstant(at))
+    }
+    // How many rows left (0 = was not subscribed).
+    Int deleteSubscription(blogId: String, userId: String) = store.execute("delete from blog_subscriptions where blog_id = ? and user_id = ?", DbParams().bindStr(blogId).bindStr(userId))
+    // The people who follow the blog: the news goes to them.
+    List<String> subscriberIds(blogId: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select user_id from blog_subscriptions where blog_id = ?", DbParams().bindStr(blogId))) {
+            out.add(r.getStr("user_id"))
+        }
+        return out
+    }
+    // The authors a reader follows through blog subscriptions: the feed adds them to "Para voce".
+    List<String> authorsFollowedBy(userId: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select distinct b.user_id from blog_subscriptions s join blogs b on b.id = s.blog_id where s.user_id = ?", DbParams().bindStr(userId))) {
+            out.add(r.getStr("user_id"))
+        }
+        return out
+    }
+}
