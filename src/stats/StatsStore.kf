@@ -1,0 +1,17 @@
+package stats
+
+import kernel.db.*
+
+// Active-user count straight from the database, one query. The definition lives in the SQL on purpose:
+// a session is alive when its refresh token is valid (it renews on every access, so it is the most
+// faithful "used in the last 30 days" signal), plus whoever posted or commented in the period. `union`
+// (not `union all`) so a person with both a session and content counts once.
+class StatsStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String activeUsersSql() = "select count(*) from (select user_id from auth_sessions where revoked_at is null and refresh_expires_at > ? union select author_id from posts where created_at > ? and status not in (\'DELETED\', \'QUARANTINED\') union select author_id from comments where created_at > ?) as ativos"
+    Long countActiveSince(since: String) = store.queryLong(StatsStore.activeUsersSql(), DbParams().bindInstant(since).bindInstant(since).bindInstant(since))
+    Long countUsers() = store.queryLong("select count(*) from users", DbParams())
+}

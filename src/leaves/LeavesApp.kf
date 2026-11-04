@@ -1,0 +1,49 @@
+package leaves
+
+import java.util.HashMap
+import kernel.*
+import kernel.security.*
+import kernel.testkit.*
+import notices.*
+import releasenotes.*
+import stats.*
+
+// Test boot of the leaf domains (ops, apiv1, stats, search, themes, projects, notices, releasenotes,
+// suggestions, blog): the platform, the shared services, the request pipeline and every module wired in the
+// order of Main.kf. One app per test file (a test file is one process).
+class LeavesApp {
+    static SharedServices? sharedSlot = null
+    static SecurityHooks? hooksSlot = null
+    // `jobs` false stops the shared scheduler right after wiring (the outbox worker and every module job
+    // would otherwise keep the test process alive); tests then call the job bodies directly.
+    static TestApp boot(name: String, overrides: Map<String,String>) = LeavesApp.bootJobs(name, overrides, false)
+    static TestApp bootJobs(name: String, overrides: Map<String,String>, jobs: Bool) {
+        var merged = new HashMap<String, String>()
+        merged.put("REDE_ORIGINS_ENFORCE", "false")
+        for (var k in overrides.keys()) {
+            merged.put(k, overrides.getOrDefault(k, ""))
+        }
+        SecurityClock.reset()
+        return TestApp.bootWith(name, merged, (p: Platform) -> LeavesApp.wire(p, jobs))
+    }
+    static wire(p: Platform, jobs: Bool) {
+        var shared = SharedServices.create(p)
+        var hooks = SecurityHooks.defaults(p.db)
+        LeavesApp.sharedSlot = shared
+        LeavesApp.hooksSlot = hooks
+        Security.install(p, hooks)
+        StatsModule.install(p, shared, hooks)
+        NoticeModule.install(p, shared, hooks)
+        ReleaseNoteModule.install(p, shared, hooks)
+        if (!jobs) {
+            shared.stop()
+        }
+    }
+    static SharedServices shared() {
+        var s = LeavesApp.sharedSlot
+        if (s == null) {
+            throw "LeavesApp not booted"
+        }
+        return s
+    }
+}
