@@ -1,0 +1,78 @@
+package search
+
+import kernel.db.*
+import kernel.text.*
+
+// The five catalogue queries. Each ranks by relevance (exact name 10, prefix 5, contains 1 plus a few
+// bonuses per column) and then by name. `query` is the raw user term: the LIKE wildcards are escaped here
+// (LikePattern, `escape '!'`), never trusted from the caller.
+class SearchStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // The three bindings of a term: contains, prefix, exact (lower case).
+    static String exact(query: String) = query.trim().toLowerCase()
+    static String like(query: String) {
+        var v = LikePattern.contains(query)
+        if (v == null) {
+            return "%"
+        }
+        return v
+    }
+    static String prefix(query: String) {
+        var v = LikePattern.startsWith(query)
+        if (v == null) {
+            return "%"
+        }
+        return v
+    }
+    List<SearchResult> searchUsers(query: String, limit: Int) {
+        var q = SearchStore.like(query)
+        var pre = SearchStore.prefix(query)
+        var ex = SearchStore.exact(query)
+        var rows = store.queryList("select id, name, headline, avatar, username, (case when lower(name) = ? then 10 when lower(name) like ? escape \'!\' then 5 when lower(name) like ? escape \'!\' then 1 else 0 end + case when lower(headline) like ? escape \'!\' then 1 else 0 end + case when lower(username) = ? then 8 else 0 end) as relevance from users where lower(name) like ? escape \'!\' or lower(username) like ? escape \'!\' or lower(headline) like ? escape \'!\' order by relevance desc, name limit ?", DbParams().bindStr(ex).bindStr(pre).bindStr(q).bindStr(q).bindStr(ex).bindStr(q).bindStr(q).bindStr(q).bindInt(limit))
+        var out = listOf<SearchResult>()
+        for (var r in rows) {
+            out.add(SearchResult(r.getStr("id"), "users", r.getStr("name"), r.getStrOrNull("headline"), r.getStrOrNull("avatar"), "/api/users/" + r.getStr("username")))
+        }
+        return out
+    }
+    List<SearchResult> searchCommunities(query: String, limit: Int) {
+        var q = SearchStore.like(query)
+        var pre = SearchStore.prefix(query)
+        var ex = SearchStore.exact(query)
+        var rows = store.queryList("select id, name, description, cover, (case when lower(name) = ? then 10 when lower(name) like ? escape \'!\' then 5 when lower(name) like ? escape \'!\' then 1 else 0 end + case when lower(topic) like ? escape \'!\' then 1 else 0 end) as relevance from communities where lower(name) like ? escape \'!\' or lower(description) like ? escape \'!\' or lower(topic) like ? escape \'!\' order by relevance desc, name limit ?", DbParams().bindStr(ex).bindStr(pre).bindStr(q).bindStr(q).bindStr(q).bindStr(q).bindStr(q).bindInt(limit))
+        return SearchStore.mapped(rows, "communities", "/api/communities/", "name", "description", "cover")
+    }
+    List<SearchResult> searchJobs(query: String, limit: Int) {
+        var q = SearchStore.like(query)
+        var pre = SearchStore.prefix(query)
+        var ex = SearchStore.exact(query)
+        var rows = store.queryList("select id, title, company, logo, (case when lower(title) = ? then 10 when lower(title) like ? escape \'!\' then 5 when lower(title) like ? escape \'!\' then 1 else 0 end + case when lower(company) like ? escape \'!\' then 3 when lower(company) like ? escape \'!\' then 1 else 0 end) as relevance from jobs where lower(title) like ? escape \'!\' or lower(company) like ? escape \'!\' order by relevance desc, title limit ?", DbParams().bindStr(ex).bindStr(pre).bindStr(q).bindStr(pre).bindStr(q).bindStr(q).bindStr(q).bindInt(limit))
+        return SearchStore.mapped(rows, "jobs", "/api/jobs/", "title", "company", "logo")
+    }
+    List<SearchResult> searchEvents(query: String, limit: Int) {
+        var q = SearchStore.like(query)
+        var pre = SearchStore.prefix(query)
+        var ex = SearchStore.exact(query)
+        var rows = store.queryList("select id, title, host, cover, (case when lower(title) = ? then 10 when lower(title) like ? escape \'!\' then 5 when lower(title) like ? escape \'!\' then 1 else 0 end + case when lower(host) like ? escape \'!\' then 3 when lower(host) like ? escape \'!\' then 1 else 0 end) as relevance from events where lower(title) like ? escape \'!\' or lower(host) like ? escape \'!\' order by relevance desc, title limit ?", DbParams().bindStr(ex).bindStr(pre).bindStr(q).bindStr(pre).bindStr(q).bindStr(q).bindStr(q).bindInt(limit))
+        return SearchStore.mapped(rows, "events", "/api/events/", "title", "host", "cover")
+    }
+    List<SearchResult> searchMentors(query: String, limit: Int) {
+        var q = SearchStore.like(query)
+        var pre = SearchStore.prefix(query)
+        var ex = SearchStore.exact(query)
+        var rows = store.queryList("select m.id, u.name, u.headline, u.avatar, (case when lower(u.name) = ? then 10 when lower(u.name) like ? escape \'!\' then 5 when lower(u.name) like ? escape \'!\' then 1 else 0 end + case when lower(m.expertise) like ? escape \'!\' then 1 else 0 end) as relevance from mentors m join users u on u.id = m.user_id where lower(u.name) like ? escape \'!\' or lower(m.expertise) like ? escape \'!\' order by relevance desc, u.name limit ?", DbParams().bindStr(ex).bindStr(pre).bindStr(q).bindStr(q).bindStr(q).bindStr(q).bindInt(limit))
+        return SearchStore.mapped(rows, "mentors", "/api/mentors/", "name", "headline", "avatar")
+    }
+    // `id` plus the three labelled columns (title, subtitle, image) of a catalogue row.
+    static List<SearchResult> mapped(rows: List<DbRow>, type: String, hrefPrefix: String, titleCol: String, subtitleCol: String, imageCol: String) {
+        var out = listOf<SearchResult>()
+        for (var r in rows) {
+            var id = r.getStr("id")
+            out.add(SearchResult(id, type, r.getStr(titleCol), r.getStrOrNull(subtitleCol), r.getStrOrNull(imageCol), hrefPrefix + id))
+        }
+        return out
+    }
+}
