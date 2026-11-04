@@ -1,0 +1,65 @@
+package kernel.blocks
+
+import java.util.HashSet
+import kernel.db.*
+import kernel.time.*
+
+// Users hidden from a visitor: blocks in BOTH directions plus the visitor's mutes that have not
+// expired. Feed, notifications, search and network need the same answer; writing (block/unblock/mute)
+// stays with the network domain, which owns the subject. Read-only port of BlockedUsersReader and its
+// network adapter, on `user_blocks` and `user_mutes`.
+//
+//   var hidden = blockedUsers.hiddenIdsFor(viewerId)      // empty without session or blocks
+//   BlockedUsers.none()                                    // neutral reader (no database): nothing hidden
+class BlockedUsers {
+    Db? store
+    public constructor(store: Db?) {
+        this.store = store
+    }
+    // Neutral implementation for whoever needs the type without the network module.
+    static BlockedUsers none() = BlockedUsers(null)
+    // Ids that must not appear for this user: who they blocked, who blocked them, who they muted (active).
+    HashSet<String> hiddenIdsFor(userId: String?) {
+        var hidden = this.blockedBetween(userId)
+        var database = store
+        if (database == null) {
+            return hidden
+        }
+        if (userId == null) {
+            return hidden
+        }
+        // Only mutes still valid: an expired one shows again without anybody undoing it.
+        var muted = database.queryList("select muted_id from user_mutes where muter_id = ? and (expires_at is null or expires_at > ?)", DbParams().bindStr(userId).bindInstant(Time.nowIso()))
+        for (var row in muted) {
+            hidden.add(row.getStr("muted_id"))
+        }
+        return hidden
+    }
+    // Only blocks, both directions: connections, suggestions and requests of the network module.
+    HashSet<String> blockedBetween(userId: String?) {
+        var hidden = new HashSet<String>()
+        var database = store
+        if (database == null) {
+            return hidden
+        }
+        if (userId == null) {
+            return hidden
+        }
+        if (userId.trim().length() == 0) {
+            return hidden
+        }
+        var rows = database.queryList("select blocked_id as other from user_blocks where blocker_id = ? union select blocker_id as other from user_blocks where blocked_id = ?", DbParams().bindStr(userId).bindStr(userId))
+        for (var row in rows) {
+            hidden.add(row.getStr("other"))
+        }
+        return hidden
+    }
+    // Is there a block between the two, either way?
+    Bool hiddenBetween(userA: String, userB: String) {
+        var database = store
+        if (database == null) {
+            return false
+        }
+        return database.queryLong("select count(*) from user_blocks where (blocker_id = ? and blocked_id = ?) or (blocker_id = ? and blocked_id = ?)", DbParams().bindStr(userA).bindStr(userB).bindStr(userB).bindStr(userA)) > 0L
+    }
+}

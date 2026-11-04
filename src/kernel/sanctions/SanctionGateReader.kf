@@ -1,0 +1,67 @@
+package kernel.sanctions
+
+import java.util.HashSet
+import kernel.db.*
+
+// Reads the active moderation sanction for enforcement (publish, comment, log in) from
+// `user_sanctions`. The moderation domain owns the writes; feed, groups, messaging and identity need the
+// same answer without depending on it. Same rules as the Java SanctionGateAdapter: at most one active
+// sanction per account (the latest ACTIVE row counts); RESTRICTION restricts, SUSPENDED/BAN/PERMABAN
+// also ban (no access at all).
+//
+// The moderation domain may extend this class and override a method; wire the instance in Main.kf.
+class SanctionGateReader {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static Bool isBlockingType(type: String) = type == "SUSPENDED" || type == "BAN" || type == "PERMABAN"
+    DbRow? active(userId: String) = store.queryOptional("select type, reason from user_sanctions where user_id = ? and status = \'ACTIVE\' order by created_at desc limit 1", DbParams().bindStr(userId))
+    // Account with an active sanction (restriction or ban): does not publish or comment.
+    Bool restricted(userId: String) = this.active(userId) != null
+    // Banned account (access denied): not even logging in.
+    Bool banned(userId: String) {
+        var row = this.active(userId)
+        if (row == null) {
+            return false
+        }
+        return SanctionGateReader.isBlockingType(row.getStr("type"))
+    }
+    // The banned among these accounts, for a list (one query per 500 ids).
+    HashSet<String> bannedAmong(userIds: List<String>) {
+        var banned = new HashSet<String>()
+        var from = 0
+        while (from < userIds.size()) {
+            var to = from + 500
+            if (to > userIds.size()) {
+                to = userIds.size()
+            }
+            var chunk = userIds.subList(from, to)
+            var marks = ""
+            var params = DbParams()
+            for (var id in chunk) {
+                if (marks != "") {
+                    marks = marks + ", "
+                }
+                marks = marks + "?"
+                params.bindStr(id)
+            }
+            var rows = store.queryList("select user_id, type from user_sanctions where status = \'ACTIVE\' and user_id in (" + marks + ")", params)
+            for (var row in rows) {
+                if (SanctionGateReader.isBlockingType(row.getStr("type"))) {
+                    banned.add(row.getStr("user_id"))
+                }
+            }
+            from = to
+        }
+        return banned
+    }
+    // Reason of the active sanction for the message to the user; null when free.
+    String? activeReason(userId: String) {
+        var row = this.active(userId)
+        if (row == null) {
+            return null
+        }
+        return row.getStrOrNull("reason")
+    }
+}

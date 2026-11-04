@@ -1,0 +1,73 @@
+package kernel
+
+import kernel.audit.*
+import kernel.blocks.*
+import kernel.cache.*
+import kernel.idempotency.*
+import kernel.jobs.*
+import kernel.outbox.*
+import kernel.risk.*
+import kernel.sanctions.*
+import kernel.security.*
+
+// The shared services of the Java `shared/*` packages wired once, so domain stores and services receive
+// them by constructor from Main.kf:
+//
+//   var platform = Platform.create(Config.env())
+//   var shared = SharedServices.create(platform)       // starts the outbox worker (every 5 s)
+//   shared.outbox.register("NOTIFICATION_REQUESTED", NotificationOutboxHandler(...))
+//   FeedService(FeedStore(platform.db), shared.sanctionGate, shared.idempotency, shared.outbox, ...)
+//
+// Defaults wired here that other modules replace when they are ported (see docs/PORTING_STATUS.md,
+// "pending ports"): `timing` (BehavioralTimingGuard of the rate-limit task: nothing looks automated until
+// then) and `escalation` (moderation turns a risk case into a report: until then it only logs).
+class SharedServices {
+    Platform platform
+    Scheduler jobs
+    Idempotency idempotency
+    Outbox outbox
+    Audit audit
+    SecretCipher cipher
+    Caches caches
+    BlockedUsers blockedUsers
+    SanctionGateReader sanctionReader
+    SanctionGate sanctionGate
+    SuspiciousText suspiciousText
+    ContentDuplicationGuard duplication
+    RiskEngine risk
+    public constructor(platform: Platform, jobs: Scheduler, idempotency: Idempotency, outbox: Outbox, audit: Audit, cipher: SecretCipher, caches: Caches, blockedUsers: BlockedUsers, sanctionReader: SanctionGateReader, sanctionGate: SanctionGate, suspiciousText: SuspiciousText, duplication: ContentDuplicationGuard, risk: RiskEngine) {
+        this.platform = platform
+        this.jobs = jobs
+        this.idempotency = idempotency
+        this.outbox = outbox
+        this.audit = audit
+        this.cipher = cipher
+        this.caches = caches
+        this.blockedUsers = blockedUsers
+        this.sanctionReader = sanctionReader
+        this.sanctionGate = sanctionGate
+        this.suspiciousText = suspiciousText
+        this.duplication = duplication
+        this.risk = risk
+    }
+    // Builds every service from the platform and starts the outbox worker. Fails fast (CONFIG_MISSING)
+    // when REDE_SECURITY_ENCRYPTION_KEY is absent outside the dev profile.
+    static SharedServices create(platform: Platform) {
+        var cfg = platform.cfg
+        var database = platform.db
+        // Fail-fast pieces first: nothing is started when the configuration is wrong.
+        var cipher = SecretCipher.fromConfig(cfg)
+        var caches = Caches.create(cfg)
+        var sanctionReader = SanctionGateReader(database)
+        var duplication = ContentDuplicationGuard.fromConfig(cfg)
+        var risk = RiskEngine.fromConfig(cfg, RiskSubjectReader(database, sanctionReader), RiskAssessmentWriter(database), RiskTimingSignals(), duplication, RiskEscalation())
+        var jobs = Scheduler()
+        var outbox = Outbox(database)
+        outbox.schedule(jobs, cfg)
+        return SharedServices(platform, jobs, Idempotency(database), outbox, Audit(database), cipher, caches, BlockedUsers(database), sanctionReader, SanctionGate(sanctionReader), SuspiciousText.fromConfig(cfg), duplication, risk)
+    }
+    // Stops the background jobs (tests, shutdown).
+    stop() {
+        jobs.stop()
+    }
+}

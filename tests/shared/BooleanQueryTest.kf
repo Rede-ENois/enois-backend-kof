@@ -1,0 +1,79 @@
+import kernel.error.*
+import kernel.search.*
+
+String bq(raw: String?) = BooleanQuery.parse(raw).root().describe()
+
+test "an empty or blank query matches everything" {
+    assert(BooleanQuery.parse(null).root().kind == "MATCH_ALL")
+    assert(BooleanQuery.parse("   ").root().kind == "MATCH_ALL")
+    assert(BooleanQuery.parse("").isEmpty())
+}
+
+test "consecutive terms mean AND" {
+    assert(bq("java spring") == "AND(java,spring)")
+    assert(BooleanQuery.parse("java spring").root().children.size() == 2)
+}
+
+test "explicit AND and OR respect precedence" {
+    // AND binds tighter than OR: java AND spring is one block, kotlin the alternative.
+    assert(bq("java AND spring OR kotlin") == "OR(AND(java,spring),kotlin)")
+}
+
+test "accepts Portuguese operators" {
+    assert(bq("java E spring") == "AND(java,spring)")
+    assert(bq("java OU rust") == "OR(java,rust)")
+    assert(bq("java NAO estagio") == "AND(java,NOT(estagio))")
+    assert(bq("java NÃO estagio") == "AND(java,NOT(estagio))")
+}
+
+test "minus excludes and plus requires" {
+    assert(bq("java -estagio") == "AND(java,NOT(estagio))")
+    // The "+" only reinforces the implicit AND.
+    assert(bq("+java +spring") == "AND(java,spring)")
+}
+
+test "quoted text becomes a phrase" {
+    assert(bq("\"desenvolvedor back-end\" senior") == "AND(\"desenvolvedor back-end\",senior)")
+}
+
+test "parentheses group expressions" {
+    assert(bq("(java OR kotlin) -junior") == "AND(OR(java,kotlin),NOT(junior))")
+}
+
+test "NOT applies to the whole group" {
+    assert(bq("NOT (java OR kotlin)") == "NOT(OR(java,kotlin))")
+}
+
+test "normalizes case and spacing" {
+    assert(bq("  JAVA    \"Frase   Exata\"  ") == "AND(java,\"frase exata\")")
+}
+
+test "tolerates unbalanced input instead of failing" {
+    assert(bq("\"sem fim") == "\"sem fim\"")
+    assert(bq("(java AND spring") == "AND(java,spring)")
+    assert(bq("java OR") == "java")
+    assert(bq(") java (") == "java")
+    assert(bq("AND java") == "java")
+    assert(BooleanQuery.parse("-").root().kind == "MATCH_ALL")
+}
+
+test "a hyphen inside a word stays in the term" {
+    assert(bq("back-end") == "back-end")
+}
+
+test "refuses queries that would explode the where clause" {
+    var manyTerms = strings.repeat("termo ", 70).trim()
+    assert(BooleanQuery.rejection(manyTerms).contains("termos"))
+    var deeplyNested = strings.repeat("(", 20) + "java" + strings.repeat(")", 20)
+    assert(BooleanQuery.rejection(deeplyNested).contains("parenteses"))
+    assert(BooleanQuery.rejection("java OR kotlin") == "")
+    var err = ""
+    try {
+        BooleanQuery.parse(manyTerms)
+    } catch (String e) {
+        err = e
+    }
+    // Like the Java IllegalArgumentException handler: 400 BAD_REQUEST.
+    assert(Errors.parse(err).status() == 400)
+    assert(Errors.parse(err).code() == "BAD_REQUEST")
+}

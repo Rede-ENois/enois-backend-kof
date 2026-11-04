@@ -113,6 +113,12 @@ var id = database.txLong(() -> database.insertReturningId(sql, p))   // ... or t
 database.inTransaction(): Bool
 ```
 
+After-commit hooks (`@TransactionalEventListener(AFTER_COMMIT)`): `database.afterCommit(() -> { ... })`
+inside a transaction runs the callback only after the outermost commit (dropped on rollback, in
+registration order, after the connection is back in the pool, so it may use the database again).
+Outside a transaction it runs immediately. A callback that throws is logged (`after_commit_failed`)
+and does not stop the others nor undo the commit.
+
 Constraint violations (unique, FK, NOT NULL, data too long) become `Errors.conflict()` (409 CONFLICT),
 like `DataIntegrityViolationException`. Other SQL failures are logged and thrown as `SQL_ERROR: ...`
 (500 at the edge). Connections are always returned to the pool, including on failure.
@@ -304,3 +310,283 @@ test "feed lists posts" {
 - Fixtures: unique prefixes per test (the database is shared by the tests of a file). Seed with
   `app.db().execute(...)`.
 - Time-based code: schedulers/jobs are instances you create in the test and `stop()`.
+
+## kernel.idempotency
+
+`Idempotency-Key` on writes, same `idempotency_keys` table and codes as the Java
+`IdempotencyApplicationService`. Route handlers call one helper:
+
+```kotlin
+import kernel.idempotency.*
+
+var idem = Idempotency(platform.db)
+server.post("/feed/posts", () -> {
+    var hash = Idempotency.hash(Req.bodyText())            // SHA-256 hex of the payload text
+    // user scope, method, route as the Java side wrote it ("/api/..."), hash, success status, action
+    return idem.handle(userId, "POST", "/api/feed/posts", hash, 201, () -> json.encode(createPost(userId)))
+})
+```
+
+`handle` reads the `Idempotency-Key` header and answers `status(successStatus, body)`. `execute(scope,
+method, route, key: String?, hash, status, action): IdempotencyReply(status, body)` is the same without
+HTTP. The action returns the JSON body text; the success status is a parameter (every Java command has a
+fixed status, and a lambda cannot return a type from another package, G28).
+
+The call is one transaction (like `@Transactional`): marker, the action's own writes and the stored
+response commit together; a throwing action leaves no marker, so the client can retry with the same key.
+
+| Situation | Answer |
+|---|---|
+| missing / blank key | 400 `IDEMPOTENCY_KEY_REQUIRED` "Idempotency-Key obrigatoria." |
+| same key + hash, completed | stored status and body, action not run |
+| same key, other hash (checked first) | 409 `IDEMPOTENCY_PAYLOAD_CONFLICT` |
+| marker `PROCESSING` / `FAILED` | 409 `IDEMPOTENCY_IN_PROGRESS` / `IDEMPOTENCY_FAILED` |
+| lost insert race (unique violation) | replay or reject against the winner's row |
+
+Keys are scoped by user, method, route and key; rows live 24 h (`expires_at`).
+`Idempotency.hash(json.encode(dto))` hashes a DTO; hashes only need to be stable within this service.
+
+## kernel.outbox, kernel.audit, kernel.id
+
+```kotlin
+import kernel.outbox.*
+
+var outbox = Outbox(platform.db)
+outbox.register("NOTIFICATION_REQUESTED", NotificationOutboxHandler(...))   // by event type, in order
+outbox.schedule(jobs, platform.cfg)             // @Scheduled: every REDE_OUTBOX_WORKER_DELAY_MS (5000)
+database.transaction(() -> {
+    // ... business write ...
+    outbox.append("NOTIFICATION_REQUESTED", aggregateId, payloadJson)    // exists only if it commits
+})
+outbox.processPending(): Int                    // one worker pass (tests call it directly)
+```
+
+A handler extends `OutboxEventHandler` (a base class: `implements` across packages does not compile,
+G28) and overrides `handle(eventType, aggregateId, payload)`. Same tables (`outbox_events`,
+`processed_events`) and delivery rules as the Java `OutboxWorker`: up to 50 PENDING events due
+(`next_attempt_at <= now`), oldest first; every handler registered for the type is called; a throwing
+handler is logged (`outbox_handler_failed`) and neither stops the others nor keeps the event pending: the
+event is marked PROCESSED anyway. That is Java's behaviour, so there is no retry and no backoff
+(`next_attempt_at` is never moved); an event with no handler is PROCESSED too. Each event runs in its own
+transaction. Domains register their own handlers (`NotificationOutboxEventHandler`,
+`LinkedInShareOutboxEventHandler`).
+
+After-commit hooks (`Db.afterCommit`, see kernel.db) are the `@TransactionalEventListener(AFTER_COMMIT)`
+equivalent.
+
+```kotlin
+import kernel.audit.*
+var audit = Audit(platform.db)
+audit.write(actorId, "USER_BANNED", targetId, "{\"reason\":\"spam\"}")      // metadata may be null
+```
+
+`audit_logs` is append-only and joins the caller's transaction. `Ids.uuid()` / `Ids.prefixed("risk_")`
+(`kernel.id`) mint the string ids of those tables.
+
+## kernel.security: hashes, secrets, passwords, TOTP
+
+```kotlin
+import kernel.security.*
+
+Hashes.sha256Hex(token)                       // lower-case hex of the UTF-8 bytes (only hashes are persisted)
+
+var cipher = SecretCipher.fromConfig(platform.cfg)   // REDE_SECURITY_ENCRYPTION_KEY (32 bytes, base64)
+cipher.encrypt(secret)  cipher.decrypt(stored)  cipher.isEnabled()  cipher.requireEnabled()
+SecretCipher.generateKeyBase64()
+```
+
+`SecretCipher` is byte-compatible with the Java class: AES-256-GCM, `base64(iv12 || ciphertext || tag16)`
+(tested against a ciphertext produced by the Java algorithm). The key is required at boot outside the
+`dev` profile (`SPRING_PROFILES_ACTIVE`; override `REDE_SECURITY_ENCRYPTION_KEY_REQUIRED`), failing with
+`CONFIG_MISSING`/`CONFIG_INVALID`. Without a key `encrypt/decrypt` throw `503 SECURITY_KEY_NOT_CONFIGURED`.
+A wrong key or corrupted value throws `SECRET_CIPHER_FAILURE` (a 500 at the edge).
+
+```kotlin
+Passwords.hash(password)                       // "120000:base64(salt):base64(key)", PBKDF2WithHmacSHA256
+Passwords.matches(password, stored)            // verifies Java hashes; malformed -> false, constant-time compare
+Passwords.validateStrength(password)           // 400 WEAK_PASSWORD: 8..128 chars, not in the common list
+Passwords.isCommon(password)                   // resources/security/common-passwords.txt (SECURITY_RESOURCES_DIR)
+```
+
+```kotlin
+var secret = Totp.generateSecret()                         // base32, 32 chars
+Totp.verifyDefault(secret, code, epochSecond)              // +-1 step; spaces in the code are ignored
+Totp.matchingStep(secret, code, epochSecond, 1): Long      // the step, or -1: persist it to refuse replays
+Totp.codeAt(secret, step)   Totp.otpauthUri(issuer, account, secret)
+```
+
+TOTP is RFC 6238 (HMAC-SHA1, 6 digits, 30 s) and passes the RFC vectors. Times are epoch seconds
+(`Time.nowMillis() / 1000L`), not `Instant`.
+
+Java checked exceptions (`GeneralSecurityException`, `SQLException`) are not caught by `catch (String)`:
+catch them by type (see `SecretCipher`).
+
+## kernel.html: sanitising and Markdown
+
+Third-party jars (versions of the Java `pom.xml`): jsoup 1.23.2, commonmark 0.31.0 with the GFM tables
+and strikethrough extensions.
+
+```kotlin
+import kernel.html.*
+
+SafeHtml.sanitizePageHtml(raw): String?       // null when nothing useful is left (blank, only <script>...)
+SafeHtml.sanitizeProfileHtml(raw)  sanitizeProjectHtml(raw)  sanitizeBlogHtml(raw)
+SafeHtml.requirePageHtml(raw)      requireProfileHtml(raw)   requireBlogHtml(raw)    // 400 INVALID_*_HTML instead of null
+SafeHtml.maxPageHtml() 200000   maxProfileHtml() 20000   maxProjectHtml() 200000   maxBlogHtml() 20000
+```
+
+Port of `shared/html/SafeHtml`, same allowlist (HTML, SVG with SMIL, `data-enois-embed`), same limits
+(raw input 400000, CSS 64000, the length limit applies to the cleaned result) and codes
+(`PAGE_HTML_TOO_LONG`, `PROFILE_HTML_TOO_LONG`, `PROJECT_HTML_TOO_LONG`, `BLOG_HTML_TOO_LONG`,
+`CSS_TOO_LONG`). `<style>` blocks are extracted, cleaned (no `@import`, `expression(`, `behavior:`,
+`image-set(`, `javascript:`; `url()` only for `data:`; CSS escapes decoded before checking) and prepended;
+only https provider embeds survive as `iframe`; links get `target="_blank" rel="noopener noreferrer"`;
+`<use>`/`<mpath>` only reference `#fragment`s. Every scan is linear (cost tests). One deliberate fix: the
+Java `Matcher.replaceAll(Function)` read `$` and `\` in the replacement as group references; here
+replacements are literal (`kernel.text.Regexes`).
+
+```kotlin
+MarkdownBio.render(markdown, owner, repo, branch): String   // README -> bio HTML (MarkdownBioRenderer)
+```
+
+Relative links/images become absolute (blob/raw), the result goes through `requireProfileHtml`; an
+oversized README is `400 README_TOO_LONG`.
+
+`Regexes.replaceAll(pattern, input, (m: Matcher) -> String)` is the regex replace with a callback
+(literal replacements); `Regexes.add(sb, text)` appends to a `StringBuilder` (see G30).
+
+## kernel.cache
+
+A tiny in-process TTL cache replaces Caffeine (`@Cacheable` lists and hot-path maps); no dependency.
+String keys and String values: cache the JSON text of a response and decode at the call site (generic
+class values come back as `Object` without a cast, and casts to domain types do not compile, G28).
+
+```kotlin
+import kernel.cache.*
+
+var caches = Caches.create(platform.cfg)             // the closed list of the Java CacheConfig
+var ranking = caches.get("publicRanking")             // unknown name throws CACHE_UNKNOWN
+var body = ranking.getOrLoad("top", () -> json.encode(loadRanking()))   // one load per expired key
+ranking.put(k, v)  ranking.get(k): String?  ranking.evict(k)  ranking.clear()
+ranking.evictAfterCommit(database, k)   ranking.clearAfterCommit(database)    // CacheInvalidator
+ranking.add(k, v): Bool                               // atomic first-writer-wins (duplicate guards)
+ranking.hits()  misses()  size()
+var own = TtlCache("name", 20000L, 500)               // ttl millis, max entries
+```
+
+Same semantics as the Caffeine setup: expire-after-write (nothing is scheduled: the next caller that needs
+a stale entry pays the load), a size cap (stale entries go first, then the ones expiring first), and one
+load when many callers hit the same expired key (a loader failure reaches all of them and caches
+nothing; do not call another `getOrLoad` from inside a loader). Per pod: invalidating does not reach the
+other pods, the TTL is the guarantee. Caches: `publicProfiles` (20 s, 5000), `publicRanking` (20 s, 64),
+`communitiesList`, `eventsList`, `jobsList` (20 s, 500), `communityStats` (10 m, 4), `externalJobs` (5 m,
+16), `pagePreviewCards` (1 h, 16), `gifSearch` (10 m, 200), `githubRepositories`, `githubReadme` (3 m,
+200). `REDE_CACHE_DYNAMIC_TTL` (default `20s`) feeds the 20 s ones; `REDE_CACHE_<NAME>_TTL` (`500ms`,
+`5s`, `10m`, `1h`, `2d`, bare number = ms) and `REDE_CACHE_<NAME>_MAX_ENTRIES` override one cache
+(`REDE_CACHE_JOBS_LIST_TTL`).
+
+## kernel.text, kernel.geo, kernel.search
+
+```kotlin
+import kernel.text.*
+
+PlainText.defuse(raw): String?                 // bidi/zero-width removed, <=5 combining marks, runs capped at 12 ("travazap")
+TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "nome", value, 160)   // 400 "O campo nome aceita no máximo 160 caracteres."
+LikePattern.contains(q)  LikePattern.startsWith(q)  LikePattern.escape(t) // null for blank; SQL must say `escape '!'`
+InlineMedia.idsIn(content)  InlineMedia.validate(content, mediaIds)       // 400 INVALID_INLINE_MEDIA for foreign markers
+Texts.stripAccents(s)  Texts.squash(s)
+Regexes.replaceAll(pattern, input, (m: Matcher) -> String)               // literal replacements
+```
+
+```kotlin
+import kernel.geo.*
+var place = CityState.of(city, state)          // CityState(city, state, cityKey) or null; 400 CITY_STATE_INCOMPLETE / INVALID_STATE / CITY_TOO_LONG
+CityState.requireState("mg") == "MG"           CityState.key("São Paulo") == "sao paulo"   CityState.states()  // the 27 UFs
+```
+
+```kotlin
+import kernel.search.*
+var q = BooleanQuery.parse(raw)                // never fails on bad syntax; 400 BAD_REQUEST past 64 terms / 12 levels
+q.isEmpty()  q.root(): BooleanNode             // kind MATCH_ALL | TERM | PHRASE | AND | OR | NOT, text, children, describe()
+BooleanQuery.rejection(raw): String            // the reason a query is refused, "" when fine
+```
+
+Syntax: loose terms (AND), `AND/E`, `OR/OU`, `NOT/NAO/NÃO`, `-term`, `+term`, `"phrase"`, parentheses; NOT > AND > OR.
+`BooleanNode` is a class with a `kind` string (the Java sealed records cannot be built across packages, G28).
+
+## kernel.url and kernel.security guards
+
+```kotlin
+import kernel.url.*
+import kernel.security.*
+
+SafeUrl.requireHttpUrl(raw, "site")                    // 400 INVALID_URL; blank passes; max 500 chars, host, no credentials
+SafeUrl.requireHttpUrlList(list, field)  SafeUrl.requireHttpUrlsJoined(text, separatorRegex, field)
+SafeUrl.requireSafeMarkdownLinks(text, field)          // 400 UNSAFE_LINK: markdown/reference/html link schemes
+SafeUrl.isSafeLinkTarget(target)                       // no scheme, or http/https/mailto (whitespace/control/format chars ignored)
+SafeLinks.checkRequest()                               // SafeLinkRequestBodyAdvice: every string of a JSON body, decoded
+SafeLinks.checkBody(text)                              // the same on a text; >2 MB -> 400 BAD_REQUEST; malformed -> left to the DTO parser
+OutboundUrlGuard.safe(url): Bool                       // SSRF: http/https, ports 80/443, no local names, DNS only to public addresses
+SuspiciousText.fromConfig(cfg).matches1(text)  .matchesAny(listOf(a, b))        // CONTENT_SWEEP_PATTERNS
+ContentDuplicationGuard.fromConfig(cfg).require(userId, text)   // 409 DUPLICATE_CONTENT; REDE_RATE_DUPLICATE_WINDOW_MINUTES (60, 0 = off)
+guard.isDuplicate(userId, text)                        // pure query; `require` is atomic
+```
+
+`SafeLinks.checkRequest()` is the handler/filter-level equivalent of the Java `@ControllerAdvice`: call it
+before parsing a JSON DTO (JSON content types only; raw payloads a handler verifies as is, such as a
+webhook HMAC, must not go through it). The Kof JSON reader behind it (`JsonStrings`) collects decoded
+string values with their property name because Kof cannot walk a Jackson tree.
+
+## kernel.blocks, kernel.sanctions, kernel.risk
+
+Read-only ports of the shared readers, on their own tables, plus the risk engine.
+
+```kotlin
+import kernel.blocks.*
+BlockedUsers(database).hiddenIdsFor(viewerId): HashSet<String>   // blocks in both directions + unexpired mutes
+.blockedBetween(userId)   .hiddenBetween(a, b)                    // blocks only (network module)
+BlockedUsers.none()                                               // no database: nothing hidden
+```
+
+```kotlin
+import kernel.sanctions.*
+var reader = SanctionGateReader(database)      // user_sanctions: the latest ACTIVE row of the account
+reader.restricted(id)  reader.banned(id)  reader.bannedAmong(listOf(...))  reader.activeReason(id): String?
+SanctionGate(reader).requireNotRestricted(userId)      // 403 ACCOUNT_RESTRICTED in every write path
+```
+
+`banned` = active SUSPENDED, BAN or PERMABAN; `restricted` = any active sanction. The moderation domain
+owns the writes and may extend `SanctionGateReader` (override a method) before wiring it in `Main.kf`.
+
+```kotlin
+import kernel.risk.*
+var engine = RiskEngine.fromConfig(cfg, RiskSubjectReader(db, sanctionReader), RiskAssessmentWriter(db),
+                                   timing, duplicationGuard, escalation)
+var a = engine.assess(userId, "publish", content): RiskAssessment?    // null without signal; never throws
+a.level  a.score  a.signals  a.decision  a.ruleVersion  a.action  a.id
+```
+
+Signals `ROBOTIC_CADENCE`, `DUPLICATE_CONTENT`, `NEW_ACCOUNT`, `ACTIVE_SANCTION` (`RiskSignals.*`), weights
+3/2/1/3, thresholds MEDIUM 2 / HIGH 5 / CRITICAL 8, decision ALLOW, MONITOR, ESCALATE or RESTRICT (RESTRICT
+only for CRITICAL with `REDE_RISK_ENFORCE=true`; default is observation mode). Env:
+`REDE_RISK_WEIGHTS_*`, `REDE_RISK_THRESHOLDS_*`, `REDE_RISK_NEW_ACCOUNT_HOURS` (24), `REDE_RISK_ENFORCE`.
+Assessments are stored in `risk_assessments`; a non-LOW level opens a moderation case once per hour per
+account through `RiskEscalation.escalate(userId, description)` (default: log only). The cadence signal
+comes from `RiskTimingSignals.looksAutomated(userId)` (default: false): wire the `BehavioralTimingGuard`
+of the security module there. Levels, signals and decisions are String constants (enums do not cross
+packages safely, G43).
+
+## SharedServices (composition)
+
+`SharedServices.create(platform)` builds everything above in one call (fail-fast config first, then the
+outbox worker) and `Main.kf` calls it after `Platform.create`:
+
+```kotlin
+var shared = SharedServices.create(platform)
+shared.idempotency  shared.outbox  shared.audit  shared.cipher  shared.caches  shared.blockedUsers
+shared.sanctionReader  shared.sanctionGate  shared.suspiciousText  shared.duplication  shared.risk
+shared.jobs  shared.stop()
+```
+
+`TestApp.bootWith/bootWire` now stop the platform when the `wire` callback throws (the open pool kept the
+test process from exiting).

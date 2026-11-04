@@ -1,0 +1,62 @@
+package kernel.risk
+
+import kernel.db.*
+import kernel.log.*
+import kernel.sanctions.*
+
+// What the risk engine needs about the assessed account, without depending on the module that owns it
+// (Java RiskSubjectReader): when the account was created (null if it does not exist) and whether it has
+// an active sanction. Default: `users.created_at` and the sanction reader.
+class RiskSubjectReader {
+    Db store
+    SanctionGateReader sanctions
+    public constructor(store: Db, sanctions: SanctionGateReader) {
+        this.store = store
+        this.sanctions = sanctions
+    }
+    // ISO instant, or null.
+    String? createdAtOf(userId: String) {
+        var row = store.queryOptional("select created_at from users where id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return row.getInstantOrNull("created_at")
+    }
+    Bool hasActiveSanction(userId: String) = sanctions.restricted(userId)
+}
+
+// Where the assessment is stored (Java JdbcRiskAssessmentWriter): the history only grows and is read by
+// aggregation. Signals go as a JSON array of codes, nothing free-form.
+class RiskAssessmentWriter {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    save(a: RiskAssessment) {
+        var codes = ""
+        for (var s in a.signals) {
+            if (codes != "") {
+                codes = codes + ","
+            }
+            codes = codes + "\"" + s + "\""
+        }
+        store.execute("insert into risk_assessments (id, user_id, action_type, level, score, signals, rule_version, decision, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(a.id).bindStr(a.userId).bindStr(a.action).bindStr(a.level).bindInt(a.score).bindStr("[" + codes + "]").bindStr(a.ruleVersion).bindStr(a.decision).bindInstant(a.createdAt))
+    }
+}
+
+// PENDING PORT: the cadence signal is the BehavioralTimingGuard of the rate-limit task. Until that guard
+// is wired, nothing looks automated. Override `looksAutomated` (extend this class) when it lands.
+class RiskTimingSignals {
+    public constructor() {}
+    Bool looksAutomated(userId: String) = false
+}
+
+// PENDING PORT: the Java engine publishes an AutoReportEvent (USER, SPAM) that the moderation module turns
+// into a report. Until moderation is ported the default only logs. Override `escalate` to open the case.
+class RiskEscalation {
+    Log log = Log("kernel.risk")
+    public constructor() {}
+    escalate(userId: String, description: String) {
+        log.warn("risk_escalation_unhandled " + description)
+    }
+}

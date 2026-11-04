@@ -1,0 +1,168 @@
+package kernel.url
+
+import java.net.URI
+import java.util.regex.Matcher
+import java.util.regex.Pattern
+import kernel.error.*
+import kernel.text.*
+
+// Validation of public links users provide (portfolio, external links, company site). The front renders
+// them in `href`; accepting `javascript:`, `data:` or `vbscript:` turned a profile into a stored-XSS
+// vector. Only http(s) with a host, no relative scheme, embedded credentials or control characters.
+//
+//   SafeUrl.requireHttpUrl(raw, "site")                  // 400 INVALID_URL; blank passes
+//   SafeUrl.requireSafeMarkdownLinks(text, "bio")        // 400 UNSAFE_LINK
+//   SafeUrl.isSafeLinkTarget(target)                     // no scheme, or http/https/mailto
+class SafeUrl {
+    // Schemes a rendered link may carry. A target without scheme (relative, `#anchor`) is fine.
+    static Bool linkScheme(scheme: String) = scheme == "http" || scheme == "https" || scheme == "mailto"
+    static Pattern scheme() = Pattern.compile("^([a-z][a-z0-9+.\\-]*):")
+    // Markdown link or image destination as the front's rich-text parser reads it: from `](` to the first `)`.
+    static Pattern markdownDestination() = Pattern.compile("\\]\\(([^)]*)\\)")
+    // Reference-style definition: `[ref]: url` on its own line.
+    static Pattern markdownReference() = Pattern.compile("(?m)^\\s{0,3}\\[([^\\]]+)\\]:\\s+(.+)$")
+    // HTML href/src/action attribute value.
+    static Pattern htmlAttrUrl() = Pattern.compile("(?i)(?:href|src|action|formaction)\\s*=\\s*[\"\']([^\"\']*)[\"\']")
+    // Whether a link target is safe as href: no scheme, or http/https/mailto. Browsers drop whitespace and
+    // control characters inside a scheme and the front drops backslash escapes, so all of them (and
+    // invisible format characters) are removed before reading the scheme.
+    static Bool isSafeLinkTarget(target: String?) {
+        if (target == null) {
+            return true
+        }
+        var normalized = SafeUrl.stripInvisible(target)
+        var m = SafeUrl.scheme().matcher(normalized.toLowerCase())
+        if (!m.find()) {
+            return true
+        }
+        return SafeUrl.linkScheme(Regexes.group(m, 1))
+    }
+    // Drops code points <= space, backslash, whitespace, ISO control and Unicode format characters.
+    static String stripInvisible(target: String) {
+        var out = new StringBuilder()
+        var i = 0
+        while (i < target.length()) {
+            var width = 1
+            var cp = target.charAt(i) as Int
+            if (cp >= 55296 && cp <= 56319 && i + 1 < target.length()) {
+                var low = target.charAt(i + 1) as Int
+                if (low >= 56320 && low <= 57343) {
+                    cp = 65536 + (cp - 55296) * 1024 + (low - 56320)
+                    width = 2
+                }
+            }
+            var drop = cp <= 32 || cp == 92 || Character.isWhitespace(cp) || Character.isISOControl(cp) || Character.getType(cp) == 16
+            if (!drop) {
+                Regexes.add(out, target.substring(i, i + width))
+            }
+            i = i + width
+        }
+        return out.toString()
+    }
+    // Rejects text with a Markdown link/image whose destination has a scheme outside http/https/mailto,
+    // a reference definition likewise, or an HTML href/src/action with one. Applied to every string of
+    // every JSON request body (see SafeLinks); URL fields go through requireHttpUrl.
+    static requireSafeMarkdownLinks(text: String?, field: String) {
+        if (text == null) {
+            return
+        }
+        if (text.indexOf("](") >= 0) {
+            var destination = SafeUrl.markdownDestination().matcher(text)
+            while (destination.find()) {
+                SafeUrl.rejectUnsafe(Regexes.group(destination, 1), field)
+            }
+        }
+        var reference = SafeUrl.markdownReference().matcher(text)
+        while (reference.find()) {
+            SafeUrl.rejectUnsafe(Regexes.group(reference, 2).trim(), field)
+        }
+        var htmlAttr = SafeUrl.htmlAttrUrl().matcher(text)
+        while (htmlAttr.find()) {
+            SafeUrl.rejectUnsafe(Regexes.group(htmlAttr, 1), field)
+        }
+    }
+    static rejectUnsafe(target: String, field: String) {
+        if (!SafeUrl.isSafeLinkTarget(target)) {
+            throw Errors.api(400, "UNSAFE_LINK", "O campo " + field + " tem um link com endereco nao permitido (use http, https ou mailto).")
+        }
+    }
+    // The trimmed link when it is a valid http(s) URL (max 500 chars, no control characters, a host, no
+    // credentials); blank/null is returned as is. Throws 400 INVALID_URL.
+    static String? requireHttpUrl(raw: String?, field: String) {
+        if (raw == null) {
+            return null
+        }
+        if (raw.trim().length() == 0) {
+            return raw
+        }
+        var clean = raw.trim()
+        if (clean.length() > 500 || SafeUrl.hasControl(clean)) {
+            throw SafeUrl.invalid(field)
+        }
+        var uri = SafeUrl.parse(clean)
+        if (uri == null) {
+            throw SafeUrl.invalid(field)
+        }
+        var uriScheme = ""
+        var declared = uri.getScheme()
+        if (declared != null) {
+            uriScheme = declared.toLowerCase()
+        }
+        if (uriScheme != "http" && uriScheme != "https") {
+            throw SafeUrl.invalid(field)
+        }
+        var host = uri.getHost()
+        if (host == null) {
+            throw SafeUrl.invalid(field)
+        }
+        if (host.trim().length() == 0 || uri.getUserInfo() != null) {
+            throw SafeUrl.invalid(field)
+        }
+        return clean
+    }
+    // Each link of the list must be a valid http(s) URL; null stays null.
+    static List<String>? requireHttpUrlList(raw: List<String>?, field: String) {
+        if (raw == null) {
+            return null
+        }
+        var out = listOf<String>()
+        for (var link in raw) {
+            var checked = SafeUrl.requireHttpUrl(link, field)
+            if (checked != null) {
+                out.add(checked)
+            }
+        }
+        return out
+    }
+    // Links kept as one text split by `separator` (a regex, like String.split): each part must be valid.
+    static String? requireHttpUrlsJoined(joined: String?, separator: String, field: String) {
+        if (joined == null) {
+            return null
+        }
+        if (joined.trim().length() > 0) {
+            for (var link in joined.split(separator)) {
+                var checked = SafeUrl.requireHttpUrl(link, field)
+            }
+        }
+        return joined
+    }
+    static Bool hasControl(text: String) {
+        var i = 0
+        while (i < text.length()) {
+            if (Character.isISOControl(text.charAt(i) as Int)) {
+                return true
+            }
+            i = i + 1
+        }
+        return false
+    }
+    // URI.create, or null when malformed.
+    static URI? parse(text: String) {
+        try {
+            return URI.create(text)
+        } catch (String e) {
+            return null
+        }
+    }
+    static String invalid(field: String) = Errors.api(400, "INVALID_URL", "O campo " + field + " precisa ser um link http(s) valido.")
+}

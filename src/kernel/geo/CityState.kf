@@ -1,0 +1,70 @@
+package kernel.geo
+
+import java.util.HashSet
+import kernel.error.*
+import kernel.text.*
+
+// City + state (local communities, profile, in-person events). The city stays as written (trimmed,
+// spaces collapsed); `cityKey` is how to compare: no accents, lower case, collapsed spaces ("São Paulo"
+// and "sao  paulo" share a key). The key is stored in its own column because collation and accent
+// functions differ between H2 and MariaDB, and a stored column is indexable on both.
+//
+//   var place = CityState.of(city, state)        // null when both blank; 400 when only one is given
+class CityState {
+    String city
+    String state
+    String cityKey
+    public constructor(city: String, state: String, cityKey: String) {
+        this.city = city
+        this.state = state
+        this.cityKey = cityKey
+    }
+    static Int cityMax() = 80
+    // The 27 federative units.
+    static List<String> states() = listOf("AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO")
+    // Both or none: both blank = no place (null); only one filled = 400 (a city without state is
+    // ambiguous, a state without city is useless for an in-person meetup).
+    static CityState? of(city: String?, state: String?) {
+        var hasCity = false
+        if (city != null) {
+            hasCity = city.trim().length() > 0
+        }
+        var hasState = false
+        if (state != null) {
+            hasState = state.trim().length() > 0
+        }
+        if (!hasCity && !hasState) {
+            return null
+        }
+        if (hasCity != hasState) {
+            throw Errors.api(400, "CITY_STATE_INCOMPLETE", "Informe a cidade e o estado juntos.")
+        }
+        var trimmedCity = ""
+        if (city != null) {
+            trimmedCity = city.trim().replaceAll("\\s+", " ")
+        }
+        TextFieldLimit.check("CITY_TOO_LONG", "cidade", trimmedCity, CityState.cityMax())
+        return CityState(trimmedCity, CityState.requireState(state), CityState.key(trimmedCity) as String)
+    }
+    // Valid UF in upper case; refuses what is not one of the 27.
+    static String requireState(state: String?) {
+        var uf = ""
+        if (state != null) {
+            uf = state.trim().toUpperCase()
+        }
+        if (!CityState.states().contains(uf)) {
+            throw Errors.api(400, "INVALID_STATE", "Estado invalido. Use a sigla da UF, como MG ou SP.")
+        }
+        return uf
+    }
+    // Comparison key: no accents, lower case, collapsed spaces. Null for a blank city.
+    static String? key(city: String?) {
+        if (city == null) {
+            return null
+        }
+        if (city.trim().length() == 0) {
+            return null
+        }
+        return Texts.stripAccents(city.trim()).toLowerCase().replaceAll("\\s+", " ")
+    }
+}

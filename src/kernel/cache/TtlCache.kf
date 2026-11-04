@@ -1,0 +1,199 @@
+package kernel.cache
+
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.ReentrantLock
+import kernel.db.*
+import kernel.log.*
+import kernel.time.*
+
+// Small in-process TTL cache replacing Caffeine for the @Cacheable lists and the hot-path maps.
+// String keys and String values: cache the JSON text of a response (or any encoded value) and decode
+// at the call site, which also avoids casts to domain types (KOF_GAPS G28).
+//
+//   var cache = TtlCache("publicRanking", 20000L, 64)
+//   var json = cache.getOrLoad("top", () -> json.encode(loadRanking()))     // one load per expired key
+//   cache.clearAfterCommit(database)                                          // CacheInvalidator.afterCommit
+//
+// Like the Java cache: expireAfterWrite (an entry is stale after the TTL; nothing is scheduled and
+// nothing queries on its own: the next caller that needs it pays the load), a size cap per cache, and
+// a single load when many callers hit the same expired key. Per pod: invalidating here does not
+// invalidate the other pods, the TTL is the guarantee.
+class TtlCache {
+    String name
+    Long ttlMillis
+    Int maxEntries
+    Map<String,TtlEntry> entries = new ConcurrentHashMap<String, TtlEntry>()
+    Map<String,CacheFlight> flights = new ConcurrentHashMap<String, CacheFlight>()
+    AtomicLong hitCount = new AtomicLong(0L)
+    AtomicLong missCount = new AtomicLong(0L)
+    ReentrantLock staleLock = new ReentrantLock()
+    Log log = Log("kernel.cache")
+    public constructor(name: String, ttlMillis: Long, maxEntries: Int) {
+        this.name = name
+        this.ttlMillis = ttlMillis
+        this.maxEntries = maxEntries
+    }
+    // The fresh value, or null (an expired entry is dropped).
+    String? get(key: String) {
+        var e = entries.get(key)
+        if (e == null) {
+            missCount.incrementAndGet()
+            return null
+        }
+        if (e.expiresAt <= Time.nowMillis()) {
+            var dropped = entries.remove(key)
+            missCount.incrementAndGet()
+            return null
+        }
+        hitCount.incrementAndGet()
+        return e.value
+    }
+    put(key: String, value: String) {
+        entries.put(key, TtlEntry(value, Time.nowMillis() + ttlMillis))
+        this.trim()
+    }
+    // Atomic "first writer wins": true when `key` had no fresh entry and now holds `value`
+    // (ContentDuplicationGuard: the same text inside the window is a duplicate).
+    Bool add(key: String, value: String) {
+        var now = Time.nowMillis()
+        var fresh = TtlEntry(value, now + ttlMillis)
+        var previous = entries.putIfAbsent(key, fresh)
+        if (previous == null) {
+            this.trim()
+            return true
+        }
+        if (previous.expiresAt > now) {
+            return false
+        }
+        // Stale: replace it under the lock so two racing callers cannot both win (the Kof Map has no
+        // conditional remove/replace: KOF_GAPS G31).
+        staleLock.lock()
+        var latest = entries.get(key)
+        var won = true
+        if (latest != null) {
+            if (latest.expiresAt > now) {
+                won = false
+            }
+        }
+        if (won) {
+            entries.put(key, fresh)
+        }
+        staleLock.unlock()
+        if (won) {
+            this.trim()
+        }
+        return won
+    }
+    // Cached value, or `loader`'s result stored for next time. Callers racing on a missing/expired key
+    // share ONE loader run; a loader failure reaches all of them and nothing is cached. Do not call
+    // another getOrLoad from inside a loader.
+    String getOrLoad(key: String, loader: () -> String) {
+        var cached = this.get(key)
+        if (cached != null) {
+            return cached
+        }
+        var mine = new CacheFlight()
+        var running = flights.putIfAbsent(key, mine)
+        if (running != null) {
+            running.done.await()
+            if (running.failed) {
+                throw running.failure
+            }
+            return running.value
+        }
+        // Another caller may have finished between our get and the registration.
+        var again = this.get(key)
+        if (again != null) {
+            mine.value = again
+            mine.done.countDown()
+            var released = flights.remove(key)
+            return again
+        }
+        try {
+            mine.value = loader()
+            this.put(key, mine.value)
+        } catch (String e) {
+            mine.failed = true
+            mine.failure = e
+        }
+        mine.done.countDown()
+        var finished = flights.remove(key)
+        if (mine.failed) {
+            throw mine.failure
+        }
+        return mine.value
+    }
+    evict(key: String) {
+        var removed = entries.remove(key)
+    }
+    clear() {
+        entries.clear()
+    }
+    // CacheInvalidator.evictAfterCommit / afterCommit: invalidate only when (and if) the transaction
+    // commits, so the cache never serves the result of a rolled back write. Outside a transaction it
+    // happens at once.
+    evictAfterCommit(database: Db, key: String) {
+        var self = this
+        database.afterCommit(() -> {
+    self.evict(key)
+})
+    }
+    clearAfterCommit(database: Db) {
+        var self = this
+        database.afterCommit(() -> {
+    self.clear()
+})
+    }
+    Int size() = entries.size()
+    Long hits() = hitCount.get()
+    Long misses() = missCount.get()
+    // Size cap: drop what is stale, then the entries that expire first.
+    trim() {
+        if (entries.size() > maxEntries) {
+            this.evictOverflow()
+        }
+    }
+    evictOverflow() {
+        this.dropStale()
+        var more = true
+        while (more) {
+            if (entries.size() > maxEntries) {
+                more = this.dropSoonest()
+            }
+            else {
+                more = false
+            }
+        }
+    }
+    dropStale() {
+        var now = Time.nowMillis()
+        for (var k in entries.keys()) {
+            var e = entries.get(k)
+            if (e != null && e.expiresAt <= now) {
+                var dropped = entries.remove(k)
+            }
+        }
+    }
+    Bool dropSoonest() {
+        var victim = this.soonestToExpire()
+        if (victim == "") {
+            return false
+        }
+        var removed = entries.remove(victim)
+        return true
+    }
+    // Key of the entry that expires first ("" when empty).
+    String soonestToExpire() {
+        var best = ""
+        var bestAt = 0L
+        for (var k in entries.keys()) {
+            var e = entries.get(k)
+            if (e != null && (best == "" || e.expiresAt < bestAt)) {
+                best = k
+                bestAt = e.expiresAt
+            }
+        }
+        return best
+    }
+}

@@ -1,0 +1,228 @@
+package kernel.url
+
+import kernel.text.*
+
+// Collects every string value of a JSON document with the name of the property that holds it (array
+// elements keep the property of the array, the root is "texto"), decoded: `j` is `j`. Kof cannot
+// walk a Jackson tree (KOF_GAPS G21) and `json.decode<T>` needs a concrete type, so this is a small
+// recursive-descent reader. `malformed` is set for any syntax error or nesting deeper than 1000.
+class JsonStrings {
+    String text
+    Int pos = 0
+    Bool malformed = false
+    List<String> fields = listOf<String>()
+    List<String> values = listOf<String>()
+    public constructor(text: String) {
+        this.text = text
+    }
+    walk() {
+        this.skipSpace()
+        this.value("texto", 0)
+        this.skipSpace()
+        if (!malformed && pos < text.length()) {
+            malformed = true
+        }
+    }
+    Bool more() = !malformed && pos < text.length()
+    skipSpace() {
+        while (pos < text.length() && JsonStrings.isSpace(text.charAt(pos))) {
+            pos = pos + 1
+        }
+    }
+    static Bool isSpace(c: Char) = c == ' ' || c == '\n' || c == '\r' || c == '\t'
+    value(field: String, depth: Int) {
+        if (depth > 1000 || pos >= text.length()) {
+            malformed = true
+            return
+        }
+        var c = text.charAt(pos)
+        if (c == '\"') {
+            var s = this.readString()
+            if (!malformed) {
+                fields.add(field)
+                values.add(s)
+            }
+        }
+        else {
+            if (c == '{') {
+                this.readObject(depth)
+            }
+            else {
+                if (c == '[') {
+                    this.readArray(field, depth)
+                }
+                else {
+                    this.readLiteral()
+                }
+            }
+        }
+    }
+    readObject(depth: Int) {
+        pos = pos + 1
+        this.skipSpace()
+        if (this.more() && text.charAt(pos) == '}') {
+            pos = pos + 1
+            return
+        }
+        var going = true
+        while (going && !malformed) {
+            this.skipSpace()
+            if (pos >= text.length() || text.charAt(pos) != '\"') {
+                malformed = true
+            }
+            else {
+                var key = this.readString()
+                this.skipSpace()
+                if (pos >= text.length() || text.charAt(pos) != ':') {
+                    malformed = true
+                }
+                else {
+                    pos = pos + 1
+                    this.skipSpace()
+                    this.value(key, depth + 1)
+                    this.skipSpace()
+                    if (pos >= text.length()) {
+                        malformed = true
+                    }
+                    else {
+                        var next = text.charAt(pos)
+                        pos = pos + 1
+                        if (next == '}') {
+                            going = false
+                        }
+                        else {
+                            if (next != ',') {
+                                malformed = true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    readArray(field: String, depth: Int) {
+        pos = pos + 1
+        this.skipSpace()
+        if (this.more() && text.charAt(pos) == ']') {
+            pos = pos + 1
+            return
+        }
+        var going = true
+        while (going && !malformed) {
+            this.skipSpace()
+            this.value(field, depth + 1)
+            this.skipSpace()
+            if (pos >= text.length()) {
+                malformed = true
+            }
+            else {
+                var next = text.charAt(pos)
+                pos = pos + 1
+                if (next == ']') {
+                    going = false
+                }
+                else {
+                    if (next != ',') {
+                        malformed = true
+                    }
+                }
+            }
+        }
+    }
+    // number, true, false, null: skipped up to the next delimiter and checked to be non-empty.
+    readLiteral() {
+        var start = pos
+        while (pos < text.length() && !JsonStrings.isDelimiter(text.charAt(pos))) {
+            pos = pos + 1
+        }
+        if (pos == start) {
+            malformed = true
+        }
+    }
+    static Bool isDelimiter(c: Char) = c == ',' || c == '}' || c == ']' || JsonStrings.isSpace(c)
+    // Reads a string starting at the opening quote; decodes the escapes.
+    String readString() {
+        pos = pos + 1
+        var out = new StringBuilder()
+        var closed = false
+        while (!closed && !malformed) {
+            if (pos >= text.length()) {
+                malformed = true
+            }
+            else {
+                var c = text.charAt(pos)
+                if (c == '\"') {
+                    closed = true
+                    pos = pos + 1
+                }
+                else {
+                    if (c == '\\') {
+                        this.readEscape(out)
+                    }
+                    else {
+                        Regexes.add(out, text.substring(pos, pos + 1))
+                        pos = pos + 1
+                    }
+                }
+            }
+        }
+        return out.toString()
+    }
+    readEscape(out: StringBuilder) {
+        if (pos + 1 >= text.length()) {
+            malformed = true
+            return
+        }
+        var e = text.charAt(pos + 1)
+        pos = pos + 2
+        if (e == 'n') {
+            Regexes.add(out, "\n")
+        }
+        else {
+            if (e == 't') {
+                Regexes.add(out, "\t")
+            }
+            else {
+                if (e == 'r') {
+                    Regexes.add(out, "\r")
+                }
+                else {
+                    if (e == 'b') {
+                        Regexes.add(out, "b")
+                    }
+                    else {
+                        if (e == 'f') {
+                            Regexes.add(out, "f")
+                        }
+                        else {
+                            if (e == 'u') {
+                                this.readUnicode(out)
+                            }
+                            else {
+                                if (e == '\"' || e == '\\' || e == '/') {
+                                    Regexes.add(out, text.substring(pos - 1, pos))
+                                }
+                                else {
+                                    malformed = true
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    readUnicode(out: StringBuilder) {
+        if (pos + 4 > text.length()) {
+            malformed = true
+            return
+        }
+        var hex = text.substring(pos, pos + 4)
+        pos = pos + 4
+        if (!hex.matches("[0-9a-fA-F]{4}")) {
+            malformed = true
+            return
+        }
+        Regexes.add(out, "" + (Integer.parseInt(hex, 16) as Char))
+    }
+}

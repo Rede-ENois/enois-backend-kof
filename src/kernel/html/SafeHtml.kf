@@ -1,0 +1,404 @@
+package kernel.html
+
+import java.util.regex.Matcher
+import java.util.regex.Pattern
+import kernel.error.*
+import kernel.text.*
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+import org.jsoup.safety.Cleaner
+import org.jsoup.safety.Safelist
+
+// Sanitising of the HTML pages users publish (page posts, profile bio, project cards, blog): port of
+// shared/html/SafeHtml, same allowlist, same CSS cleaning, same limits and error codes.
+//
+//   var clean = SafeHtml.sanitizePageHtml(raw)          // null when nothing useful is left
+//   var bio = SafeHtml.requireProfileHtml(raw)          // 400 INVALID_PROFILE_HTML when nothing is left
+//
+// Strategy: jsoup Safelist for tags/attributes/protocols (event attributes and javascript: die),
+// then CSS cleaning (no @import, expression(), behavior, image-set, url() other than data:), `<style>`
+// blocks extracted, cleaned and prepended, provider-only embeds, controlled link target/rel, SVG
+// references limited to the own document. Every scan is linear (see the cost tests).
+// Replacements are literal (kernel.text.Regexes): a `$` or `\` in the input is never a group reference.
+class SafeHtml {
+    static Int maxPageHtml() = 200000
+    static Int maxProfileHtml() = 20000
+    static Int maxProjectHtml() = 200000
+    static Int maxBlogHtml() = 20000
+    // Raw input cut before parsing: avoids CPU on a giant paste. Above the limit because cleaning shrinks markup.
+    static Int maxRawInput() = 400000
+    // CSS accepted by the cleaner; a 64 KB stylesheet is already hostile input, so above it is refused.
+    static Int maxCssInput() = 64000
+    static Safelist? allowlist = null
+    static Pattern styleImport() = Pattern.compile("(?is)@import\\b[^;]*;?")
+    // The dangerous CSS token (the word, not the whole declaration; see stripDangerous). `behavior:`
+    // is behind a lookbehind so `scroll-behavior: smooth` survives.
+    static Pattern dangerousToken() = Pattern.compile("(?is)expression\\s*\\(|javascript\\s*:\\s*|vbscript\\s*:|-moz-binding\\s*:|(?<![a-zA-Z-])behavior\\s*:|image-set\\s*\\(")
+    // CSS escape: a backslash plus 1-6 hex digits (and one optional whitespace), or plus any other char.
+    static Pattern cssEscape() = Pattern.compile("\\\\(?:([0-9a-fA-F]{1,6})[ \\t\\r\\n\\f]?|([^0-9a-fA-F\\r\\n\\f]))")
+    // url(...) with possessive classes that exclude `(` and quotes: the scan stops at the first delimiter.
+    static Pattern styleUrl() = Pattern.compile("(?is)url\\s*\\(\\s*(?:\"([^\"]*+)\"|\'([^\']*+)\'|([^\'\"()]*+))\\s*\\)")
+    static Pattern styleAttribute() = Pattern.compile("(?is)\\sstyle\\s*=\\s*(\"([^\"]*)\"|\'([^\']*)\')")
+    static Pattern embedTag() = Pattern.compile("(?is)<(?:iframe|embed|object)\\b[^>]*?(?:src|data)\\s*=\\s*(?:\"([^\"]*)\"|\'([^\']*)\')[^>]*>")
+    static Pattern providerEmbedUrl() = Pattern.compile("(?i)^https://(?:www\\.)?(?:youtube\\.com|youtube-nocookie\\.com|youtu\\.be|player\\.vimeo\\.com|vimeo\\.com|dailymotion\\.com|dai\\.ly|player\\.twitch\\.tv|twitch\\.tv|open\\.spotify\\.com|w\\.soundcloud\\.com|soundcloud\\.com)/[^\\s\"\'<>]*$")
+    // Something shaped like an HTML entity inside an embed address: whoever writes one is trying to
+    // close the attribute and write markup.
+    static Pattern entityLike() = Pattern.compile("&(?:#[0-9]+|[a-zA-Z][a-zA-Z0-9]{1,30});")
+    static Pattern iframeTag() = Pattern.compile("(?is)<iframe\\b[^>]*>")
+    static Pattern iframeSrc() = Pattern.compile("(?is)\\ssrc\\s*=\\s*(\"([^\"]*)\"|\'([^\']*)\')")
+    static Pattern linkTag() = Pattern.compile("(?is)<a\\b[^>]*>")
+    static Pattern svgRefTag() = Pattern.compile("(?is)<(?:use|mpath)\\b[^>]*>")
+    static Pattern hrefAttribute() = Pattern.compile("(?is)\\s(?:xlink:)?href\\s*=\\s*(?:\"([^\"]*)\"|\'([^\']*)\')")
+    static String? sanitizePageHtml(raw: String?) = SafeHtml.sanitize(raw, SafeHtml.maxPageHtml(), "PAGE_HTML_TOO_LONG", "HTML da pagina")
+    // Required HTML (PAGE posts): same cleaning, but refuses when nothing is left.
+    static String requirePageHtml(raw: String?) {
+        var sanitized = SafeHtml.sanitizePageHtml(raw)
+        if (sanitized == null) {
+            throw Errors.api(400, "INVALID_PAGE_HTML", "Pagina precisa de HTML valido.")
+        }
+        return sanitized
+    }
+    static String? sanitizeProfileHtml(raw: String?) = SafeHtml.sanitize(raw, SafeHtml.maxProfileHtml(), "PROFILE_HTML_TOO_LONG", "HTML do perfil")
+    static String? sanitizeProjectHtml(raw: String?) = SafeHtml.sanitize(raw, SafeHtml.maxProjectHtml(), "PROJECT_HTML_TOO_LONG", "HTML do projeto")
+    static String requireProfileHtml(raw: String?) {
+        var sanitized = SafeHtml.sanitizeProfileHtml(raw)
+        if (sanitized == null) {
+            throw Errors.api(400, "INVALID_PROFILE_HTML", "Bio em HTML precisa de conteudo valido.")
+        }
+        return sanitized
+    }
+    static String? sanitizeBlogHtml(raw: String?) = SafeHtml.sanitize(raw, SafeHtml.maxBlogHtml(), "BLOG_HTML_TOO_LONG", "HTML do blog")
+    static String requireBlogHtml(raw: String?) {
+        var sanitized = SafeHtml.sanitizeBlogHtml(raw)
+        if (sanitized == null) {
+            throw Errors.api(400, "INVALID_BLOG_HTML", "Post do blog precisa de HTML valido.")
+        }
+        return sanitized
+    }
+    // The cleaning itself, shared by page, profile, project and blog: allowlist of tags/attributes,
+    // restricted protocols, CSS without import/expression/remote url, and the length limit applied to
+    // the RESULT (the value that is stored and rendered). Null when nothing useful is left.
+    static String? sanitize(raw: String?, maxLength: Int, tooLongCode: String, label: String) {
+        if (raw == null) {
+            return null
+        }
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        if (raw.length() > SafeHtml.maxRawInput()) {
+            throw Errors.api(400, tooLongCode, label + " e grande demais.")
+        }
+        var document = SafeHtml.splitStyles(raw)
+        var css = SafeHtml.sanitizeCss(document.css())
+        var withMarkers = Regexes.replaceAll(SafeHtml.embedTag(), document.markup(), (m: Matcher) -> SafeHtml.keepProviderEmbed(SafeHtml.firstOf(m, 1, 2)))
+        var clean = new Cleaner(SafeHtml.pageAllowlist()).clean(Jsoup.parse(withMarkers))
+        clean.outputSettings().prettyPrint(false)
+        SafeHtml.normalizeAutoplay(clean)
+        var markup = SafeHtml.hardenSvgReferences(SafeHtml.hardenLinks(SafeHtml.dropUnknownIframes(clean.body().html().trim())))
+        var result = SafeHtml.sanitizeStyleAttributes(markup)
+        if (css.length() > 0) {
+            result = "<style>" + css + "</style>" + result
+        }
+        if (result.length() > maxLength) {
+            throw Errors.api(400, tooLongCode, label + " deve ter no maximo " + maxLength + " caracteres.")
+        }
+        if (result.length() == 0) {
+            return null
+        }
+        return result
+    }
+    // The first of two alternative groups that took part in the match ("" when neither did).
+    static String firstOf(m: Matcher, a: Int, b: Int) {
+        if (Regexes.hasGroup(m, a)) {
+            return Regexes.group(m, a)
+        }
+        return Regexes.group(m, b)
+    }
+    // Keeps a known provider embed with its validated address; any other host is dropped. The page is
+    // served from a separate content origin without scripts of its own: the provider's player script
+    // runs inside the provider's frame, which gives no access to the app.
+    static String keepProviderEmbed(url: String) {
+        if (url.length() == 0) {
+            return ""
+        }
+        if (!SafeHtml.providerEmbedUrl().matcher(url).matches() || SafeHtml.entityLike().matcher(url).find()) {
+            return ""
+        }
+        return "<iframe src=\"" + SafeHtml.escapeAttribute(url) + "\" allow=\"autoplay; fullscreen; encrypted-media\" allowfullscreen loading=\"lazy\" referrerpolicy=\"no-referrer\"></iframe>"
+    }
+    // Minimal attribute-value escape: `&` first, or the others would be re-escaped.
+    static String escapeAttribute(value: String) = value.replace("&", "&amp;").replace("\"", "&quot;").replace("\'", "&#39;").replace("<", "&lt;").replace(">", "&gt;")
+    // An iframe that is not a known provider embed is dropped (the allowlist permits `iframe` only so
+    // the rewritten provider frames survive; `srcdoc` already fell to the cleaner).
+    static String dropUnknownIframes(markup: String) = Regexes.replaceAll(SafeHtml.iframeTag(), markup, (m: Matcher) -> SafeHtml.keepIframe(m.group(0) as String))
+    static String keepIframe(tag: String) {
+        var src = SafeHtml.iframeSrc().matcher(tag)
+        if (!src.find()) {
+            return ""
+        }
+        var url = SafeHtml.firstOf(src, 2, 3)
+        if (url.length() > 0 && SafeHtml.providerEmbedUrl().matcher(url).matches() && !SafeHtml.entityLike().matcher(url).find()) {
+            return tag
+        }
+        return ""
+    }
+    // Author-requested autoplay needs help to actually happen: a video with sound never autoplays, so
+    // it gets muted + playsinline; audio gets controls as the fallback. A complete pair is not rewritten.
+    static normalizeAutoplay(clean: Document) {
+        clean.select("video[autoplay]:not([muted])").attr("muted", "muted")
+        clean.select("video[autoplay]:not([playsinline])").attr("playsinline", "playsinline")
+        clean.select("audio[autoplay]:not([controls])").attr("controls", "controls")
+    }
+    // Link target and rel are decided by us, never by the author (`_top` exists).
+    static String hardenLinks(markup: String) = Regexes.replaceAll(SafeHtml.linkTag(), markup, (m: Matcher) -> SafeHtml.hardenLinkTag(m.group(0) as String))
+    static String hardenLinkTag(raw: String) {
+        var tag = raw.replaceAll("(?i)\\s(?:target|rel)\\s*=\\s*(\"[^\"]*\"|\'[^\']*\'|[^\\s>]+)", "")
+        return tag.replaceFirst("(?i)<a\\b", "<a target=\"_blank\" rel=\"noopener noreferrer\"")
+    }
+    // `<use>`/`<mpath>` only reference the OWN document (`href="#id"`): an external address would make
+    // the reader's browser fetch another file. `<image>` follows the <img> rule (https/data).
+    static String hardenSvgReferences(markup: String) = Regexes.replaceAll(SafeHtml.svgRefTag(), markup, (m: Matcher) -> SafeHtml.hardenSvgTag(m.group(0) as String))
+    static String hardenSvgTag(tag: String) = Regexes.replaceAll(SafeHtml.hrefAttribute(), tag, (h: Matcher) -> SafeHtml.keepLocalHref(h))
+    static String keepLocalHref(h: Matcher) {
+        var url = SafeHtml.firstOf(h, 1, 2)
+        if (url.trim().startsWith("#")) {
+            return h.group(0) as String
+        }
+        return ""
+    }
+    // Splits the pasted document into markup (without the `<style>` blocks) and the joined stylesheet.
+    // Indices only move forward and a missing close ends the search at once: linear.
+    static StyleSplit splitStyles(raw: String) {
+        var lower = raw.toLowerCase()
+        var markup = new StringBuilder()
+        var css = new StringBuilder()
+        var cursor = 0
+        var search = 0
+        var done = false
+        while (!done) {
+            var open = lower.indexOf("<style", search)
+            if (open < 0) {
+                done = true
+            }
+            else {
+                if (!SafeHtml.isStyleOpen(lower, open)) {
+                    search = open + 6
+                }
+                else {
+                    var openEnd = lower.indexOf(">", open)
+                    if (openEnd < 0) {
+                        done = true
+                    }
+                    else {
+                        var close = lower.indexOf("</style", openEnd)
+                        if (close < 0) {
+                            done = true
+                        }
+                        else {
+                            var closeEnd = lower.indexOf(">", close)
+                            if (closeEnd < 0) {
+                                done = true
+                            }
+                            else {
+                                Regexes.add(markup, raw.substring(cursor, open))
+                                Regexes.add(css, raw.substring(openEnd + 1, close))
+                                Regexes.add(css, "\n")
+                                cursor = closeEnd + 1
+                                search = cursor
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Regexes.add(markup, raw.substring(cursor))
+        return StyleSplit(markup.toString(), css.toString())
+    }
+    // `<style>` and not `<styleX>`: the tag name ends at `>`, `/` or whitespace.
+    static Bool isStyleOpen(lower: String, open: Int) {
+        var after = open + 6
+        if (after >= lower.length()) {
+            return true
+        }
+        var next = lower.charAt(after)
+        return next == '>' || next == '/' || Character.isWhitespace(next)
+    }
+    // Removes from the CSS what can leave the box: remote import, expression and non-data url().
+    static String sanitizeCss(css: String) {
+        if (css.trim().length() == 0) {
+            return ""
+        }
+        if (css.length() > SafeHtml.maxCssInput()) {
+            throw Errors.api(400, "CSS_TOO_LONG", "CSS deve ter no maximo " + SafeHtml.maxCssInput() + " caracteres.")
+        }
+        var out = SafeHtml.stripComments(css)
+        out = SafeHtml.decodeIdentifierEscapes(out).replace("<", "")
+        out = SafeHtml.styleImport().matcher(out).replaceAll("")
+        out = SafeHtml.stripDangerous(out)
+        // CSS only loads `data:`: a remote url() is an invisible request that tells the address owner
+        // the page was opened. A remote image stays possible through <img>, visible in the markup.
+        out = Regexes.replaceAll(SafeHtml.styleUrl(), out, (m: Matcher) -> SafeHtml.keepDataUrl(m))
+        return out.trim()
+    }
+    static String keepDataUrl(m: Matcher) {
+        var target = SafeHtml.firstOf(m, 1, 2)
+        if (!Regexes.hasGroup(m, 1) && !Regexes.hasGroup(m, 2)) {
+            target = Regexes.group(m, 3)
+        }
+        if (target.trim().toLowerCase().startsWith("data:")) {
+            return m.group(0) as String
+        }
+        return ""
+    }
+    // Strips `/* ... */` in one pass (a regex with `.*?` re-reads the rest of the sheet per opening).
+    static String stripComments(css: String) {
+        var open = css.indexOf("/*")
+        if (open < 0) {
+            return css
+        }
+        var out = new StringBuilder()
+        var from = 0
+        while (open >= 0) {
+            Regexes.add(out, css.substring(from, open))
+            var close = css.indexOf("*/", open + 2)
+            if (close < 0) {
+                return out.toString()
+            }
+            from = close + 2
+            open = css.indexOf("/*", from)
+        }
+        Regexes.add(out, css.substring(from))
+        return out.toString()
+    }
+    // Deletes the whole declaration holding a dangerous token: from the last `;`/`{`/`}` before it to the
+    // next one, `;` included. O(N): the backward scan never crosses what was already copied.
+    static String stripDangerous(css: String) {
+        var matcher = SafeHtml.dangerousToken().matcher(css)
+        var out = new StringBuilder()
+        var used = false
+        var copied = 0
+        while (matcher.find()) {
+            // A token inside the already deleted stretch: scanning on would re-read the rest of the sheet.
+            if (matcher.start() >= copied) {
+                var start = SafeHtml.declarationStart(css, matcher.start(), copied)
+                var end = SafeHtml.declarationEnd(css, matcher.end())
+                if (end > start) {
+                    used = true
+                    Regexes.add(out, css.substring(copied, start))
+                    copied = end
+                }
+            }
+        }
+        if (!used) {
+            return css
+        }
+        Regexes.add(out, css.substring(copied))
+        return out.toString()
+    }
+    static Int declarationStart(css: String, index: Int, floor: Int) {
+        var start = index
+        while (start > floor && !SafeHtml.isBoundary(css.charAt(start - 1))) {
+            start = start - 1
+        }
+        return start
+    }
+    static Int declarationEnd(css: String, from: Int) {
+        var end = from
+        while (end < css.length() && !SafeHtml.isBoundary(css.charAt(end))) {
+            end = end + 1
+        }
+        if (end < css.length() && css.charAt(end) == ';') {
+            end = end + 1
+        }
+        return end
+    }
+    static Bool isBoundary(c: Char) = c == ';' || c == '{' || c == '}'
+    // Escapes (and comments) let a name be spelled so the filters do not see it (a backslash-escaped
+    // `url(`) while the browser still reads it. Escapes standing for a name character are decoded so
+    // every check runs on what the browser sees; others (quotes, newlines, `content`) stay as written.
+    static String decodeIdentifierEscapes(css: String) = Regexes.replaceAll(SafeHtml.cssEscape(), css, (m: Matcher) -> SafeHtml.decodeEscape(m))
+    static String decodeEscape(m: Matcher) {
+        var codePoint = 0
+        if (Regexes.hasGroup(m, 1)) {
+            codePoint = Integer.parseInt(Regexes.group(m, 1), 16)
+        }
+        else {
+            codePoint = Regexes.group(m, 2).charAt(0) as Int
+        }
+        if (codePoint < 128 && SafeHtml.isNameChar(codePoint)) {
+            return "" + (codePoint as Char)
+        }
+        return m.group(0) as String
+    }
+    static Bool isNameChar(c: Int) = c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 45 || c == 95
+    static String sanitizeStyleAttributes(markup: String) = Regexes.replaceAll(SafeHtml.styleAttribute(), markup, (m: Matcher) -> SafeHtml.cleanStyleAttribute(m))
+    static String cleanStyleAttribute(m: Matcher) {
+        var value = SafeHtml.firstOf(m, 2, 3)
+        var cleaned = SafeHtml.sanitizeCss(value).replace("\"", "\'").replace("&quot;", "\'")
+        if (cleaned.length() == 0) {
+            return ""
+        }
+        return " style=\"" + cleaned + "\""
+    }
+    // The markup allowlist. Without the protocol rules jsoup accepts any scheme, javascript: included.
+    static Safelist pageAllowlist() {
+        var cached = SafeHtml.allowlist
+        if (cached != null) {
+            return cached
+        }
+        var list = SafeHtml.buildAllowlist()
+        SafeHtml.allowlist = list
+        return list
+    }
+    static Safelist buildAllowlist() {
+        var s = new Safelist()
+        // Varargs need the array spelled out (KOF_GAPS G2): words() splits a space separated list.
+        s.addTags(SafeHtml.words("a abbr article aside audio b blockquote br caption cite code iframe col colgroup dd del details dfn div dl dt em figcaption figure footer h1 h2 h3 h4 h5 h6 header hr i img ins kbd li main mark ol p picture pre q s samp section small source span strong sub summary sup table tbody td tfoot th thead time tr track u ul video wbr"))
+        s.addAttributes(":all", SafeHtml.words("class style title dir lang align width height data-enois-embed"))
+        s.addAttributes("a", SafeHtml.words("href"))
+        s.addAttributes("img", SafeHtml.words("src alt loading"))
+        s.addAttributes("iframe", SafeHtml.words("src allow allowfullscreen loading referrerpolicy"))
+        s.addAttributes("video", SafeHtml.words("src poster controls autoplay preload loop muted playsinline"))
+        s.addAttributes("audio", SafeHtml.words("src controls autoplay preload loop muted"))
+        s.addAttributes("source", SafeHtml.words("src type media"))
+        s.addAttributes("track", SafeHtml.words("src kind srclang label default"))
+        s.addAttributes("ol", SafeHtml.words("start type reversed"))
+        s.addAttributes("li", SafeHtml.words("value"))
+        s.addAttributes("table", SafeHtml.words("border cellpadding cellspacing"))
+        s.addAttributes("td", SafeHtml.words("colspan rowspan headers"))
+        s.addAttributes("th", SafeHtml.words("colspan rowspan scope headers"))
+        s.addProtocols("a", "href", SafeHtml.words("http https mailto"))
+        // Media and documents only over https (or embedded as data:); `http` would be blocked as mixed content.
+        s.addProtocols("img", "src", SafeHtml.words("https data"))
+        s.addProtocols("video", "src", SafeHtml.words("https data"))
+        s.addProtocols("video", "poster", SafeHtml.words("https data"))
+        s.addProtocols("audio", "src", SafeHtml.words("https data"))
+        s.addProtocols("source", "src", SafeHtml.words("https data"))
+        s.addProtocols("track", "src", SafeHtml.words("https"))
+        // The iframe src passes only over https; the host check happened before (keepProviderEmbed).
+        s.addProtocols("iframe", "src", SafeHtml.words("https"))
+        // Inline SVG: inert markup. `script`, `foreignObject` and event attributes stay out.
+        s.addTags(SafeHtml.words("svg g defs symbol use mpath marker pattern mask clippath view path rect circle ellipse line polyline polygon text tspan textpath desc lineargradient radialgradient stop filter fegaussianblur feoffset feblend fecolormatrix fecomposite femerge femergenode feflood fedropshadow feturbulence fedisplacementmap animate animatetransform animatemotion set image"))
+        s.addAttributes(":all", SafeHtml.words("fill fill-opacity fill-rule stroke stroke-width stroke-linecap stroke-linejoin stroke-dasharray stroke-dashoffset stroke-opacity opacity color display visibility transform transform-origin transform-box clip-path clip-rule mask filter vector-effect paint-order mix-blend-mode isolation d x y x1 y1 x2 y2 cx cy r rx ry points viewbox preserveaspectratio pathlength font-family font-size font-weight font-style text-anchor dominant-baseline dx dy rotate letter-spacing text-decoration startoffset textlength lengthadjust offset stop-color stop-opacity gradientunits gradienttransform spreadmethod patternunits patterncontentunits patterntransform in in2 result stddeviation mode values flood-color flood-opacity preservealpha kernelmatrix order radius scale basefrequency numoctaves seed operator k1 k2 k3 k4 markerwidth markerheight refx refy orient markerunits clip-pathunits maskunits maskcontentunits attributename attributetype from to by begin dur end repeatcount repeatdur keytimes keysplines calcmode additive accumulate restart"))
+        // `image`/`use` follow the <img> rule (https or data:); `use` is also cut to document fragments.
+        s.addAttributes("image", SafeHtml.words("href xlink:href"))
+        s.addAttributes("use", SafeHtml.words("href xlink:href"))
+        s.addAttributes("mpath", SafeHtml.words("href xlink:href"))
+        s.addProtocols("image", "href", SafeHtml.words("https data"))
+        s.addProtocols("image", "xlink:href", SafeHtml.words("https data"))
+        return s
+    }
+    static String[] words(list: String) = list.split(" ")
+}
+
+// The pasted document split into markup (no <style> blocks) and the joined stylesheet.
+class StyleSplit {
+    String markupText
+    String cssText
+    public constructor(markupText: String, cssText: String) {
+        this.markupText = markupText
+        this.cssText = cssText
+    }
+    String markup() = markupText
+    String css() = cssText
+}

@@ -1,0 +1,150 @@
+package kernel.search
+
+import kernel.error.*
+
+// Boolean search for list filters (job listings). Accepted syntax:
+//   - loose terms: `java spring` (implicit AND)
+//   - AND / E, OR / OU, NOT / NAO / NÃO
+//   - `-term` excludes, `+term` requires (the implicit AND)
+//   - "exact phrase"
+//   - parentheses: `(java OR kotlin) -estagio`
+// Precedence NOT > AND > OR. The parser never fails: unbalanced quotes or parentheses are read as
+// literal text, because someone typing a search should not get a syntax error. It does limit size
+// (64 terms) and depth (12 parentheses): an absurd expression would become a huge WHERE clause; those
+// answer 400 BAD_REQUEST like the Java IllegalArgumentException (`rejection(raw)` has the reason).
+// Normalisation is only case and spaces: accents are the database collation's business.
+//
+//   var q = BooleanQuery.parse(raw)
+//   if (!q.isEmpty()) { ... walk q.root() (BooleanNode) to build the WHERE clause ... }
+class BooleanQuery {
+    BooleanNode rootNode
+    public constructor(rootNode: BooleanNode) {
+        this.rootNode = rootNode
+    }
+    static Int maxTokens() = 64
+    static Int maxDepth() = 12
+    BooleanNode root() = rootNode
+    Bool isEmpty() = rootNode.kind == "MATCH_ALL"
+    // Why a query is refused ("" when it is fine).
+    static String rejection(raw: String?) {
+        var out = BooleanQuery.attempt(raw)
+        return out.rejected
+    }
+    static BooleanQuery parse(raw: String?) {
+        var out = BooleanQuery.attempt(raw)
+        if (out.rejected != "") {
+            throw Errors.badRequest()
+        }
+        return out.query
+    }
+    static BooleanOutcome attempt(raw: String?) {
+        if (raw == null) {
+            return BooleanOutcome(BooleanQuery(BooleanNode.matchAll()), "")
+        }
+        if (raw.trim().length() == 0) {
+            return BooleanOutcome(BooleanQuery(BooleanNode.matchAll()), "")
+        }
+        var tokens = BooleanQuery.tokenize(raw)
+        if (tokens.size() == 0) {
+            return BooleanOutcome(BooleanQuery(BooleanNode.matchAll()), "")
+        }
+        if (tokens.size() > BooleanQuery.maxTokens()) {
+            return BooleanOutcome(BooleanQuery(BooleanNode.matchAll()), "Busca muito longa: use no maximo " + BooleanQuery.maxTokens() + " termos.")
+        }
+        // A leading ")" is typing noise (") java"): it only ends an open group, so outside it is ignored.
+        var start = 0
+        while (start < tokens.size() && tokens.get(start).kind == "CLOSE") {
+            start = start + 1
+        }
+        var parser = BooleanParser(tokens.subList(start, tokens.size()))
+        var node = parser.parseExpression(0)
+        if (parser.rejection != "") {
+            return BooleanOutcome(BooleanQuery(BooleanNode.matchAll()), parser.rejection)
+        }
+        if (node == null) {
+            return BooleanOutcome(BooleanQuery(BooleanNode.matchAll()), "")
+        }
+        return BooleanOutcome(BooleanQuery(node), "")
+    }
+    static List<BooleanToken> tokenize(raw: String) {
+        var tokens = listOf<BooleanToken>()
+        var index = 0
+        var length = raw.length()
+        while (index < length) {
+            var current = raw.charAt(index)
+            if (Character.isWhitespace(current)) {
+                index = index + 1
+            }
+            else {
+                if (current == '(') {
+                    tokens.add(BooleanToken("OPEN", "("))
+                    index = index + 1
+                }
+                else {
+                    if (current == ')') {
+                        tokens.add(BooleanToken("CLOSE", ")"))
+                        index = index + 1
+                    }
+                    else {
+                        if (current == '\"') {
+                            // Phrase: up to the next quote; unclosed, the rest of the line.
+                            var end = raw.indexOf("\"", index + 1)
+                            var phrase = raw.substring(index + 1)
+                            if (end != -1) {
+                                phrase = raw.substring(index + 1, end)
+                            }
+                            if (phrase.trim().length() > 0) {
+                                tokens.add(BooleanToken("PHRASE", BooleanQuery.normalize(phrase)))
+                            }
+                            if (end == -1) {
+                                index = length
+                            }
+                            else {
+                                index = end + 1
+                            }
+                        }
+                        else {
+                            if (current == '-' || current == '+') {
+                                // "-term" excludes; "+term" only reinforces the implicit AND. A loose sign (end of
+                                // search, before a space or parenthesis) is typing noise; a hyphen inside a word
+                                // ("back-end") never gets here, it is read with the term.
+                                if (index + 1 < length && !BooleanQuery.isBoundary(raw.charAt(index + 1))) {
+                                    if (current == '-') {
+                                        tokens.add(BooleanToken("NOT", "-"))
+                                    }
+                                }
+                                index = index + 1
+                            }
+                            else {
+                                var start = index
+                                while (index < length && !BooleanQuery.isBoundary(raw.charAt(index))) {
+                                    index = index + 1
+                                }
+                                var word = raw.substring(start, index)
+                                tokens.add(BooleanToken(BooleanQuery.classify(word), BooleanQuery.normalize(word)))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return tokens
+    }
+    static Bool isBoundary(c: Char) = Character.isWhitespace(c) || c == '(' || c == ')' || c == '\"'
+    // Operators work in English and Portuguese, always as whole words.
+    static String classify(word: String) {
+        var upper = word.toUpperCase()
+        if (upper == "AND" || upper == "E") {
+            return "AND"
+        }
+        if (upper == "OR" || upper == "OU") {
+            return "OR"
+        }
+        if (upper == "NOT" || upper == "NAO" || upper == "NÃO") {
+            return "NOT"
+        }
+        return "TERM"
+    }
+    // Lower case and collapsed spaces: the form compared with the column text.
+    static String normalize(value: String) = value.trim().toLowerCase().replaceAll("\\s+", " ")
+}

@@ -1,0 +1,35 @@
+package kernel.text
+
+import java.util.regex.Matcher
+import java.util.regex.Pattern
+
+// Defence against pathological text ("travazap"). The classic attack is not an exploit, it is text:
+// thousands of invisible or bidi control characters, stacked combining marks and giant repetitions
+// make the renderer (and the reader's device) choke, and a length limit alone does not help.
+// Removes what is not real text and keeps what is: Arabic, Hebrew and emoji stay.
+//   - bidi controls, zero-width marks and BOM are removed
+//   - combining marks are limited to 5 per base character
+//   - repetitions of the same character are cut to 12
+class PlainText {
+    static Int maxCombining() = 5
+    static Int maxRepeat() = 12
+    static Pattern invisible() = Pattern.compile("[\\u200B-\\u200F\\u202A-\\u202E\\u2066-\\u2069\\u061C\\u00AD\\uFEFF]")
+    static Pattern combiningRun() = Pattern.compile("\\p{M}{6,}")
+    static Pattern repeated() = Pattern.compile("(.)\\1{12,}")
+    // Text without the tricks that freeze reading. Null/blank stay as they are.
+    static String? defuse(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        if (raw.trim().length() == 0) {
+            return raw
+        }
+        var clean = PlainText.invisible().matcher(raw).replaceAll("")
+        clean = PlainText.collapse(clean, PlainText.combiningRun(), PlainText.maxCombining())
+        clean = PlainText.collapse(clean, PlainText.repeated(), PlainText.maxRepeat())
+        return clean
+    }
+    // Cuts the run keeping its first `keep` characters (not erasing the stretch, which would change
+    // what the author wrote, nor letting it through).
+    static String collapse(text: String, pattern: Pattern, keep: Int) = Regexes.replaceAll(pattern, text, (m: Matcher) -> Regexes.group(m, 0).substring(0, keep))
+}

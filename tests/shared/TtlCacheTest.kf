@@ -1,0 +1,205 @@
+import kernel.cache.*
+import kernel.config.*
+import kernel.db.*
+
+class CacheCounter {
+    Int loads = 0
+    hit() {
+        loads = loads + 1
+    }
+}
+
+String cacheLoad(cache: TtlCache, key: String, counter: CacheCounter) = cache.getOrLoad(key, () -> {
+    counter.hit()
+    return "v" + counter.loads
+})
+
+String cacheSlowLoad(cache: TtlCache, key: String, counter: CacheCounter) = cache.getOrLoad(key, () -> {
+    counter.hit()
+    time.sleep(300)
+    return "slow"
+})
+
+String cacheCaught(f: () -> String) {
+    try {
+        return f()
+    } catch (String e) {
+        return e
+    }
+}
+
+String cacheFail() {
+    throw "load exploded"
+}
+
+Db cacheDb() = Db.connect("jdbc:h2:mem:cachetx;MODE=MySQL;DB_CLOSE_DELAY=-1", "sa", "", 3, 1)
+
+test "the first request loads and the next ones reuse the answer" {
+    var cache = TtlCache("t1", 60000L, 10)
+    var counter = CacheCounter()
+    assert(cacheLoad(cache, "k", counter) == "v1")
+    assert(cacheLoad(cache, "k", counter) == "v1")
+    assert(cacheLoad(cache, "k", counter) == "v1")
+    assert(counter.loads == 1)
+    assert(cache.hits() == 2L)
+}
+
+test "an entry expiring does not load anything on its own" {
+    var cache = TtlCache("t2", 300L, 10)
+    var counter = CacheCounter()
+    cacheLoad(cache, "k", counter)
+    time.sleep(500)
+    assert(counter.loads == 1)
+}
+
+test "the first request after expiry renews the entry" {
+    var cache = TtlCache("t3", 300L, 10)
+    var counter = CacheCounter()
+    cacheLoad(cache, "k", counter)
+    time.sleep(500)
+    assert(cacheLoad(cache, "k", counter) == "v2")
+    assert(counter.loads == 2)
+}
+
+test "a write clears the list so the change shows up on the next request" {
+    var cache = TtlCache("t4", 60000L, 10)
+    var counter = CacheCounter()
+    var database = cacheDb()
+    cacheLoad(cache, "list", counter)
+    database.transaction(() -> {
+        cache.clearAfterCommit(database)
+    })
+    cacheLoad(cache, "list", counter)
+    assert(counter.loads == 2)
+}
+
+test "the cache is only cleared after the commit" {
+    var cache = TtlCache("t4b", 60000L, 10)
+    var counter = CacheCounter()
+    var database = cacheDb()
+    cacheLoad(cache, "list", counter)
+    database.transaction(() -> {
+        cache.clearAfterCommit(database)
+        // Still the old answer while the write is not committed.
+        assert(cache.get("list") != null)
+    })
+    assert(cache.get("list") == null)
+}
+
+test "a failed write leaves the cache alone" {
+    var cache = TtlCache("t5", 60000L, 10)
+    var counter = CacheCounter()
+    var database = cacheDb()
+    cacheLoad(cache, "list", counter)
+    var err = cacheCaught(() -> {
+        database.transaction(() -> {
+            cache.clearAfterCommit(database)
+            throw "write refused"
+        })
+        return "no error"
+    })
+    assert(err == "write refused")
+    cacheLoad(cache, "list", counter)
+    assert(counter.loads == 1)
+}
+
+test "evictAfterCommit removes one entry only" {
+    var cache = TtlCache("t5b", 60000L, 10)
+    var database = cacheDb()
+    cache.put("a", "1")
+    cache.put("b", "2")
+    database.transaction(() -> {
+        cache.evictAfterCommit(database, "a")
+    })
+    assert(cache.get("a") == null)
+    assert(cache.get("b") == "2")
+    cache.evictAfterCommit(database, "b")
+    assert(cache.get("b") == null)
+}
+
+test "callers arriving together with an expired entry load once" {
+    var cache = TtlCache("t6", 60000L, 10)
+    var counter = CacheCounter()
+    cacheLoad(cache, "k", counter)
+    cache.clear()
+    var handles = listOf<Handle<String>>()
+    var i = 0
+    while (i < 8) {
+        handles.add(__kof_spawn_expr(cacheSlowLoad(cache, "k", counter)))
+        i = i + 1
+    }
+    for (var h in handles) {
+        assert(__kof_await(h) as String == "slow")
+    }
+    // The first load plus the single renewal, not eight.
+    assert(counter.loads == 2)
+}
+
+test "a failing loader reaches the caller and nothing is cached" {
+    var cache = TtlCache("t7", 60000L, 10)
+    var err = cacheCaught(() -> cache.getOrLoad("k", () -> cacheFail()))
+    assert(err == "load exploded")
+    assert(cache.get("k") == null)
+    var counter = CacheCounter()
+    assert(cacheLoad(cache, "k", counter) == "v1")
+}
+
+test "add is first-writer-wins inside the window" {
+    var cache = TtlCache("t8", 300L, 10)
+    assert(cache.add("k", "1"))
+    assert(!cache.add("k", "1"))
+    time.sleep(500)
+    assert(cache.add("k", "1"))
+}
+
+test "the size cap evicts the entries that expire first" {
+    var cache = TtlCache("t9", 60000L, 3)
+    cache.put("a", "1")
+    time.sleep(5)
+    cache.put("b", "2")
+    time.sleep(5)
+    cache.put("c", "3")
+    time.sleep(5)
+    cache.put("d", "4")
+    assert(cache.size() == 3)
+    assert(cache.get("a") == null)
+    assert(cache.get("d") == "4")
+}
+
+test "the registry declares every cache with a freshness policy" {
+    var caches = Caches.create(Config.of(mapOf("REDE_CACHE_DYNAMIC_TTL", "20s")))
+    for (var name in Caches.names()) {
+        var c = caches.get(name)
+        assert(c.ttlMillis > 0L)
+        assert(c.maxEntries > 0)
+        assert(c.hits() == 0L)
+        assert(c.misses() == 0L)
+        assert(c.size() == 0)
+    }
+    assert(Caches.names().size() == 11)
+    assert(caches.get("eventsList").ttlMillis == 20000L)
+    assert(caches.get("publicProfiles").maxEntries == 5000)
+    assert(caches.get("communityStats").ttlMillis == 600000L)
+    assert(caches.get("externalJobs").ttlMillis == 300000L)
+    assert(caches.get("pagePreviewCards").ttlMillis == 3600000L)
+    assert(caches.get("gifSearch").maxEntries == 200)
+    assert(caches.get("githubReadme").ttlMillis == 180000L)
+    assert(cacheCaught(() -> {
+        caches.get("nope")
+        return "no error"
+    }).startsWith("CACHE_UNKNOWN"))
+}
+
+test "ttl and size can be overridden by environment" {
+    var caches = Caches.create(Config.of(mapOf("REDE_CACHE_DYNAMIC_TTL", "5s", "REDE_CACHE_JOBS_LIST_TTL", "2m", "REDE_CACHE_PUBLIC_PROFILES_MAX_ENTRIES", "7")))
+    assert(caches.get("eventsList").ttlMillis == 5000L)
+    assert(caches.get("jobsList").ttlMillis == 120000L)
+    assert(caches.get("publicProfiles").maxEntries == 7)
+    assert(Caches.parseDuration("500ms") == 500L)
+    assert(Caches.parseDuration("1h") == 3600000L)
+    assert(Caches.parseDuration("250") == 250L)
+    assert(cacheCaught(() -> {
+        Caches.parseDuration("soon")
+        return "no error"
+    }).startsWith("CONFIG_INVALID"))
+}

@@ -1,0 +1,117 @@
+import kernel.error.*
+import kernel.html.*
+import kernel.time.*
+
+// The cost is what matters here; refusing by size is an accepted end too.
+Long htmlCost(raw: String) {
+    var started = Time.nowMillis()
+    try {
+        SafeHtml.sanitizeProfileHtml(raw)
+    } catch (String e) {
+        assert(Errors.isApi(e))
+    }
+    return Time.nowMillis() - started
+}
+
+Int costSize() = 60000
+
+test "css without a delimiter finishes fast" {
+    assert(htmlCost("<style>" + strings.repeat("a", costSize()) + "</style><p>ok</p>") < 2000L)
+}
+
+test "an unclosed url finishes fast" {
+    assert(htmlCost("<style>" + strings.repeat("url(", costSize() / 4) + "</style><p>ok</p>") < 2000L)
+}
+
+test "a url closed at the very end finishes fast" {
+    assert(htmlCost("<style>" + strings.repeat("url(", costSize() / 4) + ")</style><p>ok</p>") < 2000L)
+}
+
+test "unclosed style blocks finish fast" {
+    assert(htmlCost(strings.repeat("<style>", costSize() / 7) + "<p>ok</p>") < 2000L)
+}
+
+test "an unclosed comment finishes fast" {
+    assert(htmlCost("<style>" + strings.repeat("/*", costSize() / 2) + "</style><p>ok</p>") < 2000L)
+}
+
+test "a declaration with a dangerous token at the end finishes fast" {
+    assert(htmlCost("<style>" + strings.repeat("a", costSize()) + "expression(x)</style><p>ok</p>") < 2000L)
+}
+
+test "repeated dangerous tokens finish fast" {
+    assert(htmlCost("<style>" + strings.repeat("behavior:url(x);", costSize() / 16) + "</style><p>ok</p>") < 2000L)
+}
+
+test "glued dangerous tokens without a delimiter finish fast" {
+    var payload = "<style>a:" + strings.repeat("expression(x)", 4600) + "</style><p>ok</p>"
+    assert(htmlCost(payload) < 300L)
+}
+
+test "a url with a space in an unquoted argument is refused" {
+    var out = SafeHtml.requireProfileHtml("<style>.a{background:url(foo bar)}</style><p>ok</p>")
+    assert(!out.contains("url("))
+    assert(!out.contains("foo bar"))
+}
+
+test "markup with unclosed tags finishes fast" {
+    assert(htmlCost("<p>ok</p>" + strings.repeat("<a ", costSize() / 3)) < 2000L)
+}
+
+test "css cleaning still holds" {
+    var out = SafeHtml.requireProfileHtml("<style>.a{background:expression(alert(1));} .b{background:url(https://malicioso.test/x.png)} .c{border-image:image-set('a.png')} .d{scroll-behavior:smooth} .e{background:url(data:image/png;base64,AAAA)}</style><p>ok</p>")
+    assert(!out.contains("expression("))
+    assert(!out.contains("image-set("))
+    assert(!out.contains("malicioso.test"))
+    assert(out.contains("scroll-behavior:smooth"))
+    assert(out.contains("data:image/png"))
+}
+
+test "the style block is still extracted" {
+    var out = SafeHtml.requireProfileHtml("<style>.a{color:red}</style><p>ok</p>")
+    assert(out.startsWith("<style>"))
+    assert(out.contains(".a{color:red}"))
+    assert(out.contains("<p>ok</p>"))
+}
+
+test "css above the limit is refused with a message" {
+    var err = ""
+    try {
+        SafeHtml.sanitizeProfileHtml("<style>" + strings.repeat("a", 64010) + "</style><p>ok</p>")
+    } catch (String e) {
+        err = e
+    }
+    assert(err != "")
+    assert(Errors.parse(err).code() == "CSS_TOO_LONG")
+    assert(Errors.parse(err).message().contains("CSS"))
+}
+
+String htmlRun(raw: String) = SafeHtml.requireProfileHtml(raw)
+
+test "concurrent calls do not mix" {
+    var inputs = listOf("<style>.um{color:red}</style><p>um</p>", "<style>.dois{color:blue}</style><p>dois</p>", "<style>.tres{color:green}</style><p>tres</p>", "<style>.quatro{color:black}</style><p>quatro</p>")
+    var names = listOf("um", "dois", "tres", "quatro")
+    var handles = listOf<Handle<String>>()
+    var round = 0
+    while (round < 50) {
+        var k = 0
+        while (k < 4) {
+            var input = inputs.get(k)
+            handles.add(__kof_spawn_expr(htmlRun(input)))
+            k = k + 1
+        }
+        round = round + 1
+    }
+    var i = 0
+    for (var h in handles) {
+        var out = __kof_await(h) as String
+        var expected = names.get(i % 4)
+        assert(out.contains("<p>" + expected + "</p>"))
+        for (var other in names) {
+            if (other != expected) {
+                assert(!out.contains("<p>" + other + "</p>"))
+            }
+        }
+        i = i + 1
+    }
+}

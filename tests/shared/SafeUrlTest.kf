@@ -1,0 +1,203 @@
+import kernel.*
+import kernel.error.*
+import kernel.http.*
+import kernel.testkit.*
+import kernel.url.*
+
+List<String> disguisedScriptUrls() = listOf("javascript:alert(1)", "  JaVaScRiPt:alert(1)", "java\tscript:alert(1)", "java\nscript:alert(1)", "\u0001javascript:alert(1)", "java​script:alert(1)", "java\\script:alert(1)", "vbscript:msgbox(1)", "data:text/html,<script>alert(1)</script>")
+
+record LinkBody(String content)
+
+String linkCode(f: () -> String) {
+    try {
+        return f()
+    } catch (String e) {
+        return Errors.parse(e).code()
+    }
+}
+
+wireLinkProbes(p: Platform) {
+    p.server.post("/link/probe", () -> {
+        SafeLinks.checkRequest()
+        return "{\"ok\":true}"
+    })
+}
+
+class LinkHolder {
+    static TestApp? cached = null
+    static TestApp app() {
+        var cur = LinkHolder.cached
+        if (cur != null) {
+            return cur
+        }
+        var created = TestApp.bootWire("links", (p: Platform) -> wireLinkProbes(p))
+        LinkHolder.cached = created
+        return created
+    }
+}
+
+test "link target allows only http, https, mailto or no scheme" {
+    for (var url in disguisedScriptUrls()) {
+        assert(!SafeUrl.isSafeLinkTarget(url))
+    }
+    for (var url in listOf("https://enois.ia.br", "http://x.test/a?b=c", "mailto:a@b.test", "/perfil/ana", "#topo", "")) {
+        assert(SafeUrl.isSafeLinkTarget(url))
+    }
+    assert(SafeUrl.isSafeLinkTarget(null))
+}
+
+test "a supplementary-plane format character cannot hide the scheme" {
+    // U+E0001 LANGUAGE TAG is a Unicode format character outside the BMP (a surrogate pair).
+    assert(!SafeUrl.isSafeLinkTarget("java󠀁script:alert(1)"))
+}
+
+test "an http(s) url field rejects every disguised script scheme" {
+    for (var site in disguisedScriptUrls()) {
+        var code = linkCode(() -> {
+            SafeUrl.requireHttpUrl(site, "website")
+            return "OK"
+        })
+        assert(code == "INVALID_URL")
+    }
+    assert(SafeUrl.requireHttpUrl("https://linkscheme.test", "website") == "https://linkscheme.test")
+    assert(SafeUrl.requireHttpUrl("  https://a.test/x  ", "website") == "https://a.test/x")
+    assert(SafeUrl.requireHttpUrl("", "website") == "")
+    assert(SafeUrl.requireHttpUrl(null, "website") == null)
+}
+
+test "an http(s) url field rejects the other malformed forms" {
+    for (var bad in listOf("ftp://a.test", "//a.test/x", "https://user:pw@a.test", "https:///x", "not a url", "https://a.test/\u0007x", "http://" + strings.repeat("a", 600) + ".test")) {
+        var code = linkCode(() -> {
+            SafeUrl.requireHttpUrl(bad, "website")
+            return "OK"
+        })
+        assert(code == "INVALID_URL")
+    }
+    var err = ""
+    try {
+        SafeUrl.requireHttpUrl("javascript:1", "site")
+    } catch (String e) {
+        err = e
+    }
+    assert(Errors.parse(err).status() == 400)
+    assert(Errors.parse(err).message() == "O campo site precisa ser um link http(s) valido.")
+}
+
+test "url lists and joined links are validated part by part" {
+    var ok = SafeUrl.requireHttpUrlList(listOf("https://a.test", " https://b.test "), "links")
+    assert(ok != null)
+    if (ok != null) {
+        assert(ok.size() == 2)
+        assert(ok.get(1) == "https://b.test")
+    }
+    assert(SafeUrl.requireHttpUrlList(null, "links") == null)
+    assert(linkCode(() -> {
+        SafeUrl.requireHttpUrlList(listOf("https://a.test", "javascript:1"), "links")
+        return "OK"
+    }) == "INVALID_URL")
+    assert(SafeUrl.requireHttpUrlsJoined("https://a.test,https://b.test", ",", "links") == "https://a.test,https://b.test")
+    assert(linkCode(() -> {
+        SafeUrl.requireHttpUrlsJoined("https://a.test,vbscript:x", ",", "links")
+        return "OK"
+    }) == "INVALID_URL")
+    assert(SafeUrl.requireHttpUrlsJoined(null, ",", "links") == null)
+}
+
+test "markdown links in any text reject script schemes" {
+    for (var url in disguisedScriptUrls()) {
+        if (!url.contains("\n")) {
+            // The destination ends at the first `)`.
+            var target = url.replaceAll("\\(.*", "")
+            var code = linkCode(() -> {
+                SafeUrl.requireSafeMarkdownLinks("veja [aqui](" + target + ") e ![img](" + target + ")", "texto")
+                return "OK"
+            })
+            assert(code == "UNSAFE_LINK")
+        }
+    }
+    var err = ""
+    try {
+        SafeUrl.requireSafeMarkdownLinks("[x](javascript:1)", "bio")
+    } catch (String e) {
+        err = e
+    }
+    assert(Errors.parse(err).status() == 400)
+    assert(Errors.parse(err).message() == "O campo bio tem um link com endereco nao permitido (use http, https ou mailto).")
+}
+
+test "reference-style definitions and html attributes are checked too" {
+    assert(linkCode(() -> {
+        SafeUrl.requireSafeMarkdownLinks("texto\n[ref]: javascript:alert(1)\nmais", "texto")
+        return "OK"
+    }) == "UNSAFE_LINK")
+    assert(linkCode(() -> {
+        SafeUrl.requireSafeMarkdownLinks("<a href=\"javascript:alert(1)\">x</a>", "texto")
+        return "OK"
+    }) == "UNSAFE_LINK")
+    assert(linkCode(() -> {
+        SafeUrl.requireSafeMarkdownLinks("<img src='data:text/html,x'>", "texto")
+        return "OK"
+    }) == "UNSAFE_LINK")
+    assert(linkCode(() -> {
+        SafeUrl.requireSafeMarkdownLinks("Data: amanha. Leia [o guia](https://enois.ia.br/guia) ou [escreva](mailto:a@b.test) e [ancora](#x) [rel](/a/b)\n[ok]: https://x.test", "texto")
+        return "OK"
+    }) == "OK")
+    assert(linkCode(() -> {
+        SafeUrl.requireSafeMarkdownLinks(null, "texto")
+        return "OK"
+    }) == "OK")
+}
+
+test "HTTP: every string of a JSON body is checked, escapes included" {
+    var app = LinkHolder.app()
+    var headers = listOf("Content-Type: application/json")
+    for (var url in disguisedScriptUrls()) {
+        if (!url.contains("\n")) {
+            var target = url.replaceAll("\\(.*", "")
+            var body = json.encode(LinkBody("veja [aqui](" + target + ") e ![img](" + target + ")"))
+            Check.apiError(app.client.send("POST", "/link/probe", headers, "", body), 400, "UNSAFE_LINK")
+        }
+    }
+    // A JSON escape cannot hide the scheme: the check runs on decoded strings.
+    var escaped = "{\"topic\":\"TECNOLOGIA\",\"content\":\"[x](\\u006aavascript:alert(1))\",\"tags\":[],\"mediaIds\":[]}"
+    Check.apiError(app.client.send("POST", "/link/probe", headers, "", escaped), 400, "UNSAFE_LINK")
+    // Nested objects and arrays are walked, with the property name in the message.
+    var nested = "{\"a\":{\"b\":[\"fine\",{\"bio\":\"[x](javascript:1)\"}]}}"
+    var res = app.client.send("POST", "/link/probe", headers, "", nested)
+    Check.apiError(res, 400, "UNSAFE_LINK")
+    Check.isTrue("message names the property", res.jsonStr("message") != null)
+    Check.status(app.client.send("POST", "/link/probe", headers, "", "{\"topic\":\"TECNOLOGIA\",\"content\":\"Data: amanha. Leia [o guia](https://enois.ia.br/guia) ou [escreva](mailto:a@b.test)\",\"tags\":[],\"n\":1.5e3,\"t\":true,\"z\":null}"), 200)
+}
+
+test "HTTP: other content types, empty and malformed bodies are left alone" {
+    var app = LinkHolder.app()
+    var headers = listOf("Content-Type: application/json")
+    Check.status(app.client.send("POST", "/link/probe", listOf("Content-Type: text/plain"), "", "[x](javascript:1)"), 200)
+    Check.status(app.client.send("POST", "/link/probe", headers, "", ""), 200)
+    Check.status(app.client.send("POST", "/link/probe", headers, "", "{\"content\":\"[x](javascript:1)\""), 200)
+    Check.status(app.client.send("POST", "/link/probe", headers, "", "{\"content\": }"), 200)
+    Check.apiError(app.client.send("POST", "/link/probe", listOf("Content-Type: application/vnd.api+json"), "", "{\"c\":\"[x](vbscript:1)\"}"), 400, "UNSAFE_LINK")
+}
+
+test "a JSON body above 2 MB is refused" {
+    var big = "{\"c\":\"" + strings.repeat("a", 2097200) + "\"}"
+    var err = ""
+    try {
+        SafeLinks.checkBody(big)
+    } catch (String e) {
+        err = e
+    }
+    assert(Errors.parse(err).status() == 400)
+    assert(Errors.parse(err).code() == "BAD_REQUEST")
+}
+
+test "decoded escapes are read like Jackson would" {
+    var w = JsonStrings("{\"a\":\"x\\ny\\t\\\"q\\\" \\u0041\\u00e7 \\/\",\"b\":[\"1\",2,{\"c\":\"deep\"}],\"d\":{}}")
+    w.walk()
+    assert(!w.malformed)
+    assert(w.fields.size() == 3)
+    assert(w.values.get(0) == "x\ny\t\"q\" Aç /")
+    assert(w.fields.get(1) == "b")
+    assert(w.values.get(2) == "deep")
+    assert(w.fields.get(2) == "c")
+}

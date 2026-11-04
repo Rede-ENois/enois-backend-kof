@@ -1,0 +1,63 @@
+import kernel.security.*
+
+// RFC 6238 secret "12345678901234567890" in base32.
+String totpSecret() = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+
+test "matches the RFC 6238 test vectors" {
+    var s = totpSecret()
+    assert(Totp.codeAt(s, 59L / 30L).endsWith("94287082".substring(2)))
+    assert(Totp.codeAt(s, 1111111109L / 30L).endsWith("07081804".substring(2)))
+    assert(Totp.codeAt(s, 1111111111L / 30L).endsWith("14050471".substring(2)))
+    assert(Totp.codeAt(s, 1234567890L / 30L).endsWith("89005924".substring(2)))
+    assert(Totp.codeAt(s, 2000000000L / 30L).endsWith("69279037".substring(2)))
+    assert(Totp.codeAt(s, 20000000000L / 30L).endsWith("65353130".substring(2)))
+}
+
+test "accepts the current step and the neighbouring ones only" {
+    var moment = 1111111111L
+    var current = Totp.codeAt(totpSecret(), 1111111111L / 30L)
+    assert(Totp.verifyDefault(totpSecret(), current, moment))
+    assert(Totp.verifyDefault(totpSecret(), current, moment + 30L))
+    assert(Totp.verifyDefault(totpSecret(), current, moment - 30L))
+    assert(!Totp.verifyDefault(totpSecret(), current, moment + 90L))
+    assert(!Totp.verifyDefault(totpSecret(), current, moment - 90L))
+}
+
+test "rejects malformed codes" {
+    var moment = 1111111111L
+    assert(!Totp.verifyDefault(totpSecret(), null, moment))
+    assert(!Totp.verifyDefault(totpSecret(), "", moment))
+    assert(!Totp.verifyDefault(totpSecret(), "12345", moment))
+    assert(!Totp.verifyDefault(totpSecret(), "abcdef", moment))
+    assert(!Totp.verifyDefault(null, "123456", moment))
+}
+
+test "accepts codes typed with spaces" {
+    var current = Totp.codeAt(totpSecret(), 1111111111L / 30L)
+    assert(Totp.verifyDefault(totpSecret(), current.substring(0, 3) + " " + current.substring(3), 1111111111L))
+}
+
+test "matchingStep returns the step of the code, or -1" {
+    var current = Totp.codeAt(totpSecret(), 1111111111L / 30L)
+    assert(Totp.matchingStep(totpSecret(), current, 1111111111L + 30L, 1) == 1111111111L / 30L)
+    assert(Totp.matchingStep(totpSecret(), current, 1111111111L + 90L, 1) == -1L)
+}
+
+test "generated secret is base32 and random" {
+    var first = Totp.generateSecret()
+    var second = Totp.generateSecret()
+    assert(first.length() == 32)
+    assert(first.matches("[A-Z2-7]+"))
+    assert(first != second)
+    assert(Totp.verifyDefault(first, Totp.codeAt(first, 1700000000L / 30L), 1700000000L))
+}
+
+test "otpauth uri carries the parameters authenticators need" {
+    var uri = Totp.otpauthUri("Énóis", "pessoa@example.com", totpSecret())
+    assert(uri.startsWith("otpauth://totp/"))
+    assert(uri.contains("secret=" + totpSecret()))
+    assert(uri.contains("algorithm=SHA1"))
+    assert(uri.contains("digits=6"))
+    assert(uri.contains("period=30"))
+    assert(uri.contains("issuer="))
+}

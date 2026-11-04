@@ -37,7 +37,20 @@ class TestApp {
         overrides.put("DB_URL", "jdbc:h2:mem:" + name + System.nanoTime() + ";MODE=MySQL;DB_CLOSE_DELAY=-1")
         var cfg = Config.of(overrides)
         var platform = Platform.create(cfg)
-        wire(platform)
+        // A failing wire must not leave the pool open: its non-daemon threads would keep the test
+        // process from ever exiting.
+        var wired = true
+        var failure = ""
+        try {
+            wire(platform)
+        } catch (String e) {
+            wired = false
+            failure = e
+        }
+        if (!wired) {
+            platform.stop()
+            throw failure
+        }
         var port = platform.startAsync(0)
         if (port <= 0) {
             throw "TestApp: server did not bind a port"
