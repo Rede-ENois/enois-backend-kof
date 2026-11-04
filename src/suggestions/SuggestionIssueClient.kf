@@ -1,0 +1,92 @@
+package suggestions
+
+import kernel.config.*
+import kernel.http.*
+import kernel.log.*
+import kernel.text.*
+
+// GitHub's answer to POST /repos/{owner}/{repo}/issues: only the two members the app reads.
+record GithubIssueReply(Int? number, String? html_url)
+
+// Opens the public issues of the suggestions. One repository per target, from the environment only; a
+// repository that is missing or not shaped owner/name leaves that target off. The token is the one of the
+// support issues. A network or API failure never propagates and the body of the answer never goes to the log.
+class SuggestionIssueClient extends SuggestionIssueGateway {
+    SuggestionsGithubToken tokens
+    String apiBase
+    Map<String,String> repositories = mapOf<String, String>()
+    Log log = Log("suggestions.github")
+    public constructor(tokens: SuggestionsGithubToken, apiBase: String, backendRepo: String, frontendRepo: String, designSystemRepo: String) {
+        super()
+        this.tokens = tokens
+        this.apiBase = apiBase.trim()
+        this.register("BACKEND", backendRepo)
+        this.register("FRONTEND", frontendRepo)
+        this.register("DESIGN_SYSTEM", designSystemRepo)
+    }
+    static SuggestionIssueClient fromConfig(cfg: Config, tokens: SuggestionsGithubToken) = SuggestionIssueClient(tokens, cfg.getStr("REDE_SUGGESTIONS_GITHUB_API_BASE", "https://api.github.com"), cfg.getStr("GITHUB_SUGGESTIONS_REPO_BACKEND", ""), cfg.getStr("GITHUB_SUGGESTIONS_REPO_FRONTEND", ""), cfg.getStr("GITHUB_SUGGESTIONS_REPO_DESIGN_SYSTEM", ""))
+    register(target: String, repository: String) {
+        var clean = repository.trim()
+        if (Regexes.matches("[\\w.-]+/[\\w.-]+", clean)) {
+            repositories.put(target, clean)
+        }
+        else {
+            if (clean.length() > 0) {
+                log.warn("Repositório de sugestões de " + target + " fora do formato dono/nome; destino desligado.")
+            }
+        }
+    }
+    Bool enabled(target: String) = tokens.token().trim().length() > 0 && repositories.containsKey(target)
+    SuggestionIssueRef? createIssue(target: String, title: String, body: String) {
+        if (!this.enabled(target)) {
+            return null
+        }
+        var repository = repositories.get(target)
+        if (repository == null) {
+            return null
+        }
+        var payload = "{\"title\":" + json.encode(title) + ",\"body\":" + json.encode(body) + "}"
+        var headers = listOf("Accept: application/vnd.github+json", "Authorization: Bearer " + tokens.token().trim(), "X-GitHub-Api-Version: 2022-11-28", "User-Agent: enois-sugestoes/1.0", "Content-Type: application/json")
+        var failed = false
+        var status = 0
+        var text = ""
+        try {
+            var reply = OutboundHttp.postJson(apiBase + "/repos/" + repository + "/issues", headers, payload, 6000)
+            status = reply.status()
+            text = reply.body()
+        } catch (String e) {
+            failed = true
+        }
+        if (failed) {
+            log.warn("Falha ao abrir issue de sugestão (" + target + ")")
+            return null
+        }
+        if (status / 100 != 2) {
+            log.warn("GitHub respondeu " + status + " ao abrir issue de sugestão (" + target + ")")
+            return null
+        }
+        return this.parse(text)
+    }
+    SuggestionIssueRef? parse(text: String) {
+        try {
+            var reply = json.decode<GithubIssueReply>(text)
+            var number = reply.number()
+            if (number == null) {
+                return null
+            }
+            if (number <= 0) {
+                return null
+            }
+            var url = reply.html_url()
+            if (url == null) {
+                return SuggestionIssueRef(number, null)
+            }
+            if (url.trim().length() == 0) {
+                return SuggestionIssueRef(number, null)
+            }
+            return SuggestionIssueRef(number, url)
+        } catch (String e) {
+            return null
+        }
+    }
+}

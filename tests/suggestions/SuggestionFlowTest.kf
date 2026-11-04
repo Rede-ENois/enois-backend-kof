@@ -1,0 +1,246 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import leaves.*
+import suggestions.*
+
+// Port of SuggestionFlowTests (HTTP): a suggestion enters pending, only a moderator approves, and the public
+// issue leaves with nothing about the author. The GitHub gateway is a fake that records what it was asked.
+class FakeIssueGateway extends SuggestionIssueGateway {
+    List<String> enabledTargets = listOf<String>()
+    Bool failIssue = false
+    List<String> targets = listOf<String>()
+    List<String> titles = listOf<String>()
+    List<String> bodies = listOf<String>()
+    Int nextNumber = 77
+    String nextUrl = "https://github.com/org/ds/issues/77"
+    public constructor() {
+        super()
+    }
+    Bool enabled(target: String) = enabledTargets.contains(target)
+    SuggestionIssueRef? createIssue(target: String, title: String, body: String) {
+        targets.add(target)
+        titles.add(title)
+        bodies.add(body)
+        if (failIssue) {
+            return null
+        }
+        return SuggestionIssueRef(nextNumber, nextUrl)
+    }
+}
+
+class SuggestionHolder {
+    static TestApp? app = null
+    static FakeIssueGateway? gateway = null
+}
+
+TestApp suggestionApp() {
+    var cur = SuggestionHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var fake = FakeIssueGateway()
+    SuggestionHolder.gateway = fake
+    LeavesApp.suggestionGatewaySlot = fake
+    var created = LeavesApp.boot("suggestions", mapOf("X", "1"))
+    SuggestionHolder.app = created
+    return created
+}
+
+FakeIssueGateway fake() {
+    var g = SuggestionHolder.gateway
+    if (g == null) {
+        throw "gateway not booted"
+    }
+    return g
+}
+
+List<String> asToken(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+
+String person(app: TestApp, id: String) {
+    var token = "tok-" + id + "-1234567890"
+    if (app.db().queryLong("select count(*) from users where id = ?", DbParams().bindStr(id)) == 0L) {
+        SecurityFixtures.login(app.db(), id, token)
+    }
+    return token
+}
+
+String adminToken(app: TestApp) {
+    var token = person(app, "sgg_admin")
+    app.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr("sgg_admin"))
+    return token
+}
+
+String text() = "{\"target\":\"TARGET\",\"title\":\"Modo escuro nas conversas\",\"body\":\"Seria ótimo ter o modo escuro nas conversas. Ideia de @pessoa para a equipe avaliar.\"}"
+
+String bodyFor(target: String) = text().replace("TARGET", target)
+
+TestResponse send(app: TestApp, method: String, path: String, token: String, payload: String) = app.client.send(method, path, asToken(token), "", payload)
+
+String submit(app: TestApp, token: String, target: String) {
+    var res = send(app, "POST", "/suggestions", token, bodyFor(target))
+    Check.status(res, 201)
+    return "" + res.jsonStr("id")
+}
+
+String statusOf(app: TestApp, token: String, id: String) {
+    var mine = send(app, "GET", "/suggestions/mine", token, "")
+    var i = 0
+    while (i < mine.jsonSize("")) {
+        if ("" + mine.jsonStr(i + ".id") == id) {
+            return "" + mine.jsonStr(i + ".status")
+        }
+        i = i + 1
+    }
+    return "missing"
+}
+
+test "a suggestion is born pending and without a session it is refused" {
+    var app = suggestionApp()
+    Check.apiError(app.client.send("POST", "/suggestions", listOf("Content-Type: application/json"), "", bodyFor("BACKEND")), 401, "UNAUTHENTICATED")
+    var token = person(app, "sgg_user1")
+    var before = fake().targets.size()
+    var res = send(app, "POST", "/suggestions", token, bodyFor("BACKEND"))
+    Check.status(res, 201)
+    Check.jsonEq(res, "status", "PENDING")
+    Check.isTrue("no issue url yet", res.jsonIsNull("githubIssueUrl"))
+    Check.isTrue("sugg_ id", ("" + res.jsonStr("id")).startsWith("sugg_"))
+    Check.eqInt("the gateway was not called", before, fake().targets.size())
+}
+
+test "a short text or a missing target are refused" {
+    var app = suggestionApp()
+    var token = person(app, "sgg_user2")
+    Check.apiError(send(app, "POST", "/suggestions", token, "{\"target\":\"FRONTEND\",\"title\":\"oi\",\"body\":\"curto\"}"), 400, "INVALID_SUGGESTION")
+    var noTarget = send(app, "POST", "/suggestions", token, "{\"title\":\"Título válido\",\"body\":\"Descrição longa o bastante para passar da validação.\"}")
+    Check.apiError(noTarget, 400, "INVALID_SUGGESTION")
+    Check.eqStr("message", "Escolha onde a sugestão se aplica.", "" + noTarget.jsonStr("message"))
+    var shortBody = send(app, "POST", "/suggestions", token, "{\"target\":\"FRONTEND\",\"title\":\"Título válido\",\"body\":\"curto\"}")
+    Check.eqStr("body message", "Descreva a ideia com 20 a 4000 caracteres.", "" + shortBody.jsonStr("message"))
+    var shortTitle = send(app, "POST", "/suggestions", token, "{\"target\":\"FRONTEND\",\"title\":\"oi\",\"body\":\"Descrição longa o bastante para passar da validação.\"}")
+    Check.eqStr("title message", "O título deve ter entre 5 e 120 caracteres.", "" + shortTitle.jsonStr("message"))
+    Check.apiError(send(app, "POST", "/suggestions", token, bodyFor("PLANET")), 400, "BAD_REQUEST")
+    Check.apiError(send(app, "POST", "/suggestions", token, "not json"), 400, "BAD_REQUEST")
+}
+
+test "approving opens an issue without the authors data and the author sees the link" {
+    var app = suggestionApp()
+    var token = person(app, "sgg_user3")
+    var admin = adminToken(app)
+    fake().enabledTargets.add("DESIGN_SYSTEM")
+    var id = submit(app, token, "DESIGN_SYSTEM")
+    var res = send(app, "POST", "/admin/suggestions/" + id + "/approve", admin, "")
+    Check.status(res, 200)
+    Check.jsonEq(res, "status", "PUBLISHED")
+    Check.jsonEq(res, "githubIssueNumber", "77")
+    Check.jsonEq(res, "githubIssueUrl", "https://github.com/org/ds/issues/77")
+    Check.jsonEq(res, "reviewedBy", "sgg_admin")
+    Check.isTrue("reviewedAt", res.jsonHas("reviewedAt"))
+    Check.jsonEq(res, "userId", "sgg_user3")
+    var last = fake().titles.size() - 1
+    Check.eqStr("target", "DESIGN_SYSTEM", fake().targets.get(last))
+    var published = fake().titles.get(last) + "\n" + fake().bodies.get(last)
+    Check.isTrue("the issue does not cite the author", !published.contains("sgg_user3"))
+    Check.isTrue("the issue does not carry the author id", !published.contains("sgg_user3"))
+    Check.isTrue("the issue carries no e-mail", !published.contains("@test.invalid"))
+    Check.isTrue("mentions are broken", !published.contains("@pessoa"))
+    Check.isTrue("with a zero width space", published.contains("@​pessoa"))
+    Check.isTrue("anonymous footer", published.contains("_Sugestão enviada de forma anônima pela comunidade do Enois._"))
+    var mine = send(app, "GET", "/suggestions/mine", token, "")
+    Check.jsonEq(mine, "0.githubIssueUrl", "https://github.com/org/ds/issues/77")
+    Check.jsonEq(mine, "0.status", "PUBLISHED")
+}
+
+test "approving twice does not open two issues" {
+    var app = suggestionApp()
+    var token = person(app, "sgg_user4")
+    var admin = adminToken(app)
+    fake().enabledTargets.add("FRONTEND")
+    var id = submit(app, token, "FRONTEND")
+    var before = fake().targets.size()
+    Check.status(send(app, "POST", "/admin/suggestions/" + id + "/approve", admin, ""), 200)
+    Check.apiError(send(app, "POST", "/admin/suggestions/" + id + "/approve", admin, ""), 409, "SUGGESTION_ALREADY_REVIEWED")
+    Check.eqInt("one issue", before + 1, fake().targets.size())
+}
+
+test "a GitHub failure puts the suggestion back in the queue" {
+    var app = suggestionApp()
+    var token = person(app, "sgg_user5")
+    var admin = adminToken(app)
+    fake().enabledTargets.add("BACKEND")
+    var id = submit(app, token, "BACKEND")
+    fake().failIssue = true
+    Check.apiError(send(app, "POST", "/admin/suggestions/" + id + "/approve", admin, ""), 502, "GITHUB_UNAVAILABLE")
+    fake().failIssue = false
+    Check.eqStr("back to pending", "PENDING", statusOf(app, token, id))
+    var row = app.db().queryOne("select reviewed_by, reviewed_at from suggestions where id = ?", DbParams().bindStr(id))
+    Check.isTrue("review cleared", row.isNull("reviewed_by") && row.isNull("reviewed_at"))
+    // And it can be approved again once GitHub answers.
+    Check.status(send(app, "POST", "/admin/suggestions/" + id + "/approve", admin, ""), 200)
+}
+
+test "a target without a repository does not publish and leaves the suggestion alone" {
+    var app = suggestionApp()
+    var token = person(app, "sgg_user6")
+    var admin = adminToken(app)
+    var id = submit(app, token, "BACKEND")
+    // BACKEND may have been enabled by an earlier test of this file: switch it off for this one.
+    var kept = listOf<String>()
+    for (var t in fake().enabledTargets) {
+        if (t != "BACKEND") {
+            kept.add(t)
+        }
+    }
+    fake().enabledTargets = kept
+    var before = fake().targets.size()
+    Check.apiError(send(app, "POST", "/admin/suggestions/" + id + "/approve", admin, ""), 503, "SUGGESTIONS_GITHUB_DISABLED")
+    Check.eqInt("not called", before, fake().targets.size())
+    Check.eqStr("still pending", "PENDING", statusOf(app, token, id))
+}
+
+test "rejecting does not publish and a regular person does not moderate" {
+    var app = suggestionApp()
+    var token = person(app, "sgg_user7")
+    var admin = adminToken(app)
+    var id = submit(app, token, "FRONTEND")
+    var before = fake().targets.size()
+    Check.apiError(send(app, "POST", "/admin/suggestions/" + id + "/approve", token, ""), 403, "FORBIDDEN")
+    Check.apiError(send(app, "GET", "/admin/suggestions", token, ""), 403, "FORBIDDEN")
+    var rejected = send(app, "POST", "/admin/suggestions/" + id + "/reject", admin, "")
+    Check.status(rejected, 200)
+    Check.jsonEq(rejected, "status", "REJECTED")
+    Check.eqInt("never published", before, fake().targets.size())
+    Check.apiError(send(app, "POST", "/admin/suggestions/" + id + "/reject", admin, ""), 409, "SUGGESTION_ALREADY_REVIEWED")
+    Check.apiError(send(app, "POST", "/admin/suggestions/sugg_missing/reject", admin, ""), 404, "SUGGESTION_NOT_FOUND")
+    Check.apiError(send(app, "POST", "/admin/suggestions/sugg_missing/approve", admin, ""), 404, "SUGGESTION_NOT_FOUND")
+}
+
+test "the panel lists by status" {
+    var app = suggestionApp()
+    var token = person(app, "sgg_user8")
+    var admin = adminToken(app)
+    var id = submit(app, token, "BACKEND")
+    var pending = send(app, "GET", "/admin/suggestions?status=PENDING&limit=100", admin, "")
+    Check.status(pending, 200)
+    Check.isTrue("lists it with the author id", pending.body.contains(id) && pending.body.contains("sgg_user8"))
+    Check.apiError(send(app, "GET", "/admin/suggestions?status=NOPE", admin, ""), 400, "BAD_REQUEST")
+    Check.status(send(app, "GET", "/admin/suggestions", admin, ""), 200)
+    Check.status(send(app, "GET", "/v1/admin/suggestions", admin, ""), 200)
+    Check.apiError(send(app, "GET", "/admin/suggestions", "tok-nobody-xxxxxxxxxx", ""), 401, "UNAUTHENTICATED")
+}
+
+test "five suggestions in 24 hours is the ceiling" {
+    var app = suggestionApp()
+    var token = person(app, "sgg_flood")
+    var i = 0
+    while (i < 5) {
+        submit(app, token, "BACKEND")
+        i = i + 1
+    }
+    var sixth = send(app, "POST", "/suggestions", token, bodyFor("BACKEND"))
+    Check.apiError(sixth, 429, "TOO_MANY_SUGGESTIONS")
+    var mine = send(app, "GET", "/suggestions/mine?limit=2", token, "")
+    Check.eqInt("limit honoured", 2, mine.jsonSize(""))
+}

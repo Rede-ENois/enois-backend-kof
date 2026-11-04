@@ -1,0 +1,58 @@
+package suggestions
+
+import kernel.db.*
+
+// suggestions. `transition` moves the status atomically (from -> to) and tells whether this request won:
+// that is what keeps two simultaneous approvals from opening two issues.
+class SuggestionStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, user_id, target, title, body, status, created_at, reviewed_by, reviewed_at, github_issue_number, github_issue_url"
+    static SuggestionRecord mapRow(r: DbRow) = SuggestionRecord(r.getStr("id"), r.getStr("user_id"), r.getStr("target"), r.getStr("title"), r.getStr("body"), r.getStr("status"), r.getInstant("created_at"), r.getStrOrNull("reviewed_by"), r.getInstantOrNull("reviewed_at"), r.getIntOrNull("github_issue_number"), r.getStrOrNull("github_issue_url"))
+    insert(s: SuggestionRecord) {
+        store.execute("insert into suggestions (" + SuggestionStore.columns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(s.id()).bindStr(s.userId()).bindStr(s.target()).bindStr(s.title()).bindStr(s.body()).bindStr(s.status()).bindInstant(s.createdAt()).bindStrOrNull(s.reviewedBy()).bindInstantOrNull(s.reviewedAt()).bindIntOrNull(s.githubIssueNumber()).bindStrOrNull(s.githubIssueUrl()))
+    }
+    // The public issue the approval opened.
+    attachIssue(id: String, number: Int, url: String?) {
+        store.execute("update suggestions set github_issue_number = ?, github_issue_url = ? where id = ?", DbParams().bindInt(number).bindStrOrNull(url).bindStr(id))
+    }
+    SuggestionRecord? findById(id: String) {
+        var row = store.queryOptional("select " + SuggestionStore.columns() + " from suggestions where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return SuggestionStore.mapRow(row)
+    }
+    static Int cap(limit: Int) {
+        if (limit > 100) {
+            return 100
+        }
+        if (limit < 1) {
+            return 1
+        }
+        return limit
+    }
+    // Newest first; `status` null means every status.
+    List<SuggestionRecord> findFiltered(status: String?, limit: Int) {
+        var rows = listOf<DbRow>()
+        if (status == null) {
+            rows = store.queryList("select " + SuggestionStore.columns() + " from suggestions order by created_at desc limit ?", DbParams().bindInt(SuggestionStore.cap(limit)))
+        }
+        else {
+            rows = store.queryList("select " + SuggestionStore.columns() + " from suggestions where status = ? order by created_at desc limit ?", DbParams().bindStr(status).bindInt(SuggestionStore.cap(limit)))
+        }
+        return SuggestionStore.mapped(rows)
+    }
+    List<SuggestionRecord> findByUserId(userId: String, limit: Int) = SuggestionStore.mapped(store.queryList("select " + SuggestionStore.columns() + " from suggestions where user_id = ? order by created_at desc limit ?", DbParams().bindStr(userId).bindInt(SuggestionStore.cap(limit))))
+    static List<SuggestionRecord> mapped(rows: List<DbRow>) {
+        var out = listOf<SuggestionRecord>()
+        for (var r in rows) {
+            out.add(SuggestionStore.mapRow(r))
+        }
+        return out
+    }
+    Long countByUserSince(userId: String, since: String) = store.queryLong("select count(*) from suggestions where user_id = ? and created_at > ?", DbParams().bindStr(userId).bindInstant(since))
+    Bool transition(id: String, from: String, to: String, reviewedBy: String?, at: String?) = store.execute("update suggestions set status = ?, reviewed_by = ?, reviewed_at = ? where id = ? and status = ?", DbParams().bindStr(to).bindStrOrNull(reviewedBy).bindInstantOrNull(at).bindStr(id).bindStr(from)) == 1
+}
