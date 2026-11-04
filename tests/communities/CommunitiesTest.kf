@@ -1,0 +1,474 @@
+import communities.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+
+// ---- CommunityBannerHtml ----
+// Port of CommunityBannerHtmlTests: the HTML cover is sanitised on the server (animation in, script
+// out), the owner edits, an absent field keeps and an empty one clears.
+String bannerPatch(bannerHtml: String) = json.encode(CommunityBody("Comunidade Banner", "d", "Tecnologia", "", "", bannerHtml, CommunityNull.str(), CommunityNull.str()))
+
+String bannerCreate(owner: String, key: String, name: String) = CommunityTestApp.create(CommunityTestApp.app(), owner, key, CommunityTestApp.body(name, "d", "Tecnologia", null, null))
+
+test "banner html keeps animation, drops scripts and clears" {
+    var app = CommunityTestApp.app()
+    var owner = CommunityTestApp.login(app, "banner_owner")
+    var id = bannerCreate(owner, "banner-comm-1", "Comunidade Banner")
+    var css = "<style>\n  @keyframes brilho { 0% { opacity: .6; } 100% { opacity: 1; } }\n  .capa { animation: brilho 2s infinite alternate; }\n</style>\n<div class=\"capa\">capa da comunidade</div>\n"
+    var saved = CommunityTestApp.write(app, "PATCH", "/communities/" + id, owner, "banner-patch-1", bannerPatch(css))
+    Check.status(saved, 200)
+    var html = saved.json("bannerHtml")
+    assert(html.contains("@keyframes brilho"))
+    assert(html.contains("animation: brilho 2s infinite"))
+    // Empty clears: the cover goes back to the photo (null).
+    var cleared = CommunityTestApp.write(app, "PATCH", "/communities/" + id, owner, "banner-clear-1", bannerPatch(""))
+    Check.status(cleared, 200)
+    assert(cleared.jsonIsNull("bannerHtml"))
+    // Absent keeps what was there (a saved banner survives a PATCH that does not send the field).
+    Check.status(CommunityTestApp.write(app, "PATCH", "/communities/" + id, owner, "banner-patch-2", bannerPatch(css)), 200)
+    var kept = CommunityTestApp.write(app, "PATCH", "/communities/" + id, owner, "banner-keep", "{\"description\":\"outra\"}")
+    assert(kept.json("bannerHtml").contains("@keyframes brilho"))
+    // Script goes, the rest stays.
+    var safe = CommunityTestApp.write(app, "PATCH", "/communities/" + id, owner, "banner-patch-3", bannerPatch("<style>.x{}</style><div onclick=\"alert(1)\"><script>alert(2)</script>x</div>"))
+    Check.status(safe, 200)
+    var out = safe.json("bannerHtml")
+    assert(!out.contains("script"))
+    assert(!out.contains("onclick"))
+    assert(out.contains("<div>x</div>"))
+}
+
+test "a non owner cannot set the banner html" {
+    var app = CommunityTestApp.app()
+    var owner = CommunityTestApp.login(app, "banner_owner2")
+    var intruder = CommunityTestApp.login(app, "banner_intruder2")
+    var id = bannerCreate(owner, "banner-comm-2", "Comunidade Banner 2")
+    Check.apiError(CommunityTestApp.write(app, "PATCH", "/communities/" + id, intruder, "banner-patch-intruder", bannerPatch("<style>.x{}</style>")), 403, "FORBIDDEN")
+}
+
+// ---- CommunityChannel ----
+// Port of CommunityChannelTests (community side): only members list, create and read the channels, the
+// channel feed is separate from the community feed. The /feed/posts rules (CHANNEL_REQUIRES_COMMUNITY,
+// TOPIC_FROM_CHANNEL, channel post 404s, main feed, profile posts) belong to the feed port.
+String chanCreate(token: String, key: String, name: String) = CommunityTestApp.create(CommunityTestApp.app(), token, key, CommunityTestApp.body(name, "Comunidade de teste.", "TECNOLOGIA", null, null))
+
+String chanBody(name: String, topic: String) = json.encode(CommunityChannelBody(name, topic, CommunityNull.str()))
+
+test "channels are visible only to community members and stay out of the community feed" {
+    var app = CommunityTestApp.app()
+    var member = CommunityTestApp.login(app, "chan_member")
+    var outsider = CommunityTestApp.login(app, "chan_outsider")
+    var communityId = chanCreate(member, "chan-c1", "Comunidade com canais")
+    var path = "/communities/" + communityId + "/channels"
+    var created = CommunityTestApp.write(app, "POST", path, member, "unused", chanBody("Bastidores", "carreira"))
+    Check.status(created, 200)
+    Check.jsonEq(created, "slug", "bastidores")
+    Check.jsonEq(created, "topic", "CARREIRA")
+    var channelId = created.json("id")
+    // A second channel, another theme; a repeated name gets a numbered slug.
+    Check.status(CommunityTestApp.write(app, "POST", path, member, "unused", chanBody("Carreira", "LIDERANCA")), 200)
+    var dup = CommunityTestApp.write(app, "POST", path, member, "unused", chanBody("Bastidores", "PRODUTO"))
+    Check.jsonEq(dup, "slug", "bastidores-2")
+    var list = CommunityTestApp.read(app, path, member)
+    Check.status(list, 200)
+    Check.eqInt("channels", 3, list.jsonSize(""))
+    // A non member: neither lists, creates nor reads.
+    Check.apiError(CommunityTestApp.read(app, path, outsider), 403, "NOT_A_MEMBER")
+    Check.status(CommunityTestApp.write(app, "POST", path, outsider, "unused", "{\"name\":\"Invasor\"}"), 403)
+    Check.status(CommunityTestApp.read(app, path + "/" + channelId + "/posts", outsider), 403)
+    // A visitor does not get in either (401), never a misleading empty list.
+    Check.status(app.client.get(path), 401)
+    // The channel feed shows the channel post; the community feed does not.
+    CommunityTestApp.seedPost(app, "chan_post_1", "chan_member", communityId, channelId, "Segredo do canal: o bastidor fica aqui.", "ACTIVE", Time.nowIso())
+    var feed = CommunityTestApp.read(app, path + "/" + channelId + "/posts", member)
+    Check.status(feed, 200)
+    Check.eqInt("channel items", 1, feed.jsonSize("items"))
+    Check.jsonEq(feed, "items.0.content", "Segredo do canal: o bastidor fica aqui.")
+    var communityFeed = CommunityTestApp.read(app, "/communities/" + communityId + "/feed", member)
+    Check.status(communityFeed, 200)
+    Check.eqInt("community items", 0, communityFeed.jsonSize("items"))
+    // A channel of another community is a 404 even for a member of both.
+    var other = chanCreate(member, "chan-c2", "Outra comunidade")
+    Check.apiError(CommunityTestApp.read(app, "/communities/" + other + "/channels/" + channelId + "/posts", member), 404, "CHANNEL_NOT_FOUND")
+    Check.apiError(CommunityTestApp.read(app, "/communities/" + communityId + "/channels/nope/posts", member), 404, "CHANNEL_NOT_FOUND")
+}
+
+test "channel rules are enforced by the backend" {
+    var app = CommunityTestApp.app()
+    var member = CommunityTestApp.login(app, "chan_rules")
+    var communityId = chanCreate(member, "chan-r1", "Comunidade regras")
+    var path = "/communities/" + communityId + "/channels"
+    Check.apiError(CommunityTestApp.write(app, "POST", path, member, "unused", "{\"name\":\" \"}"), 400, "INVALID_CHANNEL_NAME")
+    Check.apiError(CommunityTestApp.write(app, "POST", path, member, "unused", "{\"name\":\"a\"}"), 400, "INVALID_CHANNEL_NAME")
+    Check.apiError(CommunityTestApp.write(app, "POST", path, member, "unused", chanBody("Geral", "NAO_EXISTE")), 400, "INVALID_TOPIC")
+    var bigText = ""
+    var i = 0
+    while (i < 301) {
+        bigText = bigText + "d"
+        i = i + 1
+    }
+    Check.apiError(CommunityTestApp.write(app, "POST", path, member, "unused", json.encode(CommunityChannelBody("Geral", CommunityNull.str(), bigText))), 400, "INVALID_CHANNEL_DESCRIPTION")
+    Check.apiError(CommunityTestApp.read(app, "/communities/nope/channels", member), 404, "COMMUNITY_NOT_FOUND")
+    // The 31st channel is refused.
+    var n = 0
+    while (n < 30) {
+        Check.status(CommunityTestApp.write(app, "POST", path, member, "unused", chanBody("Canal " + n, "OUTROS")), 200)
+        n = n + 1
+    }
+    Check.apiError(CommunityTestApp.write(app, "POST", path, member, "unused", chanBody("Mais um", "OUTROS")), 409, "CHANNEL_LIMIT_REACHED")
+}
+
+test "the feed readers expose communities and channels" {
+    var app = CommunityTestApp.app()
+    var member = CommunityTestApp.login(app, "chan_readers")
+    var outsider = CommunityTestApp.login(app, "chan_readers_out")
+    var communityId = chanCreate(member, "chan-rd1", "Comunidade leitores")
+    var channel = CommunityTestApp.write(app, "POST", "/communities/" + communityId + "/channels", member, "unused", chanBody("Geral", "PRODUTO"))
+    var module = CommunityTestApp.module()
+    var refs = module.directory.byIds(listOf(communityId, "missing"), "chan_readers")
+    assert(refs.size() == 1)
+    var ref = refs.get(communityId)
+    assert(ref != null)
+    if (ref != null) {
+        assert(ref.joined)
+        assert(ref.name == "Comunidade leitores")
+        assert(ref.topic == "TECNOLOGIA")
+    }
+    var outsiderRef = module.directory.byIds(listOf(communityId), "chan_readers_out").get(communityId)
+    if (outsiderRef != null) {
+        assert(!outsiderRef.joined)
+    }
+    var chan = module.channelDirectory.byId(channel.json("id"))
+    assert(chan != null)
+    if (chan != null) {
+        assert(chan.communityId == communityId)
+        assert(chan.topic == "PRODUTO")
+    }
+    assert(module.channelDirectory.byId("missing") == null)
+}
+
+// ---- CommunityDescription ----
+// Port of CommunityDescriptionTests: the description is optional (NULL, not an invented text), can be
+// added by an edit and cleared again.
+test "a community is born without description and gains one later" {
+    var app = CommunityTestApp.app()
+    var dono = CommunityTestApp.login(app, "comm_desc_dono")
+    var created = CommunityTestApp.write(app, "POST", "/communities", dono, "comm-desc-1", "{\"name\":\"Comunidade Sem Descricao\"}")
+    Check.status(created, 201)
+    assert(created.jsonStr("description") == null)
+    var id = created.json("id")
+    var gained = CommunityTestApp.write(app, "PATCH", "/communities/" + id, dono, "comm-desc-2", "{\"description\":\"Agora tem descricao\"}")
+    Check.status(gained, 200)
+    Check.jsonEq(gained, "description", "Agora tem descricao")
+    // An empty string clears it again.
+    var cleared = CommunityTestApp.write(app, "PATCH", "/communities/" + id, dono, "comm-desc-3", "{\"description\":\"\"}")
+    Check.status(cleared, 200)
+    Check.jsonEq(cleared, "description", "")
+}
+
+test "text fields over the column ceiling are a 400 naming the field" {
+    var app = CommunityTestApp.app()
+    var dono = CommunityTestApp.login(app, "comm_desc_limit")
+    var bigText = ""
+    var i = 0
+    while (i < 2001) {
+        bigText = bigText + "x"
+        i = i + 1
+    }
+    var res = CommunityTestApp.write(app, "POST", "/communities", dono, "comm-desc-limit", CommunityTestApp.body("Limite", bigText, null, null, null))
+    Check.apiError(res, 400, "COMMUNITY_FIELD_TOO_LONG")
+    Check.jsonEq(res, "message", "O campo descricao aceita no máximo 2.000 caracteres.")
+}
+
+// ---- CommunityFavorites ----
+// Port of CommunityFavoritesTests: bookmarking does not need membership and the list reflects it.
+List<String> favoriteIds(token: String) {
+    var res = CommunityTestApp.read(CommunityTestApp.app(), "/communities/favorites", token)
+    Check.status(res, 200)
+    return CommunityTestApp.itemIds(res)
+}
+
+test "favorites and unfavorites a community" {
+    var app = CommunityTestApp.app()
+    var owner = CommunityTestApp.login(app, "fav_owner")
+    var viewer = CommunityTestApp.login(app, "fav_viewer")
+    var id = CommunityTestApp.create(app, owner, "fav-create", CommunityTestApp.body("Comunidade para favoritar", "Descricao.", "TECNOLOGIA", null, null))
+    var path = "/communities/" + id + "/favorite"
+    // Favoriting without joining is allowed (it is a bookmark).
+    var on = CommunityTestApp.write(app, "POST", path, viewer, "fav-1", "")
+    Check.status(on, 200)
+    Check.jsonEq(on, "status", "FAVORITED")
+    assert(favoriteIds(viewer).contains(id))
+    // Again does not duplicate.
+    Check.status(CommunityTestApp.write(app, "POST", path, viewer, "fav-2", ""), 200)
+    var once = favoriteIds(viewer).filter((x: String) -> x == id)
+    assert(once.size() == 1)
+    // Unfavoriting takes it off the list.
+    var off = CommunityTestApp.write(app, "DELETE", path, viewer, "unfav-1", "")
+    Check.status(off, 200)
+    Check.jsonEq(off, "status", "UNFAVORITED")
+    assert(!favoriteIds(viewer).contains(id))
+    Check.apiError(CommunityTestApp.write(app, "POST", "/communities/nope/favorite", viewer, "fav-3", ""), 404, "COMMUNITY_NOT_FOUND")
+}
+
+// ---- CommunityOwnership ----
+// Port of CommunityOwnershipTests: the owner cannot leave while others remain, the transfer moves
+// control, only the owner deletes, /mine lists joined communities, anonymous member lists hide user ids.
+String ownCreate(token: String, key: String, name: String) = CommunityTestApp.create(CommunityTestApp.app(), token, key, CommunityTestApp.body(name, "Descricao da comunidade.", "TECNOLOGIA", null, null))
+
+test "the owner cannot leave while others remain" {
+    var app = CommunityTestApp.app()
+    var owner = CommunityTestApp.login(app, "comm_own_leave_owner")
+    var member = CommunityTestApp.login(app, "comm_own_leave_member")
+    var id = ownCreate(owner, "own-leave-create", "Comunidade com dono ativo")
+    CommunityTestApp.joinCommunity(app, member, "own-join-1", id)
+    Check.apiError(CommunityTestApp.write(app, "DELETE", "/communities/" + id + "/members", owner, "own-leave-1", ""), 409, "OWNERSHIP_TRANSFER_REQUIRED")
+    // A member leaves freely; the owner, alone, leaves and the community goes with them.
+    var left = CommunityTestApp.write(app, "DELETE", "/communities/" + id + "/members", member, "own-leave-2", "")
+    Check.status(left, 200)
+    Check.jsonEq(left, "status", "LEFT")
+    Check.status(CommunityTestApp.write(app, "DELETE", "/communities/" + id + "/members", owner, "own-leave-3", ""), 200)
+    Check.apiError(app.client.get("/communities/" + id), 404, "COMMUNITY_NOT_FOUND")
+}
+
+test "transfer moves control to the new owner" {
+    var app = CommunityTestApp.app()
+    var owner = CommunityTestApp.login(app, "comm_own_transfer_owner")
+    var member = CommunityTestApp.login(app, "comm_own_transfer_member")
+    var id = ownCreate(owner, "tr-create", "Comunidade para transferir")
+    CommunityTestApp.joinCommunity(app, member, "tr-join-1", id)
+    var path = "/communities/" + id
+    Check.apiError(CommunityTestApp.write(app, "POST", path + "/transfer", owner, "tr-0", "{\"newOwnerId\":\"\"}"), 400, "INVALID_NEW_OWNER")
+    Check.apiError(CommunityTestApp.write(app, "POST", path + "/transfer", owner, "tr-00", "{\"newOwnerId\":\"comm_own_transfer_owner\"}"), 400, "INVALID_NEW_OWNER")
+    Check.apiError(CommunityTestApp.write(app, "POST", path + "/transfer", owner, "tr-000", "{\"newOwnerId\":\"nobody_here\"}"), 400, "NOT_MEMBER")
+    Check.apiError(CommunityTestApp.write(app, "POST", path + "/transfer", member, "tr-0000", "{\"newOwnerId\":\"comm_own_transfer_member\"}"), 403, "FORBIDDEN")
+    Check.status(CommunityTestApp.write(app, "POST", path + "/transfer", owner, "tr-1", "{\"newOwnerId\":\"comm_own_transfer_member\"}"), 200)
+    // The new owner edits.
+    var renamed = CommunityTestApp.write(app, "PATCH", path, member, "tr-edit-new", "{\"name\":\"Renomeada pelo novo dono\"}")
+    Check.status(renamed, 200)
+    Check.jsonEq(renamed, "name", "Renomeada pelo novo dono")
+    // The old owner lost the edit control.
+    Check.status(CommunityTestApp.write(app, "PATCH", path, owner, "tr-edit-old", "{\"name\":\"Tentativa do antigo dono\"}"), 403)
+    // And is now a plain member; the new owner is ADMIN.
+    var members = CommunityTestApp.read(app, path + "/members", member)
+    Check.jsonEq(members, "items.0.role", "MEMBER")
+    Check.jsonEq(members, "items.1.role", "ADMIN")
+}
+
+test "only the owner can delete and the members are removed" {
+    var app = CommunityTestApp.app()
+    var owner = CommunityTestApp.login(app, "comm_own_del_owner")
+    var member = CommunityTestApp.login(app, "comm_own_del_member")
+    var id = ownCreate(owner, "del-create", "Comunidade que sera excluida")
+    CommunityTestApp.joinCommunity(app, member, "del-join-1", id)
+    Check.apiError(CommunityTestApp.write(app, "DELETE", "/communities/" + id, member, "del-forbidden", ""), 403, "FORBIDDEN")
+    var deleted = CommunityTestApp.write(app, "DELETE", "/communities/" + id, owner, "del-owner", "")
+    Check.status(deleted, 200)
+    Check.jsonEq(deleted, "status", "DELETED")
+    // The community is gone and no orphan link is left.
+    Check.status(app.client.get("/communities/" + id), 404)
+    Check.eqInt("orphan members", 0, app.db().queryLong("select count(*) from community_members where community_id = ?", DbParams().bindStr(id)) as Int)
+}
+
+test "an admin may delete a community of somebody else" {
+    var app = CommunityTestApp.app()
+    var owner = CommunityTestApp.login(app, "comm_own_adm_owner")
+    var id = ownCreate(owner, "adm-create", "Comunidade moderada")
+    SecurityFixtures.user(app.db(), "comm_own_adm_admin", true, true)
+    SecurityFixtures.session(app.db(), "comm_own_adm_admin", "tok-comm-own-adm-admin-1234", 3600L)
+    Check.status(CommunityTestApp.write(app, "DELETE", "/communities/" + id, "tok-comm-own-adm-admin-1234", "adm-del", ""), 200)
+    Check.status(app.client.get("/communities/" + id), 404)
+}
+
+test "mine lists only joined communities" {
+    var app = CommunityTestApp.app()
+    var creator = CommunityTestApp.login(app, "comm_mine_creator")
+    var joiner = CommunityTestApp.login(app, "comm_mine_joiner")
+    var created = ownCreate(creator, "mine-c1", "Comunidade do criador")
+    var other = ownCreate(joiner, "mine-c2", "Comunidade do entrante")
+    CommunityTestApp.joinCommunity(app, joiner, "mine-join-1", created)
+    var joinerIds = CommunityTestApp.itemIds(CommunityTestApp.read(app, "/communities/mine", joiner))
+    assert(joinerIds.contains(created))
+    assert(joinerIds.contains(other))
+    // The creator sees only their own.
+    var creatorIds = CommunityTestApp.itemIds(CommunityTestApp.read(app, "/communities/mine", creator))
+    assert(creatorIds.contains(created))
+    assert(!creatorIds.contains(other))
+    Check.status(app.client.get("/communities/mine"), 401)
+}
+
+test "the anonymous member list omits internal user ids" {
+    var app = CommunityTestApp.app()
+    var owner = CommunityTestApp.login(app, "own_members_owner")
+    var id = ownCreate(owner, "mem-c1", "Membros anonimos 1")
+    var anon = app.client.get("/communities/" + id + "/members")
+    Check.status(anon, 200)
+    assert(anon.jsonStr("items.0.username") != null)
+    Check.jsonEq(anon, "items.0.role", "ADMIN")
+    assert(anon.jsonStr("items.0.userId") == null)
+    var signed = CommunityTestApp.read(app, "/communities/" + id + "/members", owner)
+    Check.status(signed, 200)
+    Check.jsonEq(signed, "items.0.userId", "own_members_owner")
+    Check.jsonEq(signed, "items.0.name", "own_members_owner")
+}
+
+// ---- CommunityPin ----
+String pinBody(postId: String) = "{\"postId\":\"" + postId + "\"}"
+
+// Port of CommunityPinTests: one pin, only an ADMIN pins, the post must belong to the community, and
+// unpinning frees the top. Posts are seeded in `posts` (the feed owns that table).
+test "pins one post, only an admin, only of this community, and unpin frees the top" {
+    var app = CommunityTestApp.app()
+    var dona = CommunityTestApp.login(app, "cpin_dona")
+    var membro = CommunityTestApp.login(app, "cpin_membro")
+    var communityId = CommunityTestApp.create(app, dona, "cpin-create", CommunityTestApp.body("Comunidade Pin", null, null, null, null))
+    CommunityTestApp.seedPost(app, "cpin_post_a", "cpin_dona", communityId, null, "primeiro", "ACTIVE", Time.nowIso())
+    CommunityTestApp.seedPost(app, "cpin_post_b", "cpin_dona", communityId, null, "segundo", "ACTIVE", Time.nowIso())
+    CommunityTestApp.joinCommunity(app, membro, "cpin-join", communityId)
+    var path = "/communities/" + communityId + "/pin"
+    // A plain member does not pin.
+    Check.apiError(CommunityTestApp.write(app, "POST", path, membro, "cpin-member-pin", pinBody("cpin_post_a")), 403, "FORBIDDEN")
+    // The owner pins A.
+    var pinA = CommunityTestApp.write(app, "POST", path, dona, "cpin-pin-a", pinBody("cpin_post_a"))
+    Check.status(pinA, 200)
+    Check.jsonEq(pinA, "id", "cpin_post_a")
+    var readA = CommunityTestApp.read(app, path, dona)
+    Check.status(readA, 200)
+    Check.jsonEq(readA, "id", "cpin_post_a")
+    // Pinning B replaces A.
+    Check.status(CommunityTestApp.write(app, "POST", path, dona, "cpin-pin-b", pinBody("cpin_post_b")), 200)
+    Check.jsonEq(CommunityTestApp.read(app, path, dona), "id", "cpin_post_b")
+    // A post of ANOTHER community cannot be pinned here.
+    var outra = CommunityTestApp.create(app, dona, "cpin-create-2", CommunityTestApp.body("Outra Comunidade Pin", null, null, null, null))
+    CommunityTestApp.seedPost(app, "cpin_post_outra", "cpin_dona", outra, null, "de outra", "ACTIVE", Time.nowIso())
+    Check.apiError(CommunityTestApp.write(app, "POST", path, dona, "cpin-pin-outra", pinBody("cpin_post_outra")), 404, "POST_NOT_FOUND")
+    // An inactive post cannot be pinned, a blank body is 400.
+    CommunityTestApp.seedPost(app, "cpin_post_gone", "cpin_dona", communityId, null, "apagado", "DELETED", Time.nowIso())
+    Check.apiError(CommunityTestApp.write(app, "POST", path, dona, "cpin-pin-gone", pinBody("cpin_post_gone")), 404, "POST_NOT_FOUND")
+    Check.apiError(CommunityTestApp.write(app, "POST", path, dona, "cpin-pin-blank", pinBody("  ")), 400, "BAD_REQUEST")
+    // The community feed is public: a visitor reads the pin.
+    Check.jsonEq(app.client.get(path), "id", "cpin_post_b")
+    // Unpin frees the top.
+    var unpin = CommunityTestApp.write(app, "DELETE", path, dona, "cpin-unpin", "")
+    Check.status(unpin, 200)
+    Check.jsonEq(unpin, "status", "UNPINNED")
+    Check.apiError(CommunityTestApp.read(app, path, dona), 404, "NO_PINNED_POST")
+}
+
+// ---- CommunitySearch ----
+// Port of CommunitySearchTests: search by name or description, case-insensitive.
+List<String> searchIds(query: String) {
+    var res = CommunityTestApp.app().client.get("/communities?" + query + "&limit=50")
+    Check.status(res, 200)
+    return CommunityTestApp.itemIds(res)
+}
+
+test "searches by name and description ignoring case" {
+    var app = CommunityTestApp.app()
+    var dono = CommunityTestApp.login(app, "comm_search_dono")
+    var tag = "zqxabc123"
+    var outro = CommunityTestApp.create(app, dono, "comm-search-1", CommunityTestApp.body("Comunidade Fora do Filtro", "sem a marca", null, null, null))
+    var porNome = CommunityTestApp.create(app, dono, "comm-search-2", CommunityTestApp.body("Comunidade " + tag + " Alpha", "descricao comum", "TECNOLOGIA", null, null))
+    var porDescricao = CommunityTestApp.create(app, dono, "comm-search-3", CommunityTestApp.body("Beta unica", "fala sobre " + tag, "TECNOLOGIA", null, null))
+    var found = searchIds("q=" + tag)
+    assert(found.contains(porNome))
+    assert(found.contains(porDescricao))
+    assert(!found.contains(outro))
+    // Case does not matter, topic narrows, and LIKE wildcards are literal.
+    var upper = searchIds("q=" + tag.toUpperCase())
+    assert(upper.contains(porNome))
+    assert(upper.contains(porDescricao))
+    var topic = searchIds("q=" + tag + "&topic=TECNOLOGIA")
+    assert(topic.contains(porNome))
+    assert(searchIds("q=%25&topic=NOPE").size() == 0)
+    assert(searchIds("q=" + tag + "&topic=DESIGN").size() == 0)
+}
+
+// ---- LocalCommunities ----
+// Port of LocalCommunitiesTests: city + state (both or none), accent-free filter and /communities/local.
+String lcCreate(token: String, key: String, name: String, city: String?, state: String?) = CommunityTestApp.create(CommunityTestApp.app(), token, key, CommunityTestApp.body(name, null, null, city, state))
+
+setProfilePlace(userId: String, city: String, state: String) {
+    CommunityTestApp.app().db().execute("update users set city = ?, state = ?, city_key = ? where id = ?", DbParams().bindStr(city).bindStr(state).bindStr(city.toLowerCase()).bindStr(userId))
+}
+
+test "creates with city and state and returns them" {
+    var app = CommunityTestApp.app()
+    var owner = CommunityTestApp.login(app, "lc_create")
+    var res = CommunityTestApp.write(app, "POST", "/communities", owner, "lc-create-1", CommunityTestApp.body("lc Devs de BH", null, null, " Belo Horizonte ", "mg"))
+    Check.status(res, 201)
+    Check.jsonEq(res, "city", "Belo Horizonte")
+    Check.jsonEq(res, "state", "MG")
+}
+
+test "refuses only one of city and state and an unknown state" {
+    var app = CommunityTestApp.app()
+    var owner = CommunityTestApp.login(app, "lc_invalid")
+    Check.apiError(CommunityTestApp.write(app, "POST", "/communities", owner, "lc-invalid-1", CommunityTestApp.body("lc so cidade", null, null, "Recife", null)), 400, "CITY_STATE_INCOMPLETE")
+    Check.apiError(CommunityTestApp.write(app, "POST", "/communities", owner, "lc-invalid-2", CommunityTestApp.body("lc uf ruim", null, null, "Recife", "XX")), 400, "INVALID_STATE")
+}
+
+test "the filter matches the city ignoring accents and case" {
+    var app = CommunityTestApp.app()
+    var owner = CommunityTestApp.login(app, "lc_filter")
+    var sp = lcCreate(owner, "lc-filter-1", "lc Devs de Sampa", "São Paulo", "SP")
+    var campinas = lcCreate(owner, "lc-filter-2", "lc Devs de Campinas", "Campinas", "SP")
+    var mine = listOf(sp, campinas)
+    var byCity = app.client.get("/communities?city=sao%20paulo&state=sp&limit=50")
+    Check.status(byCity, 200)
+    var cityIds = CommunityTestApp.only(CommunityTestApp.itemIds(byCity), mine)
+    assert(cityIds.size() == 1)
+    assert(cityIds.contains(sp))
+    var byState = app.client.get("/communities?state=SP&limit=50")
+    Check.status(byState, 200)
+    var stateIds = CommunityTestApp.only(CommunityTestApp.itemIds(byState), mine)
+    assert(stateIds.size() == 2)
+    assert(stateIds.contains(sp))
+    assert(stateIds.contains(campinas))
+    Check.apiError(app.client.get("/communities?city=Campinas"), 400, "CITY_STATE_INCOMPLETE")
+}
+
+test "edit keeps when absent and clears with empty strings" {
+    var app = CommunityTestApp.app()
+    var owner = CommunityTestApp.login(app, "lc_edit")
+    var id = lcCreate(owner, "lc-edit-1", "lc Edit", "Natal", "RN")
+    var kept = CommunityTestApp.write(app, "PATCH", "/communities/" + id, owner, "lc-edit-2", "{\"description\":\"nova\"}")
+    Check.status(kept, 200)
+    Check.jsonEq(kept, "city", "Natal")
+    var cleared = CommunityTestApp.write(app, "PATCH", "/communities/" + id, owner, "lc-edit-3", "{\"city\":\"\",\"state\":\"\"}")
+    Check.status(cleared, 200)
+    assert(cleared.jsonStr("city") == null)
+    assert(cleared.jsonStr("state") == null)
+    Check.apiError(CommunityTestApp.write(app, "PATCH", "/communities/" + id, owner, "lc-edit-4", "{\"city\":\"Natal\"}"), 400, "CITY_STATE_INCOMPLETE")
+}
+
+test "local lists the viewer city first then the state by members" {
+    var app = CommunityTestApp.app()
+    var viewer = CommunityTestApp.login(app, "lc_local_viewer")
+    var a = CommunityTestApp.login(app, "lc_local_a")
+    var b = CommunityTestApp.login(app, "lc_local_b")
+    // Uberlandia (same state, more members) does not pass the viewer's own city.
+    var bhSmall = lcCreate(a, "lc-local-1", "lc BH pequena", "Belo Horizonte", "MG")
+    var bhBig = lcCreate(a, "lc-local-2", "lc BH grande", "belo horizonte", "MG")
+    var udi = lcCreate(a, "lc-local-3", "lc Uberlandia", "Uberlândia", "MG")
+    var rio = lcCreate(a, "lc-local-4", "lc Rio", "Rio de Janeiro", "RJ")
+    CommunityTestApp.joinCommunity(app, b, "lc-local-j1", bhBig)
+    CommunityTestApp.joinCommunity(app, b, "lc-local-j2", udi)
+    CommunityTestApp.joinCommunity(app, viewer, "lc-local-j3", udi)
+    setProfilePlace("lc_local_viewer", "Belo Horizonte", "MG")
+    var res = CommunityTestApp.read(app, "/communities/local?limit=50", viewer)
+    Check.status(res, 200)
+    var ids = CommunityTestApp.only(CommunityTestApp.itemIds(res), listOf(bhSmall, bhBig, udi, rio))
+    assert(ids.size() == 3)
+    assert(ids.get(0) == bhBig)
+    assert(ids.get(1) == bhSmall)
+    assert(ids.get(2) == udi)
+}
+
+test "local is empty without a city on the profile and needs a session" {
+    var app = CommunityTestApp.app()
+    var viewer = CommunityTestApp.login(app, "lc_local_empty")
+    var res = CommunityTestApp.read(app, "/communities/local", viewer)
+    Check.status(res, 200)
+    Check.eqInt("items", 0, res.jsonSize("items"))
+    Check.status(app.client.get("/communities/local"), 401)
+}

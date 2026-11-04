@@ -1,0 +1,39 @@
+import kernel.testkit.*
+import groups.*
+
+// Port of GroupPinnedPostTests: at most ONE pinned post, only owner/admin pin, unpinning frees the top.
+test "pins one only and only the owner or admin" {
+    var owner = GroupsTestKit.login("gpin-dono")
+    var member = GroupsTestKit.login("gpin-membro")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Pin", "OPEN")
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    var postA = GroupsTestKit.publish(owner, groupId, topicId, "primeiro")
+    var postB = GroupsTestKit.publish(owner, groupId, topicId, "segundo")
+    GroupsTestKit.joinOk(member, groupId)
+    // A plain member does not pin.
+    Check.status(GroupsTestKit.post("/groups/" + groupId + "/posts/" + postA + "/pin", member, ""), 403)
+    // The owner pins A.
+    var pinned = GroupsTestKit.post("/groups/" + groupId + "/posts/" + postA + "/pin", owner, "")
+    Check.status(pinned, 200)
+    Check.jsonEq(pinned, "id", postA)
+    Check.jsonEq(pinned, "pinned", "true")
+    Check.jsonEq(GroupsTestKit.get("/groups/" + groupId + "/pinned", owner), "id", postA)
+    // Pinning B replaces A: the list has exactly one pinned, and it is B.
+    Check.status(GroupsTestKit.post("/groups/" + groupId + "/posts/" + postB + "/pin", owner, ""), 200)
+    Check.jsonEq(GroupsTestKit.get("/groups/" + groupId + "/pinned", owner), "id", postB)
+    var list = GroupsTestKit.get("/groups/" + groupId + "/posts", owner)
+    Check.status(list, 200)
+    var count = 0
+    var i = 0
+    while (i < list.jsonSize("items")) {
+        if (list.json("items." + i + ".pinned") == "true") {
+            count = count + 1
+            Check.eqStr("the pinned one", postB, list.json("items." + i + ".id"))
+        }
+        i = i + 1
+    }
+    Check.eqInt("pinned count", 1, count)
+    // Unpinning frees the top.
+    Check.status(GroupsTestKit.delete("/groups/" + groupId + "/posts/" + postB + "/pin", owner), 200)
+    Check.apiError(GroupsTestKit.get("/groups/" + groupId + "/pinned", owner), 404, "NO_PINNED_POST")
+}

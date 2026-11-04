@@ -18,6 +18,9 @@ import java.util.stream.Stream;
  * Usage: see scripts/kof-test and scripts/kof-run.
  */
 public class KofTool {
+    static final Path TEST_MAIN = Path.of(System.getProperty("kof.tool.dir", "scripts"), "KofTestMain.java").toAbsolutePath();
+    static final long SUITE_TIMEOUT_SECONDS = Long.getLong("kof.suite.timeout", 900L);
+
     public static void main(String[] args) throws Exception {
         if (args[0].equals("run")) {
             run(args);
@@ -98,13 +101,23 @@ public class KofTool {
                 System.out.println("SUITE " + f + " (" + driver.discoveredTests().size() + " tests)");
             }
             String mainClass = findMainClass(tmp);
+            // KofTestMain exits the JVM once the suite returns: background loops started with `spawn`
+            // (scheduler, outbox worker) are non-daemon and used to keep finished suites alive forever.
             List<String> cmd = new ArrayList<>(List.of(
                     Path.of(System.getProperty("java.home"), "bin", "java").toString(),
                     "-Dstdout.encoding=UTF-8", "-Dstderr.encoding=UTF-8",
                     "-cp", tmp + File.pathSeparator + depsCp + File.pathSeparator + cliJar,
-                    "dev.kof.runtime.KofJvmMain", mainClass));
+                    TEST_MAIN.toString(), mainClass));
             Process proc = new ProcessBuilder(cmd).inheritIO().start();
-            int code = proc.waitFor();
+            int code;
+            if (proc.waitFor(SUITE_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS)) {
+                code = proc.exitValue();
+            } else {
+                proc.descendants().forEach(ProcessHandle::destroyForcibly);
+                proc.destroyForcibly();
+                System.out.println("TIMEOUT " + f + " (> " + SUITE_TIMEOUT_SECONDS + "s, killed)");
+                code = 124;
+            }
             if (code == 0) {
                 passed++;
             } else {

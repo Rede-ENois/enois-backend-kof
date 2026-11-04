@@ -1,0 +1,263 @@
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import preferences.*
+import profile.*
+
+class PreferencesHolder {
+    static TestApp? cached = null
+}
+
+TestApp prefsApp() {
+    var cur = PreferencesHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = ProfileTestApp.boot("preferences", mapOf<String, String>())
+    PreferencesHolder.cached = created
+    return created
+}
+
+// PersonalizationTests -------------------------------------------------------------------------
+test "defaults are empty lists and persist" {
+    var user = ProfileTestApp.login(prefsApp(), "pers_defaults")
+    var first = user.get("/me/preferences")
+    Check.status(first, 200)
+    Check.eqInt("liked", 0, first.jsonSize("likedTopics"))
+    Check.eqInt("blocked", 0, first.jsonSize("blockedTopics"))
+    Check.eqInt("modules", 0, first.jsonSize("disabledModules"))
+    var put = user.put("/me/preferences", "{\"likedTopics\":[\"TECNOLOGIA\"],\"blockedTopics\":[],\"disabledModules\":[\"DAILY_GAMES\"]}")
+    Check.status(put, 200)
+    Check.jsonEq(put, "likedTopics.0", "TECNOLOGIA")
+    Check.jsonEq(put, "disabledModules.0", "DAILY_GAMES")
+    // Persistence between "sessions": a new read returns the same state.
+    var again = user.get("/me/preferences")
+    Check.status(again, 200)
+    Check.jsonEq(again, "likedTopics.0", "TECNOLOGIA")
+    Check.jsonEq(again, "disabledModules.0", "DAILY_GAMES")
+}
+
+test "invalid values are rejected" {
+    var user = ProfileTestApp.login(prefsApp(), "pers_invalid")
+    Check.apiError(user.put("/me/preferences", "{\"likedTopics\":[\"COSTURA\"]}"), 400, "INVALID_ASSUNTO")
+    var modules = user.put("/me/preferences", "{\"disabledModules\":[\"CRÉDITO_IMOBILIÁRIO\"]}")
+    Check.apiError(modules, 400, "INVALID_MÓDULO")
+    Check.jsonEq(modules, "message", "Valor desconhecido para módulo: CRÉDITO_IMOBILIÁRIO")
+}
+
+test "liked and blocked cannot conflict" {
+    var user = ProfileTestApp.login(prefsApp(), "pers_conflict")
+    var res = user.put("/me/preferences", "{\"likedTopics\":[\"DESIGN\"],\"blockedTopics\":[\"DESIGN\"]}")
+    Check.apiError(res, 409, "CONFLICTING_PREFERENCE")
+    Check.jsonEq(res, "message", "\"DESIGN\" não pode estar em \"quero ver\" e em \"não gosto\" ao mesmo tempo.")
+}
+
+test "clearing preferences returns to default" {
+    var user = ProfileTestApp.login(prefsApp(), "pers_clear")
+    Check.status(user.put("/me/preferences", "{\"likedTopics\":[\"TECNOLOGIA\"],\"blockedTopics\":[\"DESIGN\"],\"disabledModules\":[\"JOBS\"]}"), 200)
+    var cleared = user.put("/me/preferences", "{\"likedTopics\":[],\"blockedTopics\":[],\"disabledModules\":[]}")
+    Check.status(cleared, 200)
+    Check.eqInt("liked", 0, cleared.jsonSize("likedTopics"))
+    Check.eqInt("blocked", 0, cleared.jsonSize("blockedTopics"))
+    Check.eqInt("modules", 0, cleared.jsonSize("disabledModules"))
+}
+
+test "values are trimmed, upper-cased, deduplicated and blanks dropped" {
+    var user = ProfileTestApp.login(prefsApp(), "pers_normalize")
+    var res = user.put("/me/preferences", "{\"likedTopics\":[\" tecnologia \",\"TECNOLOGIA\",\"\",\"design\"]}")
+    Check.status(res, 200)
+    Check.eqInt("liked", 2, res.jsonSize("likedTopics"))
+    Check.jsonEq(res, "likedTopics.0", "TECNOLOGIA")
+    Check.jsonEq(res, "likedTopics.1", "DESIGN")
+}
+
+test "lite mode defaults off and is persisted alongside the other preferences" {
+    var user = ProfileTestApp.login(prefsApp(), "pers_lite")
+    Check.jsonEq(user.get("/me/preferences"), "liteMode", "false")
+    var on = user.put("/me/preferences", "{\"likedTopics\":[\"TECNOLOGIA\"],\"liteMode\":true}")
+    Check.status(on, 200)
+    Check.jsonEq(on, "liteMode", "true")
+    // An update that does not mention liteMode keeps the choice (partial, like the rest).
+    Check.jsonEq(user.put("/me/preferences", "{\"blockedTopics\":[\"DESIGN\"]}"), "liteMode", "true")
+    // Changing the theme writes the same row: lite mode cannot be lost.
+    Check.status(user.put("/me/theme", "{\"theme\":\"terminal\"}"), 204)
+    Check.jsonEq(user.get("/me/preferences"), "liteMode", "true")
+}
+
+test "batata mode is independent from lite and survives the other writes" {
+    var user = ProfileTestApp.login(prefsApp(), "pers_batata")
+    var start = user.get("/me/preferences")
+    Check.jsonEq(start, "batataMode", "false")
+    Check.jsonEq(start, "liteMode", "false")
+    var on = user.put("/me/preferences", "{\"batataMode\":true}")
+    Check.status(on, 200)
+    Check.jsonEq(on, "batataMode", "true")
+    // Turning BATATA on does not turn lite on in the database: the preference is the user's.
+    Check.jsonEq(on, "liteMode", "false")
+    Check.jsonEq(user.put("/me/preferences", "{\"likedTopics\":[\"TECNOLOGIA\"]}"), "batataMode", "true")
+    Check.status(user.put("/me/theme", "{\"theme\":\"terminal\"}"), 204)
+    Check.jsonEq(user.get("/me/preferences"), "batataMode", "true")
+    Check.jsonEq(user.put("/me/preferences", "{\"batataMode\":false}"), "batataMode", "false")
+}
+
+test "the theme is preserved when personalization changes" {
+    var user = ProfileTestApp.login(prefsApp(), "pers_theme")
+    Check.status(user.put("/me/theme", "{\"theme\":\"terminal\"}"), 204)
+    Check.status(user.put("/me/preferences", "{\"likedTopics\":[\"TECNOLOGIA\"]}"), 200)
+    Check.jsonEq(user.get("/me/theme"), "theme", "terminal")
+}
+
+// PersonalizationSecurityTests (the preference-only ones) -------------------------------------
+test "preferences require a session" {
+    var app = prefsApp()
+    var anon = ProfileTestApp.anonymous(app)
+    Check.apiError(anon.get("/me/preferences"), 401, "UNAUTHENTICATED")
+    Check.apiError(anon.put("/me/preferences", "{\"likedTopics\":[\"TECNOLOGIA\"]}"), 401, "UNAUTHENTICATED")
+}
+
+test "cannot change another account's preferences" {
+    var app = prefsApp()
+    var victim = ProfileTestApp.login(app, "persec_victim")
+    var attacker = ProfileTestApp.login(app, "persec_attacker")
+    Check.status(victim.put("/me/preferences", "{\"likedTopics\":[\"TECNOLOGIA\"]}"), 200)
+    // The attacker sends the victim's userId in the payload: the account is the SESSION's, never the body's.
+    Check.status(attacker.put("/me/preferences", "{\"userId\":\"persec_victim\",\"blockedTopics\":[\"DESIGN\"]}"), 200)
+    var read = victim.get("/me/preferences")
+    Check.status(read, 200)
+    Check.jsonEq(read, "likedTopics.0", "TECNOLOGIA")
+    Check.eqInt("blocked", 0, read.jsonSize("blockedTopics"))
+}
+
+test "disabling modules is an interface preference: the API keeps answering" {
+    // Adapted: the Java test also calls /conversations, /jobs, /communities and /events (other domains).
+    // Here the preference is stored and the account endpoints keep answering.
+    var user = ProfileTestApp.login(prefsApp(), "persec_modules")
+    Check.status(user.put("/me/preferences", "{\"disabledModules\":[\"MESSAGES\",\"JOBS\",\"COMMUNITIES\",\"EVENTS\"]}"), 200)
+    var read = user.get("/me/preferences")
+    Check.status(read, 200)
+    Check.eqInt("modules", 4, read.jsonSize("disabledModules"))
+    Check.status(user.get("/me/theme"), 200)
+    Check.status(user.get("/me"), 200)
+}
+
+// ThemeControllerTests -------------------------------------------------------------------------
+test "without a preference the theme is null" {
+    var user = ProfileTestApp.login(prefsApp(), "user_theme_empty")
+    var res = user.get("/me/theme")
+    Check.status(res, 200)
+    Check.isTrue("theme null", res.jsonIsNull("theme"))
+    Check.isTrue("updatedAt null", res.jsonIsNull("updatedAt"))
+}
+
+test "a valid theme is persisted and replaced, never accumulated" {
+    var user = ProfileTestApp.login(prefsApp(), "user_theme_set")
+    Check.status(user.put("/me/theme", "{\"theme\":\"win95\"}"), 204)
+    var first = user.get("/me/theme")
+    Check.jsonEq(first, "theme", "win95")
+    Check.isTrue("updatedAt present", first.jsonHas("updatedAt") && first.json("updatedAt").endsWith("Z"))
+    Check.status(user.put("/me/theme", "{\"theme\":\"synthwave\"}"), 204)
+    Check.jsonEq(user.get("/me/theme"), "theme", "synthwave")
+}
+
+test "a null theme clears the preference" {
+    var user = ProfileTestApp.login(prefsApp(), "user_theme_clear")
+    Check.status(user.put("/me/theme", "{\"theme\":\"terminal\"}"), 204)
+    Check.status(user.put("/me/theme", "{\"theme\":null}"), 204)
+    Check.isTrue("theme null", user.get("/me/theme").jsonIsNull("theme"))
+    Check.status(user.put("/me/theme", "{\"theme\":\"terminal\"}"), 204)
+    Check.status(user.put("/me/theme", "{\"theme\":\"  \"}"), 204)
+    Check.isTrue("blank clears", user.get("/me/theme").jsonIsNull("theme"))
+}
+
+test "an unknown theme is refused and nothing is stored" {
+    var user = ProfileTestApp.login(prefsApp(), "user_theme_invalid")
+    Check.apiError(user.put("/me/theme", "{\"theme\":\"tema-inventado\"}"), 400, "INVALID_THEME")
+    Check.isTrue("theme null", user.get("/me/theme").jsonIsNull("theme"))
+}
+
+test "a gallery theme survives as the account preference" {
+    // Adapted: the Java test publishes the theme through POST /temas/galeria (themes domain, not ported
+    // here); the published row is inserted directly. The id is longer than 32 characters on purpose: the
+    // validation passed and the INSERT used to die, so the test reads it back with a GET.
+    var app = prefsApp()
+    var author = ProfileTestApp.login(app, "user_theme_gallery")
+    var themeId = "theme_0123456789abcdef0123456789abcdef"
+    app.db().execute("insert into theme_gallery (id, author_id, name, description, package_json, mode_default, installs, status, created_at) values (?, ?, ?, ?, ?, ?, 0, \'PUBLISHED\', ?)", DbParams().bindStr(themeId).bindStr("user_theme_gallery").bindStr("Tema da Comunidade").bindStrOrNull(null).bindStr("{}").bindStr("light").bindInstant(Time.nowIso()))
+    Check.isTrue("long id", themeId.length() > 32)
+    Check.status(author.put("/me/theme", "{\"theme\":\"" + themeId + "\"}"), 204)
+    Check.jsonEq(author.get("/me/theme"), "theme", themeId)
+    // An unpublished gallery theme is not valid.
+    app.db().execute("insert into theme_gallery (id, author_id, name, description, package_json, mode_default, installs, status, created_at) values (?, ?, ?, ?, ?, ?, 0, \'PENDING\', ?)", DbParams().bindStr("theme_pending_0123456789abcdef0123456789").bindStr("user_theme_gallery").bindStr("Pendente").bindStrOrNull(null).bindStr("{}").bindStr("light").bindInstant(Time.nowIso()))
+    Check.apiError(author.put("/me/theme", "{\"theme\":\"theme_pending_0123456789abcdef0123456789\"}"), 400, "INVALID_THEME")
+}
+
+test "the theme endpoints require a session" {
+    var anon = ProfileTestApp.anonymous(prefsApp())
+    Check.status(anon.get("/me/theme"), 401)
+    Check.status(anon.put("/me/theme", "{\"theme\":\"win95\"}"), 401)
+}
+
+// ThemeIdsTests --------------------------------------------------------------------------------
+test "accepts every theme of the new generation" {
+    for (var id in listOf("swing-metal", "swing-ocean", "swing-nimbus", "swing-motif", "swing-windows", "swing-dark", "web2000", "web2000-forum", "web2000-cybercafe", "web2000-glass", "web2000-portal", "web2000-pixel", "arcade-8bit", "arcade-16bit", "arcade-dungeon", "arcade-space", "arcade-wasteland", "arcade-strategy", "arcade-rpg", "arcade-terminal", "unix-classic", "terminal-green", "amber-crt", "workbench", "industrial-desktop")) {
+        Check.isTrue("theme " + id, PreferencesCatalog.isThemeId(id))
+    }
+}
+
+test "keeps the original twelve and the expanded collection" {
+    for (var id in listOf("win95", "win98", "win2000", "luna", "aero-glass", "frutiger-aero", "metro", "terminal", "vaporwave", "synthwave", "y2k", "neumorfismo")) {
+        Check.isTrue("theme " + id, PreferencesCatalog.isThemeId(id))
+    }
+    Check.eqInt("size", 85, PreferencesCatalog.themeIdSet.size())
+}
+
+test "no theme id is blank or padded" {
+    var ids = listOf("win95", "win98", "win2000", "luna", "aero-glass", "frutiger-aero", "metro", "terminal", "vaporwave", "synthwave", "y2k", "neumorfismo", "blahaj", "madrugada", "papel-kraft")
+    for (var id in ids) {
+        Check.isTrue("trimmed " + id, id.trim() == id && id.length() > 0 && PreferencesCatalog.isThemeId(id))
+    }
+}
+
+// NightRestReminderPreferenceTests -------------------------------------------------------------
+test "night rest reminder: default is on and disabling sticks across partial updates" {
+    var user = ProfileTestApp.login(prefsApp(), "night_test_new")
+    Check.jsonEq(user.get("/me/preferences"), "nightRestReminder", "true")
+    Check.jsonEq(user.put("/me/preferences", "{\"nightRestReminder\":false}"), "nightRestReminder", "false")
+    Check.jsonEq(user.get("/me/preferences"), "nightRestReminder", "false")
+    Check.jsonEq(user.put("/me/preferences", "{\"likedTopics\":[\"TECNOLOGIA\"]}"), "nightRestReminder", "false")
+}
+
+test "night rest dismissal persists the night and survives other preference updates" {
+    var user = ProfileTestApp.login(prefsApp(), "night_test_dismiss")
+    Check.isTrue("none yet", user.get("/me/preferences").jsonIsNull("nightRestDismissedOn"))
+    var dismissed = user.post("/me/preferences/night-rest/dismissed", "{\"night\":\"2026-01-11\"}")
+    Check.status(dismissed, 200)
+    Check.jsonEq(dismissed, "nightRestDismissedOn", "2026-01-11")
+    Check.jsonEq(user.get("/me/preferences"), "nightRestDismissedOn", "2026-01-11")
+    // Changing other preferences (or the theme) cannot reopen the popup on the same night.
+    Check.jsonEq(user.put("/me/preferences", "{\"likedTopics\":[\"TECNOLOGIA\"]}"), "nightRestDismissedOn", "2026-01-11")
+    Check.status(user.put("/me/theme", "{\"theme\":\"terminal\"}"), 204)
+    Check.jsonEq(user.get("/me/preferences"), "nightRestDismissedOn", "2026-01-11")
+}
+
+test "a night that is not an ISO date is rejected" {
+    var user = ProfileTestApp.login(prefsApp(), "night_test_bad")
+    Check.apiError(user.post("/me/preferences/night-rest/dismissed", "{\"night\":\"11/01/2026\"}"), 400, "INVALID_NIGHT")
+    Check.apiError(user.post("/me/preferences/night-rest/dismissed", "{\"night\":\"2026-02-30\"}"), 400, "INVALID_NIGHT")
+    Check.apiError(user.post("/me/preferences/night-rest/dismissed", "{}"), 400, "INVALID_NIGHT")
+}
+
+test "an existing account gets the default without losing saved preferences" {
+    var app = prefsApp()
+    var user = ProfileTestApp.login(app, "night_test_old")
+    app.db().execute("insert into user_preferences (user_id, liked_topics, updated_at) values (?, ?, ?)", DbParams().bindStr("night_test_old").bindStr("TECNOLOGIA").bindInstant(Time.nowIso()))
+    var read = user.get("/me/preferences")
+    Check.status(read, 200)
+    Check.jsonEq(read, "nightRestReminder", "true")
+    Check.eqInt("liked", 1, read.jsonSize("likedTopics"))
+    Check.jsonEq(read, "likedTopics.0", "TECNOLOGIA")
+}
+
+test "zz stops the background jobs" {
+    ProfileTestApp.finish()
+}

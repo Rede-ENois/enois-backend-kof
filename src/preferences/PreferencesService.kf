@@ -1,0 +1,166 @@
+package preferences
+
+import kernel.error.*
+import kernel.text.*
+import kernel.time.*
+
+// The three personalization controls with DISTINCT effects, plus the account theme (PersonalizationService,
+// ThemeService). One source of truth in the backend:
+//   likedTopics    "what I want to see": raises priority in recommendations, never removes the rest of the feed;
+//   blockedTopics  "subjects I dislike": filters posts of that topic on the defined surfaces (not censorship);
+//   disabledModules "what I do not want to see": turns modules off for this person, never deletes data.
+//
+// Read API for the feed: `likedTopics(userId)` / `blockedTopics(userId)` (ReaderPreferencesReader).
+class PreferencesService {
+    PreferencesStore repository
+    PreferencesThemeGallery gallery
+    public constructor(repository: PreferencesStore, gallery: PreferencesThemeGallery) {
+        this.repository = repository
+        this.gallery = gallery
+    }
+    List<String> likedTopics(userId: String) = this.of(userId).likedTopics
+    List<String> blockedTopics(userId: String) = this.of(userId).blockedTopics
+    PreferencesView of(userId: String) {
+        var p = repository.find(userId)
+        if (p == null) {
+            return PreferencesView(listOf<String>(), listOf<String>(), listOf<String>(), true, null, false, false)
+        }
+        return PreferencesView(PreferencesService.parse(p.likedTopics), PreferencesService.parse(p.blockedTopics), PreferencesService.parse(p.disabledModules), p.nightRestReminder, p.nightRestDismissedOn, p.liteMode, p.batataMode)
+    }
+    // Partial update: every list is checked item by item against the real taxonomy/modules (an unknown
+    // value is a refusal, not silence), deduplicated and stored. Null or empty lists return to the default.
+    // The account theme is kept.
+    PreferencesView update(userId: String, b: PreferencesUpdateBody) {
+        var existing = repository.find(userId)
+        var liked = PreferencesService.validateAndJoin(b.likedTopics(), PreferencesCatalog.topicSet, "assunto")
+        var blocked = PreferencesService.validateAndJoin(b.blockedTopics(), PreferencesCatalog.topicSet, "assunto")
+        var modules = PreferencesService.validateAndJoin(b.disabledModules(), PreferencesCatalog.moduleSet, "módulo")
+        // The same subject in "want to see" and "dislike" would only create undefined behaviour in the feeds.
+        var likedList = PreferencesService.parse(liked)
+        for (var topic in PreferencesService.parse(blocked)) {
+            if (likedList.contains(topic)) {
+                throw Errors.api(409, "CONFLICTING_PREFERENCE", "\"" + topic + "\" não pode estar em \"quero ver\" e em \"não gosto\" ao mesmo tempo.")
+            }
+        }
+        var reminder = true
+        var lite = false
+        var batata = false
+        var theme = Nulls.str()
+        var dismissed = Nulls.str()
+        if (existing != null) {
+            reminder = existing.nightRestReminder
+            lite = existing.liteMode
+            batata = existing.batataMode
+            theme = existing.themeId
+            dismissed = existing.nightRestDismissedOn
+        }
+        if (b.nightRestReminder() != null) {
+            reminder = b.nightRestReminder() == true
+        }
+        if (b.liteMode() != null) {
+            lite = b.liteMode() == true
+        }
+        // BATATA is an independent presentation mode: turning one on or off never touches the other.
+        if (b.batataMode() != null) {
+            batata = b.batataMode() == true
+        }
+        repository.save(PreferencesRow(userId, theme, liked, blocked, modules, reminder, dismissed, lite, batata, Time.nowIso()))
+        return this.of(userId)
+    }
+    // Marks the night reminder as seen for THIS night (date from the device clock); the next night is a
+    // different date, so the reminder returns by itself with no reset job.
+    PreferencesView dismissNightRest(userId: String, night: String?) {
+        var text = ""
+        if (night != null) {
+            text = night.trim()
+        }
+        if (!Dates.valid(text)) {
+            throw Errors.api(400, "INVALID_NIGHT", "Informe a noite no formato AAAA-MM-DD (relógio do aparelho).")
+        }
+        var e = repository.find(userId)
+        if (e == null) {
+            repository.save(PreferencesRow(userId, null, null, null, null, true, text, false, false, Time.nowIso()))
+        }
+        else {
+            repository.save(PreferencesRow(userId, e.themeId, e.likedTopics, e.blockedTopics, e.disabledModules, e.nightRestReminder, text, e.liteMode, e.batataMode, Time.nowIso()))
+        }
+        return this.of(userId)
+    }
+    PreferencesThemeView theme(userId: String) {
+        var p = repository.find(userId)
+        if (p == null) {
+            return PreferencesThemeView(null, null)
+        }
+        return PreferencesThemeView(p.themeId, p.updatedAt)
+    }
+    // Unknown theme is a refusal (400), a blank one clears the choice but keeps the other preferences.
+    setTheme(userId: String, themeId: String?) {
+        var existing = repository.find(userId)
+        if (themeId == null) {
+            this.clearTheme(userId, existing)
+            return
+        }
+        if (themeId.trim().length() == 0) {
+            this.clearTheme(userId, existing)
+            return
+        }
+        var normalized = themeId.trim()
+        if (!PreferencesCatalog.isThemeId(normalized) && !gallery.isPublished(normalized)) {
+            throw Errors.api(400, "INVALID_THEME", "Tema desconhecido: escolha um dos temas disponiveis.")
+        }
+        if (existing == null) {
+            repository.save(PreferencesRow(userId, normalized, null, null, null, true, null, false, false, Time.nowIso()))
+        }
+        else {
+            repository.save(PreferencesRow(userId, normalized, existing.likedTopics, existing.blockedTopics, existing.disabledModules, existing.nightRestReminder, existing.nightRestDismissedOn, existing.liteMode, existing.batataMode, Time.nowIso()))
+        }
+    }
+    clearTheme(userId: String, existing: PreferencesRow?) {
+        if (existing == null) {
+            repository.delete(userId)
+            return
+        }
+        repository.save(PreferencesRow(userId, Nulls.str(), existing.likedTopics, existing.blockedTopics, existing.disabledModules, existing.nightRestReminder, existing.nightRestDismissedOn, existing.liteMode, existing.batataMode, Time.nowIso()))
+    }
+    // Trim, upper-case, drop blanks, reject unknown values, deduplicate keeping order; null when nothing is left.
+    static String? validateAndJoin(values: List<String>?, allowed: Set<String>, kind: String) {
+        if (values == null) {
+            return null
+        }
+        if (values.size() == 0) {
+            return null
+        }
+        var kept = listOf<String>()
+        for (var value in values) {
+            var normalized = value.trim().toUpperCase()
+            if (normalized.length() == 0) {
+                continue
+            }
+            if (!allowed.contains(normalized)) {
+                throw Errors.api(400, "INVALID_" + kind.toUpperCase(), "Valor desconhecido para " + kind + ": " + normalized)
+            }
+            if (!kept.contains(normalized)) {
+                kept.add(normalized)
+            }
+        }
+        if (kept.size() == 0) {
+            return null
+        }
+        return String.join(",", kept)
+    }
+    static List<String> parse(csv: String?) {
+        var out = listOf<String>()
+        if (csv == null) {
+            return out
+        }
+        if (csv.trim().length() == 0) {
+            return out
+        }
+        for (var item in csv.split(",")) {
+            if (item.trim().length() > 0) {
+                out.add(item.trim())
+            }
+        }
+        return out
+    }
+}

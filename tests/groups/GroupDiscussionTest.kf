@@ -1,0 +1,62 @@
+import kernel.testkit.*
+import groups.*
+
+// Port of GroupDiscussionTests: comments and reactions of the group.
+test "comments and reactions stay in the context of the group" {
+    var owner = GroupsTestKit.login("gdisc-dono")
+    var member = GroupsTestKit.login("gdisc-membro")
+    var stranger = GroupsTestKit.login("gdisc-estranho")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Discussao", "OPEN")
+    GroupsTestKit.joinOk(member, groupId)
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    var postId = GroupsTestKit.publish(owner, groupId, topicId, "Publicacao para discutir")
+    // Who is not a member does not comment.
+    Check.status(GroupsTestKit.commentRaw(stranger, groupId, postId, "nao deveria", null), 403)
+    // A member comments.
+    var created = GroupsTestKit.commentRaw(member, groupId, postId, "Comentario do membro", null)
+    Check.status(created, 201)
+    var commentId = created.json("id")
+    // The list brings the comment.
+    var list = GroupsTestKit.get("/groups/" + groupId + "/posts/" + postId + "/comments", member)
+    Check.status(list, 200)
+    Check.eqInt("comments", 1, list.jsonSize("items"))
+    Check.jsonEq(list, "items.0.content", "Comentario do membro")
+    Check.jsonEq(list, "items.0.authorUsername", "gdisc-membro")
+    // The post counter follows.
+    Check.jsonEq(GroupsTestKit.get("/groups/" + groupId + "/posts", member), "items.0.comments", "1")
+    // A reply to the comment (same post) goes in.
+    var reply = GroupsTestKit.commentRaw(owner, groupId, postId, "Respondendo", commentId)
+    Check.status(reply, 201)
+    Check.jsonEq(reply, "parentCommentId", commentId)
+    // Reaction: SET, toggle off, swap and DELETE.
+    var reacted = GroupsTestKit.react(member, groupId, postId, "LIKE")
+    Check.status(reacted, 200)
+    Check.jsonEq(reacted, "status", "REACTED")
+    Check.jsonEq(GroupsTestKit.get("/groups/" + groupId + "/posts", member), "items.0.reactions", "1")
+    // The same reaction again removes (toggle).
+    Check.jsonEq(GroupsTestKit.react(member, groupId, postId, "LIKE"), "status", "UNREACTED")
+    Check.jsonEq(GroupsTestKit.get("/groups/" + groupId + "/posts", member), "items.0.reactions", "0")
+    // Another reaction replaces and DELETE removes for good.
+    Check.jsonEq(GroupsTestKit.react(member, groupId, postId, "FIRE"), "status", "REACTED")
+    // The list returns the reaction of WHO IS READING (the screen needs it not to "lose" the state).
+    var mine = GroupsTestKit.get("/groups/" + groupId + "/posts", member)
+    Check.jsonEq(mine, "items.0.reactions", "1")
+    Check.jsonEq(mine, "items.0.myReaction", "FIRE")
+    var removed = GroupsTestKit.delete("/groups/" + groupId + "/posts/" + postId + "/reactions", member)
+    Check.status(removed, 200)
+    Check.jsonEq(removed, "status", "UNREACTED")
+    Check.jsonEq(GroupsTestKit.get("/groups/" + groupId + "/posts", member), "items.0.reactions", "0")
+    // An unknown reaction is 400.
+    Check.apiError(GroupsTestKit.react(member, groupId, postId, "NAO_EXISTE"), 400, "INVALID_REACTION")
+}
+
+test "a comment on a post of another group is refused" {
+    var owner = GroupsTestKit.login("gdisc-dono2")
+    var member = GroupsTestKit.login("gdisc-membro2")
+    var groupA = GroupsTestKit.createGroup(owner, "Grupo A Discussao", "OPEN")
+    var groupB = GroupsTestKit.createGroup(owner, "Grupo B Discussao", "OPEN")
+    GroupsTestKit.joinOk(member, groupA)
+    var topicB = GroupsTestKit.createTopic(owner, groupB, "Geral B")
+    var postOfB = GroupsTestKit.publish(owner, groupB, topicB, "Post do grupo B")
+    Check.apiError(GroupsTestKit.commentRaw(member, groupA, postOfB, "cruzando grupos", null), 404, "POST_NOT_FOUND")
+}

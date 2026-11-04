@@ -1,0 +1,40 @@
+package groups
+
+import kernel.*
+import kernel.idempotency.*
+import kernel.security.*
+
+// Composition of the Groups domain: stores, services, routes and the outbox handler of new posts.
+//
+//   Main.kf:  GroupsModule.install(platform, shared, hooks)
+//
+// The seams (profile, age gate, media, notifications, coins) default to read-only readers over the
+// owners' tables; an owner passes its subclass through `installWith` when it is ported.
+class GroupsModule {
+    GroupService groups
+    GroupFeedService feed
+    GroupNotifier notifier
+    GroupReportReader reports
+    GroupStore groupStore
+    GroupContentStore contentStore
+    public constructor(groups: GroupService, feed: GroupFeedService, notifier: GroupNotifier, reports: GroupReportReader, groupStore: GroupStore, contentStore: GroupContentStore) {
+        this.groups = groups
+        this.feed = feed
+        this.notifier = notifier
+        this.reports = reports
+        this.groupStore = groupStore
+        this.contentStore = contentStore
+    }
+    static GroupsModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks) = GroupsModule.installWith(platform, shared, GroupProfileLookup(platform.db), GroupAgeGate(platform.db), GroupMediaLookup(platform.db), GroupNotifications(platform.db), GroupCoins())
+    static GroupsModule installWith(platform: Platform, shared: SharedServices, profiles: GroupProfileLookup, ageGate: GroupAgeGate, media: GroupMediaLookup, notifications: GroupNotifications, coins: GroupCoins) {
+        var groupStore = GroupStore(platform.db)
+        var contentStore = GroupContentStore(platform.db)
+        var notifier = GroupNotifier(groupStore, contentStore, profiles, notifications)
+        shared.outbox.register(GroupNotifier.postPublished(), notifier)
+        var groups = GroupService(groupStore, shared.audit, notifier, coins)
+        var feed = GroupFeedService(groupStore, contentStore, shared.audit, notifier, shared.outbox, ageGate, shared.sanctionGate)
+        GroupRoutes.register(platform.server, GroupRoutes(groups, profiles, shared.idempotency))
+        GroupContentRoutes.register(platform.server, GroupContentRoutes(feed, profiles, media, shared.idempotency))
+        return GroupsModule(groups, feed, notifier, GroupReportReader(contentStore), groupStore, contentStore)
+    }
+}

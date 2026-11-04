@@ -1,0 +1,178 @@
+package groups
+
+import kernel.text.*
+
+// Rows and rules of the Groups domain (Java `groups/domain`). Roles, statuses and capabilities are
+// String constants: enums do not cross packages safely (KOF_GAPS G43).
+record GroupRow(String id, String slug, String name, String? description, String? topic, String? avatar, String? banner, String? bannerHtml, String joinMode, String status, String ownerId, String createdAt, String updatedAt, String? suspendedAt)
+
+record GroupMemberRow(String groupId, String userId, String role, String joinedAt)
+
+record GroupJoinRow(String id, String groupId, String userId, String? message, String status, String createdAt, String? decidedBy, String? decidedAt)
+
+record GroupTopicRow(String id, String groupId, String name, String? description, Int position, String status, String createdAt, String updatedAt)
+
+record GroupPostRow(String id, String groupId, String topicId, String authorId, String content, List<String> mediaIds, String status, Bool pinned, Int reactions, Int comments, String createdAt, String updatedAt)
+
+record GroupCommentRow(String id, String postId, String groupId, String authorId, String? parentId, String content, String status, String createdAt, String updatedAt)
+
+record GroupReactionRow(String id, String postId, String userId, String type, String createdAt)
+
+// Who can do what inside a group: one table, role by capability (GroupPermissions). A null role is a
+// visitor and reaches only the public presentation of the group, plus reporting it.
+class GroupPermissions {
+    static List<String> capabilities() = listOf("VIEW_PRIVATE_CONTENT", "PUBLISH", "INTERACT", "REPORT_CONTENT", "REPORT_GROUP", "MODERATE_CONTENT", "PIN_CONTENT", "MANAGE_TOPICS", "MANAGE_MEMBERS", "VIEW_JOIN_REQUESTS", "DECIDE_JOIN_REQUESTS", "EDIT_GROUP", "CONFIGURE_JOIN", "MANAGE_ROLES", "TRANSFER_OWNERSHIP", "CLOSE_GROUP", "DELETE_REPORT_EVIDENCE", "DISABLE_AUTOMOD", "CHANGE_AUDIT_RECORDS", "GRANT_GLOBAL_PRIVILEGES")
+    static List<String> roles() = listOf("OWNER", "ADMIN", "MODERATOR", "MEMBER")
+    static Bool can(role: String?, capability: String) {
+        if (role == null) {
+            return capability == "REPORT_GROUP"
+        }
+        var owner = role == "OWNER"
+        var admin = role == "ADMIN"
+        var moderator = role == "MODERATOR"
+        if (capability == "VIEW_PRIVATE_CONTENT" || capability == "PUBLISH" || capability == "INTERACT" || capability == "REPORT_CONTENT" || capability == "REPORT_GROUP") {
+            return true
+        }
+        if (capability == "MODERATE_CONTENT" || capability == "PIN_CONTENT") {
+            return owner || admin || moderator
+        }
+        if (capability == "MANAGE_TOPICS" || capability == "MANAGE_MEMBERS" || capability == "VIEW_JOIN_REQUESTS" || capability == "DECIDE_JOIN_REQUESTS" || capability == "EDIT_GROUP" || capability == "CONFIGURE_JOIN") {
+            return owner || admin
+        }
+        if (capability == "MANAGE_ROLES" || capability == "TRANSFER_OWNERSHIP" || capability == "CLOSE_GROUP") {
+            return owner
+        }
+        // DELETE_REPORT_EVIDENCE, DISABLE_AUTOMOD, CHANGE_AUDIT_RECORDS and GRANT_GLOBAL_PRIVILEGES are
+        // denied to everybody: the report and the audit belong to the platform.
+        return false
+    }
+    // The last owner is never demoted or removed: the group would be left without anyone able to edit it.
+    static Bool canDropOwnership(members: List<GroupMemberRow>, userId: String) {
+        for (var member in members) {
+            if (member.role() == "OWNER" && member.userId() != userId) {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// What each group state allows (the service asks on every operation; the screen never decides).
+class GroupStatuses {
+    static Bool valid(status: String) = status == "ACTIVE" || status == "RESTRICTED" || status == "SUSPENDED" || status == "CLOSED"
+    // Entry of new members (open or by approval).
+    static Bool acceptsNewMembers(status: String) = status == "ACTIVE"
+    // New posts and comments.
+    static Bool acceptsNewContent(status: String) = status == "ACTIVE" || status == "RESTRICTED"
+    // Shown in discovery and search.
+    static Bool visibleInDiscovery(status: String) = status == "ACTIVE" || status == "RESTRICTED"
+    // Existing content stays readable for who was a member.
+    static Bool readableByMembers(status: String) = status != "CLOSED"
+}
+
+// The address of the group from its name: accents become letters, lower case, hyphen for what is not a
+// letter or digit, never empty ("grupo"), capped at the column size (80) without a dangling hyphen.
+class GroupSlug {
+    static Int maxLength() = 80
+    static String from(name: String?) {
+        if (name == null) {
+            return "grupo"
+        }
+        var slug = Texts.stripAccents(name).toLowerCase().replaceAll("[^a-z0-9]+", "-").replaceAll("(^-|-$)", "")
+        if (slug.length() == 0) {
+            return "grupo"
+        }
+        if (slug.length() > GroupSlug.maxLength()) {
+            slug = slug.substring(0, GroupSlug.maxLength()).replaceAll("-+$", "")
+        }
+        return slug
+    }
+}
+
+// Pure edits of a group row (Group.update / withStatus / withOwner of the Java domain).
+class GroupRules {
+    // Null keeps the current value; avatar, banner and bannerHtml blank clear it. A blank bannerHtml
+    // is stored as "" (the page then falls back to the photo), a blank image as null.
+    static GroupRow update(g: GroupRow, name: String?, description: String?, topic: String?, avatar: String?, banner: String?, bannerHtml: String?, joinMode: String?, now: String) {
+        var newName = g.name()
+        if (name != null) {
+            newName = name
+        }
+        var newDescription = g.description()
+        if (description != null) {
+            newDescription = description
+        }
+        var newTopic = g.topic()
+        if (topic != null) {
+            newTopic = topic
+        }
+        var newAvatar = g.avatar()
+        if (avatar != null) {
+            newAvatar = GroupRules.blankToNull(avatar)
+        }
+        var newBanner = g.banner()
+        if (banner != null) {
+            newBanner = GroupRules.blankToNull(banner)
+        }
+        var newHtml = g.bannerHtml()
+        if (bannerHtml != null) {
+            newHtml = bannerHtml
+            if (bannerHtml.trim().length() == 0) {
+                newHtml = ""
+            }
+        }
+        var newMode = g.joinMode()
+        if (joinMode != null) {
+            newMode = joinMode
+        }
+        return GroupRow(g.id(), g.slug(), newName, newDescription, newTopic, newAvatar, newBanner, newHtml, newMode, g.status(), g.ownerId(), g.createdAt(), now, g.suspendedAt())
+    }
+    // Suspending stamps the time; leaving SUSPENDED clears the stamp.
+    static GroupRow withStatus(g: GroupRow, status: String, now: String) {
+        var stamp = g.suspendedAt()
+        if (status == "SUSPENDED") {
+            stamp = now
+        }
+        else {
+            stamp = GroupNil.str()
+        }
+        return GroupRow(g.id(), g.slug(), g.name(), g.description(), g.topic(), g.avatar(), g.banner(), g.bannerHtml(), g.joinMode(), status, g.ownerId(), g.createdAt(), now, stamp)
+    }
+    static GroupRow withOwner(g: GroupRow, ownerId: String, now: String) = GroupRow(g.id(), g.slug(), g.name(), g.description(), g.topic(), g.avatar(), g.banner(), g.bannerHtml(), g.joinMode(), g.status(), ownerId, g.createdAt(), now, g.suspendedAt())
+    static String? blankToNull(value: String) {
+        if (value.trim().length() == 0) {
+            return null
+        }
+        return value
+    }
+    static Bool blank(value: String?) {
+        if (value == null) {
+            return true
+        }
+        return value.trim().length() == 0
+    }
+    static String orEmpty(value: String?) {
+        if (value == null) {
+            return ""
+        }
+        return value
+    }
+    static String? trimToNull(value: String?) {
+        if (value == null) {
+            return null
+        }
+        var trimmed = value.trim()
+        if (trimmed.length() == 0) {
+            return null
+        }
+        return trimmed
+    }
+}
+
+// Kof refuses a null literal assigned to a variable (SEM048): these give a typed null to start from.
+class GroupNil {
+    static String? str() = null
+    static GroupNameStyle? style() = null
+    static GroupTopicRow? topic() = null
+    static GroupCommentRow? comment() = null
+}
