@@ -1,0 +1,193 @@
+import kernel.*
+import kernel.config.*
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+
+wireAuth(p: Platform) {
+    var s = p.server
+    Auth.install(s, p.db, p.cfg)
+    s.get("/probe/me", () -> "user=" + Auth.requireUser())
+    s.get("/probe/viewer", () -> viewerBody())
+    s.post("/probe/write", () -> "wrote=" + Auth.requireUser())
+    s.get("/probe/issue", () -> issueBody())
+    s.get("/probe/clear", () -> clearBody())
+}
+
+String viewerBody() {
+    var v = Auth.viewerIdOrNull()
+    if (v == null) {
+        return "anonymous"
+    }
+    return "viewer=" + v
+}
+
+String issueBody() {
+    SessionCookies.issue("tok123", Time.plusSeconds(Time.nowIso(), 3600L), "ref456", Time.plusSeconds(Time.nowIso(), 2592000L))
+    return "{}"
+}
+
+String clearBody() {
+    SessionCookies.clear()
+    return "{}"
+}
+
+class AuthHolder {
+    static TestApp? app = null
+}
+
+TestApp authApp() {
+    var cur = AuthHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = TestApp.bootWith("auth", mapOf("REDE_AUTH_COOKIE_SECURE", "true"), (p: Platform) -> wireAuth(p))
+    AuthHolder.app = created
+    return created
+}
+
+test "requireUser answers 401 without a session" {
+    var app = authApp()
+    Check.apiError(app.client.get("/probe/me"), 401, "UNAUTHENTICATED")
+    var res = app.client.getWith("/probe/me", listOf("X-Session-Token: nope-" + Time.nowMillis()))
+    Check.apiError(res, 401, "UNAUTHENTICATED")
+    Check.jsonEq(res, "message", "Sessao invalida ou expirada.")
+    Check.apiError(app.client.getWith("/probe/me", listOf("X-Session-Token:    ")), 401, "UNAUTHENTICATED")
+}
+
+test "a live session resolves through the header, the cookie and bearer" {
+    var app = authApp()
+    SecurityFixtures.login(app.db(), "auth_user_a", "tok-a-1234567890")
+    var byHeader = app.client.getWith("/probe/me", listOf("X-Session-Token: tok-a-1234567890"))
+    Check.status(byHeader, 200)
+    Check.eqStr("header", "user=auth_user_a", byHeader.body)
+    var byCookie = app.client.send("GET", "/probe/me", listOf<String>(), "enois_session=tok-a-1234567890", "")
+    Check.eqStr("cookie", "user=auth_user_a", byCookie.body)
+    var byBearer = app.client.getWith("/probe/me", listOf("Authorization: Bearer tok-a-1234567890"))
+    Check.status(byBearer, 200)
+    Check.eqStr("bearer", "user=auth_user_a", byBearer.body)
+}
+
+test "the explicit header wins over the cookie" {
+    var app = authApp()
+    SecurityFixtures.login(app.db(), "auth_user_b1", "tok-b1-1234567890")
+    SecurityFixtures.login(app.db(), "auth_user_b2", "tok-b2-1234567890")
+    var res = app.client.send("GET", "/probe/me", listOf("X-Session-Token: tok-b1-1234567890"), "enois_session=tok-b2-1234567890", "")
+    Check.eqStr("winner", "user=auth_user_b1", res.body)
+}
+
+test "revoked and expired sessions are refused" {
+    var app = authApp()
+    SecurityFixtures.user(app.db(), "auth_user_c", true, false)
+    SecurityFixtures.session(app.db(), "auth_user_c", "tok-c-revoked-1234", 3600L)
+    SecurityFixtures.session(app.db(), "auth_user_c", "tok-c-expired-1234", -60L)
+    SecurityFixtures.revoke(app.db(), "tok-c-revoked-1234")
+    Check.apiError(app.client.getWith("/probe/me", listOf("X-Session-Token: tok-c-revoked-1234")), 401, "UNAUTHENTICATED")
+    Check.apiError(app.client.getWith("/probe/me", listOf("X-Session-Token: tok-c-expired-1234")), 401, "UNAUTHENTICATED")
+}
+
+test "an unverified account gets 403 EMAIL_NOT_VERIFIED, a second factor verifies it" {
+    var app = authApp()
+    SecurityFixtures.user(app.db(), "auth_user_d", false, false)
+    SecurityFixtures.session(app.db(), "auth_user_d", "tok-d-1234567890", 3600L)
+    var res = app.client.getWith("/probe/me", listOf("X-Session-Token: tok-d-1234567890"))
+    Check.apiError(res, 403, "EMAIL_NOT_VERIFIED")
+    Check.jsonEq(res, "message", "Confirme seu e-mail ou ative a verificacao em duas etapas para usar a plataforma.")
+    app.db().execute("update users set totp_enabled_at = ? where id = ?", DbParams().bindInstant(Time.nowIso()).bindStr("auth_user_d"))
+    Check.status(app.client.getWith("/probe/me", listOf("X-Session-Token: tok-d-1234567890")), 200)
+    SecurityFixtures.user(app.db(), "auth_user_d2", false, false)
+    SecurityFixtures.session(app.db(), "auth_user_d2", "tok-d2-1234567890", 3600L)
+    app.db().execute("update users set federated_second_factor_at = ? where id = ?", DbParams().bindInstant(Time.nowIso()).bindStr("auth_user_d2"))
+    Check.status(app.client.getWith("/probe/me", listOf("X-Session-Token: tok-d2-1234567890")), 200)
+    SecurityFixtures.user(app.db(), "auth_user_d3", false, false)
+    SecurityFixtures.session(app.db(), "auth_user_d3", "tok-d3-1234567890", 3600L)
+    app.db().execute("update users set email_otp_enabled_at = ? where id = ?", DbParams().bindInstant(Time.nowIso()).bindStr("auth_user_d3"))
+    Check.status(app.client.getWith("/probe/me", listOf("X-Session-Token: tok-d3-1234567890")), 200)
+}
+
+test "a hash copied out of the table is not a session, a raw legacy row still is" {
+    var app = authApp()
+    SecurityFixtures.login(app.db(), "auth_user_e", "tok-e-1234567890")
+    var stolen = SecurityDigest.sha256Hex("tok-e-1234567890")
+    Check.apiError(app.client.getWith("/probe/me", listOf("X-Session-Token: " + stolen)), 401, "UNAUTHENTICATED")
+    SecurityFixtures.user(app.db(), "auth_user_e2", true, false)
+    SecurityFixtures.rawSession(app.db(), "auth_user_e2", "raw-token-legacy-1234", 3600L)
+    Check.eqStr("raw", "user=auth_user_e2", app.client.getWith("/probe/me", listOf("X-Session-Token: raw-token-legacy-1234")).body)
+}
+
+test "viewerIdOrNull never throws" {
+    var app = authApp()
+    SecurityFixtures.login(app.db(), "auth_user_f", "tok-f-1234567890")
+    SecurityFixtures.user(app.db(), "auth_user_f2", false, false)
+    SecurityFixtures.session(app.db(), "auth_user_f2", "tok-f2-1234567890", 3600L)
+    Check.eqStr("anonymous", "anonymous", app.client.get("/probe/viewer").body)
+    Check.eqStr("invalid", "anonymous", app.client.getWith("/probe/viewer", listOf("X-Session-Token: invalid")).body)
+    Check.eqStr("unverified", "anonymous", app.client.getWith("/probe/viewer", listOf("X-Session-Token: tok-f2-1234567890")).body)
+    Check.eqStr("viewer", "viewer=auth_user_f", app.client.getWith("/probe/viewer", listOf("X-Session-Token: tok-f-1234567890")).body)
+}
+
+test "cookie writes need the CSRF header, header and read requests do not" {
+    var app = authApp()
+    SecurityFixtures.login(app.db(), "auth_user_g", "tok-g-1234567890")
+    var blocked = app.client.send("POST", "/probe/write", listOf("Content-Type: application/json"), "enois_session=tok-g-1234567890", "{}")
+    Check.status(blocked, 403)
+    Check.jsonEq(blocked, "code", "CSRF_REQUIRED")
+    Check.jsonEq(blocked, "message", "Requisicao recusada. Recarregue a pagina e tente de novo.")
+    Check.eqStr("no timestamp", "false", "" + blocked.jsonHas("timestamp"))
+    Check.eqStr("cache", "no-store", blocked.header("cache-control"))
+    var wrong = app.client.send("POST", "/probe/write", listOf("X-CSRF-Protection: 0"), "enois_session=tok-g-1234567890", "{}")
+    Check.status(wrong, 403)
+    var refreshOnly = app.client.send("POST", "/probe/write", listOf<String>(), "enois_refresh=anything", "{}")
+    Check.status(refreshOnly, 403)
+    var ok = app.client.send("POST", "/probe/write", listOf("X-CSRF-Protection: 1"), "enois_session=tok-g-1234567890", "{}")
+    Check.status(ok, 200)
+    Check.eqStr("write", "wrote=auth_user_g", ok.body)
+    var viaHeader = app.client.send("POST", "/probe/write", listOf("X-Session-Token: tok-g-1234567890"), "enois_session=tok-g-1234567890", "{}")
+    Check.status(viaHeader, 200)
+    var get = app.client.send("GET", "/probe/me", listOf<String>(), "enois_session=tok-g-1234567890", "")
+    Check.status(get, 200)
+    var bare = app.client.send("POST", "/probe/write", listOf<String>(), "", "{}")
+    Check.apiError(bare, 401, "UNAUTHENTICATED")
+    var blank = app.client.send("POST", "/probe/write", listOf<String>(), "enois_session=", "{}")
+    Check.apiError(blank, 401, "UNAUTHENTICATED")
+}
+
+test "issued cookies carry the Java names, SameSite, Max-Age, Path and Secure flags" {
+    var app = authApp()
+    var res = app.client.get("/probe/issue")
+    Check.status(res, 200)
+    var access = res.cookieLine("enois_session")
+    var refresh = res.cookieLine("enois_refresh")
+    assert(access.startsWith("enois_session=tok123; Path=/; Max-Age=3"))
+    assert(access.contains("; Secure"))
+    assert(access.contains("; HttpOnly"))
+    assert(access.endsWith("SameSite=Lax"))
+    assert(refresh.startsWith("enois_refresh=ref456; Path=/; Max-Age=25"))
+    assert(refresh.contains("; Secure"))
+    assert(refresh.contains("; HttpOnly"))
+    assert(refresh.endsWith("SameSite=Strict"))
+    var age = access.substring(access.indexOf("Max-Age=") + 8)
+    age = age.substring(0, age.indexOf(";"))
+    assert(age.toInt() >= 3598 && age.toInt() <= 3600)
+}
+
+test "cleared cookies expire immediately" {
+    var app = authApp()
+    var res = app.client.get("/probe/clear")
+    var access = res.cookieLine("enois_session")
+    var refresh = res.cookieLine("enois_refresh")
+    assert(access.startsWith("enois_session=; Path=/; Max-Age=0;"))
+    assert(access.endsWith("SameSite=Lax"))
+    assert(refresh.startsWith("enois_refresh=; Path=/; Max-Age=0;"))
+    assert(refresh.endsWith("SameSite=Strict"))
+    assert(access.contains("HttpOnly"))
+}
+
+test "the Secure flag follows REDE_AUTH_COOKIE_SECURE" {
+    var open = Config.of(mapOf("SPRING_PROFILES_ACTIVE", "dev"))
+    assert(!Auth.cookieSecure(open))
+    assert(Auth.cookieSecure(Config.of(mapOf("SPRING_PROFILES_ACTIVE", "prd"))))
+    assert(!Auth.cookieSecure(Config.of(mapOf("REDE_AUTH_COOKIE_SECURE", "false"))))
+    assert(Auth.cookieSecure(Config.of(mapOf("REDE_AUTH_COOKIE_SECURE", "true", "SPRING_PROFILES_ACTIVE", "dev"))))
+}

@@ -1,0 +1,35 @@
+package kernel.testkit
+
+import kernel.db.*
+import kernel.security.*
+import kernel.time.*
+
+// Rows the security tests need: a user (verified or not), a session. Unique ids per test.
+class SecurityFixtures {
+    // `verified` fills email_verified_at; `admin` sets users.is_admin.
+    static user(store: Db, id: String, verified: Bool, admin: Bool) {
+        var now = Time.nowIso()
+        store.execute("insert into users (id, username, name, email, open_to_work, is_mentor, created_at, updated_at, is_admin) values (?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(id).bindStr(id).bindStr(id + "@test.invalid").bindBool(false).bindBool(false).bindInstant(now).bindInstant(now).bindBool(admin))
+        if (verified) {
+            store.execute("update users set email_verified_at = ? where id = ?", DbParams().bindInstant(now).bindStr(id))
+        }
+    }
+    // A live session for `userId` valid for `ttlSeconds`; the table stores the SHA-256 of the token.
+    static session(store: Db, userId: String, token: String, ttlSeconds: Long) {
+        var now = Time.nowIso()
+        store.execute("insert into auth_sessions (token, user_id, created_at, expires_at) values (?, ?, ?, ?)", DbParams().bindStr(SecurityDigest.sha256Hex(token)).bindStr(userId).bindInstant(now).bindInstant(Time.plusSeconds(now, ttlSeconds)))
+    }
+    // Same, but the row keeps the token in clear (the deploy-window shape).
+    static rawSession(store: Db, userId: String, token: String, ttlSeconds: Long) {
+        var now = Time.nowIso()
+        store.execute("insert into auth_sessions (token, user_id, created_at, expires_at) values (?, ?, ?, ?)", DbParams().bindStr(token).bindStr(userId).bindInstant(now).bindInstant(Time.plusSeconds(now, ttlSeconds)))
+    }
+    static revoke(store: Db, token: String) {
+        store.execute("update auth_sessions set revoked_at = ? where token = ?", DbParams().bindInstant(Time.nowIso()).bindStr(SecurityDigest.sha256Hex(token)))
+    }
+    // A verified user with a live one-hour session in one call.
+    static login(store: Db, id: String, token: String) {
+        SecurityFixtures.user(store, id, true, false)
+        SecurityFixtures.session(store, id, token, 3600L)
+    }
+}

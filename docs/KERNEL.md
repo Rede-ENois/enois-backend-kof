@@ -226,6 +226,74 @@ unknown-path fallback (like `FallbackSurfaceFilter`, before everything), order `
 Use any other integers: below `-1000` runs before the fallback (observability), between the two for
 security filters. The V1 alias needs no filter (routes are registered under both prefixes).
 
+### After hooks, request context
+
+```kotlin
+server.useAfter("access-log", (status: Int, body: String) -> { ... })    // every request, final status and body
+Http.currentStatus()      // status the current response will carry (200 until status(...) is called)
+Http.routePattern()       // "/feed/posts/:id", or "UNMATCHED" (what the access log calls http.route)
+ResponseHeaders.set("X-A", "1")   ResponseHeaders.add("Vary", "Origin")   ResponseHeaders.get / has
+RequestPath.current()     // raw path of the request without the /v1 alias: what every guard rule is written against
+RequestPath.decode(raw)   // %XX once, '+' kept, malformed -> throws "REQUEST_PATH_MALFORMED"
+Req.rawQuery()            // query string as received
+```
+
+An after hook runs whoever produced the response (a route, a filter, the 405/unknown-path answers) and
+can only observe: a failing hook is logged and never changes the response. The runtime hands guards the
+RAW path and matches routes on it literally: `/%61dmin/x`, `/admin;v=1/x`, `/auth//config` and `/Admin/x`
+are unknown paths (200 empty, `/auth/%63onfig` included, see `docs/PORTING_STATUS.md`), so a guard never
+sees a spelling that routes to a protected handler without matching its own rule.
+
+`HttpServer.install` also (a) switches the runtime's own hardening headers and CSRF off
+(`app.security(headers:false, csrf:false)`, G27: `kernel.security` writes the Java header set), and (b) moves
+the `Authorization` header out of the request (G28: the runtime would answer 401 to it). `Req.bearerToken()`
+still returns the Bearer token.
+
+## kernel.security
+
+Everything request-pipeline of `shared/web` and `shared/security`. A domain only calls `Auth` (below);
+`Main.kf` calls `Auth.install(server, db, cfg)` (the full chain is `Security.install`, listed further down).
+
+### Current user (`Auth`, `SessionCookies`)
+
+```kotlin
+import kernel.security.*
+
+var userId = Auth.requireUser()          // String. 401 UNAUTHENTICATED "Sessao invalida ou expirada."
+                                         //        403 EMAIL_NOT_VERIFIED (no confirmed e-mail and no second factor)
+var viewer = Auth.viewerIdOrNull()       // String?. Public reads: anonymous / bad session / unverified -> null, never throws
+Auth.sessionToken()                      // String?. X-Session-Token header, else Authorization: Bearer, else the enois_session cookie
+Auth.resolve(token)                      // same rules for a token you already hold (CurrentUserResolver.resolve)
+Auth.requireAdmin()   Auth.requireModerator()    // see "Guards"
+
+SessionCookies.issue(token, expiresAtIso, refreshToken, refreshExpiresAtIso)   // two Set-Cookie headers on the response
+SessionCookies.clear()                                                        // both cookies, Max-Age=0
+SessionCookies.issueLines(...) / clearLines()                                  // the lines, for tests or custom responses
+```
+
+Contract (all as the Java service):
+
+| | `enois_session` | `enois_refresh` |
+|---|---|---|
+| SameSite | Lax | Strict |
+| Max-Age | seconds until the access expiry | seconds until the refresh expiry (0 when clearing) |
+| Path / HttpOnly | `/` / yes | `/` / yes |
+| Secure | `REDE_AUTH_COOKIE_SECURE` (default true; false only when `SPRING_PROFILES_ACTIVE=dev` is explicit) | same |
+
+An explicit `X-Session-Token` always wins over the cookie. A write authenticated by cookie (`enois_session` or
+`enois_refresh` present, no `X-Session-Token`) must carry `X-CSRF-Protection: 1`, else
+`403 {"code":"CSRF_REQUIRED","message":"Requisicao recusada. Recarregue a pagina e tente de novo."}` (no
+timestamp, `Cache-Control: no-store`, CORS reflected for trusted origins). `Authorization: Bearer` is accepted as
+a token source after the header (the Java service reads only the header and the cookie; the contract in
+AGENTS.md lists Bearer) and never exempts a cookie request from CSRF.
+
+Session lookup is `select ... from auth_sessions where token = sha256(token)`, active when `revoked_at is null and
+expires_at > now`, plus the deploy-window fallback on the clear token (never for a value shaped like a stored
+hash). The verification check reads `users.email_verified_at / totp_enabled_at / email_otp_enabled_at /
+federated_second_factor_at`; a missing user row passes (as in Java). One resolution per request is cached by
+token digest (reset by `Auth.resetRequest`, called by the observability filter), so a write that went through
+the write gate does not repeat the two queries in its handler.
+
 ## kernel.jobs
 
 ```kotlin

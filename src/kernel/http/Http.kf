@@ -1,5 +1,7 @@
 package kernel.http
 
+import java.lang.Class
+import java.lang.ThreadLocal
 import java.time.Instant
 import kernel.error.*
 import kernel.log.*
@@ -39,6 +41,35 @@ class Http {
     static String methodNotAllowed() = status(405, Http.errorJson("METHOD_NOT_ALLOWED", "Metodo nao suportado para este recurso."))
     // Anti-enumeration answer for paths outside the surface: 200 and an empty body.
     static String blank() = status(200, "")
+    static ThreadLocal routeLocal = new ThreadLocal()
+    static setRoute(label: String) {
+        routeLocal.set(label)
+    }
+    // Route template of the current request (`/feed/posts/:id`), or UNMATCHED.
+    static String routePattern() {
+        var v = routeLocal.get()
+        if (v == null || v.toString().length() == 0) {
+            return "UNMATCHED"
+        }
+        return v.toString()
+    }
+    // Status the current response will carry: what status(...) set, 200 otherwise. The runtime
+    // keeps it in a thread-local that Kof code cannot read, so it is read by reflection.
+    static Int currentStatus() {
+        try {
+            var c = Class.forName("dev.kof.runtime.KofRuntime")
+            var f = c.getDeclaredField("KOF_WEB_STATUS")
+            f.setAccessible(true)
+            var tl = f.get(null) as ThreadLocal
+            var v = tl.get()
+            if (v == null) {
+                return 200
+            }
+            return v.toString().toInt()
+        } catch (String e) {
+            return 200
+        }
+    }
 }
 
 // ApiResponse<T> envelope, @JsonInclude(NON_NULL): success -> {"success":true,"data":...,"timestamp":...},
