@@ -791,3 +791,24 @@ shared.jobs  shared.stop()
 
 `TestApp.bootWith/bootWire` now stop the platform when the `wire` callback throws (the open pool kept the
 test process from exiting).
+
+## kernel.push (web push adapter)
+
+`kernel.push.WebPushAdapter` is the only file that imports the web-push library (jars in `kofdeps`:
+`nl.martijndwars:web-push`, `org.bouncycastle:bcprov-jdk18on`, `org.bitbucket.b_c:jose4j`). The library overloads
+hit G2/G4/G21 style resolver bugs, so the objects are built by reflection and a plain Apache async client does the
+POST. Domains never see the library: `push.WebPushSender` is the caller.
+
+```
+var adapter = WebPushAdapter.create(vapidPublic, vapidPrivate, subject)   // null for blank or invalid keys
+var status = adapter.post(endpoint, p256dh, auth, payloadJson, ttlSeconds) // HTTP status, or -1; never throws
+adapter.lastFailure()                                                      // why the last -1 happened (log text, no keys)
+adapter.close()
+```
+
+- `create` returns `null` when a key is blank or not a valid P-256 key, so a missing configuration turns push off
+  instead of failing the boot.
+- `post` has 5 s to connect, 10 s per read and a 15 s overall limit; 404 and 410 mean the subscription is gone (the
+  caller deletes it).
+- `WebPushKeys.vapid()` and `WebPushKeys.device()` are fixed test-only key pairs (base64url) for suites that need a
+  real encryption round trip; tests of other domains stub the sender (`push.RecordingPushSender`).

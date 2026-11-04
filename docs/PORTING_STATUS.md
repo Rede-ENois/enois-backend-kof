@@ -3,6 +3,7 @@
 | Domain | Endpoints ported / total | Tests ported / total | Gaps |
 |---|---|---|---|
 | shared/web + shared/security (request pipeline) + `apiv1` origin gate | `GET/POST /admin/panic` 2/2 (the `/v1` index and `/developers/origins` CRUD belong to `apiv1`) | 87 / 100 Java tests (149 Kof tests in `tests/security/`) | G28 to G35 |
+| notifications, push, messaging, calls (slug `messaging`) | notifications 8/8, push 3/3, messaging 24/24 (`GET /conversations/stream` answers but cannot stream, G201), calls 13/13 | 117 / 122 Java tests (notifications 34/34, push 21/21, messaging 51/55, calls 11/12; 127 Kof tests in `tests/notifications`, `tests/push`, `tests/messaging`, `tests/calls`, `tests/kernel/WebPushAdapterTest.kf`) | G200 to G212 |
 
 ## Request pipeline (`kernel.security`)
 
@@ -96,3 +97,90 @@ escalation text instead of reading the `reports` table; `IntelligentCacheTests` 
 behaviours on `TtlCache`/`Caches` (reuse, expiry loads nothing on its own, renew after expiry, a write
 clears after commit, a failed write leaves the cache alone, one load for concurrent callers, closed list of
 caches with their policy) because `EventService` is not ported.
+
+
+## Notifications, push, messaging, calls (`notifications`, `push`, `messaging`, `calls`)
+
+Wired in `Main.kf` in this order (notifications is the sink the other domains write to):
+`NotificationsModule.install`, `PushModule.install`, `MessagingModule.install`, `CallsModule.install`.
+`install(platform, shared, hooks, parts, ...)` takes `SecurityParts` as a fourth argument (the guide shows three):
+messaging and calls need `parts.userLimiter` and `parts.timingGuard`. Tests install a module with `installWith`
+and a swapped seam (`tests/*/` boot through `notifications.DomainTestKit`).
+
+Ported: every endpoint (notifications `GET /notifications`, `/notifications/unread-summary`,
+`POST /notifications/{id}/read`, `/notifications/read-all`, `GET`/`PUT /me/notification-preferences`,
+`GET`/`POST /notifications/digest/unsubscribe`; push `GET /push/config`, `POST`/`DELETE /push/subscriptions`;
+the 19 `/conversations/**` routes and the 5 `/e2e/**` routes; the 13 call routes), the outbox handler, the
+weekly digest cron, the community apology worker, web push with VAPID (`kernel.push.WebPushAdapter`), the call
+expiry worker and the `ConversationViewers.dropExpired` job, all on `kernel.jobs`.
+
+### The Notifications API other domains call (`notifications.Notifications`)
+
+Take it from the module: `var notifications = notificationsModule.notifications`. Every method writes inside the
+caller's transaction (a nested `Db.transaction` joins it) and publishes the push event after the outermost
+commit (`Db.afterCommit`), so a rolled back write sends nothing.
+
+```
+notifications.create(userId, kind, actorId, title, body, href, ctaLabel)            // simple notice
+notifications.createWithPreview(..., ctaLabel, preview)                              // + the 140 char preview
+notifications.createGrouped(userId, kind, groupKey, actorId, title, body, groupedBody: (Int) -> String, href, groupedHref, ctaLabel, preview)
+notifications.createCounted(userId, kind, groupKey, actorId, title, body, countedBody: (Int) -> String, href, ctaLabel)  // "N novos", first one pushes
+notifications.createCountedAndPushed(...)                                            // same, every increment pushes (messages)
+notifications.markReadByHref(userId, href)    notifications.markRead(id, userId)    notifications.markAllRead(userId)
+notifications.addListener(listener)           // NotificationListener.onCreated(event), what push uses
+```
+
+`NotificationOutboxEventHandler.forTypes(shared.outbox, notifications, sources, actors)` is registered by
+`NotificationsModule.install` for `PostCommented`, `PostReacted` and `CommentReacted`. Other domains register their
+own event types on `shared.outbox` as before.
+
+### Pending ports (seams owned by other domains; every default reads the owner's tables read-only)
+
+| Seam | Default | Owner / what it needs |
+|---|---|---|
+| `NotificationActors` (`notifications`) | reads `users`, `corporate_profiles` | profile and corporate: names, avatars, name style of the actor |
+| `NotificationSources` | reads `posts`, `comments` | feed: the post and comment behind an outbox event |
+| `NotificationCoins` | grants every reward, `hasReward(ref)` is false | coin: the daily/first notification rewards |
+| `NotificationAccounts`, `DigestAccounts`, `DigestPersonalization` | read `users` and the digest sources | identity and feed: who gets the weekly digest and what it shows |
+| `NotificationPlaceReader` | reads `communities`, `posts`, `groups`, `events` | communities, groups, events: the place a notice points to |
+| `DigestMailer` | logs and answers `false` (nothing is sent) | identity: `EmailService` (the digest and the apology mail) |
+| `PushPresence` (`push`) | reads `user_presence` | presence: who is online (no push to them) |
+| `MessagingAgePolicy` | reads `users.birth_date` and `parental_links` | profile/age: `AgeGate` and `AgePolicyReader` (`BIRTH_DATE_REQUIRED`, `PARENTAL_CONSENT_REQUIRED`) |
+| `MessagingConnections` | reads `user_connections` (ACCEPTED) | network: `ConnectionRepository` |
+| `MessagingCorporate` | reads `corporate_profiles` (ACTIVE) | corporate: `CorporateProfileService` |
+| `MessagingCoins` | `recordPresence` does nothing | coin: the daily presence streak |
+| `CallGroups` (`calls`) | reads `group_members` | groups: `GroupService.roleOf` and `memberIds` |
+| `CallProfiles` | reads `users.social_name`, `users.name` | profile: `displayName` |
+| `CallClock` | the security clock (tests move it with `SecurityClock.advanceSeconds`) | none: kept as a seam for tests |
+| call events (`CallService.publish`) | no listener | the event stream (G201); `CallChanged` has no consumer yet |
+
+Seams are concrete classes with overridable methods (interfaces across packages do not work, G30/G42): the
+owner subclasses the default and passes it in `NotificationsSeams` / `MessagingSeamSet` / `CallsSeamSet`.
+
+Configuration: `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` (push is off without the keys),
+`REDE_DIGEST_CRON`, `REDE_COMMUNICATIONS_APOLOGY_*`, `REDE_CALLS_JITSI_URL`, `REDE_CALLS_JITSI_JWT_SECRET`
+(32 bytes or more), `REDE_CALLS_JITSI_JWT_ISSUER` (`rede`), `REDE_CALLS_JITSI_JWT_AUDIENCE` (`meet.jitsi`),
+`REDE_CALLS_JITSI_TOKEN_TTL_MINUTES` (120). Without the Jitsi address and secret every call start is
+`503 CALLS_NOT_CONFIGURED`.
+
+### Java tests not ported (5 of 122)
+
+| Java test | Why |
+|---|---|
+| `MessageStreamTests` (4: `newMessageIsSignalledToTheRecipientStream`, `readReceiptIsSignalledToTheOtherParticipant`, `streamsPerUserAreCapped`, `streamRequiresASession`) | the runtime cannot hold a response open (G201). `streamRequiresASession` is covered in spirit by `MessagesTest` ("the event stream needs a session and ends with a retry hint": 401 without a session, a closed `text/event-stream` body with `retry: 5000` otherwise); the three that read events from an open stream have no equivalent until the runtime streams |
+| `CallMediaProbe.gravaTokensDosDoisLadosDaChamada` | a manual probe, disabled unless `-Dcall.probe.url` points to a real Jitsi stack; it needs a browser and external infrastructure, not a suite |
+
+Ported with a changed setup: `GroupCreationQueryCountTests` (3) keep the behaviour (a large group with one
+connected minor, an unconnected minor and a blocked member are decided as in Java) as HTTP tests; the Mockito
+call counts (`verify(agePolicy, times(1)).minorIds(...)`) have no HTTP equivalent, so "one read per kind" is
+guaranteed by the code (`MessagingService.createConversation` reads blocks and minors once) and not asserted.
+`CallFlowTests.atenderERecusarAoMesmoTempoNaoDeixaDoisEstados` ran two threads against MockMvc: here the two
+requests run one after the other in both orders (the compare and set in `CallsStore.advance` is what keeps one
+state; the loser gets `200` or `409`). `MessageNotificationTests` stub the push sender with
+`push.RecordingPushSender` and `inline = true` instead of mocking `PushSender` and `pushExecutor`.
+`MessagePreviewOrderTests` ran on a fixed clock; here the assertion is the same (the second message is strictly
+later than the first even inside one second) on the real clock.
+
+Deliberate differences: the 100 conversation participants limit, the 10 second duplicate window and the 4 media
+limit are the Java values; `PushService` is `PushSubscriptionService` (G206); a send with `"e2e": true` checks the
+ciphertext (`EMPTY_MESSAGE`, `MESSAGE_TOO_LONG` over 8000) and the IV (`MISSING_IV`) before storing.
