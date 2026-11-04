@@ -1,0 +1,331 @@
+import kernel.*
+import kernel.db.*
+import kernel.error.*
+import kernel.files.*
+import kernel.http.*
+import kernel.storage.*
+import kernel.testkit.*
+import kernel.time.*
+import media.*
+
+// The deletion worker, the `mediaStorage` resilience helper and the S3 REST client (against a fake
+// gateway served by the test app). No Java counterpart: the Java suite covered these only through the
+// proxy tests and Spring's resilience4j annotations.
+class WkGateway extends MediaStorageGateway {
+    List<String> calls = listOf<String>()
+    Bool failing = false
+    public constructor() {
+        super()
+    }
+    purgeCdn(asset: MediaAsset) {
+        calls.add("purge:" + asset.id)
+    }
+    deleteObject(asset: MediaAsset) {
+        if (failing) {
+            throw "gateway fora do ar"
+        }
+        calls.add("delete:" + asset.id)
+    }
+}
+
+class WkFakeS3 {
+    static Map<String,String> objects = mapOf<String, String>()
+    static Map<String,String> types = mapOf<String, String>()
+    static List<String> auths = listOf<String>()
+}
+
+class WkHolder {
+    static TestApp? app = null
+    static TestApp get() {
+        var cur = WkHolder.app
+        if (cur != null) {
+            return cur
+        }
+        var created = TestApp.bootWire("mediaworkers", (p: Platform) -> WkHolder.wire(p))
+        WkHolder.app = created
+        return created
+    }
+    static wire(p: Platform) {
+        var s = p.server
+        var depth = 1
+        while (depth <= 4) {
+            var pattern = "/enois-bucket"
+            var n = 1
+            while (n <= depth) {
+                pattern = pattern + "/:k" + n
+                n = n + 1
+            }
+            var size = depth
+            s.put(pattern, () -> WkHolder.put(size))
+            s.get(pattern, () -> WkHolder.get(size))
+            s.delete(pattern, () -> WkHolder.remove(size))
+            depth = depth + 1
+        }
+    }
+    static String key(size: Int) {
+        var k = ""
+        var n = 1
+        while (n <= size) {
+            if (n > 1) {
+                k = k + "/"
+            }
+            k = k + Req.pathParam("k" + n)
+            n = n + 1
+        }
+        return k
+    }
+    static String put(size: Int) {
+        WkFakeS3.auths.add(wkTrue(Req.authorizationHeader()))
+        WkFakeS3.objects.put(WkHolder.key(size), Req.bodyText())
+        WkFakeS3.types.put(WkHolder.key(size), wkTrue(Req.headerOrNull("content-type")))
+        return Http.respond(200, "")
+    }
+    static String get(size: Int) {
+        var body = WkFakeS3.objects.get(WkHolder.key(size))
+        if (body == null) {
+            return Http.respond(404, "<Error><Code>NoSuchKey</Code></Error>")
+        }
+        return Http.respond(200, body)
+    }
+    static String remove(size: Int) {
+        WkFakeS3.objects.remove(WkHolder.key(size))
+        return Http.respond(204, "")
+    }
+}
+
+String wkTrue(v: String?) {
+    if (v == null) {
+        return ""
+    }
+    return v
+}
+
+MediaAsset wkFind(store: MediaStore, id: String) {
+    var a = store.findById(id)
+    if (a == null) {
+        throw "asset " + id + " not found"
+    }
+    return a
+}
+
+MediaStore wkStore() = MediaStore(WkHolder.get().db())
+
+MediaAsset wkAsset(id: String) {
+    var now = Time.nowIso()
+    var asset = MediaAsset(id, "user_wk", "f.png", "image/png", 10L, "POST_IMAGE", "uploads/" + id + "/file.png", "https://cdn.exemplo.com/uploads/" + id + "/file.png", "PENDING", "NONE", now, Time.plusSeconds(now, 3600L), null, "S3", null, null, 0, null, null, null, 0)
+    wkStore().save(asset)
+    return asset
+}
+
+// ---- deletion worker
+
+test "the deletion worker purges, deletes the object and marks the asset" {
+    var store = wkStore()
+    wkAsset("media_wk_1")
+    var service = MediaService(store, MediaImageKitUrlFactory("https://ik"), null, MediaLazyCopy())
+    Check.eqStr("answer", "DELETE_REQUESTED", service.requestDeletion("user_wk", "media_wk_1").status)
+    var gateway = WkGateway()
+    Check.eqInt("deleted", 1, MediaDeletionWorker(store, gateway).processPendingJobs())
+    Check.eqStr("calls", "purge:media_wk_1,delete:media_wk_1", String.join(",", gateway.calls))
+    var after = wkFind(store, "media_wk_1")
+    Check.eqStr("asset", "OBJECT_DELETED", after.deleteStatus)
+    Check.eqStr("job", "COMPLETED", wkTrue(store.deletionJobStatus("media_wk_1")))
+}
+
+test "a failing gateway keeps the job REQUESTED with a backoff" {
+    var store = wkStore()
+    wkAsset("media_wk_2")
+    var service = MediaService(store, MediaImageKitUrlFactory("https://ik"), null, MediaLazyCopy())
+    service.requestDeletion("user_wk", "media_wk_2")
+    var gateway = WkGateway()
+    gateway.failing = true
+    Check.eqInt("deleted", 0, MediaDeletionWorker(store, gateway).processPendingJobs())
+    Check.eqStr("job", "REQUESTED", wkTrue(store.deletionJobStatus("media_wk_2")))
+    var row = store.store.queryOne("select attempts, error_message, next_attempt_at from media_deletion_jobs where media_id = ?", DbParams().bindStr("media_wk_2"))
+    Check.eqInt("attempts", 1, row.getInt("attempts"))
+    Check.eqStr("error", "gateway fora do ar", row.getStr("error_message"))
+    // Not due again right away: the next pass leaves it alone.
+    Check.eqInt("second pass", 0, MediaDeletionWorker(store, gateway).processPendingJobs())
+    var after = wkFind(store, "media_wk_2")
+    Check.eqStr("asset still requested", "REQUESTED", after.deleteStatus)
+}
+
+test "the backoff grows by ten seconds per attempt, from 10 to 300" {
+    Check.eqStr("first", "10", "" + MediaDeletionWorker.backoffSeconds(0))
+    Check.eqStr("third", "30", "" + MediaDeletionWorker.backoffSeconds(2))
+    Check.eqStr("capped", "300", "" + MediaDeletionWorker.backoffSeconds(40))
+}
+
+test "only the owner can request deletion, and an unknown media is a 404" {
+    var store = wkStore()
+    wkAsset("media_wk_3")
+    var service = MediaService(store, MediaImageKitUrlFactory("https://ik"), null, MediaLazyCopy())
+    var code = ""
+    try {
+        service.requestDeletion("someone_else", "media_wk_3")
+    } catch (String e) {
+        code = Errors.parse(e).code()
+    }
+    Check.eqStr("forbidden", "MEDIA_OWNER_MISMATCH", code)
+    try {
+        service.getMedia("media_wk_missing")
+    } catch (String e) {
+        code = Errors.parse(e).code()
+    }
+    Check.eqStr("missing", "MEDIA_NOT_FOUND", code)
+}
+
+test "post deletion and ownership checks" {
+    var store = wkStore()
+    wkAsset("media_wk_4")
+    wkAsset("media_wk_5")
+    var service = MediaService(store, MediaImageKitUrlFactory("https://ik"), null, MediaLazyCopy())
+    service.validateOwnedBy("user_wk", listOf("media_wk_4", " media_wk_5 ", "media_wk_4"))
+    var code = ""
+    try {
+        service.validateOwnedBy("other", listOf("media_wk_4"))
+    } catch (String e) {
+        code = Errors.parse(e).code()
+    }
+    Check.eqStr("foreign", "MEDIA_OWNER_MISMATCH", code)
+    try {
+        service.validateOwnedBy("user_wk", listOf("media_wk_4", "media_wk_none"))
+    } catch (String e) {
+        code = Errors.parse(e).code()
+    }
+    Check.eqStr("missing", "MEDIA_NOT_FOUND", code)
+    var done = service.requestPostMediaDeletion("user_wk", "post_9", listOf("media_wk_4", "media_wk_none"))
+    Check.eqInt("deleted ids", 1, done.size())
+    var visible = service.visibleByIds(listOf("media_wk_4", "media_wk_5", "media_wk_none"))
+    Check.eqInt("visible", 1, visible.size())
+    assert(visible.get("media_wk_5") != null)
+}
+
+
+// ---- resilience (retry 3 x, circuit 5/10 at 50%, bulkhead)
+
+class WkFlaky {
+    Int calls = 0
+    Int failFirst
+    public constructor(failFirst: Int) {
+        this.failFirst = failFirst
+    }
+    run() {
+        calls = calls + 1
+        if (calls <= failFirst) {
+            throw "boom"
+        }
+    }
+}
+
+MediaResilience wkResilience() {
+    var r = MediaResilience.standard()
+    r.sleeps = false
+    return r
+}
+
+test "a call is retried up to three attempts" {
+    var flaky = WkFlaky(2)
+    wkResilience().run(() -> flaky.run())
+    Check.eqInt("calls", 3, flaky.calls)
+    var r = wkResilience()
+    var always = WkFlaky(100)
+    var failed = ""
+    try {
+        r.run(() -> always.run())
+    } catch (String e) {
+        failed = e
+    }
+    Check.eqStr("last failure", "boom", failed)
+    Check.eqInt("attempts", 3, always.calls)
+}
+
+test "the circuit opens after five failed calls in the window and closes after the wait" {
+    var r = wkResilience()
+    r.maxAttempts = 1
+    var always = WkFlaky(100)
+    var i = 0
+    while (i < 5) {
+        try {
+            r.run(() -> always.run())
+        } catch (String e) {
+        }
+        i = i + 1
+    }
+    Check.isTrue("open", r.isOpen())
+    var refused = ""
+    try {
+        r.run(() -> always.run())
+    } catch (String e) {
+        refused = e
+    }
+    Check.eqStr("refused", "CALL_NOT_PERMITTED", refused)
+    Check.eqInt("not called while open", 5, always.calls)
+    r.clockSkewMs = 61000L
+    var healthy = WkFlaky(0)
+    r.run(() -> healthy.run())
+    Check.eqInt("probe went through", 1, healthy.calls)
+    Check.isTrue("closed again", !r.isOpen())
+}
+
+test "the bulkhead refuses a call when every permit is taken" {
+    var r = MediaResilience(1, 0L, 10, 5, 50, 60000L, 1)
+    r.sleeps = false
+    var refused = ""
+    var inner = WkFlaky(0)
+    r.run(() -> {
+    try {
+        r.run(() -> inner.run())
+    } catch (String e) {
+        refused = e
+    }
+})
+    Check.eqStr("inner refused", "BULKHEAD_FULL", refused)
+    Check.eqInt("inner never ran", 0, inner.calls)
+}
+
+// ---- S3 REST client against the fake gateway
+
+S3Rest wkRest() = S3Rest("http://127.0.0.1:" + WkHolder.get().port, "us-east-1", "enois-bucket", true, "AKIATEST", "secret", "")
+
+test "putFile signs the request, streams the file and the object reads back" {
+    var rest = wkRest()
+    var path = TempFiles.create("wk-s3-", ".txt")
+    TempFiles.write(path, "conteudo do arquivo".getBytes())
+    rest.putFile("uploads/media_a/file.txt", "text/plain", path)
+    TempFiles.delete(path)
+    Check.eqStr("stored", "conteudo do arquivo", wkTrue(WkFakeS3.objects.get("uploads/media_a/file.txt")))
+    Check.eqStr("content type", "text/plain", wkTrue(WkFakeS3.types.get("uploads/media_a/file.txt")))
+    var auth = WkFakeS3.auths.get(WkFakeS3.auths.size() - 1)
+    Check.isTrue("v4 credential", auth.startsWith("AWS4-HMAC-SHA256 Credential=AKIATEST/"))
+    Check.isTrue("signed headers", auth.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"))
+    var read = rest.get("uploads/media_a/file.txt", null)
+    Check.eqStr("read back", "conteudo do arquivo", new String(read.body.readUpTo(1000), "UTF-8"))
+    read.body.close()
+}
+
+test "a missing object is an S3_FAILED status=404 and delete is idempotent" {
+    var rest = wkRest()
+    var failed = ""
+    try {
+        rest.get("uploads/media_none/file.txt", null)
+    } catch (String e) {
+        failed = e
+    }
+    Check.eqStr("missing", "S3_FAILED status=404", failed)
+    rest.delete("uploads/media_none/file.txt")
+}
+
+test "the client refuses to run without credentials" {
+    var failed = ""
+    try {
+        S3Rest("http://127.0.0.1:1", "us-east-1", "b", true, "", "", "").delete("k")
+    } catch (String e) {
+        failed = e
+    }
+    Check.eqStr("no credentials", "S3_CREDENTIALS_MISSING", failed)
+}
+
+test "zz stop" {
+    WkHolder.get().stop()
+}

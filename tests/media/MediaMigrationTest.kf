@@ -1,0 +1,203 @@
+import kernel.*
+import kernel.db.*
+import kernel.files.*
+import kernel.testkit.*
+import kernel.time.*
+import media.*
+
+// Ports of MediaMigrationServiceTests (two-phase copy to S3) with the real store on H2 and fake
+// downloader / copier / verifier.
+class MgDownloader extends MediaSourceDownloader {
+    List<String> urls = listOf<String>()
+    Bool failNext = false
+    public constructor() {
+        super()
+    }
+    String download(sourceUrl: String) {
+        urls.add(sourceUrl)
+        if (failNext) {
+            throw "origem respondeu 404"
+        }
+        var path = TempFiles.create("migration-test-", ".bin")
+        TempFiles.write(path, "abc".getBytes())
+        return path
+    }
+}
+
+class MgCopier extends MediaS3Copier {
+    List<String> keys = listOf<String>()
+    Bool failure = false
+    public constructor() {
+        super()
+    }
+    String copy(objectKey: String, source: String, mimeType: String) {
+        if (failure) {
+            throw "S3 recusou a copia"
+        }
+        keys.add(objectKey)
+        return "https://s3.example/" + objectKey
+    }
+}
+
+class MgVerifier extends MediaPublicUrlVerifier {
+    Bool healthy = false
+    public constructor() {
+        super()
+    }
+    Bool verify(url: String, mimeType: String) = healthy
+}
+
+class MgHolder {
+    static MediaStore? store = null
+    static MediaStore get() {
+        var cur = MgHolder.store
+        if (cur != null) {
+            return cur
+        }
+        var created = MediaStore(TestApp.shared().db())
+        MgHolder.store = created
+        return created
+    }
+}
+
+String mgText(v: String?) {
+    if (v == null) {
+        return ""
+    }
+    return v
+}
+
+String mgNow() = "2026-10-19T04:00:00Z"
+
+// Every test starts from an empty table: the batches pick up every pending asset.
+mgClean() {
+    var d = TestApp.shared().db()
+    d.execute("delete from media_deletion_jobs", DbParams())
+    d.execute("delete from media_assets", DbParams())
+    MediaClock.fixedInstant = mgNow()
+}
+
+MediaAsset mgAsset(id: String, mime: String) {
+    var created = Time.plusSeconds(mgNow(), -7200L)
+    var asset = MediaAsset(id, "user_1", "arquivo", mime, 3L, "POST_IMAGE", "uploads/" + id + "/media%2Ffile", "/uploads/" + id + "/media%2Ffile", "PENDING", "NONE", created, Time.plusSeconds(created, 3600L), null, "IMAGEKIT", null, null, 0, null, null, null, 0)
+    MgHolder.get().save(asset)
+    return asset
+}
+
+MediaMigrationService mgService(d: MgDownloader, c: MgCopier, v: MgVerifier, flip: Bool) = MediaMigrationService(MgHolder.get(), d, c, v, "https://ik.imagekit.io/socialcoisa", flip)
+
+MediaAsset mgReload(id: String) {
+    var a = MgHolder.get().findById(id)
+    if (a == null) {
+        throw "asset " + id + " not found"
+    }
+    return a
+}
+
+test "the copy is verified and keeps the cdn_url until the flip" {
+    mgClean()
+    mgAsset("media_1", "image/jpeg")
+    var d = MgDownloader()
+    var c = MgCopier()
+    var copied = mgService(d, c, MgVerifier(), false).copyBatch(10)
+    Check.eqInt("copied", 1, copied)
+    var saved = mgReload("media_1")
+    Check.eqStr("provider", "S3", saved.storageProvider)
+    Check.eqStr("s3 url", "https://s3.example/uploads/media_1/media/file", mgText(saved.s3CdnUrl))
+    Check.eqStr("migrated at", mgNow(), mgText(saved.s3MigratedAt))
+    // Phase 1 does NOT change what the app reads.
+    Check.eqStr("cdn url", "/uploads/media_1/media%2Ffile", saved.cdnUrl)
+    Check.eqStr("download", "https://ik.imagekit.io/socialcoisa/uploads/media_1/media/file", d.urls.get(0))
+    Check.eqStr("key", "uploads/media_1/media/file", c.keys.get(0))
+}
+
+test "a video asks ImageKit for the original" {
+    mgClean()
+    mgAsset("media_2", "video/mp4")
+    var d = MgDownloader()
+    mgService(d, MgCopier(), MgVerifier(), false).copyBatch(10)
+    Check.eqStr("download", "https://ik.imagekit.io/socialcoisa/uploads/media_2/media/file?tr=orig-true", d.urls.get(0))
+}
+
+test "a failure changes nothing and does not delete the asset" {
+    mgClean()
+    mgAsset("media_3", "image/jpeg")
+    var c = MgCopier()
+    c.failure = true
+    var copied = mgService(MgDownloader(), c, MgVerifier(), false).copyBatch(10)
+    Check.eqInt("copied", 0, copied)
+    var saved = mgReload("media_3")
+    Check.eqStr("provider", "IMAGEKIT", saved.storageProvider)
+    assert(saved.s3CdnUrl == null)
+    Check.eqStr("cdn url", "/uploads/media_3/media%2Ffile", saved.cdnUrl)
+    Check.eqInt("attempts", 1, saved.s3MigrationAttempts)
+    Check.isTrue("error names S3", mgText(saved.s3LastError).contains("S3"))
+}
+
+test "the flip only happens once the public URL answers" {
+    mgClean()
+    mgAsset("media_4", "image/jpeg")
+    MgHolder.get().markS3Copy("media_4", "https://s3.example/uploads/media_4/media/file", mgNow())
+    var v = MgVerifier()
+    v.healthy = false
+    var service = mgService(MgDownloader(), MgCopier(), v, true)
+    Check.eqInt("not healthy", 0, service.flipBatch(10))
+    Check.eqStr("cdn url kept", "/uploads/media_4/media%2Ffile", mgReload("media_4").cdnUrl)
+    v.healthy = true
+    Check.eqInt("healthy", 1, service.flipBatch(10))
+    Check.eqStr("cdn url flipped", "https://s3.example/uploads/media_4/media/file", mgReload("media_4").cdnUrl)
+}
+
+test "a disabled flip touches nothing" {
+    mgClean()
+    mgAsset("media_5", "image/jpeg")
+    MgHolder.get().markS3Copy("media_5", "https://s3.example/uploads/media_5/media/file", mgNow())
+    var v = MgVerifier()
+    v.healthy = true
+    Check.eqInt("flipped", 0, mgService(MgDownloader(), MgCopier(), v, false).flipBatch(10))
+    Check.eqStr("cdn url", "/uploads/media_5/media%2Ffile", mgReload("media_5").cdnUrl)
+}
+
+test "the opportunistic migration copies when it wins the claim" {
+    mgClean()
+    mgAsset("media_lazy_1", "image/jpeg")
+    var c = MgCopier()
+    Check.isTrue("copied", mgService(MgDownloader(), c, MgVerifier(), false).copyOne("media_lazy_1"))
+    var saved = mgReload("media_lazy_1")
+    Check.eqStr("s3 url", "https://s3.example/uploads/media_lazy_1/media/file", mgText(saved.s3CdnUrl))
+    // The reference only changes at the flip (cdn_url stays until the public check).
+    Check.eqStr("cdn url", "/uploads/media_lazy_1/media%2Ffile", saved.cdnUrl)
+}
+
+test "the opportunistic migration without the claim neither downloads nor copies" {
+    mgClean()
+    mgAsset("media_lazy_2", "image/jpeg")
+    var now = mgNow()
+    // Another replica holds a fresh claim.
+    Check.isTrue("first claim", MgHolder.get().claimForS3Copy("media_lazy_2", now, Time.plusSeconds(now, -600L), 10))
+    var d = MgDownloader()
+    var c = MgCopier()
+    Check.isTrue("no copy", !mgService(d, c, MgVerifier(), false).copyOne("media_lazy_2"))
+    Check.eqInt("downloads", 0, d.urls.size())
+    Check.eqInt("copies", 0, c.keys.size())
+}
+
+test "a failed opportunistic copy records the error and keeps the reference" {
+    mgClean()
+    mgAsset("media_lazy_3", "image/jpeg")
+    var d = MgDownloader()
+    d.failNext = true
+    Check.isTrue("not copied", !mgService(d, MgCopier(), MgVerifier(), false).copyOne("media_lazy_3"))
+    var saved = mgReload("media_lazy_3")
+    Check.eqStr("cdn url", "/uploads/media_lazy_3/media%2Ffile", saved.cdnUrl)
+    assert(saved.s3LastError != null)
+}
+
+test "an already copied asset does not enter the queue again" {
+    mgClean()
+    mgAsset("media_lazy_4", "image/jpeg")
+    MgHolder.get().markS3Copy("media_lazy_4", "https://s3.example/uploads/media_lazy_4/media/file", mgNow())
+    var d = MgDownloader()
+    Check.isTrue("not copied", !mgService(d, MgCopier(), MgVerifier(), false).copyOne("media_lazy_4"))
+    Check.eqInt("downloads", 0, d.urls.size())
+}

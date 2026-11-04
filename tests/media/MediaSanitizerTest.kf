@@ -1,0 +1,174 @@
+import kernel.bytes.*
+import kernel.files.*
+import kernel.image.*
+import kernel.testkit.*
+import media.*
+
+// Port of MediaMetadataSanitizerTests plus the formats the Java suite exercised only through the proxy.
+MediaSanitizer sanSanitizer() = MediaSanitizer("ffmpeg", MediaPdfCleaner())
+
+ImageSize sanSize(data: Byte[]) {
+    var size = Images.dimensions(data, 1)
+    if (size == null) {
+        throw "not a readable image"
+    }
+    return size
+}
+
+String latin(data: Byte[]) = Bytes.ascii(data, 0, data.length)
+
+// 2x2 PNG with a tEXt chunk (CRC not checked by the sanitiser) before IEND.
+Byte[] sanPngWithText() {
+    var base = Images.sample("png", 2, 2)
+    var iend = latin(base).indexOf("IEND") - 4
+    var data = "Comment".getBytes()
+    var payload = ByteSink()
+    payload.addAscii("tEXt")
+    payload.addAll(data)
+    payload.addByte(0)
+    payload.addAscii("segredo")
+    var body = payload.toBytes()
+    var chunk = ByteSink()
+    var length = body.length - 4
+    chunk.addByte(length >> 24)
+    chunk.addByte(length >> 16)
+    chunk.addByte(length >> 8)
+    chunk.addByte(length)
+    chunk.addAll(body)
+    chunk.addByte(0)
+    chunk.addByte(0)
+    chunk.addByte(0)
+    chunk.addByte(0)
+    var out = ByteSink()
+    out.add(base, 0, iend)
+    out.addAll(chunk.toBytes())
+    out.add(base, iend, base.length - iend)
+    return out.toBytes()
+}
+
+// APP1/EXIF block with Orientation = 6 right after the SOI marker (as the Java dimensions test builds it).
+Byte[] sanWithOrientation6(jpeg: Byte[]) {
+    var app1 = Bytes.hex("ffe10022457869660000" + "4d4d002a00000008" + "0001" + "011200030000000100060000" + "00000000")
+    var out = ByteSink()
+    out.add(jpeg, 0, 2)
+    out.addAll(app1)
+    out.add(jpeg, 2, jpeg.length - 2)
+    return out.toBytes()
+}
+
+test "a large video keeps the original when ffmpeg cannot run" {
+    var path = TempFiles.create("san-video-", ".mp4")
+    var video = "ftypisom-corpo-de-video".getBytes()
+    TempFiles.write(path, video)
+    var missing = MediaSanitizer("ffmpeg-que-nao-existe-neste-host", MediaPdfCleaner())
+    var result = missing.sanitizeToFile(path, "video/mp4", "uploads/media_x/file.mp4")
+    Check.eqStr("same file", path, result)
+    Check.eqStr("same bytes", Bytes.toHex(video), Bytes.toHex(TempFiles.readAll(result)))
+    TempFiles.delete(path)
+}
+
+test "a PNG text chunk is removed" {
+    var png = sanPngWithText()
+    Check.isTrue("fixture has the chunk", latin(png).contains("tEXt"))
+    var clean = sanSanitizer().sanitize(png, "image/png", "x.png")
+    Check.isTrue("IEND kept", latin(clean).contains("IEND"))
+    Check.isTrue("no tEXt", !latin(clean).contains("tEXt"))
+    Check.isTrue("no secret", !latin(clean).contains("segredo"))
+    var size = sanSize(clean)
+}
+
+test "a JPEG keeps its pixels and loses EXIF, XMP and comments" {
+    var base = Images.sample("jpeg", 4, 2)
+    var tagged = ByteSink()
+    tagged.add(base, 0, 2)
+    // APP1 (EXIF, no orientation), COM, APP13 (IPTC): all carry the secret.
+    tagged.addAll(Bytes.hex("ffe1000f457869660000" + "7365677265646f"))
+    tagged.addAll(Bytes.hex("fffe0009" + "7365677265646f"))
+    tagged.addAll(Bytes.hex("ffed0009" + "7365677265646f"))
+    tagged.add(base, 2, base.length - 2)
+    var input = tagged.toBytes()
+    Check.isTrue("fixture has the secret", latin(input).contains("segredo"))
+    var clean = sanSanitizer().sanitize(input, "image/jpeg", "x.jpg")
+    Check.isTrue("no secret", !latin(clean).contains("segredo"))
+    var size = sanSize(clean)
+    Check.eqInt("width", 4, size.width())
+    Check.eqInt("height", 2, size.height())
+}
+
+test "a JPEG with EXIF orientation 6 is physically rotated" {
+    // 16x8, left half red and right half blue: a clockwise quarter turn puts red on top and blue below.
+    var rotated = sanSanitizer().sanitize(sanWithOrientation6(Images.halves("jpeg", 16, 8)), "image/jpeg", "x.jpg")
+    var size = sanSize(rotated)
+    Check.eqInt("width", 8, size.width())
+    Check.eqInt("height", 16, size.height())
+    var top = Images.pixel(rotated, 4, 2)
+    var bottom = Images.pixel(rotated, 4, 13)
+    Check.isTrue("red on top", ((top >> 16) & 255) > 150 && (top & 255) < 110)
+    Check.isTrue("blue below", (bottom & 255) > 150 && ((bottom >> 16) & 255) < 110)
+    Check.eqInt("orientation is gone", 1, MediaSanitizer.jpegOrientation(rotated))
+}
+
+test "the EXIF orientation reader understands both byte orders and absence" {
+    Check.eqInt("big endian", 6, MediaSanitizer.jpegOrientation(sanWithOrientation6(Images.sample("jpeg", 4, 2))))
+    Check.eqInt("none", 1, MediaSanitizer.jpegOrientation(Images.sample("jpeg", 4, 2)))
+    Check.eqInt("not a jpeg", 1, MediaSanitizer.jpegOrientation("hello".getBytes()))
+    var little = Bytes.hex("ffd8" + "ffe10022457869660000" + "49492a0008000000" + "0100" + "120103000100000008000000" + "00000000")
+    Check.eqInt("little endian", 8, MediaSanitizer.jpegOrientation(little))
+}
+
+test "a GIF loses its comment and XMP blocks and keeps its frames" {
+    var base = Images.sample("gif", 3, 3)
+    var packed = Bytes.at(base, 10)
+    var headerEnd = 13
+    if ((packed & 128) != 0) {
+        headerEnd = headerEnd + 3 * (1 << ((packed & 7) + 1))
+    }
+    var tagged = ByteSink()
+    tagged.add(base, 0, headerEnd)
+    // Comment extension (21 FE) and an XMP application extension (21 FF 0B "XMP DataXMP").
+    tagged.addAll(Bytes.hex("21fe07" + "7365677265646f" + "00"))
+    tagged.addAll(Bytes.hex("21ff0b" + "584d50204461746158" + "4d50" + "03" + "010203" + "00"))
+    tagged.add(base, headerEnd, base.length - headerEnd)
+    var input = tagged.toBytes()
+    Check.isTrue("fixture has the secret", latin(input).contains("segredo"))
+    var clean = sanSanitizer().sanitize(input, "image/gif", "x.gif")
+    Check.isTrue("no secret", !latin(clean).contains("segredo"))
+    Check.isTrue("no XMP", !latin(clean).contains("XMP"))
+    var size = sanSize(clean)
+    Check.eqInt("width", 3, size.width())
+}
+
+test "a WebP loses EXIF and XMP chunks and gets a consistent RIFF size" {
+    var vp8l = ByteSink()
+    vp8l.addAscii("VP8L")
+    vp8l.addLittleInt(4)
+    vp8l.addAll(Bytes.hex("2f000000"))
+    var exif = ByteSink()
+    exif.addAscii("EXIF")
+    exif.addLittleInt(6)
+    exif.addAscii("segred")
+    var body = ByteSink()
+    body.addAscii("WEBP")
+    body.addAll(vp8l.toBytes())
+    body.addAll(exif.toBytes())
+    var file = ByteSink()
+    file.addAscii("RIFF")
+    file.addLittleInt(body.size())
+    file.addAll(body.toBytes())
+    var clean = sanSanitizer().sanitize(file.toBytes(), "image/webp", "x.webp")
+    Check.isTrue("no EXIF chunk", !latin(clean).contains("EXIF"))
+    Check.isTrue("no secret", !latin(clean).contains("segred"))
+    Check.eqStr("riff", "RIFF", Bytes.ascii(clean, 0, 4))
+    Check.eqInt("riff size", clean.length - 8, Bytes.littleInt(clean, 4))
+}
+
+test "empty, unknown and unreadable data come back unchanged" {
+    var s = sanSanitizer()
+    Check.eqInt("empty", 0, s.sanitize("".getBytes(), "image/png", "x.png").length)
+    var text = "not an image".getBytes()
+    Check.eqStr("unknown type", Bytes.toHex(text), Bytes.toHex(s.sanitize(text, "text/plain", "x.txt")))
+    Check.eqStr("garbage png", Bytes.toHex(text), Bytes.toHex(s.sanitize(text, "image/png", "x.png")))
+    Check.isTrue("images clean in memory", s.supportsInMemory("image/png; x=y"))
+    Check.isTrue("video does not", !s.supportsInMemory("video/mp4"))
+    Check.isTrue("is media", s.isMedia("Audio/MPEG"))
+}

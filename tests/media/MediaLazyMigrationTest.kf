@@ -1,0 +1,223 @@
+import kernel.*
+import kernel.db.*
+import kernel.files.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import media.*
+
+// Ports of LazyUrlMigrationServiceTests (recording fakes instead of Mockito) and
+// LazyMigrationPersistenceTests (the real SQL on H2).
+class LzStore extends MediaStore {
+    List<String> calls = listOf<String>()
+    Bool claimResult = true
+    public constructor(d: Db) {
+        super(d)
+    }
+    ensureUrlPending(urlHash: String, sourceUrl: String, now: String) {
+        calls.add("ensure:" + sourceUrl)
+    }
+    Bool claimUrl(urlHash: String, now: String, staleBefore: String, maxAttempts: Int) {
+        calls.add("claim")
+        return claimResult
+    }
+    markUrlCopied(urlHash: String, s3Url: String, now: String) {
+        calls.add("copied:" + s3Url)
+    }
+    markUrlActive(urlHash: String, now: String) {
+        calls.add("active")
+    }
+    markUrlFailed(urlHash: String, error: String?, now: String) {
+        var text = ""
+        if (error != null) {
+            text = error
+        }
+        calls.add("failed:" + text)
+    }
+}
+
+class LzRefs extends MediaUrlReferences {
+    List<String> updates = listOf<String>()
+    public constructor(d: Db) {
+        super(d)
+    }
+    Int updateReferences(oldUrl: String, newUrl: String) {
+        updates.add(oldUrl + ">" + newUrl)
+        return 1
+    }
+}
+
+class LzDownloader extends MediaSourceDownloader {
+    List<String> urls = listOf<String>()
+    Bool fail = false
+    public constructor() {
+        super()
+    }
+    String download(sourceUrl: String) {
+        urls.add(sourceUrl)
+        if (fail) {
+            throw "origem respondeu 404"
+        }
+        var path = TempFiles.create("lazy-", ".png")
+        TempFiles.write(path, "png".getBytes())
+        return path
+    }
+}
+
+class LzCopier extends MediaS3Copier {
+    List<String> calls = listOf<String>()
+    public constructor() {
+        super()
+    }
+    String copy(objectKey: String, source: String, mimeType: String) {
+        calls.add(objectKey + "|" + mimeType)
+        return "https://cdn.exemplo.com/" + objectKey
+    }
+}
+
+class LzVerifier extends MediaPublicUrlVerifier {
+    Bool healthy = true
+    public constructor() {
+        super()
+    }
+    Bool verify(url: String, mimeType: String) = healthy
+}
+
+// Runs the "asynchronous" work at once, like the Java test executor.
+class LzDirect extends MediaExecutor {
+    public constructor() {
+        super()
+    }
+    execute(task: () -> void) {
+        task()
+    }
+}
+
+String lzIk() = "https://ik.imagekit.io/socialcoisa"
+
+String lzOriginal() = lzIk() + "/uploads/media_x/foto.png"
+
+String lzCdn() = "https://cdn.exemplo.com/uploads/media_x/foto.png"
+
+class LzSetup {
+    LzStore store
+    LzRefs refs
+    LzDownloader downloader
+    LzCopier copier
+    LzVerifier verifier
+    LazyUrlMigrationService service
+    public constructor() {
+        var d = TestApp.shared().db()
+        this.store = LzStore(d)
+        this.refs = LzRefs(d)
+        this.downloader = LzDownloader()
+        this.copier = LzCopier()
+        this.verifier = LzVerifier()
+        this.service = LazyUrlMigrationService(store, downloader, copier, verifier, refs, LzDirect(), "")
+    }
+}
+
+test "hosts that are not ImageKit are ignored" {
+    var s = LzSetup()
+    s.service.onAccess("https://evil.example.com/foto.png")
+    s.service.onAccess("http://ik.imagekit.io/socialcoisa/uploads/a/b.png")
+    s.service.onAccess("https://169.254.169.254/latest/meta-data/")
+    Check.eqInt("store calls", 0, s.store.calls.size())
+    Check.eqInt("downloads", 0, s.downloader.urls.size())
+    Check.eqInt("copies", 0, s.copier.calls.size())
+    Check.eqInt("reference updates", 0, s.refs.updates.size())
+}
+
+test "the old relative path is accepted and made absolute" {
+    var s = LzSetup()
+    Check.isTrue("legacy", s.service.isLegacy("/uploads/media_y/foto.png"))
+    Check.eqStr("absolute", "https://ik.imagekit.io/socialcoisa/uploads/media_y/foto.png", s.service.absoluteSourceOf("/uploads/media_y/foto.png"))
+}
+
+test "it schedules the copy and activates when the public URL answers" {
+    var s = LzSetup()
+    s.service.onAccess(lzOriginal())
+    Check.eqStr("calls", "ensure:" + lzOriginal() + ",claim,copied:" + lzCdn() + ",active", String.join(",", s.store.calls))
+    Check.eqStr("copy", "uploads/media_x/foto.png|image/png", s.copier.calls.get(0))
+    Check.eqStr("download", lzOriginal(), s.downloader.urls.get(0))
+    Check.eqStr("references", lzOriginal() + ">" + lzCdn(), s.refs.updates.get(0))
+}
+
+test "copied without a public check does not swap the references" {
+    var s = LzSetup()
+    s.verifier.healthy = false
+    s.service.onAccess(lzOriginal())
+    Check.eqStr("calls", "ensure:" + lzOriginal() + ",claim,copied:" + lzCdn(), String.join(",", s.store.calls))
+    Check.eqInt("reference updates", 0, s.refs.updates.size())
+}
+
+test "a download failure records the error and keeps the reference" {
+    var s = LzSetup()
+    s.downloader.fail = true
+    s.service.onAccess(lzOriginal())
+    Check.isTrue("failed recorded", s.store.calls.contains("failed:origem respondeu 404"))
+    Check.eqInt("reference updates", 0, s.refs.updates.size())
+}
+
+test "without the claim it neither downloads nor copies" {
+    var s = LzSetup()
+    s.store.claimResult = false
+    s.service.onAccess(lzOriginal())
+    Check.eqInt("downloads", 0, s.downloader.urls.size())
+    Check.eqInt("reference updates", 0, s.refs.updates.size())
+}
+
+// ---- LazyMigrationPersistenceTests
+
+test "the asset claim has a single winner" {
+    var store = MediaStore(TestApp.shared().db())
+    var now = Time.nowIso()
+    var created = Time.plusSeconds(now, -7200L)
+    store.save(MediaAsset("media_claim_test", "user_claim", "foto.png", "image/png", 10L, "POST_IMAGE", "uploads/media_claim_test/foto.png", "/uploads/media_claim_test/foto.png", "PENDING", "NONE", created, Time.plusSeconds(created, 3600L), null, "IMAGEKIT", null, null, 0, null, null, null, 0))
+    Check.isTrue("first wins", store.claimForS3Copy("media_claim_test", now, Time.plusSeconds(now, -600L), 5))
+    // A fresh claim of another replica NEVER wins the same asset.
+    Check.isTrue("second loses", !store.claimForS3Copy("media_claim_test", now, Time.plusSeconds(now, -600L), 5))
+}
+
+test "the status flow of a URL, with a retry" {
+    var store = MediaStore(TestApp.shared().db())
+    var now = Time.nowIso()
+    var stale = Time.plusSeconds(now, -600L)
+    var hash = "hash_fluxo_teste"
+    store.ensureUrlPending(hash, "https://ik.imagekit.io/socialcoisa/uploads/a/b.png", now)
+    Check.isTrue("claim", store.claimUrl(hash, now, stale, 5))
+    Check.isTrue("second claim", !store.claimUrl(hash, now, stale, 5))
+    store.markUrlFailed(hash, "origem respondeu 404", now)
+    Check.eqStr("failed", "FAILED", mgStatus(store, hash))
+    // FAILED goes back to the queue (a new attempt).
+    Check.isTrue("retry claim", store.claimUrl(hash, now, stale, 5))
+    store.markUrlCopied(hash, "https://cdn.exemplo.com/uploads/a/b.png", now)
+    Check.eqStr("copied", "COPIED", mgStatus(store, hash))
+    store.markUrlActive(hash, now)
+    Check.eqStr("active", "ACTIVE", mgStatus(store, hash))
+}
+
+String mgStatus(store: MediaStore, hash: String) {
+    var row = store.findUrlMigration(hash)
+    if (row == null) {
+        throw "row missing"
+    }
+    return row.status
+}
+
+test "a reference swaps by compare-and-set and is safe against a race" {
+    var d = TestApp.shared().db()
+    SecurityFixtures.user(d, "media_ref_cas", true, false)
+    var refs = MediaUrlReferences(d)
+    var old = "https://ik.imagekit.io/socialcoisa/uploads/ref/velha.png"
+    var fresh = "https://cdn.exemplo.com/uploads/ref/velha.png"
+    d.execute("update users set avatar = ? where id = ?", DbParams().bindStr(old).bindStr("media_ref_cas"))
+    Check.isTrue("legacy listed", refs.findLegacyUrls(500).contains(old))
+    Check.eqInt("first pass", 1, refs.updateReferences(old, fresh))
+    // CAS: the old one is gone, a second pass touches nothing.
+    Check.eqInt("second pass", 0, refs.updateReferences(old, fresh))
+    // A CONCURRENT change (the person swapped the photo mid-migration): never overwritten.
+    var concurrent = "https://ik.imagekit.io/socialcoisa/uploads/ref/outra.png"
+    d.execute("update users set avatar = ? where id = ?", DbParams().bindStr(concurrent).bindStr("media_ref_cas"))
+    Check.eqInt("race", 0, refs.updateReferences(old, fresh))
+}

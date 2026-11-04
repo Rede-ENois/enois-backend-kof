@@ -1,0 +1,130 @@
+import kernel.error.*
+import kernel.testkit.*
+import media.*
+
+// Port of MediaImageModerationServiceTests: classifier and reviewer are stubs.
+class ModClassifier extends MediaImageClassifier {
+    Double score = 0.0
+    // "" = answer `score`; otherwise throw this.
+    String failure = ""
+    Int calls = 0
+    public constructor() {
+        super()
+    }
+    Bool available() = true
+    Double pornographicScore(image: Byte[], mimeType: String) {
+        calls = calls + 1
+        if (failure.length() > 0) {
+            throw failure
+        }
+        return score
+    }
+}
+
+class ModReviewer extends MediaImageReviewer {
+    String answer = ""
+    Int calls = 0
+    public constructor() {
+        super()
+    }
+    String review(image: Byte[]) {
+        calls = calls + 1
+        return answer
+    }
+}
+
+MediaModeration modService(c: MediaImageClassifier, r: MediaImageReviewer, enabled: Bool) = MediaModeration(enabled, 0.70, c, r)
+
+String modCode(m: MediaModeration, mime: String) {
+    try {
+        m.verifyBeforeStorage("x".getBytes(), mime)
+    } catch (String e) {
+        return Errors.parse(e).code()
+    }
+    return "OK"
+}
+
+
+test "permits images below the threshold" {
+    var c = ModClassifier()
+    c.score = 0.10
+    var r = ModReviewer()
+    Check.eqStr("result", "OK", modCode(modService(c, r, true), "image/jpeg"))
+    Check.eqInt("classified", 1, c.calls)
+    Check.eqInt("reviewed", 0, r.calls)
+}
+
+test "blocks a score at the threshold when the review confirms it" {
+    var c = ModClassifier()
+    c.score = 0.70
+    var r = ModReviewer()
+    r.answer = "PROHIBITED"
+    Check.eqStr("code", "IMAGE_CONTENT_NOT_ALLOWED", modCode(modService(c, r, true), "image/png"))
+}
+
+test "allows an image the coarse classifier flags but the semantic review does not confirm" {
+    var c = ModClassifier()
+    c.score = 0.95
+    var r = ModReviewer()
+    r.answer = "SAFE"
+    Check.eqStr("result", "OK", modCode(modService(c, r, true), "image/jpeg"))
+    Check.eqInt("reviewed", 1, r.calls)
+}
+
+test "does not approve an image when the semantic review is inconclusive" {
+    var c = ModClassifier()
+    c.score = 0.95
+    var r = ModReviewer()
+    r.answer = "UNSURE"
+    Check.eqStr("code", "IMAGE_MODERATION_UNAVAILABLE", modCode(modService(c, r, true), "image/jpeg"))
+}
+
+test "an empty review (no answer) fails closed" {
+    var c = ModClassifier()
+    c.score = 0.95
+    Check.eqStr("code", "IMAGE_MODERATION_UNAVAILABLE", modCode(modService(c, ModReviewer(), true), "image/jpeg"))
+}
+
+test "non-image media is not classified" {
+    var c = ModClassifier()
+    var r = ModReviewer()
+    Check.eqStr("result", "OK", modCode(modService(c, r, true), "video/mp4"))
+    Check.eqInt("classified", 0, c.calls)
+    Check.eqInt("reviewed", 0, r.calls)
+}
+
+test "disabled moderation does not call the classifier" {
+    var c = ModClassifier()
+    var r = ModReviewer()
+    Check.eqStr("result", "OK", modCode(modService(c, r, false), "image/jpeg"))
+    Check.eqInt("classified", 0, c.calls)
+    Check.eqInt("reviewed", 0, r.calls)
+}
+
+test "fails closed when there is no classifier" {
+    Check.eqStr("code", "IMAGE_MODERATION_UNAVAILABLE", modCode(modService(MediaImageClassifier(), ModReviewer(), true), "image/jpeg"))
+}
+
+test "fails closed when the classifier cannot decode the image" {
+    var c = ModClassifier()
+    c.failure = "IMAGE_UNREADABLE"
+    Check.eqStr("code", "IMAGE_CANNOT_BE_VERIFIED", modCode(modService(c, ModReviewer(), true), "image/webp"))
+}
+
+test "fails closed when the classifier returns an invalid score" {
+    var c = ModClassifier()
+    c.score = 0.0 / 0.0
+    Check.eqStr("nan", "IMAGE_MODERATION_UNAVAILABLE", modCode(modService(c, ModReviewer(), true), "image/jpeg"))
+    c.score = 1.5
+    Check.eqStr("out of range", "IMAGE_MODERATION_UNAVAILABLE", modCode(modService(c, ModReviewer(), true), "image/jpeg"))
+}
+
+test "an invalid threshold is refused at startup" {
+    var refused = false
+    try {
+        MediaModeration(true, 1.1, ModClassifier(), ModReviewer())
+    } catch (String e) {
+        refused = true
+    }
+    assert(refused)
+}

@@ -1,0 +1,135 @@
+import kernel.*
+import kernel.config.*
+import kernel.error.*
+import kernel.storage.*
+import kernel.testkit.*
+import kernel.url.*
+import media.*
+
+// Ports of S3StorageUrlFactoryTests, S3UploadSignerTests, S3StorageConfigTests, S3StorageModeTests and
+// StorageDefaultTests. Nothing here touches the network: signing is local (HMAC).
+test "uses the bucket address when there is no CDN" {
+    var factory = MediaS3UrlFactory("enois-media", "sa-east-1", "uploads/", "")
+    var key = factory.objectKey("media_123", "foto de perfil.png")
+    Check.eqStr("key", "uploads/media_123/foto%20de%20perfil.png", key)
+    Check.eqStr("url", "https://enois-media.s3.sa-east-1.amazonaws.com/uploads/media_123/foto%20de%20perfil.png", factory.cdnUrl(key))
+}
+
+test "uses the CDN base when configured" {
+    var factory = MediaS3UrlFactory("enois-media", "us-east-1", "midia/", "https://cdn.enois.ia.br")
+    Check.eqStr("url", "https://cdn.enois.ia.br/midia/media_9/clipe.mp4", factory.cdnUrl(factory.objectKey("media_9", "clipe.mp4")))
+}
+
+test "normalizes the prefix and the defaults" {
+    // No prefix: the same shape as the ImageKit objects (eases the migration).
+    Check.eqStr("default prefix", "uploads/m/a.png", MediaS3UrlFactory("b", "", "", "").objectKey("m", "a.png"))
+    // Prefix "x" becomes "x/" and goes into the key (cdnUrl takes the finished key, not the prefix).
+    var withPrefix = MediaS3UrlFactory("b", "sa-east-1", "x", "")
+    Check.eqStr("prefixed", "https://b.s3.sa-east-1.amazonaws.com/x/m/a.png", withPrefix.cdnUrl(withPrefix.objectKey("m", "a.png")))
+    Check.eqStr("root", "m/a.png", MediaS3UrlFactory("b", "us-east-1", "/", "").objectKey("m", "a.png"))
+}
+
+test "it refuses to build without a bucket" {
+    var message = ""
+    try {
+        MediaS3UrlFactory("  ", "us-east-1", "uploads/", "")
+    } catch (String e) {
+        message = e
+    }
+    Check.isTrue("names the bucket", message.contains("bucket"))
+}
+
+test "the upload URL is the object address" {
+    var factory = MediaS3UrlFactory("b", "us-east-1", "uploads/", "https://cdn.enois.ia.br/")
+    Check.eqStr("upload url", "https://cdn.enois.ia.br/uploads/m/a.png", factory.uploadUrl("uploads/m/a.png"))
+}
+
+test "the ImageKit and the generated keys encode each segment and neutralise dots" {
+    var ik = MediaImageKitUrlFactory("https://ik.imagekit.io/socialcoisa")
+    Check.eqStr("ik key", "uploads/media_1/_/_/a%20b.png", ik.objectKey("media_1", "../../a b.png").replace("_/_/", "_/_/"))
+    Check.eqStr("ik url", "https://ik.imagekit.io/socialcoisa/uploads/media_1/a.png", ik.cdnUrl(ik.objectKey("media_1", "a.png")))
+    Check.eqStr("provider", "IMAGEKIT", ik.provider())
+}
+
+// ---- S3UploadSignerTests: the signed path is the path that will be read.
+S3Rest sigRest() = S3Rest("https://s3.b7cloud.tech", "us-east-1", "enois-bucket", true, "chave", "segredo", "")
+
+test "the signature covers exactly the key that will be read" {
+    var factory = MediaS3UrlFactory("enois-bucket", "us-east-1", "uploads/", "https://s3.b7cloud.tech/enois-bucket")
+    var key = factory.objectKey("media_50a1", "media/4e66/foto.jpg")
+    var signed = MediaS3UploadSigner(sigRest(), "").sign(key, "image/jpeg", 1024L)
+    var signedPath = Uris.path(signed.url())
+    Check.eqStr("same path", Uris.path(factory.cdnUrl(key)), signedPath)
+    Check.eqStr("full path", "/enois-bucket/uploads/media_50a1/media/4e66/foto.jpg", signedPath)
+    Check.isTrue("no doubled prefix", !signedPath.contains("/uploads/uploads/"))
+    Check.isTrue("signed", signed.url().contains("X-Amz-Signature="))
+    Check.eqStr("method", "PUT", signed.method())
+}
+
+test "an empty prefix does not invent a slash" {
+    var factory = MediaS3UrlFactory("enois-bucket", "us-east-1", "/", "")
+    var key = factory.objectKey("media_1", "a.png")
+    Check.eqStr("path", "/enois-bucket/media_1/a.png", Uris.path(MediaS3UploadSigner(sigRest(), "").sign(key, "image/png", 512L).url()))
+}
+
+// ---- S3StorageConfigTests
+test "moderation forces the upload through the app even with upload-through-api=false" {
+    var signer = MediaSigners.forS3(null, "https://enois.exemplo.com/api/storage", true, false, true)
+    var signed = signer.sign("uploads/media_abc/file.png", "image/png", 42L)
+    Check.eqStr("url", "https://enois.exemplo.com/api/storage/uploads/media_abc/file.png", signed.url())
+    Check.eqStr("method", "PUT", signed.method())
+}
+
+test "moderation with an empty public base URL never hands out the direct bucket URL" {
+    var signer = MediaSigners.forS3(null, "", false, true, true)
+    var failed = ""
+    try {
+        signer.sign("uploads/media_abc/file.png", "image/png", 42L)
+    } catch (String e) {
+        failed = e
+    }
+    var parsed = Errors.parse(failed)
+    Check.eqInt("status", 503, parsed.status())
+    Check.eqStr("code", "IMAGE_MODERATION_UNAVAILABLE", parsed.code())
+}
+
+test "without moderation the default upload goes through the proxy" {
+    var signer = MediaSigners.forS3(null, "https://enois.exemplo.com/api/storage", false, true, false)
+    Check.eqStr("url", "https://enois.exemplo.com/api/storage/uploads/media_abc/file.png", signer.sign("uploads/media_abc/file.png", "image/png", 42L).url())
+}
+
+test "without moderation and with upload-through-api=false the URL is presigned on the bucket" {
+    var signer = MediaSigners.forS3(sigRest(), "", true, false, false)
+    var url = signer.sign("uploads/media_abc/file.png", "image/png", 42L).url()
+    Check.isTrue("bucket path", url.startsWith("https://s3.b7cloud.tech/enois-bucket/uploads/media_abc/file.png?"))
+}
+
+// ---- S3StorageModeTests and StorageDefaultTests
+test "s3 mode builds the S3 factory, a signer and the S3 gateway; the default stays on ImageKit" {
+    var app = TestApp.shared()
+    var shared = SharedServices.create(app.platform)
+    var s3 = MediaModule.build(Config.of(mapOf("REDE_MEDIA_STORAGE", "s3", "REDE_MEDIA_S3_BUCKET", "bucket-de-teste", "REDE_MEDIA_S3_PUBLIC_BASE_URL", "https://cdn.exemplo.com")), app.db(), shared)
+    Check.eqStr("factory", "S3", s3.urls.provider())
+    Check.isTrue("signer", s3.signer != null)
+    Check.isTrue("object store", s3.objectStore != null)
+    // In s3 mode deletion goes to S3: the ImageKit gateway (compromised) must not exist.
+    Check.eqStr("gateway", "guarded(s3)", s3.gateway.kind())
+    var stay = MediaModule.build(Config.of(mapOf("IMAGEKIT_URL_ENDPOINT", "https://ik.imagekit.io/socialcoisa")), app.db(), shared)
+    Check.eqStr("default provider", "IMAGEKIT", stay.urls.provider())
+    Check.isTrue("no signer: uploads disabled", stay.signer == null)
+    Check.isTrue("no object store", stay.objectStore == null)
+    shared.stop()
+}
+
+test "s3 mode without a bucket fails at boot" {
+    var app = TestApp.shared()
+    var shared = SharedServices.create(app.platform)
+    var failed = ""
+    try {
+        MediaModule.build(Config.of(mapOf("REDE_MEDIA_STORAGE", "s3")), app.db(), shared)
+    } catch (String e) {
+        failed = e
+    }
+    shared.stop()
+    Check.isTrue("names the bucket", failed.contains("bucket"))
+}

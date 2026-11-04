@@ -1,0 +1,70 @@
+import kernel.*
+import kernel.security.*
+import kernel.testkit.*
+import media.*
+
+// Port of MediaUploadsDisabledTests (and StorageDefaultTests' visible effect): with no S3 configured the
+// upload answers 503 UPLOADS_DISABLED, never a write path to the old provider.
+class DisabledHolder {
+    static TestApp? app = null
+    static SharedServices? shared = null
+    static TestApp get() {
+        var cur = DisabledHolder.app
+        if (cur != null) {
+            return cur
+        }
+        SecurityClock.reset()
+        var created = TestApp.bootWith("mediadisabled", mapOf("REDE_ORIGINS_ENFORCE", "false", "REDE_MEDIA_DELETION_WORKER_DELAY_MS", "3600000", "REDE_MEDIA_DIMENSIONS_BACKFILL_ENABLED", "false"), (p: Platform) -> DisabledHolder.wire(p))
+        DisabledHolder.app = created
+        return created
+    }
+    static wire(p: Platform) {
+        var shared = SharedServices.create(p)
+        DisabledHolder.shared = shared
+        var hooks = SecurityHooks.defaults(p.db)
+        Security.install(p, hooks)
+        MediaModule.install(p, shared, hooks)
+    }
+}
+
+test "an upload without S3 is refused" {
+    var app = DisabledHolder.get()
+    SecurityFixtures.login(app.db(), "media_disabled_user", "tok-media-disabled-1234567890")
+    var res = app.client.send("POST", "/media/uploads", listOf("X-Session-Token: tok-media-disabled-1234567890", "Idempotency-Key: media-disabled-1", "Content-Type: application/json"), "", "{\"fileName\":\"media/x/foto.png\",\"mimeType\":\"image/png\",\"size\":1234,\"purpose\":\"POST_IMAGE\"}")
+    Check.apiError(res, 503, "UPLOADS_DISABLED")
+}
+
+test "the storage routes answer 503 without an object store" {
+    var app = DisabledHolder.get()
+    var res = BinaryClient(app.port).get("/storage/uploads/media_abc/file.png", listOf<String>())
+    Check.eqInt("status", 503, res.status)
+    Check.eqStr("code", "MEDIA_STORAGE_DISABLED", res.json("code"))
+}
+
+test "GET /media/migration is public and exposes only aggregate counts" {
+    var app = DisabledHolder.get()
+    var res = app.client.get("/media/migration")
+    Check.status(res, 200)
+    Check.jsonEq(res, "enabled", "false")
+    Check.jsonEq(res, "flipEnabled", "false")
+    Check.isTrue("total", res.jsonHas("total"))
+    Check.isTrue("imagekit", res.jsonHas("imagekit"))
+    Check.isTrue("s3Copied", res.jsonHas("s3Copied"))
+    Check.isTrue("s3Active", res.jsonHas("s3Active"))
+    Check.isTrue("errors", res.jsonHas("errors"))
+    Check.isTrue("lastError is null", res.jsonIsNull("lastError"))
+    Check.isTrue("no ids or urls", !res.body.contains("http"))
+}
+
+test "an unknown media id is a 404 MEDIA_NOT_FOUND" {
+    var app = DisabledHolder.get()
+    Check.apiError(app.client.get("/media/media_nope"), 404, "MEDIA_NOT_FOUND")
+}
+
+test "zz background jobs stop" {
+    var shared = DisabledHolder.shared
+    if (shared != null) {
+        shared.stop()
+    }
+    DisabledHolder.get().stop()
+}
