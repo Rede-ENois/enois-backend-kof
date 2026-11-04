@@ -1,0 +1,88 @@
+package kernel.config
+
+import java.lang.System
+import java.util.HashMap
+
+// Typed access to environment variables (the Java app reads the same names).
+// Lookup order: explicit overrides (tests/dev), then the process environment.
+// A blank value counts as "not set".
+class Config {
+    Map<String,String> overrides
+    public constructor(overrides: Map<String,String>) {
+        this.overrides = overrides
+    }
+    // The process environment only.
+    static Config env() = Config(new HashMap<String, String>())
+    // Overrides on top of the process environment.
+    static Config of(overrides: Map<String,String>) = Config(overrides)
+    String? lookup(key: String) {
+        var o = overrides.get(key)
+        if (o != null && o.trim().length() > 0) {
+            return o
+        }
+        var e = System.getenv(key)
+        if (e != null && e.trim().length() > 0) {
+            return e
+        }
+        return null
+    }
+    Bool has(key: String) = lookup(key) != null
+    String getStr(key: String, fallback: String) {
+        var v = lookup(key)
+        if (v == null) {
+            return fallback
+        }
+        return v
+    }
+    // Fails fast (boot) when the variable is missing.
+    String required(key: String) {
+        var v = lookup(key)
+        if (v == null) {
+            throw "CONFIG_MISSING: required environment variable " + key + " is not set"
+        }
+        return v
+    }
+    Int getInt(key: String, fallback: Int) {
+        var v = lookup(key)
+        if (v == null) {
+            return fallback
+        }
+        return parseInt(key, v)
+    }
+    Long getLong(key: String, fallback: Long) {
+        var v = lookup(key)
+        if (v == null) {
+            return fallback
+        }
+        return parseLong(key, v)
+    }
+    Bool getBool(key: String, fallback: Bool) {
+        var v = lookup(key)
+        if (v == null) {
+            return fallback
+        }
+        var t = v.trim().toLowerCase()
+        if (t == "true" || t == "1" || t == "yes") {
+            return true
+        }
+        if (t == "false" || t == "0" || t == "no") {
+            return false
+        }
+        throw "CONFIG_INVALID: " + key + " must be true or false"
+    }
+    Int requiredInt(key: String) = parseInt(key, required(key))
+    Int parseInt(key: String, raw: String) {
+        try {
+            return raw.trim().toInt()
+        } catch (String e) {
+            throw "CONFIG_INVALID: " + key + " must be an integer"
+        }
+    }
+    Long parseLong(key: String, raw: String) {
+        try {
+            return raw.trim().toLong()
+        } catch (String e) {
+            throw "CONFIG_INVALID: " + key + " must be an integer"
+        }
+    }
+}
