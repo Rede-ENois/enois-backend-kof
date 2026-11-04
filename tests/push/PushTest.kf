@@ -1,0 +1,261 @@
+import java.util.HashMap
+import kernel.*
+import kernel.db.*
+import kernel.push.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import notifications.*
+import push.*
+
+class PushHolder {
+    static TestApp? cached = null
+    static NotificationsModule? module = null
+    static PushModule? push = null
+    static RecordingPushSender sender = RecordingPushSender()
+}
+
+// HTTP app: the real WebPushSender without keys (push off), so /push/config answers enabled=false.
+TestApp pushApp() {
+    var cur = PushHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = DomainTestKit.boot("pushapp", mapOf<String, String>(), (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+        var module = NotificationsModule.install(p, s, SecurityHooks(), parts)
+        PushHolder.module = module
+        var store = PushStore(p.db)
+        PushHolder.push = PushModule.installWith(p, module, store, WebPushSender.fromConfig(store, "", "", ""), PushPresence(p.db), true)
+    })
+    PushHolder.cached = created
+    return created
+}
+
+String jsonBody(endpoint: String, p256dh: String, auth: String) = "{\"endpoint\":" + json.encode(endpoint) + ",\"keys\":{\"p256dh\":" + json.encode(p256dh) + ",\"auth\":" + json.encode(auth) + "}}"
+
+List<String> jsonAuth(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+
+test "subscribing requires a session" {
+    var app = pushApp()
+    var res = app.client.postJson("/push/subscriptions", jsonBody("https://fcm.googleapis.com/fcm/send/1", "a", "b"))
+    Check.apiError(res, 401, "UNAUTHENTICATED")
+}
+
+test "an endpoint that is too long is a 400 naming the field" {
+    var app = pushApp()
+    var token = DomainTestKit.login(app, "push_longo")
+    var endpoint = "https://fcm.googleapis.com/fcm/send/" + strings.repeat("e", 700)
+    var res = app.client.send("POST", "/push/subscriptions", jsonAuth(token), "", jsonBody(endpoint, "p256dh-key", "auth-key"))
+    Check.apiError(res, 400, "INVALID_PUSH_SUBSCRIPTION")
+    assert(("" + res.jsonStr("message")).contains("longo demais"))
+}
+
+test "registers, re-registers the same device and removes the subscription" {
+    var app = pushApp()
+    var token = DomainTestKit.login(app, "push_user")
+    var endpoint = "https://fcm.googleapis.com/fcm/send/push_user"
+    var first = app.client.send("POST", "/push/subscriptions", jsonAuth(token), "", jsonBody(endpoint, "p256dh-key", "auth-key"))
+    Check.status(first, 201)
+    assert(first.jsonStr("id") != null)
+    var second = app.client.send("POST", "/push/subscriptions", jsonAuth(token), "", jsonBody(endpoint, "p256dh-key", "auth-key"))
+    Check.status(second, 201)
+    Check.eqStr("same device keeps its id", "" + first.jsonStr("id"), "" + second.jsonStr("id"))
+    Check.eqInt("one row", 1, app.db().queryList("select id from push_subscriptions where user_id = ?", DbParams().bindStr("push_user")).size())
+    var del = app.client.send("DELETE", "/push/subscriptions?endpoint=" + endpoint, DomainTestKit.auth(token), "", "")
+    Check.status(del, 204)
+    Check.eqInt("gone", 0, app.db().queryList("select id from push_subscriptions where user_id = ?", DbParams().bindStr("push_user")).size())
+    Check.apiError(app.client.send("DELETE", "/push/subscriptions", DomainTestKit.auth(token), "", ""), 400, "BAD_REQUEST")
+}
+
+test "an http endpoint and a host outside the allowlist are refused" {
+    var app = pushApp()
+    var token = DomainTestKit.login(app, "push_user_bad")
+    Check.status(app.client.send("POST", "/push/subscriptions", jsonAuth(token), "", jsonBody("http://fcm.googleapis.com/fcm/send/1", "a", "b")), 400)
+    var host = app.client.send("POST", "/push/subscriptions", jsonAuth(token), "", jsonBody("https://push.example/1", "a", "b"))
+    Check.apiError(host, 400, "INVALID_PUSH_SUBSCRIPTION")
+    Check.jsonEq(host, "message", "Endpoint de push de um servico nao suportado.")
+    Check.jsonEq(app.client.send("POST", "/push/subscriptions", jsonAuth(token), "", "{\"endpoint\":\"https://fcm.googleapis.com/x\"}"), "message", "Chaves do dispositivo obrigatorias.")
+    Check.jsonEq(app.client.send("POST", "/push/subscriptions", jsonAuth(token), "", "{}"), "message", "Endpoint de push invalido.")
+}
+
+test "an account is capped at ten devices" {
+    var app = pushApp()
+    var token = DomainTestKit.login(app, "push_cap_user")
+    var i = 0
+    while (i < 10) {
+        Check.status(app.client.send("POST", "/push/subscriptions", jsonAuth(token), "", jsonBody("https://fcm.googleapis.com/fcm/send/cap" + i, "k", "a")), 201)
+        i = i + 1
+    }
+    Check.apiError(app.client.send("POST", "/push/subscriptions", jsonAuth(token), "", jsonBody("https://fcm.googleapis.com/fcm/send/cap-extra", "k", "a")), 429, "TOO_MANY_PUSH_SUBSCRIPTIONS")
+    // an endpoint already known is not a new device
+    Check.status(app.client.send("POST", "/push/subscriptions", jsonAuth(token), "", jsonBody("https://fcm.googleapis.com/fcm/send/cap3", "k2", "a2")), 201)
+}
+
+test "config has no key when VAPID is not configured" {
+    var app = pushApp()
+    var res = app.client.get("/push/config")
+    Check.status(res, 200)
+    Check.jsonEq(res, "enabled", "false")
+    assert(res.jsonIsNull("publicKey"))
+    assert(!res.body.contains("publicKey\":\""))
+}
+
+test "config advertises the feature and the public key, never the private one" {
+    var vapid = WebPushKeys.vapid()
+    var store = PushStore(TestApp.shared().db())
+    var sender = WebPushSender.fromConfig(store, vapid.get(0), vapid.get(1), "mailto:teste@enois.test")
+    var service = PushSubscriptionService(store, sender)
+    var body = json.encode(PushConfigView(service.isEnabled(), service.publicKey()))
+    assert(body.contains("\"enabled\":true"))
+    assert(body.contains(vapid.get(0)))
+    assert(!body.contains(vapid.get(1)))
+    sender.store.database.queryLong("select 1", DbParams())
+}
+
+// ---- the listener ----
+
+insertPresence(app: TestApp, userId: String, status: String) {
+    app.db().execute("insert into user_presence (user_id, status, last_seen_at) values (?, ?, ?)", DbParams().bindStr(userId).bindStr(status).bindInstant(Time.nowIso()))
+}
+
+test "a created notification is pushed to its owner after the commit, on its own task" {
+    var app = pushApp()
+    DomainTestKit.login(app, "push_async_owner")
+    var sender = PushHolder.sender
+    var async = PushNotificationListener(sender, notificationsModuleOf().preferences, PushPresence(app.db()), false)
+    var module = PushHolder.module
+    assert(module != null)
+    if (module != null) {
+        module.notifications.addListener(async)
+        var created = module.notifications.create("push_async_owner", "NEW_REACTION", "sistema", "t", "b", "/feed", "Ver")
+        var waited = 0
+        while (sender.countFor("push_async_owner") == 0 && waited < 50) {
+            time.sleep(100)
+            waited = waited + 1
+        }
+        Check.eqInt("pushed", 1, sender.countFor("push_async_owner"))
+        Check.eqStr("notification id", created.id(), sender.messages.get(sender.messages.size() - 1).notificationId())
+    }
+}
+
+NotificationsModule notificationsModuleOf() {
+    var m = PushHolder.module
+    if (m == null) {
+        throw "module"
+    }
+    return m
+}
+
+Notifications notificationsOf() {
+    var m = PushHolder.module
+    if (m == null) {
+        throw "module"
+    }
+    return m.notifications
+}
+
+test "do not disturb keeps the notification but skips the push" {
+    var app = pushApp()
+    DomainTestKit.login(app, "push_dnd_receiver")
+    insertPresence(app, "push_dnd_receiver", "DO_NOT_DISTURB")
+    var module = PushHolder.module
+    var sender = RecordingPushSender()
+    var listener = PushNotificationListener(sender, notificationsModuleOf().preferences, PushPresence(app.db()), true)
+    listener.onCreated(NotificationCreatedEvent("n1", "push_dnd_receiver", "CONNECTION_REQUEST", "t", "b", "/rede", null))
+    Check.eqInt("social push skipped", 0, sender.countFor("push_dnd_receiver"))
+    // the inbox is unaffected
+    notificationsOf().create("push_dnd_receiver", "CONNECTION_REQUEST", "x", "t", "b", "/rede", "Ver")
+    var token = "tok-push_dnd_receiver-1234567890"
+    var res = app.client.getWith("/notifications", DomainTestKit.auth(token))
+    Check.eqInt("in the inbox", 1, res.jsonSize("items"))
+    // security still reaches a do-not-disturb phone
+    listener.onCreated(NotificationCreatedEvent("n2", "push_dnd_receiver", "SANCAO", "Sancao", "Corpo", "/notificacoes", null))
+    Check.eqInt("sanction pushed", 1, sender.countFor("push_dnd_receiver"))
+}
+
+// ---- web push delivery with the network stubbed ----
+
+class StubWebPushSender extends WebPushSender {
+    List<String> received = listOf<String>()
+    Map<String,Int> responses = new HashMap<String, Int>()
+    public constructor(store: PushStore, adapter: WebPushAdapter?, anyEndpoint: Bool) {
+        super(store, adapter, anyEndpoint)
+    }
+    Int deliver(device: PushSubscriptionRecord, payload: String) {
+        var path = device.endpoint().substring(device.endpoint().lastIndexOf("/"))
+        received.add(path)
+        return responses.getOrDefault(path, 201)
+    }
+}
+
+StubWebPushSender stub(anyEndpoint: Bool) {
+    var vapid = WebPushKeys.vapid()
+    var store = PushStore(TestApp.shared().db())
+    var adapter = WebPushAdapter.create(vapid.get(0), vapid.get(1), "mailto:teste@enois.test")
+    var sender = StubWebPushSender(store, adapter, anyEndpoint)
+    sender.responses.put("/gone", 410)
+    sender.responses.put("/rejected", 413)
+    return sender
+}
+
+subscribe(sender: WebPushSender, id: String, userId: String, path: String) {
+    var now = Time.nowIso()
+    sender.store.insert(PushSubscriptionRecord(id, userId, "https://fcm.googleapis.com/fcm/send" + path, "k", "a", now, now))
+}
+
+test "delivers to every device of the user" {
+    var sender = stub(true)
+    subscribe(sender, "pd_a", "pd_user_1", "/ok")
+    subscribe(sender, "pd_b", "pd_user_1", "/rejected")
+    sender.sendToUser("pd_user_1", PushMessage("notification_1", "Titulo", "Corpo", "/par-de-estudo", null))
+    Check.eqInt("devices reached", 2, sender.received.size())
+    assert(sender.received.contains("/ok") && sender.received.contains("/rejected"))
+    Check.eqInt("rejected is not removed", 2, sender.store.findByUser("pd_user_1").size())
+}
+
+test "removes the device when the push service says it is gone" {
+    var sender = stub(true)
+    subscribe(sender, "pd_gone", "pd_user_2", "/gone")
+    sender.sendToUser("pd_user_2", PushMessage("notification_1", "Titulo", "Corpo", "/feed", null))
+    Check.eqInt("called", 1, sender.received.size())
+    Check.eqInt("forgotten", 0, sender.store.findByUser("pd_user_2").size())
+}
+
+test "does nothing without devices" {
+    var sender = stub(true)
+    sender.sendToUser("pd_user_none", PushMessage("notification_1", "Titulo", "Corpo", "/feed", null))
+    Check.eqInt("nothing sent", 0, sender.received.size())
+}
+
+test "skips endpoints outside the allowlist" {
+    var strict = stub(false)
+    var now = Time.nowIso()
+    strict.store.insert(PushSubscriptionRecord("pd_local", "pd_user_3", "http://127.0.0.1:9/ok", "k", "a", now, now))
+    strict.sendToUser("pd_user_3", PushMessage("notification_1", "Titulo", "Corpo", "/feed", null))
+    Check.eqInt("not called", 0, strict.received.size())
+}
+
+test "caps the number of devices per account" {
+    var sender = stub(true)
+    var i = 0
+    while (i < PushSubscriptionService.maxSubscriptionsPerUser() + 2) {
+        subscribe(sender, "pd_cap_" + i, "pd_user_4", "/ok" + i)
+        i = i + 1
+    }
+    sender.sendToUser("pd_user_4", PushMessage("notification_1", "Titulo", "Corpo", "/feed", null))
+    Check.eqInt("capped", PushSubscriptionService.maxSubscriptionsPerUser(), sender.received.size())
+}
+
+test "the payload carries the notification id next to title, body and url, and the tag when there is one" {
+    Check.eqStr("default url", "{\"title\":\"Titulo\",\"body\":\"Corpo\",\"url\":\"/feed\",\"notificationId\":\"notification_abc\"}", WebPushSender.toJson(PushMessage("notification_abc", "Titulo", "Corpo", null, null)))
+    var tagged = WebPushSender.toJson(PushMessage("notification_abc", "Titulo", "Corpo", "/mensagens", "conversation:c1"))
+    assert(tagged.endsWith(",\"tag\":\"conversation:c1\"}"))
+    assert(tagged.contains("\"url\":\"/mensagens\""))
+}
+
+test "without keys the sender reports itself disabled and sends nothing" {
+    var off = WebPushSender.fromConfig(PushStore(TestApp.shared().db()), "", "", "mailto:teste@enois.test")
+    assert(!off.isEnabled())
+    assert(off.publicKey() == null)
+    off.sendToUser("pd_user_off", PushMessage("notification_1", "Titulo", "Corpo", "/feed", null))
+}

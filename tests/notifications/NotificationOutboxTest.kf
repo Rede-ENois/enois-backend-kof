@@ -1,0 +1,181 @@
+import java.util.HashMap
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import notifications.*
+
+// Posts and comments the feed would own, held in memory.
+class StubSources extends NotificationSources {
+    Map<String,NotificationSource> posts = new HashMap<String, NotificationSource>()
+    Map<String,NotificationSource> comments = new HashMap<String, NotificationSource>()
+    public constructor(database: Db) {
+        super(database)
+    }
+    NotificationSource? post(postId: String) = posts.get(postId)
+    NotificationSource? comment(commentId: String) = comments.get(commentId)
+}
+
+// The coin ledger the coin port will own, recorded.
+class RecordingCoins extends NotificationCoins {
+    List<String> refs = listOf<String>()
+    List<Long> amounts = listOf<Long>()
+    public constructor() {
+        super()
+    }
+    Bool hasReward(ref: String) = refs.contains(ref)
+    reward(userId: String, amount: Long, ref: String, message: String) {
+        refs.add(ref)
+        amounts.add(amount)
+    }
+}
+
+class OutboxHolder {
+    static TestApp? cached = null
+    static NotificationsModule? module = null
+    static SharedServices? shared = null
+    static StubSources? sources = null
+    static RecordingCoins coins = RecordingCoins()
+}
+
+TestApp outboxApp() {
+    var cur = OutboxHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = DomainTestKit.boot("notifoutbox", mapOf<String, String>(), (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+        var seams = NotificationsSeams(p)
+        var sources = StubSources(p.db)
+        seams.sources = sources
+        seams.coins = OutboxHolder.coins
+        OutboxHolder.sources = sources
+        OutboxHolder.shared = s
+        OutboxHolder.module = NotificationsModule.installWith(p, s, seams)
+    })
+    OutboxHolder.cached = created
+    return created
+}
+
+NotificationsModule moduleOf() {
+    var m = OutboxHolder.module
+    if (m == null) {
+        throw "module"
+    }
+    return m
+}
+
+StubSources sourcesOf() {
+    var s = OutboxHolder.sources
+    if (s == null) {
+        throw "sources"
+    }
+    return s
+}
+
+// The notification rows of a user, newest first, as `kind|actor|href|preview`.
+List<String> rows(app: TestApp, userId: String) {
+    var out = listOf<String>()
+    for (var r in app.db().queryList("select kind, actor_id, href, preview, title, group_key from notifications where user_id = ? order by created_at desc, id", DbParams().bindStr(userId))) {
+        out.add(r.getStr("kind") + "|" + r.getStr("actor_id") + "|" + r.getStrOrNull("href") + "|" + r.getStrOrNull("preview") + "|" + r.getStr("title") + "|" + r.getStrOrNull("group_key"))
+    }
+    return out
+}
+
+test "a comment notification carries the comment text" {
+    var app = outboxApp()
+    DomainTestKit.login(app, "ob_autor")
+    DomainTestKit.login(app, "ob_outra")
+    sourcesOf().posts.put("ob_post_1", NotificationSource("ob_post_1", "ob_autor", "post do autor"))
+    sourcesOf().comments.put("ob_comment_1", NotificationSource("ob_comment_1", "ob_outra", "  **muito bom**, parabéns!  "))
+    moduleOf().outboxHandler.handle("PostCommented", "ob_post_1", "{\"postId\":\"ob_post_1\",\"commentId\":\"ob_comment_1\",\"authorId\":\"ob_outra\"}")
+    var list = rows(app, "ob_autor")
+    Check.eqInt("one", 1, list.size())
+    Check.eqStr("row", "NEW_COMMENT|ob_outra|/api/feed/posts/ob_post_1|muito bom, parabéns!|Novo comentário|null", list.get(0))
+    var body = app.db().queryOne("select body from notifications where user_id = ?", DbParams().bindStr("ob_autor")).getStr("body")
+    Check.eqStr("body", "ob_outra comentou no seu post.", body)
+}
+
+test "a comment with only media falls back to the post text" {
+    var app = outboxApp()
+    DomainTestKit.login(app, "ob_autor2")
+    sourcesOf().posts.put("ob_post_2", NotificationSource("ob_post_2", "ob_autor2", "como fiz meu café"))
+    sourcesOf().comments.put("ob_comment_2", NotificationSource("ob_comment_2", "ob_outra", "![foto](https://cdn/foto.png)"))
+    moduleOf().outboxHandler.handle("PostCommented", "ob_post_2", "{\"postId\":\"ob_post_2\",\"commentId\":\"ob_comment_2\",\"authorId\":\"ob_outra\"}")
+    var list = rows(app, "ob_autor2")
+    assert(list.get(0).contains("|como fiz meu café|"))
+}
+
+test "a reaction notification carries the post text, grouped by target" {
+    var app = outboxApp()
+    DomainTestKit.login(app, "ob_autor3")
+    sourcesOf().posts.put("ob_post_3", NotificationSource("ob_post_3", "ob_autor3", "<p>dica de <b>Kotlin</b></p>"))
+    moduleOf().outboxHandler.handle("PostReacted", "ob_post_3", "{\"postId\":\"ob_post_3\",\"authorId\":\"ob_outra\"}")
+    moduleOf().outboxHandler.handle("PostReacted", "ob_post_3", "{\"postId\":\"ob_post_3\",\"authorId\":\"ob_terceira\"}")
+    var list = rows(app, "ob_autor3")
+    Check.eqInt("grouped into one", 1, list.size())
+    Check.eqStr("row", "NEW_REACTION|ob_terceira|/api/feed/posts/ob_post_3?reacoes=1|dica de Kotlin|Nova reação|NEW_REACTION:post:ob_post_3", list.get(0))
+}
+
+test "a comment reaction leaves the preview empty when the comment has no text" {
+    var app = outboxApp()
+    DomainTestKit.login(app, "ob_autor4")
+    sourcesOf().comments.put("ob_comment_4", NotificationSource("ob_comment_4", "ob_autor4", "<video src=\"x.mp4\"></video>"))
+    moduleOf().outboxHandler.handle("CommentReacted", "ob_comment_4", "{\"commentId\":\"ob_comment_4\",\"authorId\":\"ob_outra\"}")
+    var list = rows(app, "ob_autor4")
+    Check.eqInt("one", 1, list.size())
+    Check.eqStr("row", "COMMENT_REACTION|ob_outra|null|null|Reação no comentário|COMMENT_REACTION:comment:ob_comment_4", list.get(0))
+}
+
+test "reacting to your own content or to something that is gone notifies nobody" {
+    var app = outboxApp()
+    sourcesOf().posts.put("ob_post_5", NotificationSource("ob_post_5", "ob_self", "meu post"))
+    moduleOf().outboxHandler.handle("PostReacted", "ob_post_5", "{\"postId\":\"ob_post_5\",\"authorId\":\"ob_self\"}")
+    moduleOf().outboxHandler.handle("PostCommented", "ob_post_gone", "{\"postId\":\"ob_post_gone\",\"authorId\":\"ob_outra\"}")
+    moduleOf().outboxHandler.handle("PostCommented", "x", "not json at all")
+    Check.eqInt("none", 0, rows(app, "ob_self").size())
+}
+
+test "the kernel outbox delivers the feed events to the handler" {
+    var app = outboxApp()
+    var shared = OutboxHolder.shared
+    DomainTestKit.login(app, "ob_autor6")
+    sourcesOf().posts.put("ob_post_6", NotificationSource("ob_post_6", "ob_autor6", "post seis"))
+    assert(shared != null)
+    if (shared != null) {
+        Check.eqInt("PostCommented handler", 1, shared.outbox.handlerCount("PostCommented"))
+        Check.eqInt("PostReacted handler", 1, shared.outbox.handlerCount("PostReacted"))
+        Check.eqInt("CommentReacted handler", 1, shared.outbox.handlerCount("CommentReacted"))
+        shared.outbox.append("PostCommented", "ob_post_6", "{\"postId\":\"ob_post_6\",\"authorId\":\"ob_outra\"}")
+        shared.outbox.processPending()
+    }
+    Check.eqInt("created by the worker", 1, rows(app, "ob_autor6").size())
+}
+
+test "the apology grants the bonus and notifies each account once" {
+    var app = outboxApp()
+    var db = app.db()
+    DomainTestKit.login(app, "apology_community_a")
+    DomainTestKit.login(app, "apology_community_b")
+    db.execute("delete from system_announcements where announcement_key = ?", DbParams().bindStr(CommunityApologyWorker.announcementKey()))
+    var worker = moduleOf().apology
+    worker.announce()
+    for (var user in listOf<String>("apology_community_a", "apology_community_b")) {
+        var ref = CommunityApologyWorker.announcementKey() + ":" + user
+        assert(OutboxHolder.coins.hasReward(ref))
+        var found = false
+        for (var r in rows(app, user)) {
+            if (r.contains("|" + CommunityApologyWorker.title() + "|")) {
+                found = true
+            }
+        }
+        assert(found)
+    }
+    assert(OutboxHolder.coins.amounts.get(0) == CommunityApologyWorker.bonus())
+    assert(db.queryLong("select count(*) from system_announcements where announcement_key = ?", DbParams().bindStr(CommunityApologyWorker.announcementKey())) == 1L)
+    var rewards = OutboxHolder.coins.refs.size()
+    var notices = rows(app, "apology_community_a").size()
+    worker.announce()
+    Check.eqInt("no second reward", rewards, OutboxHolder.coins.refs.size())
+    Check.eqInt("no second notice", notices, rows(app, "apology_community_a").size())
+}
