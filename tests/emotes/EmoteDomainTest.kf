@@ -1,0 +1,144 @@
+import emotes.*
+
+// Ports of EmoteNamePolicyTest, EmoteImagesTest and EmotePageTest (pure rules, no HTTP).
+String edCodes(list: List<Emote>) {
+    var out = ""
+    for (var e in list) {
+        if (out.length() > 0) {
+            out = out + ","
+        }
+        out = out + e.code()
+    }
+    return out
+}
+
+Emote edEmote(code: String, provider: String, rank: Int) {
+    var e = EmoteRules.create(code, provider, "1", false, rank)
+    if (e == null) {
+        throw "edEmote: invalid fixture " + code
+    }
+    return e
+}
+
+test "the requested names are blocked" {
+    for (var n in listOf("poggies", "booty", "butt", "egg", "plant", "show", "dick")) {
+        assert(EmoteNamePolicy.blocked(n))
+    }
+}
+
+test "look-alike names fall on the same rule as the exact one" {
+    // case, separator, accent and digit-for-letter swaps
+    for (var n in listOf("POGGIES", "big-booty", "booty_shake", "D1CK", "d1ckhead", "p0rn", "s3xy", "Egg_Plant", "peitos")) {
+        assert(EmoteNamePolicy.blocked(n))
+    }
+}
+
+test "a compound that carries a strong term is blocked" {
+    assert(EmoteNamePolicy.blocked("hugebutt"))
+    assert(EmoteNamePolicy.blocked("hentaiHug"))
+}
+
+test "harmless stickers are not blocked" {
+    for (var n in listOf("KEKW", "OMEGALUL", "catJAM", "button", "butterfly", "showdown", "plantfood", "Pog", "")) {
+        assert(!EmoteNamePolicy.blocked(n))
+    }
+    assert(!EmoteNamePolicy.blocked(null))
+}
+
+test "BTTV animated uses the gif in text and the grid scale for the thumb" {
+    assert(EmoteImages.upstream("BTTV", "abc", "thumb", true) == "https://cdn.betterttv.net/emote/abc/1x.png")
+    assert(EmoteImages.upstream("BTTV", "abc", "full", true) == "https://cdn.betterttv.net/emote/abc/1x.gif")
+    assert(EmoteImages.fallback("BTTV", "abc", "full", true) == "https://cdn.betterttv.net/emote/abc/2x.png")
+    assert(EmoteImages.fallback("BTTV", "abc", "thumb", true) == null)
+}
+
+test "BTTV static never tries the gif" {
+    assert(EmoteImages.upstream("BTTV", "abc", "full", false) == "https://cdn.betterttv.net/emote/abc/2x.png")
+    assert(EmoteImages.fallback("BTTV", "abc", "full", false) == null)
+}
+
+test "FFZ animated uses the moving file and falls back to the static one" {
+    assert(EmoteImages.upstream("FFZ", "100", "thumb", true) == "https://cdn.frankerfacez.com/emote/100/1")
+    assert(EmoteImages.upstream("FFZ", "100", "full", true) == "https://cdn.frankerfacez.com/emote/100/animated/2")
+    assert(EmoteImages.fallback("FFZ", "100", "full", true) == "https://cdn.frankerfacez.com/emote/100/2")
+}
+
+test "FFZ static goes straight to the static file because the animated one hangs the connection" {
+    assert(EmoteImages.upstream("FFZ", "100", "full", false) == "https://cdn.frankerfacez.com/emote/100/2")
+    assert(EmoteImages.fallback("FFZ", "100", "full", false) == null)
+}
+
+test "the public path points at this backend" {
+    var animated = edEmote("catJAM", "BTTV", -1)
+    var animatedArt = Emote(animated.code(), animated.provider(), "abc", true, -1)
+    var staticArt = Emote("KEKW", "BTTV", "abc", false, -1)
+    assert(EmoteImages.publicPathOf(animatedArt, "thumb") == "/emotes/image/BTTV/abc?variant=thumb")
+    assert(EmoteImages.publicPathOf(animatedArt, "full") == "/emotes/image/BTTV/abc?variant=full&a=1")
+    // static does not carry the marker: the address does not change when the catalog discovers animation
+    assert(EmoteImages.publicPathOf(staticArt, "full") == "/emotes/image/BTTV/abc?variant=full")
+}
+
+test "a code or id out of the pattern does not enter, nor a bad rank" {
+    assert(EmoteRules.create("com espaco", "BTTV", "1", false, -1) == null)
+    assert(EmoteRules.create("KEKW", "BTTV", "../../etc/passwd", false, -1) == null)
+    assert(EmoteRules.create("KEKW", "BTTV", "1", false, 0) == null)
+    assert(EmoteRules.create("KEKW", "BTTV", "1", false, -1) != null)
+    assert(EmoteRules.create("KEKW", "7TV", "1", false, -1) == null)
+}
+
+test "an unknown variant falls on the sharp artwork" {
+    assert(EmoteImages.variant(null) == "full")
+    assert(EmoteImages.variant("sei-la") == "full")
+    assert(EmoteImages.variant("thumb") == "thumb")
+}
+
+test "popular come first in usage order" {
+    var catalog = listOf(edEmote("AAA", "FFZ", 2), edEmote("BBB", "BTTV", -1), edEmote("CCC", "FFZ", 1))
+    assert(edCodes(EmotePages.filter(catalog, null, "ALL")) == "CCC,AAA,BBB")
+}
+
+test "the popular tab brings only who has a usage position" {
+    var catalog = listOf(edEmote("AAA", "FFZ", 2), edEmote("BBB", "BTTV", -1), edEmote("CCC", "FFZ", 1))
+    assert(edCodes(EmotePages.filter(catalog, "", "popular")) == "CCC,AAA")
+}
+
+test "a provider filter brings only its collection" {
+    var catalog = listOf(edEmote("KEKW", "BTTV", -1), edEmote("catJAM", "FFZ", -1))
+    assert(edCodes(EmotePages.filter(catalog, null, "BTTV")) == "KEKW")
+    assert(edCodes(EmotePages.filter(catalog, null, "FFZ")) == "catJAM")
+}
+
+test "search ignores case and an empty term returns everything" {
+    var catalog = listOf(edEmote("KEKW", "BTTV", -1), edEmote("catJAM", "FFZ", -1), edEmote("kekwait", "FFZ", -1))
+    assert(edCodes(EmotePages.filter(catalog, "KEK", null)) == "KEKW,kekwait")
+    assert(EmotePages.filter(catalog, "   ", null).size() == 3)
+}
+
+test "the page cuts in forty and clamps to the range that exists" {
+    var catalog = listOf<Emote>()
+    var i = 0
+    while (i < 100) {
+        catalog.add(edEmote("E" + i, "BTTV", -1))
+        i = i + 1
+    }
+    var first = EmotePages.of(catalog, 1, 40)
+    assert(first.items().size() == 40)
+    assert(first.total() == 100)
+    assert(first.totalPages() == 3)
+    var last = EmotePages.of(catalog, 99, 40)
+    assert(last.page() == 3)
+    assert(last.items().size() == 20)
+    assert(EmotePages.of(catalog, 0, 40).page() == 1)
+}
+
+test "an empty catalog still has one page" {
+    var empty = EmotePages.of(listOf<Emote>(), 1, 40)
+    assert(empty.items().size() == 0)
+    assert(empty.total() == 0)
+    assert(empty.totalPages() == 1)
+}
+
+test "an unknown provider does not filter" {
+    var catalog = listOf(edEmote("KEKW", "BTTV", -1), edEmote("catJAM", "FFZ", -1))
+    assert(EmotePages.filter(catalog, null, "sei-la").size() == 2)
+}

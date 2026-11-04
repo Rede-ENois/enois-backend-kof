@@ -1,0 +1,156 @@
+import emotes.*
+
+// Port of EmoteSourcesTest, plus the live sources driven through the EmoteFeed seam (no network).
+String esCodes(list: List<Emote>) {
+    var out = ""
+    for (var e in list) {
+        if (out.length() > 0) {
+            out = out + ","
+        }
+        out = out + e.code()
+    }
+    return out
+}
+
+class EsFeed extends EmoteFeed {
+    List<String> urls = listOf<String>()
+    Map<String,String> answers = mapOf<String, String>()
+    public constructor() {
+        super()
+    }
+    String get(url: String, label: String, timeoutMs: Int) {
+        urls.add(url)
+        var body = answers.get(url)
+        if (body == null) {
+            throw label + " respondeu 522"
+        }
+        return body
+    }
+}
+
+test "BTTV reads id, code and animation" {
+    var body = "[{\"id\":\"5ff8274b8c4b6d6a6a6f4d3a\",\"code\":\"KEKW\",\"imageType\":\"png\"},{\"id\":\"60ae1c7c6a6f4d3a\",\"code\":\"catJAM\",\"animated\":true,\"imageType\":\"gif\"},{\"id\":\"x1\",\"code\":\"com espaco\",\"animated\":false}]"
+    var emotes = EmoteParsers.bttv(body)
+    assert(esCodes(emotes) == "KEKW,catJAM")
+    for (var e in emotes) {
+        assert(e.provider() == "BTTV")
+    }
+    assert(emotes.get(1).animated())
+    assert(!emotes.get(0).animated())
+}
+
+test "BTTV animation also comes from a gif image type" {
+    var emotes = EmoteParsers.bttv("[{\"id\":\"a1\",\"code\":\"dance\",\"imageType\":\"gif\"}]")
+    assert(emotes.get(0).animated())
+}
+
+test "FFZ global enters only the default sets and skips hidden and modifier ones" {
+    var body = "{\"default_sets\":[3],\"sets\":{\"3\":{\"emoticons\":[{\"name\":\"catJAM\",\"urls\":{\"1\":\"https://cdn.frankerfacez.com/emote/100/1\",\"2\":\"https://cdn.frankerfacez.com/emote/100/2\"}},{\"name\":\"oculta\",\"hidden\":true,\"urls\":{\"2\":\"https://cdn.frankerfacez.com/emote/101/2\"}},{\"name\":\"modificador\",\"modifier\":true,\"urls\":{\"2\":\"https://cdn.frankerfacez.com/emote/102/2\"}},{\"name\":\"animada\",\"urls\":{\"2\":\"https://cdn.frankerfacez.com/emote/103/2\"},\"animated\":{\"2\":\"https://cdn.frankerfacez.com/emote/103/animated/2\"}}]},\"9\":{\"emoticons\":[{\"name\":\"deSetPrivado\",\"urls\":{\"2\":\"https://cdn.frankerfacez.com/emote/200/2\"}}]}}}"
+    var emotes = EmoteParsers.ffzGlobal(body)
+    assert(esCodes(emotes) == "catJAM,animada")
+    assert(emotes.get(0).id() == "100")
+    assert(emotes.get(1).animated())
+}
+
+test "FFZ global with no default sets reads every set" {
+    var body = "{\"sets\":{\"9\":{\"emoticons\":[{\"name\":\"deSet\",\"urls\":{\"2\":\"https://cdn.frankerfacez.com/emote/200/2\"}}]}}}"
+    assert(esCodes(EmoteParsers.ffzGlobal(body)) == "deSet")
+}
+
+test "the embedded snapshot brings common and animated stickers without a network" {
+    var emotes = EmbeddedEmoteSource("resources/emotes/catalogo.json").load()
+    // what the pod serves when no provider answers: both global collections plus the popular ones
+    assert(emotes.size() > 800)
+    var bttv = 0
+    var ffz = 0
+    var animated = 0
+    var seenCodes = mapOf<String, Int>()
+    var seenRanks = mapOf<String, Int>()
+    for (var e in emotes) {
+        if (e.provider() == "BTTV") {
+            bttv = bttv + 1
+        }
+        if (e.provider() == "FFZ") {
+            ffz = ffz + 1
+        }
+        if (e.animated()) {
+            animated = animated + 1
+        }
+        // unique code: the picker pages through the catalog, a repeated code would be a repeated sticker
+        assert(seenCodes.get(e.code()) == null)
+        seenCodes.put(e.code(), 1)
+        if (EmoteRules.popular(e)) {
+            // unique position: the picker relies on it not to repeat from page 1 to page 2
+            assert(seenRanks.get("" + e.popularRank()) == null)
+            seenRanks.put("" + e.popularRank(), 1)
+        }
+    }
+    assert(bttv > 0)
+    assert(ffz > 0)
+    assert(animated > 200)
+    assert(emotes.get(0).code() == "OMEGALUL")
+    assert(emotes.get(0).popularRank() == 1)
+    assert(seenRanks.size() > 0)
+}
+
+test "the embedded snapshot ignores a row that would never be used in text" {
+    var body = "[{\"code\":\"KEKW\",\"provider\":\"BTTV\",\"id\":\"abc\",\"animated\":false},{\"code\":\"catJAM\",\"provider\":\"FFZ\",\"id\":\"777171\",\"animated\":true,\"popularRank\":7},{\"code\":\"com espaco\",\"provider\":\"FFZ\",\"id\":\"1\"},{\"code\":\"SEMPROVEDOR\",\"provider\":\"7TV\",\"id\":\"1\"},{\"code\":\"SEMID\",\"provider\":\"FFZ\"}]"
+    var emotes = EmoteParsers.snapshotArray(body)
+    assert(esCodes(emotes) == "KEKW,catJAM")
+    assert(emotes.get(1).animated())
+    assert(emotes.get(1).popularRank() == 7)
+    assert(EmoteParsers.snapshotArray("{}").size() == 0)
+    assert(EmoteParsers.snapshotArray("").size() == 0)
+}
+
+test "the id comes out of the FFZ CDN path" {
+    assert(EmoteParsers.idFromUrl("https://cdn.frankerfacez.com/emote/128054/2") == "128054")
+    assert(EmoteParsers.idFromUrl("https://cdn.frankerfacez.com/emote/128054/animated/2") == "128054")
+    assert(EmoteParsers.idFromUrl("https://exemplo.com/sem-id/2") == null)
+    assert(EmoteParsers.idFromUrl(null) == null)
+}
+
+test "the FFZ listing comes wrapped in emoticons" {
+    // regression: the listing is NOT a bare list, it is {"_pages":..,"_total":..,"emoticons":[..]};
+    // iterating the object gave zero stickers while the source "answered fine"
+    var body = "{\"_pages\":7,\"_total\":1400,\"emoticons\":[{\"id\":128054,\"name\":\"OMEGALUL\",\"urls\":{\"2\":\"https://cdn.frankerfacez.com/emote/128054/2\"}},{\"id\":777171,\"name\":\"catJAM\",\"urls\":{\"2\":\"https://cdn.frankerfacez.com/emote/777171/2\"},\"animated\":{\"2\":\"https://cdn.frankerfacez.com/emote/777171/animated/2\"}}]}"
+    var emotes = listOf<Emote>()
+    for (var node in EmoteParsers.ffzListing(body)) {
+        var e = EmoteParsers.ffz(node, EmoteRules.noRank())
+        if (e != null) {
+            emotes.add(e)
+        }
+    }
+    assert(esCodes(emotes) == "OMEGALUL,catJAM")
+    assert(emotes.get(1).animated())
+    assert(EmoteParsers.ffzListing("{}").size() == 0)
+    assert(EmoteParsers.ffzListing("").size() == 0)
+}
+
+test "the live sources read their provider through the feed and give the popular position by listing order" {
+    var feed = EsFeed()
+    feed.answers.put("https://api.betterttv.net/3/cached/emotes/global", "[{\"id\":\"a1\",\"code\":\"KEKW\"}]")
+    feed.answers.put("https://api.frankerfacez.com/v1/emotes?sort=count-desc&per_page=200&page=1", "{\"emoticons\":[{\"name\":\"OMEGALUL\",\"urls\":{\"2\":\"https://cdn.frankerfacez.com/emote/128054/2\"}},{\"name\":\"Pog\",\"urls\":{\"2\":\"https://cdn.frankerfacez.com/emote/210748/2\"}}]}")
+    feed.answers.put("https://api.frankerfacez.com/v1/emotes?sort=count-desc&per_page=200&page=2", "{\"emoticons\":[]}")
+    assert(esCodes(BttvEmoteSource(feed).load()) == "KEKW")
+    var popular = FfzListingEmoteSource(feed, 3, false)
+    assert(popular.name() == "FFZ-POPULAR")
+    var loaded = popular.load()
+    assert(esCodes(loaded) == "OMEGALUL,Pog")
+    assert(loaded.get(0).popularRank() == 1)
+    assert(loaded.get(1).popularRank() == 2)
+    // an empty page stops the listing: page 3 is never asked
+    assert(feed.urls.size() == 3)
+    var animated = FfzListingEmoteSource(feed, 1, true)
+    assert(animated.name() == "FFZ-ANIMADAS")
+}
+
+test "a provider that answers with an error makes the source throw" {
+    var failed = ""
+    try {
+        FfzGlobalEmoteSource(EsFeed()).load()
+    } catch (String e) {
+        failed = e
+    }
+    assert(failed == "FFZ respondeu 522")
+}

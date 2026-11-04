@@ -1,0 +1,297 @@
+package emotes
+
+import kernel.http.*
+
+// A source of stickers (a provider's global collection, the popular listing, the embedded snapshot). Each one
+// may fail without taking the others down: EmoteCatalogService merges them. Base class, not an interface
+// (cross-package `implements` does not compile, G30); tests and modules subclass it.
+class EmoteSource {
+    public constructor() {}
+    String name() = ""
+    // Lists the stickers of this source. May throw: the caller handles the failure.
+    List<Emote> load() = listOf<Emote>()
+}
+
+// The outbound GET of the live sources, behind a seam so tests answer from memory (no network in tests).
+// The default asks the provider with the same User-Agent and timeouts as the Java HttpClient.
+class EmoteFeed {
+    public constructor() {}
+    // The body of a 200 answer; any other status (FFZ answers 522 when its Cloudflare gives up) throws.
+    String get(url: String, label: String, timeoutMs: Int) {
+        var res = OutboundHttp.get(url, listOf("User-Agent: enois/1.0 (+https://enois.ia.br)", "Accept: application/json"), 5000, timeoutMs, 33554432)
+        if (res.status != 200) {
+            throw label + " respondeu " + res.status
+        }
+        return res.text()
+    }
+}
+
+record BttvRow(String? id, String? code, Troolean animated, String? imageType)
+
+record FfzEmoticon(String? name, Troolean hidden, Troolean modifier, Map<String,String>? urls, Map<String,String>? animated)
+
+record FfzSet(List<FfzEmoticon>? emoticons)
+
+record FfzGlobalBody(List<Int>? default_sets, Map<String,FfzSet>? sets)
+
+record FfzListingBody(List<FfzEmoticon>? emoticons)
+
+record EmoteSnapshotRow(String? code, String? provider, String? id, Troolean animated, Int? popularRank)
+
+record EmoteSnapshot(List<EmoteSnapshotRow>? emotes)
+
+// Pure readers of the provider formats (separate from the HTTP so the tests cover the shapes without a network).
+class EmoteParsers {
+    // BTTV `/3/cached/emotes/global`: an array of {id, code, animated?, imageType?}.
+    static List<Emote> bttv(text: String) {
+        var out = listOf<Emote>()
+        if (!text.trim().startsWith("[")) {
+            return out
+        }
+        for (var row in json.decode<List<BttvRow>>(text)) {
+            var animated = row.animated() == true
+            var type = row.imageType()
+            if (type != null && type == "gif") {
+                animated = true
+            }
+            var e = EmoteRules.create(row.code(), "BTTV", row.id(), animated, EmoteRules.noRank())
+            if (e != null) {
+                out.add(e)
+            }
+        }
+        return out
+    }
+    // `https://cdn.frankerfacez.com/emote/128054/2` -> `128054`; null when the URL has no `/emote/` segment.
+    static String? idFromUrl(url: String?) {
+        if (url == null) {
+            return null
+        }
+        if (url.length() == 0) {
+            return null
+        }
+        var parts = url.split("/")
+        var i = parts.length - 2
+        while (i >= 0) {
+            if (parts[i] == "emote") {
+                return parts[i + 1]
+            }
+            i = i - 1
+        }
+        return null
+    }
+    static String firstUrl(em: FfzEmoticon) {
+        var urls = em.urls()
+        if (urls == null) {
+            return ""
+        }
+        for (var scale in listOf("2", "1", "4", "3")) {
+            var u = urls.get(scale)
+            if (u != null) {
+                if (u.length() > 0) {
+                    return u
+                }
+            }
+        }
+        return ""
+    }
+    static Bool hasUrl(map: Map<String,String>?, key: String) {
+        if (map == null) {
+            return false
+        }
+        var u = map.get(key)
+        return u != null
+    }
+    // One FFZ emoticon. Hidden, modifier (tints another one) and nameless ones are not drawn alone: null.
+    static Emote? ffz(em: FfzEmoticon, rank: Int) {
+        if (em.hidden() == true || em.modifier() == true) {
+            return null
+        }
+        var name = em.name()
+        var id = EmoteParsers.idFromUrl(EmoteParsers.firstUrl(em))
+        if (name == null) {
+            return null
+        }
+        if (name.length() == 0) {
+            return null
+        }
+        var animatedMap = em.animated()
+        var animated = EmoteParsers.hasUrl(animatedMap, "1") || EmoteParsers.hasUrl(animatedMap, "2")
+        return EmoteRules.create(name, "FFZ", id, animated, rank)
+    }
+    // FFZ `/v1/set/global`: only the `default_sets` (the other sets are channel collections), or every set when
+    // the answer has none.
+    static List<Emote> ffzGlobal(text: String) {
+        var out = listOf<Emote>()
+        if (!text.trim().startsWith("{")) {
+            return out
+        }
+        var body = json.decode<FfzGlobalBody>(text)
+        var sets = body.sets()
+        if (sets == null) {
+            return out
+        }
+        var ids = listOf<String>()
+        var defaults = body.default_sets()
+        if (defaults != null && defaults.size() > 0) {
+            for (var id in defaults) {
+                ids.add("" + id)
+            }
+        }
+        else {
+            for (var id in sets.keys()) {
+                ids.add(id)
+            }
+        }
+        for (var id in ids) {
+            var set = sets.get(id)
+            if (set == null) {
+                continue
+            }
+            var list = set.emoticons()
+            if (list == null) {
+                continue
+            }
+            for (var em in list) {
+                var e = EmoteParsers.ffz(em, EmoteRules.noRank())
+                if (e != null) {
+                    out.add(e)
+                }
+            }
+        }
+        return out
+    }
+    // The FFZ listing comes wrapped (`{"_pages":..,"emoticons":[..]}`), not as a bare array.
+    static List<FfzEmoticon> ffzListing(text: String) {
+        var trimmed = text.trim()
+        if (trimmed.startsWith("[")) {
+            return json.decode<List<FfzEmoticon>>(trimmed)
+        }
+        if (!trimmed.startsWith("{")) {
+            return listOf<FfzEmoticon>()
+        }
+        var list = json.decode<FfzListingBody>(trimmed).emoticons()
+        if (list == null) {
+            return listOf<FfzEmoticon>()
+        }
+        return list
+    }
+    // The rows of the embedded snapshot (the value of `emotes`). A corrupted row is skipped, the others stand.
+    static List<Emote> snapshotRows(rows: List<EmoteSnapshotRow>) {
+        var out = listOf<Emote>()
+        for (var row in rows) {
+            var rank = row.popularRank()
+            var value = EmoteRules.noRank()
+            if (rank != null) {
+                value = rank
+            }
+            var e = EmoteRules.create(row.code(), row.provider(), row.id(), row.animated() == true, value)
+            if (e != null) {
+                out.add(e)
+            }
+        }
+        return out
+    }
+    // `text` is the `emotes` array alone (`[...]`); anything else is empty.
+    static List<Emote> snapshotArray(text: String) {
+        if (!text.trim().startsWith("[")) {
+            return listOf<Emote>()
+        }
+        return EmoteParsers.snapshotRows(json.decode<List<EmoteSnapshotRow>>(text))
+    }
+}
+
+// BTTV global collection (65 stickers, ~0.3 s). The popular page of betterttv.com is not reachable from here.
+class BttvEmoteSource extends EmoteSource {
+    EmoteFeed feed
+    public constructor(feed: EmoteFeed) {
+        super()
+        this.feed = feed
+    }
+    String name() = "BTTV"
+    List<Emote> load() = EmoteParsers.bttv(feed.get("https://api.betterttv.net/3/cached/emotes/global", "BTTV", 10000))
+}
+
+// FFZ global collection (13 stickers).
+class FfzGlobalEmoteSource extends EmoteSource {
+    EmoteFeed feed
+    public constructor(feed: EmoteFeed) {
+        super()
+        this.feed = feed
+    }
+    String name() = "FFZ-GLOBAL"
+    List<Emote> load() = EmoteParsers.ffzGlobal(feed.get("https://api.frankerfacez.com/v1/set/global", "FFZ", 12000))
+}
+
+// FFZ listing by usage (`/v1/emotes?sort=count-desc`), popular or animated-only. The popular one gives the
+// usage position; the animated one gives "has a moving version" (the popular listing does not publish it).
+// Runs only in the scheduled refresh: each 200-item page takes seconds.
+class FfzListingEmoteSource extends EmoteSource {
+    EmoteFeed feed
+    Int pages
+    Bool animatedOnly
+    public constructor(feed: EmoteFeed, pages: Int, animatedOnly: Bool) {
+        super()
+        this.feed = feed
+        var clamped = pages
+        if (clamped < 1) {
+            clamped = 1
+        }
+        if (clamped > 20) {
+            clamped = 20
+        }
+        this.pages = clamped
+        this.animatedOnly = animatedOnly
+    }
+    String name() {
+        if (animatedOnly) {
+            return "FFZ-ANIMADAS"
+        }
+        return "FFZ-POPULAR"
+    }
+    List<Emote> load() {
+        var out = listOf<Emote>()
+        var page = 1
+        while (page <= pages) {
+            var url = "https://api.frankerfacez.com/v1/emotes?sort=count-desc&per_page=200&page=" + page
+            if (animatedOnly) {
+                url = url + "&animated=true"
+            }
+            var list = EmoteParsers.ffzListing(feed.get(url, this.name(), 45000))
+            if (list.size() == 0) {
+                break
+            }
+            for (var em in list) {
+                // sort=count-desc comes in usage order: the accepted position is the popular rank.
+                var rank = EmoteRules.noRank()
+                if (!animatedOnly) {
+                    rank = out.size() + 1
+                }
+                var e = EmoteParsers.ffz(em, rank)
+                if (e != null) {
+                    out.add(e)
+                }
+            }
+            page = page + 1
+        }
+        return out
+    }
+}
+
+// The snapshot embedded in the deployment (`resources/emotes/catalogo.json`): what the pod serves when no
+// provider answers. It carries both global collections, the most used and the animated ones, already merged.
+class EmbeddedEmoteSource extends EmoteSource {
+    String path
+    public constructor(path: String) {
+        super()
+        this.path = path
+    }
+    String name() = "EMBARCADO"
+    List<Emote> load() {
+        var text = File(path).readText()
+        var rows = json.decode<EmoteSnapshot>(text).emotes()
+        if (rows == null) {
+            return listOf<Emote>()
+        }
+        return EmoteParsers.snapshotRows(rows)
+    }
+}
