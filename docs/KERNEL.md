@@ -113,6 +113,12 @@ var id = database.txLong(() -> database.insertReturningId(sql, p))   // ... or t
 database.inTransaction(): Bool
 ```
 
+After-commit hooks (`@TransactionalEventListener(AFTER_COMMIT)`): `database.afterCommit(() -> { ... })`
+inside a transaction runs the callback only after the outermost commit (dropped on rollback, in
+registration order, after the connection is back in the pool, so it may use the database again).
+Outside a transaction it runs immediately. A callback that throws is logged (`after_commit_failed`)
+and does not stop the others nor undo the commit.
+
 Constraint violations (unique, FK, NOT NULL, data too long) become `Errors.conflict()` (409 CONFLICT),
 like `DataIntegrityViolationException`. Other SQL failures are logged and thrown as `SQL_ERROR: ...`
 (500 at the edge). Connections are always returned to the pool, including on failure.
