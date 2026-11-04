@@ -1,0 +1,119 @@
+import feed.*
+import kernel.testkit.*
+
+// Port of PollPostTests (all but pollTravelsInTheFeedPage: it needs GET /feed, see PORTING_STATUS).
+String pollJson(content: String, options: String) = "{\"topic\":\"TECNOLOGIA\",\"type\":\"POLL\",\"content\":\"" + content + "\",\"pollOptions\":[" + options + "]}"
+
+String publishPoll(token: String, content: String, options: String, key: String) {
+    var res = FeedTestSupport.post(token, key, pollJson(content, options))
+    Check.status(res, 201)
+    return FeedTestSupport.field(res, "id")
+}
+
+TestResponse readPost(token: String, postId: String) = FeedTestSupport.app().client.getWith("/feed/posts/" + postId, FeedTestSupport.read(token))
+
+TestResponse castVote(token: String, postId: String, body: String) = FeedTestSupport.app().client.send("POST", "/feed/posts/" + postId + "/poll/vote", FeedTestSupport.write(token, "v-" + Time.nowMillis()), "", body)
+
+test "publishes a poll with options and no votes" {
+    var author = FeedTestSupport.user("user_poll_pub1")
+    var id = publishPoll(author, "Qual linguagem voce usa?", "\"Java\",\"Kotlin\",\"Go\"", "poll-pub-1")
+    var res = readPost(author, id)
+    Check.eqInt("options", 3, res.jsonSize("poll.options"))
+    Check.jsonEq(res, "poll.options.0", "Java")
+    Check.jsonEq(res, "poll.counts.0", "0")
+    Check.jsonEq(res, "poll.totalVotes", "0")
+    Check.isTrue("no vote yet", res.jsonIsNull("poll.myVote"))
+}
+
+test "a vote is counted once and only for the chosen option" {
+    var author = FeedTestSupport.user("user_poll_vote1")
+    var voter = FeedTestSupport.user("user_poll_voter1")
+    var id = publishPoll(author, "Qual o melhor horario?", "\"Manha\",\"Tarde\"", "poll-vote-1")
+    var vote = castVote(voter, id, "{\"option\":1}")
+    Check.status(vote, 200)
+    Check.jsonEq(vote, "myVote", "1")
+    Check.jsonEq(vote, "totalVotes", "1")
+    Check.jsonEq(vote, "counts.0", "0")
+    Check.jsonEq(vote, "counts.1", "1")
+    var poll = readPost(voter, id)
+    Check.jsonEq(poll, "poll.myVote", "1")
+    Check.jsonEq(poll, "poll.totalVotes", "1")
+    Check.jsonEq(poll, "poll.counts.1", "1")
+}
+
+test "the vote cannot be changed after casting" {
+    var author = FeedTestSupport.user("user_poll_change")
+    var voter = FeedTestSupport.user("user_poll_changer")
+    var id = publishPoll(author, "Cafe ou cha?", "\"Cafe\",\"Cha\"", "poll-change-1")
+    Check.status(castVote(voter, id, "{\"option\":0}"), 200)
+    Check.apiError(castVote(voter, id, "{\"option\":1}"), 409, "ALREADY_VOTED")
+    Check.apiError(castVote(voter, id, "{\"option\":0}"), 409, "ALREADY_VOTED")
+    var poll = readPost(voter, id)
+    Check.jsonEq(poll, "poll.myVote", "0")
+    Check.jsonEq(poll, "poll.totalVotes", "1")
+    Check.jsonEq(poll, "poll.counts.0", "1")
+    Check.jsonEq(poll, "poll.counts.1", "0")
+}
+
+test "each person counts once in the total" {
+    var author = FeedTestSupport.user("user_poll_people")
+    var a = FeedTestSupport.user("user_poll_people_a")
+    var b = FeedTestSupport.user("user_poll_people_b")
+    var id = publishPoll(author, "Escolha uma", "\"A\",\"B\"", "poll-people-1")
+    Check.status(castVote(a, id, "{\"option\":0}"), 200)
+    Check.status(castVote(b, id, "{\"option\":0}"), 200)
+    var poll = readPost(a, id)
+    Check.jsonEq(poll, "poll.totalVotes", "2")
+    Check.jsonEq(poll, "poll.counts.0", "2")
+}
+
+test "rejects an invalid option" {
+    var author = FeedTestSupport.user("user_poll_bad_opt")
+    var voter = FeedTestSupport.user("user_poll_bad_voter")
+    var id = publishPoll(author, "Duas opcoes", "\"A\",\"B\"", "poll-bad-opt-1")
+    Check.apiError(castVote(voter, id, "{\"option\":2}"), 400, "INVALID_POLL_OPTION")
+    Check.apiError(castVote(voter, id, "{}"), 400, "INVALID_POLL_OPTION")
+}
+
+test "a vote requires a session" {
+    var author = FeedTestSupport.user("user_poll_anon")
+    var id = publishPoll(author, "Sem sessao", "\"A\",\"B\"", "poll-anon-1")
+    var res = FeedTestSupport.app().client.send("POST", "/feed/posts/" + id + "/poll/vote", listOf("Content-Type: application/json"), "", "{\"option\":0}")
+    Check.status(res, 401)
+}
+
+test "rejects a poll without enough options" {
+    var author = FeedTestSupport.user("user_poll_few")
+    Check.apiError(FeedTestSupport.post(author, "poll-few-1", pollJson("Uma so", "\"A\"")), 400, "POLL_TOO_FEW_OPTIONS")
+}
+
+test "rejects a poll with more than six options" {
+    var author = FeedTestSupport.user("user_poll_many")
+    Check.apiError(FeedTestSupport.post(author, "poll-many-1", pollJson("Sete", "\"A\",\"B\",\"C\",\"D\",\"E\",\"F\",\"G\"")), 400, "POLL_TOO_MANY_OPTIONS")
+}
+
+test "rejects empty, blank and repeated options" {
+    var author = FeedTestSupport.user("user_poll_blank")
+    Check.apiError(FeedTestSupport.post(author, "poll-blank-1", pollJson("Vazia", "\"A\",\"  \"")), 400, "POLL_EMPTY_OPTION")
+    Check.apiError(FeedTestSupport.post(author, "poll-repeat-1", pollJson("Repetida", "\"Java\",\"java\"")), 400, "POLL_DUPLICATE_OPTION")
+}
+
+test "the title is limited to four hundred characters" {
+    var author = FeedTestSupport.user("user_poll_title")
+    publishPoll(author, strings.repeat("a", 400), "\"A\",\"B\"", "poll-title-ok")
+    Check.apiError(FeedTestSupport.post(author, "poll-title-long", pollJson(strings.repeat("a", 401), "\"A\",\"B\"")), 400, "CONTENT_TOO_LONG")
+}
+
+test "options are ignored outside a poll" {
+    var author = FeedTestSupport.user("user_poll_ignored")
+    var res = FeedTestSupport.post(author, "poll-ignored-1", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Post comum\",\"pollOptions\":[\"A\",\"B\"]}")
+    Check.status(res, 201)
+    var poll = readPost(author, FeedTestSupport.field(res, "id"))
+    Check.isTrue("no poll on a plain post", poll.jsonIsNull("poll"))
+}
+
+test "voting on a post that is not a poll is rejected" {
+    var author = FeedTestSupport.user("user_poll_notpoll")
+    var res = FeedTestSupport.post(author, "poll-notpoll-1", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Nao e enquete\"}")
+    Check.apiError(castVote(author, FeedTestSupport.field(res, "id"), "{\"option\":0}"), 400, "NOT_A_POLL")
+}
