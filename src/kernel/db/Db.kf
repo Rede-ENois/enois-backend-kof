@@ -1,0 +1,270 @@
+package kernel.db
+
+import com.zaxxer.hikari.HikariConfig
+import com.zaxxer.hikari.HikariDataSource
+import java.lang.ThreadLocal
+import java.sql.Connection
+import java.sql.PreparedStatement
+import java.sql.SQLException
+import kernel.config.*
+import kernel.error.*
+import kernel.log.*
+
+// Connection pool + JDBC access. Domain code never touches java.sql.
+//
+//   db.execute("update t set a = ? where id = ?", DbParams().bindStr("x").bindLong(1L))
+//   var rows = db.queryList("select id, name from t", DbParams())
+//   var names = rows.map((r: DbRow) -> r.getStr("name"))
+//   db.transaction(() -> { ... })        // stores called inside reuse the same connection
+//
+// Constraint violations (SQLSTATE 23xxx) become Errors.conflict() (409 CONFLICT), like the
+// Java GlobalExceptionHandler. Any other SQL failure is logged and rethrown as a plain String.
+class Db {
+    HikariDataSource ds
+    ThreadLocal current = new ThreadLocal()
+    Log log = Log("kernel.db")
+    public constructor(ds: HikariDataSource) {
+        this.ds = ds
+    }
+    // Pool sized like the Java prd profile (DB_POOL_MAX 30, DB_POOL_MIN_IDLE 10).
+    static Db connect(url: String, user: String, password: String, maxPool: Int, minIdle: Int) {
+        var hc = new HikariConfig()
+        hc.setJdbcUrl(url)
+        hc.setUsername(user)
+        hc.setPassword(password)
+        hc.setMaximumPoolSize(maxPool)
+        hc.setMinimumIdle(minIdle)
+        hc.setConnectionTimeout(10000L)
+        hc.setMaxLifetime(600000L)
+        hc.setIdleTimeout(300000L)
+        hc.setValidationTimeout(5000L)
+        return Db(new HikariDataSource(hc))
+    }
+    // Boots from DB_URL, or DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD, or in-memory H2.
+    static Db fromConfig(cfg: Config) = Db.connect(DbSettings.url(cfg), DbSettings.user(cfg), DbSettings.password(cfg), DbSettings.poolMax(cfg), DbSettings.poolMinIdle(cfg))
+    close() {
+        ds.close()
+    }
+    Bool inTransaction() = current.get() != null
+    Connection acquire() {
+        var c = current.get()
+        if (c != null) {
+            return c as Connection
+        }
+        return ds.getConnection()
+    }
+    release(c: Connection) {
+        var cur = current.get()
+        if (cur == null) {
+            c.close()
+        }
+    }
+    // Maps a SQL failure to the thrown String contract.
+    String failure(e: SQLException) {
+        // SQLException.getSQLState()/getErrorCode() are mis-typed by the compiler (NoSuchMethodError,
+        // KOF_GAPS G11), so integrity violations are recognised by their vendor message (H2 and MariaDB).
+        var msg = e.getMessage().toLowerCase()
+        if (Db.isIntegrityMessage(msg)) {
+            log.warn("data_integrity_violation: " + e.getMessage())
+            return Errors.conflict()
+        }
+        log.error("sql_error message=" + e.getMessage())
+        return "SQL_ERROR: " + e.getMessage()
+    }
+    static Bool isIntegrityMessage(msg: String) {
+        var needles = listOf("unique index or primary key", "duplicate entry", "referential integrity", "cannot add or update a child row", "cannot delete or update a parent row", "cannot be null", "null not allowed for column", "value too long for column", "data too long", "check constraint", "out of range value", "doesn\'t have a default value")
+        for (var n in needles) {
+            if (msg.contains(n)) {
+                return true
+            }
+        }
+        return false
+    }
+    bind(ps: PreparedStatement, p: DbParams) {
+        var i = 0
+        while (i < p.items.size()) {
+            var v = p.items.get(i)
+            var nullType = p.nullTypes.get(i)
+            if (nullType != 0) {
+                ps.setNull(i + 1, nullType)
+            }
+            else {
+                ps.setObject(i + 1, v)
+            }
+            i = i + 1
+        }
+    }
+    // Every statement method below releases its connection without `finally`: a throw from inside
+    // a catch block skips the finally on the JVM backend (KOF_GAPS G12), which leaked pooled
+    // connections. Failures are captured, the connection released, then rethrown.
+    // Rows affected.
+    Int execute(sql: String, p: DbParams) {
+        var c = acquire()
+        var affected = 0
+        var failed = false
+        var failure = ""
+        try {
+            var ps = c.prepareStatement(sql)
+            bind(ps, p)
+            affected = ps.executeUpdate()
+            ps.close()
+        } catch (SQLException e) {
+            failed = true
+            failure = this.failure(e)
+        } catch (String e) {
+            failed = true
+            failure = e
+        }
+        release(c)
+        if (failed) {
+            throw failure
+        }
+        return affected
+    }
+    // INSERT returning the generated auto-increment key.
+    Long insertReturningId(sql: String, p: DbParams) {
+        var c = acquire()
+        var id = 0L
+        var failed = false
+        var failure = ""
+        try {
+            var ps = c.prepareStatement(sql, 1)
+            bind(ps, p)
+            ps.executeUpdate()
+            var keys = ps.getGeneratedKeys()
+            if (keys.next()) {
+                id = keys.getLong(1)
+            }
+            else {
+                failed = true
+                failure = "SQL_ERROR: no generated key returned"
+            }
+            ps.close()
+        } catch (SQLException e) {
+            failed = true
+            failure = this.failure(e)
+        } catch (String e) {
+            failed = true
+            failure = e
+        }
+        release(c)
+        if (failed) {
+            throw failure
+        }
+        return id
+    }
+    List<DbRow> queryList(sql: String, p: DbParams) {
+        var c = acquire()
+        var out = listOf<DbRow>()
+        var failed = false
+        var failure = ""
+        try {
+            var ps = c.prepareStatement(sql)
+            bind(ps, p)
+            var rs = ps.executeQuery()
+            var meta = rs.getMetaData()
+            var n = meta.getColumnCount()
+            while (rs.next()) {
+                var row = DbRow()
+                var i = 1
+                while (i <= n) {
+                    row.put(meta.getColumnLabel(i) as String, rs.getString(i) as String)
+                    i = i + 1
+                }
+                out.add(row)
+            }
+            ps.close()
+        } catch (SQLException e) {
+            failed = true
+            failure = this.failure(e)
+        } catch (String e) {
+            failed = true
+            failure = e
+        }
+        release(c)
+        if (failed) {
+            throw failure
+        }
+        return out
+    }
+    // Exactly one row or an error (404-style decisions belong to the caller: use queryOptional).
+    DbRow queryOne(sql: String, p: DbParams) {
+        var rows = queryList(sql, p)
+        if (rows.size() != 1) {
+            throw "SQL_ERROR: expected one row, got " + rows.size()
+        }
+        return rows.get(0)
+    }
+    DbRow? queryOptional(sql: String, p: DbParams) {
+        var rows = queryList(sql, p)
+        if (rows.size() == 0) {
+            return null
+        }
+        return rows.get(0)
+    }
+    // `select count(*)`-style single numeric cell.
+    Long queryLong(sql: String, p: DbParams) {
+        var rows = queryList(sql, p)
+        if (rows.size() == 0) {
+            return 0L
+        }
+        var r = rows.get(0)
+        var first = r.cols.keys().get(0)
+        return r.getLong(first)
+    }
+    // Runs body in one transaction on one connection (bound to the current virtual thread).
+    // Nested calls join the outer transaction. A thrown String rolls back and is rethrown.
+    // Kof has no generic function types: to return a value, assign it to a captured variable
+    // or use txLong/txStr/txBool.
+    transaction(body: () -> void) {
+        if (current.get() != null) {
+            body()
+            return
+        }
+        var c = ds.getConnection()
+        c.setAutoCommit(false)
+        current.set(c)
+        var failed = false
+        var failure = ""
+        try {
+            body()
+            c.commit()
+        } catch (SQLException e) {
+            c.rollback()
+            failed = true
+            failure = this.failure(e)
+        } catch (String e) {
+            c.rollback()
+            failed = true
+            failure = e
+        }
+        // Not a `finally`: a throw from inside a catch skips it (KOF_GAPS G12).
+        current.remove()
+        c.setAutoCommit(true)
+        c.close()
+        if (failed) {
+            throw failure
+        }
+    }
+    Long txLong(body: () -> Long) {
+        var result = 0L
+        this.transaction(() -> {
+    result = body()
+})
+        return result
+    }
+    String txStr(body: () -> String) {
+        var result = ""
+        this.transaction(() -> {
+    result = body()
+})
+        return result
+    }
+    Bool txBool(body: () -> Bool) {
+        var result = false
+        this.transaction(() -> {
+    result = body()
+})
+        return result
+    }
+}

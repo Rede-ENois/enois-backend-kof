@@ -1,0 +1,75 @@
+package kernel.db
+
+import java.util.logging.Level
+import java.util.logging.Logger
+import org.flywaydb.core.Flyway
+import kernel.config.*
+import kernel.log.*
+
+record MigrationSummary(Int applied, Int pending, Int failed, String last)
+
+// Flyway at boot, like the Java app: repair a FAILED marker (non-transactional MariaDB DDL
+// leaves one behind), then migrate. Profile qa/hml/prd (SPRING_PROFILES_ACTIVE) run with
+// out-of-order=true and validate-on-migrate=false; dev/test are strict.
+// Location: MIGRATIONS_DIR (default `filesystem:resources/db/migration`, relative to the
+// working directory).
+class Migrations {
+    static Flyway build(cfg: Config, url: String, user: String, password: String) {
+        var profile = cfg.getStr("SPRING_PROFILES_ACTIVE", "dev")
+        var relaxed = profile == "qa" || profile == "hml" || profile == "prd"
+        var outOfOrder = cfg.getBool("SPRING_FLYWAY_OUT_OF_ORDER", relaxed)
+        var validate = cfg.getBool("SPRING_FLYWAY_VALIDATE_ON_MIGRATE", !relaxed)
+        // Java varargs emit a VerifyError (docs/KOF_GAPS.md G2): pass the array explicitly.
+        var locations = new String[1]
+        locations[0] = cfg.getStr("MIGRATIONS_DIR", "filesystem:resources/db/migration")
+        var fc = Flyway.configure().dataSource(url, user, password)
+        fc = fc.locations(locations)
+        fc = fc.outOfOrder(outOfOrder)
+        fc = fc.validateOnMigrate(validate)
+        return fc.load()
+    }
+    static MigrationSummary migrate(cfg: Config, url: String, user: String, password: String) {
+        var log = Log("kernel.migrations")
+        // Flyway falls back to java.util.logging (no SLF4J binding): keep it to warnings, our own log reports the result.
+        Logger.getLogger("org.flywaydb").setLevel(Level.WARNING)
+        var flyway = Migrations.build(cfg, url, user, password)
+        var failed = 0
+        for (var info in flyway.info().all()) {
+            var state = info.getState()
+            if (state != null && state.isFailed()) {
+                failed = failed + 1
+            }
+        }
+        if (failed > 0) {
+            log.warn("flyway found FAILED migration markers; running repair before migrate")
+            flyway.repair()
+        }
+        flyway.migrate()
+        return Migrations.summary(flyway)
+    }
+    static MigrationSummary summary(flyway: Flyway) {
+        var applied = 0
+        var pending = 0
+        var failed = 0
+        var last = ""
+        for (var info in flyway.info().all()) {
+            var state = info.getState()
+            if (state == null) {
+                continue
+            }
+            if (state.isFailed()) {
+                failed = failed + 1
+            }
+            else 
+                if (state.isApplied()) {
+                    applied = applied + 1
+                    last = info.getVersion() + " " + info.getDescription()
+                }
+                else 
+                    if (state.toString() == "PENDING") {
+                        pending = pending + 1
+                    }
+        }
+        return MigrationSummary(applied, pending, failed, last)
+    }
+}

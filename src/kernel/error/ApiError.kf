@@ -1,0 +1,33 @@
+package kernel.error
+
+// Kof exceptions are Strings, so the Java ApiException travels as a tagged String:
+//   throw Errors.api(404, "NOT_FOUND", "Recurso nao encontrado.")
+// kernel.http turns it into {"code","message","timestamp"} with that status. Any other thrown
+// String (or Java exception) is an unexpected failure: 500 INTERNAL_ERROR.
+record ApiError(Int status, String code, String message, Long retryAfterSeconds)
+
+class Errors {
+    static String tag() = "ApiError:"
+    static String api(status: Int, code: String, message: String) = Errors.tag() + json.encode(ApiError(status, code, message, 0L))
+    // Same, with a Retry-After response header (seconds).
+    static String apiRetry(status: Int, code: String, message: String, retryAfterSeconds: Long) = Errors.tag() + json.encode(ApiError(status, code, message, retryAfterSeconds))
+    // IllegalArgumentException / bean validation in the Java app: 400 BAD_REQUEST.
+    static String badRequest() = Errors.api(400, "BAD_REQUEST", "Requisicao invalida.")
+    // DataIntegrityViolationException in the Java app: 409 CONFLICT.
+    static String conflict() = Errors.api(409, "CONFLICT", "Operacao conflita com o estado atual dos dados.")
+    static Bool isApi(e: String) = e.startsWith(Errors.tag())
+    // Decodes a thrown String. Anything that is not an ApiError becomes the generic 500.
+    static ApiError parse(e: String) {
+        if (Errors.isApi(e)) {
+            try {
+                return json.decode<ApiError>(e.substring(Errors.tag().length()))
+            } catch (String bad) {
+                return Errors.internal()
+            }
+        }
+        return Errors.internal()
+    }
+    static ApiError internal() = ApiError(500, "INTERNAL_ERROR", "Erro interno inesperado.", 0L)
+    // True when `e` is an ApiError with that code (e.g. catch a duplicate: hasCode(e, "CONFLICT")).
+    static Bool hasCode(e: String, code: String) = Errors.isApi(e) && Errors.parse(e).code() == code
+}

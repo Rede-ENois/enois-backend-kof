@@ -1,0 +1,146 @@
+import kernel.config.*
+import kernel.db.*
+import kernel.error.*
+import java.util.HashMap
+
+Db freshDb(name: String) {
+    var url = "jdbc:h2:mem:" + name + ";MODE=MySQL;DB_CLOSE_DELAY=-1"
+    var database = Db.connect(url, "sa", "", 5, 1)
+    database.execute("create table t (id bigint auto_increment primary key, a varchar(50), b int, c boolean, n bigint, d timestamp null, dt date null, u varchar(20) unique)", DbParams())
+    return database
+}
+
+test "binds more than four params of every type" {
+    var database = freshDb("dbbinds")
+    var id = database.insertReturningId("insert into t (a, b, c, n, d, dt, u) values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr("x").bindInt(7).bindBool(true).bindLongOrNull(null).bindInstant("2026-11-04T16:05:00.123456Z").bindDate("2026-11-04").bindStr("u1"))
+    assert(id > 0L)
+    var r = database.queryOne("select * from t where id = ? and a = ? and b = ? and c = ? and u = ?", DbParams().bindLong(id).bindStr("x").bindInt(7).bindBool(true).bindStr("u1"))
+    assert(r.getStr("a") == "x")
+    assert(r.getInt("b") == 7)
+    assert(r.getBool("c"))
+    assert(r.getLongOrNull("n") == null)
+    assert(r.isNull("n"))
+    assert(r.getInstant("d") == "2026-11-04T16:05:00.123456Z")
+    assert(r.getDate("dt") == "2026-11-04")
+}
+
+test "null binds and optional rows" {
+    var database = freshDb("dbnulls")
+    database.execute("insert into t (a, b, u) values (?, ?, ?)", DbParams().bindStrOrNull(null).bindIntOrNull(null).bindStr("n1"))
+    var r = database.queryOptional("select * from t where u = ?", DbParams().bindStr("n1"))
+    assert(r != null)
+    assert(database.queryOptional("select * from t where u = ?", DbParams().bindStr("zzz")) == null)
+    var all = database.queryList("select a from t", DbParams())
+    assert(all.size() == 1)
+    assert(all.get(0).getStrOrNull("a") == null)
+    assert(database.queryLong("select count(*) from t", DbParams()) == 1L)
+}
+
+test "generated keys increase" {
+    var database = freshDb("dbkeys")
+    var a = database.insertReturningId("insert into t (a, u) values (?, ?)", DbParams().bindStr("1").bindStr("k1"))
+    var b = database.insertReturningId("insert into t (a, u) values (?, ?)", DbParams().bindStr("2").bindStr("k2"))
+    assert(b == a + 1L)
+}
+
+test "transaction commits" {
+    var database = freshDb("dbcommit")
+    database.transaction(() -> {
+    database.execute("insert into t (a, u) values (?, ?)", DbParams().bindStr("c").bindStr("c1"))
+    assert(database.inTransaction())
+})
+    assert(!database.inTransaction())
+    assert(database.queryLong("select count(*) from t", DbParams()) == 1L)
+}
+
+test "transaction rolls back when the body throws" {
+    var database = freshDb("dbrollback")
+    var caught = ""
+    try {
+        database.transaction(() -> {
+    database.execute("insert into t (a, u) values (?, ?)", DbParams().bindStr("r").bindStr("r1"))
+    throw "boom"
+})
+    } catch (String e) {
+        caught = e
+    }
+    assert(caught == "boom")
+    assert(database.queryLong("select count(*) from t", DbParams()) == 0L)
+    assert(!database.inTransaction())
+}
+
+test "nested transactions join the outer one" {
+    var database = freshDb("dbnested")
+    var caught = false
+    try {
+        database.transaction(() -> {
+    database.transaction(() -> {
+    database.execute("insert into t (a, u) values (?, ?)", DbParams().bindStr("n").bindStr("nn1"))
+})
+    throw "outer fails"
+})
+    } catch (String e) {
+        caught = true
+    }
+    assert(caught)
+    assert(database.queryLong("select count(*) from t", DbParams()) == 0L)
+}
+
+test "txLong returns the body value" {
+    var database = freshDb("dbtxlong")
+    var id = database.txLong(() -> database.insertReturningId("insert into t (a, u) values (?, ?)", DbParams().bindStr("v").bindStr("v1")))
+    assert(id > 0L)
+}
+
+test "select for update works inside a transaction" {
+    var database = freshDb("dbforupdate")
+    var id = database.insertReturningId("insert into t (a, b, u) values (?, ?, ?)", DbParams().bindStr("f").bindInt(1).bindStr("f1"))
+    database.transaction(() -> {
+    var row = database.queryOne("select b from t where id = ? for update", DbParams().bindLong(id))
+    database.execute("update t set b = ? where id = ?", DbParams().bindInt(row.getInt("b") + 1).bindLong(id))
+})
+    assert(database.queryOne("select b from t where id = ?", DbParams().bindLong(id)).getInt("b") == 2)
+}
+
+test "constraint violation maps to 409 CONFLICT" {
+    var database = freshDb("dbconflict")
+    database.execute("insert into t (a, u) values (?, ?)", DbParams().bindStr("d").bindStr("dup"))
+    var err = ""
+    try {
+        database.execute("insert into t (a, u) values (?, ?)", DbParams().bindStr("d").bindStr("dup"))
+    } catch (String e) {
+        err = e
+    }
+    assert(Errors.hasCode(err, "CONFLICT"))
+    assert(Errors.parse(err).status() == 409)
+}
+
+test "concurrent transactions on separate connections" {
+    var database = freshDb("dbconcurrent")
+    var handles = listOf<Handle<Long>>()
+    var i = 0
+    while (i < 20) {
+        var n = i
+        handles.add(__kof_spawn_expr(database.txLong(() -> database.insertReturningId("insert into t (a, u) values (?, ?)", DbParams().bindStr("p").bindStr("par" + n)))))
+        i = i + 1
+    }
+    for (var h in handles) {
+        __kof_await(h)
+    }
+    assert(database.queryLong("select count(*) from t", DbParams()) == 20L)
+}
+
+test "failed statements release their connection" {
+    var database = Db.connect("jdbc:h2:mem:dbleak;MODE=MySQL;DB_CLOSE_DELAY=-1", "sa", "", 2, 1)
+    database.execute("create table t (id bigint primary key)", DbParams())
+    var i = 0
+    while (i < 8) {
+        try {
+            database.execute("insert into nope values (?)", DbParams().bindLong(1L))
+        } catch (String e) {
+            assert(e.startsWith("SQL_ERROR"))
+        }
+        i = i + 1
+    }
+    assert(database.queryLong("select count(*) from t", DbParams()) == 0L)
+}
