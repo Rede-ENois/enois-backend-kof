@@ -1,0 +1,183 @@
+package communityprojects
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.text.*
+import kernel.time.*
+import kernel.url.*
+
+// Community projects: own table, own lifecycle (submit -> review -> publish), own page. Port of
+// CommunityProjectService; every code and pt-BR message is the Java one.
+class CommunityProjectService {
+    Db database
+    CommunityProjectStore projects
+    CommunityProjectProfiles profiles
+    public constructor(database: Db, projects: CommunityProjectStore, profiles: CommunityProjectProfiles) {
+        this.database = database
+        this.projects = projects
+        this.profiles = profiles
+    }
+    CommunityProject submit(userId: String, slugBase: String?, title: String?, description: String?, shortDescription: String?, cover: String?, url: String?, repoUrl: String?, tags: String?, category: String?) {
+        var cleanTitle = CommunityProjectService.requireTitle(title)
+        var base = CommunityProjectService.slugFrom(cleanTitle)
+        var wanted = CommunityProjectRules.trimOrNull(slugBase)
+        if (wanted != null) {
+            base = CommunityProjectService.slugFrom(wanted)
+        }
+        var now = Time.nowIso()
+        var created = database.txStr(() -> {
+    var slug = this.uniqueSlug(userId, base)
+    var p = CommunityProject(Ids.prefixed("proj_"), userId, slug, cleanTitle, CommunityProjectRules.trimOrNull(description), CommunityProjectRules.trimOrNull(shortDescription), CommunityProjectRules.trimOrNull(cover), CommunityProjectService.safeUrl(url), CommunityProjectService.safeUrl(repoUrl), CommunityProjectRules.trimOrNull(tags), CommunityProjectRules.trimOrNull(category), CommunityProjectStatus.submitted(), null, null, now, null, null, null, now, now)
+    projects.insert(p)
+    return p.id()
+})
+        return this.project(created)
+    }
+    CommunityProject edit(projectId: String, userId: String, title: String?, description: String?, shortDescription: String?, cover: String?, url: String?, repoUrl: String?, tags: String?, category: String?, newSlug: String?) {
+        var current = this.owned(projectId, userId)
+        var cleanTitle = CommunityProjectService.requireTitle(title)
+        var slug = this.slugChange(current, userId, newSlug)
+        projects.update(projectId, cleanTitle, CommunityProjectRules.trimOrNull(description), CommunityProjectRules.trimOrNull(shortDescription), CommunityProjectRules.trimOrNull(cover), CommunityProjectService.safeUrl(url), CommunityProjectService.safeUrl(repoUrl), CommunityProjectRules.trimOrNull(tags), CommunityProjectRules.trimOrNull(category), slug, Time.nowIso())
+        return this.project(projectId)
+    }
+    // The new slug when the PATCH asks for a different one (validated), null to keep the current.
+    String? slugChange(current: CommunityProject, userId: String, newSlug: String?) {
+        var wanted = CommunityProjectRules.trimOrNull(newSlug)
+        if (wanted == null) {
+            return null
+        }
+        var candidate = CommunityProjectService.slugFrom(wanted)
+        if (candidate == current.slug()) {
+            return null
+        }
+        if (candidate.length() < 3) {
+            throw Errors.api(400, "INVALID_SLUG", "O endereço do projeto precisa de pelo menos 3 caracteres (letras, números ou hífen).")
+        }
+        if (projects.existsByUserAndSlug(userId, candidate)) {
+            throw Errors.api(409, "SLUG_IN_USE", "Você já tem um projeto nesse endereço. Escolha outro.")
+        }
+        return candidate
+    }
+    CommunityProject resubmit(projectId: String, userId: String) {
+        var current = this.owned(projectId, userId)
+        if (current.status() != CommunityProjectStatus.rejected()) {
+            throw Errors.api(409, "NOT_REJECTED", "Só projeto recusado pode ser reenviado.")
+        }
+        projects.resubmit(projectId, Time.nowIso())
+        return this.project(projectId)
+    }
+    remove(projectId: String, userId: String) {
+        this.owned(projectId, userId)
+        projects.delete(projectId)
+    }
+    CommunityProject approve(projectId: String, reviewerId: String, note: String?) {
+        var current = this.project(projectId)
+        if (current.status() != CommunityProjectStatus.submitted()) {
+            throw Errors.api(409, "NOT_SUBMITTED", "Este projeto não está na fila de revisão.")
+        }
+        projects.approve(projectId, reviewerId, CommunityProjectRules.trimOrNull(note), Time.nowIso())
+        return this.project(projectId)
+    }
+    CommunityProject reject(projectId: String, reviewerId: String, note: String?) {
+        var current = this.project(projectId)
+        if (current.status() != CommunityProjectStatus.submitted()) {
+            throw Errors.api(409, "NOT_SUBMITTED", "Este projeto não está na fila de revisão.")
+        }
+        var reason = CommunityProjectRules.trimOrNull(note)
+        if (reason == null) {
+            throw Errors.api(400, "REVIEW_NOTE_REQUIRED", "A recusa precisa de um motivo.")
+        }
+        projects.reject(projectId, reviewerId, reason, Time.nowIso())
+        return this.project(projectId)
+    }
+    CommunityProject suspend(projectId: String, reviewerId: String, note: String?) {
+        var current = this.project(projectId)
+        if (current.status() == CommunityProjectStatus.suspended()) {
+            throw Errors.api(409, "ALREADY_SUSPENDED", "Este projeto já está suspenso.")
+        }
+        projects.suspend(projectId, reviewerId, CommunityProjectRules.trimOrNull(note), Time.nowIso())
+        return this.project(projectId)
+    }
+    CommunityProject unsuspend(projectId: String, reviewerId: String) {
+        var current = this.project(projectId)
+        if (current.status() != CommunityProjectStatus.suspended()) {
+            throw Errors.api(409, "NOT_SUSPENDED", "Este projeto não está suspenso.")
+        }
+        projects.unsuspend(projectId, reviewerId, Time.nowIso())
+        return this.project(projectId)
+    }
+    // Public page of one project: only published ones, except to the owner.
+    CommunityProject byUserAndSlug(username: String, slug: String, viewerId: String?) {
+        var found = projects.findByUserAndSlug(this.userIdFromUsername(username), slug)
+        if (found == null) {
+            throw Errors.api(404, "PROJECT_NOT_FOUND", "Projeto não encontrado.")
+        }
+        var owner = false
+        if (viewerId != null) {
+            owner = found.userId() == viewerId
+        }
+        if (found.status() != CommunityProjectStatus.published() && !owner) {
+            throw Errors.api(404, "PROJECT_NOT_FOUND", "Projeto não encontrado.")
+        }
+        return found
+    }
+    List<CommunityProject> publishedByUser(username: String) = projects.findByUserAndStatus(this.userIdFromUsername(username), CommunityProjectStatus.published(), 100)
+    List<CommunityProject> ownedBy(userId: String) = projects.findByUser(userId)
+    List<CommunityProject> pending(limit: Int) = projects.findByStatus(CommunityProjectStatus.submitted(), CommunityProjectRules.clamp(limit, 1, 100))
+    CommunityProjectSearchPage search(query: String?, order: String?, limit: Int, offset: Int) = projects.search(query, order, CommunityProjectRules.clamp(limit, 1, 48), CommunityProjectRules.clamp(offset, 0, 2147483647))
+    String? usernameOf(userId: String) = profiles.usernameOf(userId)
+    Map<String,String> usernamesOf(userIds: List<String>) = profiles.usernamesOf(userIds)
+    String userIdFromUsername(username: String) {
+        var id = profiles.idOfUsername(username)
+        if (id == null) {
+            throw Errors.api(404, "PROJECT_NOT_FOUND", "Criador não encontrado.")
+        }
+        return id
+    }
+    CommunityProject project(id: String) {
+        var found = projects.findById(id)
+        if (found == null) {
+            throw Errors.api(404, "PROJECT_NOT_FOUND", "Projeto não encontrado.")
+        }
+        return found
+    }
+    CommunityProject owned(id: String, userId: String) {
+        var found = this.project(id)
+        if (found.userId() != userId) {
+            throw Errors.api(403, "NOT_AUTHORIZED", "Este projeto não é seu.")
+        }
+        return found
+    }
+    String uniqueSlug(userId: String, base: String) {
+        var slug = base
+        if (slug.length() == 0) {
+            slug = "projeto"
+        }
+        var candidate = slug
+        var n = 2
+        while (projects.existsByUserAndSlug(userId, candidate)) {
+            candidate = slug + "-" + n
+            n = n + 1
+        }
+        return candidate
+    }
+    static String requireTitle(title: String?) {
+        var clean = CommunityProjectRules.trimOrNull(title)
+        if (clean == null) {
+            throw Errors.api(400, "INVALID_TITLE", "Título do projeto precisa de pelo menos 3 caracteres.")
+        }
+        if (clean.length() < 3) {
+            throw Errors.api(400, "INVALID_TITLE", "Título do projeto precisa de pelo menos 3 caracteres.")
+        }
+        return clean
+    }
+    static String slugFrom(value: String) = Texts.stripAccents(value).toLowerCase().replaceAll("[^a-z0-9]+", "-").replaceAll("(^-|-$)", "")
+    // Project/repository link: public http(s) only, never javascript/data/file.
+    static String? safeUrl(value: String?) {
+        if (CommunityProjectRules.trimOrNull(value) == null) {
+            return null
+        }
+        return SafeUrl.requireHttpUrl(value, "link")
+    }
+}

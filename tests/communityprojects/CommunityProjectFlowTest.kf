@@ -1,0 +1,155 @@
+import communityprojects.*
+import java.util.HashMap
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of CommunityProjectFlowTests (submit -> review -> publish -> suspend) plus the guards around it.
+wireProjects(p: Platform) {
+    var shared = SharedServices.create(p)
+    var hooks = SecurityHooks.defaults(p.db)
+    Security.install(p, hooks)
+    CommunityProjectsModule.install(p, shared, hooks)
+}
+
+class ProjectsHolder {
+    static TestApp? cachedApp = null
+}
+
+TestApp projectsApp() {
+    var cur = ProjectsHolder.cachedApp
+    if (cur != null) {
+        return cur
+    }
+    SecurityClock.reset()
+    var created = TestApp.bootWith("cproj", mapOf("REDE_ORIGINS_ENFORCE", "false"), (p: Platform) -> wireProjects(p))
+    SecurityFixtures.login(created.db(), "projcreator", "tok-proj-creator-1234")
+    SecurityFixtures.login(created.db(), "projother", "tok-proj-other-12345")
+    SecurityFixtures.user(created.db(), "projadmin", true, true)
+    SecurityFixtures.session(created.db(), "projadmin", "tok-proj-admin-123456", 3600L)
+    ProjectsHolder.cachedApp = created
+    return created
+}
+
+List<String> asCreator() = listOf("X-Session-Token: tok-proj-creator-1234")
+
+List<String> asOther() = listOf("X-Session-Token: tok-proj-other-12345")
+
+List<String> asAdmin() = listOf("X-Session-Token: tok-proj-admin-123456")
+
+String submitBody(title: String) = "{\"title\":\"" + title + "\",\"description\":\"Um painel open source para auditar contraste e foco.\",\"shortDescription\":\"Auditoria de acessibilidade\",\"url\":\"https://exemplo.test/projeto\",\"repoUrl\":\"https://github.com/exemplo/projeto\",\"tags\":\"acessibilidade,react\",\"category\":\"WEB\"}"
+
+TestResponse send(method: String, path: String, headers: List<String>, body: String) = projectsApp().client.send(method, path, headers, "", body)
+
+// Submits as the creator and returns the new project id.
+String submitAs(headers: List<String>, title: String) {
+    var res = send("POST", "/community-projects", headers, submitBody(title))
+    Check.status(res, 200)
+    return res.json("id")
+}
+
+test "submit, review, publish and suspend a project" {
+    var app = projectsApp()
+    var created = send("POST", "/community-projects", asCreator(), submitBody("Painel de acessibilidade"))
+    Check.status(created, 200)
+    Check.jsonEq(created, "status", "SUBMITTED")
+    Check.jsonEq(created, "slug", "painel-de-acessibilidade")
+    Check.jsonEq(created, "username", "projcreator")
+    Check.jsonEq(created, "owned", "true")
+    var id = created.json("id")
+    // Not published: neither the catalogue nor the public page shows it.
+    var catalog = app.client.get("/community-projects?query=acessibilidade")
+    Check.status(catalog, 200)
+    Check.eqInt("catalogue size", 0, catalog.jsonSize("items"))
+    Check.apiError(app.client.get("/community-projects/projcreator/painel-de-acessibilidade"), 404, "PROJECT_NOT_FOUND")
+    // The moderation queue exists.
+    var queue = app.client.getWith("/moderation/community-projects", asAdmin())
+    Check.status(queue, 200)
+    Check.jsonEq(queue, "0.id", id)
+    var approved = send("POST", "/moderation/community-projects/" + id + "/approve", asAdmin(), "{\"note\":\"ok\"}")
+    Check.status(approved, 200)
+    Check.jsonEq(approved, "status", "PUBLISHED")
+    Check.jsonEq(approved, "id", id)
+    var published = app.client.get("/community-projects?query=acessibilidade")
+    Check.status(published, 200)
+    Check.jsonEq(published, "items.0.title", "Painel de acessibilidade")
+    var page = app.client.get("/community-projects/projcreator/painel-de-acessibilidade")
+    Check.status(page, 200)
+    Check.jsonEq(page, "repoUrl", "https://github.com/exemplo/projeto")
+    Check.jsonEq(page, "owned", "false")
+    var suspended = send("POST", "/admin/community-projects/" + id + "/suspend", asAdmin(), "{\"note\":\"revisar\"}")
+    Check.status(suspended, 200)
+    Check.jsonEq(suspended, "status", "SUSPENDED")
+    Check.apiError(app.client.get("/community-projects/projcreator/painel-de-acessibilidade"), 404, "PROJECT_NOT_FOUND")
+    // The owner still reads a project that is not public.
+    Check.status(app.client.getWith("/community-projects/projcreator/painel-de-acessibilidade", asCreator()), 200)
+    Check.apiError(send("POST", "/admin/community-projects/" + id + "/suspend", asAdmin(), "{}"), 409, "ALREADY_SUSPENDED")
+    var back = send("POST", "/admin/community-projects/" + id + "/unsuspend", asAdmin(), "")
+    Check.jsonEq(back, "status", "PUBLISHED")
+    Check.apiError(send("POST", "/admin/community-projects/" + id + "/unsuspend", asAdmin(), ""), 409, "NOT_SUSPENDED")
+}
+
+test "validation, ownership and the review rules" {
+    var app = projectsApp()
+    Check.apiError(send("POST", "/community-projects", asCreator(), "{\"title\":\"ab\"}"), 400, "INVALID_TITLE")
+    Check.apiError(send("POST", "/community-projects", asCreator(), "{\"title\":\"Projeto valido\",\"url\":\"javascript:alert(1)\"}"), 400, "INVALID_URL")
+    Check.apiError(send("POST", "/community-projects", asCreator(), "not json"), 400, "BAD_REQUEST")
+    Check.apiError(send("POST", "/community-projects", listOf<String>(), submitBody("Sem sessao")), 401, "UNAUTHENTICATED")
+    var first = submitAs(asCreator(), "Projeto repetido")
+    var second = submitAs(asCreator(), "Projeto repetido")
+    Check.jsonEq(app.client.getWith("/me/community-projects", asCreator()), "0.slug", "projeto-repetido-2")
+    // Edit: owner only, slug rules.
+    Check.apiError(send("PATCH", "/community-projects/" + first, asOther(), submitBody("Roubado")), 403, "NOT_AUTHORIZED")
+    Check.apiError(send("PATCH", "/community-projects/" + first, asCreator(), "{\"title\":\"Projeto repetido\",\"slug\":\"projeto-repetido-2\"}"), 409, "SLUG_IN_USE")
+    Check.apiError(send("PATCH", "/community-projects/" + first, asCreator(), "{\"title\":\"Projeto repetido\",\"slug\":\"a\"}"), 400, "INVALID_SLUG")
+    Check.apiError(send("PATCH", "/community-projects/nope", asCreator(), submitBody("Qualquer")), 404, "PROJECT_NOT_FOUND")
+    var edited = send("PATCH", "/community-projects/" + first, asCreator(), "{\"title\":\"Novo nome\",\"slug\":\"Novo Endereço\"}")
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "slug", "novo-endereco")
+    Check.jsonEq(edited, "title", "Novo nome")
+    // Review: reject needs a reason, only a submitted project is reviewed, only a rejected one is resubmitted.
+    Check.apiError(send("POST", "/moderation/community-projects/" + first + "/approve", asCreator(), "{}"), 403, "FORBIDDEN")
+    Check.jsonEq(send("POST", "/moderation/community-projects/" + first + "/approve", asCreator(), "{}"), "message", "Acesso restrito à moderação.")
+    Check.apiError(send("POST", "/moderation/community-projects/" + first + "/reject", asAdmin(), "{}"), 400, "REVIEW_NOTE_REQUIRED")
+    Check.apiError(send("POST", "/community-projects/" + first + "/resubmit", asCreator(), ""), 409, "NOT_REJECTED")
+    var rejected = send("POST", "/moderation/community-projects/" + first + "/reject", asAdmin(), "{\"note\":\"faltou descricao\"}")
+    Check.jsonEq(rejected, "status", "REJECTED")
+    Check.apiError(send("POST", "/moderation/community-projects/" + first + "/approve", asAdmin(), "{}"), 409, "NOT_SUBMITTED")
+    Check.jsonEq(app.client.getWith("/me/community-projects", asCreator()), "0.reviewNote", "faltou descricao")
+    Check.jsonEq(send("POST", "/community-projects/" + first + "/resubmit", asCreator(), ""), "status", "SUBMITTED")
+    // Remove: owner only.
+    Check.apiError(send("DELETE", "/community-projects/" + second, asOther(), ""), 403, "NOT_AUTHORIZED")
+    var gone = send("DELETE", "/community-projects/" + second, asCreator(), "")
+    Check.status(gone, 200)
+    Check.jsonEq(gone, "status", "DELETED")
+    Check.apiError(send("DELETE", "/community-projects/" + second, asCreator(), ""), 404, "PROJECT_NOT_FOUND")
+    // Admin routes are admin only; an approved moderator application opens the moderation queue.
+    Check.apiError(send("POST", "/admin/community-projects/" + first + "/suspend", asOther(), "{}"), 403, "FORBIDDEN")
+    Check.apiError(app.client.getWith("/moderation/community-projects", asOther()), 403, "FORBIDDEN")
+    app.db().execute("insert into moderator_applications (id, user_id, motivation, status, created_at) values (?, ?, ?, ?, ?)", DbParams().bindStr("modapp_projother").bindStr("projother").bindStr("quero ajudar").bindStr("APPROVED").bindInstant(Time.nowIso()))
+    Check.status(app.client.getWith("/moderation/community-projects", asOther()), 200)
+    Check.apiError(app.client.get("/community-projects/ghost-user"), 404, "PROJECT_NOT_FOUND")
+}
+
+test "the catalogue filters, orders and pages by offset cursor" {
+    var app = projectsApp()
+    var ids = listOf<String>()
+    for (var title in listOf("Catalogo zebra", "Catalogo alfa", "Catalogo meio")) {
+        var id = submitAs(asCreator(), title)
+        Check.status(send("POST", "/moderation/community-projects/" + id + "/approve", asAdmin(), ""), 200)
+    }
+    var byTitle = app.client.get("/community-projects?query=catalogo&order=title&limit=2")
+    Check.jsonEq(byTitle, "items.0.title", "Catalogo alfa")
+    Check.jsonEq(byTitle, "items.1.title", "Catalogo meio")
+    Check.eqInt("page size", 2, byTitle.jsonSize("items"))
+    Check.jsonEq(byTitle, "nextCursor", "2")
+    var rest = app.client.get("/community-projects?query=catalogo&order=title&limit=2&cursor=2")
+    Check.eqInt("rest size", 1, rest.jsonSize("items"))
+    Check.jsonEq(rest, "items.0.title", "Catalogo zebra")
+    assert(rest.jsonIsNull("nextCursor"))
+    // A wildcard is literal text, not a filter that matches everything.
+    Check.eqInt("percent", 0, app.client.get("/community-projects?query=%25").jsonSize("items"))
+    assert(app.client.get("/community-projects/projcreator").jsonSize("") >= 3)
+}
