@@ -1,0 +1,219 @@
+import java.util.Base64
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import notifications.*
+
+class RecordingMailer extends DigestMailer {
+    List<String> recipients = listOf<String>()
+    List<String> subjects = listOf<String>()
+    List<String> bodies = listOf<String>()
+    List<String> links = listOf<String>()
+    List<String> kinds = listOf<String>()
+    public constructor() {
+        super()
+    }
+    Bool sendHtml(toEmail: String, subject: String, htmlBody: String, fromName: String, listUnsubscribeUrl: String, kind: String) {
+        recipients.add(toEmail)
+        subjects.add(subject)
+        bodies.add(htmlBody)
+        links.add(listUnsubscribeUrl)
+        kinds.add(kind)
+        return true
+    }
+    Int countTo(email: String) {
+        var n = 0
+        for (var r in recipients) {
+            if (r == email) {
+                n = n + 1
+            }
+        }
+        return n
+    }
+}
+
+class DigestHolder {
+    static TestApp? cached = null
+    static NotificationsModule? module = null
+    static SharedServices? shared = null
+    static RecordingMailer mailer = RecordingMailer()
+}
+
+TestApp digestApp() {
+    var cur = DigestHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = DomainTestKit.boot("notifdigest", mapOf("REDE_SECURITY_ENCRYPTION_KEY", SecretCipher.generateKeyBase64()), (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+        var seams = NotificationsSeams(p)
+        seams.digestMailer = DigestHolder.mailer
+        DigestHolder.shared = s
+        DigestHolder.module = NotificationsModule.installWith(p, s, seams)
+    })
+    DigestHolder.cached = created
+    return created
+}
+
+WeeklyDigest digestOf() {
+    var m = DigestHolder.module
+    if (m == null) {
+        throw "module"
+    }
+    return m.digest
+}
+
+community(app: TestApp, prefix: String, memberId: String) {
+    var now = Time.nowIso()
+    var db = app.db()
+    db.execute("insert into communities (id, name, description, topic, created_by, created_at, updated_at) values (?, ?, 'desc', 'TECNOLOGIA', ?, ?, ?)", DbParams().bindStr(prefix).bindStr("Comunidade " + prefix).bindStr(memberId).bindInstant(now).bindInstant(now))
+    db.execute("insert into community_members (community_id, user_id, role, joined_at) values (?, ?, 'MEMBER', ?)", DbParams().bindStr(prefix).bindStr(memberId).bindInstant(now))
+}
+
+communityPost(app: TestApp, communityId: String, authorId: String, content: String, reactions: Int, n: String) {
+    app.db().execute("insert into posts (id, author_id, type, content, created_at, visibility, reactions, comments, saves, shares, status, community_id) values (?, ?, 'INSIGHT', ?, ?, 'PUBLIC', ?, 0, 0, 0, 'ACTIVE', ?)", DbParams().bindStr("digest-post-" + communityId + n).bindStr(authorId).bindStr(content).bindInstant(Time.nowIso()).bindInt(reactions).bindStr(communityId))
+}
+
+userEmail(app: TestApp, id: String) {
+    DomainTestKit.login(app, id)
+    app.db().execute("update users set email = ? where id = ?", DbParams().bindStr(id + "@test.com").bindStr(id))
+}
+
+test "sends once per week with real content" {
+    var app = digestApp()
+    userEmail(app, "digest_send_reader")
+    userEmail(app, "digest_send_author")
+    var db = app.db()
+    var now = Time.nowIso()
+    community(app, "digest-send", "digest_send_reader")
+    communityPost(app, "digest-send", "digest_send_author", "Como vocês organizam o estudo de algoritmos?", 4, "1")
+    communityPost(app, "digest-send", "digest_send_author", "Compartilhando um guia de testes de contrato", 1, "2")
+    db.execute("insert into jobs (id, title, company, type, level, posted_by, posted_at, updated_at, status) values ('digest-job-1', 'Pessoa engenheira Kotlin digest', 'Acme', 'CLT', 'PLENO', 'digest_send_author', ?, ?, 'OPEN')", DbParams().bindInstant(now).bindInstant(now))
+    db.execute("insert into job_skills (job_id, skill) values ('digest-job-1', 'Kotlin')", DbParams())
+    db.execute("insert into user_skills (user_id, skill) values ('digest_send_reader', 'kotlin')", DbParams())
+    var eventDay = Time.plusSeconds(now, 172800L).substring(0, 10)
+    db.execute("insert into events (id, title, date, time, format, host, created_by, created_at, updated_at) values ('digest-event-1', 'Encontro de Kotlin digest', ?, '19:00', 'ONLINE', 'Casa', 'digest_send_reader', ?, ?)", DbParams().bindStr(eventDay).bindInstant(now).bindInstant(now))
+    db.execute("insert into event_attendees (event_id, user_id, responded_at) values ('digest-event-1', 'digest_send_reader', ?)", DbParams().bindInstant(now))
+    db.execute("insert into groups (id, slug, name, owner_id, created_at, updated_at) values ('digest-group-1', 'digest-send-grp', 'Grupo digest-send', 'digest_send_author', ?, ?)", DbParams().bindInstant(now).bindInstant(now))
+    db.execute("insert into group_members (id, group_id, user_id, joined_at) values ('dgm-1', 'digest-group-1', 'digest_send_reader', ?)", DbParams().bindInstant(now))
+    db.execute("insert into group_posts (id, group_id, topic_id, author_id, content, created_at, updated_at) values ('dgp-1', 'digest-group-1', 'topic', 'digest_send_author', 'Conteudo do grupo', ?, ?)", DbParams().bindInstant(now).bindInstant(now))
+    Check.eqStr("first", "SENT", digestOf().sendTo("digest_send_reader"))
+    Check.eqStr("second", "ALREADY_SENT", digestOf().sendTo("digest_send_reader"))
+    var mailer = DigestHolder.mailer
+    Check.eqInt("exactly one e-mail", 1, mailer.countTo("digest_send_reader@test.com"))
+    var i = mailer.recipients.indexOf("digest_send_reader@test.com")
+    Check.eqStr("subject", "Sua semana no Énóis", mailer.subjects.get(i))
+    Check.eqStr("kind", "WEEKLY_DIGEST", mailer.kinds.get(i))
+    var body = mailer.bodies.get(i)
+    assert(body.contains("Como vocês organizam o estudo de algoritmos?"))
+    assert(body.contains("Pessoa engenheira Kotlin digest"))
+    assert(body.contains("Encontro de Kotlin digest"))
+    assert(body.contains("Conversas novas em Grupo digest-send"))
+    assert(body.contains("Não quero mais receber"))
+    assert(body.contains(mailer.links.get(i).replace("&", "&amp;")))
+    assert(mailer.links.get(i).contains("/api/notifications/digest/unsubscribe?token="))
+    var store = WeeklyDigestStore(db)
+    assert(!store.eligibleUserIds(digestOf().weekKey(), "", 1000000).contains("digest_send_reader"))
+}
+
+test "skips silently when there is not enough content" {
+    var app = digestApp()
+    userEmail(app, "digest_empty_reader")
+    userEmail(app, "digest_empty_author")
+    community(app, "digest-empty", "digest_empty_reader")
+    communityPost(app, "digest-empty", "digest_empty_reader", "Meu proprio post", 9, "1")
+    communityPost(app, "digest-empty", "digest_empty_reader", "Outro post meu", 9, "2")
+    communityPost(app, "digest-empty", "digest_empty_author", "Unico post de outra pessoa", 1, "3")
+    Check.eqStr("empty", "EMPTY", digestOf().sendTo("digest_empty_reader"))
+    Check.eqInt("no mail", 0, DigestHolder.mailer.countTo("digest_empty_reader@test.com"))
+    Check.eqInt("no delivery row", 0, app.db().queryList("select user_id from digest_deliveries where user_id = ?", DbParams().bindStr("digest_empty_reader")).size())
+    assert(WeeklyDigestStore(app.db()).eligibleUserIds(digestOf().weekKey(), "", 1000000).contains("digest_empty_reader"))
+}
+
+test "muted and blocked people stay out of the digest" {
+    var app = digestApp()
+    userEmail(app, "digest_hidden_reader")
+    userEmail(app, "digest_hidden_muted")
+    userEmail(app, "digest_hidden_blocker")
+    community(app, "digest-hidden", "digest_hidden_reader")
+    communityPost(app, "digest-hidden", "digest_hidden_muted", "Post de quem foi silenciado", 5, "1")
+    communityPost(app, "digest-hidden", "digest_hidden_muted", "Outro post silenciado", 5, "2")
+    communityPost(app, "digest-hidden", "digest_hidden_blocker", "Post de quem bloqueou", 5, "3")
+    var now = Time.nowIso()
+    app.db().execute("insert into user_mutes (muter_id, muted_id, created_at) values (?, ?, ?)", DbParams().bindStr("digest_hidden_reader").bindStr("digest_hidden_muted").bindInstant(now))
+    app.db().execute("insert into user_blocks (blocker_id, blocked_id, created_at) values (?, ?, ?)", DbParams().bindStr("digest_hidden_blocker").bindStr("digest_hidden_reader").bindInstant(now))
+    Check.eqStr("empty", "EMPTY", digestOf().sendTo("digest_hidden_reader"))
+    Check.eqInt("no mail", 0, DigestHolder.mailer.countTo("digest_hidden_reader@test.com"))
+}
+
+test "never sends to who opted out" {
+    var app = digestApp()
+    userEmail(app, "digest_optout_reader")
+    userEmail(app, "digest_optout_author")
+    community(app, "digest-optout", "digest_optout_reader")
+    communityPost(app, "digest-optout", "digest_optout_author", "Post um", 1, "1")
+    communityPost(app, "digest-optout", "digest_optout_author", "Post dois", 1, "2")
+    var module = DigestHolder.module
+    assert(module != null)
+    if (module != null) {
+        module.preferences.update("digest_optout_reader", NotificationPrefsPatch(0, -1, -1, -1, -1, -1))
+    }
+    Check.eqStr("not eligible", "NOT_ELIGIBLE", digestOf().sendTo("digest_optout_reader"))
+    assert(!WeeklyDigestStore(app.db()).eligibleUserIds(digestOf().weekKey(), "", 1000000).contains("digest_optout_reader"))
+    Check.eqInt("no mail", 0, DigestHolder.mailer.countTo("digest_optout_reader@test.com"))
+}
+
+String flipLast(token: String) {
+    var last = token.substring(token.length() - 1)
+    var swap = "A"
+    if (last == "A") {
+        swap = "B"
+    }
+    return token.substring(0, token.length() - 1) + swap
+}
+
+test "the unsubscribe link turns the digest off and rejects forged tokens" {
+    var app = digestApp()
+    userEmail(app, "digest_unsub_reader")
+    var digest = digestOf()
+    var token = digest.unsubscribeToken("digest_unsub_reader")
+    Check.status(app.client.get("/notifications/digest/unsubscribe?token=" + flipLast(token)), 400)
+    // a token of the blog newsletter ("blog:user") is not a digest token
+    var shared = DigestHolder.shared
+    assert(shared != null)
+    if (shared != null) {
+        var blog = Base64.getUrlEncoder().withoutPadding().encodeToString(Base64.getDecoder().decode(shared.cipher.encrypt("blog_x:digest_unsub_reader")))
+        Check.status(app.client.get("/notifications/digest/unsubscribe?token=" + blog), 400)
+    }
+    Check.status(app.client.get("/notifications/digest/unsubscribe"), 400)
+    var module = DigestHolder.module
+    assert(module != null)
+    if (module != null) {
+        assert(module.preferences.of("digest_unsub_reader").weeklyDigest())
+    }
+    var ok = app.client.get("/notifications/digest/unsubscribe?token=" + token)
+    Check.status(ok, 200)
+    assert(ok.body.contains("Resumo semanal desligado"))
+    if (module != null) {
+        assert(!module.preferences.of("digest_unsub_reader").weeklyDigest())
+    }
+    Check.status(app.client.get("/notifications/digest/unsubscribe?token=" + token), 200)
+}
+
+test "the one click post from the mail client turns the digest off" {
+    var app = digestApp()
+    userEmail(app, "digest_oneclick_reader")
+    var token = digestOf().unsubscribeToken("digest_oneclick_reader")
+    var post = listOf<String>("Content-Type: application/x-www-form-urlencoded")
+    Check.status(app.client.send("POST", "/notifications/digest/unsubscribe?token=" + flipLast(token), post, "", "List-Unsubscribe=One-Click"), 400)
+    var module = DigestHolder.module
+    assert(module != null)
+    if (module != null) {
+        assert(module.preferences.of("digest_oneclick_reader").weeklyDigest())
+    }
+    Check.status(app.client.send("POST", "/notifications/digest/unsubscribe?token=" + token, post, "", "List-Unsubscribe=One-Click"), 200)
+    if (module != null) {
+        assert(!module.preferences.of("digest_oneclick_reader").weeklyDigest())
+    }
+}

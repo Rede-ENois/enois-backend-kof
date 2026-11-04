@@ -1,6 +1,7 @@
 package notifications
 
 import kernel.*
+import kernel.http.*
 import kernel.security.*
 
 // Composition of the notifications domain. The module object is what the other domains receive:
@@ -16,12 +17,18 @@ class NotificationsSeams {
     NotificationCoins coins
     NotificationAccounts accounts
     NotificationPlaceReader placeReader
+    DigestMailer digestMailer
+    DigestAccounts digestAccounts
+    DigestPersonalization digestPersonalization
     public constructor(platform: Platform) {
         this.actors = NotificationActors(platform.db)
         this.sources = NotificationSources(platform.db)
         this.coins = NotificationCoins()
         this.accounts = NotificationAccounts(platform.db)
         this.placeReader = NotificationPlaceReader(platform.db)
+        this.digestMailer = DigestMailer()
+        this.digestAccounts = DigestAccounts(platform.db)
+        this.digestPersonalization = DigestPersonalization(platform.db)
     }
 }
 
@@ -33,7 +40,8 @@ class NotificationsModule {
     NotificationSources sources
     NotificationOutboxEventHandler outboxHandler
     CommunityApologyWorker apology
-    public constructor(store: NotificationsStore, notifications: Notifications, preferences: NotificationPreferenceService, actors: NotificationActors, sources: NotificationSources, outboxHandler: NotificationOutboxEventHandler, apology: CommunityApologyWorker) {
+    WeeklyDigest digest
+    public constructor(store: NotificationsStore, notifications: Notifications, preferences: NotificationPreferenceService, actors: NotificationActors, sources: NotificationSources, outboxHandler: NotificationOutboxEventHandler, apology: CommunityApologyWorker, digest: WeeklyDigest) {
         this.store = store
         this.notifications = notifications
         this.preferences = preferences
@@ -41,6 +49,7 @@ class NotificationsModule {
         this.sources = sources
         this.outboxHandler = outboxHandler
         this.apology = apology
+        this.digest = digest
     }
     static NotificationsModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks, parts: SecurityParts) = NotificationsModule.installWith(platform, shared, NotificationsSeams(platform))
     static NotificationsModule installWith(platform: Platform, shared: SharedServices, seams: NotificationsSeams) {
@@ -51,7 +60,10 @@ class NotificationsModule {
         var handler = NotificationOutboxEventHandler.forTypes(shared.outbox, notifications, seams.sources, seams.actors)
         var apology = CommunityApologyWorker(notifications, store, seams.coins, seams.accounts)
         apology.schedule(shared.jobs, platform.cfg)
+        var digest = WeeklyDigest(WeeklyDigestStore(platform.db), preferences, seams.placeReader, seams.digestPersonalization, seams.digestAccounts, seams.digestMailer, shared.cipher, platform.cfg)
+        digest.schedule(shared.jobs, platform.cfg)
+        WeeklyDigestRoutes.register(platform.server, digest)
         NotificationsRoutes.register(platform.server, notifications, preferences, seams.actors, shared.blockedUsers, shared.idempotency)
-        return NotificationsModule(store, notifications, preferences, seams.actors, seams.sources, handler, apology)
+        return NotificationsModule(store, notifications, preferences, seams.actors, seams.sources, handler, apology, digest)
     }
 }

@@ -1,0 +1,59 @@
+package notifications
+
+import kernel.db.*
+import kernel.log.*
+
+// A person as the digest needs them: verified e-mail and first name.
+record DigestRecipient(String id, String name, String email, Bool emailVerified)
+
+// pending-port: identity (EmailService). Sends an HTML e-mail with a named sender and List-Unsubscribe
+// (sendHtml of the Java EmailService). The default sends nothing and answers false, so a digest run
+// without the identity port reports FAILED instead of pretending to deliver.
+class DigestMailer {
+    Log log = Log("notifications.digest.mail")
+    Bool sendHtml(toEmail: String, subject: String, htmlBody: String, fromName: String, listUnsubscribeUrl: String, kind: String) {
+        log.warn("digest_mail_pending kind=" + kind)
+        return false
+    }
+}
+
+// pending-port: profile. Reads one account. The default reads `users` read-only.
+class DigestAccounts {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    DigestRecipient? find(userId: String) {
+        var r = database.queryOptional("select id, name, email, email_verified_at from users where id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        return DigestRecipient(r.getStr("id"), r.getStr("name"), r.getStr("email"), !r.isNull("email_verified_at"))
+    }
+}
+
+// pending-port: preferences (PersonalizationService.disabledModules). The default reads
+// `user_preferences.disabled_modules` (comma separated), like the Java adapter.
+class DigestPersonalization {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    List<String> disabledModules(userId: String) {
+        var out = listOf<String>()
+        var r = database.queryOptional("select disabled_modules from user_preferences where user_id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return out
+        }
+        var csv = r.getStrOrNull("disabled_modules")
+        if (csv == null) {
+            return out
+        }
+        for (var item in csv.split(",")) {
+            if (item.trim().length() > 0) {
+                out.add(item.trim())
+            }
+        }
+        return out
+    }
+}

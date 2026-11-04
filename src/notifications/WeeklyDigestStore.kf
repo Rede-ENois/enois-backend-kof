@@ -1,0 +1,59 @@
+package notifications
+
+import kernel.db.*
+import kernel.time.*
+
+// One line of the digest (DigestItem): `score` only orders the posts, it is never shown.
+record DigestItem(String title, String? context, String path, Int score)
+
+// Plain SQL over the tables of other modules (the digest only reads them): one query per section.
+// Neither side of a block shows up in the other's digest, and someone the reader muted stays out of it
+// (a mute with a deadline stops hiding as soon as it passes).
+class WeeklyDigestStore {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    static String notHidden(authorColumn: String) = "not exists (select 1 from user_blocks b where (b.blocker_id = ? and b.blocked_id = " + authorColumn + ") or (b.blocker_id = " + authorColumn + " and b.blocked_id = ?)) and not exists (select 1 from user_mutes mu where mu.muter_id = ? and mu.muted_id = " + authorColumn + " and (mu.expires_at is null or mu.expires_at > ?))"
+    List<String> eligibleUserIds(weekKey: String, afterUserId: String, limit: Int) {
+        var out = listOf<String>()
+        for (var r in database.queryList("select u.id from users u where u.email_verified_at is not null and u.id > ? and not exists (select 1 from notification_preferences p where p.user_id = u.id and p.weekly_digest = false) and not exists (select 1 from digest_deliveries d where d.user_id = u.id and d.week_key = ?) and not exists (select 1 from user_sanctions s where s.user_id = u.id and s.status = \'ACTIVE\' and s.type in (\'SUSPENDED\', \'BAN\', \'PERMABAN\')) order by u.id limit " + limit, DbParams().bindStr(afterUserId).bindStr(weekKey))) {
+            out.add(r.getStr("id"))
+        }
+        return out
+    }
+    // The primary key is the idempotency rule: claimed before the e-mail goes out.
+    Bool claim(userId: String, weekKey: String, now: String) {
+        try {
+            database.execute("insert into digest_deliveries (user_id, week_key, sent_at) values (?, ?, ?)", DbParams().bindStr(userId).bindStr(weekKey).bindInstant(now))
+            return true
+        } catch (String alreadyClaimed) {
+            return false
+        }
+    }
+    Int unreadNotifications(userId: String, since: String) = database.queryLong("select count(*) from notifications where user_id = ? and is_read = false and created_at >= ?", DbParams().bindStr(userId).bindInstant(since)) as Int
+    List<DigestItem> communityPosts(userId: String, since: String, limit: Int) {
+        var out = listOf<DigestItem>()
+        var sql = "select p.id, p.content, c.name, p.reactions + p.comments as score from posts p join community_members m on m.community_id = p.community_id and m.user_id = ? join communities c on c.id = p.community_id where p.author_id <> ? and p.status = \'ACTIVE\' and p.deleted_at is null and p.visibility = \'PUBLIC\' and p.channel_id is null and p.expires_at is null and p.repost_of is null and p.created_at >= ? and " + WeeklyDigestStore.notHidden("p.author_id") + " order by score desc, p.created_at desc limit " + limit
+        for (var r in database.queryList(sql, DbParams().bindStr(userId).bindStr(userId).bindInstant(since).bindStr(userId).bindStr(userId).bindStr(userId).bindInstant(Time.nowIso()))) {
+            out.add(DigestItem(r.getStr("content"), r.getStr("name"), "/post/" + r.getStr("id"), r.getInt("score")))
+        }
+        return out
+    }
+    List<DigestItem> activeGroups(userId: String, since: String, limit: Int) {
+        var out = listOf<DigestItem>()
+        var sql = "select g.name, g.slug, sum(gp.reactions + gp.comments + 1) as score from group_posts gp join group_members gm on gm.group_id = gp.group_id and gm.user_id = ? join groups g on g.id = gp.group_id where gp.author_id <> ? and gp.status = \'PUBLISHED\' and g.status = \'ACTIVE\' and gp.created_at >= ? and " + WeeklyDigestStore.notHidden("gp.author_id") + " group by g.name, g.slug order by score desc limit " + limit
+        for (var r in database.queryList(sql, DbParams().bindStr(userId).bindStr(userId).bindInstant(since).bindStr(userId).bindStr(userId).bindStr(userId).bindInstant(Time.nowIso()))) {
+            out.add(DigestItem("Conversas novas em " + r.getStr("name"), null, "/grupos/" + r.getStr("slug"), r.getInt("score")))
+        }
+        return out
+    }
+    List<DigestItem> matchingJobs(userId: String, since: String, limit: Int) {
+        var out = listOf<DigestItem>()
+        var sql = "select j.id, j.title, j.company from jobs j where j.status = \'OPEN\' and j.posted_at >= ? and j.posted_by <> ? and exists (select 1 from job_skills js join user_skills us on lower(js.skill) = lower(us.skill) where js.job_id = j.id and us.user_id = ?) and not exists (select 1 from job_applications a where a.job_id = j.id and a.user_id = ?) order by j.posted_at desc limit " + limit
+        for (var r in database.queryList(sql, DbParams().bindInstant(since).bindStr(userId).bindStr(userId).bindStr(userId))) {
+            out.add(DigestItem(r.getStr("title"), r.getStrOrNull("company"), "/vagas/" + r.getStr("id"), 0))
+        }
+        return out
+    }
+}
