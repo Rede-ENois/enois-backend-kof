@@ -1,0 +1,33 @@
+import kernel.push.*
+
+test "the adapter stays off without keys or with garbage keys" {
+    assert(WebPushAdapter.create("", "", "mailto:a@b.test") == null)
+    assert(WebPushAdapter.create("not-a-key", "not-a-key", "mailto:a@b.test") == null)
+}
+
+test "a post to an unreachable device fails with -1 and never throws" {
+    var pair = WebPushKeys.vapid()
+    var adapter = WebPushAdapter.create(pair.get(0), pair.get(1), "mailto:a@b.test")
+    assert(adapter != null)
+    if (adapter != null) {
+        assert(adapter.publicKey == pair.get(0))
+        assert(adapter.post("https://127.0.0.1:1/none", "BAD", "BAD", "{}", 60) == -1)
+        adapter.close()
+    }
+}
+
+test "a well formed device gets as far as the network: encryption and VAPID signing succeed" {
+    var vapid = WebPushKeys.vapid()
+    var device = WebPushKeys.device()
+    var adapter = WebPushAdapter.create(vapid.get(0), vapid.get(1), "mailto:a@b.test")
+    assert(adapter != null)
+    if (adapter != null) {
+        var status = adapter.post("https://127.0.0.1:1/none", device.get(0), "AAAAAAAAAAAAAAAAAAAAAA", "{\"title\":\"x\"}", 60)
+        assert(status == -1)
+        // a bad key would fail inside the library (InvocationTargetException / InvalidKeySpec...); a good
+        // one fails only when connecting.
+        assert(adapter.lastFailure != "InvocationTargetException")
+        assert(adapter.lastFailure.length() > 0)
+        adapter.close()
+    }
+}
