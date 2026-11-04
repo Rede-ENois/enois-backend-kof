@@ -1,0 +1,48 @@
+package ops
+
+import kernel.http.*
+import kernel.log.*
+import kernel.security.*
+
+// The monitoring panel (moderators and admins: the origin gate also restricts /admin/** to the front end's trusted
+// origin) and the e-mail delivery log.
+class OpsRoutes {
+    static register(server: HttpServer, monitoring: MonitoringService, userMetrics: UserMetricsService, emails: EmailLogStore) {
+        server.get("/admin/monitoring/overview", () -> OpsRoutes.overview(monitoring))
+        server.get("/admin/monitoring/users", () -> OpsRoutes.users(userMetrics))
+        server.get("/admin/monitoring/events", () -> OpsRoutes.events(monitoring))
+        server.get("/admin/emails", () -> OpsRoutes.recentEmails(emails))
+    }
+    static String overview(monitoring: MonitoringService) {
+        Auth.requireModerator()
+        return json.encode(monitoring.overview())
+    }
+    // Community accounts: total, joins per day, growth and projection.
+    static String users(userMetrics: UserMetricsService) {
+        Auth.requireModerator()
+        return json.encode(userMetrics.users())
+    }
+    static String events(monitoring: MonitoringService) {
+        Auth.requireModerator()
+        return json.encode(monitoring.events(Req.queryParam("level"), Req.queryParam("type"), Req.queryParam("q"), Req.queryParam("from"), Req.queryParam("to"), Req.queryParam("before"), Req.queryInt("limit", 100)))
+    }
+    // 2FA stays out of the panel: neither recipient nor subject nor the existence of the send. The log exists to follow
+    // the delivery of notices; a second-factor code is not operations metadata.
+    static String recentEmails(emails: EmailLogStore) {
+        Auth.requireModerator()
+        var views = listOf<EmailLogView>()
+        for (var log in emails.findRecent(Req.queryInt("limit", 50))) {
+            if (log.kind() != "TWO_FACTOR") {
+                views.add(OpsRoutes.view(log))
+            }
+        }
+        return json.encode(views)
+    }
+    static EmailLogView view(log: EmailLogRecord) = EmailLogView(log.id(), PiiMask.email(log.toEmail()), PiiMask.text(log.subject()), log.kind(), log.status(), OpsRoutes.maskedOrNull(log.error()), log.createdAt())
+    static String? maskedOrNull(error: String?) {
+        if (error == null) {
+            return null
+        }
+        return PiiMask.text(error)
+    }
+}

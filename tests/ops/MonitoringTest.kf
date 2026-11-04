@@ -1,0 +1,183 @@
+import kernel.*
+import kernel.db.*
+import kernel.log.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import leaves.*
+import ops.*
+
+// Port of MonitoringTests (the admin panel over HTTP), minus the recordRequest/Exception unit-style tests that
+// call the service directly (they keep the assertions through the same public service API).
+class MonitoringHolder {
+    static TestApp? app = null
+    static String dir = ""
+}
+
+TestApp monitoringApp() {
+    var cur = MonitoringHolder.app
+    if (cur != null) {
+        return cur
+    }
+    MonitoringHolder.dir = "/tmp/kof-monitoring-test-" + uuid.v4()
+    var created = LeavesApp.boot("monitoring", mapOf("REDE_MONITORING_FILE_DIR", MonitoringHolder.dir))
+    MonitoringHolder.app = created
+    return created
+}
+
+MonitoringService service() = LeavesApp.ops().monitoring
+
+List<String> asToken(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+
+String panelUser(app: TestApp, id: String, admin: Bool) {
+    var token = "tok-" + id + "-1234567890"
+    if (app.db().queryLong("select count(*) from users where id = ?", DbParams().bindStr(id)) == 0L) {
+        SecurityFixtures.login(app.db(), id, token)
+        if (admin) {
+            app.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr(id))
+        }
+    }
+    return token
+}
+
+// The flush job is not running in tests: drain by hand until the marker is on disk.
+flushAll() {
+    var i = 0
+    while (i < 10) {
+        service().flush()
+        i = i + 1
+    }
+}
+
+test "admin sees overview and events while a regular user is forbidden" {
+    var app = monitoringApp()
+    var admin = panelUser(app, "group-admin", true)
+    var regular = panelUser(app, "mon_regular", false)
+    var marker = "monitor-test-" + uuid.v4()
+    service().recordEvent("ERROR", "TEST", marker, mapOf("origem", "teste"))
+    flushAll()
+
+    var overview = app.client.getWith("/admin/monitoring/overview", asToken(admin))
+    Check.status(overview, 200)
+    Check.isTrue("series is an array", overview.jsonSize("series") == 60)
+    Check.isTrue("recent is an array", overview.jsonHas("recent"))
+    Check.isTrue("jvm heap max", overview.jsonStr("jvm.heapMaxBytes") != null)
+    Check.isTrue("db pool max", overview.jsonStr("resources.dbPool.max") != null)
+    Check.isTrue("db pool active", overview.jsonStr("resources.dbPool.active") != null)
+    Check.isTrue("db pool waiting", overview.jsonStr("resources.dbPool.waiting") != null)
+    Check.isTrue("status counts", overview.jsonSize("statusCounts") == 4)
+
+    var events = app.client.getWith("/admin/monitoring/events?q=" + marker + "&level=ERROR", asToken(admin))
+    Check.status(events, 200)
+    Check.jsonEq(events, "0.message", marker)
+    Check.jsonEq(events, "0.type", "TEST")
+    Check.jsonEq(events, "0.metadata", "{origem=teste}")
+
+    Check.apiError(app.client.getWith("/admin/monitoring/overview", asToken(regular)), 403, "FORBIDDEN")
+    Check.apiError(app.client.get("/admin/monitoring/overview"), 401, "UNAUTHENTICATED")
+}
+
+test "events accept a date time range" {
+    var app = monitoringApp()
+    var admin = panelUser(app, "group-admin", true)
+    var marker = "monitor-range-" + uuid.v4()
+    service().recordEvent("WARN", "TEST", marker, mapOf("origem", "teste"))
+    flushAll()
+    var now = Time.nowMillis()
+    var from = encoding.urlEncode(Time.fromMillis(now - 3600000L))
+    var to = encoding.urlEncode(Time.fromMillis(now + 3600000L))
+    var inside = app.client.getWith("/admin/monitoring/events?q=" + marker + "&from=" + from + "&to=" + to, asToken(admin))
+    Check.status(inside, 200)
+    Check.jsonEq(inside, "0.message", marker)
+    var future = encoding.urlEncode(Time.fromMillis(now + 7200000L))
+    var outside = app.client.getWith("/admin/monitoring/events?q=" + marker + "&from=" + future, asToken(admin))
+    Check.status(outside, 200)
+    Check.eqInt("nothing in the future", 0, outside.jsonSize(""))
+}
+
+test "request metrics and exceptions feed the overview" {
+    monitoringApp()
+    var before = service().overview().errors5xxLastMinute()
+    var i = 0
+    while (i < 12) {
+        service().recordRequest("GET", "/monitor-probe", "/monitor-probe", 500, 42L, "req-monitor-" + i, null, "127.0.0.1", null)
+        i = i + 1
+    }
+    var after = service().overview()
+    Check.isTrue("5xx counted", after.errors5xxLastMinute() >= before + 1L)
+    Check.isTrue("series", after.series().size() > 0)
+    var seen = false
+    for (var route in after.topRoutes()) {
+        if (route.label() == "/monitor-probe") {
+            seen = true
+        }
+    }
+    Check.isTrue("the probe is among the top routes", seen)
+}
+
+test "an exception carries a sanitized failure text to the panel" {
+    var app = monitoringApp()
+    var admin = panelUser(app, "group-admin", true)
+    var marker = "monitor-stack-" + uuid.v4()
+    service().recordException(500, "INTERNAL_ERROR", marker, "GET", "/painel-prova", "req-stack-" + uuid.v4(), null, "IllegalStateException: " + marker + " para contato@exemplo.com com token abc123")
+    flushAll()
+    var res = app.client.getWith("/admin/monitoring/events?q=" + marker, asToken(admin))
+    Check.status(res, 200)
+    var metadata = res.jsonStr("0.metadata")
+    if (metadata == null) {
+        throw "FAIL no metadata"
+    }
+    Check.isTrue("names the failure", metadata.contains("IllegalStateException"))
+    Check.isTrue("no e-mail", !metadata.contains("contato@exemplo.com"))
+    Check.isTrue("no token", !metadata.contains("abc123"))
+}
+
+test "every request becomes an event with the level by status" {
+    var app = monitoringApp()
+    var admin = panelUser(app, "group-admin", true)
+    var okPath = "/prova-2xx-" + uuid.v4()
+    var errorPath = "/prova-4xx-" + uuid.v4()
+    service().recordRequest("GET", okPath, okPath, 200, 8L, "req-" + uuid.v4(), null, "127.0.0.1", null)
+    service().recordRequest("GET", errorPath, errorPath, 429, 12L, "req-" + uuid.v4(), null, "127.0.0.1", null)
+    flushAll()
+    var ok = app.client.getWith("/admin/monitoring/events?q=" + okPath, asToken(admin))
+    Check.jsonEq(ok, "0.status", "200")
+    Check.jsonEq(ok, "0.level", "INFO")
+    var bad = app.client.getWith("/admin/monitoring/events?q=" + errorPath, asToken(admin))
+    Check.jsonEq(bad, "0.status", "429")
+    Check.jsonEq(bad, "0.level", "WARN")
+}
+
+test "real traffic reaches the panel through the pipeline hook" {
+    var app = monitoringApp()
+    var admin = panelUser(app, "group-admin", true)
+    var path = "/stats/community"
+    Check.status(app.client.get(path), 200)
+    flushAll()
+    var events = app.client.getWith("/admin/monitoring/events?q=" + path, asToken(admin))
+    Check.status(events, 200)
+    Check.jsonEq(events, "0.type", "REQUEST")
+    Check.jsonEq(events, "0.route", "/stats/community")
+    Check.jsonEq(events, "0.method", "GET")
+    // The panel's own polling never feeds itself.
+    var self = app.client.getWith("/admin/monitoring/events?q=/admin/monitoring/events", asToken(admin))
+    Check.eqInt("the monitoring routes are not tracked", 0, self.jsonSize(""))
+}
+
+test "warnings, audit lines and server errors captured from the log become events" {
+    var app = monitoringApp()
+    var admin = panelUser(app, "group-admin", true)
+    var marker = "logmarker-" + uuid.v4()
+    Log("some.domain").warn("careful " + marker + " user@example.com")
+    Log("some.domain").info("quiet " + marker + "-info")
+    Log("ops.monitoring").warn("never captured " + marker + "-ops")
+    Log("audit").info("admin_action " + marker + "-audit")
+    flushAll()
+    var warn = app.client.getWith("/admin/monitoring/events?q=" + marker + "&type=LOG", asToken(admin))
+    Check.jsonEq(warn, "0.level", "WARN")
+    Check.isTrue("e-mail masked", !warn.body.contains("user@example.com"))
+    Check.eqInt("only the warning", 1, app.client.getWith("/admin/monitoring/events?q=" + marker + "&type=LOG", asToken(admin)).jsonSize(""))
+    var audit = app.client.getWith("/admin/monitoring/events?q=" + marker + "-audit", asToken(admin))
+    Check.jsonEq(audit, "0.type", "AUDIT")
+    Check.eqInt("the monitoring's own logger is skipped", 0, app.client.getWith("/admin/monitoring/events?q=" + marker + "-ops", asToken(admin)).jsonSize(""))
+}

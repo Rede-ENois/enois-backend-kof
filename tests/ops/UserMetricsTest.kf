@@ -1,0 +1,121 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.text.*
+import kernel.time.*
+import leaves.*
+import ops.*
+
+// Port of UserMetricsTests plus the /admin/emails log (no Java test for it). Accounts on the panel: total, daily
+// series, growth and projection, closed to regular users and anonymous callers.
+class OpsHolder {
+    static TestApp? app = null
+}
+
+TestApp opsApp() {
+    var cur = OpsHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = LeavesApp.boot("ops-users", mapOf("REDE_MONITORING_FILE_DIR", "/tmp/kof-ops-users-" + uuid.v4()))
+    OpsHolder.app = created
+    return created
+}
+
+List<String> asToken(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+
+String opsUser(app: TestApp, id: String, admin: Bool) {
+    var token = "tok-" + id + "-1234567890"
+    if (app.db().queryLong("select count(*) from users where id = ?", DbParams().bindStr(id)) == 0L) {
+        SecurityFixtures.login(app.db(), id, token)
+        if (admin) {
+            app.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr(id))
+        }
+    }
+    return token
+}
+
+test "the users panel shows the daily series, growth and projections" {
+    var app = opsApp()
+    var admin = opsUser(app, "group-admin", true)
+    var view = LeavesApp.ops().userMetrics.users()
+    assert(view.total() > 0L)
+    assert(view.series().size() == 30)
+    assert(view.projections().size() == 3)
+    assert(view.projections().get(0).days() == 7)
+    assert(view.projections().get(1).days() == 30)
+    assert(view.projections().get(2).days() == 90)
+    // Nobody leaves the database when an account is deleted (the sign-up is anonymized): a projection never falls
+    // below today's total.
+    for (var p in view.projections()) {
+        assert(p.total() >= view.total())
+    }
+    var first = view.series().get(0)
+    var last = view.series().get(29)
+    assert(last.date() == ZoneDates.today("America/Sao_Paulo"))
+    assert(first.date().compareTo(last.date()) < 0)
+    // The series is cumulative, not just the daily count.
+    assert(first.total() <= last.total())
+
+    var res = app.client.getWith("/admin/monitoring/users", asToken(admin))
+    Check.status(res, 200)
+    Check.isTrue("total", res.jsonStr("total") != null)
+    Check.isTrue("newLast7Days", res.jsonStr("newLast7Days") != null)
+    Check.isTrue("growthTodayPercent", res.jsonStr("growthTodayPercent") != null)
+    Check.isTrue("growth7DaysPercent", res.jsonStr("growth7DaysPercent") != null)
+    Check.isTrue("averageDailyNew7Days", res.jsonStr("averageDailyNew7Days") != null)
+    Check.eqInt("series", 30, res.jsonSize("series"))
+    Check.jsonEq(res, "projections.0.days", "7")
+}
+
+test "sign-ups group by Sao Paulo day and feed the growth numbers" {
+    var app = opsApp()
+    opsUser(app, "metrics_today_1", false)
+    opsUser(app, "metrics_today_2", false)
+    // Born 10 days ago at 12:00 UTC.
+    opsUser(app, "metrics_old_1", false)
+    var tenDaysAgo = Time.fromMillis(Time.nowMillis() - 10L * 86400000L)
+    app.db().execute("update users set created_at = ? where id = ?", DbParams().bindInstant(tenDaysAgo).bindStr("metrics_old_1"))
+    // A fresh service: the shared one caches for a minute.
+    var view = UserMetricsService(app.db()).users()
+    assert(view.newToday() >= 2L)
+    assert(view.newLast7Days() >= 2L)
+    assert(view.newLast30Days() >= view.newLast7Days() + 1L)
+    var born = 0L
+    for (var point in view.series()) {
+        born = born + point.newUsers()
+    }
+    assert(born == view.newLast30Days())
+    assert(view.series().get(29).total() == view.total())
+    assert(view.averageDailyNew7Days() == Numbers.round2(view.newLast7Days().toDouble() / 7.0))
+}
+
+test "the users panel is closed to regular users and anonymous callers" {
+    var app = opsApp()
+    var regular = opsUser(app, "metrics_regular", false)
+    Check.apiError(app.client.getWith("/admin/monitoring/users", asToken(regular)), 403, "FORBIDDEN")
+    Check.apiError(app.client.get("/admin/monitoring/users"), 401, "UNAUTHENTICATED")
+}
+
+test "the e-mail log shows masked metadata, hides two-factor sends and is moderator only" {
+    var app = opsApp()
+    var admin = opsUser(app, "group-admin", true)
+    var regular = opsUser(app, "emaillog_regular", false)
+    var store = LeavesApp.ops().emails
+    var tag = uuid.v4().substring(0, 8)
+    store.append("dest-" + tag + "@exemplo.com", "Novo post " + tag + " de ana@exemplo.com", "BLOG_POST", true, null)
+    store.append("falha-" + tag + "@exemplo.com", "Aviso " + tag, "NOTICE", false, "smtp recusou contato@exemplo.com")
+    store.append("2fa-" + tag + "@exemplo.com", "Seu codigo 123456", "TWO_FACTOR", true, null)
+
+    var res = app.client.getWith("/admin/emails?limit=100", asToken(admin))
+    Check.status(res, 200)
+    Check.isTrue("two-factor sends never show", !res.body.contains("TWO_FACTOR") && !res.body.contains("123456"))
+    Check.isTrue("recipient masked", !res.body.contains("exemplo.com"))
+    Check.isTrue("subject kept without the address", res.body.contains("Novo post " + tag + " de ***"))
+    Check.isTrue("sent status", res.body.contains("\"status\":\"SENT\""))
+    Check.isTrue("failed status", res.body.contains("\"status\":\"FAILED\""))
+    Check.isTrue("error scrubbed", res.body.contains("smtp recusou ***"))
+    Check.isTrue("kinds", res.body.contains("\"kind\":\"BLOG_POST\"") && res.body.contains("\"kind\":\"NOTICE\""))
+    Check.apiError(app.client.getWith("/admin/emails", asToken(regular)), 403, "FORBIDDEN")
+}

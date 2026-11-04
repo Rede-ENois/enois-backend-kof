@@ -1,0 +1,37 @@
+package ops
+
+import kernel.*
+import kernel.log.*
+import kernel.monitoring.*
+import kernel.security.*
+
+// ops: the monitoring panel, the e-mail log and the capture that feeds them. Install it BEFORE Security.install:
+// the request pipeline takes hooks.monitoring by value when it is built.
+//
+// Env: REDE_MONITORING_FILE_DIR (/app/data/monitoring), REDE_MONITORING_RETENTION_DAYS (7),
+// REDE_MONITORING_MAX_EVENTS_PER_MINUTE (1000).
+class OpsModule {
+    MonitoringService monitoring
+    UserMetricsService userMetrics
+    EmailLogStore emails
+    public constructor(monitoring: MonitoringService, userMetrics: UserMetricsService, emails: EmailLogStore) {
+        this.monitoring = monitoring
+        this.userMetrics = userMetrics
+        this.emails = emails
+    }
+    static OpsModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks) {
+        var cfg = platform.cfg
+        var sink = DayLog(cfg.getStr("REDE_MONITORING_FILE_DIR", "/app/data/monitoring"), cfg.getInt("REDE_MONITORING_RETENTION_DAYS", 7))
+        var monitoring = MonitoringService(platform.db, sink, cfg.getInt("REDE_MONITORING_MAX_EVENTS_PER_MINUTE", 1000))
+        var userMetrics = UserMetricsService(platform.db)
+        var emails = EmailLogStore(platform.db)
+        hooks.monitoring = OpsMonitoring(monitoring)
+        Log.installTap(OpsLogTap(monitoring))
+        shared.jobs.fixedDelay("monitoring-flush", 0L, 500L, () -> monitoring.flush())
+        shared.jobs.fixedDelay("monitoring-sample-resources", 5000L, 60000L, () -> monitoring.sampleResources())
+        shared.jobs.fixedDelay("monitoring-prune-minutes", 300000L, 300000L, () -> monitoring.pruneMinutes())
+        shared.jobs.fixedDelay("monitoring-purge-old", 60000L, 3600000L, () -> monitoring.purgeOld())
+        OpsRoutes.register(platform.server, monitoring, userMetrics, emails)
+        return OpsModule(monitoring, userMetrics, emails)
+    }
+}
