@@ -1,0 +1,36 @@
+package age
+
+import identity.*
+
+// Age policy (ECA Digital, Lei 15.211/2025), the state enforcement reads: AgePolicyReader of shared/age. The
+// birth date is DECLARED, not an official verification; the protections apply anyway. Age is computed on the
+// São Paulo date so a birthday does not depend on the server's zone. Other domains call AgeGate (below) before a
+// write; the profile domain owns the birth date writes.
+class AgePolicyReader {
+    AgeStore store
+    public constructor(store: AgeStore) {
+        this.store = store
+    }
+    // Has the account declared its birth date? Without it, writes stay blocked.
+    Bool birthDateDeclared(userId: String) = store.birthDate(userId) != null
+    // Under 18 on the São Paulo date, by the declared birth date (never by a client flag).
+    Bool isMinor(userId: String) {
+        var birth = store.birthDate(userId)
+        if (birth == null) {
+            return false
+        }
+        return IdentityDates.yearsBetween(birth, IdentityDates.today()) < 18
+    }
+    // The ids among `userIds` that belong to minors.
+    List<String> minorIds(userIds: List<String>) {
+        var minors = listOf<String>()
+        for (var id in userIds) {
+            if (isMinor(id)) {
+                minors.add(id)
+            }
+        }
+        return minors
+    }
+    // A minor with an active guardian authorization (parental supervision in force).
+    Bool parentalConsentActive(userId: String) = store.activeByMinor(userId) != null
+}

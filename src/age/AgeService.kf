@@ -1,0 +1,162 @@
+package age
+
+import identity.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.security.*
+import kernel.time.*
+
+// Parental supervision (ParentalConsentService). Core rules: only the minor starts the invite; the accept needs
+// an ADULT with a declared birth date and an account of their own; the link can be revoked by the guardian. The
+// minor never ticks "my guardian authorised": the authorization is born from an authenticated accept.
+class AgeService {
+    Db store
+    AgeStore links
+    AgePolicyReader policy
+    IdentityMailer mailer
+    public constructor(store: Db, links: AgeStore, policy: AgePolicyReader, mailer: IdentityMailer) {
+        this.store = store
+        this.links = links
+        this.policy = policy
+        this.mailer = mailer
+    }
+    // Version of the supervision terms accepted; it goes up when the text changes.
+    static String termsVersion() = "2026-10"
+    static Long inviteTtlSeconds() = 604800L
+
+    // The minor invites a guardian by e-mail. One pending invite at a time.
+    AgeInviteBody invite(minorUserId: String, guardianEmail: String?) {
+        var out = AgeInviteBody("", "", false)
+        var self = this
+        store.transaction(() -> {
+            out = self.inviteTx(minorUserId, guardianEmail)
+        })
+        return out
+    }
+    AgeInviteBody inviteTx(minorUserId: String, guardianEmail: String?) {
+        requireMinor(minorUserId)
+        var minor = links.profile(minorUserId)
+        if (minor == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        var typed = IdentityText.orEmpty(guardianEmail)
+        if (guardianEmail == null || !typed.contains("@") || typed.trim().length() > 255) {
+            throw Errors.api(400, "INVALID_EMAIL", "Informe um e-mail valido do responsavel.")
+        }
+        var email = typed.trim().toLowerCase()
+        if (email == minor.getStr("email").toLowerCase()) {
+            throw Errors.api(400, "SAME_EMAIL", "O e-mail do responsavel precisa ser diferente do seu.")
+        }
+        if (links.activeByMinor(minorUserId) != null) {
+            throw Errors.api(409, "ALREADY_SUPERVISED", "Sua conta ja tem um responsavel autorizado.")
+        }
+        var now = Time.nowIso()
+        links.cancelPendingByMinor(minorUserId, now)
+        var raw = Tokens.random(32)
+        var link = AgeLink(Ids.prefixed("pl_"), minorUserId, IdentityText.none(), email, "PENDING", Hashes.sha256Hex(raw), AgeService.termsVersion(), now, Time.plusSeconds(now, AgeService.inviteTtlSeconds()), IdentityText.none(), IdentityText.none())
+        links.save(link)
+        var sent = mailer.sendParentalConsentEmail(email, minor.getStr("name"), raw)
+        audit(minorUserId, "PARENTAL_INVITE_CREATED", minorUserId, "convite enviado para responsavel")
+        return AgeInviteBody(link.status(), link.expiresAt(), sent)
+    }
+    // The authenticated guardian accepts the invite (adult, declared date, own account).
+    accept(guardianUserId: String, token: String?) {
+        var self = this
+        store.transaction(() -> {
+            self.acceptTx(guardianUserId, token)
+        })
+    }
+    acceptTx(guardianUserId: String, token: String?) {
+        var link = pendingLink(token)
+        requireAdultGuardian(guardianUserId)
+        if (guardianUserId == link.minorUserId()) {
+            throw Errors.api(403, "INVALID_GUARDIAN", "O proprio menor nao pode aceitar o convite.")
+        }
+        if (links.activeByMinor(link.minorUserId()) != null) {
+            throw Errors.api(409, "ALREADY_SUPERVISED", "Este menor ja tem um responsavel autorizado.")
+        }
+        links.save(AgeLink(link.id(), link.minorUserId(), guardianUserId, link.guardianEmail(), "ACTIVE", link.tokenHash(), link.termsVersion(), link.createdAt(), link.expiresAt(), Time.nowIso(), IdentityText.none()))
+        audit(link.minorUserId(), "PARENTAL_CONSENT_ACCEPTED", guardianUserId, "autorizacao aceita")
+    }
+    // The guardian turns the invite down.
+    reject(guardianUserId: String, token: String?) {
+        var self = this
+        store.transaction(() -> {
+            self.rejectTx(guardianUserId, token)
+        })
+    }
+    rejectTx(guardianUserId: String, token: String?) {
+        var link = pendingLink(token)
+        requireAdultGuardian(guardianUserId)
+        links.save(AgeLink(link.id(), link.minorUserId(), guardianUserId, link.guardianEmail(), "REJECTED", link.tokenHash(), link.termsVersion(), link.createdAt(), link.expiresAt(), Time.nowIso(), IdentityText.none()))
+        audit(link.minorUserId(), "PARENTAL_CONSENT_REJECTED", guardianUserId, "autorizacao recusada")
+    }
+    // The guardian revokes the authorization; the minor is blocked for writes again.
+    revoke(guardianUserId: String, minorUserId: String?) {
+        var self = this
+        store.transaction(() -> {
+            self.revokeTx(guardianUserId, minorUserId)
+        })
+    }
+    revokeTx(guardianUserId: String, minorUserId: String?) {
+        var minorId = IdentityText.orEmpty(minorUserId)
+        var link = links.activeByMinor(minorId)
+        if (link == null) {
+            throw Errors.api(404, "NO_SUPERVISION", "Nao ha supervisao ativa para este perfil.")
+        }
+        if (guardianUserId != link.guardianUserId()) {
+            throw Errors.api(403, "NOT_YOUR_MINOR", "Voce nao e o responsavel autorizado deste perfil.")
+        }
+        links.save(AgeLink(link.id(), link.minorUserId(), link.guardianUserId(), link.guardianEmail(), "REVOKED", link.tokenHash(), link.termsVersion(), link.createdAt(), link.expiresAt(), link.decidedAt(), Time.nowIso()))
+        audit(minorId, "PARENTAL_CONSENT_REVOKED", guardianUserId, "autorizacao revogada")
+    }
+    // The profiles this guardian supervises (only their own active links).
+    List<AgeSupervisedBody> supervisedBy(guardianUserId: String) {
+        var out = listOf<AgeSupervisedBody>()
+        for (var link in links.activeByGuardian(guardianUserId)) {
+            var minor = links.profile(link.minorUserId())
+            if (minor != null) {
+                var since = link.createdAt()
+                var decided = link.decidedAt()
+                if (decided != null) {
+                    since = decided
+                }
+                out.add(AgeSupervisedBody(minor.getStr("id"), minor.getStr("username"), minor.getStr("name"), since))
+            }
+        }
+        return out
+    }
+    AgeLink pendingLink(token: String?) {
+        if (IdentityText.blank(token)) {
+            throw Errors.api(400, "INVALID_TOKEN", "Convite obrigatorio.")
+        }
+        var link = links.byTokenHash(Hashes.sha256Hex(IdentityText.orEmpty(token).trim()))
+        if (link == null) {
+            throw Errors.api(404, "INVALID_TOKEN", "Convite invalido.")
+        }
+        if (link.status() != "PENDING") {
+            throw Errors.api(409, "TOKEN_ALREADY_USED", "Este convite ja foi usado.")
+        }
+        if (Time.toMillis(link.expiresAt()) <= Time.nowMillis()) {
+            throw Errors.api(410, "TOKEN_EXPIRED", "Convite expirado. Peca um novo ao menor.")
+        }
+        return link
+    }
+    requireMinor(userId: String) {
+        if (!policy.birthDateDeclared(userId)) {
+            throw Errors.api(403, "BIRTH_DATE_REQUIRED", "Confirme sua data de nascimento antes de pedir a autorizacao de um responsavel.")
+        }
+        if (!policy.isMinor(userId)) {
+            throw Errors.api(403, "NOT_A_MINOR", "Sua conta nao e de menor de idade.")
+        }
+    }
+    requireAdultGuardian(guardianUserId: String) {
+        if (!policy.birthDateDeclared(guardianUserId) || policy.isMinor(guardianUserId)) {
+            throw Errors.api(403, "GUARDIAN_MUST_BE_ADULT", "O responsavel precisa ter uma conta de adulto com data de nascimento confirmada.")
+        }
+    }
+    audit(userId: String, event: String, actorId: String, detail: String) {
+        links.audit(Ids.prefixed("age_"), userId, event, actorId, detail, Time.nowIso())
+    }
+}

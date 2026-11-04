@@ -1,11 +1,13 @@
 package identity
 
+import age.*
 import java.util.HashMap
 import kernel.*
 import kernel.db.*
 import kernel.http.*
 import kernel.security.*
 import kernel.testkit.*
+import onboarding.*
 
 // Turnstile siteverify without the network: answers `reply`, or fails like a dead network when `down`.
 class IdentityStubTurnstile extends IdentityTurnstileTransport {
@@ -33,7 +35,9 @@ class IdentityTestApp {
     IdentityMailer mailer
     IdentityStubTurnstile turnstile
     SharedServices services
-    public constructor(app: TestApp, module: IdentityModule, parts: SecurityParts, mailer: IdentityMailer, turnstile: IdentityStubTurnstile, services: SharedServices) {
+    AgeModule age
+    public constructor(app: TestApp, module: IdentityModule, parts: SecurityParts, mailer: IdentityMailer, turnstile: IdentityStubTurnstile, services: SharedServices, age: AgeModule) {
+        this.age = age
         this.services = services
         this.app = app
         this.module = module
@@ -171,7 +175,7 @@ class IdentityTestApp {
         var holder = IdentityWiring()
         holder.probes = probes
         var app = TestApp.bootWith(name, merged, (p: Platform) -> holder.wire(p))
-        return IdentityTestApp(app, holder.module(), holder.parts(), holder.mailer(), holder.turnstile(), holder.services())
+        return IdentityTestApp(app, holder.module(), holder.parts(), holder.mailer(), holder.turnstile(), holder.services(), holder.ageModule())
     }
 }
 
@@ -183,6 +187,7 @@ class IdentityWiring {
     IdentityMailer? capturing = null
     IdentityStubTurnstile? stub = null
     SharedServices? sharedServices = null
+    AgeModule? agePart = null
     wire(p: Platform) {
         var shared = SharedServices.create(p)
         sharedServices = shared
@@ -195,11 +200,21 @@ class IdentityWiring {
         seams.mailer = mailer
         seams.turnstile = turnstile
         built = IdentityModule.installWith(p, shared, hooks, parts, seams)
+        var ageMod = AgeModule.install(p, mailer)
+        agePart = ageMod
+        OnboardingModule.install(p, ageMod.policy)
         securityParts = parts
         capturing = mailer
         stub = turnstile
         var register = probes
         register(p.server)
+    }
+    AgeModule ageModule() {
+        var m = agePart
+        if (m == null) {
+            throw "IdentityWiring: not wired"
+        }
+        return m
     }
     SharedServices services() {
         var m = sharedServices

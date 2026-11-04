@@ -1,0 +1,57 @@
+package age
+
+import kernel.db.*
+
+// parental_links and age_audit_events (V137), plus the users columns the age policy reads
+// (birth_date). pending-port: profile owns `users`; the reads here are the ones AgePolicyAdapter does.
+class AgeStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    String linkColumns() = "id, minor_user_id, guardian_user_id, guardian_email, status, token_hash, terms_version, created_at, expires_at, decided_at, revoked_at"
+    AgeLink? byTokenHash(tokenHash: String) = link(store.queryOptional("select " + linkColumns() + " from parental_links where token_hash = ?", DbParams().bindStr(tokenHash)))
+    AgeLink? activeByMinor(minorUserId: String) = link(store.queryOptional("select " + linkColumns() + " from parental_links where minor_user_id = ? and status = 'ACTIVE' order by created_at limit 1", DbParams().bindStr(minorUserId)))
+    // A loop, not .map(): a lambda that returns a record of its own package fails at runtime (NoClassDefFoundError).
+    List<AgeLink> activeByGuardian(guardianUserId: String) {
+        var out = listOf<AgeLink>()
+        for (var r in store.queryList("select " + linkColumns() + " from parental_links where guardian_user_id = ? and status = 'ACTIVE' order by created_at", DbParams().bindStr(guardianUserId))) {
+            out.add(AgeStore.row(r))
+        }
+        return out
+    }
+    AgeLink? link(r: DbRow?) {
+        if (r == null) {
+            return null
+        }
+        return AgeStore.row(r)
+    }
+    static AgeLink row(r: DbRow) = AgeLink(r.getStr("id"), r.getStr("minor_user_id"), r.getStrOrNull("guardian_user_id"), r.getStr("guardian_email"), r.getStr("status"), r.getStrOrNull("token_hash"), r.getStr("terms_version"), r.getInstant("created_at"), r.getInstant("expires_at"), r.getInstantOrNull("decided_at"), r.getInstantOrNull("revoked_at"))
+    save(l: AgeLink) {
+        var updated = store.execute("update parental_links set minor_user_id = ?, guardian_user_id = ?, guardian_email = ?, status = ?, token_hash = ?, terms_version = ?, created_at = ?, expires_at = ?, decided_at = ?, revoked_at = ? where id = ?", DbParams().bindStr(l.minorUserId()).bindStrOrNull(l.guardianUserId()).bindStr(l.guardianEmail()).bindStr(l.status()).bindStrOrNull(l.tokenHash()).bindStr(l.termsVersion()).bindInstant(l.createdAt()).bindInstant(l.expiresAt()).bindInstantOrNull(l.decidedAt()).bindInstantOrNull(l.revokedAt()).bindStr(l.id()))
+        if (updated == 0) {
+            store.execute("insert into parental_links (id, minor_user_id, guardian_user_id, guardian_email, status, token_hash, terms_version, created_at, expires_at, decided_at, revoked_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(l.id()).bindStr(l.minorUserId()).bindStrOrNull(l.guardianUserId()).bindStr(l.guardianEmail()).bindStr(l.status()).bindStrOrNull(l.tokenHash()).bindStr(l.termsVersion()).bindInstant(l.createdAt()).bindInstant(l.expiresAt()).bindInstantOrNull(l.decidedAt()).bindInstantOrNull(l.revokedAt()))
+        }
+    }
+    // A new invite closes the previous pending one (REVOKED), so there is one pending invite at a time.
+    cancelPendingByMinor(minorUserId: String, now: String) {
+        store.execute("update parental_links set status = 'REVOKED', revoked_at = ? where minor_user_id = ? and status = 'PENDING'", DbParams().bindInstant(now).bindStr(minorUserId))
+    }
+    audit(id: String, userId: String, event: String, actorId: String, detail: String, now: String) {
+        var clipped = detail
+        if (detail.length() > 500) {
+            clipped = detail.substring(0, 500)
+        }
+        store.execute("insert into age_audit_events (id, user_id, event, actor_id, detail, created_at) values (?, ?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(userId).bindStr(event).bindStr(actorId).bindStr(clipped).bindInstant(now))
+    }
+    // users.birth_date of an account, or null when it never declared one (or the account is gone).
+    String? birthDate(userId: String) {
+        var r = store.queryOptional("select birth_date from users where id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        return r.getDateOrNull("birth_date")
+    }
+    // name / username / e-mail of an account, for the invite mail and the supervised list.
+    DbRow? profile(userId: String) = store.queryOptional("select id, username, name, email from users where id = ?", DbParams().bindStr(userId))
+}

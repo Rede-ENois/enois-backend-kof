@@ -1,0 +1,64 @@
+package age
+
+import identity.*
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+
+// /age/parental/** (ParentalController): the minor invites, the guardian (an adult, authenticated) accepts or
+// rejects, the link can be revoked. The backend is the source of truth: nothing depends on a client flag.
+class AgeRoutes {
+    AgeService service
+    public constructor(service: AgeService) {
+        this.service = service
+    }
+    register(server: HttpServer) {
+        var self = this
+        server.post("/age/parental/invite", () -> self.invite())
+        server.post("/age/parental/accept", () -> self.accept())
+        server.post("/age/parental/reject", () -> self.reject())
+        server.post("/age/parental/revoke", () -> self.revoke())
+        server.get("/age/parental/mine", () -> self.mine())
+    }
+    AgeInviteRequest inviteBody() {
+        try {
+            return json.decode<AgeInviteRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    AgeTokenRequest tokenBody() {
+        try {
+            return json.decode<AgeTokenRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    AgeRevokeRequest revokeBody() {
+        try {
+            return json.decode<AgeRevokeRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    String invite() {
+        var body = inviteBody()
+        return json.encode(service.invite(Auth.requireUser(), body.email))
+    }
+    String accept() {
+        var body = tokenBody()
+        service.accept(Auth.requireUser(), body.token)
+        return json.encode(AgeStatusBody(IdentityText.orEmpty(body.token), "SUPERVISION_ACCEPTED"))
+    }
+    String reject() {
+        var body = tokenBody()
+        service.reject(Auth.requireUser(), body.token)
+        return json.encode(AgeStatusBody(IdentityText.orEmpty(body.token), "SUPERVISION_REJECTED"))
+    }
+    String revoke() {
+        var body = revokeBody()
+        service.revoke(Auth.requireUser(), body.minorUserId)
+        return json.encode(AgeStatusBody(IdentityText.orEmpty(body.minorUserId), "SUPERVISION_REVOKED"))
+    }
+    String mine() = json.encode(service.supervisedBy(Auth.requireUser()))
+}
