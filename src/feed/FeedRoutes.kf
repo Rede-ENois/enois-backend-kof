@@ -30,6 +30,36 @@ class FeedRoutes {
             throw Errors.badRequest()
         }
     }
+    static FeedEditBody editBody() {
+        try {
+            return json.decode<FeedEditBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static FeedBulkDeleteBody bulkBody() {
+        try {
+            return json.decode<FeedBulkDeleteBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    // Type of an edit: blank keeps it, an unknown spelling is a 400 (never a 500).
+    static String? editType(raw: String?) {
+        if (!FeedRules.hasText(raw)) {
+            return null
+        }
+        var t = FeedRules.trimmed(raw).toUpperCase()
+        if (!FeedRules.postTypes().contains(t)) {
+            throw Errors.api(400, "TIPO_INVALIDO", "Tipo de publicação desconhecido.")
+        }
+        return t
+    }
+    static List<String> sortedDistinct(raw: List<String>?) {
+        var out = FeedRules.cleanList(raw)
+        out.sort()
+        return out
+    }
     static FeedReactBody reactBody() {
         try {
             return json.decode<FeedReactBody>(Req.bodyText())
@@ -68,6 +98,26 @@ class FeedRoutes {
     var reason = Req.queryStr("reason", "")
     return idem.handle(userId, "DELETE", "/api/feed/posts/{postId}", FeedRoutes.hashOf("postId=" + postId + "&reason=" + reason), 200, () -> json.encode(svc.deletePost(userId, postId, reasonOrNull)))
 })
+        server.patch("/feed/posts/:postId", () -> {
+            var userId = Auth.requireUser()
+            var postId = Req.pathParam("postId")
+            SafeLinks.checkRequest()
+            var b = FeedRoutes.editBody()
+            var newType = FeedRoutes.editType(b.type())
+            InlineMedia.validate(b.content(), svc.mediaIdsOf(postId))
+            return idem.handle(userId, "PATCH", "/api/feed/posts/{postId}", FeedRoutes.hashOf(postId + "|" + json.encode(b)), 200, () -> json.encode(svc.edit(userId, postId, b, newType)))
+        })
+        server.post("/feed/posts/:postId/restore", () -> {
+            var userId = Auth.requireUser()
+            var postId = Req.pathParam("postId")
+            return idem.handle(userId, "POST", "/api/feed/posts/{postId}/restore", FeedRoutes.hashOf(postId + "|restore"), 200, () -> json.encode(svc.restore(userId, postId)))
+        })
+        server.post("/feed/posts/bulk-delete", () -> {
+            var userId = Auth.requireUser()
+            var b = FeedRoutes.bulkBody()
+            var ids = FeedRoutes.sortedDistinct(b.postIds())
+            return idem.handle(userId, "POST", "/api/feed/posts/bulk-delete", FeedRoutes.hashOf(String.join(",", ids) + "|" + FeedRules.nz(b.reason())), 200, () -> json.encode(svc.bulkDelete(userId, ids, b.reason())))
+        })
         server.post("/feed/posts/:postId/comments", () -> {
     var userId = Auth.requireUser()
     var postId = Req.pathParam("postId")

@@ -525,6 +525,8 @@ class FeedService {
             notifier.notify(m, "MENTION", actorId, title, "Você foi mencionado em um " + what + ".", "/api/feed/posts/" + postId, "Ver")
         }
     }
+    List<String> mediaIdsOf(postId: String) = FeedRules.orEmpty(posts.mediaOf(listOf(postId)).get(postId))
+
     // ---- delete ----
     FeedDeleteResult deletePost(userId: String, postId: String, reason: String?) {
         var p = posts.post(postId)
@@ -554,6 +556,141 @@ class FeedService {
         }
         media.requestPostMediaDeletion(p.authorId(), p.id(), mediaIds)
     }
+    // ---- edit, restore, bulk delete ----
+    FeedPostView authorView(p: FeedPostRow) {
+        var tags = FeedRules.orEmpty(posts.tagsOf(listOf(p.id())).get(p.id()))
+        var mediaIds = FeedRules.orEmpty(posts.mediaOf(listOf(p.id())).get(p.id()))
+        var author = authors.byIds(listOf(p.authorId())).get(p.authorId())
+        var contributor = authors.contributorIds(listOf(p.authorId())).contains(p.authorId())
+        var view = this.baseView(p, tags, mediaIds, author, contributor)
+        return FeedPostView(view.id(), view.authorId(), view.authorUsername(), view.authorName(), view.authorAvatar(), view.authorBadge(), view.authorBadges(), view.type(), view.content(), null, null, view.tags(), view.mediaIds(), view.createdAt(), view.counters(), null, view.communityId(), null, view.editedAt(), view.expiresAt(), view.authorIdentity(), view.authorAvatarFrame(), view.topic(), view.repostOf(), view.repostOfAuthor(), view.repostWithOpinion(), null, listOf<String>(), null, view.mediaSpoiler(), view.authorStyle(), view.authorContributor(), listOf<String>(), null, view.acceptedCommentId(), null, null, false, this.mediaIn(mediaIds, media.visibleByIds(mediaIds)), view.resolved())
+    }
+    FeedPostView edit(userId: String, postId: String, b: FeedEditBody, newType: String?) {
+        var p = posts.post(postId)
+        if (p == null) {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+        }
+        if (p.authorId() != userId) {
+            throw Errors.api(403, "POST_OWNER_MISMATCH", "Post nao pertence ao usuario autenticado.")
+        }
+        if (p.status() != "ACTIVE") {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+        }
+        var type = p.type()
+        if (newType != null) {
+            type = newType
+        }
+        var corporateNow = p.authorIdentity() == "CORPORATE"
+        if (corporateNow != (type == "BUSINESS")) {
+            if (corporateNow) {
+                throw Errors.api(400, "IDENTITY_TYPE_MISMATCH", "Publicação corporativa permanece BUSINESS. Se quiser um post social, publique um novo.")
+            }
+            throw Errors.api(400, "IDENTITY_TYPE_MISMATCH", "Posts sociais não viram BUSINESS. Publique um novo com o perfil profissional.")
+        }
+        var content = this.editedContent(b.content(), type)
+        var tags = FeedRules.cleanList(b.tags())
+        if (tags.size() > 5) {
+            throw Errors.api(400, "TOO_MANY_TAGS", "Post deve ter no maximo 5 tags.")
+        }
+        var topic = this.editedTopic(p, b.topic())
+        var pageHtml = this.pageHtmlOf(type, b.pageHtml())
+        var articleBody = this.articleBodyOf(type, b.articleBody())
+        var now = Time.nowIso()
+        var expires = this.expiryAfterEdit(type, p.expiresAt(), now)
+        posts.updateEdited(p.id(), type, content, pageHtml, topic, now, expires, tags)
+        if (articleBody != null) {
+            if (posts.articleBody(p.id()) != null) {
+                posts.updateArticle(p.id(), articleBody, now)
+            } else {
+                posts.insertArticle(p.id(), articleBody, now)
+            }
+        }
+        audit.write(userId, "POST_EDITED", p.id(), null)
+        return this.authorView(this.activePost(p.id()))
+    }
+    String? expiryAfterEdit(type: String, current: String?, now: String) {
+        if (type != "MOMENT") {
+            return null
+        }
+        if (current != null) {
+            return current
+        }
+        return Time.plusSeconds(now, 86400L)
+    }
+    String editedContent(raw: String?, type: String) {
+        if (!FeedRules.hasText(raw)) {
+            if (type == "PAGE") {
+                return ""
+            }
+            throw Errors.api(400, "INVALID_CONTENT", "Conteudo obrigatorio.")
+        }
+        var text = FeedRules.trimmed(raw)
+        var limit = FeedRules.contentLimit(type)
+        if (text.length() > limit) {
+            throw Errors.api(400, "CONTENT_TOO_LONG", "Este tipo de post aceita no maximo " + limit + " caracteres.")
+        }
+        return FeedRules.nz(PlainText.defuse(text))
+    }
+    String? editedTopic(p: FeedPostRow, raw: String?) {
+        if (!FeedRules.hasText(raw)) {
+            return p.topic()
+        }
+        if (p.communityId() != null) {
+            throw Errors.api(400, "TOPIC_FROM_COMMUNITY", "Post em comunidade herda o assunto dela — o compositor não escolhe assunto aqui.")
+        }
+        var declared = FeedRules.trimmed(raw).toUpperCase()
+        if (!FeedRules.topics().contains(declared)) {
+            throw Errors.api(400, "INVALID_TOPIC", "Assunto inválido: escolha um da lista.")
+        }
+        return declared
+    }
+    FeedPostView restore(userId: String, postId: String) {
+        var p = posts.post(postId)
+        if (p == null) {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+        }
+        if (p.authorId() != userId) {
+            throw Errors.api(403, "POST_OWNER_MISMATCH", "Post nao pertence ao usuario autenticado.")
+        }
+        if (posts.undelete(p.id()) == 0) {
+            throw Errors.api(409, "POST_NOT_DELETED", "Este post nao esta excluido.")
+        }
+        audit.write(userId, "POST_RESTORED", p.id(), null)
+        return this.authorView(this.activePost(p.id()))
+    }
+    FeedBulkResult bulkDelete(userId: String, ids: List<String>, reason: String?) {
+        if (ids.size() == 0) {
+            throw Errors.api(400, "EMPTY_POST_LIST", "Lista de posts obrigatoria.")
+        }
+        if (ids.size() > 100) {
+            throw Errors.api(400, "TOO_MANY_POSTS", "Bulk delete aceita no maximo 100 posts.")
+        }
+        var found = new HashMap<String, FeedPostRow>()
+        for (var p in posts.posts(ids)) {
+            found.put(p.id(), p)
+            if (p.authorId() != userId) {
+                throw Errors.api(403, "POST_OWNER_MISMATCH", "Todos os posts precisam pertencer ao usuario autenticado.")
+            }
+        }
+        var items = listOf<FeedBulkItem>()
+        var now = Time.nowIso()
+        for (var id in ids) {
+            var p = found.get(id)
+            if (p == null) {
+                items.add(FeedBulkItem(id, "NOT_FOUND"))
+            } else if (p.status() != "ACTIVE") {
+                items.add(FeedBulkItem(id, "ALREADY_DELETED"))
+            } else {
+                posts.markDeleted(id, now)
+                outbox.append("PostDeleted", id, "{\"postId\":\"" + id + "\"}")
+                this.releaseMedia(p)
+                audit.write(userId, "POST_BULK_DELETED", id, FeedRules.trimmedOrNull(reason))
+                items.add(FeedBulkItem(id, "MARKED_DELETED"))
+            }
+        }
+        return FeedBulkResult("COMPLETED", items)
+    }
+
     // ---- reactions, saves, shares ----
     FeedActionResult react(userId: String, postId: String, type: String?) {
         if (type == null) {

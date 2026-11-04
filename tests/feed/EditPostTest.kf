@@ -1,0 +1,80 @@
+import feed.*
+import kernel.testkit.*
+
+// Port of EditPostTests.
+TestResponse patchPost(token: String, postId: String, key: String, body: String) = FeedTestSupport.send("PATCH", "/feed/posts/" + postId, token, key, body)
+
+test "the owner edits the content and tags" {
+    var author = FeedTestSupport.user("user_edit_owner")
+    var postId = FeedFixtures.publish(author, "pub-edit-1", "Texto original do post.")
+    var res = patchPost(author, postId, "edit-1", "{\"content\":\"Texto revisado.\",\"tags\":[\"java\"]}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "content", "Texto revisado.")
+    Check.jsonEq(res, "tags.0", "java")
+    Check.isTrue("edited at", res.jsonStr("editedAt") != null)
+    var read = FeedTestSupport.app().client.getWith("/feed/posts/" + postId, FeedTestSupport.read(author))
+    Check.status(read, 200)
+    Check.jsonEq(read, "content", "Texto revisado.")
+    Check.isTrue("edited at on read", read.jsonHas("editedAt"))
+}
+
+test "the category is editable and an unknown type is a 400" {
+    var author = FeedTestSupport.user("user_edit_tipo")
+    var postId = FeedFixtures.publish(author, "pub-edit-2", "Postei como insight sem querer.")
+    var res = patchPost(author, postId, "edit-tipo-1", "{\"content\":\"Postei como insight sem querer.\",\"type\":\"QUESTION\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "type", "QUESTION")
+    Check.apiError(patchPost(author, postId, "edit-tipo-2", "{\"content\":\"x\",\"type\":\"XPTO\"}"), 400, "TIPO_INVALIDO")
+}
+
+test "a post becomes a page only with its HTML" {
+    var author = FeedTestSupport.user("user_edit_pagina")
+    var postId = FeedFixtures.publish(author, "pub-edit-3", "Texto que vai virar pagina.")
+    Check.status(patchPost(author, postId, "edit-pagina-1", "{\"content\":\"Texto que vai virar pagina.\",\"type\":\"PAGE\"}"), 400)
+    var page = patchPost(author, postId, "edit-pagina-2", "{\"content\":\"\",\"type\":\"PAGE\",\"pageHtml\":\"<h1>Minha página</h1>\"}")
+    Check.status(page, 200)
+    Check.jsonEq(page, "type", "PAGE")
+    Check.status(patchPost(author, postId, "edit-pagina-3", "{\"content\":\"\",\"type\":\"INSIGHT\"}"), 400)
+    var back = patchPost(author, postId, "edit-pagina-4", "{\"content\":\"De volta ao feed.\",\"type\":\"INSIGHT\"}")
+    Check.status(back, 200)
+    Check.jsonEq(back, "type", "INSIGHT")
+}
+
+test "a post becomes an article only with its body" {
+    var author = FeedTestSupport.user("user_edit_artigo")
+    var postId = FeedFixtures.publish(author, "pub-edit-4", "Titulo do artigo novo.")
+    Check.status(patchPost(author, postId, "edit-artigo-1", "{\"content\":\"Titulo do artigo novo.\",\"type\":\"ARTICLE\"}"), 400)
+    var res = patchPost(author, postId, "edit-artigo-2", "{\"content\":\"Titulo do artigo novo.\",\"type\":\"ARTICLE\",\"articleBody\":\"Corpo completo do artigo, agora com casa.\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "type", "ARTICLE")
+    var read = FeedTestSupport.app().client.getWith("/feed/posts/" + postId, FeedTestSupport.read(author))
+    Check.jsonEq(read, "articleBody", "Corpo completo do artigo, agora com casa.")
+}
+
+test "someone else's post cannot be edited" {
+    var author = FeedTestSupport.user("user_edit_author2")
+    var intruder = FeedTestSupport.user("user_edit_intruder")
+    var postId = FeedFixtures.publish(author, "pub-edit-5", "Post que nao pertence ao intruso.")
+    Check.apiError(patchPost(intruder, postId, "edit-intrude-1", "{\"content\":\"Tentativa de edicao alheia.\"}"), 403, "POST_OWNER_MISMATCH")
+}
+
+test "an emptied content is refused" {
+    var author = FeedTestSupport.user("user_edit_author3")
+    var postId = FeedFixtures.publish(author, "pub-edit-6", "Conteudo que sera esvaziado.")
+    Check.apiError(patchPost(author, postId, "edit-empty-1", "{\"content\":\"   \"}"), 400, "INVALID_CONTENT")
+}
+
+test "an edit cannot exceed the limit of the type" {
+    var author = FeedTestSupport.user("user_edit_author4")
+    var postId = FeedFixtures.publish(author, "pub-edit-7", "Conteudo normal.")
+    Check.apiError(patchPost(author, postId, "edit-long-1", "{\"content\":\"" + strings.repeat("0123456789", 121) + "\"}"), 400, "CONTENT_TOO_LONG")
+}
+
+test "the edit limit follows the type of the post" {
+    var author = FeedTestSupport.user("plimits_author2")
+    var created = FeedTestSupport.post(author, "plimits-edit-create", "{\"topic\":\"TECNOLOGIA\",\"type\":\"QUESTION\",\"content\":\"Uma duvida curta.\"}")
+    var postId = FeedTestSupport.field(created, "id")
+    // What fits a tutorial does not fit a question, not even when editing.
+    Check.apiError(patchPost(author, postId, "plimits-edit-long", "{\"content\":\"" + strings.repeat("x", 5000) + "\"}"), 400, "CONTENT_TOO_LONG")
+    Check.status(patchPost(author, postId, "plimits-edit-ok", "{\"content\":\"" + strings.repeat("x", 1200) + "\"}"), 200)
+}
