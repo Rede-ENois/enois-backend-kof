@@ -1,0 +1,162 @@
+import kernel.*
+import kernel.config.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+
+// Port of AbuseGuardFilterTests. Ceiling of 3 errors for the test to close fast (the app default is
+// off, 0). The clock moves with SecurityClock instead of the Java movable Clock.
+wireAbuse(s: HttpServer) {
+    s.post("/feed/probe", () -> "{\"ok\":true}")
+    s.post("/auth/signup", () -> status(409, "{\"code\":\"EMAIL_TAKEN\",\"message\":\"x\"}"))
+    s.post("/auth/login", () -> status(401, "{\"code\":\"INVALID_CREDENTIALS\",\"message\":\"x\"}"))
+    s.get("/feed", () -> "{}")
+    s.get("/private", () -> status(401, "{\"code\":\"UNAUTHENTICATED\",\"message\":\"x\"}"))
+    s.post("/validate", () -> status(400, "{\"code\":\"BAD_REQUEST\",\"message\":\"x\"}"))
+    s.post("/forbidden", () -> status(403, "{\"code\":\"FORBIDDEN\",\"message\":\"x\"}"))
+    s.post("/health/x", () -> status(404, "{\"code\":\"NOT_FOUND\",\"message\":\"x\"}"))
+    s.get("/health", () -> "{}")
+}
+
+class AbuseHolder {
+    static TestApp? app = null
+}
+
+TestApp abuseApp() {
+    var cur = AbuseHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = SecurityApp.boot("abuse", mapOf("REDE_SECURITY_ABUSE_MAX_ERRORS", "3", "REDE_SECURITY_ABUSE_WINDOW_SECONDS", "180", "REDE_SECURITY_ABUSE_FIRST_BLOCK_MINUTES", "15", "REDE_SECURITY_ABUSE_MAX_BLOCK_MINUTES", "360", "POST_GUARD_ENABLED", "false", "GLOBAL_RATE_LIMIT_PER_MINUTE", "0"), (s: HttpServer) -> wireAbuse(s))
+    AbuseHolder.app = created
+    SecurityFixtures.login(created.db(), "abuse_user", "tok-abuse-user-12345")
+    return created
+}
+
+// POST: reads do not enter the block count, so the scan is a write scan. Unknown paths answer 200
+// through the surface fallback, so the 404s of the Java test are 404 from a route here.
+TestResponse call(ip: String, uri: String) = abuseApp().client.send("POST", uri, listOf("X-Forwarded-For: " + ip, "X-Session-Token: tok-abuse-user-12345", "Content-Type: application/json"), "", "{}")
+
+Int errorStatus(ip: String, uri: String) = call(ip, uri).status
+
+test "a scan of routes ends in a timed denial" {
+    var ip = "203.0.113.10"
+    Check.eqInt("first", 403, errorStatus(ip, "/forbidden"))
+    Check.eqInt("second", 403, errorStatus(ip, "/forbidden"))
+    Check.eqInt("third arms the block", 403, errorStatus(ip, "/forbidden"))
+    var denied = call(ip, "/feed/probe")
+    Check.eqInt("everything is denied, the right route too", 429, denied.status)
+    assert(denied.header("Retry-After").length() > 0)
+    assert(denied.body.contains("RATE_LIMITED"))
+    Check.jsonEq(denied, "message", "Muitas requisicoes invalidas. Tente novamente mais tarde.")
+    Check.eqStr("no timestamp (hand written body)", "false", "" + denied.jsonHas("timestamp"))
+    Check.eqInt("reads are outside the guard, blocked ip or not", 200, abuseApp().client.getWith("/feed", listOf("X-Forwarded-For: " + ip)).status)
+}
+
+test "the block expires by itself" {
+    var ip = "203.0.113.20"
+    var i = 0
+    while (i < 3) {
+        errorStatus(ip, "/forbidden")
+        i = i + 1
+    }
+    Check.eqInt("blocked", 429, errorStatus(ip, "/feed/probe"))
+    SecurityClock.advanceSeconds(16L * 60L)
+    Check.eqInt("served again", 200, errorStatus(ip, "/feed/probe"))
+    SecurityClock.reset()
+}
+
+test "recurrence blocks for longer" {
+    var ip = "203.0.113.30"
+    var i = 0
+    while (i < 3) {
+        errorStatus(ip, "/forbidden")
+        i = i + 1
+    }
+    SecurityClock.advanceSeconds(16L * 60L)
+    i = 0
+    while (i < 3) {
+        errorStatus(ip, "/forbidden")
+        i = i + 1
+    }
+    SecurityClock.advanceSeconds(20L * 60L)
+    Check.eqInt("still inside the second block", 429, errorStatus(ip, "/feed/probe"))
+    var denied = call(ip, "/feed/probe")
+    var wait = denied.header("Retry-After").toInt()
+    assert(wait > 500 && wait <= 600)
+    SecurityClock.advanceSeconds(11L * 60L)
+    Check.eqInt("second block of 30 min is over", 200, errorStatus(ip, "/feed/probe"))
+    SecurityClock.reset()
+}
+
+test "normal use does not count" {
+    var ip = "203.0.113.40"
+    var i = 0
+    while (i < 10) {
+        Check.eqInt("feed", 200, abuseApp().client.getWith("/feed", listOf("X-Forwarded-For: " + ip)).status)
+        Check.eqInt("409 is state, not a scan", 409, errorStatus(ip, "/auth/signup"))
+        i = i + 1
+    }
+    Check.eqInt("validation 400 does not count", 400, errorStatus(ip, "/validate"))
+    Check.eqInt("still served", 200, errorStatus(ip, "/feed/probe"))
+}
+
+test "400 and reads and auth routes never count" {
+    var ip = "203.0.113.45"
+    var i = 0
+    while (i < 8) {
+        Check.eqInt("400", 400, errorStatus(ip, "/validate"))
+        Check.eqInt("401 read", 401, abuseApp().client.getWith("/private", listOf("X-Forwarded-For: " + ip)).status)
+        Check.eqInt("401 auth", 401, errorStatus(ip, "/auth/login"))
+        i = i + 1
+    }
+    Check.eqInt("never blocked", 200, errorStatus(ip, "/feed/probe"))
+}
+
+test "the cluster probe never enters the count" {
+    var ip = "203.0.113.50"
+    var i = 0
+    while (i < 10) {
+        Check.eqInt("probe 404", 404, errorStatus(ip, "/health/x"))
+        i = i + 1
+    }
+    Check.eqInt("served", 200, errorStatus(ip, "/feed/probe"))
+}
+
+test "the denial carries the CORS header of the asking origin, without credentials" {
+    var ip = "203.0.113.77"
+    var i = 0
+    while (i < 3) {
+        errorStatus(ip, "/forbidden")
+        i = i + 1
+    }
+    var res = abuseApp().client.send("POST", "/v1/feed/probe", listOf("X-Forwarded-For: " + ip, "X-Session-Token: tok-abuse-user-12345", "Origin: https://enois-qa.b7cloud.tech", "Content-Type: application/json"), "", "{}")
+    Check.status(res, 429)
+    Check.eqStr("origin", "https://enois-qa.b7cloud.tech", res.header("Access-Control-Allow-Origin"))
+    Check.eqStr("vary", "Origin", res.header("Vary"))
+    Check.eqStr("credentials", "", res.header("Access-Control-Allow-Credentials"))
+}
+
+test "the v1 alias is counted with the same rules, auth routes included in the exemption" {
+    var ip = "203.0.113.88"
+    var i = 0
+    while (i < 6) {
+        Check.eqInt("v1 auth", 401, errorStatus(ip, "/v1/auth/login"))
+        i = i + 1
+    }
+    Check.eqInt("never blocked", 200, errorStatus(ip, "/v1/feed/probe"))
+}
+
+test "an off ceiling disables the guard" {
+    var guard = AbuseGuardFilter(Config.of(mapOf("X", "1")))
+    Check.eqInt("default off", 0, guard.errorLimit)
+}
+
+test "only 404 401 403 405 415 count as scan errors" {
+    for (var s in listOf(404, 401, 403, 405, 415)) {
+        Check.isTrue("counts " + s, AbuseGuardFilter.counts(s))
+    }
+    for (var s in listOf(200, 201, 204, 400, 409, 422, 429, 500, 503)) {
+        Check.isTrue("ignores " + s, !AbuseGuardFilter.counts(s))
+    }
+}

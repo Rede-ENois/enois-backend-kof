@@ -32,12 +32,15 @@ wirePipeline(s: HttpServer) {
     s.get("/admin/users/:id", () -> "{\"user\":true}")
     s.get("/admin/moderators", () -> "{\"mods\":true}")
     s.post("/admin/moderators", () -> "{\"mods\":true}")
-    s.get("/moderation/me", () -> "{\"me\":true}")
+    s.get("/moderation/me", () -> moderationMe())
     s.get("/users/:name", () -> "{\"profile\":true}")
     s.get("/administer/support", () -> "{\"profile\":true}")
     s.get("/auth/config", () -> "{\"captchaMode\":\"x\"}")
     s.get("/v1", () -> "{\"index\":true}")
+    wireCache(s)
 }
+
+String moderationMe() = "{\"me\":\"" + Auth.requireUser() + "\"}"
 
 String feedMissing() {
     throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
@@ -117,6 +120,7 @@ test "protected admin and moderation routes answer 401 without a session or with
     Check.apiError(invalid, 401, "UNAUTHENTICATED")
     var viaV1 = app.client.get("/v1/admin/reports")
     Check.apiError(viaV1, 401, "UNAUTHENTICATED")
+    Check.apiError(app.client.get("/moderation/me"), 401, "UNAUTHENTICATED")
 }
 
 test "a write route requires a session unless it is a public flow" {
@@ -328,4 +332,126 @@ test "the /v1 alias is stripped for guards, the bare index and lookalikes are no
     assert(RequestPath.stripAlias("/v1") == "/v1")
     assert(RequestPath.stripAlias("/v1x/auth") == "/v1x/auth")
     assert(RequestPath.stripAlias("/auth/login") == "/auth/login")
+}
+
+// PublicReadCacheHttpTests
+wireCache(s: HttpServer) {
+    s.get("/communities", () -> "{\"items\":[{\"id\":\"c1\"}]}")
+    s.get("/communities/:id", () -> "{\"id\":\"c1\"}")
+    s.get("/notifications", () -> "{\"items\":[]}")
+    s.get("/feed/posts/:id/comments", () -> "{\"comments\":[]}")
+}
+
+test "an anonymous list carries an ETag and the revalidating policy" {
+    var app = pipelineApp()
+    var res = app.client.get("/communities")
+    Check.status(res, 200)
+    assert(res.header("ETag").startsWith("W/\"0"))
+    Check.eqStr("policy", "public, max-age=0, must-revalidate", res.header("Cache-Control"))
+}
+
+test "the same body comes back as not modified" {
+    var app = pipelineApp()
+    var first = app.client.get("/communities")
+    var etag = first.header("ETag")
+    var second = app.client.getWith("/communities", listOf("If-None-Match: " + etag))
+    Check.status(second, 304)
+    Check.eqStr("empty", "", second.body)
+    Check.eqStr("etag kept", etag, second.header("ETag"))
+    var strong = app.client.getWith("/communities", listOf("If-None-Match: " + etag.substring(2)))
+    Check.status(strong, 304)
+    var other = app.client.getWith("/communities", listOf("If-None-Match: W/\"0deadbeef\""))
+    Check.status(other, 200)
+    Check.status(app.client.getWith("/communities", listOf("If-None-Match: *")), 304)
+}
+
+test "a logged-in reader never gets the public policy" {
+    var app = pipelineApp()
+    var res = app.client.getWith("/communities", listOf("X-Session-Token: whatever-token"))
+    Check.status(res, 200)
+    Check.eqStr("no-store", "no-store", res.header("Cache-Control"))
+    Check.eqStr("no etag", "", res.header("ETag"))
+    var byCookie = app.client.send("GET", "/communities", listOf<String>(), "enois_session=x", "")
+    Check.eqStr("cookie no-store", "no-store", byCookie.header("Cache-Control"))
+    Check.eqStr("cookie no etag", "", byCookie.header("ETag"))
+}
+
+test "a route outside the public list keeps no policy from us" {
+    var app = pipelineApp()
+    var res = app.client.get("/notifications")
+    Check.status(res, 200)
+    Check.isTrue("not public", res.header("Cache-Control") != "public, max-age=0, must-revalidate")
+    Check.eqStr("no etag", "", res.header("ETag"))
+}
+
+test "the etag list is a servlet prefix, the policy list is one segment" {
+    assert(PublicReadCache.listed("/communities/c1"))
+    assert(!PublicReadCache.listed("/communities/c1/members"))
+    assert(PublicReadCache.etagListed("/communities/c1/members"))
+    assert(PublicReadCache.etagListed("/feed"))
+    assert(!PublicReadCache.etagListed("/feedback"))
+    assert(!PublicReadCache.etagListed("/notifications"))
+    var app = pipelineApp()
+    var deep = app.client.get("/feed/posts/p1/comments")
+    Check.status(deep, 200)
+    assert(deep.header("ETag").startsWith("W/"))
+    Check.eqStr("no policy past one segment", "", deep.header("Cache-Control"))
+}
+
+// V1ApiAliasTests (the pipeline half; the /v1 index itself belongs to the apiv1 domain)
+test "a public read answers the same under the v1 alias" {
+    var app = pipelineApp()
+    var plain = app.client.get("/communities/c1")
+    var versioned = app.client.get("/v1/communities/c1")
+    Check.eqInt("status", plain.status, versioned.status)
+    Check.eqStr("body", plain.body, versioned.body)
+}
+
+test "an authenticated read answers the same under the v1 alias" {
+    var app = pipelineApp()
+    SecurityFixtures.login(app.db(), "v1_alias_read", "tok-v1-alias-read-12")
+    var h = listOf("X-Session-Token: tok-v1-alias-read-12")
+    var plain = app.client.getWith("/communities/c1", h)
+    var versioned = app.client.getWith("/v1/communities/c1", h)
+    Check.eqInt("status", plain.status, versioned.status)
+    Check.eqStr("body", plain.body, versioned.body)
+}
+
+test "an error has the same envelope under the v1 alias" {
+    var app = pipelineApp()
+    var plain = app.client.get("/feed/posts/post-que-nao-existe")
+    var versioned = app.client.get("/v1/feed/posts/post-que-nao-existe")
+    Check.eqInt("status", plain.status, versioned.status)
+    Check.eqStr("code", plain.json("code"), versioned.json("code"))
+    Check.eqStr("message", plain.json("message"), versioned.json("message"))
+    Check.isTrue("timestamp", versioned.jsonHas("timestamp"))
+}
+
+test "a write with a session answers the same shape under the v1 alias, and without one is refused" {
+    var app = pipelineApp()
+    SecurityFixtures.login(app.db(), "v1_alias_write", "tok-v1-alias-write-1")
+    var h = listOf("X-Session-Token: tok-v1-alias-write-1", "Content-Type: application/json")
+    var plain = app.client.send("POST", "/feed/posts", h, "", "{\"content\":\"a\"}")
+    var versioned = app.client.send("POST", "/v1/feed/posts", h, "", "{\"content\":\"b\"}")
+    Check.eqInt("plain", 200, plain.status)
+    Check.eqInt("status", plain.status, versioned.status)
+    Check.eqStr("body", plain.body, versioned.body)
+    var anonymous = app.client.postJson("/v1/feed/posts", "{\"type\":\"TEXT\",\"content\":\"sem sessao\"}")
+    Check.apiError(anonymous, 401, "UNAUTHENTICATED")
+}
+
+test "a path that does not exist answers the same under the alias, and /v1x is not the alias" {
+    var app = pipelineApp()
+    var plain = app.client.get("/nao-existe-mesmo")
+    var versioned = app.client.get("/v1/nao-existe-mesmo")
+    Check.eqInt("status", 200, versioned.status)
+    Check.eqInt("same", plain.status, versioned.status)
+    Check.eqStr("body", plain.body, versioned.body)
+    var named = app.client.get("/v1x/communities")
+    Check.status(named, 200)
+    Check.eqStr("v1x", "", named.body)
+    var noDoc = app.client.get("/openapi.json")
+    Check.status(noDoc, 200)
+    Check.eqStr("no openapi document", "", noDoc.body)
+    Check.status(app.client.get("/communities/c1"), 200)
 }

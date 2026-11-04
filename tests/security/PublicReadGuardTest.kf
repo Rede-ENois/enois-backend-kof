@@ -1,0 +1,86 @@
+import kernel.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+
+// Port of PublicReadGuardTests: the per-ip ceiling on the people-search and profile reads cuts
+// enumeration in seconds. Limit of 20 in this app so the test fits in a few requests.
+wireReads(s: HttpServer) {
+    s.get("/users/search", () -> "{\"items\":[]}")
+    s.get("/users/:username", () -> "{\"profile\":true}")
+    s.get("/feed", () -> "{\"items\":[]}")
+}
+
+class ReadsHolder {
+    static TestApp? app = null
+}
+
+TestApp readsApp() {
+    var cur = ReadsHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = SecurityApp.boot("reads", mapOf("REDE_RATE_PUBLIC_READ_PER_MINUTE", "20"), (s: HttpServer) -> wireReads(s))
+    ReadsHolder.app = created
+    return created
+}
+
+TestResponse search(ip: String, q: String, extra: String) {
+    var headers = listOf("X-Forwarded-For: " + ip)
+    if (extra.length() > 0) {
+        headers.add(extra)
+    }
+    return readsApp().client.getWith("/users/search?q=" + q, headers)
+}
+
+test "enumeration on the people search is cut off" {
+    var ip = "203.0.113.101"
+    var i = 0
+    while (i < 20) {
+        Check.status(search(ip, "t1ab" + i, ""), 200)
+        i = i + 1
+    }
+    var blocked = search(ip, "t1ab-final", "")
+    Check.filterError(blocked, 429, "ENUMERATION_GUARD")
+    Check.jsonEq(blocked, "message", "Muitas consultas de perfis em pouco tempo. Tente de novo em instantes.")
+    Check.eqStr("retry after", "60", blocked.header("Retry-After"))
+}
+
+test "profile reads share the ceiling, other routes do not" {
+    var ip = "203.0.113.102"
+    var a = readsApp()
+    var i = 0
+    while (i < 20) {
+        Check.status(a.client.getWith("/users/maria", listOf("X-Forwarded-For: " + ip)), 200)
+        i = i + 1
+    }
+    Check.status(a.client.getWith("/users/maria", listOf("X-Forwarded-For: " + ip)), 429)
+    Check.status(a.client.getWith("/v1/users/joao", listOf("X-Forwarded-For: " + ip)), 429)
+    Check.status(a.client.getWith("/feed", listOf("X-Forwarded-For: " + ip)), 200)
+}
+
+test "a logged-in user is not blocked by anonymous enumeration" {
+    var ip = "203.0.113.103"
+    var i = 0
+    while (i < 20) {
+        Check.status(search(ip, "t2anon" + i, ""), 200)
+        i = i + 1
+    }
+    Check.status(search(ip, "t2anon-final", ""), 429)
+    SecurityFixtures.login(readsApp().db(), "mon_reader2", "tok-mon-reader2-1234")
+    i = 0
+    while (i < 5) {
+        Check.status(search(ip, "t2log" + i, "X-Session-Token: tok-mon-reader2-1234"), 200)
+        i = i + 1
+    }
+}
+
+test "an invented session token does not earn a fresh bucket" {
+    var ip = "203.0.113.104"
+    var i = 0
+    while (i < 20) {
+        Check.status(search(ip, "t3anon" + i, ""), 200)
+        i = i + 1
+    }
+    Check.status(search(ip, "t3fake", "X-Session-Token: invented-" + Time.nowMillis()), 429)
+}

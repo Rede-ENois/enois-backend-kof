@@ -1,0 +1,107 @@
+import kernel.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+
+// Port of RateLimitCorsTests (the 429 of the filters carries CORS) and the behaviour of
+// GlobalApiRateLimitFilter: a write ceiling per user, else per ip. Limit 1 in this app.
+wireGlobal(s: HttpServer) {
+    s.post("/feed/posts/:id/reactions", () -> "{}")
+    s.get("/feed/posts/:id/reactions", () -> "{}")
+    s.post("/auth/logout", () -> "{}")
+    s.get("/health", () -> "{}")
+}
+
+class GlobalHolder {
+    static TestApp? app = null
+}
+
+TestApp globalApp() {
+    var cur = GlobalHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = SecurityApp.boot("globalrl", mapOf("GLOBAL_RATE_LIMIT_PER_MINUTE", "1", "POST_GUARD_ENABLED", "false"), (s: HttpServer) -> wireGlobal(s))
+    GlobalHolder.app = created
+    return created
+}
+
+List<String> trusted(ip: String) = listOf("Origin: https://enois.ia.br", "Access-Control-Request-Headers: content-type,x-session-token,idempotency-key", "X-Forwarded-For: " + ip)
+
+test "the global limit answers 429 with CORS headers" {
+    var a = globalApp()
+    a.client.send("POST", "/feed/posts/x/reactions", trusted("203.0.113.9"), "", "")
+    var res = a.client.send("POST", "/feed/posts/x/reactions", trusted("203.0.113.9"), "", "")
+    Check.status(res, 429)
+    Check.eqStr("origin", "https://enois.ia.br", res.header("Access-Control-Allow-Origin"))
+    Check.eqStr("credentials", "true", res.header("Access-Control-Allow-Credentials"))
+    assert(res.header("Vary").contains("Origin"))
+    Check.eqStr("allow headers", "content-type,x-session-token,idempotency-key", res.header("Access-Control-Allow-Headers"))
+    Check.eqStr("allow methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS", res.header("Access-Control-Allow-Methods"))
+    Check.eqStr("retry after", "60", res.header("Retry-After"))
+    Check.filterError(res, 429, "RATE_LIMITED")
+    Check.jsonEq(res, "message", "Muitas requisicoes. Tente novamente em instantes.")
+}
+
+test "a default Allow-Headers list is offered when none was requested" {
+    var a = globalApp()
+    var h = listOf("Origin: https://enois.ia.br", "X-Forwarded-For: 203.0.113.19")
+    a.client.send("POST", "/auth/logout", h, "", "")
+    var res = a.client.send("POST", "/auth/logout", h, "", "")
+    Check.status(res, 429)
+    Check.eqStr("allow headers", "content-type,x-client-origin,x-session-token,idempotency-key,x-device-id", res.header("Access-Control-Allow-Headers"))
+}
+
+test "an untrusted origin gets no credentialed CORS" {
+    var a = globalApp()
+    var h = listOf("Origin: https://attacker.example", "X-Forwarded-For: 203.0.113.10")
+    a.client.send("POST", "/feed/posts/y/reactions", h, "", "")
+    var res = a.client.send("POST", "/feed/posts/y/reactions", h, "", "")
+    Check.status(res, 429)
+    Check.eqStr("origin", "", res.header("Access-Control-Allow-Origin"))
+    Check.eqStr("credentials", "", res.header("Access-Control-Allow-Credentials"))
+}
+
+test "a preflight is never counted by the global limit" {
+    var a = globalApp()
+    var h = listOf("Origin: https://enois.ia.br", "X-Forwarded-For: 203.0.113.11", "Access-Control-Request-Method: POST")
+    var i = 0
+    while (i < 5) {
+        var res = a.client.send("OPTIONS", "/feed/posts/x/reactions", h, "", "")
+        assert(res.status != 429)
+        i = i + 1
+    }
+}
+
+test "reads and probes are never counted" {
+    var a = globalApp()
+    var i = 0
+    while (i < 5) {
+        Check.status(a.client.getWith("/feed/posts/x/reactions", listOf("X-Forwarded-For: 203.0.113.12")), 200)
+        Check.status(a.client.getWith("/health", listOf("X-Forwarded-For: 203.0.113.12")), 200)
+        i = i + 1
+    }
+}
+
+test "a live session has its own bucket, an invented token falls back to the ip" {
+    var a = globalApp()
+    SecurityFixtures.login(a.db(), "glob_user", "tok-glob-user-12345")
+    var ip = "203.0.113.13"
+    a.client.send("POST", "/auth/logout", listOf("X-Forwarded-For: " + ip), "", "")
+    Check.status(a.client.send("POST", "/auth/logout", listOf("X-Forwarded-For: " + ip), "", ""), 429)
+    var viaUser = a.client.send("POST", "/auth/logout", listOf("X-Forwarded-For: " + ip, "X-Session-Token: tok-glob-user-12345"), "", "")
+    Check.status(viaUser, 200)
+    Check.status(a.client.send("POST", "/auth/logout", listOf("X-Forwarded-For: " + ip, "X-Session-Token: tok-glob-user-12345"), "", ""), 429)
+    var fake = a.client.send("POST", "/auth/logout", listOf("X-Forwarded-For: " + ip, "X-Session-Token: invented-" + Time.nowMillis()), "", "")
+    Check.status(fake, 429)
+}
+
+test "a trusted proxy address gets the shared multiplier" {
+    var a = globalApp()
+    var h = listOf("X-Forwarded-For: 10.20.30.40")
+    var i = 0
+    while (i < 6) {
+        Check.status(a.client.send("POST", "/auth/logout", h, "", ""), 200)
+        i = i + 1
+    }
+}

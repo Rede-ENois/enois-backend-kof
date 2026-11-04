@@ -1,0 +1,63 @@
+import kernel.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+
+// Port of PostRateLimitTests: with a limit of 1 per minute the first action passes and the second is a
+// 429 even with a valid session; another user stays free; GET is untouched.
+wirePostLimit(s: HttpServer) {
+    s.post("/auth/logout", () -> "{\"ok\":true}")
+    s.post("/feed/posts", () -> "{\"posted\":true}")
+    s.get("/auth/me", () -> "{\"me\":true}")
+    s.post("/health/echo", () -> "{}")
+}
+
+class PostLimitHolder {
+    static TestApp? app = null
+}
+
+TestApp postApp() {
+    var cur = PostLimitHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = SecurityApp.boot("postlimit", mapOf("POST_GUARD_ENABLED", "true", "POST_USER_RATE_LIMIT", "1", "POST_IP_RATE_LIMIT", "2"), (s: HttpServer) -> wirePostLimit(s))
+    PostLimitHolder.app = created
+    return created
+}
+
+TestResponse logoutAs(token: String) = postApp().client.send("POST", "/auth/logout", listOf("X-Session-Token: " + token, "Idempotency-Key: prl-" + Time.nowMillis()), "", "")
+
+test "post is limited per user but not get" {
+    var a = postApp()
+    SecurityFixtures.login(a.db(), "prl_first", "tok-prl-first-12345")
+    SecurityFixtures.login(a.db(), "prl_second", "tok-prl-second-1234")
+    Check.status(a.client.getWith("/auth/me", listOf("X-Session-Token: tok-prl-first-12345")), 200)
+    Check.status(logoutAs("tok-prl-first-12345"), 200)
+    var limited = logoutAs("tok-prl-first-12345")
+    Check.filterError(limited, 429, "RATE_LIMITED")
+    Check.jsonEq(limited, "message", "Muitas acoes em pouco tempo. Espere um minuto e tente de novo.")
+    Check.eqStr("retry after", "60", limited.header("Retry-After"))
+    Check.status(logoutAs("tok-prl-second-1234"), 200)
+    Check.status(a.client.getWith("/auth/me", listOf("X-Session-Token: tok-prl-first-12345")), 200)
+}
+
+test "a cookie session has the same per-session bucket" {
+    var a = postApp()
+    SecurityFixtures.login(a.db(), "prl_cookie", "tok-prl-cookie-1234")
+    var send = a.client.send("POST", "/auth/logout", listOf("X-CSRF-Protection: 1"), "enois_session=tok-prl-cookie-1234", "")
+    Check.status(send, 200)
+    var again = a.client.send("POST", "/auth/logout", listOf("X-CSRF-Protection: 1"), "enois_session=tok-prl-cookie-1234", "")
+    Check.filterError(again, 429, "RATE_LIMITED")
+}
+
+test "anonymous posts are limited by ip, and a logged-in user does not inherit the ip bucket" {
+    var a = postApp()
+    var ip = listOf("X-Forwarded-For: 203.0.113.44")
+    Check.status(a.client.send("POST", "/auth/logout", ip, "", ""), 200)
+    Check.status(a.client.send("POST", "/auth/logout", ip, "", ""), 200)
+    Check.filterError(a.client.send("POST", "/auth/logout", ip, "", ""), 429, "RATE_LIMITED")
+    SecurityFixtures.login(a.db(), "prl_third", "tok-prl-third-12345")
+    var viaUser = a.client.send("POST", "/auth/logout", listOf("X-Forwarded-For: 203.0.113.44", "X-Session-Token: tok-prl-third-12345"), "", "")
+    Check.status(viaUser, 200)
+}

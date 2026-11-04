@@ -279,9 +279,9 @@ test "a limit or window of zero disables the ip limiter" {
 }
 
 class RecordingReports extends SecurityAutoReports {
-    List<String> seen = listOf<String>()
+    List<String> captured = listOf<String>()
     report(userId: String, reason: String, description: String) {
-        seen.add(userId + "|" + reason + "|" + description)
+        captured.add(userId + "|" + reason + "|" + description)
     }
 }
 
@@ -303,8 +303,8 @@ test "user limiter rejects over the limit and reports the third rejection of the
     }
     assert(codes.size() == 4)
     assert(codes.get(0) == "RATE_LIMIT_EXCEEDED429Voce atingiu o limite desta acao. Tente novamente em alguns minutos.")
-    assert(reports.seen.size() == 1)
-    assert(reports.seen.get(0).startsWith("user_1|SPAM|[auto] Usuario rejeitado pelo rate limiter 3 vezes em 1 hora (ultima acao: create_post)"))
+    assert(reports.captured.size() == 1)
+    assert(reports.captured.get(0).startsWith("user_1|SPAM|[auto] Usuario rejeitado pelo rate limiter 3 vezes em 1 hora (ultima acao: create_post)"))
     limiter.require("user_2", "create_post")
     limiter.require("user_1", "create_comment")
     SecurityClock.advanceSeconds(3601L)
@@ -436,4 +436,60 @@ test "named rate limiter defaults and period parsing" {
         unknown = true
     }
     assert(unknown)
+}
+
+// RateLimitSessionsTests
+class CountingLookup extends SessionLookup {
+    Int calls = 0
+    Bool live = false
+    String? findActiveUserId(token: String) {
+        calls = calls + 1
+        if (live && token == "live") {
+            return "user_a"
+        }
+        return null
+    }
+}
+
+test "a live session is looked up once and then served from the cache" {
+    SecurityClock.reset()
+    var lookup = CountingLookup()
+    lookup.live = true
+    var sessions = RateLimitSessions(lookup, 50)
+    assert(sessions.userId("live", "203.0.113.1") == "user_a")
+    assert(sessions.userId("live", "203.0.113.1") == "user_a")
+    assert(lookup.calls == 1)
+    SecurityClock.advanceSeconds(61L)
+    assert(sessions.userId("live", "203.0.113.1") == "user_a")
+    assert(lookup.calls == 2)
+    SecurityClock.reset()
+}
+
+test "invented tokens stop reaching the database once the ip lookup budget is spent" {
+    SecurityClock.reset()
+    var lookup = CountingLookup()
+    var sessions = RateLimitSessions(lookup, 50)
+    var i = 0
+    while (i < 200) {
+        assert(sessions.userId("invented-" + i, "203.0.113.2") == null)
+        i = i + 1
+    }
+    assert(lookup.calls == 60)
+    sessions.userId("invented-x", "203.0.113.3")
+    assert(lookup.calls == 61)
+    SecurityClock.advanceSeconds(61L)
+    sessions.userId("invented-y", "203.0.113.2")
+    assert(lookup.calls == 62)
+    SecurityClock.reset()
+}
+
+test "a trusted proxy address gets the shared multiplier" {
+    var lookup = CountingLookup()
+    var sessions = RateLimitSessions(lookup, 50)
+    var i = 0
+    while (i < 61) {
+        sessions.userId("behind-proxy-" + i, "10.0.0.1")
+        i = i + 1
+    }
+    assert(lookup.calls == 61)
 }

@@ -1,0 +1,129 @@
+import kernel.*
+import kernel.config.*
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+
+// Port of IdentityRateLimitTests and V1LoginRateLimitTests. The handlers stand in for the identity
+// controller (wrong credentials = 401, invalid body = 400); the limiter is what is under test.
+wireIdentity(s: HttpServer) {
+    s.post("/auth/login", () -> status(401, "{\"code\":\"INVALID_CREDENTIALS\",\"message\":\"x\"}"))
+    s.post("/auth/signup", () -> status(400, "{\"code\":\"BAD_REQUEST\",\"message\":\"x\"}"))
+    s.post("/auth/refresh", () -> status(401, "{\"code\":\"UNAUTHENTICATED\",\"message\":\"x\"}"))
+    s.post("/auth/password/forgot", () -> "{}")
+    s.post("/auth/2fa/verify", () -> status(401, "{\"code\":\"X\",\"message\":\"x\"}"))
+    s.post("/auth/2fa/totp/enable", () -> status(401, "{\"code\":\"X\",\"message\":\"x\"}"))
+    s.post("/auth/email/resend", () -> "{}")
+    s.get("/auth/me", () -> status(401, "{\"code\":\"UNAUTHENTICATED\",\"message\":\"x\"}"))
+}
+
+class IdentityHolder {
+    static TestApp? app = null
+}
+
+TestApp identityApp() {
+    var cur = IdentityHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var tight = mapOf("LOGIN_RATE_LIMIT", "3", "REDE_SECURITY_RATE_LIMIT_LOGIN_WINDOW_MINUTES", "5", "SIGNUP_RATE_LIMIT", "2", "REDE_SECURITY_RATE_LIMIT_SIGNUP_WINDOW_MINUTES", "5", "REFRESH_RATE_LIMIT", "2", "REDE_SECURITY_RATE_LIMIT_REFRESH_WINDOW_MINUTES", "5", "PASSWORD_RATE_LIMIT", "2", "TWO_FACTOR_RATE_LIMIT", "2", "EMAIL_RATE_LIMIT", "2")
+    var created = SecurityApp.boot("identity", tight, (s: HttpServer) -> wireIdentity(s))
+    IdentityHolder.app = created
+    return created
+}
+
+TestResponse login(ip: String) = identityApp().client.send("POST", "/auth/login", listOf("X-Forwarded-For: " + ip, "Content-Type: application/json", "Idempotency-Key: ratelimit-" + Time.nowMillis()), "", "{\"email\":\"ninguem@exemplo.com\",\"password\":\"errada\"}")
+
+TestResponse loginWithForwarded(forwarded: String) = login(forwarded)
+
+test "the same ip is blocked after the limit and another ip is not" {
+    var first = "203.0.113.10"
+    var i = 0
+    while (i < 3) {
+        Check.status(login(first), 401)
+        i = i + 1
+    }
+    var blocked = login(first)
+    Check.filterError(blocked, 429, "RATE_LIMITED")
+    Check.jsonEq(blocked, "message", "Muitas tentativas em sequencia. Espere alguns minutos e tente de novo.")
+    Check.eqStr("retry after", "300", blocked.header("Retry-After"))
+    Check.status(login("203.0.113.11"), 401)
+}
+
+test "forwarded-for counts the last hop only" {
+    var i = 0
+    while (i < 3) {
+        Check.status(loginWithForwarded("198.51.100." + i + ", 203.0.113.30"), 401)
+        i = i + 1
+    }
+    Check.status(loginWithForwarded("198.51.100.99, 203.0.113.30, 10.0.0.99"), 429)
+    Check.status(loginWithForwarded("198.51.100.7, 203.0.113.31"), 401)
+}
+
+test "an absurd forwarded header falls back instead of failing" {
+    var enorme = strings.repeat("9", 5000)
+    var res = identityApp().client.send("POST", "/auth/login", listOf("X-Forwarded-For: " + enorme, "Content-Type: application/json"), "", "{}")
+    Check.status(res, 401)
+}
+
+test "normal use is not blocked" {
+    var i = 0
+    while (i < 3) {
+        Check.status(login("203.0.113.50"), 401)
+        i = i + 1
+    }
+}
+
+TestResponse signupFrom(ip: String) = identityApp().client.send("POST", "/auth/signup", listOf("X-Forwarded-For: " + ip, "Content-Type: application/json"), "", "{\"name\":\"Teste\"}")
+
+TestResponse refreshFrom(ip: String) = identityApp().client.send("POST", "/auth/refresh", listOf("X-Forwarded-For: " + ip, "Content-Type: application/json"), "", "{\"refreshToken\":\"not-a-real-token\"}")
+
+test "signup has its own limit" {
+    var ip = "203.0.113.60"
+    Check.status(signupFrom(ip), 400)
+    Check.status(signupFrom(ip), 400)
+    Check.filterError(signupFrom(ip), 429, "RATE_LIMITED")
+}
+
+test "refresh has its own bucket and does not consume the login bucket" {
+    var ip = "203.0.113.70"
+    Check.status(refreshFrom(ip), 401)
+    Check.status(refreshFrom(ip), 401)
+    Check.status(refreshFrom(ip), 429)
+    Check.status(login(ip), 401)
+}
+
+test "password, e-mail and second factor routes are limited per ip by their action" {
+    var a = identityApp()
+    var h = listOf("X-Forwarded-For: 203.0.113.80", "Content-Type: application/json")
+    Check.status(a.client.send("POST", "/auth/password/forgot", h, "", "{}"), 200)
+    Check.status(a.client.send("POST", "/auth/password/forgot", h, "", "{}"), 200)
+    Check.status(a.client.send("POST", "/auth/password/forgot", h, "", "{}"), 429)
+    Check.status(a.client.send("POST", "/auth/email/resend", h, "", "{}"), 200)
+    Check.status(a.client.send("POST", "/auth/2fa/verify", h, "", "{}"), 401)
+    Check.status(a.client.send("POST", "/auth/2fa/verify", h, "", "{}"), 401)
+    Check.status(a.client.send("POST", "/auth/2fa/verify", h, "", "{}"), 429)
+    Check.status(a.client.send("POST", "/auth/2fa/totp/enable", h, "", "{}"), 429)
+}
+
+test "reads are never limited by the identity filter" {
+    var a = identityApp()
+    var i = 0
+    while (i < 10) {
+        Check.status(a.client.getWith("/auth/me", listOf("X-Forwarded-For: 203.0.113.90")), 401)
+        i = i + 1
+    }
+}
+
+test "the login limit through the v1 alias is the same bucket" {
+    var a = identityApp()
+    var h = listOf("X-Forwarded-For: 203.0.113.99", "Content-Type: application/json", "Idempotency-Key: v1-rate")
+    var body = "{\"email\":\"v1-rate-limit@test.com\",\"password\":\"SenhaErrada1!\"}"
+    Check.status(a.client.send("POST", "/auth/login", h, "", body), 401)
+    Check.status(a.client.send("POST", "/v1/auth/login", h, "", body), 401)
+    Check.status(a.client.send("POST", "/v1/auth/login", h, "", body), 401)
+    var third = a.client.send("POST", "/v1/auth/login", h, "", body)
+    Check.status(third, 429)
+    assert(third.body.contains("RATE_LIMITED"))
+}

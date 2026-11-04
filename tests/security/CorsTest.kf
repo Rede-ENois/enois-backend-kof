@@ -1,0 +1,85 @@
+import kernel.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+
+// The router-level CORS (Spring CorsConfig + DefaultCorsProcessor), reached with origin enforcement off
+// so the origin gate does not answer first.
+wireCors(s: HttpServer) {
+    s.get("/feed", () -> "{\"items\":[]}")
+    s.post("/auth/login", () -> status(401, "{\"code\":\"X\",\"message\":\"x\"}"))
+}
+
+class CorsHolder {
+    static TestApp? app = null
+}
+
+TestApp corsApp() {
+    var cur = CorsHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = SecurityApp.boot("cors", mapOf("CORS_ALLOWED_ORIGINS", "https://enois.ia.br,http://localhost:5173"), (s: HttpServer) -> wireCors(s))
+    CorsHolder.app = created
+    return created
+}
+
+test "an allowed origin gets the credentialed CORS headers on a real request" {
+    var a = corsApp()
+    var res = a.client.getWith("/feed", listOf("Origin: https://enois.ia.br"))
+    Check.status(res, 200)
+    Check.eqStr("origin", "https://enois.ia.br", res.header("Access-Control-Allow-Origin"))
+    Check.eqStr("credentials", "true", res.header("Access-Control-Allow-Credentials"))
+    Check.eqStr("expose", "*", res.header("Access-Control-Expose-Headers"))
+    Check.eqStr("vary", "Origin", res.header("Vary"))
+    var local = a.client.getWith("/feed", listOf("Origin: http://localhost:5173"))
+    Check.eqStr("local origin", "http://localhost:5173", local.header("Access-Control-Allow-Origin"))
+}
+
+test "an origin that is not allowed is refused with Invalid CORS request" {
+    var a = corsApp()
+    var res = a.client.getWith("/feed", listOf("Origin: https://evil.example"))
+    Check.status(res, 403)
+    Check.eqStr("body", "Invalid CORS request", res.body)
+    Check.eqStr("no origin header", "", res.header("Access-Control-Allow-Origin"))
+    Check.status(a.client.getWith("/feed", listOf("Origin: https://outro.b7cloud.com.br")), 403)
+    Check.status(a.client.postJson("/auth/login", "{}"), 401)
+    var post = a.client.send("POST", "/auth/login", listOf("Origin: https://evil.example", "Content-Type: application/json"), "", "{}")
+    Check.status(post, 403)
+}
+
+test "a request without Origin or from the same origin is not touched" {
+    var a = corsApp()
+    var plain = a.client.get("/feed")
+    Check.status(plain, 200)
+    Check.eqStr("no cors", "", plain.header("Access-Control-Allow-Origin"))
+    var same = a.client.getWith("/feed", listOf("Origin: http://localhost:" + a.port))
+    Check.status(same, 200)
+    Check.eqStr("same origin", "", same.header("Access-Control-Allow-Origin"))
+}
+
+test "a preflight of an allowed origin is answered with methods, echoed headers and max age" {
+    var a = corsApp()
+    var res = a.client.send("OPTIONS", "/feed", listOf("Origin: https://enois.ia.br", "Access-Control-Request-Method: POST", "Access-Control-Request-Headers: content-type,x-session-token,x-csrf-protection"), "", "")
+    Check.status(res, 200)
+    Check.eqStr("origin", "https://enois.ia.br", res.header("Access-Control-Allow-Origin"))
+    Check.eqStr("credentials", "true", res.header("Access-Control-Allow-Credentials"))
+    Check.eqStr("methods", "GET,POST,PUT,DELETE,PATCH,OPTIONS", res.header("Access-Control-Allow-Methods"))
+    Check.eqStr("headers", "content-type,x-session-token,x-csrf-protection", res.header("Access-Control-Allow-Headers"))
+    Check.eqStr("max age", "1800", res.header("Access-Control-Max-Age"))
+    var vary = res.header("Vary")
+    assert(vary.contains("Origin") && vary.contains("Access-Control-Request-Method") && vary.contains("Access-Control-Request-Headers"))
+}
+
+test "a preflight of an origin that is not allowed is refused" {
+    var a = corsApp()
+    var res = a.client.send("OPTIONS", "/feed", listOf("Origin: https://evil.example", "Access-Control-Request-Method: POST"), "", "")
+    Check.status(res, 403)
+    Check.eqStr("body", "Invalid CORS request", res.body)
+}
+
+test "an OPTIONS without Origin is a plain method check" {
+    var a = corsApp()
+    var res = a.client.send("OPTIONS", "/feed", listOf<String>(), "", "")
+    Check.status(res, 405)
+}
