@@ -1,0 +1,410 @@
+package communities
+
+import kernel.error.*
+import kernel.geo.*
+import kernel.html.*
+import kernel.id.*
+import kernel.sanctions.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+
+// Use cases of CommunityService. Idempotency, auth and JSON are the routes' business.
+//
+// ponytail: the Java `communitiesList` @Cacheable (20 s, invalidated after commit) is not ported: the
+// result is the same without it (the cache was only a read shortcut). Add a TtlCache of the JSON page
+// keyed by the filter if the showcase scan shows up in the slow-request log.
+class CommunityService {
+    CommunityStore repository
+    CommunityFeedLookup feed
+    SanctionGateReader sanctions
+    SuspiciousText suspicious
+    CommunityCoins coins
+    public constructor(repository: CommunityStore, feed: CommunityFeedLookup, sanctions: SanctionGateReader, suspicious: SuspiciousText, coins: CommunityCoins) {
+        this.repository = repository
+        this.feed = feed
+        this.sanctions = sanctions
+        this.suspicious = suspicious
+        this.coins = coins
+    }
+    CommunityRow create(name: String?, description: String?, topic: String?, cover: String?, avatar: String?, city: String?, state: String?, userId: String) {
+        // The ceilings are the columns' (name 255, description 2000): without them the database refused
+        // with "Data too long" and the person got a meaningless 409.
+        TextFieldLimit.check("COMMUNITY_FIELD_TOO_LONG", "nome", name, 255)
+        TextFieldLimit.check("COMMUNITY_FIELD_TOO_LONG", "descricao", description, 2000)
+        var place = CityState.of(city, state)
+        var id = Ids.prefixed("community_")
+        // Optional description: blank is NULL, not an empty text.
+        var finalDescription = CommunityNull.str()
+        if (description != null) {
+            if (description.trim().length() > 0) {
+                finalDescription = description.trim()
+            }
+        }
+        var now = Time.nowIso()
+        var placeCity = CommunityNull.str()
+        var placeState = CommunityNull.str()
+        var placeKey = CommunityNull.str()
+        if (place != null) {
+            placeCity = place.city
+            placeState = place.state
+            placeKey = place.cityKey
+        }
+        // A null name violates NOT NULL: the database answers 409 like Java's DataIntegrityViolation.
+        var community = CommunityRow(id, name as String, finalDescription, topic, cover, avatar, null, placeCity, placeState, placeKey, userId, now, now)
+        repository.insert(community)
+        repository.insertMember(id, userId, "ADMIN")
+        return community
+    }
+    CommunityRow update(communityId: String, name: String?, description: String?, topic: String?, cover: String?, avatar: String?, bannerHtml: String?, city: String?, state: String?, userId: String) {
+        var community = this.getById(communityId)
+        if (community.createdBy != userId) {
+            throw Errors.api(403, "FORBIDDEN", "So o criador pode atualizar a comunidade.")
+        }
+        TextFieldLimit.check("COMMUNITY_FIELD_TOO_LONG", "nome", name, 255)
+        TextFieldLimit.check("COMMUNITY_FIELD_TOO_LONG", "descricao", description, 2000)
+        var finalName = community.name
+        if (name != null) {
+            finalName = name
+        }
+        var finalDesc = community.description
+        if (description != null) {
+            finalDesc = description
+        }
+        var finalTopic = community.topic
+        if (topic != null) {
+            finalTopic = topic
+        }
+        var finalCover = community.cover
+        if (cover != null) {
+            finalCover = cover
+        }
+        var finalAvatar = community.avatar
+        if (avatar != null) {
+            finalAvatar = avatar
+        }
+        // HTML banner: same sanitiser as the profile cover. Absent keeps, empty clears (back to the photo),
+        // text is sanitised and replaces.
+        var finalBanner = community.bannerHtml
+        if (bannerHtml != null) {
+            finalBanner = CommunityNull.str()
+            if (bannerHtml.trim().length() > 0) {
+                finalBanner = SafeHtml.requireProfileHtml(bannerHtml)
+            }
+        }
+        // City/state: both absent keep, both empty clear, only one filled is 400.
+        var placeCity = community.city
+        var placeState = community.state
+        var placeKey = community.cityKey
+        if (city != null || state != null) {
+            var place = CityState.of(city, state)
+            placeCity = CommunityNull.str()
+            placeState = CommunityNull.str()
+            placeKey = CommunityNull.str()
+            if (place != null) {
+                placeCity = place.city
+                placeState = place.state
+                placeKey = place.cityKey
+            }
+        }
+        var updated = CommunityRow(community.id, finalName, finalDesc, finalTopic, finalCover, finalAvatar, finalBanner, placeCity, placeState, placeKey, community.createdBy, community.createdAt, Time.nowIso())
+        repository.update(updated)
+        return updated
+    }
+    join(communityId: String, userId: String) {
+        // Without this an unknown id left a membership row pointing at nothing.
+        this.getById(communityId)
+        if (repository.isMember(communityId, userId)) {
+            throw Errors.api(409, "ALREADY_MEMBER", "Voce ja e membro desta comunidade.")
+        }
+        repository.insertMember(communityId, userId, "MEMBER")
+        coins.recordPresence(userId)
+    }
+    // The owner cannot just leave while others remain (409 OWNERSHIP_TRANSFER_REQUIRED); the last member
+    // out deletes the community.
+    leave(communityId: String, userId: String) {
+        var community = this.getById(communityId)
+        if (!repository.isMember(communityId, userId)) {
+            throw Errors.api(404, "NOT_MEMBER", "Voce nao e membro desta comunidade.")
+        }
+        if (community.createdBy == userId && repository.countMembers(communityId) > 1) {
+            throw Errors.api(409, "OWNERSHIP_TRANSFER_REQUIRED", "Transfira a administracao para outro membro antes de sair.")
+        }
+        repository.removeMember(communityId, userId)
+        if (repository.countMembers(communityId) == 0) {
+            repository.removeAllMembers(communityId)
+            repository.delete(communityId)
+        }
+    }
+    // Only the current owner; the new owner becomes ADMIN, the old one a plain member.
+    CommunityRow transferOwnership(communityId: String, currentUserId: String, newOwnerId: String?) {
+        var community = this.getById(communityId)
+        if (community.createdBy != currentUserId) {
+            throw Errors.api(403, "FORBIDDEN", "So o dono pode transferir a administracao.")
+        }
+        if (newOwnerId == null) {
+            throw Errors.api(400, "INVALID_NEW_OWNER", "Escolha quem vai administrar a comunidade.")
+        }
+        if (newOwnerId.trim().length() == 0) {
+            throw Errors.api(400, "INVALID_NEW_OWNER", "Escolha quem vai administrar a comunidade.")
+        }
+        if (newOwnerId == currentUserId) {
+            throw Errors.api(400, "INVALID_NEW_OWNER", "Voce ja e o administrador desta comunidade.")
+        }
+        if (!repository.isMember(communityId, newOwnerId)) {
+            throw Errors.api(400, "NOT_MEMBER", "O novo administrador precisa ser membro da comunidade.")
+        }
+        var transferred = CommunityRow(community.id, community.name, community.description, community.topic, community.cover, community.avatar, community.bannerHtml, community.city, community.state, community.cityKey, newOwnerId, community.createdAt, Time.nowIso())
+        repository.update(transferred)
+        repository.updateMemberRole(communityId, newOwnerId, "ADMIN")
+        if (repository.isMember(communityId, currentUserId)) {
+            repository.updateMemberRole(communityId, currentUserId, "MEMBER")
+        }
+        return transferred
+    }
+    // Only the owner, or an admin (moderation of attack/spam, ECA Digital); members go with it.
+    deleteCommunity(communityId: String, userId: String, adminOverride: Bool) {
+        var community = this.getById(communityId)
+        if (!adminOverride && community.createdBy != userId) {
+            throw Errors.api(403, "FORBIDDEN", "So o dono pode excluir a comunidade.")
+        }
+        repository.removeAllMembers(communityId)
+        repository.delete(communityId)
+    }
+    List<CommunityRow> listMine(userId: String, limit: Int) = repository.findByMember(userId, CommunityRules.clampLimit(limit))
+    favorite(communityId: String, userId: String) {
+        this.getById(communityId)
+        repository.addFavorite(communityId, userId)
+    }
+    unfavorite(communityId: String, userId: String) {
+        repository.removeFavorite(communityId, userId)
+    }
+    List<CommunityRow> listFavorites(userId: String, limit: Int) = repository.findFavorites(userId, CommunityRules.clampLimit(limit))
+    // The showcase. `state` alone filters by UF; `city` needs `state` (the same name exists in many
+    // states). The city compares without accents or case.
+    List<CommunityRow> list(topic: String?, query: String?, city: String?, state: String?, before: String?, limit: Int) {
+        var uf = CommunityNull.str()
+        var cityKey = CommunityNull.str()
+        if (CommunityRules.has(city)) {
+            var place = CityState.of(city, state)
+            if (place != null) {
+                uf = place.state
+                cityKey = place.cityKey
+            }
+        }
+        else 
+            if (CommunityRules.has(state)) {
+                uf = CityState.requireState(state)
+            }
+        var topicFilter = CommunityNull.str()
+        if (CommunityRules.has(topic)) {
+            topicFilter = topic
+        }
+        return this.visible(repository.findAll(topicFilter, query, uf, cityKey, before, CommunityRules.clampLimit(limit)))
+    }
+    // Same city first, then the same state, each by member count. No city on the profile: empty.
+    List<CommunityRow> listLocal(place: CityState?, limit: Int) {
+        if (place == null) {
+            return listOf<CommunityRow>()
+        }
+        return this.visible(repository.findLocal(place.state, place.cityKey, limit))
+    }
+    // A community created by a banned account (or matching the content sweep) leaves the showcase.
+    List<CommunityRow> visible(communities: List<CommunityRow>) {
+        var owners = listOf<String>()
+        for (var c in communities) {
+            owners.add(c.createdBy)
+        }
+        var banned = sanctions.bannedAmong(owners)
+        var out = listOf<CommunityRow>()
+        for (var c in communities) {
+            var text = ""
+            if (c.description != null) {
+                text = c.description as String
+            }
+            var hide = banned.contains(c.createdBy)
+            if (!hide) {
+                hide = suspicious.matchesAny(listOf(c.name, text))
+            }
+            if (!hide) {
+                out.add(c)
+            }
+        }
+        return out
+    }
+    CommunityRow getById(id: String) {
+        var c = repository.findById(id)
+        if (c == null) {
+            throw Errors.api(404, "COMMUNITY_NOT_FOUND", "Comunidade nao encontrada.")
+        }
+        return c
+    }
+    Bool isMember(communityId: String, userId: String) = repository.isMember(communityId, userId)
+    // Pins ONE post on top of the community: only an ADMIN, the post must be active and of this
+    // community; pinning another replaces the previous one.
+    String pinPost(communityId: String, postId: String, userId: String) {
+        this.getById(communityId)
+        this.requireAdmin(communityId, userId)
+        var post = feed.postRef(postId)
+        if (post == null) {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+        }
+        if (!post.active) {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+        }
+        if (post.communityId != communityId) {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post nao pertence a esta comunidade.")
+        }
+        repository.savePinnedPost(communityId, postId, userId)
+        return postId
+    }
+    unpinPost(communityId: String, userId: String) {
+        this.getById(communityId)
+        this.requireAdmin(communityId, userId)
+        repository.removePinnedPost(communityId)
+    }
+    String? pinnedPostId(communityId: String) = repository.findPinnedPostId(communityId)
+    requireAdmin(communityId: String, userId: String) {
+        var member = repository.findMember(communityId, userId)
+        if (member == null) {
+            throw Errors.api(403, "FORBIDDEN", "So quem administra a comunidade pode fixar publicacoes.")
+        }
+        if (member.role != "ADMIN") {
+            throw Errors.api(403, "FORBIDDEN", "So quem administra a comunidade pode fixar publicacoes.")
+        }
+    }
+    Int countMembers(communityId: String) = repository.countMembers(communityId)
+    Map<String,Int> countMembersByIds(ids: List<String>) = repository.countMembersByIds(ids)
+    List<String> memberCommunityIds(userId: String, ids: List<String>) = repository.memberCommunityIds(userId, ids)
+    List<CommunityMemberRow> findMembers(communityId: String) = repository.findMembers(communityId)
+}
+
+// Private channels by theme inside a community. One access rule: whoever is in the community is in its
+// channels.
+class CommunityChannelService {
+    CommunityChannelStore channels
+    CommunityService communities
+    public constructor(channels: CommunityChannelStore, communities: CommunityService) {
+        this.channels = channels
+        this.communities = communities
+    }
+    static CommunityChannelView view(c: CommunityChannelRow) = CommunityChannelView(c.id, c.name, c.slug, c.topic, c.description, c.createdAt)
+    // Members only. A non-member gets 403, never a misleading empty list.
+    List<CommunityChannelView> list(communityId: String, viewerId: String) {
+        this.requireMember(communityId, viewerId)
+        var out = listOf<CommunityChannelView>()
+        for (var c in channels.findByCommunity(communityId)) {
+            out.add(CommunityChannelService.view(c))
+        }
+        return out
+    }
+    // Any member may create one (the community is the trust filter).
+    CommunityChannelView create(communityId: String, viewerId: String, name: String?, topic: String?, description: String?) {
+        this.requireMember(communityId, viewerId)
+        if (!CommunityRules.has(name)) {
+            throw Errors.api(400, "INVALID_CHANNEL_NAME", "Dê um nome ao canal.")
+        }
+        var rawName = name as String
+        var cleanName = rawName.trim()
+        if (cleanName.length() < 2 || cleanName.length() > CommunityRules.channelNameMax()) {
+            throw Errors.api(400, "INVALID_CHANNEL_NAME", "O nome do canal deve ter entre 2 e " + CommunityRules.channelNameMax() + " caracteres.")
+        }
+        if (CommunityRules.trimLength(description) > CommunityRules.channelDescriptionMax()) {
+            throw Errors.api(400, "INVALID_CHANNEL_DESCRIPTION", "A descrição do canal deve ter no máximo " + CommunityRules.channelDescriptionMax() + " caracteres.")
+        }
+        if (channels.countByCommunity(communityId) >= CommunityRules.maxChannelsPerCommunity()) {
+            throw Errors.api(409, "CHANNEL_LIMIT_REACHED", "Esta comunidade já atingiu o limite de canais.")
+        }
+        var cleanTopic = this.normalizeTopic(topic)
+        var slug = this.uniqueSlug(communityId, cleanName)
+        var cleanDescription = CommunityNull.str()
+        if (CommunityRules.has(description)) {
+            var rawDescription = description as String
+            cleanDescription = rawDescription.trim()
+        }
+        var channel = CommunityChannelRow(Ids.prefixed("chan_"), communityId, cleanName, slug, cleanTopic, cleanDescription, viewerId, Time.nowIso())
+        channels.insert(channel)
+        return CommunityChannelService.view(channel)
+    }
+    // A channel of a community for a member (or 403/404). Used by the channel feed.
+    CommunityChannelRow requireChannelForMember(communityId: String, channelId: String, viewerId: String) {
+        this.requireMember(communityId, viewerId)
+        var channel = channels.findById(channelId)
+        if (channel == null) {
+            throw Errors.api(404, "CHANNEL_NOT_FOUND", "Canal não encontrado.")
+        }
+        if (channel.communityId != communityId) {
+            throw Errors.api(404, "CHANNEL_NOT_FOUND", "Canal não encontrado nesta comunidade.")
+        }
+        return channel
+    }
+    requireMember(communityId: String, viewerId: String) {
+        if (viewerId.trim().length() == 0) {
+            throw Errors.api(401, "UNAUTHENTICATED", "Entre para acessar os canais da comunidade.")
+        }
+        communities.getById(communityId)
+        if (!communities.isMember(communityId, viewerId)) {
+            throw Errors.api(403, "NOT_A_MEMBER", "Os canais são privados: só quem participa da comunidade pode ver.")
+        }
+    }
+    String? normalizeTopic(topic: String?) {
+        if (!CommunityRules.has(topic)) {
+            return null
+        }
+        var rawTopic = topic as String
+        var normalized = rawTopic.trim().toUpperCase()
+        if (!CommunityRules.topics().contains(normalized)) {
+            throw Errors.api(400, "INVALID_TOPIC", "Assunto inválido: escolha um da lista.")
+        }
+        return normalized
+    }
+    String uniqueSlug(communityId: String, name: String) {
+        var base = CommunityRules.slugify(name)
+        var slug = base
+        var suffix = 2
+        while (channels.existsBySlug(communityId, slug)) {
+            slug = base + "-" + suffix
+            suffix = suffix + 1
+        }
+        return slug
+    }
+}
+
+// What the feed reads from communities (PostCommunityReader): name, topic and whether the reader is in.
+// Exposed for the feed port: `Main.kf` hands the same instance to it.
+class CommunityDirectory {
+    CommunityStore repository
+    public constructor(repository: CommunityStore) {
+        this.repository = repository
+    }
+    // Communities by id; unknown ids are absent. `joined` is false without a viewer.
+    Map<String,CommunityRef> byIds(communityIds: List<String>, viewerId: String?) {
+        var out = mapOf<String, CommunityRef>()
+        for (var id in communityIds) {
+            var c = repository.findById(id)
+            if (c != null) {
+                var joined = false
+                if (viewerId != null) {
+                    joined = repository.isMember(id, viewerId)
+                }
+                out.put(id, CommunityRef(c.id, c.name, c.topic, joined))
+            }
+        }
+        return out
+    }
+}
+
+// What the feed reads from channels (CommunityChannelReader).
+class CommunityChannelDirectory {
+    CommunityChannelStore channels
+    public constructor(channels: CommunityChannelStore) {
+        this.channels = channels
+    }
+    CommunityChannelRef? byId(channelId: String) {
+        var c = channels.findById(channelId)
+        if (c == null) {
+            return null
+        }
+        return CommunityChannelRef(c.id, c.communityId, c.name, c.topic)
+    }
+}
