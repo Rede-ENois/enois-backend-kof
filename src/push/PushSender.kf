@@ -1,0 +1,101 @@
+package push
+
+import kernel.log.*
+import kernel.push.*
+
+// pending-port: none. The outgoing side of push (PushSender). This base class is the disabled default;
+// WebPushSender is the real one and tests subclass it (or WebPushSender.deliver) to capture messages.
+class PushSender {
+    public constructor() {}
+    Bool isEnabled() = false
+    String? publicKey() = null
+    sendToUser(userId: String, message: PushMessage);
+}
+
+// Web Push with VAPID (WebPushSender). Off without VAPID keys. Every device of the user gets the
+// message (at most MAX_SUBSCRIPTIONS_PER_USER, only allow-listed push services); a device the push
+// service reports gone (404/410) is forgotten. The network call is `deliver`, replaceable in tests.
+class WebPushSender extends PushSender {
+    PushStore store
+    WebPushAdapter? adapter
+    Bool anyEndpoint
+    Log log = Log("push.sender")
+    public constructor(store: PushStore, adapter: WebPushAdapter?, anyEndpoint: Bool) {
+        super()
+        this.store = store
+        this.adapter = adapter
+        this.anyEndpoint = anyEndpoint
+    }
+    static WebPushSender fromConfig(store: PushStore, publicKey: String, privateKey: String, subject: String) {
+        var adapter = WebPushAdapter.create(publicKey, privateKey, subject)
+        if (adapter == null) {
+            Log("push.sender").info("Web Push desligado: configure VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY para ativar.")
+        }
+        return WebPushSender(store, adapter, false)
+    }
+    static Int ttlSeconds() = 86400
+    Bool isEnabled() = adapter != null
+    String? publicKey() {
+        var a = adapter
+        if (a == null) {
+            return null
+        }
+        return a.publicKey
+    }
+    // The payload the service worker reads: title, body, url (default /feed), notificationId, tag.
+    static String toJson(message: PushMessage) {
+        var url = "/feed"
+        var given = message.url()
+        if (given != null) {
+            url = given
+        }
+        var out = "{\"title\":" + json.encode(message.title()) + ",\"body\":" + json.encode(message.body()) + ",\"url\":" + json.encode(url) + ",\"notificationId\":" + json.encode(message.notificationId())
+        var tag = message.tag()
+        if (tag != null) {
+            out = out + ",\"tag\":" + json.encode(tag)
+        }
+        return out + "}"
+    }
+    sendToUser(userId: String, message: PushMessage) {
+        if (adapter == null) {
+            return
+        }
+        var devices = store.findByUser(userId)
+        if (devices.isEmpty()) {
+            return
+        }
+        var payload = WebPushSender.toJson(message)
+        var sent = 0
+        for (var device in devices) {
+            if (sent >= PushSubscriptionService.maxSubscriptionsPerUser()) {
+                log.warn("push: conta tem mais dispositivos que o teto; excedente ignorado")
+                break
+            }
+            if (!anyEndpoint && !PushSubscriptionService.allowedPushEndpoint(device.endpoint())) {
+                log.warn("push: endpoint fora da allowlist ignorado")
+                continue
+            }
+            sendOne(device, payload)
+            sent = sent + 1
+        }
+    }
+    sendOne(device: PushSubscriptionRecord, payload: String) {
+        var status = deliver(device, payload)
+        if (status == 404 || status == 410) {
+            store.deleteById(device.id())
+            log.info("push subscription expirada removida")
+        }
+        else 
+            if (status >= 400) {
+                log.warn("push rejeitado (status " + status + ")")
+            }
+    }
+    // Posts to the push service; the HTTP status, or -1 when the call failed.
+    Int deliver(device: PushSubscriptionRecord, payload: String) {
+        var a = adapter
+        if (a == null) {
+            return -1
+        }
+        return a.post(device.endpoint(), device.p256dh(), device.auth(), payload, WebPushSender.ttlSeconds())
+    }
+}

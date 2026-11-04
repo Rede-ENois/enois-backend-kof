@@ -1,0 +1,101 @@
+package push
+
+import java.net.URI
+import kernel.error.*
+import kernel.id.*
+import kernel.time.*
+
+// Subscriptions of the devices of a user (PushSubscriptionService).
+class PushSubscriptionService {
+    PushStore store
+    PushSender sender
+    public constructor(store: PushStore, sender: PushSender) {
+        this.store = store
+        this.sender = sender
+    }
+    static Int maxEndpointLength() = 700
+    static Int maxSubscriptionsPerUser() = 10
+    static List<String> allowedHosts() = listOf<String>("fcm.googleapis.com", "updates.push.services.mozilla.com", "push.services.mozilla.com", "web.push.apple.com", "notify.windows.com")
+    Bool isEnabled() = sender.isEnabled()
+    String? publicKey() = sender.publicKey()
+    static Bool hasText(v: String?) {
+        if (v == null) {
+            return false
+        }
+        return v.trim().length() > 0
+    }
+    // https only, no credentials, port 443, host (or a subdomain of it) on the allowlist.
+    static Bool allowedPushEndpoint(endpoint: String) {
+        try {
+            var uri = URI.create(endpoint)
+            var scheme = uri.getScheme()
+            if (scheme == null || scheme.toLowerCase() != "https") {
+                return false
+            }
+            if (uri.getUserInfo() != null) {
+                return false
+            }
+            var rawHost = uri.getHost()
+            if (rawHost == null) {
+                return false
+            }
+            var port = uri.getPort()
+            if (port != -1 && port != 443) {
+                return false
+            }
+            var host = rawHost.toLowerCase()
+            for (var allowed in PushSubscriptionService.allowedHosts()) {
+                if (host == allowed || host.endsWith("." + allowed)) {
+                    return true
+                }
+            }
+            return false
+        } catch (String invalid) {
+            return false
+        }
+    }
+    static String textOf(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    PushSubscriptionRecord register(userId: String, rawEndpoint: String?, rawP256dh: String?, rawAuth: String?) {
+        var endpoint = PushSubscriptionService.textOf(rawEndpoint)
+        var p256dh = PushSubscriptionService.textOf(rawP256dh)
+        var auth = PushSubscriptionService.textOf(rawAuth)
+        if (rawEndpoint == null || !endpoint.startsWith("https://") || endpoint.trim().length() == 0) {
+            throw Errors.api(400, "INVALID_PUSH_SUBSCRIPTION", "Endpoint de push invalido.")
+        }
+        if (rawP256dh == null || rawAuth == null || p256dh.trim().length() == 0 || auth.trim().length() == 0) {
+            throw Errors.api(400, "INVALID_PUSH_SUBSCRIPTION", "Chaves do dispositivo obrigatorias.")
+        }
+        if (endpoint.length() > PushSubscriptionService.maxEndpointLength()) {
+            throw Errors.api(400, "INVALID_PUSH_SUBSCRIPTION", "Endpoint de push longo demais (maximo " + PushSubscriptionService.maxEndpointLength() + " caracteres).")
+        }
+        var trimmed = endpoint.trim()
+        if (!PushSubscriptionService.allowedPushEndpoint(trimmed)) {
+            throw Errors.api(400, "INVALID_PUSH_SUBSCRIPTION", "Endpoint de push de um servico nao suportado.")
+        }
+        var existing = store.findByEndpoint(trimmed)
+        if (existing == null && store.findByUser(userId).size() >= PushSubscriptionService.maxSubscriptionsPerUser()) {
+            throw Errors.api(429, "TOO_MANY_PUSH_SUBSCRIPTIONS", "Limite de " + PushSubscriptionService.maxSubscriptionsPerUser() + " dispositivos por conta atingido.")
+        }
+        var now = Time.nowIso()
+        if (existing != null) {
+            var updated = PushSubscriptionRecord(existing.id(), userId, trimmed, p256dh.trim(), auth.trim(), existing.createdAt(), now)
+            store.update(updated)
+            return updated
+        }
+        var created = PushSubscriptionRecord(Ids.prefixed("push_"), userId, trimmed, p256dh.trim(), auth.trim(), now, now)
+        store.insert(created)
+        return created
+    }
+    unregister(userId: String, endpoint: String) {
+        if (endpoint.trim().length() == 0) {
+            throw Errors.api(400, "INVALID_PUSH_SUBSCRIPTION", "Endpoint de push obrigatorio.")
+        }
+        store.deleteByEndpointAndUser(endpoint.trim(), userId)
+    }
+    List<PushSubscriptionRecord> listByUser(userId: String) = store.findByUser(userId)
+}

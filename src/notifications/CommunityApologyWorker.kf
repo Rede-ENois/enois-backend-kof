@@ -1,0 +1,78 @@
+package notifications
+
+import kernel.config.*
+import kernel.jobs.*
+import kernel.log.*
+import kernel.time.*
+
+// The one-off apology of 2026-10-21: every account gets 100 faiscas and a SISTEMA notification, once
+// (CommunityApologyWorker). `system_announcements` makes the whole run idempotent; the per-account
+// reward reference and the existing notification make a half-finished run safe to repeat.
+class CommunityApologyWorker {
+    Notifications notifications
+    NotificationsStore store
+    NotificationCoins coins
+    NotificationAccounts accounts
+    Log log = Log("notifications.apology")
+    public constructor(notifications: Notifications, store: NotificationsStore, coins: NotificationCoins, accounts: NotificationAccounts) {
+        this.notifications = notifications
+        this.store = store
+        this.coins = coins
+        this.accounts = accounts
+    }
+    static String announcementKey() = "desculpa-comunidade-2026-10-21"
+    static String title() = "Estamos trabalhando para melhorar o Énóis!"
+    static String body() = "Pedimos desculpas pelos inconvenientes dos últimos dias. " + "Estamos trabalhando ativamente para corrigir problemas, reforçar a segurança e tornar a " + "plataforma cada vez melhor para todo mundo. Obrigada pela paciência e por fazer parte dessa " + "comunidade. O Énóis é feito por pessoas, para pessoas, e seguimos construindo tudo isso com " + "muito cuidado e transparência. Seguimos juntos. E para agradecer, você recebeu 100 faíscas " + "para usar como quiser na loja, no marketplace e nos espaços da comunidade."
+    static String href() = "/marketplace"
+    static String cta() = "Ver as novidades"
+    // FAIS(100L): the coin scale is 1000 per faisca.
+    static Long bonus() = 100000L
+    static Int pageSize() = 200
+    // @Scheduled(fixedDelay = rede.communications.apology-delay-ms:1800000, initialDelay = ...:90000).
+    schedule(jobs: Scheduler, cfg: Config) {
+        var self = this
+        jobs.fixedDelay("community-apology", cfg.getLong("REDE_COMMUNICATIONS_APOLOGY_INITIAL_DELAY_MS", 90000L), cfg.getLong("REDE_COMMUNICATIONS_APOLOGY_DELAY_MS", 1800000L), () -> {
+    self.announce()
+})
+    }
+    Int announce() {
+        if (store.announcementSent(CommunityApologyWorker.announcementKey())) {
+            return 0
+        }
+        var announced = 0
+        var offset = 0
+        while (true) {
+            var ids = accounts.allIds(offset, CommunityApologyWorker.pageSize())
+            if (ids.isEmpty()) {
+                break
+            }
+            for (var userId in ids) {
+                try {
+                    var ref = CommunityApologyWorker.announcementKey() + ":" + userId
+                    if (!coins.hasReward(ref)) {
+                        coins.reward(userId, CommunityApologyWorker.bonus(), ref, "Desculpas pelos últimos dias — 100 faíscas de presente")
+                    }
+                    var alreadyNotified = false
+                    for (var n in notifications.listRecent(userId, 10)) {
+                        if (n.title() == CommunityApologyWorker.title()) {
+                            alreadyNotified = true
+                        }
+                    }
+                    if (!alreadyNotified) {
+                        notifications.create(userId, "SISTEMA", "sistema", CommunityApologyWorker.title(), CommunityApologyWorker.body(), CommunityApologyWorker.href(), CommunityApologyWorker.cta())
+                    }
+                    announced = announced + 1
+                } catch (String perUser) {
+                    log.warn("Falha ao comunicar o usuário " + userId + " sobre as desculpas: " + perUser)
+                }
+            }
+            if (ids.size() < CommunityApologyWorker.pageSize()) {
+                break
+            }
+            offset = offset + CommunityApologyWorker.pageSize()
+        }
+        store.markAnnouncementSent(CommunityApologyWorker.announcementKey(), Time.nowIso())
+        log.info("Comunicado de desculpas enviado: " + announced + " usuários, 100 faíscas cada.")
+        return announced
+    }
+}

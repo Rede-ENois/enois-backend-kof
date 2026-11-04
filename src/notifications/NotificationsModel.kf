@@ -1,0 +1,224 @@
+package notifications
+
+import kernel.error.*
+import java.util.regex.Pattern
+
+// A stored notification (table `notifications`). `read` maps to the column `is_read`.
+record NotificationRecord(String id, String userId, String kind, String actorId, String title, String? body, String? href, String? ctaLabel, Bool read, String createdAt, String? groupKey, Int actorCount, String? preview)
+
+// What a notification points at, read from its href (NotificationTarget): `type` is COMMUNITY, POST,
+// GROUP or EVENT.
+record NotificationTarget(String type, String key)
+
+// The community or group a notification came from (NotificationPlace). `color` is always null.
+record NotificationPlaceView(String type, String id, String name, String? color)
+
+// The raw fact event a notification was created (NotificationCreatedEvent). `tag` groups the pushes of
+// one device: a new push with the same tag replaces the previous one.
+record NotificationCreatedEvent(String notificationId, String userId, String kind, String title, String body, String href, String? tag)
+
+// One unread count row grouped by kind, actor and href (NotificationRepository.UnreadCount).
+record NotificationUnreadCount(String kind, String? actorId, String? href, Long count)
+
+// Where a href lands: a place and/or the day of an event (NotificationPlaces.Resolved).
+record NotificationResolved(NotificationPlaceView? place, String? eventDate)
+
+// GET /me/notification-preferences and PUT answer (PreferencesView). `updatedAt` is null for the defaults.
+record NotificationPreferencesView(Bool weeklyDigest, Bool pushSocial, Bool pushMessages, Bool pushGroups, Bool pushJobs, Bool pushSystem, String? updatedAt)
+
+// The push category of each kind (NotificationCategory): the single place that decides which toggle a
+// kind obeys. SOCIAL, MESSAGES, GROUPS, JOBS, SYSTEM or ALWAYS (security, moderation and sanctions are
+// pushed whatever the person chose). An unmapped kind falls back to SYSTEM.
+class NotificationCategories {
+    static String always() = "|SEGURANCA|MODERACAO|SANCAO|RECURSO|"
+    static String social() = "|CONNECTION_REQUEST|CONNECTION_ACCEPTED|NEW_COMMENT|NEW_REPLY|NEW_REACTION|COMMENT_REACTION|MENTION|ANSWER_ACCEPTED|STUDY_PAIR_MATCHED|STUDY_PAIR_CHECKIN|STUDY_PAIR_ENDED|STUDY_PAIR_REMINDER|"
+    static String messages() = "|NEW_MESSAGE|NEW_WORK_MESSAGE|CALL_INCOMING|CALL_MISSED|CALL_ENDED|"
+    static String groups() = "|CALL_GROUP_LIVE|GROUP_MEMBER_JOINED|GROUP_JOIN_REQUEST|GROUP_JOIN_APPROVED|GROUP_JOIN_REJECTED|GROUP_MEMBER_REMOVED|GROUP_OWNERSHIP_TRANSFERRED|GROUP_CONTENT_REMOVED|GROUP_STATUS_CHANGED|GROUP_NEW_POST|NEW_GROUP_COMMENT|NEW_GROUP_REPLY|NEW_BLOG_POST|NEW_GAME|JOGO_DIARIO|EVENT_NEXT_OCCURRENCE|"
+    static String jobs() = "|JOB_APPLICATION_STATUS|COMPANY_NEW_OPPORTUNITY|"
+    static String system() = "|SUPORTE|MICROPROJETO|SISTEMA|"
+    static String of(kind: String?) {
+        if (kind == null) {
+            return "SYSTEM"
+        }
+        var key = "|" + kind + "|"
+        if (NotificationCategories.always().contains(key)) {
+            return "ALWAYS"
+        }
+        if (NotificationCategories.social().contains(key)) {
+            return "SOCIAL"
+        }
+        if (NotificationCategories.messages().contains(key)) {
+            return "MESSAGES"
+        }
+        if (NotificationCategories.groups().contains(key)) {
+            return "GROUPS"
+        }
+        if (NotificationCategories.jobs().contains(key)) {
+            return "JOBS"
+        }
+        return "SYSTEM"
+    }
+    // Is the kind in the closed table (the Java test scans the sources for kinds that are not).
+    static Bool isMapped(kind: String) {
+        var key = "|" + kind + "|"
+        return NotificationCategories.always().contains(key) || NotificationCategories.social().contains(key) || NotificationCategories.messages().contains(key) || NotificationCategories.groups().contains(key) || NotificationCategories.jobs().contains(key) || NotificationCategories.system().contains(key)
+    }
+    // NotificationPreferences.allowsPush: does this person's toggle let the kind reach the phone.
+    static Bool allowsPush(prefs: NotificationPreferencesView, kind: String?) {
+        var category = NotificationCategories.of(kind)
+        if (category == "ALWAYS") {
+            return true
+        }
+        if (category == "SOCIAL") {
+            return prefs.pushSocial()
+        }
+        if (category == "MESSAGES") {
+            return prefs.pushMessages()
+        }
+        if (category == "GROUPS") {
+            return prefs.pushGroups()
+        }
+        if (category == "JOBS") {
+            return prefs.pushJobs()
+        }
+        return prefs.pushSystem()
+    }
+}
+
+// The interface area a kind belongs to (NotificationModule), so the menu can flag the area with news.
+// Compared case-insensitively; OTHER for kinds with no menu of their own.
+class NotificationModules {
+    static String of(kind: String?) {
+        if (kind == null) {
+            return "OTHER"
+        }
+        var k = kind.toUpperCase()
+        if ("|MESSAGE|NEW_MESSAGE|NEW_WORK_MESSAGE|CALL_INCOMING|CALL_MISSED|CALL_ENDED|".contains("|" + k + "|")) {
+            return "MESSAGES"
+        }
+        if (k == "CALL_GROUP_LIVE") {
+            return "GROUPS"
+        }
+        if (k == "EVENT" || k == "EVENT_NEXT_OCCURRENCE") {
+            return "EVENTS"
+        }
+        if (k == "JOB" || k == "JOB_APPLICATION_STATUS" || k == "COMPANY_NEW_OPPORTUNITY") {
+            return "JOBS"
+        }
+        if (k == "MICROPROJETO") {
+            return "COMPANIES"
+        }
+        if (k == "MENTORING") {
+            return "MENTORING"
+        }
+        if (k == "JOGO_DIARIO") {
+            return "DAILY_GAMES"
+        }
+        if (k == "NEW_GAME") {
+            return "COMMUNITY_GAMES"
+        }
+        if (k == "NEW_BLOG_POST") {
+            return "BLOGS"
+        }
+        if (k == "CONNECTION_REQUEST" || k == "CONNECTION_ACCEPTED") {
+            return "NETWORK"
+        }
+        if (k.startsWith("GROUP_") || k.startsWith("NEW_GROUP_")) {
+            return "GROUPS"
+        }
+        if (k.startsWith("STUDY_PAIR_")) {
+            return "STUDY_PAIRS"
+        }
+        return "OTHER"
+    }
+    // Kinds that have their own channel (messages, connection requests) are not counted in the summary.
+    static Bool hasOwnChannel(kind: String?) = NotificationModules.of(kind) == "MESSAGES" || kind != null && kind.toUpperCase() == "CONNECTION_REQUEST"
+}
+
+// The interface a notification belongs to (NotificationContext): SOCIAL, PROFESSIONAL or SHARED.
+class NotificationContexts {
+    static String professionalList() = "(\'JOB_APPLICATION_STATUS\', \'NEW_WORK_MESSAGE\', \'MICROPROJETO\', \'COMPANY_NEW_OPPORTUNITY\')"
+    static String sharedList() = "(\'SEGURANCA\', \'MODERACAO\', \'SANCAO\', \'RECURSO\', \'SUPORTE\', \'SISTEMA\')"
+    static String of(kind: String?) {
+        if (kind == null) {
+            return "SOCIAL"
+        }
+        if ("|JOB_APPLICATION_STATUS|NEW_WORK_MESSAGE|MICROPROJETO|COMPANY_NEW_OPPORTUNITY|".contains("|" + kind + "|")) {
+            return "PROFESSIONAL"
+        }
+        if ("|SEGURANCA|MODERACAO|SANCAO|RECURSO|SUPORTE|SISTEMA|".contains("|" + kind + "|")) {
+            return "SHARED"
+        }
+        return "SOCIAL"
+    }
+    // The `context` query parameter: null for none, 400 INVALID_CONTEXT for anything but SOCIAL/PROFESSIONAL.
+    static String? parse(value: String?) {
+        if (value == null) {
+            return null
+        }
+        if (value.trim().length() == 0) {
+            return null
+        }
+        var normalized = value.trim().toUpperCase()
+        if (normalized != "SOCIAL" && normalized != "PROFESSIONAL") {
+            throw Errors.api(400, "INVALID_CONTEXT", "Contexto invalido: use SOCIAL ou PROFESSIONAL.")
+        }
+        return normalized
+    }
+}
+
+// Reads the target of an href (NotificationTarget.of): /comunidades/{id}, /api/feed/posts/{id}[?reacoes=1],
+// /grupos/{slug} and /eventos?evento={id}. Any other href has no target.
+class NotificationTargets {
+    static NotificationTarget? of(href: String?) {
+        if (href == null) {
+            return null
+        }
+        var community = NotificationTargets.find("^/comunidades/([^/?#]+)", href)
+        if (community != null) {
+            return NotificationTarget("COMMUNITY", community)
+        }
+        var post = NotificationTargets.find("^/api/feed/posts/([^/?#]+)", href)
+        if (post != null) {
+            return NotificationTarget("POST", post)
+        }
+        var group = NotificationTargets.find("^/grupos/([^/?#]+)", href)
+        if (group != null) {
+            return NotificationTarget("GROUP", group)
+        }
+        var event = NotificationTargets.find("^/eventos\\?(?:[^#]*&)?evento=([^&#]+)", href)
+        if (event != null) {
+            return NotificationTarget("EVENT", event)
+        }
+        return null
+    }
+    static String? find(pattern: String, href: String) {
+        var matcher = Pattern.compile(pattern).matcher(href)
+        if (matcher.find()) {
+            return matcher.group(1)
+        }
+        return null
+    }
+}
+
+// The short readable excerpt of a post or comment shown below the notification body
+// (NotificationPreview): HTML tags and light markdown out, 140 characters at most.
+class NotificationPreviews {
+    static Int maxChars() = 140
+    static String? of(content: String?) {
+        if (content == null) {
+            return null
+        }
+        if (content.trim().length() == 0) {
+            return null
+        }
+        var text = content.replaceAll("<[^>]+>", " ").replaceAll("!\\[[^\\]]*\\]\\([^\\)]*\\)", " ").replaceAll("\\[([^\\]]*)\\]\\([^\\)]*\\)", "$1").replaceAll("(?m)^#{1,6}\\s*", "").replaceAll("[*_`>~]", "").replaceAll("\\s+", " ").trim()
+        if (text.length() == 0) {
+            return null
+        }
+        if (text.length() > NotificationPreviews.maxChars()) {
+            return text.substring(0, NotificationPreviews.maxChars()).trim() + "…"
+        }
+        return text
+    }
+}

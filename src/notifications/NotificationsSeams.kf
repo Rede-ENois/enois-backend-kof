@@ -1,0 +1,136 @@
+package notifications
+
+import java.util.HashMap
+import kernel.db.*
+import kernel.log.*
+
+// Name styling of a profile (NameStyleView): null when the profile has none of the four fields.
+record NotificationNameStyle(String? theme, String? font, String? color, String? nameplate)
+
+// A person as the notification list shows them (UserProfile name, username, avatar, name style).
+record NotificationActor(String id, String name, String username, String? avatar, NotificationNameStyle? style)
+
+// The ACTIVE professional identity of a person (CorporateProfile).
+record NotificationCorporate(String userId, String name, String username, String? avatar)
+
+// pending-port: profile + corporate. Who an actor is. The default reads `users` and `corporate_profiles`
+// read-only with the same columns the owners use; the profile / corporate ports subclass it and
+// override a method.
+class NotificationActors {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    static String marks(n: Int) {
+        var sb = ""
+        var i = 0
+        while (i < n) {
+            if (i > 0) {
+                sb = sb + ", "
+            }
+            sb = sb + "?"
+            i = i + 1
+        }
+        return sb
+    }
+    static DbParams bindAll(ids: List<String>) {
+        var p = DbParams()
+        for (var id in ids) {
+            p.bindStr(id)
+        }
+        return p
+    }
+    static NotificationNameStyle? styleOf(theme: String?, font: String?, color: String?, plate: String?) {
+        if (theme == null && font == null && color == null && plate == null) {
+            return null
+        }
+        return NotificationNameStyle(theme, font, color, plate)
+    }
+    Map<String,NotificationActor> profilesByIds(ids: List<String>) {
+        var out = new HashMap<String, NotificationActor>()
+        if (ids.isEmpty()) {
+            return out
+        }
+        var rows = database.queryList("select id, name, username, avatar, name_theme, name_font, name_color, nameplate from users where id in (" + NotificationActors.marks(ids.size()) + ")", NotificationActors.bindAll(ids))
+        for (var r in rows) {
+            var theme = r.getStrOrNull("name_theme")
+            var font = r.getStrOrNull("name_font")
+            var color = r.getStrOrNull("name_color")
+            var plate = r.getStrOrNull("nameplate")
+            out.put(r.getStr("id"), NotificationActor(r.getStr("id"), r.getStr("name"), r.getStr("username"), r.getStrOrNull("avatar"), NotificationActors.styleOf(theme, font, color, plate)))
+        }
+        return out
+    }
+    // Only ACTIVE identities.
+    Map<String,NotificationCorporate> activeCorporatesByIds(ids: List<String>) {
+        var out = new HashMap<String, NotificationCorporate>()
+        if (ids.isEmpty()) {
+            return out
+        }
+        var rows = database.queryList("select user_id, name, username, avatar from corporate_profiles where status = \'ACTIVE\' and user_id in (" + NotificationActors.marks(ids.size()) + ")", NotificationActors.bindAll(ids))
+        for (var r in rows) {
+            out.put(r.getStr("user_id"), NotificationCorporate(r.getStr("user_id"), r.getStr("name"), r.getStr("username"), r.getStrOrNull("avatar")))
+        }
+        return out
+    }
+    // The registration name of a person, or null for an unknown id.
+    String? nameOf(userId: String) {
+        var row = database.queryOptional("select name from users where id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return row.getStr("name")
+    }
+}
+
+// The post or comment a notification is about (feed domain).
+record NotificationSource(String id, String authorId, String content)
+
+// pending-port: feed. Reads of posts and comments for the outbox handler. The default reads `posts` and
+// `comments` read-only; the feed port subclasses it.
+class NotificationSources {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    NotificationSource? post(postId: String) {
+        var r = database.queryOptional("select id, author_id, content from posts where id = ?", DbParams().bindStr(postId))
+        if (r == null) {
+            return null
+        }
+        return NotificationSource(r.getStr("id"), r.getStr("author_id"), r.getStr("content"))
+    }
+    NotificationSource? comment(commentId: String) {
+        var r = database.queryOptional("select id, author_id, content from comments where id = ?", DbParams().bindStr(commentId))
+        if (r == null) {
+            return null
+        }
+        return NotificationSource(r.getStr("id"), r.getStr("author_id"), r.getStr("content"))
+    }
+}
+
+// pending-port: coin. The faiscas ledger for the community apology. The default is a logged no-op (a
+// reward moves the treasury and the account in two ledger lines: not a single insert), so no faiscas are
+// granted until the coin port subclasses it. `hasReward(ref)` answers false by default.
+class NotificationCoins {
+    Log log = Log("notifications.coins")
+    Bool hasReward(ref: String) = false
+    reward(userId: String, amount: Long, ref: String, message: String) {
+        log.warn("coin_reward_pending ref=" + ref)
+    }
+}
+
+// pending-port: profile. Ids of every account, paged, for the apology announcement.
+class NotificationAccounts {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    List<String> allIds(offset: Int, limit: Int) {
+        var out = listOf<String>()
+        for (var r in database.queryList("select id from users order by id limit " + limit + " offset " + offset, DbParams())) {
+            out.add(r.getStr("id"))
+        }
+        return out
+    }
+}

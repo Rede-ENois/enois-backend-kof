@@ -1,0 +1,57 @@
+package notifications
+
+import kernel.*
+import kernel.security.*
+
+// Composition of the notifications domain. The module object is what the other domains receive:
+//
+//   var notificationsModule = NotificationsModule.install(platform, shared, hooks, parts)
+//   notificationsModule.notifications        // THE API to write notifications (see Notifications.kf)
+//   notificationsModule.preferences          // push preferences (read by push)
+//
+// Swap a seam before install by passing a subclass in `NotificationsSeams` (owners do this in Main.kf).
+class NotificationsSeams {
+    NotificationActors actors
+    NotificationSources sources
+    NotificationCoins coins
+    NotificationAccounts accounts
+    NotificationPlaceReader placeReader
+    public constructor(platform: Platform) {
+        this.actors = NotificationActors(platform.db)
+        this.sources = NotificationSources(platform.db)
+        this.coins = NotificationCoins()
+        this.accounts = NotificationAccounts(platform.db)
+        this.placeReader = NotificationPlaceReader(platform.db)
+    }
+}
+
+class NotificationsModule {
+    NotificationsStore store
+    Notifications notifications
+    NotificationPreferenceService preferences
+    NotificationActors actors
+    NotificationSources sources
+    NotificationOutboxEventHandler outboxHandler
+    CommunityApologyWorker apology
+    public constructor(store: NotificationsStore, notifications: Notifications, preferences: NotificationPreferenceService, actors: NotificationActors, sources: NotificationSources, outboxHandler: NotificationOutboxEventHandler, apology: CommunityApologyWorker) {
+        this.store = store
+        this.notifications = notifications
+        this.preferences = preferences
+        this.actors = actors
+        this.sources = sources
+        this.outboxHandler = outboxHandler
+        this.apology = apology
+    }
+    static NotificationsModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks, parts: SecurityParts) = NotificationsModule.installWith(platform, shared, NotificationsSeams(platform))
+    static NotificationsModule installWith(platform: Platform, shared: SharedServices, seams: NotificationsSeams) {
+        var store = NotificationsStore(platform.db)
+        var places = NotificationPlaces(seams.placeReader)
+        var notifications = Notifications(platform.db, store, places)
+        var preferences = NotificationPreferenceService(store)
+        var handler = NotificationOutboxEventHandler.forTypes(shared.outbox, notifications, seams.sources, seams.actors)
+        var apology = CommunityApologyWorker(notifications, store, seams.coins, seams.accounts)
+        apology.schedule(shared.jobs, platform.cfg)
+        NotificationsRoutes.register(platform.server, notifications, preferences, seams.actors, shared.blockedUsers, shared.idempotency)
+        return NotificationsModule(store, notifications, preferences, seams.actors, seams.sources, handler, apology)
+    }
+}

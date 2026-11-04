@@ -1,0 +1,168 @@
+package notifications
+
+import java.util.HashMap
+import java.util.HashSet
+import kernel.blocks.*
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+
+// GET /notifications item (NotificationView). Field order is the Jackson record order.
+record NotificationView(String id, String kind, String context, String module, String actorId, String? actorName, String? actorUsername, String? actorAvatar, String actorIdentity, NotificationNameStyle? actorStyle, String title, String? body, String? preview, String? createdAt, Bool read, String? href, String? ctaLabel, Int actorCount, NotificationPlaceView? place, String? eventDate)
+
+record NotificationPage(List<NotificationView> items, String? nextCursor)
+
+record NotificationWho(String? name, String? username, String? avatar, String identity, NotificationNameStyle? style)
+
+record NotificationStatusBody(String id, String status)
+
+// HTTP adapter of the notifications domain: /notifications, /notifications/unread-summary,
+// /notifications/{id}/read, /notifications/read-all, /me/notification-preferences. The digest
+// unsubscribe links are registered by WeeklyDigestRoutes.
+class NotificationsRoutes {
+    static register(server: HttpServer, notifications: Notifications, preferences: NotificationPreferenceService, actors: NotificationActors, blocked: BlockedUsers, idempotency: Idempotency) {
+        server.get("/notifications", () -> NotificationsRoutes.list(notifications, actors, blocked))
+        server.get("/notifications/unread-summary", () -> NotificationsRoutes.unreadSummary(notifications, blocked))
+        server.post("/notifications/:notificationId/read", () -> NotificationsRoutes.read(notifications, idempotency))
+        server.post("/notifications/read-all", () -> NotificationsRoutes.readAll(notifications, idempotency))
+        server.get("/me/notification-preferences", () -> json.encode(preferences.of(Auth.requireUser())))
+        server.put("/me/notification-preferences", () -> NotificationsRoutes.updatePreferences(preferences))
+    }
+    static String list(notifications: Notifications, actors: NotificationActors, blocked: BlockedUsers) {
+        var limit = Req.queryInt("limit", 20)
+        var userId = Auth.requireUser()
+        var before = NotificationCursor.decode(Req.queryStr("cursor", ""))
+        var hidden = blocked.hiddenIdsFor(userId)
+        var context = NotificationContexts.parse(Req.queryStr("context", ""))
+        var page = notifications.list(userId, before, context, limit)
+        var visible = listOf<NotificationRecord>()
+        var actorIds = listOf<String>()
+        var professionalIds = listOf<String>()
+        var hrefs = listOf<String>()
+        for (var n in page) {
+            if (hidden.contains(n.actorId())) {
+                continue
+            }
+            visible.add(n)
+            actorIds.add(n.actorId())
+            if (NotificationContexts.of(n.kind()) == "PROFESSIONAL") {
+                professionalIds.add(n.actorId())
+            }
+            var href = n.href()
+            if (href != null) {
+                hrefs.add(href)
+            }
+        }
+        var profiles = actors.profilesByIds(NotificationsRoutes.distinct(actorIds))
+        var professionals = actors.activeCorporatesByIds(NotificationsRoutes.distinct(professionalIds))
+        var targets = notifications.places.resolve(NotificationsRoutes.distinct(hrefs))
+        var items = listOf<NotificationView>()
+        for (var n in visible) {
+            items.add(NotificationsRoutes.view(n, profiles, professionals, targets))
+        }
+        return json.encode(NotificationPage(items, NotificationsRoutes.nextCursor(page, limit)))
+    }
+    static String? nextCursor(page: List<NotificationRecord>, limit: Int) {
+        if (page.size() == limit) {
+            return page.get(page.size() - 1).createdAt()
+        }
+        return null
+    }
+    static List<String> distinct(values: List<String>) {
+        var seen = new HashSet<String>()
+        var out = listOf<String>()
+        for (var v in values) {
+            if (seen.add(v)) {
+                out.add(v)
+            }
+        }
+        return out
+    }
+    static NotificationWho who(pro: NotificationCorporate?, p: NotificationActor?) {
+        if (pro != null) {
+            var avatar = pro.avatar()
+            if (avatar == null) {
+                return NotificationWho(pro.name(), pro.username(), "", "CORPORATE", null)
+            }
+            return NotificationWho(pro.name(), pro.username(), avatar, "CORPORATE", null)
+        }
+        if (p != null) {
+            return NotificationWho(p.name(), p.username(), p.avatar(), "SOCIAL", p.style())
+        }
+        return NotificationWho(null, null, null, "SOCIAL", null)
+    }
+    static NotificationResolved resolvedOf(targets: Map<String,NotificationResolved>, href: String?) {
+        if (href == null) {
+            return NotificationResolved(null, null)
+        }
+        var r = targets.get(href)
+        if (r == null) {
+            return NotificationResolved(null, null)
+        }
+        return r
+    }
+    static NotificationView view(n: NotificationRecord, profiles: Map<String,NotificationActor>, professionals: Map<String,NotificationCorporate>, targets: Map<String,NotificationResolved>) {
+        var context = NotificationContexts.of(n.kind())
+        var proId = n.actorId()
+        if (context != "PROFESSIONAL") {
+            proId = ""
+        }
+        var who = NotificationsRoutes.who(professionals.get(proId), profiles.get(n.actorId()))
+        var target = NotificationsRoutes.resolvedOf(targets, n.href())
+        return NotificationView(n.id(), n.kind(), context, NotificationModules.of(n.kind()), n.actorId(), who.name(), who.username(), who.avatar(), who.identity(), who.style(), n.title(), n.body(), n.preview(), n.createdAt(), n.read(), n.href(), n.ctaLabel(), n.actorCount(), target.place(), target.eventDate())
+    }
+    static String unreadSummary(notifications: Notifications, blocked: BlockedUsers) {
+        var userId = Auth.requireUser()
+        var context = NotificationContexts.parse(Req.queryStr("context", ""))
+        return json.encode(notifications.unreadSummary(userId, context, blocked.hiddenIdsFor(userId)))
+    }
+    static String read(notifications: Notifications, idempotency: Idempotency) {
+        var userId = Auth.requireUser()
+        var notificationId = Req.pathParam("notificationId")
+        var hash = Idempotency.hash("{\"notificationId\":" + json.encode(notificationId) + "}")
+        return idempotency.handle(userId, "POST", "/api/notifications/{notificationId}/read", hash, 200, () -> {
+    notifications.markRead(notificationId, userId)
+    return json.encode(NotificationStatusBody(notificationId, "READ"))
+})
+    }
+    static String readAll(notifications: Notifications, idempotency: Idempotency) {
+        var userId = Auth.requireUser()
+        var hash = Idempotency.hash("{\"userId\":" + json.encode(userId) + "}")
+        return idempotency.handle(userId, "POST", "/api/notifications/read-all", hash, 200, () -> {
+    notifications.markAllRead(userId)
+    return json.encode(NotificationStatusBody(userId, "ALL_READ"))
+})
+    }
+    // A null or absent property keeps the value; anything but a JSON boolean is 400.
+    static Int flag(body: Map<String,Object>, key: String) {
+        var v = body.get(key)
+        if (v == null) {
+            return -1
+        }
+        var text = "" + v
+        if (text == "true") {
+            return 1
+        }
+        if (text == "false") {
+            return 0
+        }
+        throw Errors.badRequest()
+    }
+    static NotificationPrefsPatch parsePatch(raw: String) {
+        if (raw.trim().length() == 0) {
+            return NotificationPreferenceService.keepAll()
+        }
+        var body = new HashMap<String, Object>()
+        try {
+            body = json.decode<Map<String,Object>>(raw)
+        } catch (String bad) {
+            throw Errors.badRequest()
+        }
+        return NotificationPrefsPatch(NotificationsRoutes.flag(body, "weeklyDigest"), NotificationsRoutes.flag(body, "pushSocial"), NotificationsRoutes.flag(body, "pushMessages"), NotificationsRoutes.flag(body, "pushGroups"), NotificationsRoutes.flag(body, "pushJobs"), NotificationsRoutes.flag(body, "pushSystem"))
+    }
+    static String updatePreferences(preferences: NotificationPreferenceService) {
+        var userId = Auth.requireUser()
+        return json.encode(preferences.update(userId, NotificationsRoutes.parsePatch(Req.bodyText())))
+    }
+}
