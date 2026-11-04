@@ -345,3 +345,40 @@ response commit together; a throwing action leaves no marker, so the client can 
 
 Keys are scoped by user, method, route and key; rows live 24 h (`expires_at`).
 `Idempotency.hash(json.encode(dto))` hashes a DTO; hashes only need to be stable within this service.
+
+## kernel.outbox, kernel.audit, kernel.id
+
+```kotlin
+import kernel.outbox.*
+
+var outbox = Outbox(platform.db)
+outbox.register("NOTIFICATION_REQUESTED", NotificationOutboxHandler(...))   // by event type, in order
+outbox.schedule(jobs, platform.cfg)             // @Scheduled: every REDE_OUTBOX_WORKER_DELAY_MS (5000)
+database.transaction(() -> {
+    // ... business write ...
+    outbox.append("NOTIFICATION_REQUESTED", aggregateId, payloadJson)    // exists only if it commits
+})
+outbox.processPending(): Int                    // one worker pass (tests call it directly)
+```
+
+A handler extends `OutboxEventHandler` (a base class: `implements` across packages does not compile,
+G28) and overrides `handle(eventType, aggregateId, payload)`. Same tables (`outbox_events`,
+`processed_events`) and delivery rules as the Java `OutboxWorker`: up to 50 PENDING events due
+(`next_attempt_at <= now`), oldest first; every handler registered for the type is called; a throwing
+handler is logged (`outbox_handler_failed`) and neither stops the others nor keeps the event pending: the
+event is marked PROCESSED anyway. That is Java's behaviour, so there is no retry and no backoff
+(`next_attempt_at` is never moved); an event with no handler is PROCESSED too. Each event runs in its own
+transaction. Domains register their own handlers (`NotificationOutboxEventHandler`,
+`LinkedInShareOutboxEventHandler`).
+
+After-commit hooks (`Db.afterCommit`, see kernel.db) are the `@TransactionalEventListener(AFTER_COMMIT)`
+equivalent.
+
+```kotlin
+import kernel.audit.*
+var audit = Audit(platform.db)
+audit.write(actorId, "USER_BANNED", targetId, "{\"reason\":\"spam\"}")      // metadata may be null
+```
+
+`audit_logs` is append-only and joins the caller's transaction. `Ids.uuid()` / `Ids.prefixed("risk_")`
+(`kernel.id`) mint the string ids of those tables.

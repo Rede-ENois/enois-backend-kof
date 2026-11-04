@@ -1,0 +1,203 @@
+import kernel.audit.*
+import kernel.config.*
+import kernel.db.*
+import kernel.jobs.*
+import kernel.outbox.*
+import kernel.testkit.*
+import kernel.time.*
+
+class OutRecorder extends OutboxEventHandler {
+    List<String> seen = listOf<String>()
+    String label
+    public constructor(label: String) {
+        super()
+        this.label = label
+    }
+    handle(eventType: String, aggregateId: String, payload: String) {
+        seen.add(label + ":" + eventType + ":" + aggregateId + ":" + payload)
+    }
+}
+
+class OutFailing extends OutboxEventHandler {
+    Int calls = 0
+    handle(eventType: String, aggregateId: String, payload: String) {
+        calls = calls + 1
+        throw "handler exploded"
+    }
+}
+
+Db outDb() = TestApp.shared().db()
+
+Long outCount(sql: String, id: String) = outDb().queryLong(sql, DbParams().bindStr(id))
+
+String outStatus(aggregate: String) = outDb().queryOne("select status from outbox_events where aggregate_id = ?", DbParams().bindStr(aggregate)).getStr("status")
+
+// The shared database is also used by the other tests of the file: a worker pass handles every
+// pending event, so each test drains the table first and asserts only on its own aggregates.
+Outbox outFresh() {
+    var o = Outbox(outDb())
+    o.processPending()
+    return o
+}
+
+test "append stores a PENDING event due now" {
+    var o = outFresh()
+    o.append("OUT_T1", "out_agg_1", "{\"a\":1}")
+    var row = outDb().queryOne("select event_type, payload, status, created_at, next_attempt_at from outbox_events where aggregate_id = ?", DbParams().bindStr("out_agg_1"))
+    assert(row.getStr("event_type") == "OUT_T1")
+    assert(row.getStr("payload") == "{\"a\":1}")
+    assert(row.getStr("status") == "PENDING")
+    assert(row.getInstant("created_at") == row.getInstant("next_attempt_at"))
+}
+
+test "the worker delivers to the handlers of the type in order and marks the event PROCESSED" {
+    var o = outFresh()
+    var first = OutRecorder("first")
+    var second = OutRecorder("second")
+    var other = OutRecorder("other")
+    o.register("OUT_T2", first)
+    o.register("OUT_T2", second)
+    o.register("OUT_T2_OTHER", other)
+    o.append("OUT_T2", "out_agg_2", "p2")
+    assert(outStatus("out_agg_2") == "PENDING")
+    o.processPending()
+    assert(first.seen.size() == 1)
+    assert(first.seen.get(0) == "first:OUT_T2:out_agg_2:p2")
+    assert(second.seen.get(0) == "second:OUT_T2:out_agg_2:p2")
+    assert(other.seen.size() == 0)
+    assert(outStatus("out_agg_2") == "PROCESSED")
+    var id = outDb().queryOne("select id from outbox_events where aggregate_id = ?", DbParams().bindStr("out_agg_2")).getStr("id")
+    assert(outCount("select count(*) from processed_events where event_id = ?", id) == 1L)
+    o.processPending()
+    assert(first.seen.size() == 1)
+}
+
+test "a failing handler does not stop the others nor keep the event pending" {
+    var o = outFresh()
+    var bad = OutFailing()
+    var good = OutRecorder("good")
+    o.register("OUT_T3", bad)
+    o.register("OUT_T3", good)
+    o.append("OUT_T3", "out_agg_3", "p3")
+    o.processPending()
+    assert(bad.calls == 1)
+    assert(good.seen.size() == 1)
+    assert(outStatus("out_agg_3") == "PROCESSED")
+    o.processPending()
+    assert(bad.calls == 1)
+}
+
+test "an event with no handler is still marked PROCESSED" {
+    var o = outFresh()
+    o.append("OUT_NOBODY", "out_agg_4", "p4")
+    o.processPending()
+    assert(outStatus("out_agg_4") == "PROCESSED")
+}
+
+test "an event whose next attempt is in the future is not delivered" {
+    var o = outFresh()
+    var rec = OutRecorder("later")
+    o.register("OUT_T5", rec)
+    o.append("OUT_T5", "out_agg_5", "p5")
+    outDb().execute("update outbox_events set next_attempt_at = ? where aggregate_id = ?", DbParams().bindInstant(Time.plusSeconds(Time.nowIso(), 3600L)).bindStr("out_agg_5"))
+    o.processPending()
+    assert(rec.seen.size() == 0)
+    assert(outStatus("out_agg_5") == "PENDING")
+    outDb().execute("update outbox_events set next_attempt_at = ? where aggregate_id = ?", DbParams().bindInstant(Time.plusSeconds(Time.nowIso(), -5L)).bindStr("out_agg_5"))
+    o.processPending()
+    assert(rec.seen.size() == 1)
+}
+
+test "events are delivered oldest first, at most 50 per pass" {
+    var o = outFresh()
+    var rec = OutRecorder("order")
+    o.register("OUT_T6", rec)
+    var i = 0
+    while (i < 55) {
+        outDb().execute("insert into outbox_events (id, event_type, aggregate_id, payload, status, created_at, next_attempt_at) values (?, 'OUT_T6', ?, 'p', 'PENDING', ?, ?)", DbParams().bindStr("out6_" + i).bindStr("out_agg_6_" + i).bindInstantMillis(1000000000000L + i * 1000L).bindInstantMillis(1000000000000L + i * 1000L))
+        i = i + 1
+    }
+    assert(o.processPending() == 50)
+    assert(rec.seen.size() == 50)
+    assert(rec.seen.get(0) == "order:OUT_T6:out_agg_6_0:p")
+    assert(rec.seen.get(49) == "order:OUT_T6:out_agg_6_49:p")
+    assert(o.processPending() == 5)
+    assert(rec.seen.size() == 55)
+    assert(rec.seen.get(54) == "order:OUT_T6:out_agg_6_54:p")
+}
+
+test "an event appended in a rolled back transaction never exists" {
+    var o = outFresh()
+    var rec = OutRecorder("rb")
+    o.register("OUT_T7", rec)
+    try {
+        outDb().transaction(() -> {
+            o.append("OUT_T7", "out_agg_7", "p7")
+            throw "business write failed"
+        })
+    } catch (String e) {
+        assert(e == "business write failed")
+    }
+    o.processPending()
+    assert(rec.seen.size() == 0)
+    assert(outCount("select count(*) from outbox_events where aggregate_id = ?", "out_agg_7") == 0L)
+}
+
+test "a handler may use after-commit hooks and the database" {
+    var o = outFresh()
+    var rec = OutRecorder("hook")
+    o.register("OUT_T8", rec)
+    outDb().transaction(() -> {
+        o.append("OUT_T8", "out_agg_8", "p8")
+        outDb().afterCommit(() -> { o.processPending() })
+        assert(rec.seen.size() == 0)
+    })
+    assert(rec.seen.size() == 1)
+}
+
+test "the scheduled worker delivers on its own" {
+    var o = outFresh()
+    var rec = OutRecorder("sched")
+    o.register("OUT_T9", rec)
+    var jobs = Scheduler()
+    var cfg = Config.of(mapOf("REDE_OUTBOX_WORKER_DELAY_MS", "100"))
+    o.schedule(jobs, cfg)
+    o.append("OUT_T9", "out_agg_9", "p9")
+    var waited = 0
+    while (rec.seen.size() == 0 && waited < 50) {
+        time.sleep(100)
+        waited = waited + 1
+    }
+    jobs.stop()
+    assert(rec.seen.size() == 1)
+    assert(jobs.runCount("outbox-worker") >= 1)
+    assert(jobs.failureCount("outbox-worker") == 0)
+}
+
+test "audit records the entry with its metadata" {
+    var audit = Audit(outDb())
+    audit.write("audit_actor_1", "USER_BANNED", "audit_target_1", "{\"reason\":\"spam\"}")
+    audit.write("audit_actor_1", "NOTE", "audit_target_2", null)
+    var rows = outDb().queryList("select id, actor_id, action, target_id, metadata, created_at from audit_logs where actor_id = ? order by action", DbParams().bindStr("audit_actor_1"))
+    assert(rows.size() == 2)
+    assert(rows.get(0).getStr("action") == "NOTE")
+    assert(rows.get(0).getStrOrNull("metadata") == null)
+    assert(rows.get(1).getStr("action") == "USER_BANNED")
+    assert(rows.get(1).getStr("target_id") == "audit_target_1")
+    assert(rows.get(1).getStr("metadata") == "{\"reason\":\"spam\"}")
+    assert(rows.get(1).getStr("id").length() == 36)
+    assert(rows.get(0).getStr("id") != rows.get(1).getStr("id"))
+}
+
+test "audit joins the caller transaction" {
+    var audit = Audit(outDb())
+    try {
+        outDb().transaction(() -> {
+            audit.write("audit_actor_2", "X", "t", null)
+            throw "rolled back"
+        })
+    } catch (String e) {
+        assert(e == "rolled back")
+    }
+    assert(outCount("select count(*) from audit_logs where actor_id = ?", "audit_actor_2") == 0L)
+}

@@ -1,0 +1,94 @@
+package kernel.outbox
+
+import java.util.HashMap
+import kernel.config.*
+import kernel.db.*
+import kernel.id.*
+import kernel.jobs.*
+import kernel.log.*
+import kernel.time.*
+
+// Transactional outbox: domains append events inside their own transaction (`append`), the worker
+// delivers them later to the handlers registered by event type. Same `outbox_events` and
+// `processed_events` tables as the Java OutboxWorker.
+//
+//   var outbox = Outbox(platform.db)
+//   outbox.register("NOTIFICATION_REQUESTED", NotificationOutboxHandler(...))
+//   outbox.schedule(jobs, platform.cfg)                    // every 5 s (REDE_OUTBOX_WORKER_DELAY_MS)
+//   outbox.append("NOTIFICATION_REQUESTED", userId, json)  // inside database.transaction(...)
+//
+// Delivery semantics (identical to Java): up to 50 PENDING events whose next_attempt_at has arrived,
+// oldest first; every handler registered for the type is called; a handler that throws is logged and
+// does NOT stop the other handlers nor keep the event pending: the event is marked PROCESSED anyway
+// (at-most-once, no retry, next_attempt_at is never moved). An event with no handler is marked
+// PROCESSED too. Each event is handled in its own transaction (the Java batch shared one).
+class Outbox {
+    Db store
+    Map<String,List<OutboxEventHandler>> handlers = new HashMap<String, List<OutboxEventHandler>>()
+    Log log = Log("kernel.outbox")
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // Handlers of one type run in registration order.
+    register(eventType: String, handler: OutboxEventHandler) {
+        var list = handlers.get(eventType)
+        if (list == null) {
+            var created = listOf<OutboxEventHandler>()
+            created.add(handler)
+            handlers.put(eventType, created)
+            return
+        }
+        list.add(handler)
+    }
+    Int handlerCount(eventType: String) {
+        var list = handlers.get(eventType)
+        if (list == null) {
+            return 0
+        }
+        return list.size()
+    }
+    // OutboxEventRepository.append: joins the caller's transaction, so the event exists only if the
+    // business write commits.
+    append(eventType: String, aggregateId: String, payload: String) {
+        var now = Time.nowIso()
+        store.execute("insert into outbox_events (id, event_type, aggregate_id, payload, status, created_at, next_attempt_at) values (?, ?, ?, ?, \'PENDING\', ?, ?)", DbParams().bindStr(Ids.uuid()).bindStr(eventType).bindStr(aggregateId).bindStr(payload).bindInstant(now).bindInstant(now))
+    }
+    // @Scheduled(fixedDelay = rede.outbox.worker-delay-ms:5000).
+    schedule(jobs: Scheduler, cfg: Config) {
+        var self = this
+        jobs.fixedDelay("outbox-worker", 0L, cfg.getLong("REDE_OUTBOX_WORKER_DELAY_MS", 5000L), () -> {
+    self.processPending()
+})
+    }
+    // One worker pass; returns how many events it processed.
+    Int processPending() {
+        var rows = store.queryList("select id, event_type, aggregate_id, payload from outbox_events where status = \'PENDING\' and next_attempt_at <= ? order by created_at asc limit 50", DbParams().bindInstant(Time.nowIso()))
+        var self = this
+        for (var row in rows) {
+            store.transaction(() -> {
+    self.processOne(row)
+})
+        }
+        return rows.size()
+    }
+    processOne(row: DbRow) {
+        var id = row.getStr("id")
+        var eventType = row.getStr("event_type")
+        var aggregateId = row.getStr("aggregate_id")
+        var payload = row.getStr("payload")
+        if (store.queryLong("select count(*) from processed_events where event_id = ?", DbParams().bindStr(id)) == 0L) {
+            store.execute("insert into processed_events (event_id, processed_at) values (?, ?)", DbParams().bindStr(id).bindInstant(Time.nowIso()))
+        }
+        var list = handlers.get(eventType)
+        if (list != null) {
+            for (var handler in list) {
+                try {
+                    handler.handle(eventType, aggregateId, payload)
+                } catch (String e) {
+                    log.warn("outbox_handler_failed event=" + id + " type=" + eventType + " message=" + e)
+                }
+            }
+        }
+        store.execute("update outbox_events set status = \'PROCESSED\' where id = ?", DbParams().bindStr(id))
+    }
+}
