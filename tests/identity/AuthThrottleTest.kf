@@ -1,0 +1,72 @@
+import identity.*
+import kernel.db.*
+import kernel.testkit.*
+
+IdentityTestApp ctx() = IdentityTestApp.shared("throttle", mapOf("REDE_AUTH_THROTTLE_LOGIN_MAX_FAILURES", "5", "REDE_AUTH_THROTTLE_SIGNUP_PER_HOUR", "100000"))
+
+// AuthThrottleTests (F-02/F-04 of the pentest): login failures on the SAME account lock it for that network.
+test "loginBruteForceNaMesmaContaFicaPreso" {
+    var t = ctx()
+    // The account is born with the right password.
+    t.authenticate("throttle_vitima")
+    var i = 1
+    while (i <= 5) {
+        Check.status(t.postWith("/auth/login", listOf("Idempotency-Key: thr-login-fail-" + i), t.loginJson("throttle_vitima@test.com", "senha-errada-" + i)), 401)
+        i = i + 1
+    }
+    // The 6th attempt of the same network that failed 5 times is refused with 429 (not even the right password).
+    Check.apiError(t.postWith("/auth/login", listOf("Idempotency-Key: thr-login-lock"), t.loginJson("throttle_vitima@test.com", "Test1234!")), 429, "LOGIN_THROTTLED")
+    // The owner from another clean network keeps signing in (nobody takes the victim's account down).
+    Check.status(t.postWith("/auth/login", listOf("Idempotency-Key: thr-login-owner", "X-Forwarded-For: 203.0.113.7"), t.loginJson("throttle_vitima@test.com", "Test1234!")), 200)
+}
+
+test "a login success clears the failure counter and a 400 or 403 is not a failure" {
+    var t = ctx()
+    t.authenticate("throttle_clear")
+    var i = 0
+    while (i < 4) {
+        Check.status(t.login("throttle_clear@test.com", "errada-" + i), 401)
+        i = i + 1
+    }
+    Check.status(t.login("throttle_clear@test.com", "Test1234!"), 200)
+    // Cleared by the success: four more failures still leave room.
+    i = 0
+    while (i < 4) {
+        Check.status(t.login("throttle_clear@test.com", "errada-b-" + i), 401)
+        i = i + 1
+    }
+    Check.status(t.login("throttle_clear@test.com", "Test1234!"), 200)
+    // Missing fields are a 400 and never count as a credential failure.
+    var j = 0
+    while (j < 8) {
+        Check.apiError(t.post("/auth/login", "{\"email\":\"throttle_clear@test.com\"}"), 400, "INVALID_LOGIN")
+        j = j + 1
+    }
+    Check.status(t.login("throttle_clear@test.com", "Test1234!"), 200)
+}
+
+test "a blocked IP gets no signup, login or second-factor session" {
+    var t = ctx()
+    t.db().execute("insert into blocked_ips (id, ip, reason, created_by, created_at) values ('blk1', '198.51.100.9', 'test', 'mod', current_timestamp)", DbParams())
+    var headers = listOf("X-Forwarded-For: 198.51.100.9", "Idempotency-Key: blocked-1")
+    Check.apiError(t.postWith("/auth/login", headers, t.loginJson("x@test.com", "Test1234!")), 403, "IP_BLOCKED")
+    Check.apiError(t.postWith("/auth/signup", headers, t.signupJson("blocked@test.com", "Test1234!")), 403, "IP_BLOCKED")
+    Check.apiError(t.postWith("/auth/2fa/verify", headers, "{\"challengeId\":\"x\",\"code\":\"1\"}"), 403, "IP_BLOCKED")
+}
+
+test "an attack-pattern name creates no account and repeated hits pause the IP" {
+    var t = ctx()
+    var body = "{\"name\":\"probe-x3mm\",\"role\":\"USER\",\"email\":\"probe1@test.com\",\"password\":\"Test1234!\",\"acceptedTerms\":true,\"birthDate\":\"1990-05-10\"}"
+    var headers = listOf("X-Forwarded-For: 198.51.100.77", "Idempotency-Key: probe-1")
+    Check.apiError(t.postWith("/auth/signup", headers, body), 403, "SIGNUP_REFUSED")
+    Check.apiError(t.postWith("/auth/signup", listOf("X-Forwarded-For: 198.51.100.77", "Idempotency-Key: probe-2"), body), 403, "SIGNUP_REFUSED")
+    Check.apiError(t.postWith("/auth/signup", listOf("X-Forwarded-For: 198.51.100.77", "Idempotency-Key: probe-3"), body), 403, "SIGNUP_REFUSED")
+    // After 3 strikes the whole IP is cooling down, even for a normal name.
+    Check.apiError(t.postWith("/auth/signup", listOf("X-Forwarded-For: 198.51.100.77", "Idempotency-Key: probe-4"), t.signupJson("normal@test.com", "Test1234!")), 403, "SIGNUP_REFUSED")
+    // Another network is untouched, and login never is.
+    Check.status(t.signup("normal2@test.com", "Test1234!", "probe-5"), 201)
+}
+
+test "zz shutdown" {
+    ctx().stop()
+}

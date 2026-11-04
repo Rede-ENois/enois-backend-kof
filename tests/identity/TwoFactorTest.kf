@@ -1,0 +1,387 @@
+import identity.*
+import kernel.db.*
+import kernel.http.*
+import kernel.security.*
+import kernel.time.*
+import kernel.testkit.*
+
+wireProbes(s: HttpServer) {
+    s.get("/probe/verified", () -> "user=" + Auth.requireUser())
+}
+
+IdentityTestApp ctx() = IdentityTestApp.sharedWith("twofactor", mapOf(), (s: HttpServer) -> wireProbes(s))
+
+Long totpStep() = Time.nowMillis() / 1000L / 30L
+String validCode(secret: String) = Totp.codeAt(secret, totpStep())
+String nextCode(secret: String) = Totp.codeAt(secret, totpStep() + 1L)
+String pw(value: String) = "{\"password\":\"" + value + "\"}"
+String codeWithPassword(code: String, password: String) = "{\"code\":\"" + code + "\",\"password\":\"" + password + "\"}"
+String codeOnly(code: String) = "{\"code\":\"" + code + "\"}"
+String challengeBody(id: String, code: String) = "{\"challengeId\":\"" + id + "\",\"code\":\"" + code + "\"}"
+
+String enrollSecret(t: IdentityTestApp, token: String) {
+    var setup = t.postWithToken("/auth/2fa/totp/setup", token, pw("Test1234!"))
+    Check.status(setup, 200)
+    return setup.json("secret")
+}
+
+String loginChallenge(t: IdentityTestApp, email: String) {
+    var login = t.login(email, "Test1234!")
+    Check.status(login, 202)
+    return login.json("challengeId")
+}
+
+// A six-digit code that matches no step inside the verification window.
+String wrongCode(secret: String) {
+    var current = totpStep()
+    var valid = listOf(Totp.codeAt(secret, current - 1L), Totp.codeAt(secret, current), Totp.codeAt(secret, current + 1L), Totp.codeAt(secret, current + 2L))
+    var candidate = 0
+    while (true) {
+        var code = "" + candidate
+        while (code.length() < 6) {
+            code = "0" + code
+        }
+        if (!valid.contains(code)) {
+            return code
+        }
+        candidate = candidate + 1
+    }
+    return "000000"
+}
+
+test "totpSetupRequiresAConfirmedCodeAndThenChallengesTheLogin (TwoFactorFlowTests)" {
+    var t = ctx()
+    var session = t.authenticate("two_factor_totp")
+    // 1) setup returns the secret and the app URI
+    var setup = t.postWith("/auth/2fa/totp/setup", listOf("X-Session-Token: " + session.token(), "Idempotency-Key: totp-setup-1"), pw("Test1234!"))
+    Check.status(setup, 200)
+    Check.isTrue("secret", setup.json("secret").length() > 0)
+    Check.isTrue("otpauth uri", setup.json("otpauthUri").startsWith("otpauth://totp/"))
+    var secret = setup.json("secret")
+    // 2) a wrong code does not activate
+    Check.apiError(t.postWithToken("/auth/2fa/totp/enable", session.token(), codeWithPassword("000000", "Test1234!")), 400, "INVALID_TWO_FACTOR_CODE")
+    // 3) an app code activates and returns the recovery codes (shown once)
+    var enabled = t.postWithToken("/auth/2fa/totp/enable", session.token(), codeWithPassword(validCode(secret), "Test1234!"))
+    Check.status(enabled, 200)
+    Check.jsonEq(enabled, "status", "TOTP_ENABLED")
+    Check.eqInt("8 recovery codes", 8, enabled.jsonSize("backupCodes"))
+    var backup = enabled.json("backupCodes.0")
+    var status = t.getWithToken("/auth/2fa/status", session.token())
+    Check.status(status, 200)
+    Check.jsonEq(status, "totpEnabled", "true")
+    Check.jsonEq(status, "identityVerified", "true")
+    Check.jsonEq(status, "backupCodesLeft", "8")
+    // 4) the password login now asks for the second factor (no session comes out)
+    var login = t.postWith("/auth/login", listOf("Idempotency-Key: totp-login-1"), t.loginJson("two_factor_totp@test.com", "Test1234!"))
+    Check.status(login, 202)
+    Check.jsonEq(login, "twoFactorRequired", "true")
+    Check.jsonEq(login, "method", "TOTP")
+    Check.eqInt("no cookies yet", 0, login.setCookies().size())
+    var challengeId = login.json("challengeId")
+    // 5) a wrong code hands out no session
+    Check.status(t.postWith("/auth/2fa/verify", listOf("Idempotency-Key: totp-verify-bad"), challengeBody(challengeId, "123456")), 400)
+    // 6) the right code finishes the login (the next step's: the enrollment one is spent)
+    var verified = t.postWith("/auth/2fa/verify", listOf("Idempotency-Key: totp-verify-ok"), challengeBody(challengeId, nextCode(secret)))
+    Check.status(verified, 200)
+    Check.isTrue("no token", !verified.jsonHas("token"))
+    Check.jsonEq(verified, "user.twoFactorEnabled", "true")
+    // 7) the challenge is single use
+    Check.apiError(t.postWith("/auth/2fa/verify", listOf("Idempotency-Key: totp-verify-replay"), challengeBody(challengeId, validCode(secret))), 409, "TWO_FACTOR_CHALLENGE_ALREADY_USED")
+    // 8) a recovery code also gets in (and counts once)
+    var sessionToken = verified.cookie("enois_session")
+    Check.isTrue("session token", sessionToken.length() > 0)
+    var recoveryLogin = t.postWith("/auth/login", listOf("Idempotency-Key: totp-login-2"), t.loginJson("two_factor_totp@test.com", "Test1234!"))
+    Check.status(recoveryLogin, 202)
+    var recovered = t.postWith("/auth/2fa/verify", listOf("Idempotency-Key: totp-verify-recovery"), challengeBody(recoveryLogin.json("challengeId"), backup))
+    Check.status(recovered, 200)
+    Check.isTrue("session cookie", recovered.cookie("enois_session").length() > 0)
+    Check.jsonEq(t.getWithToken("/auth/2fa/status", sessionToken), "backupCodesLeft", "7")
+}
+
+test "emailSecondFactorSendsAndChecksTheCode (TwoFactorFlowTests)" {
+    var t = ctx()
+    var session = t.authenticate("two_factor_email")
+    var email = "two_factor_email@test.com"
+    Check.status(t.postWith("/auth/2fa/email/request", listOf("X-Session-Token: " + session.token(), "Idempotency-Key: email-2fa-1"), ""), 202)
+    var code = t.emailedCode(email)
+    Check.eqInt("six digits", 6, code.length())
+    var confirm = t.postWith("/auth/2fa/email/confirm", listOf("X-Session-Token: " + session.token(), "Idempotency-Key: email-2fa-2"), codeOnly(code))
+    Check.status(confirm, 200)
+    Check.jsonEq(confirm, "status", "EMAIL_OTP_ENABLED")
+    // Login: the password leads to the e-mail challenge, with the code sent right away.
+    var login = t.postWith("/auth/login", listOf("Idempotency-Key: email-login-1"), t.loginJson(email, "Test1234!"))
+    Check.status(login, 202)
+    Check.jsonEq(login, "method", "EMAIL")
+    var loginCode = t.emailedCode(email)
+    Check.eqInt("a second code was sent", 2, t.mailCount("TWO_FACTOR", email))
+    var verified = t.postWith("/auth/2fa/verify", listOf("Idempotency-Key: email-verify-1"), challengeBody(login.json("challengeId"), loginCode))
+    Check.status(verified, 200)
+    Check.isTrue("session cookie", verified.cookie("enois_session").length() > 0)
+    // The mail log never keeps a code: the subject is redacted by kind.
+    var logged = t.db().queryLong("select count(*) from email_log where kind = 'TWO_FACTOR' and subject = ?", DbParams().bindStr("Seu código de acesso (redigido)"))
+    Check.isTrue("redacted subject", logged >= 2L)
+}
+
+test "disablingRequiresThePasswordAndReactivatesTheChallenge (TwoFactorFlowTests)" {
+    var t = ctx()
+    var session = t.authenticate("two_factor_disable")
+    var secret = enrollSecret(t, session.token())
+    Check.status(t.postWithToken("/auth/2fa/totp/enable", session.token(), codeWithPassword(validCode(secret), "Test1234!")), 200)
+    // Without the password nobody switches the second factor off.
+    Check.status(t.postWithToken("/auth/2fa/totp/disable", session.token(), pw("errada")), 401)
+    Check.status(t.postWithToken("/auth/2fa/totp/disable", session.token(), pw("Test1234!")), 200)
+    // Off: the login hands out the session directly again.
+    var login = t.login("two_factor_disable@test.com", "Test1234!")
+    Check.status(login, 200)
+    Check.isTrue("session cookie", login.cookie("enois_session").length() > 0)
+}
+
+test "accountLosesAccessToProtectedFeaturesWhenVerificationIsGone (TwoFactorFlowTests)" {
+    var t = ctx()
+    var session = t.authenticate("two_factor_reputation")
+    var verified = t.getWithToken("/auth/me", session.token())
+    Check.jsonEq(verified, "identityVerified", "true")
+    // Any verified-only route (the write gate) answers while the account is verified.
+    Check.status(t.getWithToken("/probe/verified", session.token()), 200)
+    t.db().execute("update users set email_verified_at = null where id = ?", DbParams().bindStr(session.userId()))
+    // Back to pending (no confirmed e-mail, no second factor): the second barrier of the resolver stops the
+    // protected features. /auth/me stays reachable: it is where the person sees the state of the account.
+    Check.apiError(t.getWithToken("/probe/verified", session.token()), 403, "EMAIL_NOT_VERIFIED")
+    var unverified = t.getWithToken("/auth/me", session.token())
+    Check.status(unverified, 200)
+    Check.jsonEq(unverified, "identityVerified", "false")
+    // Turning the second factor on makes the account verified again.
+    t.db().execute("update users set totp_enabled_at = ? where id = ?", DbParams().bindInstant(Time.nowIso()).bindStr(session.userId()))
+    Check.status(t.getWithToken("/probe/verified", session.token()), 200)
+}
+
+test "totpSetupAndEnableRequireThePasswordAndRevokeOtherSessions (TwoFactorFlowTests)" {
+    var t = ctx()
+    var session = t.authenticate("two_factor_reauth")
+    var other = t.login("two_factor_reauth@test.com", "Test1234!")
+    var otherToken = other.cookie("enois_session")
+    Check.status(t.postWithToken("/auth/2fa/totp/setup", session.token(), ""), 401)
+    Check.status(t.postWithToken("/auth/2fa/totp/setup", session.token(), pw("errada")), 401)
+    var secret = enrollSecret(t, session.token())
+    Check.status(t.postWithToken("/auth/2fa/totp/enable", session.token(), codeOnly(validCode(secret))), 401)
+    Check.status(t.postWithToken("/auth/2fa/totp/enable", session.token(), codeWithPassword(validCode(secret), "Test1234!")), 200)
+    // The device that made the change stays signed in; every other session is gone.
+    Check.status(t.getWithToken("/auth/me", session.token()), 200)
+    Check.status(t.getWithToken("/auth/me", otherToken), 401)
+}
+
+test "wrongCodesLockTheChallengeEvenForTheRightCode (TwoFactorFlowTests)" {
+    var t = ctx()
+    var session = t.authenticate("two_factor_lockout")
+    var secret = enrollSecret(t, session.token())
+    Check.status(t.postWithToken("/auth/2fa/totp/enable", session.token(), codeWithPassword(validCode(secret), "Test1234!")), 200)
+    var challengeId = loginChallenge(t, "two_factor_lockout@test.com")
+    var attempt = 0
+    while (attempt < 5) {
+        Check.status(t.post("/auth/2fa/verify", challengeBody(challengeId, wrongCode(secret))), 400)
+        attempt = attempt + 1
+    }
+    Check.apiError(t.post("/auth/2fa/verify", challengeBody(challengeId, nextCode(secret))), 429, "TOO_MANY_ATTEMPTS")
+}
+
+test "aTotpCodeIsAcceptedOnlyOnce (TwoFactorFlowTests)" {
+    var t = ctx()
+    var session = t.authenticate("two_factor_replay")
+    var secret = enrollSecret(t, session.token())
+    var enrollmentCode = validCode(secret)
+    Check.status(t.postWithToken("/auth/2fa/totp/enable", session.token(), codeWithPassword(enrollmentCode, "Test1234!")), 200)
+    // The enrollment code cannot complete a login.
+    Check.status(t.post("/auth/2fa/verify", challengeBody(loginChallenge(t, "two_factor_replay@test.com"), enrollmentCode)), 400)
+    var code = nextCode(secret)
+    Check.status(t.post("/auth/2fa/verify", challengeBody(loginChallenge(t, "two_factor_replay@test.com"), code)), 200)
+    // Same code on a fresh challenge: rejected.
+    Check.status(t.post("/auth/2fa/verify", challengeBody(loginChallenge(t, "two_factor_replay@test.com"), code)), 400)
+}
+
+test "wrongEmailSetupCodesAreCountedDespiteTheRollback (TwoFactorFlowTests)" {
+    var t = ctx()
+    var session = t.authenticate("two_factor_email_lockout")
+    Check.status(t.postWithToken("/auth/2fa/email/request", session.token(), ""), 202)
+    var sent = t.emailedCode("two_factor_email_lockout@test.com")
+    var wrong = "000000"
+    if (sent == "000000") {
+        wrong = "111111"
+    }
+    var attempt = 0
+    while (attempt < 5) {
+        Check.status(t.postWithToken("/auth/2fa/email/confirm", session.token(), codeOnly(wrong)), 400)
+        attempt = attempt + 1
+    }
+    Check.status(t.postWithToken("/auth/2fa/email/confirm", session.token(), codeOnly(sent)), 429)
+}
+
+String raceVerify(t: IdentityTestApp, body: String) = "" + t.post("/auth/2fa/verify", body).status
+
+test "parallelCorrectCodesCompleteTheLoginOnlyOnce (TwoFactorFlowTests)" {
+    var t = ctx()
+    var session = t.authenticate("two_factor_email_race")
+    var email = "two_factor_email_race@test.com"
+    Check.status(t.postWithToken("/auth/2fa/email/request", session.token(), ""), 202)
+    Check.status(t.postWithToken("/auth/2fa/email/confirm", session.token(), codeOnly(t.emailedCode(email))), 200)
+    var challengeId = loginChallenge(t, email)
+    var code = t.emailedCode(email)
+    // Distinct bodies (the code is trimmed) so the duplicate-POST filter lets every one through.
+    var a = spawn raceVerify(t, challengeBody(challengeId, code))
+    var b = spawn raceVerify(t, challengeBody(challengeId, " " + code))
+    var c = spawn raceVerify(t, challengeBody(challengeId, "  " + code))
+    var d = spawn raceVerify(t, challengeBody(challengeId, "   " + code))
+    var statuses = listOf(await a, await b, await c, await d)
+    var sessions = 0
+    for (var s in statuses) {
+        if (s == "200") {
+            sessions = sessions + 1
+        }
+        else {
+            Check.eqStr("a loser is 409", "409", s)
+        }
+    }
+    Check.eqInt("one session", 1, sessions)
+}
+
+test "aResendNeverReopensAConsumedChallenge (TwoFactorFlowTests)" {
+    var t = ctx()
+    var tf = t.module.twoFactor
+    var id = "resend-race-1"
+    var now = Time.nowIso()
+    tf.saveChallenge(IdentityChallenge(id, "resend-race-user", "EMAIL", "hash", 0, Time.plusSeconds(now, 300L), null, now))
+    Check.isTrue("consumed once", tf.consumeChallenge(id, now))
+    // The resend read the challenge before the verify consumed it; its write must not undo that.
+    var replaced = t.db().execute("update two_factor_challenges set code_hash = ?, attempts = 0, expires_at = ? where id = ? and consumed_at is null", DbParams().bindStr("new-hash").bindInstant(Time.plusSeconds(now, 300L)).bindStr(id))
+    Check.eqInt("replaceCode touched nothing", 0, replaced)
+    var after = tf.findChallenge(id)
+    Check.isTrue("still consumed", after != null)
+    Check.isTrue("consumed flag", t.db().queryLong("select count(*) from two_factor_challenges where id = ? and consumed_at is not null", DbParams().bindStr(id)) == 1L)
+    Check.isTrue("a second consume fails", !tf.consumeChallenge(id, now))
+    // A claim on it says why it failed, without relying on the caller's snapshot.
+    var failure = ""
+    try {
+        tf.requireClaim(id, "ja usado", "tentativas")
+    } catch (String e) {
+        failure = e
+    }
+    Check.isTrue("claim reports consumed", failure.indexOf("TWO_FACTOR_CHALLENGE_ALREADY_USED") >= 0)
+}
+
+String raceClaim(t: IdentityTestApp, id: String) {
+    var ok = "claimed"
+    try {
+        t.module.twoFactor.requireClaim(id, "ja usado", "tentativas")
+    } catch (String e) {
+        ok = "refused"
+    }
+    return ok
+}
+
+test "parallelVerifiesCannotShareOneReadOfTheAttemptCounter (TwoFactorFlowTests)" {
+    var t = ctx()
+    var id = "claim-race-1"
+    var now = Time.nowIso()
+    t.module.twoFactor.saveChallenge(IdentityChallenge(id, "claim-race-user", "EMAIL", "hash", 0, Time.plusSeconds(now, 300L), null, now))
+    var handles = listOf(spawn raceClaim(t, id), spawn raceClaim(t, id), spawn raceClaim(t, id), spawn raceClaim(t, id), spawn raceClaim(t, id), spawn raceClaim(t, id), spawn raceClaim(t, id), spawn raceClaim(t, id), spawn raceClaim(t, id), spawn raceClaim(t, id), spawn raceClaim(t, id), spawn raceClaim(t, id))
+    var granted = 0
+    for (var h in handles) {
+        if (await h == "claimed") {
+            granted = granted + 1
+        }
+    }
+    Check.eqInt("attempt ceiling", 5, granted)
+}
+
+// ---- TwoFactorVerifyHardeningTests: explicit answers where a 500 used to be
+
+test "desafioSemMetodoRespondeErroExplicitoEmVezDeNpe (TwoFactorVerifyHardeningTests)" {
+    var t = ctx()
+    var now = Time.nowIso()
+    t.module.twoFactor.saveChallenge(IdentityChallenge("challenge-no-method", "user_1", "", "hash", 0, Time.plusSeconds(now, 600L), null, now))
+    Check.apiError(t.post("/auth/2fa/verify", challengeBody("challenge-no-method", "123456")), 409, "TWO_FACTOR_CHALLENGE_INVALID")
+}
+
+test "segredoTotpIlegivelRespondeErroExplicitoEmVezDe500 (TwoFactorVerifyHardeningTests)" {
+    var t = ctx()
+    var now = Time.nowIso()
+    t.module.twoFactor.saveChallenge(IdentityChallenge("challenge-unreadable", "user_unreadable", "TOTP", "hash", 0, Time.plusSeconds(now, 600L), null, now))
+    t.db().execute("insert into user_two_factor_secrets (user_id, totp_secret_encrypted, updated_at) values (?, ?, ?)", DbParams().bindStr("user_unreadable").bindStr("c2VncmVkby1jaWZyYWRvLWludmFsaWRvLWNvbS1jaGF2ZS10cm9jYWRh").bindInstant(now))
+    Check.apiError(t.post("/auth/2fa/verify", challengeBody("challenge-unreadable", "123456")), 409, "TWO_FACTOR_SECRET_UNREADABLE")
+}
+
+test "desafioSemSegredoAtivoNaoQuebraEContaComoCodigoErrado (TwoFactorVerifyHardeningTests)" {
+    var t = ctx()
+    var now = Time.nowIso()
+    t.module.twoFactor.saveChallenge(IdentityChallenge("challenge-no-secret", "user_no_secret", "TOTP", "hash", 0, Time.plusSeconds(now, 600L), null, now))
+    Check.apiError(t.post("/auth/2fa/verify", challengeBody("challenge-no-secret", "123456")), 400, "INVALID_TWO_FACTOR_CODE")
+}
+
+// ---- management endpoints around the flows
+
+test "expired and unknown challenges, resend and the e-mail setup guards" {
+    var t = ctx()
+    Check.apiError(t.post("/auth/2fa/verify", challengeBody("nao-existe", "123456")), 404, "TWO_FACTOR_CHALLENGE_NOT_FOUND")
+    Check.apiError(t.post("/auth/2fa/verify", "{\"code\":\"123456\"}"), 400, "TWO_FACTOR_CHALLENGE_NOT_FOUND")
+    var now = Time.nowIso()
+    t.module.twoFactor.saveChallenge(IdentityChallenge("challenge-expired", "user_x", "EMAIL", "hash", 0, "2020-01-01T00:00:00Z", null, now))
+    Check.apiError(t.post("/auth/2fa/verify", challengeBody("challenge-expired", "123456")), 410, "TWO_FACTOR_CHALLENGE_EXPIRED")
+    Check.apiError(t.post("/auth/2fa/resend", "{\"challengeId\":\"nao-existe\"}"), 404, "TWO_FACTOR_CHALLENGE_NOT_FOUND")
+    Check.apiError(t.post("/auth/2fa/resend", "{\"challengeId\":\"challenge-expired\"}"), 410, "TWO_FACTOR_CHALLENGE_EXPIRED")
+    t.module.twoFactor.saveChallenge(IdentityChallenge("challenge-totp", "user_x", "TOTP", "hash", 0, Time.plusSeconds(now, 600L), null, now))
+    Check.apiError(t.post("/auth/2fa/resend", "{\"challengeId\":\"challenge-totp\"}"), 400, "TWO_FACTOR_RESEND_NOT_APPLICABLE")
+    // The e-mail challenge resends a fresh code and resets the attempts.
+    var session = t.authenticate("two_factor_resend")
+    var email = "two_factor_resend@test.com"
+    Check.status(t.postWithToken("/auth/2fa/email/request", session.token(), ""), 202)
+    Check.status(t.postWithToken("/auth/2fa/email/confirm", session.token(), codeOnly(t.emailedCode(email))), 200)
+    Check.apiError(t.postWithToken("/auth/2fa/email/request", session.token(), ""), 409, "EMAIL_OTP_ALREADY_ENABLED")
+    var login = t.login(email, "Test1234!")
+    var id = login.json("challengeId")
+    var resend = t.post("/auth/2fa/resend", "{\"challengeId\":\"" + id + "\"}")
+    Check.status(resend, 202)
+    Check.jsonEq(resend, "status", "CODE_SENT")
+    Check.eqInt("two codes for the login", 3, t.mailCount("TWO_FACTOR", email))
+    Check.status(t.post("/auth/2fa/verify", challengeBody(id, t.emailedCode(email))), 200)
+    // Disabling the e-mail factor asks for the password.
+    var again = t.login(email, "Test1234!")
+    Check.status(again, 202)
+    Check.status(t.post("/auth/2fa/verify", challengeBody(again.json("challengeId"), t.emailedCode(email))), 200)
+    var token = t.login(email, "Test1234!")
+    Check.apiError(t.postWithToken("/auth/2fa/email/disable", session.token(), pw("errada")), 401, "INVALID_CREDENTIALS")
+    Check.status(token, 202)
+}
+
+test "status of a social-only account asks for a password before the second factor" {
+    var t = ctx()
+    var session = t.authenticate("two_factor_nopass")
+    t.db().execute("update user_credentials set password_usable = false where user_id = ?", DbParams().bindStr(session.userId()))
+    Check.apiError(t.postWithToken("/auth/2fa/totp/setup", session.token(), pw("Test1234!")), 409, "PASSWORD_NOT_SET")
+    var status = t.getWithToken("/auth/2fa/status", session.token())
+    Check.status(status, 200)
+    Check.jsonEq(status, "totpAvailable", "true")
+    Check.jsonEq(status, "emailVerified", "true")
+    Check.apiError(t.app.client.get("/auth/2fa/status"), 401, "UNAUTHENTICATED")
+}
+
+test "the emergency reset clears only the unreadable TOTP secrets and needs an admin" {
+    var t = ctx()
+    var admin = t.authenticate("two_factor_admin")
+    t.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr(admin.userId()))
+    var victim = t.authenticate("two_factor_broken")
+    var good = t.authenticate("two_factor_healthy")
+    var goodSecret = enrollSecret(t, good.token())
+    Check.status(t.postWithToken("/auth/2fa/totp/enable", good.token(), codeWithPassword(validCode(goodSecret), "Test1234!")), 200)
+    var now = Time.nowIso()
+    t.db().execute("insert into user_two_factor_secrets (user_id, totp_secret_encrypted, updated_at) values (?, ?, ?)", DbParams().bindStr(victim.userId()).bindStr("c2VncmVkby1jaWZyYWRvLWludmFsaWRvLWNvbS1jaGF2ZS10cm9jYWRh").bindInstant(now))
+    t.db().execute("update users set totp_enabled_at = ? where id = ?", DbParams().bindInstant(now).bindStr(victim.userId()))
+    var done = t.postWithToken("/auth/admin/two-factor/reset-broken", admin.token(), "")
+    Check.status(done, 200)
+    Check.jsonEq(done, "ok", "true")
+    Check.isTrue("broken cleared", t.db().queryOne("select totp_enabled_at from users where id = ?", DbParams().bindStr(victim.userId())).isNull("totp_enabled_at"))
+    Check.eqInt("broken secret row gone", 0, t.db().queryLong("select count(*) from user_two_factor_secrets where user_id = ?", DbParams().bindStr(victim.userId())) as Int)
+    Check.isTrue("healthy untouched", !t.db().queryOne("select totp_enabled_at from users where id = ?", DbParams().bindStr(good.userId())).isNull("totp_enabled_at"))
+}
+
+test "zz shutdown" {
+    ctx().stop()
+}
