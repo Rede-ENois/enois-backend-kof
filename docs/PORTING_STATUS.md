@@ -96,3 +96,73 @@ escalation text instead of reading the `reports` table; `IntelligentCacheTests` 
 behaviours on `TtlCache`/`Caches` (reuse, expiry loads nothing on its own, renew after expiry, a write
 clears after commit, a failed write leaves the cache alone, one load for concurrent callers, closed list of
 caches with their policy) because `EventService` is not ported.
+
+## media
+
+| Domain | Endpoints ported / total | Tests ported / total | Gaps |
+|---|---|---|---|
+| media (uploads, assets, `/storage` proxy, S3 and ImageKit modes, sanitiser, workers, migration) | 6 / 6 | 69 / 76 Java tests (88 Kof tests in `tests/media/`) | G160 to G169 |
+
+Endpoints: `POST /media/uploads`, `GET /media/{id}`, `DELETE /media/{id}`, `GET /media/migration`,
+`GET /storage/{key}` (Range, `Cache-Control` immutable) and `PUT /storage/{key}` (the owner's session, the
+exact key of the asset, the declared size).
+
+Ported: assets and deletion jobs on the same tables, upload validation (types, purposes, 500 MB), the S3
+mode (`REDE_MEDIA_STORAGE=s3`: URL factory, signer that goes through the app when moderation is on, gateway)
+and the ImageKit mode (the default: uploads answer 503 `UPLOADS_DISABLED`), the metadata sanitiser (JPEG with
+physical EXIF rotation, PNG, GIF, WebP, video and audio through ffmpeg on `ProcessRunner`), image-content
+moderation (classifier and reviewer seams), width and height (on upload and the backfill job),
+`MediaDeletionWorker`, `MediaMigrationService` + worker + `MediaLazyCopyTrigger`, `LazyUrlMigrationService`
+(SSRF guarded by `OutboundUrlGuard`), `MediaResilience` (retry 3 x 250 ms, circuit breaker, bulkhead of 4 on the
+storage gateway: a small helper with no kernel dependency but `Gate`/`Permits`), the S3 REST client with
+Signature V4 (`kernel.storage.S3Rest`, G160).
+
+### Large bodies and binary data (read this)
+
+The Kof web runtime reads every request body as a UTF-8 String and writes every response body as a String, so
+the Java `PUT/GET /api/storage/{key}` (raw image/video bytes, up to 500 MB, Range) cannot be an ordinary route
+(measured, G161). The workaround is a kernel adapter, `kernel.http.BinaryLane` + `BinaryFront`: when a module
+claims a route prefix (`BinaryLane.claim("/storage/")`), `Platform.start` moves the web runtime to an internal
+loopback port and serves the public port with a byte-level front that forwards every other request unchanged.
+For a claimed `PUT` the front asks the route to authorise (the whole security pipeline runs, no body read yet),
+then spools the body to a temp file and calls the route again with a ticket; for a claimed `GET` the route
+registers a stream and the front sends the bytes. Consequences for operators: the service is one hop heavier
+(loopback), the internal port must not be published, `REDE_BINARY_MAX_BODY_BYTES` caps one upload (default
+520 MB), and an upload is spooled to disk (`java.io.tmpdir`), never held in memory. Nothing else changes: the
+gateway still sees one port.
+
+### Pending ports (seams)
+
+| Seam (class in `media`) | Default | Owner / what it needs |
+|---|---|---|
+| `MediaImageClassifier` (`available`, `pornographicScore`) | not available: with `REDE_MEDIA_NSFW_ENABLED=true` (the default) an image upload answers 503 `IMAGE_MODERATION_UNAVAILABLE` | media: the ONNX OpenNSFW model (`OnnxImageContentClassifier`) needs a runtime that is not reachable from Kof yet. Run with `REDE_MEDIA_NSFW_ENABLED=false` only if moderation happens elsewhere |
+| `MediaImageReviewer.review` | no answer (fails closed, 503) | moderation: `ModerationImageContentReviewer` |
+| `MediaPdfCleaner.clean` | passes the bytes through | media: PDFBox (G164): PDFs keep author and title meanwhile |
+| `MediaObjectStore`, `MediaStorageGateway`, `MediaUploadSigner` | S3 (`MediaS3ObjectStore`, `MediaS3Gateway`, `MediaS3UploadSigner`) or ImageKit | tests use `MediaLocalObjectStore` or a fake |
+| S3 credentials | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | the web-identity (IRSA) provider is not ported |
+
+What other domains call (on `MediaModule.service`, wired in `Main.kf`): `visibleByIds(ids): Map<String, MediaSummaryView>`
+(feed, groups, profile cards), `validateOwnedBy(ownerId, ids)` (post and comment creation),
+`requestPostMediaDeletion(ownerId, postId, ids)` (post deletion), and `MediaModule.onUrlAccess(url)` (profiles,
+covers and logos call it when they serve a legacy ImageKit URL). Each of those domains owns its seam class and
+subclasses it over these methods.
+
+Deliberate differences from Java:
+
+- ImageKit mode without `IMAGEKIT_PRIVATE_KEY`: deletion jobs use the no-op gateway and a warning is logged (Java called
+  the ImageKit API with an empty key and failed forever).
+- A JPEG rotated by its EXIF orientation is re-encoded at the ImageIO default quality (G163).
+- The `{*key}` wildcard is registered once per depth (1 to 10 segments), the router matches by segment count.
+- Retry waits and the circuit breaker's open state (60 s, the library default) are fixed values, not Spring properties.
+
+### Java tests that could not be ported (7 of 76)
+
+| Java test | Why |
+|---|---|
+| `OnnxImageContentClassifierTests` (6: animated GIF budget, frame sampling, partial-frame compositing, disposal method, NHWC buffer, centre crop) | the classifier is the ONNX Runtime model, pending (see the seam table). Port them with the classifier |
+| `MediaMetadataSanitizerTests.pdfDocumentInformationIsCleared` | PDF cleaning is a seam without PDFBox (G164). The pass-through default is asserted by `empty, unknown and unreadable data come back unchanged` |
+
+Ported with a changed trigger: `MediaControllerTests.deletesMediaReferencedByDeletedPost` calls
+`requestPostMediaDeletion` (what the feed calls on post deletion) because the feed endpoint is not part of this
+domain; the `/storage` tests use real bytes through the binary lane; `MediaStorageProxyTests` and the S3 tests run
+with fakes behind the `MediaObjectStore` seam, like the Java ones.

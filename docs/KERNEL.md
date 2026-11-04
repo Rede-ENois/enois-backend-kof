@@ -791,3 +791,63 @@ shared.jobs  shared.stop()
 
 `TestApp.bootWith/bootWire` now stop the platform when the `wire` callback throws (the open pool kept the
 test process from exiting).
+
+## kernel.bytes, kernel.files, kernel.image, kernel.concurrent (media support)
+
+```kotlin
+import kernel.bytes.*   import kernel.files.*   import kernel.image.*   import kernel.concurrent.*
+
+var sink = ByteSink()                           // growable buffer: add(data, off, len) addAll addByte addAscii addLittleInt
+sink.toBytes(): Byte[]                          //   size()
+Bytes.at(data, i)  Bytes.bigShort/bigInt/littleShort/littleInt(data, off)  Bytes.ascii(data, off, len)
+Bytes.hex("89504e47"): Byte[]   Bytes.toHex(data)                           // fixtures and assertions
+```
+
+`ByteStream` (kernel.files) wraps a readable byte stream: `ByteStream.ofFile(path)`, `ofBytes(data)`,
+`copyToFile(path, max)` (throws `STREAM_TOO_LARGE`), `copyExactToFile(path, length)` (`STREAM_TRUNCATED`),
+`readUpTo(n)`, `transferTo(out)`, `close()`. `TempFiles`: `create(prefix, suffix)`, `delete`, `exists`, `size`,
+`readAll`, `write`. `ProcessRunner.run(listOf("ffmpeg", ...), timeoutSeconds): Int` runs a program with its output
+discarded: exit code, `-1` when missing or timed out (and killed).
+
+`Images` (kernel.image): `dimensions(data, exifOrientation): ImageSize?` reads the header only, `rotateJpeg(data,
+orientation)` applies EXIF orientations 2 to 8 to the pixels (16 megapixel cap), `sample/halves` build test
+fixtures. `Gate` is a lock (`enter()` / `leave()`), `Permits(max)` a non-waiting semaphore (`tryAcquire`, `release`).
+
+## kernel.storage: S3 without the SDK
+
+```kotlin
+import kernel.storage.*
+var rest = S3Rest.fromConfig(platform.cfg)   // REDE_MEDIA_S3_ENDPOINT (empty = AWS), _REGION, _BUCKET, _FORCE_PATH_STYLE,
+                                             // AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
+rest.putFile(key, contentType, path)         // streamed, signed payload hash; S3_FAILED status=N on a refusal
+rest.get(key, "bytes=0-99"): S3Object        // body ByteStream, length, contentType, contentRange, eTag
+rest.head(key): Long                         // -1 when absent
+rest.delete(key)                             // idempotent
+rest.presignPut(key, contentType, 3600)      // URL for a browser PUT
+```
+
+AWS Signature V4, path-style or virtual-hosted, verified against the AWS documentation vectors
+(`tests/media/S3RestTest.kf`). The SDK itself cannot be called from Kof (G160). `Uris` (kernel.url):
+`encodePathSegment`, `encodeAws`, `decode`, `base64`, `host`, `path`, `scheme`, `parses`.
+
+## kernel.http: HttpFetch and the binary lane
+
+`HttpFetch.probe(url, timeoutMs): FetchProbe(status, contentType)`, `HttpFetch.download(url, maxBytes): String`
+(a temp file path, no redirects, throws `download falhou: ...`), `HttpFetch.send(method, url, headers, body,
+timeoutMs): HttpReply(status, body)`.
+
+```kotlin
+BinaryLane.claim("/storage/")                // in the module install: this prefix (and /v1/...) goes through the lane
+// upload handler (PUT)
+var phase = Req.headerOrNull("x-kernel-binary")          // "authorize" | "commit"
+ResponseHeaders.set("X-Kernel-Accept", BinaryLane.accept(userId, key, declaredLength)); return Http.respond(202, "{}")
+var path = BinaryLane.bodyPath(ticket, userId, key)      // commit: the temp file holding the body
+// download handler (GET)
+ResponseHeaders.set("X-Kernel-Stream", BinaryLane.stream(byteStream, length)); return Http.respond(200, "")
+```
+
+With a claimed prefix `Platform.start`/`startAsync` run the web runtime on a loopback port and serve the public
+port with `BinaryFront` (every other request is forwarded byte for byte, `X-Kernel-Peer` carries the client
+address and `Req.peerAddress()` honours it only from a loopback peer; client-sent `X-Kernel-*` and `Expect` are
+dropped). `REDE_BINARY_MAX_BODY_BYTES` (default 545259520) caps one upload. Why and what it costs: `docs/PORTING_STATUS.md`
+(media) and G161. Tests use `BinaryClient(app.port)` (`get`, `put`, `send` with `Byte[]` bodies, `BinaryResponse.body`).
