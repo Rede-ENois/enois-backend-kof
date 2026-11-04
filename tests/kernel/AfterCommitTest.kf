@@ -1,0 +1,79 @@
+import kernel.db.*
+
+Db hookDb(name: String) {
+    var database = Db.connect("jdbc:h2:mem:" + name + ";MODE=MySQL;DB_CLOSE_DELAY=-1", "sa", "", 3, 1)
+    database.execute("create table t (id bigint auto_increment primary key, a varchar(50))", DbParams())
+    return database
+}
+
+test "after-commit callbacks run only after the commit, in order" {
+    var database = hookDb("hookorder")
+    var seen = listOf<String>()
+    database.transaction(() -> {
+        database.afterCommit(() -> {
+            seen.add("first:" + database.queryLong("select count(*) from t", DbParams()) + ":" + database.inTransaction())
+        })
+        database.afterCommit(() -> { seen.add("second") })
+        database.execute("insert into t (a) values (?)", DbParams().bindStr("x"))
+        assert(seen.size() == 0)
+    })
+    assert(seen.size() == 2)
+    assert(seen.get(0) == "first:1:false")
+    assert(seen.get(1) == "second")
+}
+
+test "after-commit callbacks are dropped on rollback" {
+    var database = hookDb("hookrollback")
+    var ran = 0
+    try {
+        database.transaction(() -> {
+            database.afterCommit(() -> { ran = ran + 1 })
+            throw "boom"
+        })
+    } catch (String e) {
+        assert(e == "boom")
+    }
+    assert(ran == 0)
+    database.transaction(() -> { database.afterCommit(() -> { ran = ran + 10 }) })
+    assert(ran == 10)
+}
+
+test "nested transactions defer to the outermost commit" {
+    var database = hookDb("hooknested")
+    var ran = 0
+    try {
+        database.transaction(() -> {
+            database.transaction(() -> { database.afterCommit(() -> { ran = ran + 1 }) })
+            assert(ran == 0)
+            throw "outer fails"
+        })
+    } catch (String e) {
+        assert(e == "outer fails")
+    }
+    assert(ran == 0)
+    database.transaction(() -> {
+        database.transaction(() -> { database.afterCommit(() -> { ran = ran + 1 }) })
+        assert(ran == 0)
+    })
+    assert(ran == 1)
+}
+
+test "outside a transaction the callback runs immediately" {
+    var database = hookDb("hookimmediate")
+    var ran = false
+    database.afterCommit(() -> { ran = true })
+    assert(ran)
+}
+
+test "a failing callback does not stop the others nor the commit" {
+    var database = hookDb("hookfail")
+    var ran = 0
+    database.transaction(() -> {
+        database.execute("insert into t (a) values (?)", DbParams().bindStr("kept"))
+        database.afterCommit(() -> { throw "hook failed" })
+        database.afterCommit(() -> { ran = ran + 1 })
+    })
+    assert(ran == 1)
+    assert(database.queryLong("select count(*) from t", DbParams()) == 1L)
+    assert(!database.inTransaction())
+}

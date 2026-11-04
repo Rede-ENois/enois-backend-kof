@@ -6,6 +6,7 @@ import java.lang.ThreadLocal
 import java.sql.Connection
 import java.sql.PreparedStatement
 import java.sql.SQLException
+import java.util.concurrent.ConcurrentHashMap
 import kernel.config.*
 import kernel.error.*
 import kernel.log.*
@@ -22,6 +23,9 @@ import kernel.log.*
 class Db {
     HikariDataSource ds
     ThreadLocal current = new ThreadLocal()
+    // After-commit hooks of the open transactions, by connection (a ThreadLocal would need a cast to
+    // DbHooks, which the compiler emits unqualified: KOF_GAPS G19).
+    Map<Connection,DbHooks> hooks = new ConcurrentHashMap<Connection, DbHooks>()
     Log log = Log("kernel.db")
     public constructor(ds: HikariDataSource) {
         this.ds = ds
@@ -224,6 +228,8 @@ class Db {
         var c = ds.getConnection()
         c.setAutoCommit(false)
         current.set(c)
+        var pending = DbHooks()
+        hooks.put(c, pending)
         var failed = false
         var failure = ""
         try {
@@ -240,11 +246,31 @@ class Db {
         }
         // Not a `finally`: a throw from inside a catch skips it (KOF_GAPS G12).
         current.remove()
+        hooks.remove(c)
         c.setAutoCommit(true)
         c.close()
         if (failed) {
             throw failure
         }
+        // Committed and released: hooks may use the database on their own connection.
+        pending.run(log)
+    }
+    // @TransactionalEventListener(AFTER_COMMIT): inside a transaction the callback runs only after
+    // the outermost commit (never on rollback, in registration order, on the committing thread,
+    // after the connection is back in the pool); outside a transaction it runs immediately.
+    // A callback that throws is logged and does not stop the others nor undo the commit.
+    afterCommit(callback: () -> void) {
+        var c = current.get()
+        if (c == null) {
+            callback()
+            return
+        }
+        var pending = hooks.get(c as Connection)
+        if (pending == null) {
+            callback()
+            return
+        }
+        pending.add(callback)
     }
     Long txLong(body: () -> Long) {
         var result = 0L
