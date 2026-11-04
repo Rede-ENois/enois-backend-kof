@@ -1,0 +1,57 @@
+import gifs.*
+import kernel.cache.*
+import kernel.error.*
+
+class FakeGifProvider extends GifProvider {
+    String label
+    Bool up
+    String? failure
+    public constructor(label: String, up: Bool, failure: String?) {
+        super()
+        this.label = label
+        this.up = up
+        this.failure = failure
+    }
+    String name() = label
+    Bool available() = up
+    List<GifItem> search(query: String, limit: Int) {
+        var f = failure
+        if (f != null) {
+            var raised = "" + f
+            throw raised
+        }
+        return listOf<GifItem>()
+    }
+}
+
+GifSearchService fakeService(providers: List<GifProvider>) = GifSearchService(providers, TtlCache("gifSearch", 600000L, 200))
+
+String bad() = Errors.api(502, "GIF_PROVIDER_ERROR", "fora")
+
+test "a failing provider hands the search to the next one" {
+    var list = listOf<GifProvider>()
+    list.add(FakeGifProvider("tenor", true, bad()))
+    list.add(FakeGifProvider("giphy", true, null))
+    var result = fakeService(list).search("oi", 1)
+    assert(result.available)
+    assert(result.provider == "giphy")
+}
+
+test "the error reaches the screen only when every provider fails" {
+    var list = listOf<GifProvider>()
+    list.add(FakeGifProvider("tenor", true, bad()))
+    list.add(FakeGifProvider("giphy", true, bad()))
+    var failed = false
+    try {
+        fakeService(list).search("oi", 1)
+    } catch (String e) {
+        failed = Errors.hasCode(e, "GIF_PROVIDER_ERROR")
+    }
+    assert(failed)
+}
+
+test "without keys the search is unavailable, not an error" {
+    var list = listOf<GifProvider>()
+    list.add(FakeGifProvider("tenor", false, null))
+    assert(!fakeService(list).search("oi", 1).available)
+}

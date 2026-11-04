@@ -1,0 +1,110 @@
+import gifs.*
+import kernel.*
+import kernel.cache.*
+import kernel.error.*
+import kernel.security.*
+import kernel.testkit.*
+
+// Stand-in for Tenor/GIPHY (a third party's network is never tested): a counted, programmable provider.
+class StubGifProvider extends GifProvider {
+    static Int stubCalls = 0
+    static Int stubLastLimit = 0
+    String name() = "Stub"
+    Bool available() = true
+    List<GifItem> search(query: String, limit: Int) {
+        StubGifProvider.stubCalls = StubGifProvider.stubCalls + 1
+        StubGifProvider.stubLastLimit = limit
+        if (query == "falhar") {
+            throw Errors.api(502, "GIF_PROVIDER_ERROR", "A busca de GIF nao respondeu. Tente de novo.")
+        }
+        return listOf(GifItem("g1", "https://media.tenor.com/abc/gato.gif", "https://media.tenor.com/abc/gato-tiny.gif", 220, 220, "um gato", "Stub"))
+    }
+}
+
+wireGifs(p: Platform) {
+    Auth.install(p.server, p.db, p.cfg)
+    var providers = listOf<GifProvider>()
+    providers.add(StubGifProvider())
+    GifsModule.installWith(p.server, TtlCache("gifSearch", 600000L, 200), providers)
+}
+
+class GifTestHolder {
+    static TestApp? cached = null
+    static TestApp app() {
+        var cur = GifTestHolder.cached
+        if (cur != null) {
+            return cur
+        }
+        var created = TestApp.bootWire("gifs", (p: Platform) -> wireGifs(p))
+        GifTestHolder.cached = created
+        return created
+    }
+}
+
+List<String> gifAuth(id: String) {
+    var token = "tok-" + id + "-1234567890"
+    SecurityFixtures.login(GifTestHolder.app().db(), id, token)
+    return listOf("X-Session-Token: " + token)
+}
+
+test "requires session" {
+    var app = GifTestHolder.app()
+    Check.apiError(app.client.get("/gifs/search?q=gato-sem-sessao"), 401, "UNAUTHENTICATED")
+}
+
+test "returns items from the provider" {
+    var app = GifTestHolder.app()
+    var res = app.client.getWith("/gifs/search?q=gato", gifAuth("user_gif1"))
+    Check.status(res, 200)
+    Check.eqStr("available", "true", res.json("available"))
+    Check.jsonEq(res, "provider", "Stub")
+    Check.jsonEq(res, "items.0.url", "https://media.tenor.com/abc/gato.gif")
+    Check.jsonEq(res, "items.0.previewUrl", "https://media.tenor.com/abc/gato-tiny.gif")
+    Check.jsonEq(res, "items.0.width", "220")
+    Check.jsonEq(res, "items.0.description", "um gato")
+}
+
+test "caches the repeated term" {
+    var app = GifTestHolder.app()
+    var auth = gifAuth("user_gif2")
+    StubGifProvider.stubCalls = 0
+    Check.status(app.client.getWith("/gifs/search?q=cache-este-termo", auth), 200)
+    var afterFirst = StubGifProvider.stubCalls
+    Check.status(app.client.getWith("/gifs/search?q=cache-este-termo", auth), 200)
+    Check.eqInt("calls after first", 1, afterFirst)
+    Check.eqInt("calls after second", 1, StubGifProvider.stubCalls)
+}
+
+test "the term is trimmed and lower cased before it becomes the cache key" {
+    var app = GifTestHolder.app()
+    var auth = gifAuth("user_gif5")
+    StubGifProvider.stubCalls = 0
+    Check.status(app.client.getWith("/gifs/search?q=%20Gato-Normal%20", auth), 200)
+    Check.status(app.client.getWith("/gifs/search?q=gato-normal", auth), 200)
+    Check.eqInt("one provider call", 1, StubGifProvider.stubCalls)
+}
+
+test "caps the limit" {
+    var app = GifTestHolder.app()
+    var auth = gifAuth("user_gif3")
+    Check.status(app.client.getWith("/gifs/search?q=limite-alto&limit=500", auth), 200)
+    Check.eqInt("capped", 50, StubGifProvider.stubLastLimit)
+    Check.status(app.client.getWith("/gifs/search?q=limite-zero&limit=0", auth), 200)
+    Check.eqInt("floored", 1, StubGifProvider.stubLastLimit)
+    Check.status(app.client.getWith("/gifs/search?q=limite-padrao", auth), 200)
+    Check.eqInt("default", 24, StubGifProvider.stubLastLimit)
+}
+
+test "a malformed limit is a 400" {
+    var app = GifTestHolder.app()
+    Check.apiError(app.client.getWith("/gifs/search?q=x&limit=abc", gifAuth("user_gif6")), 400, "BAD_REQUEST")
+}
+
+test "turns provider failure into 502 and does not cache it" {
+    var app = GifTestHolder.app()
+    var auth = gifAuth("user_gif4")
+    StubGifProvider.stubCalls = 0
+    Check.apiError(app.client.getWith("/gifs/search?q=falhar", auth), 502, "GIF_PROVIDER_ERROR")
+    Check.apiError(app.client.getWith("/gifs/search?q=falhar", auth), 502, "GIF_PROVIDER_ERROR")
+    Check.eqInt("not cached", 2, StubGifProvider.stubCalls)
+}
