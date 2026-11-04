@@ -1,0 +1,50 @@
+package presence
+
+import kernel.error.*
+import kernel.http.*
+import kernel.sanctions.*
+import kernel.security.*
+import kernel.url.*
+import profile.*
+
+// HTTP adapter of presence (PresenceController).
+class PresenceRoutes {
+    static PresenceStatusBody statusBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<PresenceStatusBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static register(server: HttpServer, service: PresenceService, directory: ProfileDirectory, sanctions: SanctionGateReader) {
+        server.get("/me/presence", () -> json.encode(PresenceView(service.ownStatus(Auth.requireUser()))))
+        server.put("/me/presence", () -> {
+    var userId = Auth.requireUser()
+    var body = PresenceRoutes.statusBody()
+    var wanted = body.status()
+    if (wanted == null) {
+        throw Errors.api(400, "INVALID_PRESENCE_STATUS", "Escolha um estado de presenca.")
+    }
+    if (!PresenceStatuses.all.contains(wanted)) {
+        throw Errors.badRequest()
+    }
+    return json.encode(PresenceView(service.setStatus(userId, wanted)))
+})
+        // An unknown enum name is an unreadable body (400 BAD_REQUEST), like Jackson.
+        server.post("/me/presence/heartbeat", () -> {
+    service.heartbeat(Auth.requireUser())
+    return status(204, "")
+})
+        server.get("/users/:username/presence", () -> {
+    var profile = directory.findByUsername(Req.pathParam("username"))
+    if (profile == null) {
+        throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+    }
+    if (sanctions.banned(profile.id)) {
+        throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+    }
+    return json.encode(PresenceView(service.publicStatus(profile.id)))
+})
+    }
+}

@@ -1,0 +1,71 @@
+package kernel.time
+
+import kernel.error.*
+
+// ISO local dates (`yyyy-MM-dd`) as Jackson reads LocalDate and LocalDate.parse reads them: strict format,
+// real calendar days. Dates travel as Strings; ISO text compares in calendar order.
+class Dates {
+    static Bool isLeap(y: Int) = y % 4 == 0 && y % 100 != 0 || y % 400 == 0
+    static Int daysIn(y: Int, m: Int) {
+        if (m == 2) {
+            if (Dates.isLeap(y)) {
+                return 29
+            }
+            return 28
+        }
+        if (m == 4 || m == 6 || m == 9 || m == 11) {
+            return 30
+        }
+        return 31
+    }
+    static Bool digits(s: String) {
+        var i = 0
+        while (i < s.length()) {
+            var c = s.substring(i, i + 1)
+            if (c.compareTo("0") < 0 || c.compareTo("9") > 0) {
+                return false
+            }
+            i = i + 1
+        }
+        return s.length() > 0
+    }
+    // True for a real `yyyy-MM-dd`.
+    static Bool valid(raw: String) {
+        if (raw.length() != 10 || raw.substring(4, 5) != "-" || raw.substring(7, 8) != "-") {
+            return false
+        }
+        var ys = raw.substring(0, 4)
+        var ms = raw.substring(5, 7)
+        var ds = raw.substring(8, 10)
+        if (!Dates.digits(ys) || !Dates.digits(ms) || !Dates.digits(ds)) {
+            return false
+        }
+        var y = ys.toInt()
+        var m = ms.toInt()
+        var d = ds.toInt()
+        return m >= 1 && m <= 12 && d >= 1 && d <= Dates.daysIn(y, m)
+    }
+    // Request field: null/empty -> null, malformed -> 400 BAD_REQUEST (HttpMessageNotReadableException).
+    static String? body(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        if (raw.length() == 0) {
+            return null
+        }
+        if (!Dates.valid(raw)) {
+            throw Errors.badRequest()
+        }
+        return raw
+    }
+    // Today in São Paulo (UTC-3 all year since the 2019 end of daylight saving time).
+    static String todayBrazil() = Time.plusSeconds(Time.nowIso(), -10800L).substring(0, 10)
+    // Completed years between two valid dates (Period.between(birth, today).getYears()).
+    static Int yearsBetween(birth: String, today: String) {
+        var years = today.substring(0, 4).toInt() - birth.substring(0, 4).toInt()
+        if (today.substring(5, 10).compareTo(birth.substring(5, 10)) < 0) {
+            years = years - 1
+        }
+        return years
+    }
+}

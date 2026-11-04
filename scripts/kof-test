@@ -2,9 +2,43 @@
 # Runs Kof test suites with the kofdeps jars on the classpath (kof test 0.7.1 cannot, see
 # docs/KOF_GAPS.md G9). Usage: scripts/kof-test [paths...]   (default: tests/)
 # Needs JDK 21+ and `kof deps resolve` already done.
+#
+# Every test file recompiles the whole module, so concurrent runs from several worktrees saturate the
+# machine. Runs take one of KOF_TEST_SLOTS machine-wide slots (default 3) and wait for a free one.
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 DEPS=$("$HOME/.local/kof/kof" deps resolve 2>/dev/null | tail -n 1)
 [ $# -eq 0 ] && set -- tests
-exec java -cp "$HOME/.local/kof/kof-cli-0.7.1.jar" "$ROOT/scripts/KofTool.java" test src "$DEPS" "$@"
+
+SLOTS_DIR="${TMPDIR:-/tmp}/kof-test-slots"
+SLOTS="${KOF_TEST_SLOTS:-3}"
+mkdir -p "$SLOTS_DIR"
+SLOT=""
+WAITED=0
+while [ -z "$SLOT" ]; do
+    i=1
+    while [ "$i" -le "$SLOTS" ]; do
+        dir="$SLOTS_DIR/slot$i"
+        if mkdir "$dir" 2>/dev/null; then
+            echo $$ > "$dir/pid"
+            SLOT="$dir"
+            break
+        fi
+        # Reclaim a slot whose owner died without cleaning up.
+        owner=$(cat "$dir/pid" 2>/dev/null || true)
+        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -rf "$dir"
+            continue
+        fi
+        i=$((i + 1))
+    done
+    if [ -z "$SLOT" ]; then
+        [ "$WAITED" -eq 0 ] && echo "kof-test: waiting for a free test slot ($SLOTS in use)"
+        WAITED=1
+        sleep 5
+    fi
+done
+trap 'rm -rf "$SLOT"' EXIT INT TERM
+
+java -cp "$HOME/.local/kof/kof-cli-0.7.1.jar" "$ROOT/scripts/KofTool.java" test src "$DEPS" "$@"

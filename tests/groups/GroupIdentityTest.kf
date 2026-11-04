@@ -1,0 +1,37 @@
+import kernel.testkit.*
+import groups.*
+
+// Port of GroupIdentityTests: visual identity of the group through the edit (logo, banner as photo or HTML).
+test "the owner sets and clears logo and banner" {
+    var owner = GroupsTestKit.login("gid-dono")
+    var groupId = GroupsTestKit.createGroup(owner, "Identidade do Grupo", "OPEN")
+    Check.status(GroupsTestKit.patch("/groups/" + groupId, owner, "{\"avatar\":\"https://cdn.enois.ia.br/logo.png\",\"banner\":\"https://cdn.enois.ia.br/capa.png\"}"), 200)
+    var withImages = GroupsTestKit.get("/groups/identidade-do-grupo", owner)
+    Check.jsonEq(withImages, "avatar", "https://cdn.enois.ia.br/logo.png")
+    Check.jsonEq(withImages, "banner", "https://cdn.enois.ia.br/capa.png")
+    // An absent field keeps what was there (the PATCH is partial).
+    Check.status(GroupsTestKit.patch("/groups/" + groupId, owner, "{\"description\":\"nova descricao\"}"), 200)
+    var kept = GroupsTestKit.get("/groups/identidade-do-grupo", owner)
+    Check.jsonEq(kept, "avatar", "https://cdn.enois.ia.br/logo.png")
+    Check.jsonEq(kept, "banner", "https://cdn.enois.ia.br/capa.png")
+    // Blank removes both images.
+    Check.status(GroupsTestKit.patch("/groups/" + groupId, owner, "{\"avatar\":\"\",\"banner\":\"\"}"), 200)
+    var cleared = GroupsTestKit.get("/groups/identidade-do-grupo", owner)
+    assert(cleared.jsonIsNull("avatar"))
+    assert(cleared.jsonIsNull("banner"))
+}
+
+test "the banner HTML is sanitised and can be cleared" {
+    var owner = GroupsTestKit.login("gid-html-dono")
+    var groupId = GroupsTestKit.createGroup(owner, "Capa HTML do Grupo", "OPEN")
+    Check.status(GroupsTestKit.patch("/groups/" + groupId, owner, "{\"bannerHtml\":\"<div style=\\\"color:red\\\">capa</div><script>alert(1)</script>\"}"), 200)
+    var withHtml = GroupsTestKit.get("/groups/capa-html-do-grupo", owner)
+    var banner = withHtml.json("bannerHtml")
+    assert(banner.contains("capa"))
+    assert(!banner.contains("<script"))
+    // Blank clears the HTML header (the photo, if any, goes back to count).
+    Check.status(GroupsTestKit.patch("/groups/" + groupId, owner, "{\"bannerHtml\":\"\"}"), 200)
+    var cleared = GroupsTestKit.get("/groups/capa-html-do-grupo", owner)
+    Check.eqStr("cleared header", "", cleared.json("bannerHtml"))
+    assert(!cleared.jsonIsNull("bannerHtml"))
+}

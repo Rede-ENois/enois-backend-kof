@@ -1,0 +1,166 @@
+package groups
+
+import kernel.db.*
+
+// SQL of the private group feed: topics, posts, comments, reactions (GroupContentPersistenceAdapter).
+class GroupContentStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String topicColumns() = "id, group_id, name, description, position, status, created_at, updated_at"
+    static String postColumns() = "id, group_id, topic_id, author_id, content, media_ids, status, pinned, reactions, comments, created_at, updated_at"
+    static String commentColumns() = "id, post_id, group_id, author_id, parent_id, content, status, created_at, updated_at"
+    static GroupTopicRow toTopic(r: DbRow) = GroupTopicRow(r.getStr("id"), r.getStr("group_id"), r.getStr("name"), r.getStrOrNull("description"), r.getInt("position"), r.getStr("status"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    static GroupPostRow toPost(r: DbRow) = GroupPostRow(r.getStr("id"), r.getStr("group_id"), r.getStr("topic_id"), r.getStr("author_id"), r.getStr("content"), GroupContentStore.splitMedia(r.getStrOrNull("media_ids")), r.getStr("status"), r.getBool("pinned"), r.getInt("reactions"), r.getInt("comments"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    static GroupCommentRow toComment(r: DbRow) = GroupCommentRow(r.getStr("id"), r.getStr("post_id"), r.getStr("group_id"), r.getStr("author_id"), r.getStrOrNull("parent_id"), r.getStr("content"), r.getStr("status"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    static List<GroupTopicRow> topics(rows: List<DbRow>) {
+        var out = listOf<GroupTopicRow>()
+        for (var r in rows) {
+            out.add(GroupContentStore.toTopic(r))
+        }
+        return out
+    }
+    static List<GroupPostRow> posts(rows: List<DbRow>) {
+        var out = listOf<GroupPostRow>()
+        for (var r in rows) {
+            out.add(GroupContentStore.toPost(r))
+        }
+        return out
+    }
+    static List<GroupCommentRow> comments(rows: List<DbRow>) {
+        var out = listOf<GroupCommentRow>()
+        for (var r in rows) {
+            out.add(GroupContentStore.toComment(r))
+        }
+        return out
+    }
+    // media_ids is one id per line (no id has a line break).
+    static List<String> splitMedia(raw: String?) {
+        var out = listOf<String>()
+        if (raw == null) {
+            return out
+        }
+        for (var part in raw.split("\n")) {
+            var trimmed = part.trim()
+            if (trimmed.length() > 0) {
+                out.add(trimmed)
+            }
+        }
+        return out
+    }
+    static String joinLines(parts: List<String>, separator: String) {
+        var out = ""
+        for (var part in parts) {
+            if (out.length() > 0) {
+                out = out + separator
+            }
+            out = out + part
+        }
+        return out
+    }
+    static String joinMedia(ids: List<String>) = GroupContentStore.joinLines(ids, "\n")
+    insertTopic(t: GroupTopicRow) {
+        store.execute("insert into group_topics (id, group_id, name, description, position, status, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(t.id()).bindStr(t.groupId()).bindStr(t.name()).bindStrOrNull(t.description()).bindInt(t.position()).bindStr(t.status()).bindInstant(t.createdAt()).bindInstant(t.updatedAt()))
+    }
+    updateTopic(t: GroupTopicRow) {
+        store.execute("update group_topics set name = ?, description = ?, position = ?, status = ?, updated_at = ? where id = ?", DbParams().bindStr(t.name()).bindStrOrNull(t.description()).bindInt(t.position()).bindStr(t.status()).bindInstant(t.updatedAt()).bindStr(t.id()))
+    }
+    GroupTopicRow? findTopic(topicId: String) {
+        var row = store.queryOptional("select " + GroupContentStore.topicColumns() + " from group_topics where id = ?", DbParams().bindStr(topicId))
+        if (row == null) {
+            return null
+        }
+        return GroupContentStore.toTopic(row)
+    }
+    List<GroupTopicRow> listTopics(groupId: String) = GroupContentStore.topics(store.queryList("select " + GroupContentStore.topicColumns() + " from group_topics where group_id = ? order by position asc", DbParams().bindStr(groupId)))
+    Bool topicNameExists(groupId: String, name: String) = store.queryLong("select count(*) from group_topics where group_id = ? and lower(name) = lower(?)", DbParams().bindStr(groupId).bindStr(name)) > 0L
+    Int nextTopicPosition(groupId: String) = (store.queryLong("select coalesce(max(position), 0) from group_topics where group_id = ?", DbParams().bindStr(groupId)) as Int) + 1
+    insertPost(p: GroupPostRow) {
+        store.execute("insert into group_posts (id, group_id, topic_id, author_id, content, media_ids, status, pinned, reactions, comments, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(p.id()).bindStr(p.groupId()).bindStr(p.topicId()).bindStr(p.authorId()).bindStr(p.content()).bindStr(GroupContentStore.joinMedia(p.mediaIds())).bindStr(p.status()).bindBool(p.pinned()).bindInt(p.reactions()).bindInt(p.comments()).bindInstant(p.createdAt()).bindInstant(p.updatedAt()))
+    }
+    updatePost(p: GroupPostRow) {
+        store.execute("update group_posts set status = ?, pinned = ?, reactions = ?, comments = ?, updated_at = ? where id = ?", DbParams().bindStr(p.status()).bindBool(p.pinned()).bindInt(p.reactions()).bindInt(p.comments()).bindInstant(p.updatedAt()).bindStr(p.id()))
+    }
+    GroupPostRow? findPost(postId: String) {
+        var row = store.queryOptional("select " + GroupContentStore.postColumns() + " from group_posts where id = ?", DbParams().bindStr(postId))
+        if (row == null) {
+            return null
+        }
+        return GroupContentStore.toPost(row)
+    }
+    List<GroupPostRow> listPosts(groupId: String, topicId: String?, before: String?, limit: Int) {
+        var sql = "select " + GroupContentStore.postColumns() + " from group_posts where group_id = ? and status = \'PUBLISHED\'"
+        var params = DbParams().bindStr(groupId)
+        if (topicId != null) {
+            sql = sql + " and topic_id = ?"
+            params = params.bindStr(topicId)
+        }
+        if (before != null) {
+            sql = sql + " and created_at < ?"
+            params = params.bindInstant(before)
+        }
+        sql = sql + " order by created_at desc limit " + limit
+        return GroupContentStore.posts(store.queryList(sql, params))
+    }
+    GroupPostRow? findPinned(groupId: String) {
+        var row = store.queryOptional("select " + GroupContentStore.postColumns() + " from group_posts where group_id = ? and pinned = true and status = \'PUBLISHED\' order by created_at desc limit 1", DbParams().bindStr(groupId))
+        if (row == null) {
+            return null
+        }
+        return GroupContentStore.toPost(row)
+    }
+    // One pinned post per group: unpins the previous one in the same transaction as the new pin.
+    clearPinned(groupId: String) {
+        store.execute("update group_posts set pinned = false where group_id = ? and pinned = true", DbParams().bindStr(groupId))
+    }
+    insertComment(c: GroupCommentRow) {
+        store.execute("insert into group_post_comments (id, post_id, group_id, author_id, parent_id, content, status, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(c.id()).bindStr(c.postId()).bindStr(c.groupId()).bindStr(c.authorId()).bindStrOrNull(c.parentId()).bindStr(c.content()).bindStr(c.status()).bindInstant(c.createdAt()).bindInstant(c.updatedAt()))
+    }
+    updateComment(c: GroupCommentRow) {
+        store.execute("update group_post_comments set content = ?, status = ?, updated_at = ? where id = ?", DbParams().bindStr(c.content()).bindStr(c.status()).bindInstant(c.updatedAt()).bindStr(c.id()))
+    }
+    GroupCommentRow? findComment(commentId: String) {
+        var row = store.queryOptional("select " + GroupContentStore.commentColumns() + " from group_post_comments where id = ?", DbParams().bindStr(commentId))
+        if (row == null) {
+            return null
+        }
+        return GroupContentStore.toComment(row)
+    }
+    List<GroupCommentRow> listComments(postId: String, limit: Int) = GroupContentStore.comments(store.queryList("select " + GroupContentStore.commentColumns() + " from group_post_comments where post_id = ? and status = \'PUBLISHED\' order by created_at asc limit " + limit, DbParams().bindStr(postId)))
+    Long countComments(postId: String) = store.queryLong("select count(*) from group_post_comments where post_id = ? and status = \'PUBLISHED\'", DbParams().bindStr(postId))
+    // One reaction per person and post: a different type replaces the row.
+    saveReaction(r: GroupReactionRow) {
+        var changed = store.execute("update group_post_reactions set type = ? where post_id = ? and user_id = ?", DbParams().bindStr(r.type()).bindStr(r.postId()).bindStr(r.userId()))
+        if (changed == 0) {
+            store.execute("insert into group_post_reactions (id, post_id, user_id, type, created_at) values (?, ?, ?, ?, ?)", DbParams().bindStr(r.id()).bindStr(r.postId()).bindStr(r.userId()).bindStr(r.type()).bindInstant(r.createdAt()))
+        }
+    }
+    String? findReactionType(postId: String, userId: String) {
+        var row = store.queryOptional("select type from group_post_reactions where post_id = ? and user_id = ?", DbParams().bindStr(postId).bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return row.getStr("type")
+    }
+    removeReaction(postId: String, userId: String) {
+        store.execute("delete from group_post_reactions where post_id = ? and user_id = ?", DbParams().bindStr(postId).bindStr(userId))
+    }
+    Long countReactions(postId: String) = store.queryLong("select count(*) from group_post_reactions where post_id = ?", DbParams().bindStr(postId))
+    // The reader's reaction per post in one query (no N+1): post id -> reaction type.
+    Map<String,String> reactionsByUser(userId: String, postIds: List<String>) {
+        var out = mapOf<String, String>()
+        if (postIds.size() == 0) {
+            return out
+        }
+        var marks = GroupContentStore.joinLines(postIds.map((id: String) -> "?"), ", ")
+        var params = DbParams().bindStr(userId)
+        for (var id in postIds) {
+            params = params.bindStr(id)
+        }
+        for (var row in store.queryList("select post_id, type from group_post_reactions where user_id = ? and post_id in (" + marks + ")", params)) {
+            out.put(row.getStr("post_id"), row.getStr("type"))
+        }
+        return out
+    }
+}

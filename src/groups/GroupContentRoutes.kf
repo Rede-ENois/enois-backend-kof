@@ -1,0 +1,306 @@
+package groups
+
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+
+// Topics and the private feed of the group (GroupContentController).
+//
+// Everything here demands a session: there is no public read of a topic or post. A non-member gets 403
+// even knowing the ids (authorization is in the service, not on the screen).
+class GroupContentRoutes {
+    GroupFeedService feed
+    GroupProfileLookup profiles
+    GroupMediaLookup media
+    Idempotency idem
+    public constructor(feed: GroupFeedService, profiles: GroupProfileLookup, media: GroupMediaLookup, idem: Idempotency) {
+        this.feed = feed
+        this.profiles = profiles
+        this.media = media
+        this.idem = idem
+    }
+    static register(server: HttpServer, routes: GroupContentRoutes) {
+        server.get("/groups/:groupId/topics", () -> routes.topics())
+        server.post("/groups/:groupId/topics", () -> routes.createTopic())
+        server.patch("/groups/:groupId/topics/:topicId", () -> routes.updateTopic())
+        server.post("/groups/:groupId/topics/:topicId/archive", () -> routes.archiveTopic())
+        server.post("/groups/:groupId/topics/reorder", () -> routes.reorderTopics())
+        server.post("/groups/:groupId/posts", () -> routes.publish())
+        server.get("/groups/:groupId/posts", () -> routes.posts())
+        server.get("/groups/:groupId/pinned", () -> routes.pinned())
+        server.post("/groups/:groupId/posts/:postId/pin", () -> routes.pin())
+        server.delete("/groups/:groupId/posts/:postId/pin", () -> routes.unpin())
+        server.post("/groups/:groupId/posts/:postId/comments", () -> routes.comment())
+        server.get("/groups/:groupId/posts/:postId/comments", () -> routes.comments())
+        server.patch("/groups/:groupId/posts/:postId/comments/:commentId", () -> routes.editComment())
+        server.post("/groups/:groupId/posts/:postId/reactions", () -> routes.react())
+        server.delete("/groups/:groupId/posts/:postId/reactions", () -> routes.unreact())
+        server.delete("/groups/:groupId/posts/:postId", () -> routes.removePost())
+        server.delete("/groups/:groupId/posts/:postId/comments/:commentId", () -> routes.removeComment())
+    }
+    static GroupTopicBody parseTopic() {
+        try {
+            return json.decode<GroupTopicBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static GroupReorderBody parseReorder() {
+        try {
+            return json.decode<GroupReorderBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static GroupPostBody parsePost() {
+        try {
+            return json.decode<GroupPostBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static GroupCommentBody parseComment() {
+        try {
+            return json.decode<GroupCommentBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static GroupCommentEditBody parseCommentEdit() {
+        try {
+            return json.decode<GroupCommentEditBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static GroupReactionBody parseReaction() {
+        try {
+            return json.decode<GroupReactionBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    String topics() {
+        var user = Auth.requireUser()
+        var items = GroupContentRoutes.topicViews(feed.listTopics(Req.pathParam("groupId"), user))
+        return json.encode(GroupTopicPage(items, null))
+    }
+    String createTopic() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var body = GroupContentRoutes.parseTopic()
+        var hash = Idempotency.hash(groupId + "|" + Req.bodyText())
+        return idem.handle(user, "POST", "/api/groups/{groupId}/topics", hash, 201, () -> json.encode(GroupContentRoutes.topicView(feed.createTopic(groupId, user, body.name(), body.description()))))
+    }
+    String updateTopic() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var topicId = Req.pathParam("topicId")
+        var body = GroupContentRoutes.parseTopic()
+        var hash = Idempotency.hash(groupId + "|" + topicId + "|" + Req.bodyText())
+        return idem.handle(user, "PATCH", "/api/groups/{groupId}/topics/{topicId}", hash, 200, () -> json.encode(GroupContentRoutes.topicView(feed.updateTopic(groupId, topicId, body.name(), body.description(), user))))
+    }
+    String archiveTopic() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var topicId = Req.pathParam("topicId")
+        var hash = Idempotency.hash("archive|" + groupId + "|" + topicId)
+        return idem.handle(user, "POST", "/api/groups/{groupId}/topics/{topicId}/archive", hash, 200, () -> json.encode(GroupContentRoutes.topicView(feed.archiveTopic(groupId, topicId, user))))
+    }
+    String reorderTopics() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var body = GroupContentRoutes.parseReorder()
+        var hash = Idempotency.hash(groupId + "|" + Req.bodyText())
+        return idem.handle(user, "POST", "/api/groups/{groupId}/topics/reorder", hash, 200, () -> json.encode(GroupTopicPage(GroupContentRoutes.topicViews(feed.reorderTopics(groupId, body.topicIds(), user)), null)))
+    }
+    String publish() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var body = GroupContentRoutes.parsePost()
+        var hash = Idempotency.hash(groupId + "|" + Req.bodyText())
+        return idem.handle(user, "POST", "/api/groups/{groupId}/posts", hash, 201, () -> {
+    var post = feed.publish(groupId, body.topicId(), user, body.content(), body.mediaIds())
+    return json.encode(this.postView(post, null, profiles.find(post.authorId()), media.visibleByIds(post.mediaIds())))
+})
+    }
+    String posts() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var before = GroupRoutes.cursor()
+        var limit = Req.queryInt("limit", 20)
+        var found = feed.listPosts(groupId, Req.queryStr("topicId", ""), user, before, limit)
+        // The reader's reaction comes in one query (no N+1), like the main feed.
+        var mine = feed.myReactions(groupId, user, found.map((p: GroupPostRow) -> p.id()))
+        var authors = profiles.findAll(found.map((p: GroupPostRow) -> p.authorId()))
+        var mediaIds = listOf<String>()
+        for (var p in found) {
+            for (var id in p.mediaIds()) {
+                mediaIds.add(id)
+            }
+        }
+        var summaries = media.visibleByIds(mediaIds)
+        var items = listOf<GroupPostView>()
+        for (var p in found) {
+            items.add(this.postView(p, mine.get(p.id()), authors.get(p.authorId()), summaries))
+        }
+        var next = GroupNil.str()
+        if (found.size() == limit) {
+            next = found.get(found.size() - 1).createdAt()
+        }
+        return json.encode(GroupPostPage(items, next))
+    }
+    // The only pinned post of the group; 404 when there is none.
+    String pinned() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var post = feed.pinnedPost(groupId, user)
+        if (post == null) {
+            throw Errors.api(404, "NO_PINNED_POST", "Nao ha publicacao fixada neste grupo.")
+        }
+        var mine = feed.myReactions(groupId, user, listOf(post.id()))
+        return json.encode(this.postView(post, mine.get(post.id()), profiles.find(post.authorId()), media.visibleByIds(post.mediaIds())))
+    }
+    String pin() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var postId = Req.pathParam("postId")
+        var hash = Idempotency.hash("pin|" + groupId + "|" + postId)
+        return idem.handle(user, "POST", "/api/groups/{groupId}/posts/{postId}/pin", hash, 200, () -> {
+    var post = feed.pinPost(groupId, postId, user)
+    return json.encode(this.postView(post, null, profiles.find(post.authorId()), media.visibleByIds(post.mediaIds())))
+})
+    }
+    String unpin() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var postId = Req.pathParam("postId")
+        var hash = Idempotency.hash("unpin|" + groupId + "|" + postId)
+        return idem.handle(user, "DELETE", "/api/groups/{groupId}/posts/{postId}/pin", hash, 200, () -> {
+    feed.unpinPost(groupId, postId, user)
+    return json.encode(GroupStatusView(postId, "UNPINNED"))
+})
+    }
+    String comment() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var postId = Req.pathParam("postId")
+        var body = GroupContentRoutes.parseComment()
+        var hash = Idempotency.hash(groupId + "|" + postId + "|" + Req.bodyText())
+        return idem.handle(user, "POST", "/api/groups/{groupId}/posts/{postId}/comments", hash, 201, () -> {
+    var created = feed.comment(groupId, postId, user, body.content(), body.parentCommentId())
+    return json.encode(GroupContentRoutes.commentView(created, profiles.find(created.authorId())))
+})
+    }
+    String comments() {
+        var user = Auth.requireUser()
+        var found = feed.listComments(Req.pathParam("groupId"), Req.pathParam("postId"), user, Req.queryInt("limit", 100))
+        var authors = profiles.findAll(found.map((c: GroupCommentRow) -> c.authorId()))
+        var items = listOf<GroupCommentView>()
+        for (var c in found) {
+            items.add(GroupContentRoutes.commentView(c, authors.get(c.authorId())))
+        }
+        return json.encode(GroupCommentPage(items, null))
+    }
+    String editComment() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var postId = Req.pathParam("postId")
+        var commentId = Req.pathParam("commentId")
+        var body = GroupContentRoutes.parseCommentEdit()
+        var hash = Idempotency.hash(groupId + "|" + postId + "|" + commentId + "|" + Req.bodyText())
+        return idem.handle(user, "PATCH", "/api/groups/{groupId}/posts/{postId}/comments/{commentId}", hash, 200, () -> {
+    var edited = feed.editComment(groupId, postId, commentId, user, body.content())
+    return json.encode(GroupContentRoutes.commentView(edited, profiles.find(edited.authorId())))
+})
+    }
+    String react() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var postId = Req.pathParam("postId")
+        var body = GroupContentRoutes.parseReaction()
+        var hash = Idempotency.hash(groupId + "|" + postId + "|" + Req.bodyText())
+        return idem.handle(user, "POST", "/api/groups/{groupId}/posts/{postId}/reactions", hash, 200, () -> {
+    var active = feed.toggleReaction(groupId, postId, user, body.type())
+    var state = "UNREACTED"
+    if (active) {
+        state = "REACTED"
+    }
+    return json.encode(GroupStatusView(postId, state))
+})
+    }
+    String unreact() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var postId = Req.pathParam("postId")
+        var hash = Idempotency.hash("unreact|" + groupId + "|" + postId)
+        return idem.handle(user, "DELETE", "/api/groups/{groupId}/posts/{postId}/reactions", hash, 200, () -> {
+    feed.removeReaction(groupId, postId, user)
+    return json.encode(GroupStatusView(postId, "UNREACTED"))
+})
+    }
+    String removePost() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var postId = Req.pathParam("postId")
+        var hash = Idempotency.hash("remove|" + groupId + "|" + postId)
+        return idem.handle(user, "DELETE", "/api/groups/{groupId}/posts/{postId}", hash, 200, () -> {
+    feed.removePost(groupId, postId, user)
+    return json.encode(GroupStatusView(postId, "REMOVED"))
+})
+    }
+    String removeComment() {
+        var user = Auth.requireUser()
+        var groupId = Req.pathParam("groupId")
+        var postId = Req.pathParam("postId")
+        var commentId = Req.pathParam("commentId")
+        var hash = Idempotency.hash("remove|" + groupId + "|" + postId + "|" + commentId)
+        return idem.handle(user, "DELETE", "/api/groups/{groupId}/posts/{postId}/comments/{commentId}", hash, 200, () -> {
+    feed.removeComment(groupId, postId, commentId, user)
+    return json.encode(GroupStatusView(commentId, "REMOVED"))
+})
+    }
+    GroupPostView postView(post: GroupPostRow, myReaction: String?, author: GroupAuthor?, summaries: Map<String,GroupMediaSummary>) {
+        var badges = listOf<String>()
+        var name = GroupNil.str()
+        var username = GroupNil.str()
+        var avatar = GroupNil.str()
+        var frame = GroupNil.str()
+        var style = GroupNil.style()
+        if (author != null) {
+            badges = author.badges()
+            name = author.displayName()
+            username = author.username()
+            avatar = author.avatar()
+            frame = author.avatarFrame()
+            style = author.nameStyle()
+        }
+        return GroupPostView(post.id(), post.groupId(), post.topicId(), post.authorId(), name, username, avatar, badges, post.content(), post.mediaIds(), post.pinned(), post.reactions(), post.comments(), myReaction, post.createdAt(), frame, style, GroupMediaLookup.inOrder(post.mediaIds(), summaries))
+    }
+    static GroupCommentView commentView(c: GroupCommentRow, author: GroupAuthor?) {
+        var badges = listOf<String>()
+        var name = GroupNil.str()
+        var username = GroupNil.str()
+        var avatar = GroupNil.str()
+        var frame = GroupNil.str()
+        var style = GroupNil.style()
+        if (author != null) {
+            badges = author.badges()
+            name = author.displayName()
+            username = author.username()
+            avatar = author.avatar()
+            frame = author.avatarFrame()
+            style = author.nameStyle()
+        }
+        return GroupCommentView(c.id(), c.postId(), c.authorId(), name, username, avatar, badges, c.parentId(), c.content(), c.createdAt(), frame, style)
+    }
+    static List<GroupTopicView> topicViews(rows: List<GroupTopicRow>) {
+        var out = listOf<GroupTopicView>()
+        for (var t in rows) {
+            out.add(GroupContentRoutes.topicView(t))
+        }
+        return out
+    }
+    static GroupTopicView topicView(t: GroupTopicRow) = GroupTopicView(t.id(), t.groupId(), t.name(), t.description(), t.position(), t.status(), t.createdAt())
+}

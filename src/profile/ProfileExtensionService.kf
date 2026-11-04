@@ -1,0 +1,110 @@
+package profile
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.time.*
+import kernel.url.*
+
+// Experiences, education and certifications of a profile (ProfileExtensionService). At most 10 per kind
+// (an artificial resume of dozens of entries stops turning into reputation); rows are owned by the account.
+class ProfileExtensionService {
+    ProfileExtensionStore extension
+    ProfileDirectory directory
+    Db store
+    public constructor(store: Db, extension: ProfileExtensionStore, directory: ProfileDirectory) {
+        this.store = store
+        this.extension = extension
+        this.directory = directory
+    }
+    // Public curriculum: most recent first (the owner's own list keeps the order they arranged).
+    List<ProfileExperienceView> experiencesOf(username: String) {
+        var p = directory.findByUsername(username.trim())
+        if (p == null) {
+            throw Errors.api(404, "PROFILE_NOT_FOUND", "Perfil não encontrado.")
+        }
+        return extension.experiences(p.id, true)
+    }
+    ProfileExperienceView addExperience(userId: String, b: ProfileExperienceBody) {
+        var order = extension.countExperiences(userId)
+        if (order >= 10) {
+            throw Errors.api(409, "EXPERIENCES_LIMIT", "Você pode ter no máximo 10 experiências no perfil.")
+        }
+        var start = Dates.body(b.startDate())
+        var end = Dates.body(b.endDate())
+        var id = Ids.uuid()
+        extension.insertExperience(id, userId, b, start, end, order, Time.nowIso())
+        return this.experience(userId, id)
+    }
+    ProfileExperienceView updateExperience(userId: String, id: String, b: ProfileExperienceBody) {
+        this.experience(userId, id)
+        extension.updateExperience(id, b, Dates.body(b.startDate()), Dates.body(b.endDate()), Time.nowIso())
+        return this.experience(userId, id)
+    }
+    removeExperience(userId: String, id: String) {
+        this.experience(userId, id)
+        extension.deleteExperience(userId, id)
+    }
+    ProfileExperienceView experience(userId: String, id: String) {
+        var e = extension.experienceOf(userId, id)
+        if (e == null) {
+            throw Errors.api(404, "EXPERIENCE_NOT_FOUND", "Experiencia nao encontrada.")
+        }
+        return e
+    }
+    ProfileEducationView addEducation(userId: String, b: ProfileEducationBody) {
+        var order = extension.countEducations(userId)
+        if (order >= 10) {
+            throw Errors.api(409, "EDUCATION_LIMIT", "Você pode ter no máximo 10 formações no perfil.")
+        }
+        var start = Dates.body(b.startDate())
+        var end = Dates.body(b.endDate())
+        var id = Ids.uuid()
+        extension.insertEducation(id, userId, b, start, end, order, Time.nowIso())
+        return this.education(userId, id)
+    }
+    ProfileEducationView updateEducation(userId: String, id: String, b: ProfileEducationBody) {
+        this.education(userId, id)
+        extension.updateEducation(id, b, Dates.body(b.startDate()), Dates.body(b.endDate()), Time.nowIso())
+        return this.education(userId, id)
+    }
+    removeEducation(userId: String, id: String) {
+        this.education(userId, id)
+        extension.deleteEducation(userId, id)
+    }
+    ProfileEducationView education(userId: String, id: String) {
+        var e = extension.educationOf(userId, id)
+        if (e == null) {
+            throw Errors.api(404, "EDUCATION_NOT_FOUND", "Formacao nao encontrada.")
+        }
+        return e
+    }
+    ProfileCertificationView addCertification(userId: String, b: ProfileCertificationBody) {
+        if (extension.countCertifications(userId) >= 10) {
+            throw Errors.api(409, "CERTIFICATIONS_LIMIT", "Você pode ter no máximo 10 certificações no perfil.")
+        }
+        var issue = Dates.body(b.issueDate())
+        var expiration = Dates.body(b.expirationDate())
+        var url = SafeUrl.requireHttpUrl(b.credentialUrl(), "credencial")
+        var id = Ids.uuid()
+        extension.insertCertification(id, userId, b, issue, expiration, url, Time.nowIso())
+        return this.certification(userId, id)
+    }
+    ProfileCertificationView updateCertification(userId: String, id: String, b: ProfileCertificationBody) {
+        this.certification(userId, id)
+        var url = SafeUrl.requireHttpUrl(b.credentialUrl(), "credencial")
+        extension.updateCertification(id, b, Dates.body(b.issueDate()), Dates.body(b.expirationDate()), url, Time.nowIso())
+        return this.certification(userId, id)
+    }
+    removeCertification(userId: String, id: String) {
+        this.certification(userId, id)
+        extension.deleteCertification(userId, id)
+    }
+    ProfileCertificationView certification(userId: String, id: String) {
+        var c = extension.certificationOf(userId, id)
+        if (c == null) {
+            throw Errors.api(404, "CERTIFICATION_NOT_FOUND", "Certificacao nao encontrada.")
+        }
+        return c
+    }
+}

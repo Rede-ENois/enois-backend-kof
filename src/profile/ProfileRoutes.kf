@@ -1,0 +1,252 @@
+package profile
+
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+import kernel.url.*
+
+// HTTP adapter of the profile domain (ProfileController, RecommendationController, IdentityDisplayController,
+// AdminUsersController). Paths, statuses, bodies and pt-BR errors are the Java contract.
+class ProfileRoutes {
+    // Reads and decodes a JSON request body; a missing, malformed or mistyped body is 400 BAD_REQUEST.
+    static ProfileUpdateBody updateBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ProfileUpdateBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ProfileBirthDateBody birthBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ProfileBirthDateBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ProfileRankingBody rankingBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ProfileRankingBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ProfileAppearanceBody appearanceBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ProfileAppearanceBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ProfileBadgesBody badgesBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ProfileBadgesBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ProfileIdentityBody identityBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ProfileIdentityBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ProfileExperienceBody experienceBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ProfileExperienceBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ProfileEducationBody educationBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ProfileEducationBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ProfileCertificationBody certificationBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ProfileCertificationBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ProfilePromoteBody promoteBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ProfilePromoteBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    // @RequestBody(required = false): an empty body is a null comment.
+    static String? recommendComment() {
+        var text = Req.bodyText()
+        if (text.trim().length() == 0) {
+            return null
+        }
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ProfileRecommendBody>(text).comment()
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static Int publicListLimit(limit: Int) {
+        if (limit < 1) {
+            return 1
+        }
+        if (limit > 50) {
+            return 50
+        }
+        return limit
+    }
+    static String failMissingParam() {
+        throw "MISSING_REQUEST_PARAMETER"
+    }
+    static register(server: HttpServer, service: ProfileService, extension: ProfileExtensionService, recommendations: ProfileRecommendationService, appearance: ProfileAppearanceService, identity: ProfileIdentityService, admins: ProfileAdminService, idem: Idempotency, directory: ProfileDirectory) {
+        server.get("/me", () -> json.encode(service.getMe(Auth.requireUser())))
+        server.get("/me/age-state", () -> json.encode(service.ageState(Auth.requireUser())))
+        server.post("/me/birth-date", () -> {
+    var userId = Auth.requireUser()
+    var body = ProfileRoutes.birthBody()
+    return json.encode(service.declareBirthDate(userId, body.birthDate()))
+})
+        // Literal path first: it must win over `/users/:username`.
+        server.get("/users/search", () -> {
+    var q = query("q")
+    if (q == null) {
+        return ProfileRoutes.failMissingParam()
+    }
+    if (q.trim().length() < 2) {
+        return "[]"
+    }
+    return json.encode(service.search(q.trim()))
+})
+        server.get("/users/by-id/:userId", () -> {
+    Auth.requireUser()
+    return service.publicById(Req.pathParam("userId"))
+})
+        server.get("/users/:username", () -> service.publicByUsername(Req.pathParam("username")))
+        server.get("/ranking", () -> service.rankingJson(ProfileRoutes.publicListLimit(Req.queryInt("limit", 20))))
+        server.get("/profile/ranking", () -> service.rankingJson(ProfileRoutes.publicListLimit(Req.queryInt("limit", 20))))
+        server.put("/me/ranking", () -> {
+    var userId = Auth.requireUser()
+    var body = ProfileRoutes.rankingBody()
+    var show = body.show() == true
+    return idem.handle(userId, "PUT", "/api/me/ranking", Idempotency.hash(json.encode(body)), 200, () -> json.encode(service.setShowRanking(userId, show)))
+})
+        server.put("/me/profile-appearance", () -> {
+    var userId = Auth.requireUser()
+    var body = ProfileRoutes.appearanceBody()
+    return idem.handle(userId, "PUT", "/api/me/profile-appearance", Idempotency.hash(json.encode(body)), 200, () -> json.encode(appearance.update(userId, body)))
+})
+        server.patch("/me/profile", () -> {
+    var userId = Auth.requireUser()
+    var body = ProfileRoutes.updateBody()
+    return idem.handle(userId, "PATCH", "/api/me/profile", Idempotency.hash(json.encode(body)), 200, () -> json.encode(service.update(userId, body)))
+})
+        server.put("/me/badges", () -> {
+    var userId = Auth.requireUser()
+    var body = ProfileRoutes.badgesBody()
+    return json.encode(ProfileViews.publicView(identity.updateBadges(userId, body.badges()), null, null, false))
+})
+        server.put("/me/identity", () -> {
+    var userId = Auth.requireUser()
+    var body = ProfileRoutes.identityBody()
+    return json.encode(ProfileViews.publicView(identity.update(userId, body.nickname(), body.socialName(), body.pronouns()), null, null, false))
+})
+        ProfileRoutes.registerExtension(server, extension)
+        ProfileRoutes.registerRecommendations(server, recommendations, idem, directory)
+        ProfileRoutes.registerAdmin(server, admins)
+    }
+    static registerExtension(server: HttpServer, extension: ProfileExtensionService) {
+        server.get("/users/:username/experiences", () -> json.encode(extension.experiencesOf(Req.pathParam("username"))))
+        server.get("/me/experiences", () -> json.encode(extension.extension.experiences(Auth.requireUser(), false)))
+        server.post("/me/experiences", () -> {
+    var userId = Auth.requireUser()
+    return status(201, json.encode(extension.addExperience(userId, ProfileRoutes.experienceBody())))
+})
+        server.put("/me/experiences/:id", () -> {
+    var userId = Auth.requireUser()
+    return json.encode(extension.updateExperience(userId, Req.pathParam("id"), ProfileRoutes.experienceBody()))
+})
+        server.delete("/me/experiences/:id", () -> {
+    extension.removeExperience(Auth.requireUser(), Req.pathParam("id"))
+    return status(200, "")
+})
+        server.get("/me/education", () -> json.encode(extension.extension.educations(Auth.requireUser())))
+        server.post("/me/education", () -> {
+    var userId = Auth.requireUser()
+    return status(201, json.encode(extension.addEducation(userId, ProfileRoutes.educationBody())))
+})
+        server.put("/me/education/:id", () -> {
+    var userId = Auth.requireUser()
+    return json.encode(extension.updateEducation(userId, Req.pathParam("id"), ProfileRoutes.educationBody()))
+})
+        server.delete("/me/education/:id", () -> {
+    extension.removeEducation(Auth.requireUser(), Req.pathParam("id"))
+    return status(200, "")
+})
+        server.get("/me/certifications", () -> json.encode(extension.extension.certifications(Auth.requireUser())))
+        server.post("/me/certifications", () -> {
+    var userId = Auth.requireUser()
+    return status(201, json.encode(extension.addCertification(userId, ProfileRoutes.certificationBody())))
+})
+        server.put("/me/certifications/:id", () -> {
+    var userId = Auth.requireUser()
+    return json.encode(extension.updateCertification(userId, Req.pathParam("id"), ProfileRoutes.certificationBody()))
+})
+        server.delete("/me/certifications/:id", () -> {
+    extension.removeCertification(Auth.requireUser(), Req.pathParam("id"))
+    return status(200, "")
+})
+    }
+    static registerRecommendations(server: HttpServer, recommendations: ProfileRecommendationService, idem: Idempotency, directory: ProfileDirectory) {
+        server.post("/recommendations/:targetId", () -> {
+    var userId = Auth.requireUser()
+    var targetId = Req.pathParam("targetId")
+    var comment = ProfileRoutes.recommendComment()
+    var hashed = comment
+    if (hashed == null) {
+        hashed = ""
+    }
+    return idem.handle(userId, "POST", "/api/recommendations/{targetId}", Idempotency.hash("{\"targetId\":" + json.encode(targetId) + ",\"comment\":" + json.encode(hashed) + "}"), 201, () -> json.encode(recommendations.recommend(userId, targetId, comment)))
+})
+        server.delete("/recommendations/:targetId", () -> {
+    var userId = Auth.requireUser()
+    var targetId = Req.pathParam("targetId")
+    return idem.handle(userId, "DELETE", "/api/recommendations/{targetId}", Idempotency.hash("{\"targetId\":" + json.encode(targetId) + "}"), 200, () -> {
+    recommendations.remove(userId, targetId)
+    return "{\"status\":\"REMOVED\"}"
+})
+})
+        server.get("/recommendations/received/:userId", () -> json.encode(recommendations.extension.received(Req.pathParam("userId"))))
+        server.get("/recommendations/given/:userId", () -> json.encode(recommendations.extension.given(Req.pathParam("userId"))))
+    }
+    static registerAdmin(server: HttpServer, admins: ProfileAdminService) {
+        server.get("/admin/admins", () -> {
+    Auth.requireAdmin()
+    return json.encode(admins.admins())
+})
+        server.post("/admin/admins", () -> {
+    var by = Auth.requireAdmin()
+    return json.encode(admins.promote(ProfileRoutes.promoteBody().username(), by))
+})
+        server.post("/admin/admins/:username/revoke", () -> {
+    var by = Auth.requireAdmin()
+    return json.encode(admins.revoke(Req.pathParam("username"), by))
+})
+    }
+}

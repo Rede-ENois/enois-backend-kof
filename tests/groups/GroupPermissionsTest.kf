@@ -1,0 +1,76 @@
+import groups.*
+
+// Port of GroupPermissionsTests: the authorization table, role by role.
+List<String> ofGroup() = listOf("VIEW_PRIVATE_CONTENT", "PUBLISH", "INTERACT", "REPORT_CONTENT", "REPORT_GROUP", "MODERATE_CONTENT", "PIN_CONTENT", "MANAGE_TOPICS", "MANAGE_MEMBERS", "VIEW_JOIN_REQUESTS", "DECIDE_JOIN_REQUESTS", "EDIT_GROUP", "CONFIGURE_JOIN", "MANAGE_ROLES", "TRANSFER_OWNERSHIP", "CLOSE_GROUP")
+
+List<String> forbidden() = listOf("DELETE_REPORT_EVIDENCE", "DISABLE_AUTOMOD", "CHANGE_AUDIT_RECORDS", "GRANT_GLOBAL_PRIVILEGES")
+
+test "the owner can everything that belongs to the group" {
+    for (var capability in ofGroup()) {
+        assert(GroupPermissions.can("OWNER", capability))
+    }
+}
+
+test "the admin administers the group but neither the appointment nor the end" {
+    assert(GroupPermissions.can("ADMIN", "EDIT_GROUP"))
+    assert(GroupPermissions.can("ADMIN", "MANAGE_TOPICS"))
+    assert(GroupPermissions.can("ADMIN", "MANAGE_MEMBERS"))
+    assert(GroupPermissions.can("ADMIN", "DECIDE_JOIN_REQUESTS"))
+    assert(GroupPermissions.can("ADMIN", "MODERATE_CONTENT"))
+    assert(!GroupPermissions.can("ADMIN", "MANAGE_ROLES"))
+    assert(!GroupPermissions.can("ADMIN", "TRANSFER_OWNERSHIP"))
+    assert(!GroupPermissions.can("ADMIN", "CLOSE_GROUP"))
+}
+
+test "the moderator takes care of content and not of configuration" {
+    assert(GroupPermissions.can("MODERATOR", "MODERATE_CONTENT"))
+    assert(GroupPermissions.can("MODERATOR", "PIN_CONTENT"))
+    assert(GroupPermissions.can("MODERATOR", "PUBLISH"))
+    assert(!GroupPermissions.can("MODERATOR", "MANAGE_TOPICS"))
+    assert(!GroupPermissions.can("MODERATOR", "MANAGE_MEMBERS"))
+    assert(!GroupPermissions.can("MODERATOR", "DECIDE_JOIN_REQUESTS"))
+    assert(!GroupPermissions.can("MODERATOR", "EDIT_GROUP"))
+}
+
+test "the member takes part and does not moderate" {
+    assert(GroupPermissions.can("MEMBER", "VIEW_PRIVATE_CONTENT"))
+    assert(GroupPermissions.can("MEMBER", "PUBLISH"))
+    assert(GroupPermissions.can("MEMBER", "INTERACT"))
+    assert(GroupPermissions.can("MEMBER", "REPORT_CONTENT"))
+    assert(!GroupPermissions.can("MEMBER", "MODERATE_CONTENT"))
+    assert(!GroupPermissions.can("MEMBER", "VIEW_JOIN_REQUESTS"))
+    assert(!GroupPermissions.can("MEMBER", "MANAGE_MEMBERS"))
+    assert(!GroupPermissions.can("MEMBER", "EDIT_GROUP"))
+}
+
+test "the visitor reaches only the presentation and may report it" {
+    var visitor = GroupNil.str()
+    assert(GroupPermissions.can(visitor, "REPORT_GROUP"))
+    for (var capability in ofGroup()) {
+        if (capability != "REPORT_GROUP") {
+            assert(!GroupPermissions.can(visitor, capability))
+        }
+    }
+}
+
+test "the four prohibitions hold for everybody, owner included" {
+    for (var role in GroupPermissions.roles()) {
+        for (var capability in forbidden()) {
+            assert(!GroupPermissions.can(role, capability))
+        }
+    }
+    for (var capability in forbidden()) {
+        assert(!GroupPermissions.can(GroupNil.str(), capability))
+    }
+    // The table lists exactly the capabilities of the group plus the four prohibitions.
+    assert(GroupPermissions.capabilities().size() == ofGroup().size() + forbidden().size())
+}
+
+test "the group never ends up without an authority" {
+    var now = "2026-10-18T12:00:00Z"
+    var owner = GroupMemberRow("group_1", "user_dono", "OWNER", now)
+    var other = GroupMemberRow("group_1", "user_outro", "MEMBER", now)
+    assert(!GroupPermissions.canDropOwnership(listOf(owner, other), "user_dono"))
+    var second = GroupMemberRow("group_1", "user_segundo", "OWNER", now)
+    assert(GroupPermissions.canDropOwnership(listOf(owner, second), "user_dono"))
+}

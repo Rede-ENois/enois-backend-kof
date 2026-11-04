@@ -1,0 +1,242 @@
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import profile.*
+
+class ReputationHolder {
+    static TestApp? cached = null
+}
+
+TestApp rApp() {
+    var cur = ReputationHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = ProfileTestApp.boot("reputation", mapOf<String, String>())
+    ReputationHolder.cached = created
+    return created
+}
+
+ProfileReputation reputationService() {
+    var store = rApp().db()
+    return ProfileReputation(store, ProfileDirectory(store), ProfileStore(store), ProfileExtensionStore(store), ProfileForeignCounts(store))
+}
+
+Int rep(id: String) = reputationService().countsFor(id).reputation()
+
+String daysAgo(days: Long) = Time.plusSeconds(Time.nowIso(), 0L - days * 86400L)
+
+// The scenario of the Java service tests: a verified account of about six months with 5 connections
+// (4 followers), 2 distinct engagers, 3 experiences and nothing else = 86 points.
+//   T = 15*sqrt(3) = 25.98 | R = 9*sqrt(5) = 20.12 | C = 7.5*sqrt(2) = 10.61 | K = 6*sqrt(6*4) = 29.39
+seedActivity(id: String) {
+    var store = rApp().db()
+    var now = Time.nowIso()
+    store.execute("update users set created_at = ? where id = ?", DbParams().bindInstant(daysAgo(184L)).bindStr(id))
+    var i = 1
+    while (i <= 5) {
+        var other = id + "_o" + i
+        SecurityFixtures.user(store, other, true, false)
+        if (i <= 4) {
+            store.execute("insert into user_connections (requester_user_id, receiver_user_id, status, created_at) values (?, ?, \'ACCEPTED\', ?)", DbParams().bindStr(other).bindStr(id).bindInstant(now))
+        }
+        else {
+            store.execute("insert into user_connections (requester_user_id, receiver_user_id, status, created_at) values (?, ?, \'ACCEPTED\', ?)", DbParams().bindStr(id).bindStr(other).bindInstant(now))
+        }
+        i = i + 1
+    }
+    var e = 1
+    while (e <= 3) {
+        store.execute("insert into user_experiences (id, user_id, title, company, currently_here, start_date, display_order, created_at, updated_at) values (?, ?, \'Dev\', \'X\', true, \'2020-01-01\', ?, ?, ?)", DbParams().bindStr("exp_" + id + "_" + e).bindStr(id).bindInt(e).bindInstant(now).bindInstant(now))
+        e = e + 1
+    }
+    store.execute("insert into posts (id, author_id, type, content, created_at, visibility, reactions, comments, saves, shares, status, author_identity) values (?, ?, \'INSIGHT\', \'Post de reputacao.\', ?, \'PUBLIC\', 0, 0, 0, 0, \'ACTIVE\', \'SOCIAL\')", DbParams().bindStr("post_" + id).bindStr(id).bindInstant(now))
+    store.execute("insert into reactions (id, post_id, user_id, reaction_type, created_at) values (?, ?, ?, \'LIKE\', ?)", DbParams().bindStr("rx_" + id + "_1").bindStr("post_" + id).bindStr(id + "_o1").bindInstant(now))
+    store.execute("insert into reactions (id, post_id, user_id, reaction_type, created_at) values (?, ?, ?, \'LIKE\', ?)", DbParams().bindStr("rx_" + id + "_2").bindStr("post_" + id).bindStr(id + "_o2").bindInstant(now))
+}
+
+String verifiedUser(id: String) {
+    SecurityFixtures.user(rApp().db(), id, true, false)
+    seedActivity(id)
+    return id
+}
+
+// ReputationServiceTests ---------------------------------------------------------------------------
+test "a verified account scores by components" {
+    var id = verifiedUser("rep_verified")
+    var counts = reputationService().countsFor(id)
+    Check.isTrue("identity verified", counts.identityVerified())
+    Check.eqInt("reputation", 86, counts.reputation())
+    Check.eqInt("connections", 5, counts.connections())
+    Check.eqInt("followers", 4, counts.followers())
+}
+
+test "the second factor also counts as verification" {
+    var id = "rep_totp"
+    SecurityFixtures.user(rApp().db(), id, false, false)
+    seedActivity(id)
+    rApp().db().execute("update users set totp_enabled_at = ? where id = ?", DbParams().bindInstant(Time.nowIso()).bindStr(id))
+    var counts = reputationService().countsFor(id)
+    Check.isTrue("verified by the second factor", counts.identityVerified())
+    Check.eqInt("reputation", 86, counts.reputation())
+}
+
+test "reputation is zero without e-mail verification or second factor" {
+    var id = "rep_unverified"
+    SecurityFixtures.user(rApp().db(), id, false, false)
+    seedActivity(id)
+    var counts = reputationService().countsFor(id)
+    Check.isTrue("not verified", !counts.identityVerified())
+    Check.eqInt("zero", 0, counts.reputation())
+    // The connections keep being counted: credibility goes to zero, the profile does not.
+    Check.eqInt("connections", 5, counts.connections())
+    // The garden still grows: T 25.98/195 and K 29.39/120 reach stage 1; R and C stay seeds.
+    var garden = counts.garden()
+    Check.eqInt("trajectory", 1, garden.trajectory())
+    Check.eqInt("relations", 0, garden.relations())
+    Check.eqInt("contribution", 0, garden.contribution())
+    Check.eqInt("tenure", 1, garden.tenure())
+    Check.eqInt("health", 2, garden.health())
+}
+
+test "abandoning jobs without responding penalizes" {
+    var id = verifiedUser("rep_abandon")
+    rApp().db().execute("insert into job_abandon_penalties (job_id, user_id, unanswered, recorded_at) values (\'job_rep_abandon\', ?, 3, ?)", DbParams().bindStr(id).bindInstant(Time.nowIso()))
+    // 86 from the components; one active penalty takes 25.
+    Check.eqInt("reputation", 61, rep(id))
+}
+
+test "an approved community note gives up to five points each" {
+    var id = verifiedUser("rep_notes_ok")
+    addNote(id, 1, "APPROVED")
+    addNote(id, 2, "APPROVED")
+    // 86 from the components + 2 fact-checks x 5.
+    Check.eqInt("reputation", 96, rep(id))
+}
+
+test "the approved community note bonus is capped at five notes" {
+    var id = verifiedUser("rep_notes_cap")
+    var n = 1
+    while (n <= 9) {
+        addNote(id, n, "APPROVED")
+        n = n + 1
+    }
+    Check.eqInt("reputation", 111, rep(id))
+}
+
+test "a denied community note penalizes" {
+    var id = verifiedUser("rep_notes_denied")
+    addNote(id, 1, "DENIED")
+    // One denied false note takes 25 off the 86.
+    var counts = reputationService().countsFor(id)
+    Check.eqInt("reputation", 61, counts.reputation())
+    Check.eqInt("health dims", 1, counts.garden().health())
+}
+
+addNote(author: String, n: Int, status: String) {
+    var store = rApp().db()
+    var postId = "post_note_" + author + "_" + n
+    store.execute("insert into posts (id, author_id, type, content, created_at, visibility, reactions, comments, saves, shares, status, author_identity) values (?, ?, \'INSIGHT\', \'Alvo da nota.\', ?, \'PUBLIC\', 0, 0, 0, 0, \'ACTIVE\', \'SOCIAL\')", DbParams().bindStr(postId).bindStr(author).bindInstant(Time.nowIso()))
+    store.execute("insert into post_notes (id, post_id, author_id, body, status, created_at) values (?, ?, ?, \'Contexto da nota.\', ?, ?)", DbParams().bindStr("note_" + author + "_" + n).bindStr(postId).bindStr(author).bindStr(status).bindInstant(Time.nowIso()))
+}
+
+test "only confirmed facts penalize and each fact costs once" {
+    var id = verifiedUser("rep_facts")
+    var store = rApp().db()
+    SecurityFixtures.user(store, "rep_facts_reporter", true, false)
+    var now = Time.nowIso()
+    // A pending report does not count: the service only looks at confirmed facts.
+    store.execute("insert into posts (id, author_id, type, content, created_at, visibility, reactions, comments, saves, shares, status, author_identity) values (\'post_rep_facts_a\', ?, \'INSIGHT\', \'Denunciado A.\', ?, \'PUBLIC\', 0, 0, 0, 0, \'ACTIVE\', \'SOCIAL\')", DbParams().bindStr(id).bindInstant(now))
+    store.execute("insert into reports (id, reporter_id, target_type, target_id, reason, status, created_at) values (\'rep_f_pending\', \'rep_facts_reporter\', \'POST\', \'post_rep_facts_a\', \'SPAM\', \'PENDING\', ?)", DbParams().bindInstant(now))
+    Check.eqInt("pending is free", 86, rep(id))
+    store.execute("update reports set status = \'APPROVED\' where id = \'rep_f_pending\'", DbParams())
+    Check.eqInt("86 - 60", 26, rep(id))
+    // Two more confirmed facts on distinct contents: 60 * 3 * 4 / 2 = 360, floor at zero.
+    var k = 2
+    while (k <= 3) {
+        store.execute("insert into posts (id, author_id, type, content, created_at, visibility, reactions, comments, saves, shares, status, author_identity) values (?, ?, \'INSIGHT\', \'Denunciado.\', ?, \'PUBLIC\', 0, 0, 0, 0, \'ACTIVE\', \'SOCIAL\')", DbParams().bindStr("post_rep_facts_" + k).bindStr(id).bindInstant(now))
+        store.execute("insert into reports (id, reporter_id, target_type, target_id, reason, status, created_at) values (?, \'rep_facts_reporter\', \'POST\', ?, \'SPAM\', \'APPROVED\', ?)", DbParams().bindStr("rep_f_" + k).bindStr("post_rep_facts_" + k).bindInstant(now))
+        k = k + 1
+    }
+    Check.eqInt("floor", 0, rep(id))
+    // Two reports on the same content are one fact.
+    store.execute("delete from reports where id in (\'rep_f_2\', \'rep_f_3\')", DbParams())
+    store.execute("insert into reports (id, reporter_id, target_type, target_id, reason, status, created_at) values (\'rep_f_dup\', \'rep_facts_reporter\', \'POST\', \'post_rep_facts_a\', \'SPAM\', \'APPROVED\', ?)", DbParams().bindInstant(now))
+    Check.eqInt("same content costs once", 26, rep(id))
+}
+
+test "reciprocal recommendations do not count" {
+    var id = verifiedUser("rep_recs")
+    var store = rApp().db()
+    var now = Time.nowIso()
+    var i = 0
+    while (i < 10) {
+        var other = "rep_recs_r" + i
+        SecurityFixtures.user(store, other, true, false)
+        store.execute("insert into user_recommendations (id, recommender_id, recommended_id, comment, created_at) values (?, ?, ?, \'texto\', ?)", DbParams().bindStr("rec_in_" + i).bindStr(other).bindStr(id).bindInstant(now))
+        store.execute("insert into user_recommendations (id, recommender_id, recommended_id, comment, created_at) values (?, ?, ?, \'texto\', ?)", DbParams().bindStr("rec_out_" + i).bindStr(id).bindStr(other).bindInstant(now))
+        i = i + 1
+    }
+    // All reciprocal: the recommendations component is zero.
+    Check.eqInt("all reciprocal", 86, rep(id))
+    // None reciprocal: the 10 count (diminishing returns: 30 * sqrt(10) = 94.87).
+    store.execute("delete from user_recommendations where id like \'rec_out_%\' and recommender_id = ?", DbParams().bindStr(id))
+    Check.eqInt("none reciprocal", 181, rep(id))
+}
+
+test "the refresh job persists the reputation column used by the search" {
+    var id = verifiedUser("rep_refresh")
+    var store = rApp().db()
+    Check.eqInt("starts at zero", 0, store.queryLong("select reputation from users where id = ?", DbParams().bindStr(id)) as Int)
+    Check.isTrue("pass updated profiles", reputationService().refreshRankingColumn() > 0)
+    Check.eqInt("stored", 86, store.queryLong("select reputation from users where id = ?", DbParams().bindStr(id)) as Int)
+}
+
+test "the own profile and the public garden carry the same numbers" {
+    var id = verifiedUser("rep_http")
+    var user = ProfileTestApp.login(rApp(), id)
+    var me = user.get("/me")
+    Check.status(me, 200)
+    Check.jsonEq(me, "reputation", "86")
+    Check.jsonEq(me, "connectionsCount", "5")
+    Check.jsonEq(me, "followersCount", "4")
+    var pub = ProfileTestApp.anonymous(rApp()).get("/users/" + id)
+    Check.jsonEq(pub, "garden.trajectory", "1")
+    Check.jsonEq(pub, "garden.health", "2")
+}
+
+// ReputationGardenTests -------------------------------------------------------------------------------
+test "the stage follows the fraction of the cap" {
+    Check.eqInt("0", 0, ProfileReputation.stage(0.0, 100))
+    Check.eqInt("9.99", 0, ProfileReputation.stage(9.99, 100))
+    Check.eqInt("10", 1, ProfileReputation.stage(10.0, 100))
+    Check.eqInt("34.99", 1, ProfileReputation.stage(34.99, 100))
+    Check.eqInt("35", 2, ProfileReputation.stage(35.0, 100))
+    Check.eqInt("69.99", 2, ProfileReputation.stage(69.99, 100))
+    Check.eqInt("70", 3, ProfileReputation.stage(70.0, 100))
+    Check.eqInt("100", 3, ProfileReputation.stage(100.0, 100))
+}
+
+test "health dims only with a penalty" {
+    Check.eqInt("0", 2, ProfileReputation.health(0))
+    Check.eqInt("1", 1, ProfileReputation.health(1))
+    Check.eqInt("150", 1, ProfileReputation.health(150))
+    Check.eqInt("151", 0, ProfileReputation.health(151))
+    Check.eqInt("600", 0, ProfileReputation.health(600))
+}
+
+test "each component uses its own cap" {
+    // 19.5 is 10% of trajectory (195) but only 6.5% of relations (300).
+    Check.eqInt("trajectory", 1, ProfileReputation.stage(19.5, 195))
+    Check.eqInt("relations", 0, ProfileReputation.stage(19.5, 300))
+    Check.eqInt("contribution", 1, ProfileReputation.stage(42.0, 420))
+    Check.eqInt("tenure", 3, ProfileReputation.stage(120.0, 120))
+    Check.eqInt("trajectory full", 3, ProfileReputation.stage(195.0, 195))
+    Check.eqInt("relations 70%", 3, ProfileReputation.stage(210.0, 300))
+    Check.eqInt("contribution 69.8%", 2, ProfileReputation.stage(293.0, 420))
+    Check.eqInt("tenure 34.9%", 1, ProfileReputation.stage(41.9, 120))
+}
+
+test "zz stops the background jobs" {
+    ProfileTestApp.finish()
+}

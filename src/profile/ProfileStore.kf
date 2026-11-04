@@ -1,0 +1,51 @@
+package profile
+
+import kernel.db.*
+
+// Every column the profile edit endpoint writes, final values (the service merges the request with the
+// stored profile first, like UserProfile.update did).
+record ProfileEdit(String id, String username, String name, String? headline, String? company, String? location, String? avatar, String? banner, String? bannerItem, String? badge, String? bio, String? aka, List<String> skills, List<String> goals, String? availability, String? portfolio, List<String> externalLinks, Bool openToWork, Bool mentor, String? city, String? state, String? cityKey, Bool showCity, String? resumeUrl, String? resumeName, String? bioHtml, String? bannerHtml, String? birthDate, String updatedAt)
+
+// Writes of the profile domain (users row and its collections, user_recommendations are elsewhere). Each
+// statement touches only the columns of its use case, so a concurrent cosmetics write is never reverted.
+class ProfileStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // UserProfile edit: all editable columns plus the three element collections when they changed.
+    saveEdit(e: ProfileEdit, current: ProfileRecord) {
+        store.execute("update users set username = ?, name = ?, headline = ?, company = ?, location = ?, avatar = ?, banner = ?, banner_item = ?, badge = ?, bio = ?, aka = ?, availability = ?, portfolio = ?, open_to_work = ?, is_mentor = ?, city = ?, state = ?, city_key = ?, show_city = ?, resume_url = ?, resume_name = ?, bio_html = ?, banner_html = ?, birth_date = ?, updated_at = ? where id = ?", DbParams().bindStr(e.username).bindStr(e.name).bindStrOrNull(e.headline).bindStrOrNull(e.company).bindStrOrNull(e.location).bindStrOrNull(e.avatar).bindStrOrNull(e.banner).bindStrOrNull(e.bannerItem).bindStrOrNull(e.badge).bindStrOrNull(e.bio).bindStrOrNull(e.aka).bindStrOrNull(e.availability).bindStrOrNull(e.portfolio).bindBool(e.openToWork).bindBool(e.mentor).bindStrOrNull(e.city).bindStrOrNull(e.state).bindStrOrNull(e.cityKey).bindBool(e.showCity).bindStrOrNull(e.resumeUrl).bindStrOrNull(e.resumeName).bindStrOrNull(e.bioHtml).bindStrOrNull(e.bannerHtml).bindDateOrNull(e.birthDate).bindInstant(e.updatedAt).bindStr(e.id))
+        this.replaceCollection("user_skills", "skill", e.id, current.skills, e.skills)
+        this.replaceCollection("user_goals", "goal", e.id, current.goals, e.goals)
+        this.replaceCollection("user_external_links", "external_link", e.id, current.externalLinks, e.externalLinks)
+    }
+    // Hibernate rewrote a collection only when it changed: delete all, insert all.
+    replaceCollection(table: String, col: String, userId: String, before: List<String>, after: List<String>) {
+        if (String.join("\u0001", before) == String.join("\u0001", after) && before.size() == after.size()) {
+            return
+        }
+        store.execute("delete from " + table + " where user_id = ?", DbParams().bindStr(userId))
+        for (var v in after) {
+            store.execute("insert into " + table + " (user_id, " + col + ") values (?, ?)", DbParams().bindStr(userId).bindStr(v))
+        }
+    }
+    setShowRanking(id: String, show: Bool, now: String) {
+        store.execute("update users set show_ranking = ?, updated_at = ? where id = ?", DbParams().bindBool(show).bindInstant(now).bindStr(id))
+    }
+    declareBirthDate(id: String, date: String, now: String) {
+        store.execute("update users set birth_date = ?, updated_at = ? where id = ?", DbParams().bindDate(date).bindInstant(now).bindStr(id))
+    }
+    updateReputation(id: String, value: Int) {
+        store.execute("update users set reputation = ? where id = ?", DbParams().bindInt(value).bindStr(id))
+    }
+    updateIdentity(id: String, nickname: String?, socialName: String?, pronouns: String?, now: String) {
+        store.execute("update users set nickname = ?, social_name = ?, pronouns = ?, updated_at = ? where id = ?", DbParams().bindStrOrNull(nickname).bindStrOrNull(socialName).bindStrOrNull(pronouns).bindInstant(now).bindStr(id))
+    }
+    updateAppearance(id: String, encoded: String?, now: String) {
+        store.execute("update users set profile_appearance = ?, updated_at = ? where id = ?", DbParams().bindStrOrNull(encoded).bindInstant(now).bindStr(id))
+    }
+    updateAdmin(id: String, admin: Bool) {
+        store.execute("update users set is_admin = ? where id = ?", DbParams().bindBool(admin).bindStr(id))
+    }
+}

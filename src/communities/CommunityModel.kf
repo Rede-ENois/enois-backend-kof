@@ -1,0 +1,99 @@
+package communities
+
+import kernel.text.*
+
+// Rows and JSON shapes of the communities domain (Java: Community, CommunityMember, CommunityChannel,
+// CommunityContractController records). Instants are ISO-8601 UTC strings.
+// A row of `communities`. `city`, `state` and `cityKey` are all present or all absent.
+record CommunityRow(String id, String name, String? description, String? topic, String? cover, String? avatar, String? bannerHtml, String? city, String? state, String? cityKey, String createdBy, String createdAt, String updatedAt)
+
+// A row of `community_members`; role is ADMIN or MEMBER.
+record CommunityMemberRow(Long id, String communityId, String userId, String role, String joinedAt)
+
+// A row of `community_channels`.
+record CommunityChannelRow(String id, String communityId, String name, String slug, String? topic, String? description, String createdBy, String createdAt)
+
+// What the feed needs to know about a community or a channel (PostCommunityReader / CommunityChannelReader).
+record CommunityRef(String id, String name, String? topic, Bool joined)
+
+record CommunityChannelRef(String id, String communityId, String name, String? topic)
+
+// What the pin rule needs to know about a post (the feed owns the `posts` table).
+record CommunityPostRef(String id, String? communityId, Bool active)
+
+// A profile as the member list shows it (UserProfile.displayWithNickname + the name style slots).
+record CommunityProfileCard(String id, String username, String displayName, String? avatar, String? nameTheme, String? nameFont, String? nameColor, String? nameplate)
+
+// ---- JSON views, field order = the Java records ----
+record CommunityView(String id, String name, String? description, Int members, String? topic, String? cover, String? avatar, String? bannerHtml, Bool joined, String? city, String? state)
+
+record CommunityPage(List<CommunityView> items, String? nextCursor)
+
+record CommunityNameStyle(String? theme, String? font, String? color, String? nameplate)
+
+record CommunityMemberView(String? userId, String? username, String? name, String? avatar, String role, CommunityNameStyle? nameStyle)
+
+record CommunityMemberPage(List<CommunityMemberView> items, String? nextCursor)
+
+record CommunityStatusView(String id, String status)
+
+record CommunityChannelView(String id, String name, String slug, String? topic, String? description, String createdAt)
+
+// ---- request bodies ----
+record CommunityBody(String? name, String? description, String? topic, String? cover, String? avatar, String? bannerHtml, String? city, String? state)
+
+record CommunityTransferBody(String? newOwnerId)
+
+record CommunityPinBody(String? postId)
+
+record CommunityChannelBody(String? name, String? topic, String? description)
+
+// Pure rules shared by the service and the tests.
+class CommunityRules {
+    static Int maxChannelsPerCommunity() = 30
+    static Int channelNameMax() = 80
+    static Int channelDescriptionMax() = 300
+    static Int maxPage() = 100
+    // The communities list was unbounded in Java; a hot public read must not be (see PORTING_STATUS).
+    // Non-null and not blank (null narrowing does not survive || and &&, G31).
+    static Bool has(value: String?) {
+        if (value == null) {
+            return false
+        }
+        return value.trim().length() > 0
+    }
+    static Int trimLength(value: String?) {
+        if (value == null) {
+            return 0
+        }
+        return value.trim().length()
+    }
+    static Int clampLimit(limit: Int) {
+        if (limit < 1) {
+            return 1
+        }
+        if (limit > CommunityRules.maxPage()) {
+            return CommunityRules.maxPage()
+        }
+        return limit
+    }
+    // "Café & Cia" -> "cafe-cia": no accents, lower case, hyphens; never empty ("canal"), at most 80.
+    static String slugify(value: String) {
+        var base = Texts.stripAccents(value).toLowerCase().replaceAll("[^a-z0-9]+", "-").replaceAll("(^-|-$)", "")
+        if (base.length() == 0) {
+            return "canal"
+        }
+        if (base.length() > 80) {
+            return base.substring(0, 80)
+        }
+        return base
+    }
+    // The ContentTaxonomy.TOPICS closed list.
+    static List<String> topics() = listOf("TECNOLOGIA", "ENGENHARIA", "DESIGN", "PRODUTO", "LIDERANCA", "CARREIRA", "FREELANCE", "OUTROS", "GAMES", "ART", "MUSIC", "EDUCACAO", "CIENCIA", "EMPREENDER", "FINANCAS", "MARKETING", "RH", "DADOS", "FUN", "QUALIDADE_VIDA", "SAUDE", "VIAGEM", "COMIDA", "ESPORTES", "CINEMA", "LIVROS", "FOTOGRAFIA", "CASA", "PETS", "PARENTALIDADE", "RELACIONAMENTOS", "MODA", "POLITICA", "RELIGIAO")
+}
+
+// Kof cannot assign a null literal to a variable (SEM048): this is the one null source.
+class CommunityNull {
+    static String? nullStringSlot = null
+    static String? str() = CommunityNull.nullStringSlot
+}
