@@ -1,0 +1,136 @@
+package communities
+
+import kernel.db.*
+import kernel.error.*
+import kernel.geo.*
+
+// Cross-domain seams owned by communities (the caller). Each is a concrete class with a safe default;
+// the owner subclasses it (`extends`) and Main.kf passes the subclass to CommunitiesModule.install.
+// Interfaces from another package do not work (KOF_GAPS G30).
+// Profile data the member list and /communities/local need.
+// pending-port: profile. Default: reads `users` read-only, like UserProfileRepository.
+class CommunityProfileLookup {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // Cards of the given users, keyed by id; unknown ids are absent.
+    Map<String,CommunityProfileCard> cards(userIds: List<String>) {
+        var out = mapOf<String, CommunityProfileCard>()
+        if (userIds.size() == 0) {
+            return out
+        }
+        var marks = ""
+        var params = DbParams()
+        for (var id in userIds) {
+            if (marks.length() > 0) {
+                marks = marks + ", "
+            }
+            marks = marks + "?"
+            params = params.bindStr(id)
+        }
+        var rows = store.queryList("select id, username, name, social_name, nickname, avatar, name_theme, name_font, name_color, nameplate from users where id in (" + marks + ")", params)
+        for (var r in rows) {
+            out.put(r.getStr("id"), CommunityProfileCard(r.getStr("id"), r.getStr("username"), CommunityProfileLookup.display(r), r.getStrOrNull("avatar"), r.getStrOrNull("name_theme"), r.getStrOrNull("name_font"), r.getStrOrNull("name_color"), r.getStrOrNull("nameplate")))
+        }
+        return out
+    }
+    // UserProfile.displayWithNickname: the social name when there is one, else the name, plus " (nickname)".
+    static String display(r: DbRow) {
+        var base = r.getStr("name")
+        var social = r.getStrOrNull("social_name")
+        if (social != null) {
+            if (social.trim().length() > 0) {
+                base = social
+            }
+        }
+        var nick = r.getStrOrNull("nickname")
+        if (nick == null) {
+            return base
+        }
+        if (nick.trim().length() == 0) {
+            return base
+        }
+        return base + " (" + nick + ")"
+    }
+    // The viewer's own city/state (UserProfile.place); null when the profile has none.
+    CityState? placeOf(userId: String) {
+        var r = store.queryOptional("select city, state, city_key from users where id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        var city = r.getStrOrNull("city")
+        var state = r.getStrOrNull("state")
+        if (city == null) {
+            return null
+        }
+        if (state == null) {
+            return null
+        }
+        var key = r.getStrOrNull("city_key")
+        if (key == null) {
+            return CityState.of(city, state)
+        }
+        return CityState(city, state, key)
+    }
+}
+
+// What the feed owns and communities reads or serves: the pin rule, the community and channel feeds
+// and the pinned post card. The feed returns its PostView JSON; the default is a minimal shape.
+// pending-port: feed (GetFeedService.getCommunityFeed/getChannelFeed/getPost, PostRepository.findById).
+class CommunityFeedLookup {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // The post as the pin rule needs it; null when it does not exist.
+    CommunityPostRef? postRef(postId: String) {
+        var r = store.queryOptional("select id, community_id, status from posts where id = ?", DbParams().bindStr(postId))
+        if (r == null) {
+            return null
+        }
+        return CommunityPostRef(r.getStr("id"), r.getStrOrNull("community_id"), r.getStr("status") == "ACTIVE")
+    }
+    // FeedPage JSON of the community: active posts of it that are not in a channel, newest first.
+    String communityFeed(communityId: String, before: String?, limit: Int, viewerId: String?) = this.page("community_id = ? and channel_id is null", communityId, before, limit)
+    // FeedPage JSON of one channel (membership already checked by the caller).
+    String channelFeed(communityId: String, channelId: String, before: String?, limit: Int, viewerId: String) = this.page("channel_id = ?", channelId, before, limit)
+    // PostView JSON of one post; 404 POST_NOT_FOUND when it is gone.
+    String post(postId: String, viewerId: String?) {
+        var r = store.queryOptional("select id, author_id, content, community_id, channel_id, created_at from posts where id = ? and status = \'ACTIVE\'", DbParams().bindStr(postId))
+        if (r == null) {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+        }
+        return json.encode(CommunityFeedLookup.card(r))
+    }
+    static CommunityPostCard card(r: DbRow) = CommunityPostCard(r.getStr("id"), r.getStr("author_id"), r.getStr("content"), r.getStrOrNull("community_id"), r.getStrOrNull("channel_id"), r.getInstant("created_at"))
+    String page(where: String, key: String, before: String?, limit: Int) {
+        var cap = CommunityRules.clampLimit(limit)
+        var params = DbParams().bindStr(key)
+        var sql = "select id, author_id, content, community_id, channel_id, created_at from posts where " + where + " and status = \'ACTIVE\'"
+        if (before != null) {
+            sql = sql + " and created_at < ?"
+            params = params.bindInstant(before)
+        }
+        sql = sql + " order by created_at desc limit ?"
+        params = params.bindInt(cap)
+        var items = listOf<CommunityPostCard>()
+        for (var r in store.queryList(sql, params)) {
+            items.add(CommunityFeedLookup.card(r))
+        }
+        if (items.size() == cap) {
+            return json.encode(CommunityPostPage(items, items.get(items.size() - 1).createdAt))
+        }
+        return json.encode(CommunityPostPage(items, null))
+    }
+}
+
+// Minimal post JSON of the default feed seam (the feed port replaces it with the full PostView).
+record CommunityPostCard(String id, String authorId, String content, String? communityId, String? channelId, String createdAt)
+
+record CommunityPostPage(List<CommunityPostCard> items, String? nextCursor)
+
+// Presence reward on join (CoinService.recordPresence). pending-port: coin. Default: no-op.
+class CommunityCoins {
+    recordPresence(userId: String);
+}

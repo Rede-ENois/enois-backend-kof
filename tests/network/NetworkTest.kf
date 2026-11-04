@@ -1,0 +1,454 @@
+import kernel.blocks.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.text.*
+import kernel.time.*
+import network.*
+import profile.*
+
+class NetworkHolder {
+    static TestApp? cached = null
+}
+
+TestApp netApp() {
+    var cur = NetworkHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = ProfileTestApp.boot("network", mapOf<String, String>())
+    NetworkHolder.cached = created
+    return created
+}
+
+ProfileCaller netUser(id: String) = ProfileTestApp.login(netApp(), id)
+
+TestResponse netRequest(from: ProfileCaller, toId: String) = from.post("/network/connections/" + toId, "")
+
+netConnect(from: ProfileCaller, fromId: String, to: ProfileCaller, toId: String) {
+    Check.status(netRequest(from, toId), 202)
+    Check.status(to.put("/network/connections/" + fromId + "/accept", ""), 200)
+}
+
+netAssertStatus(viewer: ProfileCaller, targetId: String, expected: String, requestedByMe: Bool) {
+    var res = viewer.get("/network/connections/" + targetId + "/status")
+    Check.status(res, 200)
+    Check.jsonEq(res, "status", expected)
+    Check.jsonEq(res, "requestedByMe", "" + requestedByMe)
+}
+
+// NetworkContractControllerTests ---------------------------------------------------------------
+test "suggests, requests, accepts and removes a connection" {
+    var a = netUser("net_user_a")
+    var b = netUser("net_user_b")
+    var suggestions = a.get("/network/suggestions?limit=4")
+    Check.status(suggestions, 200)
+    Check.isTrue("array", suggestions.body.startsWith("["))
+    var requested = a.callKey("POST", "/network/connections/net_user_b", "net-req-net_user_a", "")
+    Check.status(requested, 202)
+    Check.jsonEq(requested, "status", "REQUESTED")
+    Check.jsonEq(requested, "id", "net_user_b")
+    var requests = b.get("/network/requests")
+    Check.status(requests, 200)
+    Check.eqInt("requests", 1, requests.jsonSize("items"))
+    Check.jsonEq(requests, "items.0.fromUserId", "net_user_a")
+    var accepted = b.put("/network/connections/net_user_a/accept", "")
+    Check.status(accepted, 200)
+    Check.jsonEq(accepted, "status", "ACCEPTED")
+    var anon = ProfileTestApp.anonymous(netApp())
+    var connections = anon.get("/users/net_user_a/connections")
+    Check.status(connections, 200)
+    Check.jsonEq(connections, "0.id", "net_user_b")
+    Check.jsonEq(connections, "0.username", "net_user_b")
+    Check.eqStr("followers of A", "[]", anon.get("/users/net_user_a/followers").body)
+    var followers = anon.get("/users/net_user_b/followers")
+    Check.status(followers, 200)
+    Check.jsonEq(followers, "0.id", "net_user_a")
+    Check.jsonEq(followers, "0.username", "net_user_a")
+    Check.jsonEq(a.get("/network/summary"), "connections", "1")
+    Check.jsonEq(b.get("/network/summary"), "connections", "1")
+    var users = a.get("/network/users")
+    Check.status(users, 200)
+    Check.eqInt("items", 1, users.jsonSize("items"))
+    Check.jsonEq(users, "items.0.connected", "true")
+    Check.status(a.delete("/network/connections/net_user_b"), 200)
+    Check.jsonEq(a.get("/network/summary"), "connections", "0")
+    Check.eqStr("connections after removal", "[]", anon.get("/users/net_user_a/connections").body)
+}
+
+test "status tells who requested the pending connection" {
+    var a = netUser("net_dir_a")
+    var b = netUser("net_dir_b")
+    netAssertStatus(a, "net_dir_b", "NONE", false)
+    Check.status(netRequest(a, "net_dir_b"), 202)
+    // The same PENDING for both sides: without the direction the receiver saw "cancel" and refused.
+    netAssertStatus(a, "net_dir_b", "PENDING", true)
+    netAssertStatus(b, "net_dir_a", "PENDING", false)
+    Check.status(b.put("/network/connections/net_dir_a/accept", ""), 200)
+    netAssertStatus(a, "net_dir_b", "ACCEPTED", false)
+    netAssertStatus(b, "net_dir_a", "ACCEPTED", false)
+    Check.status(a.delete("/network/connections/net_dir_b"), 200)
+    netAssertStatus(a, "net_dir_b", "REMOVED", false)
+    // Reopening reuses the same row: the direction follows who asked this time.
+    Check.status(netRequest(b, "net_dir_a"), 202)
+    netAssertStatus(b, "net_dir_a", "PENDING", true)
+    netAssertStatus(a, "net_dir_b", "PENDING", false)
+}
+
+test "a removed or blocked connection can be requested again after unblocking" {
+    var a = netUser("net_reconnect_a")
+    var b = netUser("net_reconnect_b")
+    netConnect(a, "net_reconnect_a", b, "net_reconnect_b")
+    // Remove (the "refuse" button uses the same endpoint) does not stop a new request.
+    Check.status(a.delete("/network/connections/net_reconnect_b"), 200)
+    var again = netRequest(a, "net_reconnect_b")
+    Check.status(again, 202)
+    Check.jsonEq(again, "status", "REQUESTED")
+    Check.status(b.put("/network/connections/net_reconnect_a/accept", ""), 200)
+    Check.status(a.post("/network/blocks/net_reconnect_b", ""), 201)
+    var blocked = netRequest(b, "net_reconnect_a")
+    Check.apiError(blocked, 403, "BLOCKED")
+    Check.jsonEq(blocked, "message", "Esta conexao nao esta disponivel.")
+    Check.status(a.delete("/network/blocks/net_reconnect_b"), 200)
+    var unblocked = netRequest(b, "net_reconnect_a")
+    Check.status(unblocked, 202)
+    Check.jsonEq(unblocked, "status", "REQUESTED")
+}
+
+test "requests carry the other side and hide blocked people" {
+    var me = netUser("net_req_me")
+    var asker = netUser("net_req_asker")
+    netUser("net_req_asked")
+    var blocked = netUser("net_req_blocked")
+    Check.status(netRequest(asker, "net_req_me"), 202)
+    Check.status(netRequest(me, "net_req_asked"), 202)
+    Check.status(netRequest(blocked, "net_req_me"), 202)
+    Check.status(me.post("/network/blocks/net_req_blocked", ""), 201)
+    var requests = me.get("/network/requests")
+    Check.status(requests, 200)
+    Check.eqInt("items", 2, requests.jsonSize("items"))
+    // Newest first: the request I sent came after the one I received.
+    Check.jsonEq(requests, "items.0.direction", "OUTGOING")
+    Check.jsonEq(requests, "items.0.peer.id", "net_req_asked")
+    Check.isTrue("peer username", requests.json("items.0.peer.username").length() > 0)
+    Check.jsonEq(requests, "items.1.direction", "INCOMING")
+    Check.jsonEq(requests, "items.1.peer.id", "net_req_asker")
+    Check.jsonEq(requests, "items.1.status", "PENDING")
+    Check.isTrue("no cursor", requests.jsonIsNull("nextCursor"))
+    // The badge counts only what I can answer: not what I sent, not a blocked person.
+    Check.jsonEq(me.get("/network/summary"), "pendingRequests", "1")
+}
+
+test "suggests friends of friends first with the mutual count" {
+    var me = netUser("net_sug_me")
+    var friend = netUser("net_sug_friend")
+    var otherFriend = netUser("net_sug_friend2")
+    var two = netUser("net_sug_two")
+    var one = netUser("net_sug_one")
+    netConnect(me, "net_sug_me", friend, "net_sug_friend")
+    netConnect(me, "net_sug_me", otherFriend, "net_sug_friend2")
+    netConnect(two, "net_sug_two", friend, "net_sug_friend")
+    netConnect(two, "net_sug_two", otherFriend, "net_sug_friend2")
+    netConnect(one, "net_sug_one", friend, "net_sug_friend")
+    // The shared base has many other users: they must not push these two out of the list.
+    var res = me.get("/network/suggestions?limit=2")
+    Check.status(res, 200)
+    Check.eqInt("size", 2, res.jsonSize(""))
+    Check.jsonEq(res, "0.id", "net_sug_two")
+    Check.jsonEq(res, "0.mutualConnections", "2")
+    Check.jsonEq(res, "1.id", "net_sug_one")
+    Check.jsonEq(res, "1.mutualConnections", "1")
+    Check.jsonEq(res, "0.connected", "false")
+}
+
+test "replays an idempotent connection request" {
+    netUser("net_idem_target")
+    var user = netUser("net_idem_user")
+    var first = user.callKey("POST", "/network/connections/net_idem_target", "net-idem-req", "")
+    Check.status(first, 202)
+    var replay = user.callKey("POST", "/network/connections/net_idem_target", "net-idem-req", "")
+    Check.status(replay, 202)
+    Check.eqStr("replayed body", first.body, replay.body)
+}
+
+test "connection rules: self, unknown user, missing request, wrong side" {
+    var a = netUser("net_rules_a")
+    var b = netUser("net_rules_b")
+    Check.apiError(netRequest(a, "net_rules_a"), 400, "SELF_CONNECTION")
+    Check.apiError(netRequest(a, "net_rules_nobody"), 404, "USER_NOT_FOUND")
+    Check.apiError(b.put("/network/connections/net_rules_a/accept", ""), 404, "CONNECTION_NOT_FOUND")
+    Check.apiError(a.delete("/network/connections/net_rules_b"), 404, "CONNECTION_NOT_FOUND")
+    Check.status(netRequest(a, "net_rules_b"), 202)
+    // The requester cannot accept their own request.
+    Check.apiError(a.put("/network/connections/net_rules_b/accept", ""), 403, "FORBIDDEN")
+    // A second request while pending is a no-op, not a duplicate row.
+    Check.status(netRequest(a, "net_rules_b"), 202)
+    Check.eqInt("one row", 1, netApp().db().queryLong("select count(*) from user_connections where (requester_user_id = \'net_rules_a\' and receiver_user_id = \'net_rules_b\') or (requester_user_id = \'net_rules_b\' and receiver_user_id = \'net_rules_a\')", DbParams()) as Int)
+    // Accepting twice answers the same ACCEPTED.
+    Check.status(b.put("/network/connections/net_rules_a/accept", ""), 200)
+    Check.status(b.put("/network/connections/net_rules_a/accept", ""), 200)
+    // Removing twice is fine.
+    Check.status(a.delete("/network/connections/net_rules_b"), 200)
+    Check.status(a.delete("/network/connections/net_rules_b"), 200)
+    // A removed request cannot be accepted any more.
+    Check.apiError(b.put("/network/connections/net_rules_a/accept", ""), 409, "INVALID_STATUS")
+}
+
+test "requests and acceptances notify the other person" {
+    var a = netUser("net_notify_a")
+    var b = netUser("net_notify_b")
+    Check.status(netRequest(a, "net_notify_b"), 202)
+    var request = netApp().db().queryOne("select kind, actor_id, title, body, href, cta_label from notifications where user_id = \'net_notify_b\'", DbParams())
+    Check.eqStr("kind", "CONNECTION_REQUEST", request.getStr("kind"))
+    Check.eqStr("actor", "net_notify_a", request.getStr("actor_id"))
+    Check.eqStr("title", "Solicitação de conexão", request.getStr("title"))
+    Check.eqStr("body", "net_notify_a quer se conectar com você.", request.getStr("body"))
+    Check.eqStr("href", "/api/network/connections/net_notify_a/accept", request.getStr("href"))
+    Check.eqStr("cta", "Aceitar", request.getStr("cta_label"))
+    Check.status(b.put("/network/connections/net_notify_a/accept", ""), 200)
+    var accepted = netApp().db().queryOne("select kind, title, body, href, cta_label from notifications where user_id = \'net_notify_a\'", DbParams())
+    Check.eqStr("kind", "CONNECTION_ACCEPTED", accepted.getStr("kind"))
+    Check.eqStr("title", "Conexão aceita", accepted.getStr("title"))
+    Check.eqStr("body", "net_notify_b aceitou sua solicitação de conexão.", accepted.getStr("body"))
+    Check.eqStr("href", "/api/network/connections/net_notify_b", accepted.getStr("href"))
+}
+
+test "the network endpoints require a session" {
+    var anon = ProfileTestApp.anonymous(netApp())
+    Check.apiError(anon.get("/network/users"), 401, "UNAUTHENTICATED")
+    Check.apiError(anon.get("/network/summary"), 401, "UNAUTHENTICATED")
+    Check.apiError(anon.post("/network/connections/x", ""), 401, "UNAUTHENTICATED")
+    Check.apiError(anon.get("/network/blocks"), 401, "UNAUTHENTICATED")
+    Check.apiError(anon.get("/network/mutes"), 401, "UNAUTHENTICATED")
+    Check.apiError(anon.get("/users/net_nobody_here/connections"), 404, "USER_NOT_FOUND")
+}
+
+test "the people list can be searched and respects the limit of the public lists" {
+    var me = netUser("net_list_me")
+    var ana = netUser("net_list_ana")
+    var bia = netUser("net_list_bia")
+    netConnect(me, "net_list_me", ana, "net_list_ana")
+    netConnect(me, "net_list_me", bia, "net_list_bia")
+    var all = me.get("/network/users")
+    Check.eqInt("all", 2, all.jsonSize("items"))
+    var filtered = me.get("/network/users?query=ANA")
+    Check.eqInt("filtered", 1, filtered.jsonSize("items"))
+    Check.jsonEq(filtered, "items.0.id", "net_list_ana")
+    Check.jsonEq(filtered, "items.0.connections", "0")
+    Check.jsonEq(filtered, "items.0.followers", "0")
+    var anon = ProfileTestApp.anonymous(netApp())
+    var limited = anon.get("/users/net_list_me/connections?limit=1")
+    Check.eqInt("limit 1", 1, limited.jsonSize(""))
+    Check.eqInt("limit 0 is clamped to 1", 1, anon.get("/users/net_list_me/connections?limit=0").jsonSize(""))
+    Check.eqInt("default", 2, anon.get("/users/net_list_me/connections").jsonSize(""))
+}
+
+// BlockContractTests ---------------------------------------------------------------------------
+test "a blocked author disappears for the reader until unblocked" {
+    // Adapted: the Java test watches the feed and the direct post link (feed domain). The feed hides
+    // through BlockedUsers.hiddenIdsFor, which this test reads on the same tables.
+    var app = netApp()
+    netUser("blk_author")
+    var reader = netUser("blk_reader")
+    var hidden = BlockedUsers(app.db())
+    Check.isTrue("visible before", !hidden.hiddenIdsFor("blk_reader").contains("blk_author"))
+    var blocked = reader.callKey("POST", "/network/blocks/blk_author", "block-1", "")
+    Check.status(blocked, 201)
+    Check.jsonEq(blocked, "status", "BLOCKED")
+    Check.isTrue("hidden after", hidden.hiddenIdsFor("blk_reader").contains("blk_author"))
+    // And the blocked one does not see the blocker either.
+    Check.isTrue("hidden both ways", hidden.hiddenIdsFor("blk_author").contains("blk_reader"))
+    var list = reader.get("/network/blocks")
+    Check.status(list, 200)
+    Check.jsonEq(list, "0.userId", "blk_author")
+    Check.jsonEq(list, "0.username", "blk_author")
+    Check.isTrue("blockedAt", list.json("0.blockedAt").endsWith("Z"))
+    Check.jsonEq(reader.callKey("DELETE", "/network/blocks/blk_author", "unblock-1", ""), "status", "UNBLOCKED")
+    Check.isTrue("visible again", !hidden.hiddenIdsFor("blk_reader").contains("blk_author"))
+}
+
+test "a blocked commenter disappears from the reader's view and blocking twice is harmless" {
+    // Adapted: comments belong to the feed; the reader's hidden set is what the comment list filters by.
+    var app = netApp()
+    netUser("blk_comment_author")
+    var reader = netUser("blk_comment_reader")
+    Check.status(reader.post("/network/blocks/blk_comment_author", ""), 201)
+    Check.status(reader.post("/network/blocks/blk_comment_author", ""), 201)
+    Check.eqInt("one row", 1, app.db().queryLong("select count(*) from user_blocks where blocker_id = \'blk_comment_reader\' and blocked_id = \'blk_comment_author\'", DbParams()) as Int)
+    Check.isTrue("hidden", BlockedUsers(app.db()).hiddenIdsFor("blk_comment_reader").contains("blk_comment_author"))
+}
+
+test "a blocked user cannot request a connection again" {
+    var blocked = netUser("blk_requester")
+    var blocker = netUser("blk_blocker")
+    Check.status(blocker.post("/network/blocks/blk_requester", ""), 201)
+    Check.status(netRequest(blocked, "blk_blocker"), 403)
+    // Blocking also ends an active connection.
+    var a = netUser("blk_conn_a")
+    var b = netUser("blk_conn_b")
+    netConnect(a, "blk_conn_a", b, "blk_conn_b")
+    Check.status(a.post("/network/blocks/blk_conn_b", ""), 201)
+    netAssertStatus(b, "blk_conn_a", "REMOVED", false)
+    Check.jsonEq(a.get("/network/summary"), "connections", "0")
+}
+
+test "cannot block yourself or an unknown user" {
+    var session = netUser("blk_self")
+    Check.apiError(session.post("/network/blocks/blk_self", ""), 400, "SELF_BLOCK")
+    Check.apiError(session.post("/network/blocks/blk_nobody", ""), 404, "USER_NOT_FOUND")
+}
+
+// MuteContractTests ----------------------------------------------------------------------------
+test "a muted author leaves the reader's view and comes back after the deadline" {
+    // Adapted: the feed filters with BlockedUsers.hiddenIdsFor (active mutes only).
+    var app = netApp()
+    netUser("mute_deadline_author")
+    var reader = netUser("mute_deadline_reader")
+    var hidden = BlockedUsers(app.db())
+    var muted = reader.callKey("POST", "/network/mutes/mute_deadline_author", "mute-24h-1", "{\"duration\":\"24h\"}")
+    Check.status(muted, 201)
+    Check.jsonEq(muted, "status", "MUTED")
+    Check.isTrue("hidden", hidden.hiddenIdsFor("mute_deadline_reader").contains("mute_deadline_author"))
+    // The list shows the deadline so the screen can say when it comes back.
+    var list = reader.get("/network/mutes")
+    Check.status(list, 200)
+    Check.jsonEq(list, "0.userId", "mute_deadline_author")
+    Check.isTrue("expiresAt", list.json("0.expiresAt").endsWith("Z"))
+    var status = reader.get("/network/connections/mute_deadline_author/status")
+    Check.jsonEq(status, "muted", "true")
+    Check.isTrue("muteExpiresAt", status.json("muteExpiresAt").endsWith("Z"))
+    // Move the deadline to the past: the mute expires without anybody touching it.
+    app.db().execute("update user_mutes set expires_at = ? where muter_id = ? and muted_id = ?", DbParams().bindInstant(Time.plusSeconds(Time.nowIso(), -60L)).bindStr("mute_deadline_reader").bindStr("mute_deadline_author"))
+    Check.isTrue("visible again", !hidden.hiddenIdsFor("mute_deadline_reader").contains("mute_deadline_author"))
+    Check.isTrue("not listed", !reader.get("/network/mutes").body.contains("mute_deadline_author"))
+    Check.jsonEq(reader.get("/network/connections/mute_deadline_author/status"), "muted", "false")
+}
+
+test "a mute without duration still hides forever" {
+    var app = netApp()
+    netUser("mute_forever_author")
+    var reader = netUser("mute_forever_reader")
+    // No body: the old contract the front end uses today.
+    Check.status(reader.post("/network/mutes/mute_forever_author", ""), 201)
+    Check.isTrue("hidden", BlockedUsers(app.db()).hiddenIdsFor("mute_forever_reader").contains("mute_forever_author"))
+    var list = reader.get("/network/mutes")
+    Check.status(list, 200)
+    Check.jsonEq(list, "0.userId", "mute_forever_author")
+    Check.isTrue("no expiry", list.jsonIsNull("0.expiresAt"))
+    var status = reader.get("/network/connections/mute_forever_author/status")
+    Check.jsonEq(status, "muted", "true")
+    Check.isTrue("no muteExpiresAt", status.jsonIsNull("muteExpiresAt"))
+    Check.status(reader.post("/network/mutes/mute_forever_author", "{\"duration\":\"forever\"}"), 201)
+    Check.status(reader.post("/network/mutes/mute_forever_author", "{\"duration\":\"sempre\"}"), 201)
+}
+
+test "muting again renews the deadline instead of being ignored" {
+    var app = netApp()
+    netUser("mute_renew_author")
+    var reader = netUser("mute_renew_reader")
+    Check.status(reader.post("/network/mutes/mute_renew_author", "{\"duration\":\"24h\"}"), 201)
+    // The first request already expired.
+    app.db().execute("update user_mutes set expires_at = ? where muter_id = ? and muted_id = ?", DbParams().bindInstant(Time.plusSeconds(Time.nowIso(), -60L)).bindStr("mute_renew_reader").bindStr("mute_renew_author"))
+    Check.status(reader.post("/network/mutes/mute_renew_author", "{\"duration\":\"7d\"}"), 201)
+    var expires = app.db().queryOne("select expires_at from user_mutes where muter_id = \'mute_renew_reader\' and muted_id = \'mute_renew_author\'", DbParams()).getInstant("expires_at")
+    Check.isTrue("renewed for ~7 days", Time.toMillis(expires) > Time.nowMillis() + 6L * 24L * 3600L * 1000L)
+    Check.eqInt("one row", 1, app.db().queryLong("select count(*) from user_mutes where muter_id = \'mute_renew_reader\' and muted_id = \'mute_renew_author\'", DbParams()) as Int)
+}
+
+test "unmute hides nothing and removes the row" {
+    var app = netApp()
+    netUser("mute_undo_author")
+    var reader = netUser("mute_undo_reader")
+    Check.status(reader.post("/network/mutes/mute_undo_author", "{\"duration\":\"72h\"}"), 201)
+    Check.isTrue("hidden", BlockedUsers(app.db()).hiddenIdsFor("mute_undo_reader").contains("mute_undo_author"))
+    var undone = reader.callKey("DELETE", "/network/mutes/mute_undo_author", "mute-undo-2", "")
+    Check.status(undone, 200)
+    Check.jsonEq(undone, "status", "UNMUTED")
+    Check.isTrue("visible", !BlockedUsers(app.db()).hiddenIdsFor("mute_undo_reader").contains("mute_undo_author"))
+    Check.eqInt("row gone", 0, app.db().queryLong("select count(*) from user_mutes where muter_id = \'mute_undo_reader\' and muted_id = \'mute_undo_author\'", DbParams()) as Int)
+}
+
+test "rejects an unknown or oversized duration and stores nothing" {
+    var app = netApp()
+    netUser("mute_invalid_author")
+    var reader = netUser("mute_invalid_reader")
+    var invalid = reader.post("/network/mutes/mute_invalid_author", "{\"duration\":\"para sempre\"}")
+    Check.apiError(invalid, 400, "MUTE_DURATION_INVALID")
+    Check.jsonEq(invalid, "message", "Prazo de silenciamento invalido.")
+    var tooLong = reader.post("/network/mutes/mute_invalid_author", "{\"duration\":\"400d\"}")
+    Check.apiError(tooLong, 400, "MUTE_DURATION_TOO_LONG")
+    Check.jsonEq(tooLong, "message", "Prazo de silenciamento longo demais.")
+    // A text that is not a duration can never become an eternal mute by mistake.
+    Check.eqInt("nothing stored", 0, app.db().queryLong("select count(*) from user_mutes where muter_id = \'mute_invalid_reader\' and muted_id = \'mute_invalid_author\'", DbParams()) as Int)
+    Check.apiError(reader.post("/network/mutes/mute_invalid_author", "{\"duration\":\"0h\"}"), 400, "MUTE_DURATION_INVALID")
+    Check.apiError(reader.post("/network/mutes/mute_invalid_author", "{\"duration\":\"PT-5M\"}"), 400, "MUTE_DURATION_INVALID")
+    Check.apiError(reader.post("/network/mutes/mute_invalid_author", "{\"duration\":\"99999h\"}"), 400, "MUTE_DURATION_TOO_LONG")
+    Check.apiError(reader.post("/network/mutes/mute_invalid_author", "not json"), 400, "BAD_REQUEST")
+}
+
+test "mute durations accept shorthand, ISO-8601 and the forever words" {
+    var app = netApp()
+    netUser("mute_forms_author")
+    var reader = netUser("mute_forms_reader")
+    for (var form in listOf("30m", "1w", "2D", "PT24H", "pt1h30m", "P1D", "P1DT2H", "PT90S", "PT1.5S", "until-unmute", "")) {
+        Check.status(reader.post("/network/mutes/mute_forms_author", "{\"duration\":\"" + form + "\"}"), 201)
+    }
+    var row = app.db().queryOne("select expires_at from user_mutes where muter_id = \'mute_forms_reader\' and muted_id = \'mute_forms_author\'", DbParams())
+    Check.isTrue("the last form (empty) clears the deadline", row.isNull("expires_at"))
+    Check.status(reader.post("/network/mutes/mute_forms_author", "{\"duration\":\"PT1H30M\"}"), 201)
+    var after = app.db().queryOne("select expires_at from user_mutes where muter_id = \'mute_forms_reader\' and muted_id = \'mute_forms_author\'", DbParams()).getInstant("expires_at")
+    var seconds = (Time.toMillis(after) - Time.nowMillis()) / 1000L
+    Check.isTrue("about 90 minutes", seconds > 5300L && seconds <= 5400L)
+}
+
+test "cannot mute yourself or an unknown user" {
+    var session = netUser("mute_self")
+    Check.apiError(session.post("/network/mutes/mute_self", ""), 400, "SELF_MUTE")
+    Check.apiError(session.post("/network/mutes/mute_nobody", ""), 404, "USER_NOT_FOUND")
+}
+
+// Read API ---------------------------------------------------------------------------------------
+test "the network read API: friends, friends of friends and tags" {
+    var app = netApp()
+    var me = netUser("net_api_me")
+    var f = netUser("net_api_f")
+    var g = netUser("net_api_g")
+    netConnect(me, "net_api_me", f, "net_api_f")
+    netConnect(f, "net_api_f", g, "net_api_g")
+    app.db().execute("insert into user_skills (user_id, skill) values (\'net_api_me\', \'Kof\')", DbParams())
+    var directory = ProfileDirectory(app.db())
+    var store = NetworkStore(app.db())
+    var service = NetworkService(app.db(), store, directory, ProfileNotifier(app.db()))
+    Check.eqStr("friends", "net_api_f", String.join(",", service.friendIds("net_api_me")))
+    Check.eqStr("friends of friends", "net_api_g", String.join(",", service.friendsOfFriends("net_api_me")))
+    Check.eqStr("tags", "kof", String.join(",", service.userTags("net_api_me")))
+}
+
+test "hash order of ids is the java.util.HashSet iteration order" {
+    var ids = listOf("net_b", "net_a", "net_c", "net_a")
+    var ordered = HashOrder.of(ids)
+    Check.eqInt("distinct", 3, ordered.size())
+    // Bucket order of the 16-slot table (spread hash modulo 16), not insertion or alphabetical order.
+    Check.eqStr("order", "net_a,net_c,net_b", String.join(",", ordered))
+}
+
+// NameplateInListsTests (adapted) -----------------------------------------------------------------
+// The Java test covers group, feed and community lists (other domains). The lists of this slice carry the
+// equipped nameplate too, with the authors loaded in one batch query (ProfileDirectory.findAllByIds).
+test "the people lists carry the nameplate of each person" {
+    var app = netApp()
+    var me = netUser("plate_me")
+    var ana = netUser("plate_ana")
+    netConnect(me, "plate_me", ana, "plate_ana")
+    app.db().execute("update users set nameplate = \'placa-mata\' where id = \'plate_ana\'", DbParams())
+    var list = me.get("/network/users")
+    Check.status(list, 200)
+    Check.jsonEq(list, "items.0.nameStyle.nameplate", "placa-mata")
+    Check.isTrue("no other style fields", list.jsonIsNull("items.0.nameStyle.theme"))
+    var pub = ProfileTestApp.anonymous(app).get("/users/plate_me/connections")
+    Check.status(pub, 200)
+    Check.jsonEq(pub, "0.nameStyle.nameplate", "placa-mata")
+}
+
+test "zz stops the background jobs" {
+    ProfileTestApp.finish()
+}

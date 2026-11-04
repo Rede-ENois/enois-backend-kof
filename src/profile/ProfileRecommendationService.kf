@@ -1,0 +1,42 @@
+package profile
+
+import kernel.config.*
+import kernel.error.*
+import kernel.id.*
+import kernel.security.*
+import kernel.time.*
+
+// Recommendations between people (RecommendationService): a per-account frequency ceiling, no
+// self-recommendation, one per pair.
+class ProfileRecommendationService {
+    ProfileExtensionStore extension
+    ActionThrottle throttle
+    Int perDay
+    public constructor(extension: ProfileExtensionStore, throttle: ActionThrottle, cfg: Config) {
+        this.extension = extension
+        this.throttle = throttle
+        this.perDay = cfg.getInt("REDE_PROFILE_RECOMMENDATIONS_PER_DAY", 20)
+    }
+    ProfileRecommendationView recommend(recommenderId: String, recommendedId: String, comment: String?) {
+        throttle.requireAllowed("recommendation", recommenderId, perDay, 86400000L)
+        if (recommenderId == recommendedId) {
+            throw Errors.api(400, "SELF_RECOMMENDATION", "Voce nao pode recomendar a si mesmo.")
+        }
+        if (extension.recommended(recommenderId, recommendedId)) {
+            throw Errors.api(409, "ALREADY_RECOMMENDED", "Voce ja recomendou este usuario.")
+        }
+        var id = Ids.prefixed("rec_")
+        var now = Time.nowIso()
+        extension.insertRecommendation(id, recommenderId, recommendedId, comment, now)
+        return ProfileRecommendationView(id, recommenderId, recommendedId, comment, now)
+    }
+    remove(recommenderId: String, recommendedId: String) {
+        for (var r in extension.given(recommenderId)) {
+            if (r.recommendedId() == recommendedId) {
+                extension.deleteRecommendation(r.id())
+                return
+            }
+        }
+        throw Errors.api(404, "RECOMMENDATION_NOT_FOUND", "Recomendacao nao encontrada.")
+    }
+}

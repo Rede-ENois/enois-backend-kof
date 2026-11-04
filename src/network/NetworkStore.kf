@@ -1,0 +1,140 @@
+package network
+
+import kernel.db.*
+import profile.*
+
+// SQL of the network domain: user_connections, user_blocks, user_mutes.
+class NetworkStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String connectionColumns() = "id, requester_user_id, receiver_user_id, status, created_at, accepted_at, removed_at"
+    static NetworkConnection connection(r: DbRow) = NetworkConnection(r.getLong("id"), r.getStr("requester_user_id"), r.getStr("receiver_user_id"), r.getStr("status"), r.getInstant("created_at"), r.getInstantOrNull("accepted_at"), r.getInstantOrNull("removed_at"))
+    // The pair is unique and looked up in both directions; the latest row wins.
+    NetworkConnection? findBetween(a: String, b: String) {
+        var r = store.queryOptional("select " + NetworkStore.connectionColumns() + " from user_connections where (requester_user_id = ? and receiver_user_id = ?) or (requester_user_id = ? and receiver_user_id = ?) order by created_at desc limit 1", DbParams().bindStr(a).bindStr(b).bindStr(b).bindStr(a))
+        if (r == null) {
+            return null
+        }
+        return NetworkStore.connection(r)
+    }
+    insertRequest(requester: String, receiver: String, now: String) {
+        store.insertReturningId("insert into user_connections (requester_user_id, receiver_user_id, status, created_at) values (?, ?, \'PENDING\', ?)", DbParams().bindStr(requester).bindStr(receiver).bindInstant(now))
+    }
+    // Same row (a new one would collide with the unique pair), possibly in the opposite direction.
+    reopen(id: Long, requester: String, receiver: String, now: String) {
+        store.execute("update user_connections set requester_user_id = ?, receiver_user_id = ?, status = \'PENDING\', created_at = ?, accepted_at = null, removed_at = null where id = ?", DbParams().bindStr(requester).bindStr(receiver).bindInstant(now).bindLong(id))
+    }
+    // Direct UPDATE: two concurrent removes must not fail on a changed row.
+    markRemoved(id: Long, at: String) {
+        store.execute("update user_connections set status = \'REMOVED\', removed_at = ? where id = ?", DbParams().bindInstant(at).bindLong(id))
+    }
+    // Conditional: only one concurrent call finds the PENDING row, the loser gets 0.
+    Int markAccepted(id: Long, at: String) = store.execute("update user_connections set status = \'ACCEPTED\', accepted_at = ? where id = ? and status = \'PENDING\'", DbParams().bindInstant(at).bindLong(id))
+    // Accepted connections: the ones the person asked for first, then the ones they received.
+    List<NetworkConnection> accepted(userId: String) {
+        var out = listOf<NetworkConnection>()
+        for (var r in store.queryList("select " + NetworkStore.connectionColumns() + " from user_connections where requester_user_id = ? and status = \'ACCEPTED\' order by id", DbParams().bindStr(userId))) {
+            out.add(NetworkStore.connection(r))
+        }
+        for (var r in store.queryList("select " + NetworkStore.connectionColumns() + " from user_connections where receiver_user_id = ? and status = \'ACCEPTED\' order by id", DbParams().bindStr(userId))) {
+            out.add(NetworkStore.connection(r))
+        }
+        return out
+    }
+    // Pending requests in both directions, newest first.
+    List<NetworkConnection> pending(userId: String) {
+        var out = listOf<NetworkConnection>()
+        for (var r in store.queryList("select " + NetworkStore.connectionColumns() + " from user_connections where (requester_user_id = ? and status = \'PENDING\') or (receiver_user_id = ? and status = \'PENDING\') order by created_at desc, id desc", DbParams().bindStr(userId).bindStr(userId))) {
+            out.add(NetworkStore.connection(r))
+        }
+        return out
+    }
+    Int countAccepted(userId: String) = store.queryLong("select count(*) from user_connections where requester_user_id = ? and status = \'ACCEPTED\'", DbParams().bindStr(userId)) + store.queryLong("select count(*) from user_connections where receiver_user_id = ? and status = \'ACCEPTED\'", DbParams().bindStr(userId)) as Int
+    // People connected to, or with a pending request with, the user.
+    static String alreadyLinked() = "select requester_user_id from user_connections where receiver_user_id = ? and status in (\'PENDING\',\'ACCEPTED\') union select receiver_user_id from user_connections where requester_user_id = ? and status in (\'PENDING\',\'ACCEPTED\')"
+    List<String> friendIds(userId: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select receiver_user_id as other from user_connections where requester_user_id = ? and status = \'ACCEPTED\' union select requester_user_id as other from user_connections where receiver_user_id = ? and status = \'ACCEPTED\'", DbParams().bindStr(userId).bindStr(userId))) {
+            out.add(r.getStr("other"))
+        }
+        return out
+    }
+    // Friends of friends first, ranked by shared connections (one query); then other people fill the list.
+    List<NetworkSuggestion> suggestions(userId: String, limit: Int) {
+        var out = listOf<NetworkSuggestion>()
+        var friends = this.friendIds(userId)
+        if (friends.size() > 0) {
+            var marks = ProfileDirectory.marks(friends.size())
+            var p = DbParams()
+            for (var f in friends) {
+                p.bindStr(f)
+            }
+            for (var f in friends) {
+                p.bindStr(f)
+            }
+            p.bindStr(userId).bindStr(userId).bindStr(userId).bindInt(limit)
+            var rows = store.queryList("select f.other_id, count(*) as mutual from (select receiver_user_id as other_id from user_connections where status = \'ACCEPTED\' and requester_user_id in (" + marks + ") union all select requester_user_id as other_id from user_connections where status = \'ACCEPTED\' and receiver_user_id in (" + marks + ")) f where f.other_id <> ? and f.other_id not in (" + NetworkStore.alreadyLinked() + ") group by f.other_id order by mutual desc, f.other_id limit ?", p)
+            for (var r in rows) {
+                out.add(NetworkSuggestion(r.getStr("other_id"), r.getInt("mutual")))
+            }
+        }
+        if (out.size() < limit) {
+            var taken = listOf<String>()
+            for (var s in out) {
+                taken.add(s.userId)
+            }
+            var rows = store.queryList("select id from users where id <> ? and id not in (" + NetworkStore.alreadyLinked() + ") limit ?", DbParams().bindStr(userId).bindStr(userId).bindStr(userId).bindInt(limit + taken.size()))
+            for (var r in rows) {
+                var id = r.getStr("id")
+                if (out.size() < limit && !taken.contains(id)) {
+                    taken.add(id)
+                    out.add(NetworkSuggestion(id, 0))
+                }
+            }
+        }
+        return out
+    }
+    // user_blocks
+    Bool blockExists(blocker: String, blocked: String) = store.queryLong("select count(*) from user_blocks where blocker_id = ? and blocked_id = ?", DbParams().bindStr(blocker).bindStr(blocked)) > 0L
+    insertBlock(blocker: String, blocked: String, now: String) {
+        store.execute("insert into user_blocks (blocker_id, blocked_id, created_at) values (?, ?, ?)", DbParams().bindStr(blocker).bindStr(blocked).bindInstant(now))
+    }
+    deleteBlock(blocker: String, blocked: String) {
+        store.execute("delete from user_blocks where blocker_id = ? and blocked_id = ?", DbParams().bindStr(blocker).bindStr(blocked))
+    }
+    List<NetworkBlock> blocksOf(blocker: String) {
+        var out = listOf<NetworkBlock>()
+        for (var r in store.queryList("select id, blocker_id, blocked_id, created_at from user_blocks where blocker_id = ? order by created_at desc, id desc", DbParams().bindStr(blocker))) {
+            out.add(NetworkBlock(r.getLong("id"), r.getStr("blocker_id"), r.getStr("blocked_id"), r.getInstant("created_at")))
+        }
+        return out
+    }
+    // user_mutes (expired rows stay until unmuted; every read filters by the clock).
+    NetworkMute? findActiveMute(muter: String, muted: String, now: String) {
+        var r = store.queryOptional("select id, muter_id, muted_id, created_at, expires_at from user_mutes where muter_id = ? and muted_id = ? and (expires_at is null or expires_at > ?)", DbParams().bindStr(muter).bindStr(muted).bindInstant(now))
+        if (r == null) {
+            return null
+        }
+        return NetworkStore.mute(r)
+    }
+    static NetworkMute mute(r: DbRow) = NetworkMute(r.getLong("id"), r.getStr("muter_id"), r.getStr("muted_id"), r.getInstant("created_at"), r.getInstantOrNull("expires_at"))
+    List<NetworkMute> activeMutes(muter: String, now: String) {
+        var out = listOf<NetworkMute>()
+        for (var r in store.queryList("select id, muter_id, muted_id, created_at, expires_at from user_mutes where muter_id = ? and (expires_at is null or expires_at > ?) order by created_at desc, id desc", DbParams().bindStr(muter).bindInstant(now))) {
+            out.add(NetworkStore.mute(r))
+        }
+        return out
+    }
+    // Muting again renews the term from now.
+    saveMute(muter: String, muted: String, now: String, expiresAt: String?) {
+        var changed = store.execute("update user_mutes set created_at = ?, expires_at = ? where muter_id = ? and muted_id = ?", DbParams().bindInstant(now).bindInstantOrNull(expiresAt).bindStr(muter).bindStr(muted))
+        if (changed == 0) {
+            store.execute("insert into user_mutes (muter_id, muted_id, created_at, expires_at) values (?, ?, ?, ?)", DbParams().bindStr(muter).bindStr(muted).bindInstant(now).bindInstantOrNull(expiresAt))
+        }
+    }
+    deleteMute(muter: String, muted: String) {
+        store.execute("delete from user_mutes where muter_id = ? and muted_id = ?", DbParams().bindStr(muter).bindStr(muted))
+    }
+}

@@ -1,0 +1,70 @@
+package profile
+
+import kernel.error.*
+import kernel.text.*
+import kernel.time.*
+
+// Displayed identity (nickname, social name, pronouns) and the badge list. The social name replaces the
+// registered name for everybody, the nickname goes in parentheses after the name, pronouns show only on the
+// profile. A null or blank value CLEARS the field: "I do not want it anymore" is an intent.
+class ProfileIdentityService {
+    ProfileDirectory directory
+    ProfileStore writes
+    ProfileSlots slots
+    ProfileBadgeOwnership badgeOwnership
+    public constructor(directory: ProfileDirectory, writes: ProfileStore, slots: ProfileSlots, badgeOwnership: ProfileBadgeOwnership) {
+        this.directory = directory
+        this.writes = writes
+        this.slots = slots
+        this.badgeOwnership = badgeOwnership
+    }
+    ProfileRecord update(userId: String, nickname: String?, socialName: String?, pronouns: String?) {
+        this.require(userId)
+        this.check("apelido", nickname, 60)
+        this.check("nome social", socialName, 160)
+        this.check("pronomes", pronouns, 60)
+        writes.updateIdentity(userId, this.defused(nickname), this.defused(socialName), this.defused(pronouns), Time.nowIso())
+        return this.require(userId)
+    }
+    // Up to 5 badges: the first follows the name everywhere, all show on the profile. Null/empty clears.
+    ProfileRecord updateBadges(userId: String, badges: List<String>?) {
+        this.require(userId)
+        var clean = listOf<String>()
+        if (badges != null) {
+            if (badges.size() > 5) {
+                throw Errors.api(400, "MAX_BADGES", "Sao no maximo 5 emblemas.")
+            }
+            for (var b in badges) {
+                var t = b.trim()
+                if (t.length() > 0) {
+                    this.check("emblema", t, 500)
+                    clean.add(t)
+                }
+            }
+        }
+        if (!badgeOwnership.ownsAllOfficial(userId, clean)) {
+            throw Errors.api(403, "NOT_OWNED", "Voce so pode exibir emblemas oficiais que tem.")
+        }
+        slots.updateBadges(userId, clean, Time.nowIso())
+        return this.require(userId)
+    }
+    ProfileRecord require(userId: String) {
+        var p = directory.findById(userId)
+        if (p == null) {
+            throw Errors.api(404, "PROFILE_NOT_FOUND", "Perfil nao encontrado.")
+        }
+        return p
+    }
+    check(field: String, value: String?, max: Int) {
+        if (value != null && value.trim().length() > max) {
+            throw Errors.api(400, "FIELD_TOO_LONG", field + " deve ter no maximo " + max + " caracteres.")
+        }
+    }
+    // PlainText.defuse then blankToNull (UserProfile.updateIdentityDisplay).
+    String? defused(value: String?) {
+        if (value == null) {
+            return null
+        }
+        return profileBlankNull(PlainText.defuse(value))
+    }
+}

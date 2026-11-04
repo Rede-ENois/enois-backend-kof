@@ -1,0 +1,133 @@
+package groups
+
+import communities.*
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+
+// Fixtures of the groups suites (like kernel.testkit: lives in src so every test file can import it).
+// One booted app per test file: a file is one process. The app runs the whole request pipeline, the
+// shared services and the Groups module with the default seams over the real tables.
+//
+//   var app = GroupsTestKit.app()
+//   var owner = GroupsTestKit.login("gfeed-owner")           // verified, adult user + live session
+//   var groupId = GroupsTestKit.createGroup(owner, "Turma", "OPEN")
+class GroupsTestKit {
+    static TestApp? cachedApp = null
+    static GroupsModule? cachedModule = null
+    static SharedServices? cachedShared = null
+    static Int keyCounter = 0
+    static TestApp app() {
+        var cur = GroupsTestKit.cachedApp
+        if (cur != null) {
+            return cur
+        }
+        SecurityClock.reset()
+        var created = TestApp.bootWith("groups", mapOf("REDE_ORIGINS_ENFORCE", "false"), (p: Platform) -> GroupsTestKit.wire(p))
+        GroupsTestKit.cachedApp = created
+        return created
+    }
+    static wire(p: Platform) {
+        var hooks = SecurityHooks.defaults(p.db)
+        Security.install(p, hooks)
+        var shared = SharedServices.create(p)
+        // The outbox worker would keep the test process alive (non-daemon thread): tests drain the outbox
+        // by hand with `shared().outbox.processPending()`.
+        shared.stop()
+        GroupsTestKit.cachedShared = shared
+        GroupsTestKit.cachedModule = GroupsModule.install(p, shared, hooks)
+        // The communities module is wired too: the isolation test reads both feeds.
+        CommunitiesModule.install(p, shared, hooks)
+    }
+    static GroupsModule module() {
+        GroupsTestKit.app()
+        var cur = GroupsTestKit.cachedModule
+        if (cur == null) {
+            throw "GroupsTestKit: module not wired"
+        }
+        return cur
+    }
+    static SharedServices shared() {
+        GroupsTestKit.app()
+        var cur = GroupsTestKit.cachedShared
+        if (cur == null) {
+            throw "GroupsTestKit: shared services not wired"
+        }
+        return cur
+    }
+    static Db db() = GroupsTestKit.app().db()
+    static String token(userId: String) = "tok-" + userId + "-1234567890"
+    // A verified adult user (birth date declared) with a live one-hour session; the id doubles as
+    // username and name. Safe to call twice for the same id.
+    static String login(userId: String) {
+        var store = GroupsTestKit.db()
+        if (store.queryLong("select count(*) from users where id = ?", DbParams().bindStr(userId)) == 0L) {
+            SecurityFixtures.login(store, userId, GroupsTestKit.token(userId))
+            store.execute("update users set birth_date = ? where id = ?", DbParams().bindDate("1990-05-10").bindStr(userId))
+        }
+        return userId
+    }
+    // Same, with the platform admin flag.
+    static String loginAdmin(userId: String) {
+        GroupsTestKit.login(userId)
+        GroupsTestKit.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr(userId))
+        return userId
+    }
+    static String nextKey() {
+        GroupsTestKit.keyCounter = GroupsTestKit.keyCounter + 1
+        return "gk-" + GroupsTestKit.keyCounter
+    }
+    static TestResponse send(method: String, path: String, userId: String?, body: String, idempotencyKey: String?) {
+        var headers = listOf("Content-Type: application/json")
+        if (userId != null) {
+            headers.add("X-Session-Token: " + GroupsTestKit.token(userId))
+        }
+        if (idempotencyKey != null) {
+            headers.add("Idempotency-Key: " + idempotencyKey)
+        }
+        return GroupsTestKit.app().client.send(method, path, headers, "", body)
+    }
+    static TestResponse get(path: String, userId: String?) = GroupsTestKit.send("GET", path, userId, "", null)
+    // A write with a fresh Idempotency-Key.
+    static TestResponse write(method: String, path: String, userId: String, body: String) = GroupsTestKit.send(method, path, userId, body, GroupsTestKit.nextKey())
+    static TestResponse post(path: String, userId: String, body: String) = GroupsTestKit.write("POST", path, userId, body)
+    static TestResponse patch(path: String, userId: String, body: String) = GroupsTestKit.write("PATCH", path, userId, body)
+    static TestResponse delete(path: String, userId: String) = GroupsTestKit.write("DELETE", path, userId, "")
+    static String q(value: String) = json.encode(value)
+    // POST /groups; answers the new group id (asserts 201).
+    static String createGroup(owner: String, name: String, joinMode: String) {
+        var res = GroupsTestKit.post("/groups", owner, "{\"name\":" + GroupsTestKit.q(name) + ",\"description\":\"grupo de teste\",\"joinMode\":\"" + joinMode + "\"}")
+        Check.status(res, 201)
+        return res.json("id")
+    }
+    static joinOk(user: String, groupId: String) {
+        Check.status(GroupsTestKit.post("/groups/" + groupId + "/join", user, ""), 200)
+    }
+    static String createTopic(admin: String, groupId: String, name: String) {
+        var res = GroupsTestKit.post("/groups/" + groupId + "/topics", admin, "{\"name\":" + GroupsTestKit.q(name) + ",\"description\":\"assunto\"}")
+        Check.status(res, 201)
+        return res.json("id")
+    }
+    static TestResponse publishRaw(author: String, groupId: String, topicId: String, content: String) = GroupsTestKit.post("/groups/" + groupId + "/posts", author, "{\"topicId\":" + GroupsTestKit.q(topicId) + ",\"content\":" + GroupsTestKit.q(content) + ",\"mediaIds\":[]}")
+    static String publish(author: String, groupId: String, topicId: String, content: String) {
+        var res = GroupsTestKit.publishRaw(author, groupId, topicId, content)
+        Check.status(res, 201)
+        return res.json("id")
+    }
+    static TestResponse commentRaw(author: String, groupId: String, postId: String, content: String, parentId: String?) {
+        var body = "{\"content\":" + GroupsTestKit.q(content)
+        if (parentId != null) {
+            body = body + ",\"parentCommentId\":" + GroupsTestKit.q(parentId)
+        }
+        return GroupsTestKit.post("/groups/" + groupId + "/posts/" + postId + "/comments", author, body + "}")
+    }
+    static String comment(author: String, groupId: String, postId: String, content: String, parentId: String?) {
+        var res = GroupsTestKit.commentRaw(author, groupId, postId, content, parentId)
+        Check.status(res, 201)
+        return res.json("id")
+    }
+    static TestResponse react(user: String, groupId: String, postId: String, type: String) = GroupsTestKit.post("/groups/" + groupId + "/posts/" + postId + "/reactions", user, "{\"type\":\"" + type + "\"}")
+    // The notifications of a user with the given kind: (title, body, href, actor_id, actor_count, is_read).
+    static List<DbRow> notifications(userId: String, kind: String) = GroupsTestKit.db().queryList("select id, title, body, href, actor_id, actor_count, is_read from notifications where user_id = ? and kind = ? order by created_at desc", DbParams().bindStr(userId).bindStr(kind))
+}

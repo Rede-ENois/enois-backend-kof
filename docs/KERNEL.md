@@ -464,6 +464,15 @@ INFO). Message and field values pass through `PiiMask.text`: still never log sec
 `Time.nowIso()`, `Time.nowMillis()`, `Time.toMillis(iso)`, `Time.fromMillis(ms)`,
 `Time.plusSeconds(iso, s)`, `Time.todayIso()`, `Time.fromDbTimestamp(raw)`.
 
+`kernel.time.Dates` (calendar dates, `yyyy-MM-dd`, added by the profile port):
+
+```kotlin
+Dates.valid(raw)          // real calendar date (leap years, month lengths)
+Dates.body(raw)           // request field: null/empty -> null, malformed -> 400 BAD_REQUEST
+Dates.todayBrazil()       // today in Sao Paulo (UTC-3 all year)
+Dates.yearsBetween(birth, today)   Dates.isLeap(y)   Dates.daysIn(y, m)
+```
+
 ## Testing (`kernel.testkit`)
 
 ```kotlin
@@ -696,6 +705,9 @@ TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "nome", value, 160)   // 400 "O c
 LikePattern.contains(q)  LikePattern.startsWith(q)  LikePattern.escape(t) // null for blank; SQL must say `escape '!'`
 InlineMedia.idsIn(content)  InlineMedia.validate(content, mediaIds)       // 400 INVALID_INLINE_MEDIA for foreign markers
 Texts.stripAccents(s)  Texts.squash(s)
+Texts.isBlank(s)  Texts.hasText(s)  Texts.trimIfText(s)               // nullable-safe helpers (G31: no narrowing through || / &&)
+Nulls.str()  Nulls.integer()  Nulls.bigint()                           // typed null values (a null literal initializer is SEM048, G120)
+HashOrder.of(ids)                                                       // java.util.HashSet<String> iteration order of these ids
 Regexes.replaceAll(pattern, input, (m: Matcher) -> String)               // literal replacements
 ```
 
@@ -851,3 +863,10 @@ port with `BinaryFront` (every other request is forwarded byte for byte, `X-Kern
 address and `Req.peerAddress()` honours it only from a loopback peer; client-sent `X-Kernel-*` and `Expect` are
 dropped). `REDE_BINARY_MAX_BODY_BYTES` (default 545259520) caps one upload. Why and what it costs: `docs/PORTING_STATUS.md`
 (media) and G161. Tests use `BinaryClient(app.port)` (`get`, `put`, `send` with `Byte[]` bodies, `BinaryResponse.body`).
+### Profile slice support (`profile.ProfileTestApp`)
+
+`ProfileTestApp.boot(name, overrides)` boots the platform with the request pipeline, `SharedServices` and
+`ProfileModule` (which also installs network, preferences and presence). `ProfileTestApp.login(app, id)` creates
+a verified account (once) with a live session and returns a `ProfileCaller` (token, JSON content type and a fresh
+`Idempotency-Key` on every write). `ProfileTestApp.finish()` must be the last test of every file: the shared
+jobs keep the test process alive otherwise (G124).

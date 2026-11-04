@@ -1,0 +1,222 @@
+package communities
+
+import kernel.db.*
+import kernel.id.*
+import kernel.text.*
+import kernel.time.*
+
+// SQL of the communities domain: communities, community_members, favorite_communities,
+// community_pinned_posts (CommunityPersistenceAdapter).
+class CommunityStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, name, description, topic, cover, avatar, banner_html, city, state, city_key, created_by, created_at, updated_at"
+    static CommunityRow row(r: DbRow) = CommunityRow(r.getStr("id"), r.getStr("name"), r.getStrOrNull("description"), r.getStrOrNull("topic"), r.getStrOrNull("cover"), r.getStrOrNull("avatar"), r.getStrOrNull("banner_html"), r.getStrOrNull("city"), r.getStrOrNull("state"), r.getStrOrNull("city_key"), r.getStr("created_by"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    // Plain loop: a `map` lambda that builds a record fails at runtime (NoClassDefFoundError, G190).
+    static List<CommunityRow> rows(list: List<DbRow>) {
+        var out = listOf<CommunityRow>()
+        for (var r in list) {
+            out.add(CommunityStore.row(r))
+        }
+        return out
+    }
+    static CommunityMemberRow memberRow(r: DbRow) = CommunityMemberRow(r.getLong("id"), r.getStr("community_id"), r.getStr("user_id"), r.getStr("role"), r.getInstant("joined_at"))
+    // "?, ?, ?" for an IN list.
+    static String marks(n: Int) {
+        var out = ""
+        var i = 0
+        while (i < n) {
+            if (i > 0) {
+                out = out + ", "
+            }
+            out = out + "?"
+            i = i + 1
+        }
+        return out
+    }
+    static DbParams strParams(ids: List<String>) {
+        var p = DbParams()
+        for (var id in ids) {
+            p = p.bindStr(id)
+        }
+        return p
+    }
+    insert(c: CommunityRow) {
+        store.execute("insert into communities (" + CommunityStore.columns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(c.id).bindStr(c.name).bindStrOrNull(c.description).bindStrOrNull(c.topic).bindStrOrNull(c.cover).bindStrOrNull(c.avatar).bindStrOrNull(c.bannerHtml).bindStrOrNull(c.city).bindStrOrNull(c.state).bindStrOrNull(c.cityKey).bindStr(c.createdBy).bindInstant(c.createdAt).bindInstant(c.updatedAt))
+    }
+    update(c: CommunityRow) {
+        store.execute("update communities set name = ?, description = ?, topic = ?, cover = ?, avatar = ?, banner_html = ?, city = ?, state = ?, city_key = ?, created_by = ?, updated_at = ? where id = ?", DbParams().bindStr(c.name).bindStrOrNull(c.description).bindStrOrNull(c.topic).bindStrOrNull(c.cover).bindStrOrNull(c.avatar).bindStrOrNull(c.bannerHtml).bindStrOrNull(c.city).bindStrOrNull(c.state).bindStrOrNull(c.cityKey).bindStr(c.createdBy).bindInstant(c.updatedAt).bindStr(c.id))
+    }
+    CommunityRow? findById(id: String) {
+        var r = store.queryOptional("select " + CommunityStore.columns() + " from communities where id = ?", DbParams().bindStr(id))
+        if (r == null) {
+            return null
+        }
+        return CommunityStore.row(r)
+    }
+    // The showcase: name/description search (LikePattern, `escape '!'`), topic, state, city key, cursor.
+    List<CommunityRow> findAll(topic: String?, query: String?, state: String?, cityKey: String?, before: String?, limit: Int) {
+        var sql = "select " + CommunityStore.columns() + " from communities where 1 = 1"
+        var params = DbParams()
+        if (topic != null) {
+            sql = sql + " and topic = ?"
+            params = params.bindStr(topic)
+        }
+        var q = LikePattern.contains(query)
+        if (q != null) {
+            sql = sql + " and (lower(name) like ? escape \'!\' or lower(description) like ? escape \'!\')"
+            params = params.bindStr(q).bindStr(q)
+        }
+        if (state != null) {
+            sql = sql + " and state = ?"
+            params = params.bindStr(state)
+        }
+        if (cityKey != null) {
+            sql = sql + " and city_key = ?"
+            params = params.bindStr(cityKey)
+        }
+        if (before != null) {
+            sql = sql + " and created_at < ?"
+            params = params.bindInstant(before)
+        }
+        sql = sql + " order by created_at desc limit ?"
+        return CommunityStore.rows(store.queryList(sql, params.bindInt(limit)))
+    }
+    // Same city first, then the rest of the state, each by member count.
+    List<CommunityRow> findLocal(state: String, cityKey: String, limit: Int) = CommunityStore.rows(store.queryList("select " + CommunityStore.columns() + " from communities c where c.state = ? order by case when c.city_key = ? then 0 else 1 end, (select count(*) from community_members m where m.community_id = c.id) desc, c.created_at desc limit ?", DbParams().bindStr(state).bindStr(cityKey).bindInt(limit)))
+    List<CommunityRow> findByMember(userId: String, limit: Int) = CommunityStore.rows(store.queryList("select " + CommunityStore.columns() + " from communities where id in (select community_id from community_members where user_id = ?) order by created_at desc limit ?", DbParams().bindStr(userId).bindInt(limit)))
+    delete(id: String) {
+        store.execute("delete from communities where id = ?", DbParams().bindStr(id))
+    }
+    // ---- members ----
+    insertMember(communityId: String, userId: String, role: String) {
+        store.execute("insert into community_members (community_id, user_id, role, joined_at) values (?, ?, ?, ?)", DbParams().bindStr(communityId).bindStr(userId).bindStr(role).bindInstant(Time.nowIso()))
+    }
+    Bool isMember(communityId: String, userId: String) = store.queryLong("select count(*) from community_members where community_id = ? and user_id = ?", DbParams().bindStr(communityId).bindStr(userId)) > 0L
+    CommunityMemberRow? findMember(communityId: String, userId: String) {
+        var r = store.queryOptional("select id, community_id, user_id, role, joined_at from community_members where community_id = ? and user_id = ?", DbParams().bindStr(communityId).bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        return CommunityStore.memberRow(r)
+    }
+    List<CommunityMemberRow> findMembers(communityId: String) {
+        var out = listOf<CommunityMemberRow>()
+        for (var r in store.queryList("select id, community_id, user_id, role, joined_at from community_members where community_id = ? order by id", DbParams().bindStr(communityId))) {
+            out.add(CommunityStore.memberRow(r))
+        }
+        return out
+    }
+    updateMemberRole(communityId: String, userId: String, role: String) {
+        store.execute("update community_members set role = ? where community_id = ? and user_id = ?", DbParams().bindStr(role).bindStr(communityId).bindStr(userId))
+    }
+    removeMember(communityId: String, userId: String) {
+        store.execute("delete from community_members where community_id = ? and user_id = ?", DbParams().bindStr(communityId).bindStr(userId))
+    }
+    removeAllMembers(communityId: String) {
+        store.execute("delete from community_members where community_id = ?", DbParams().bindStr(communityId))
+    }
+    Int countMembers(communityId: String) = store.queryLong("select count(*) from community_members where community_id = ?", DbParams().bindStr(communityId)) as Int
+    // Member counts of a whole page in one query; communities without members are absent.
+    Map<String,Int> countMembersByIds(ids: List<String>) {
+        var out = mapOf<String, Int>()
+        if (ids.size() == 0) {
+            return out
+        }
+        for (var r in store.queryList("select community_id, count(*) as n from community_members where community_id in (" + CommunityStore.marks(ids.size()) + ") group by community_id", CommunityStore.strParams(ids))) {
+            out.put(r.getStr("community_id"), r.getInt("n"))
+        }
+        return out
+    }
+    // Which of these communities the user belongs to, in one query.
+    List<String> memberCommunityIds(userId: String, ids: List<String>) {
+        var out = listOf<String>()
+        if (ids.size() == 0) {
+            return out
+        }
+        var params = DbParams().bindStr(userId)
+        for (var id in ids) {
+            params = params.bindStr(id)
+        }
+        for (var r in store.queryList("select community_id from community_members where user_id = ? and community_id in (" + CommunityStore.marks(ids.size()) + ")", params)) {
+            out.add(r.getStr("community_id"))
+        }
+        return out
+    }
+    // ---- pinned post (one per community: the primary key is the community) ----
+    savePinnedPost(communityId: String, postId: String, pinnedBy: String) {
+        store.execute("delete from community_pinned_posts where community_id = ?", DbParams().bindStr(communityId))
+        store.execute("insert into community_pinned_posts (community_id, post_id, pinned_by, pinned_at) values (?, ?, ?, ?)", DbParams().bindStr(communityId).bindStr(postId).bindStr(pinnedBy).bindInstant(Time.nowIso()))
+    }
+    String? findPinnedPostId(communityId: String) {
+        var r = store.queryOptional("select post_id from community_pinned_posts where community_id = ?", DbParams().bindStr(communityId))
+        if (r == null) {
+            return null
+        }
+        return r.getStr("post_id")
+    }
+    removePinnedPost(communityId: String) {
+        store.execute("delete from community_pinned_posts where community_id = ?", DbParams().bindStr(communityId))
+    }
+    // ---- favorites ----
+    Bool isFavorite(communityId: String, userId: String) = store.queryLong("select count(*) from favorite_communities where user_id = ? and community_id = ?", DbParams().bindStr(userId).bindStr(communityId)) > 0L
+    addFavorite(communityId: String, userId: String) {
+        if (this.isFavorite(communityId, userId)) {
+            return
+        }
+        store.execute("insert into favorite_communities (id, community_id, user_id, created_at) values (?, ?, ?, ?)", DbParams().bindStr(Ids.prefixed("fav_")).bindStr(communityId).bindStr(userId).bindInstant(Time.nowIso()))
+    }
+    removeFavorite(communityId: String, userId: String) {
+        store.execute("delete from favorite_communities where user_id = ? and community_id = ?", DbParams().bindStr(userId).bindStr(communityId))
+    }
+    // Newest favorite first; ids pointing at deleted communities drop out (the limit counts them, as in Java).
+    List<CommunityRow> findFavorites(userId: String, limit: Int) {
+        var ids = listOf<String>()
+        for (var r in store.queryList("select community_id from favorite_communities where user_id = ? order by created_at desc, id limit ?", DbParams().bindStr(userId).bindInt(limit))) {
+            ids.add(r.getStr("community_id"))
+        }
+        var out = listOf<CommunityRow>()
+        if (ids.size() == 0) {
+            return out
+        }
+        var found = CommunityStore.rows(store.queryList("select " + CommunityStore.columns() + " from communities where id in (" + CommunityStore.marks(ids.size()) + ")", CommunityStore.strParams(ids)))
+        for (var id in ids) {
+            for (var c in found) {
+                if (c.id == id) {
+                    out.add(c)
+                }
+            }
+        }
+        return out
+    }
+}
+
+// SQL of community_channels (CommunityChannelPersistenceAdapter).
+class CommunityChannelStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static CommunityChannelRow row(r: DbRow) = CommunityChannelRow(r.getStr("id"), r.getStr("community_id"), r.getStr("name"), r.getStr("slug"), r.getStrOrNull("topic"), r.getStrOrNull("description"), r.getStr("created_by"), r.getInstant("created_at"))
+    insert(c: CommunityChannelRow) {
+        store.execute("insert into community_channels (id, community_id, name, slug, topic, description, created_by, created_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(c.id).bindStr(c.communityId).bindStr(c.name).bindStr(c.slug).bindStrOrNull(c.topic).bindStrOrNull(c.description).bindStr(c.createdBy).bindInstant(c.createdAt))
+    }
+    List<CommunityChannelRow> findByCommunity(communityId: String) {
+        var out = listOf<CommunityChannelRow>()
+        for (var r in store.queryList("select id, community_id, name, slug, topic, description, created_by, created_at from community_channels where community_id = ? order by created_at asc, id", DbParams().bindStr(communityId))) {
+            out.add(CommunityChannelStore.row(r))
+        }
+        return out
+    }
+    CommunityChannelRow? findById(channelId: String) {
+        var r = store.queryOptional("select id, community_id, name, slug, topic, description, created_by, created_at from community_channels where id = ?", DbParams().bindStr(channelId))
+        if (r == null) {
+            return null
+        }
+        return CommunityChannelStore.row(r)
+    }
+    Bool existsBySlug(communityId: String, slug: String) = store.queryLong("select count(*) from community_channels where community_id = ? and slug = ?", DbParams().bindStr(communityId).bindStr(slug)) > 0L
+    Int countByCommunity(communityId: String) = store.queryLong("select count(*) from community_channels where community_id = ?", DbParams().bindStr(communityId)) as Int
+}

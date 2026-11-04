@@ -1,0 +1,107 @@
+package communityprojects
+
+import kernel.db.*
+import kernel.text.*
+import kernel.time.*
+
+// SQL over `community_projects` (CommunityProjectPersistenceAdapter). Same columns as V142.
+class CommunityProjectStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, user_id, slug, title, description, short_description, cover, url, repo_url, tags, category, status, reviewed_by, review_note, submitted_at, reviewed_at, published_at, suspended_at, created_at, updated_at"
+    static CommunityProject fromRow(r: DbRow) = CommunityProject(r.getStr("id"), r.getStr("user_id"), r.getStr("slug"), r.getStr("title"), r.getStrOrNull("description"), r.getStrOrNull("short_description"), r.getStrOrNull("cover"), r.getStrOrNull("url"), r.getStrOrNull("repo_url"), r.getStrOrNull("tags"), r.getStrOrNull("category"), r.getStr("status"), r.getStrOrNull("reviewed_by"), r.getStrOrNull("review_note"), r.getInstant("submitted_at"), r.getInstantOrNull("reviewed_at"), r.getInstantOrNull("published_at"), r.getInstantOrNull("suspended_at"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    // A loop, not `.map(lambda)`: a lambda returning a packaged record fails at runtime (NoClassDefFoundError).
+    List<CommunityProject> list(sql: String, params: DbParams) {
+        var out = new java.util.ArrayList<CommunityProject>()
+        for (var row in store.queryList(sql, params)) {
+            out.add(CommunityProjectStore.fromRow(row))
+        }
+        return out
+    }
+    CommunityProject? findById(id: String) {
+        var rows = this.list("select " + CommunityProjectStore.columns() + " from community_projects where id = ?", DbParams().bindStr(id))
+        if (rows.size() == 0) {
+            return null
+        }
+        return rows.get(0)
+    }
+    CommunityProject? findByUserAndSlug(userId: String, slug: String) {
+        var rows = this.list("select " + CommunityProjectStore.columns() + " from community_projects where user_id = ? and slug = ?", DbParams().bindStr(userId).bindStr(slug))
+        if (rows.size() == 0) {
+            return null
+        }
+        return rows.get(0)
+    }
+    List<CommunityProject> findByUser(userId: String) = this.list("select " + CommunityProjectStore.columns() + " from community_projects where user_id = ? order by updated_at desc", DbParams().bindStr(userId))
+    List<CommunityProject> findByUserAndStatus(userId: String, status: String, limit: Int) = this.list("select " + CommunityProjectStore.columns() + " from community_projects where user_id = ? and status = ? order by published_at desc limit ?", DbParams().bindStr(userId).bindStr(status).bindInt(limit))
+    List<CommunityProject> findByStatus(status: String, limit: Int) = this.list("select " + CommunityProjectStore.columns() + " from community_projects where status = ? order by submitted_at asc limit ?", DbParams().bindStr(status).bindInt(limit))
+    Bool existsByUserAndSlug(userId: String, slug: String) = store.queryLong("select count(*) from community_projects where user_id = ? and slug = ?", DbParams().bindStr(userId).bindStr(slug)) > 0L
+    insert(p: CommunityProject) {
+        store.execute("insert into community_projects (" + CommunityProjectStore.columns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(p.id()).bindStr(p.userId()).bindStr(p.slug()).bindStr(p.title()).bindStrOrNull(p.description()).bindStrOrNull(p.shortDescription()).bindStrOrNull(p.cover()).bindStrOrNull(p.url()).bindStrOrNull(p.repoUrl()).bindStrOrNull(p.tags()).bindStrOrNull(p.category()).bindStr(p.status()).bindStrOrNull(p.reviewedBy()).bindStrOrNull(p.reviewNote()).bindInstant(p.submittedAt()).bindInstantOrNull(p.reviewedAt()).bindInstantOrNull(p.publishedAt()).bindInstantOrNull(p.suspendedAt()).bindInstant(p.createdAt()).bindInstant(p.updatedAt()))
+    }
+    // CommunityProject.edit: every showcase field is replaced; the slug only when a new one is given.
+    update(id: String, title: String, description: String?, shortDescription: String?, cover: String?, url: String?, repoUrl: String?, tags: String?, category: String?, newSlug: String?, now: String) {
+        var slugSql = ""
+        var params = DbParams().bindStr(title).bindStrOrNull(description).bindStrOrNull(shortDescription).bindStrOrNull(cover).bindStrOrNull(url).bindStrOrNull(repoUrl).bindStrOrNull(tags).bindStrOrNull(category).bindInstant(now)
+        if (newSlug != null) {
+            slugSql = ", slug = ?"
+            params.bindStr(newSlug)
+        }
+        store.execute("update community_projects set title = ?, description = ?, short_description = ?, cover = ?, url = ?, repo_url = ?, tags = ?, category = ?, updated_at = ?" + slugSql + " where id = ?", params.bindStr(id))
+    }
+    // CommunityProject.approve: publishes; published_at keeps the first publication date.
+    approve(id: String, reviewerId: String, note: String?, now: String) {
+        store.execute("update community_projects set status = \'PUBLISHED\', reviewed_by = ?, review_note = ?, reviewed_at = ?, published_at = coalesce(published_at, ?), suspended_at = null, updated_at = ? where id = ?", DbParams().bindStr(reviewerId).bindStrOrNull(note).bindInstant(now).bindInstant(now).bindInstant(now).bindStr(id))
+    }
+    reject(id: String, reviewerId: String, note: String, now: String) {
+        store.execute("update community_projects set status = \'REJECTED\', reviewed_by = ?, review_note = ?, reviewed_at = ?, updated_at = ? where id = ?", DbParams().bindStr(reviewerId).bindStr(note).bindInstant(now).bindInstant(now).bindStr(id))
+    }
+    resubmit(id: String, now: String) {
+        store.execute("update community_projects set status = \'SUBMITTED\', reviewed_by = null, review_note = null, submitted_at = ?, reviewed_at = null, updated_at = ? where id = ?", DbParams().bindInstant(now).bindInstant(now).bindStr(id))
+    }
+    suspend(id: String, reviewerId: String, note: String?, now: String) {
+        store.execute("update community_projects set status = \'SUSPENDED\', reviewed_by = ?, review_note = ?, reviewed_at = ?, suspended_at = ?, updated_at = ? where id = ?", DbParams().bindStr(reviewerId).bindStrOrNull(note).bindInstant(now).bindInstant(now).bindInstant(now).bindStr(id))
+    }
+    // CommunityProject.restoreFromSuspension: back to PUBLISHED, the review note stays.
+    unsuspend(id: String, reviewerId: String, now: String) {
+        store.execute("update community_projects set status = \'PUBLISHED\', reviewed_by = ?, reviewed_at = ?, suspended_at = null, updated_at = ? where id = ?", DbParams().bindStr(reviewerId).bindInstant(now).bindInstant(now).bindStr(id))
+    }
+    delete(id: String) {
+        store.execute("delete from community_projects where id = ?", DbParams().bindStr(id))
+    }
+    // Published catalogue, filtered by title/description/tags, newest first or by title. One extra row
+    // answers "is there a next page".
+    // ponytail: the Java paging math returned a short second page (page size limit+1, offset skipped inside
+    // the page); this reads exactly `limit + 1` rows from `offset`.
+    CommunityProjectSearchPage search(query: String?, order: String?, limit: Int, offset: Int) {
+        var pattern = LikePattern.contains(query)
+        var sql = "select " + CommunityProjectStore.columns() + " from community_projects where status = \'PUBLISHED\'"
+        var params = DbParams()
+        if (pattern != null) {
+            sql = sql + " and (lower(title) like ? escape \'!\' or lower(coalesce(description, \'\')) like ? escape \'!\' or lower(coalesce(tags, \'\')) like ? escape \'!\')"
+            params.bindStr(pattern).bindStr(pattern).bindStr(pattern)
+        }
+        var sortByTitle = false
+        if (order != null) {
+            sortByTitle = order.toLowerCase() == "title"
+        }
+        if (sortByTitle) {
+            sql = sql + " order by lower(title) asc, id asc"
+        }
+        else {
+            sql = sql + " order by published_at desc, id asc"
+        }
+        sql = sql + " limit ? offset ?"
+        var rows = this.list(sql, params.bindInt(limit + 1).bindInt(offset))
+        var hasMore = rows.size() > limit
+        var items = new java.util.ArrayList<CommunityProject>()
+        var i = 0
+        while (i < rows.size() && i < limit) {
+            items.add(rows.get(i))
+            i = i + 1
+        }
+        return CommunityProjectSearchPage(items, hasMore)
+    }
+}

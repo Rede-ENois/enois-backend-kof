@@ -1,0 +1,100 @@
+package profile
+
+import kernel.db.*
+import kernel.error.*
+import kernel.time.*
+import preferences.*
+
+// The showcase look the owner chooses for visitors: social and professional sides, independent. Every value
+// comes from a CLOSED list (theme from the catalog, six-digit hex accent, known font/header/border names, a
+// three-level decoration): nothing becomes free CSS.
+class ProfileAppearanceService {
+    ProfileDirectory directory
+    ProfileStore writes
+    static Set<String> fonts = setOf("sans", "serif", "mono", "rounded", "display")
+    static Set<String> headers = setOf("solid", "gradient", "clean")
+    static Set<String> borders = setOf("rounded", "square")
+    public constructor(directory: ProfileDirectory, writes: ProfileStore) {
+        this.directory = directory
+        this.writes = writes
+    }
+    ProfileAppearance update(userId: String, requested: ProfileAppearanceBody) {
+        var profile = directory.findById(userId)
+        if (profile == null) {
+            throw Errors.api(404, "PROFILE_NOT_FOUND", "Perfil nao encontrado.")
+        }
+        var clean = ProfileAppearance(this.sanitize(requested.social()), this.sanitize(requested.professional()))
+        writes.updateAppearance(userId, ProfileAppearances.encode(clean), Time.nowIso())
+        return clean
+    }
+    ProfileLook sanitize(look: ProfileLookBody?) {
+        if (look == null) {
+            return ProfileAppearances.emptyLook()
+        }
+        return ProfileLook(this.theme(look.theme()), this.accent(look.accent()), this.choice("fonte", look.font(), ProfileAppearanceService.fonts), this.choice("cabecalho", look.header(), ProfileAppearanceService.headers), look.textures(), this.choice("borda", look.borders(), ProfileAppearanceService.borders), this.decoration(look.decoration()))
+    }
+    String? theme(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        var n = raw.trim()
+        if (!PreferencesCatalog.isThemeId(n)) {
+            throw Errors.api(400, "INVALID_PROFILE_THEME", "Tema de perfil desconhecido: escolha um dos temas disponiveis.")
+        }
+        return n
+    }
+    String? accent(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        var n = raw.trim().toLowerCase()
+        if (!ProfileAppearanceService.isHex(n)) {
+            throw Errors.api(400, "INVALID_PROFILE_ACCENT", "Cor do perfil precisa ser um hex como #7c3aed.")
+        }
+        return n
+    }
+    static Bool isHex(n: String) {
+        if (n.length() != 7 || n.substring(0, 1) != "#") {
+            return false
+        }
+        var i = 1
+        while (i < 7) {
+            var c = n.substring(i, i + 1)
+            var digit = c.compareTo("0") >= 0 && c.compareTo("9") <= 0
+            var letter = c.compareTo("a") >= 0 && c.compareTo("f") <= 0
+            if (!digit && !letter) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    String? choice(label: String, raw: String?, allowed: Set<String>) {
+        if (raw == null) {
+            return null
+        }
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        var n = raw.trim().toLowerCase()
+        if (!allowed.contains(n)) {
+            throw Errors.api(400, "INVALID_PROFILE_APPEARANCE", "Valor de " + label + " nao reconhecido.")
+        }
+        return n
+    }
+    Int? decoration(level: Int?) {
+        if (level == null) {
+            return null
+        }
+        if (level < 0 || level > 2) {
+            throw Errors.api(400, "INVALID_PROFILE_APPEARANCE", "Decoracao do perfil vai de 0 a 2.")
+        }
+        return level
+    }
+}
