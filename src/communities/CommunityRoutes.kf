@@ -1,0 +1,319 @@
+package communities
+
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+import kernel.time.*
+
+// HTTP adapter of CommunityContractController: paths, status codes and JSON as the Java service.
+class CommunityRoutes {
+    static register(server: HttpServer, service: CommunityService, channelService: CommunityChannelService, idem: Idempotency, profiles: CommunityProfileLookup, feed: CommunityFeedLookup, admin: AdminGuard) {
+        server.get("/communities", () -> CommunityRoutes.list(service))
+        server.get("/communities/favorites", () -> CommunityRoutes.favorites(service))
+        server.get("/communities/local", () -> CommunityRoutes.local(service, profiles))
+        server.get("/communities/mine", () -> CommunityRoutes.mine(service))
+        server.get("/communities/:communityId", () -> CommunityRoutes.one(service))
+        server.post("/communities", () -> CommunityRoutes.create(service, idem))
+        server.patch("/communities/:communityId", () -> CommunityRoutes.update(service, idem))
+        server.post("/communities/:communityId/members", () -> CommunityRoutes.join(service, idem))
+        server.delete("/communities/:communityId/members", () -> CommunityRoutes.leave(service, idem))
+        server.post("/communities/:communityId/favorite", () -> CommunityRoutes.favorite(service, idem))
+        server.delete("/communities/:communityId/favorite", () -> CommunityRoutes.unfavorite(service, idem))
+        server.post("/communities/:communityId/transfer", () -> CommunityRoutes.transfer(service, idem))
+        server.delete("/communities/:communityId", () -> CommunityRoutes.remove(service, idem, admin))
+        server.get("/communities/:communityId/members", () -> CommunityRoutes.members(service, profiles))
+        server.get("/communities/:communityId/channels", () -> CommunityRoutes.channels(channelService))
+        server.post("/communities/:communityId/channels", () -> CommunityRoutes.createChannel(channelService))
+        server.get("/communities/:communityId/channels/:channelId/posts", () -> CommunityRoutes.channelFeed(channelService, feed))
+        server.get("/communities/:communityId/feed", () -> CommunityRoutes.communityFeed(feed))
+        server.get("/communities/:communityId/pin", () -> CommunityRoutes.pinned(service, feed))
+        server.post("/communities/:communityId/pin", () -> CommunityRoutes.pin(service, idem, feed))
+        server.delete("/communities/:communityId/pin", () -> CommunityRoutes.unpin(service, idem))
+    }
+    // ---- helpers ----
+    static List<String> idsOf(rows: List<CommunityRow>) {
+        var out = listOf<String>()
+        for (var c in rows) {
+            out.add(c.id)
+        }
+        return out
+    }
+    static String routeOf(path: String) = "/api/communities" + path
+    // CursorCodec.decode: absent -> null, malformed -> 400 INVALID_CURSOR.
+    static String? cursor() {
+        var raw = Req.queryStr("cursor", "")
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        try {
+            var ignored = Time.toMillis(raw)
+        } catch (String e) {
+            throw Errors.api(400, "INVALID_CURSOR", "Cursor invalido.")
+        }
+        return raw
+    }
+    static String? optionalQuery(name: String) {
+        var raw = Req.queryStr(name, "")
+        if (raw.length() == 0) {
+            return null
+        }
+        return raw
+    }
+    static CommunityView view(c: CommunityRow, members: Int, joined: Bool) = CommunityView(c.id, c.name, c.description, members, c.topic, c.cover, c.avatar, c.bannerHtml, joined, c.city, c.state)
+    static CommunityBody body() {
+        try {
+            return json.decode<CommunityBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String hashOf(parts: String) = Idempotency.hash(parts)
+    static String status(id: String, status: String) = json.encode(CommunityStatusView(id, status))
+    // ---- reads ----
+    static String list(service: CommunityService) {
+        var viewer = Auth.viewerIdOrNull()
+        var limit = Req.queryInt("limit", 20)
+        var before = CommunityRoutes.cursor()
+        var communities = service.list(CommunityRoutes.optionalQuery("topic"), CommunityRoutes.optionalQuery("q"), CommunityRoutes.optionalQuery("city"), CommunityRoutes.optionalQuery("state"), before, limit)
+        var ids = CommunityRoutes.idsOf(communities)
+        // Two queries for the whole page (counts and "am I a member"), not four per item.
+        var counts = service.countMembersByIds(ids)
+        var mine = listOf<String>()
+        if (viewer != null) {
+            mine = service.memberCommunityIds(viewer, ids)
+        }
+        var items = listOf<CommunityView>()
+        for (var c in communities) {
+            items.add(CommunityRoutes.view(c, counts.getOrDefault(c.id, 0), mine.contains(c.id)))
+        }
+        var next = CommunityNull.str()
+        if (communities.size() == CommunityRules.clampLimit(limit)) {
+            next = communities.get(communities.size() - 1).createdAt
+        }
+        return json.encode(CommunityPage(items, next))
+    }
+    static String one(service: CommunityService) {
+        var viewer = Auth.viewerIdOrNull()
+        var c = service.getById(Req.pathParam("communityId"))
+        var joined = false
+        if (viewer != null) {
+            joined = service.isMember(c.id, viewer)
+        }
+        return json.encode(CommunityRoutes.view(c, service.countMembers(c.id), joined))
+    }
+    static String viewsOf(service: CommunityService, userId: String, rows: List<CommunityRow>) {
+        var items = listOf<CommunityView>()
+        for (var c in rows) {
+            items.add(CommunityRoutes.view(c, service.countMembers(c.id), service.isMember(c.id, userId)))
+        }
+        return json.encode(CommunityPage(items, null))
+    }
+    static String favorites(service: CommunityService) {
+        var userId = Auth.requireUser()
+        return CommunityRoutes.viewsOf(service, userId, service.listFavorites(userId, Req.queryInt("limit", 50)))
+    }
+    static String local(service: CommunityService, profiles: CommunityProfileLookup) {
+        var userId = Auth.requireUser()
+        var limit = Req.queryInt("limit", 20)
+        if (limit < 1) {
+            limit = 1
+        }
+        if (limit > 50) {
+            limit = 50
+        }
+        return CommunityRoutes.viewsOf(service, userId, service.listLocal(profiles.placeOf(userId), limit))
+    }
+    static String mine(service: CommunityService) {
+        var userId = Auth.requireUser()
+        var rows = service.listMine(userId, Req.queryInt("limit", 20))
+        var items = listOf<CommunityView>()
+        for (var c in rows) {
+            items.add(CommunityRoutes.view(c, service.countMembers(c.id), true))
+        }
+        return json.encode(CommunityPage(items, null))
+    }
+    static String members(service: CommunityService, profiles: CommunityProfileLookup) {
+        // Anonymous viewers get what the page renders (name, @username, avatar, role); the internal user
+        // id is only for signed-in viewers (admin checks, ownership transfer).
+        var signedIn = Auth.viewerIdOrNull() != null
+        var members = service.findMembers(Req.pathParam("communityId"))
+        var userIds = listOf<String>()
+        for (var m in members) {
+            userIds.add(m.userId)
+        }
+        var cards = profiles.cards(userIds)
+        var items = listOf<CommunityMemberView>()
+        for (var m in members) {
+            items.add(CommunityRoutes.memberView(m, cards.get(m.userId), signedIn))
+        }
+        return json.encode(CommunityMemberPage(items, null))
+    }
+    static CommunityMemberView memberView(m: CommunityMemberRow, card: CommunityProfileCard?, signedIn: Bool) {
+        var uid = CommunityNull.str()
+        if (signedIn) {
+            uid = m.userId
+        }
+        if (card == null) {
+            return CommunityMemberView(uid, null, null, null, m.role, null)
+        }
+        return CommunityMemberView(uid, card.username, card.displayName, card.avatar, m.role, CommunityRoutes.styleOf(card))
+    }
+    // NameStyleView.from: null when the person set none of the four slots.
+    static CommunityNameStyle? styleOf(card: CommunityProfileCard) {
+        if (card.nameTheme != null || card.nameFont != null || card.nameColor != null || card.nameplate != null) {
+            return CommunityNameStyle(card.nameTheme, card.nameFont, card.nameColor, card.nameplate)
+        }
+        return null
+    }
+    // ---- idempotent writes ----
+    static String create(service: CommunityService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var request = CommunityRoutes.body()
+        var hash = CommunityRoutes.hashOf(json.encode(request))
+        return idem.handle(userId, "POST", "/api/communities", hash, 201, () -> {
+    var c = service.create(request.name, request.description, request.topic, request.cover, request.avatar, request.city, request.state, userId)
+    return json.encode(CommunityRoutes.view(c, 1, true))
+})
+    }
+    static String update(service: CommunityService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var communityId = Req.pathParam("communityId")
+        var request = CommunityRoutes.body()
+        var hash = CommunityRoutes.hashOf("communityId=" + communityId + "&" + json.encode(request))
+        return idem.handle(userId, "PATCH", "/api/communities/{communityId}", hash, 200, () -> {
+    var c = service.update(communityId, request.name, request.description, request.topic, request.cover, request.avatar, request.bannerHtml, request.city, request.state, userId)
+    return json.encode(CommunityRoutes.view(c, service.countMembers(c.id), service.isMember(c.id, userId)))
+})
+    }
+    static String join(service: CommunityService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var communityId = Req.pathParam("communityId")
+        return idem.handle(userId, "POST", "/api/communities/{communityId}/members", CommunityRoutes.hashOf("communityId=" + communityId), 200, () -> {
+    service.join(communityId, userId)
+    return CommunityRoutes.status(communityId, "JOINED")
+})
+    }
+    static String leave(service: CommunityService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var communityId = Req.pathParam("communityId")
+        return idem.handle(userId, "DELETE", "/api/communities/{communityId}/members", CommunityRoutes.hashOf("communityId=" + communityId), 200, () -> {
+    service.leave(communityId, userId)
+    return CommunityRoutes.status(communityId, "LEFT")
+})
+    }
+    static String favorite(service: CommunityService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var communityId = Req.pathParam("communityId")
+        return idem.handle(userId, "POST", "/api/communities/{communityId}/favorite", CommunityRoutes.hashOf("communityId=" + communityId + "&op=favorite"), 200, () -> {
+    service.favorite(communityId, userId)
+    return CommunityRoutes.status(communityId, "FAVORITED")
+})
+    }
+    static String unfavorite(service: CommunityService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var communityId = Req.pathParam("communityId")
+        return idem.handle(userId, "DELETE", "/api/communities/{communityId}/favorite", CommunityRoutes.hashOf("communityId=" + communityId + "&op=unfavorite"), 200, () -> {
+    service.unfavorite(communityId, userId)
+    return CommunityRoutes.status(communityId, "UNFAVORITED")
+})
+    }
+    static String transfer(service: CommunityService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var communityId = Req.pathParam("communityId")
+        CommunityTransferBody request = CommunityRoutes.transferBody()
+        var newOwner = ""
+        if (request.newOwnerId != null) {
+            newOwner = request.newOwnerId as String
+        }
+        return idem.handle(userId, "POST", "/api/communities/{communityId}/transfer", CommunityRoutes.hashOf("communityId=" + communityId + "&newOwnerId=" + newOwner), 200, () -> {
+    var c = service.transferOwnership(communityId, userId, request.newOwnerId)
+    return json.encode(CommunityRoutes.view(c, service.countMembers(c.id), service.isMember(c.id, userId)))
+})
+    }
+    static CommunityTransferBody transferBody() {
+        try {
+            return json.decode<CommunityTransferBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String remove(service: CommunityService, idem: Idempotency, admin: AdminGuard) {
+        var userId = Auth.requireUser()
+        var communityId = Req.pathParam("communityId")
+        return idem.handle(userId, "DELETE", "/api/communities/{communityId}", CommunityRoutes.hashOf("communityId=" + communityId), 200, () -> {
+    service.deleteCommunity(communityId, userId, admin.isAdmin(userId))
+    return CommunityRoutes.status(communityId, "DELETED")
+})
+    }
+    // ---- channels (no idempotency in Java: plain 200) ----
+    static String channels(channelService: CommunityChannelService) {
+        var userId = Auth.requireUser()
+        return json.encode(channelService.list(Req.pathParam("communityId"), userId))
+    }
+    static String createChannel(channelService: CommunityChannelService) {
+        var userId = Auth.requireUser()
+        var communityId = Req.pathParam("communityId")
+        var request = CommunityRoutes.channelBody()
+        return json.encode(channelService.create(communityId, userId, request.name, request.topic, request.description))
+    }
+    static CommunityChannelBody channelBody() {
+        try {
+            return json.decode<CommunityChannelBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String channelFeed(channelService: CommunityChannelService, feed: CommunityFeedLookup) {
+        var userId = Auth.requireUser()
+        var communityId = Req.pathParam("communityId")
+        var channelId = Req.pathParam("channelId")
+        var before = CommunityRoutes.cursor()
+        var limit = Req.queryInt("limit", 20)
+        var channel = channelService.requireChannelForMember(communityId, channelId, userId)
+        return feed.channelFeed(communityId, channel.id, before, limit, userId)
+    }
+    static String communityFeed(feed: CommunityFeedLookup) {
+        var viewer = Auth.viewerIdOrNull()
+        var before = CommunityRoutes.cursor()
+        return feed.communityFeed(Req.pathParam("communityId"), before, Req.queryInt("limit", 20), viewer)
+    }
+    // ---- pin ----
+    // The single pinned post; a visitor may read it (the community feed is public).
+    static String pinned(service: CommunityService, feed: CommunityFeedLookup) {
+        var viewer = Auth.viewerIdOrNull()
+        var postId = service.pinnedPostId(Req.pathParam("communityId"))
+        if (postId == null) {
+            throw Errors.api(404, "NO_PINNED_POST", "Nao ha publicacao fixada nesta comunidade.")
+        }
+        return feed.post(postId, viewer)
+    }
+    static String pin(service: CommunityService, idem: Idempotency, feed: CommunityFeedLookup) {
+        var userId = Auth.requireUser()
+        var communityId = Req.pathParam("communityId")
+        var request = CommunityRoutes.pinBody()
+        if (!CommunityRules.has(request.postId)) {
+            throw Errors.api(400, "BAD_REQUEST", "Informe o post.")
+        }
+        var wanted = request.postId as String
+        return idem.handle(userId, "POST", "/api/communities/{communityId}/pin", CommunityRoutes.hashOf("communityId=" + communityId + "&postId=" + wanted), 200, () -> {
+    var postId = service.pinPost(communityId, wanted.trim(), userId)
+    return feed.post(postId, userId)
+})
+    }
+    static CommunityPinBody pinBody() {
+        try {
+            return json.decode<CommunityPinBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String unpin(service: CommunityService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var communityId = Req.pathParam("communityId")
+        return idem.handle(userId, "DELETE", "/api/communities/{communityId}/pin", CommunityRoutes.hashOf("communityId=" + communityId + "&action=unpin"), 200, () -> {
+    service.unpinPost(communityId, userId)
+    return CommunityRoutes.status(communityId, "UNPINNED")
+})
+    }
+}

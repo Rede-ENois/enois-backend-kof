@@ -1,0 +1,419 @@
+package studypairs
+
+import java.util.HashSet
+import kernel.blocks.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.sanctions.*
+import kernel.text.*
+import kernel.time.*
+
+// Study pairs: two people with the same goal, one check-in a week.
+//
+// Adults only (ECA Digital): a pair is a private channel between strangers, and minors are only
+// reachable through an accepted connection. Minors and accounts without a declared birth date cannot
+// open a request, so no minor ever sits in the queue; the candidate filter re-checks it anyway.
+class StudyPairService {
+    Db database
+    StudyPairStore repository
+    StudyPairProfiles profiles
+    BlockedUsers blocks
+    StudyPairAgePolicy agePolicy
+    SanctionGate sanctionGate
+    SanctionGateReader sanctions
+    StudyPairNotifier notifications
+    StudyPairPreferences preferences
+    public constructor(database: Db, repository: StudyPairStore, profiles: StudyPairProfiles, blocks: BlockedUsers, agePolicy: StudyPairAgePolicy, sanctionGate: SanctionGate, sanctions: SanctionGateReader, notifications: StudyPairNotifier, preferences: StudyPairPreferences) {
+        this.database = database
+        this.repository = repository
+        this.profiles = profiles
+        this.blocks = blocks
+        this.agePolicy = agePolicy
+        this.sanctionGate = sanctionGate
+        this.sanctions = sanctions
+        this.notifications = notifications
+        this.preferences = preferences
+    }
+    static Int candidateScan() = 50
+    static Int popularLimit() = 10
+    // Opens a request and, when someone already waits on the same goal, pairs with the oldest one.
+    // Runs inside the caller's transaction (the idempotency wrapper).
+    StudyPairRequestResult request(userId: String, rawGoal: String?, rawTopic: String?) {
+        var me = profiles.find(userId)
+        if (me == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuário não encontrado.")
+        }
+        if (!agePolicy.birthDateDeclared(userId)) {
+            throw Errors.api(403, "BIRTH_DATE_REQUIRED", "Confirme sua data de nascimento para continuar. É um requisito da plataforma.")
+        }
+        if (agePolicy.isMinor(userId)) {
+            throw Errors.api(403, "STUDY_PAIRS_ADULTS_ONLY", "O par de estudo é só para maiores de 18 anos, por segurança.")
+        }
+        if (!me.emailVerified()) {
+            throw Errors.api(403, "EMAIL_NOT_VERIFIED", "Confirme seu e-mail para procurar um par de estudo.")
+        }
+        sanctionGate.requireNotRestricted(userId)
+        if (preferences.moduleDisabled(userId)) {
+            throw Errors.api(409, "STUDY_PAIRS_DISABLED", "O par de estudo está desativado nas suas preferências.")
+        }
+        // Serializes this person's participation: a second request firing at the same time waits here
+        // and then sees the request (or the pair) the first one created.
+        repository.lockUser(userId)
+        var goal = this.clean(rawGoal)
+        TextFieldLimit.check("STUDY_GOAL_TOO_LONG", "objetivo", goal, StudyPairRules.goalMaxLength())
+        var goalKey = StudyGoal.key(goal)
+        if (goalKey.length() == 0) {
+            throw Errors.api(400, "STUDY_GOAL_REQUIRED", "Conte qual é o seu objetivo de estudo.")
+        }
+        var topic = this.topicOf(rawTopic)
+        if (repository.findOpenRequest(userId) != null) {
+            throw this.alreadyOpen()
+        }
+        var myPairs = this.activePairsOf(userId)
+        if (myPairs.size() >= StudyPairRules.maxActivePairs()) {
+            throw Errors.api(409, "STUDY_PAIR_LIMIT", "Você já tem " + StudyPairRules.maxActivePairs() + " pares de estudo ativos. Encerre um para procurar outro.")
+        }
+        var now = Time.nowIso()
+        var requestId = Ids.prefixed("spr_")
+        var currentPartners = new HashSet<String>()
+        for (var p in myPairs) {
+            currentPartners.add(this.partnerOf(p, userId))
+        }
+        for (var candidate in this.visibleOpen(repository.findOpenByGoal(goalKey, StudyPairService.candidateScan()), userId, currentPartners)) {
+            // Atomic claim: if another request grabbed this candidate first, try the next one.
+            if (!repository.closeOpenRequest(candidate.id(), "MATCHED")) {
+                continue
+            }
+            repository.saveRequest(StudyPairRequest(requestId, userId, goalKey, goal, topic, "MATCHED", now))
+            var pairTopic = candidate.topic()
+            if (pairTopic == null) {
+                pairTopic = topic
+            }
+            var pair = StudyPair(Ids.prefixed("sp_"), candidate.userId(), userId, goalKey, candidate.goalText(), pairTopic, "ACTIVE", now, null)
+            repository.savePair(pair)
+            var partner = profiles.find(candidate.userId())
+            this.notifyMatched(candidate.userId(), me, pair.goalText())
+            if (partner != null) {
+                this.notifyMatched(userId, partner, pair.goalText())
+            }
+            return StudyPairRequestResult(requestId, "MATCHED", pair.id())
+        }
+        var saved = true
+        try {
+            repository.saveRequest(StudyPairRequest(requestId, userId, goalKey, goal, topic, "OPEN", now))
+        } catch (String e) {
+            if (!Errors.hasCode(e, "CONFLICT")) {
+                throw e
+            }
+            saved = false
+        }
+        if (!saved) {
+            // The unique open-per-user index is the backstop if the row lock could not serialize.
+            throw this.alreadyOpen()
+        }
+        return StudyPairRequestResult(requestId, "OPEN", null)
+    }
+    String alreadyOpen() = Errors.api(409, "STUDY_REQUEST_ALREADY_OPEN", "Você já está procurando um par. Cancele o pedido atual para trocar de objetivo.")
+    String clean(raw: String?) {
+        if (raw == null) {
+            return ""
+        }
+        var defused = PlainText.defuse(raw.trim())
+        if (defused == null) {
+            return ""
+        }
+        return defused
+    }
+    String? topicOf(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        var trimmed = raw.trim()
+        if (trimmed.length() == 0) {
+            return null
+        }
+        var topic = trimmed.toUpperCase()
+        if (!StudyPairRules.topics().contains(topic)) {
+            throw Errors.api(400, "INVALID_TOPIC", "Assunto inválido.")
+        }
+        return topic
+    }
+    String partnerOf(p: StudyPair, userId: String) {
+        if (p.userA() == userId) {
+            return p.userB()
+        }
+        return p.userA()
+    }
+    Bool isMember(p: StudyPair, userId: String) = p.userA() == userId || p.userB() == userId
+    // Busca de pedidos abertos por objetivo/assunto, com a mesma régua do pareamento. O resultado é
+    // ANÔNIMO: sai o objetivo e o assunto, não quem pediu.
+    List<StudyPairSearchResult> search(userId: String, rawTerm: String?, limit: Int) {
+        var term = ""
+        if (rawTerm != null) {
+            term = rawTerm.trim().replace("%", "").replace("_", "").replace("\\", "")
+        }
+        if (term.length() < 2) {
+            return listOf<StudyPairSearchResult>()
+        }
+        TextFieldLimit.check("STUDY_SEARCH_TOO_LONG", "busca", term, 80)
+        // Same folding the goal goes through when it is stored.
+        var folded = StudyGoal.key(term)
+        if (folded.length() == 0) {
+            return listOf<StudyPairSearchResult>()
+        }
+        var currentPartners = new HashSet<String>()
+        for (var p in repository.findActivePairs(userId)) {
+            currentPartners.add(this.partnerOf(p, userId))
+        }
+        var cap = limit
+        if (cap < 1) {
+            cap = 1
+        }
+        if (cap > 50) {
+            cap = 50
+        }
+        var out = listOf<StudyPairSearchResult>()
+        for (var r in this.visibleOpen(repository.searchOpenRequests(folded, cap), userId, currentPartners)) {
+            out.add(StudyPairSearchResult(r.goalText(), r.topic(), r.createdAt()))
+        }
+        return out
+    }
+    // Pedidos abertos que a pessoa pode de fato parear: some quem ela bloqueou/mutou e vice-versa.
+    List<StudyPairRequest> visibleOpen(fetched: List<StudyPairRequest>, userId: String, currentPartners: HashSet<String>) {
+        var hidden = blocks.hiddenIdsFor(userId)
+        var open = listOf<StudyPairRequest>()
+        for (var r in fetched) {
+            if (r.userId() != userId && !hidden.contains(r.userId()) && !currentPartners.contains(r.userId())) {
+                open.add(r)
+            }
+        }
+        if (open.size() == 0) {
+            return open
+        }
+        var ids = listOf<String>()
+        for (var r in open) {
+            if (!ids.contains(r.userId())) {
+                ids.add(r.userId())
+            }
+        }
+        var verified = new HashSet<String>()
+        for (var person in profiles.findAll(ids)) {
+            if (person.emailVerified()) {
+                verified.add(person.id())
+            }
+        }
+        var minors = agePolicy.minorIds(ids)
+        var out = listOf<StudyPairRequest>()
+        for (var r in open) {
+            if (!verified.contains(r.userId())) {
+                continue
+            }
+            if (minors.contains(r.userId())) {
+                continue
+            }
+            if (sanctions.banned(r.userId())) {
+                continue
+            }
+            // hiddenIdsFor covers blocks both ways but mutes only from the muter's side: ask the
+            // candidate too, so nobody is paired with someone they muted.
+            if (blocks.hiddenIdsFor(r.userId()).contains(userId)) {
+                continue
+            }
+            // Turned the module off: the request is paused, not matched, until it is turned back on.
+            if (preferences.moduleDisabled(r.userId())) {
+                continue
+            }
+            if (this.activePairsOf(r.userId()).size() >= StudyPairRules.maxActivePairs()) {
+                continue
+            }
+            out.add(r)
+        }
+        return out
+    }
+    String cancelCurrentRequest(userId: String) {
+        var open = repository.findOpenRequest(userId)
+        if (open == null) {
+            throw Errors.api(404, "STUDY_REQUEST_NOT_FOUND", "Você não tem pedido aberto.")
+        }
+        if (!repository.closeOpenRequest(open.id(), "CANCELLED")) {
+            throw Errors.api(409, "STUDY_REQUEST_ALREADY_MATCHED", "Seu pedido acabou de encontrar um par.")
+        }
+        return open.id()
+    }
+    // The pairs and the open request of one person. Not read-only on purpose: a block or a mute between
+    // the two ends the pair here, and that cleanup is a write.
+    StudyPairMine mine(userId: String) {
+        var today = StudyGoal.todayDay()
+        var thisWeek = StudyGoal.weekKeyOfDay(today)
+        var weeks = listOf<String>()
+        var i = 0
+        while (i < StudyPairRules.historyWeeks()) {
+            weeks.add(StudyGoal.weekKeyOfDay(today - 7 * i))
+            i = i + 1
+        }
+        var pairs = listOf<StudyPair>()
+        for (var p in repository.findActivePairs(userId)) {
+            if (!this.closedByBlock(p)) {
+                pairs.add(p)
+            }
+        }
+        var partnerIds = listOf<String>()
+        for (var p in pairs) {
+            partnerIds.add(this.partnerOf(p, userId))
+        }
+        var partners = profiles.findAll(partnerIds)
+        var views = listOf<StudyPairView>()
+        for (var pair in pairs) {
+            var partnerId = this.partnerOf(pair, userId)
+            var partnerView = StudyPairPartnerView(partnerId, null, null, null)
+            for (var person in partners) {
+                if (person.id() == partnerId) {
+                    partnerView = StudyPairPartnerView(person.id(), person.username(), person.name(), person.avatar())
+                }
+            }
+            var checkins = repository.findCheckins(pair.id(), weeks)
+            var mineDone = false
+            var partnerDone = false
+            var cviews = listOf<StudyPairCheckinView>()
+            for (var c in checkins) {
+                if (c.userId() == userId && c.weekKey() == thisWeek) {
+                    mineDone = true
+                }
+                if (c.userId() == partnerId && c.weekKey() == thisWeek) {
+                    partnerDone = true
+                }
+                cviews.add(StudyPairCheckinView(c.userId(), c.weekKey(), c.note(), c.createdAt(), c.updatedAt()))
+            }
+            views.add(StudyPairView(pair.id(), pair.goalText(), pair.goalKey(), pair.topic(), pair.startedAt(), thisWeek, partnerView, mineDone, partnerDone, cviews))
+        }
+        return StudyPairMine(this.openView(userId), views)
+    }
+    StudyPairOpenRequestView? openView(userId: String) {
+        var open = repository.findOpenRequest(userId)
+        if (open == null) {
+            return null
+        }
+        return StudyPairOpenRequestView(open.id(), open.goalText(), open.goalKey(), open.topic(), open.createdAt())
+    }
+    // One check-in per member per ISO week; posting again in the same week edits the note.
+    StudyPairCheckinView checkin(userId: String, pairId: String, rawNote: String?) {
+        var pair = this.memberPair(userId, pairId)
+        if (pair.status() != "ACTIVE" || this.closedByBlock(pair)) {
+            throw Errors.api(409, "STUDY_PAIR_ENDED", "Este par de estudo foi encerrado.")
+        }
+        sanctionGate.requireNotRestricted(userId)
+        var note = this.clean(rawNote)
+        TextFieldLimit.check("STUDY_NOTE_TOO_LONG", "nota", note, StudyPairRules.noteMaxLength())
+        var week = StudyGoal.weekKeyOfDay(StudyGoal.todayDay())
+        var now = Time.nowIso()
+        var existing = repository.findCheckin(pairId, userId, week)
+        if (existing != null) {
+            repository.updateCheckinNote(pairId, userId, week, note, now)
+            return StudyPairCheckinView(userId, week, note, existing.createdAt(), now)
+        }
+        var inserted = true
+        try {
+            repository.insertCheckin(StudyCheckin(pairId, userId, week, note, now, now))
+        } catch (String e) {
+            if (!Errors.hasCode(e, "CONFLICT")) {
+                throw e
+            }
+            inserted = false
+        }
+        if (!inserted) {
+            // A double tap with two Idempotency-Keys can both miss the read above. The primary key
+            // (pair, member, week) lets exactly one insert win; the loser edited the note the winner
+            // wrote, and must not notify the partner a second time.
+            repository.updateCheckinNote(pairId, userId, week, note, now)
+            var saved = repository.findCheckin(pairId, userId, week)
+            if (saved == null) {
+                throw Errors.api(409, "STUDY_PAIR_ENDED", "Este par de estudo foi encerrado.")
+            }
+            return StudyPairCheckinView(userId, week, note, saved.createdAt(), saved.updatedAt())
+        }
+        // Only the first check-in of the week notifies; editing the note stays quiet.
+        var me = profiles.find(userId)
+        if (me != null) {
+            notifications.create(this.partnerOf(pair, userId), "STUDY_PAIR_CHECKIN", userId, "Seu par fez o check-in da semana", "@" + me.username() + " contou como foi a semana em \"" + pair.goalText() + "\".", StudyPairRules.href(), "Ver check-in")
+        }
+        return StudyPairCheckinView(userId, week, note, now, now)
+    }
+    end(userId: String, pairId: String) {
+        var pair = this.memberPair(userId, pairId)
+        if (!repository.endPair(pairId, Time.nowIso())) {
+            throw Errors.api(409, "STUDY_PAIR_ENDED", "Este par de estudo já foi encerrado.")
+        }
+        var me = profiles.find(userId)
+        if (me != null) {
+            notifications.create(this.partnerOf(pair, userId), "STUDY_PAIR_ENDED", userId, "Um par de estudo foi encerrado", "@" + me.username() + " encerrou o par em \"" + pair.goalText() + "\". Obrigado pela companhia nessas semanas. Quando quiser, você pode procurar um novo par.", StudyPairRules.href(), "Procurar par")
+        }
+    }
+    // Weekly nudge: one notification per member of an ACTIVE pair who has not checked in this week, at
+    // most once per week however many times (or on however many replicas) it runs. Returns how many
+    // were sent.
+    Int sendWeeklyReminders() {
+        var sent = 0
+        var self = this
+        database.transaction(() -> {
+    sent = self.remindAll()
+})
+        return sent
+    }
+    Int remindAll() {
+        var week = StudyGoal.weekKeyOfDay(StudyGoal.todayDay())
+        var sent = 0
+        for (var pair in repository.findAllActivePairs()) {
+            if (this.closedByBlock(pair)) {
+                continue
+            }
+            var done = new HashSet<String>()
+            for (var c in repository.findCheckins(pair.id(), listOf(week))) {
+                done.add(c.userId())
+            }
+            for (var member in listOf(pair.userA(), pair.userB())) {
+                // The claim is the idempotency key: every replica runs the cron, only one row wins.
+                if (done.contains(member) || preferences.moduleDisabled(member) || !repository.claimReminder(pair.id(), member, week, Time.nowIso())) {
+                    continue
+                }
+                notifications.create(member, "STUDY_PAIR_REMINDER", "sistema", "Como foi sua semana de estudo?", "Um check-in curto já ajuda seu par em \"" + pair.goalText() + "\". Sem pressa.", StudyPairRules.href(), "Fazer check-in")
+                sent = sent + 1
+            }
+        }
+        return sent
+    }
+    List<StudyPairPopularGoal> popularGoals() = repository.popularOpenGoals(StudyPairService.popularLimit())
+    StudyPair memberPair(userId: String, pairId: String) {
+        var pair = repository.findPair(pairId)
+        if (pair == null) {
+            throw Errors.api(404, "STUDY_PAIR_NOT_FOUND", "Par de estudo não encontrado.")
+        }
+        if (!this.isMember(pair, userId)) {
+            throw Errors.api(403, "FORBIDDEN", "Você não faz parte deste par de estudo.")
+        }
+        return pair
+    }
+    // A block or a mute (either direction) after the match ends the pair quietly: no notification, no
+    // more check-ins or reminders. Done lazily so the network module does not depend on this one.
+    Bool closedByBlock(pair: StudyPair) {
+        if (!blocks.hiddenIdsFor(pair.userA()).contains(pair.userB()) && !blocks.hiddenIdsFor(pair.userB()).contains(pair.userA())) {
+            return false
+        }
+        repository.endPair(pair.id(), Time.nowIso())
+        return true
+    }
+    // Active pairs of a person, with a pair already ended by a block or a mute left out: it is over even
+    // before the lazy cleanup writes it down, and must not count against the two-pair ceiling.
+    List<StudyPair> activePairsOf(userId: String) {
+        var out = listOf<StudyPair>()
+        for (var p in repository.findActivePairs(userId)) {
+            if (!this.closedByBlock(p)) {
+                out.add(p)
+            }
+        }
+        return out
+    }
+    notifyMatched(recipientId: String, partner: StudyPairPerson, goal: String) {
+        notifications.create(recipientId, "STUDY_PAIR_MATCHED", partner.id(), "Você tem um par de estudo", "Você e @" + partner.username() + " querem \"" + goal + "\". Um check-in por semana, no ritmo de vocês.", StudyPairRules.href(), "Ver par")
+    }
+}

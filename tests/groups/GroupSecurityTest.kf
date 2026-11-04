@@ -1,0 +1,45 @@
+import kernel.testkit.*
+import groups.*
+
+// Port of GroupSecurityTests: isolation between groups.
+test "a member of one group neither reads nor interacts with the other" {
+    var owner = GroupsTestKit.login("gsec-dono")
+    var memberA = GroupsTestKit.login("gsec-membro-a")
+    var groupA = GroupsTestKit.createGroup(owner, "Grupo Seguro A", "OPEN")
+    var groupB = GroupsTestKit.createGroup(owner, "Grupo Seguro B", "OPEN")
+    GroupsTestKit.joinOk(memberA, groupA)
+    var topicB = GroupsTestKit.createTopic(owner, groupB, "Geral B")
+    var postB = GroupsTestKit.publish(owner, groupB, topicB, "Conteudo de B")
+    // A member of A, with the ids of B in hand, reads nothing of B.
+    Check.status(GroupsTestKit.get("/groups/" + groupB + "/topics", memberA), 403)
+    Check.status(GroupsTestKit.get("/groups/" + groupB + "/posts", memberA), 403)
+    Check.status(GroupsTestKit.get("/groups/" + groupB + "/posts/" + postB + "/comments", memberA), 403)
+    Check.status(GroupsTestKit.get("/groups/" + groupB + "/members", memberA), 403)
+    // And interacting across contexts is 404 (the group of the post is checked).
+    Check.apiError(GroupsTestKit.commentRaw(memberA, groupA, postB, "cruzando", null), 404, "POST_NOT_FOUND")
+    Check.apiError(GroupsTestKit.react(memberA, groupA, postB, "LIKE"), 404, "POST_NOT_FOUND")
+}
+
+test "the removed loses the content at once" {
+    var owner = GroupsTestKit.login("gsec-rem-dono")
+    var member = GroupsTestKit.login("gsec-rem-membro")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Remocao Segura", "OPEN")
+    GroupsTestKit.joinOk(member, groupId)
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    GroupsTestKit.publish(owner, groupId, topicId, "Conteudo interno")
+    Check.status(GroupsTestKit.get("/groups/" + groupId + "/posts", member), 200)
+    // The owner removes; the SAME session stops seeing the content immediately.
+    Check.status(GroupsTestKit.delete("/groups/" + groupId + "/members/" + member, owner), 200)
+    Check.status(GroupsTestKit.get("/groups/" + groupId + "/posts", member), 403)
+    Check.status(GroupsTestKit.post("/groups/" + groupId + "/topics", member, "{\"name\":\"Nao posso\"}"), 403)
+}
+
+test "an HTML cover keeps no script" {
+    var owner = GroupsTestKit.login("gsec-capa-dono")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Capa Segura", "OPEN")
+    var update = GroupsTestKit.patch("/groups/" + groupId, owner, "{\"bannerHtml\":\"<script>alert(\'x\')</script><div>capa</div>\"}")
+    Check.status(update, 200)
+    var banner = update.json("bannerHtml")
+    assert(!banner.toLowerCase().contains("<script"))
+    assert(banner.contains("capa"))
+}

@@ -1,0 +1,221 @@
+package groups
+
+import kernel.db.*
+import kernel.id.*
+import kernel.log.*
+import kernel.error.*
+import kernel.time.*
+
+// Seams of the Groups domain to data and effects owned by other domains. Each is a concrete class with
+// a default over the owner's tables (read-only, or the single insert the Java code also does) so
+// behaviour and tests are real today; the owner subclasses it when it is ported and Main.kf passes the
+// subclass in (PORTING_GUIDE). Interfaces from another package cannot be implemented (G30).
+// Name style that travels with a name (NameStyleView): null when the person customised nothing.
+record GroupNameStyle(String? theme, String? font, String? color, String? nameplate)
+
+// What the group views need of an author or member (UserProfile).
+record GroupAuthor(String id, String username, String name, String displayName, String? avatar, List<String> badges, String? avatarFrame, GroupNameStyle? nameStyle)
+
+// pending-port: profile. Default reads `users` (same columns UserProfileJpaEntity maps).
+class GroupProfileLookup {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, username, name, social_name, nickname, avatar, badge, badges, avatar_frame, name_theme, name_font, name_color, nameplate"
+    GroupAuthor? find(userId: String) {
+        var row = store.queryOptional("select " + GroupProfileLookup.columns() + " from users where id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return GroupProfileLookup.toAuthor(row)
+    }
+    // One query for the whole list instead of one per row: user id -> author.
+    Map<String,GroupAuthor> findAll(userIds: List<String>) {
+        var out = mapOf<String, GroupAuthor>()
+        if (userIds.size() == 0) {
+            return out
+        }
+        var marks = GroupContentStore.joinLines(userIds.map((id: String) -> "?"), ", ")
+        var params = DbParams()
+        for (var id in userIds) {
+            params = params.bindStr(id)
+        }
+        for (var row in store.queryList("select " + GroupProfileLookup.columns() + " from users where id in (" + marks + ")", params)) {
+            var author = GroupProfileLookup.toAuthor(row)
+            out.put(author.id(), author)
+        }
+        return out
+    }
+    // The name shown in notifications: the account name, "Alguém" when the account is gone.
+    String nameOf(userId: String) {
+        var author = this.find(userId)
+        if (author == null) {
+            return "Alguém"
+        }
+        return author.name()
+    }
+    static GroupAuthor toAuthor(r: DbRow) {
+        var name = r.getStr("name")
+        var social = r.getStrOrNull("social_name")
+        var display = name
+        if (social != null && social.trim().length() > 0) {
+            display = social
+        }
+        var nickname = r.getStrOrNull("nickname")
+        var withNickname = display
+        if (nickname != null && nickname.trim().length() > 0) {
+            withNickname = display + " (" + nickname + ")"
+        }
+        var badges = GroupContentStore.splitMedia(r.getStrOrNull("badges"))
+        if (badges.size() == 0) {
+            var single = r.getStrOrNull("badge")
+            if (single != null && single.trim().length() > 0) {
+                badges = listOf(single)
+            }
+        }
+        var theme = r.getStrOrNull("name_theme")
+        var font = r.getStrOrNull("name_font")
+        var color = r.getStrOrNull("name_color")
+        var plate = r.getStrOrNull("nameplate")
+        var style = GroupNil.style()
+        if (theme != null || font != null || color != null || plate != null) {
+            style = GroupNameStyle(theme, font, color, plate)
+        }
+        return GroupAuthor(r.getStr("id"), r.getStr("username"), name, withNickname, r.getStrOrNull("avatar"), badges, r.getStrOrNull("avatar_frame"), style)
+    }
+}
+
+// ECA Digital write gate (AgeGate): a declared birth date and, for a minor, an active parental link.
+// pending-port: profile/age. Default reads `users.birth_date` and `parental_links`.
+class GroupAgeGate {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    requireCanWrite(userId: String) {
+        var row = store.queryOptional("select birth_date from users where id = ?", DbParams().bindStr(userId))
+        var birth = GroupNil.str()
+        if (row != null) {
+            birth = row.getDateOrNull("birth_date")
+        }
+        if (birth == null) {
+            throw Errors.api(403, "BIRTH_DATE_REQUIRED", "Confirme sua data de nascimento para continuar. É um requisito da plataforma.")
+        }
+        if (GroupAgeGate.ageOn(birth, GroupAgeGate.todayInBrazil()) < 18 && !this.parentalConsentActive(userId)) {
+            throw Errors.api(403, "PARENTAL_CONSENT_REQUIRED", "Sua conta e de menor de 18 anos e precisa da autorizacao de um responsavel para publicar, comentar e enviar mensagens.")
+        }
+    }
+    Bool parentalConsentActive(userId: String) = store.queryLong("select count(*) from parental_links where minor_user_id = ? and status = \'ACTIVE\'", DbParams().bindStr(userId)) > 0L
+    // America/Sao_Paulo is UTC-3 all year (no daylight saving since 2019).
+    static String todayInBrazil() = Time.plusSeconds(Time.nowIso(), -10800L).substring(0, 10)
+    static Int ageOn(birth: String, today: String) {
+        var years = today.substring(0, 4).toInt() - birth.substring(0, 4).toInt()
+        if (today.substring(5, 10).compareTo(birth.substring(5, 10)) < 0) {
+            years = years - 1
+        }
+        return years
+    }
+}
+
+// Attachment summary of a card (MediaSummaryView).
+record GroupMediaSummary(String id, String cdnUrl, String mimeType, Int? width, Int? height)
+
+// pending-port: media. Default reads `media_assets` (visible = delete_status NONE).
+class GroupMediaLookup {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    Map<String,GroupMediaSummary> visibleByIds(ids: List<String>) {
+        var out = mapOf<String, GroupMediaSummary>()
+        var distinctIds = listOf<String>()
+        for (var id in ids) {
+            if (id.trim().length() > 0 && !distinctIds.contains(id)) {
+                distinctIds.add(id)
+            }
+        }
+        if (distinctIds.size() == 0) {
+            return out
+        }
+        var marks = GroupContentStore.joinLines(distinctIds.map((id: String) -> "?"), ", ")
+        var params = DbParams()
+        for (var id in distinctIds) {
+            params = params.bindStr(id)
+        }
+        for (var row in store.queryList("select id, cdn_url, mime_type, width, height from media_assets where delete_status = \'NONE\' and id in (" + marks + ")", params)) {
+            out.put(row.getStr("id"), GroupMediaSummary(row.getStr("id"), row.getStr("cdn_url"), row.getStr("mime_type"), row.getIntOrNull("width"), row.getIntOrNull("height")))
+        }
+        return out
+    }
+    // The attachments in the order of `ids`, skipping the ones missing from `byId`.
+    static List<GroupMediaSummary> inOrder(ids: List<String>, byId: Map<String,GroupMediaSummary>) {
+        var out = listOf<GroupMediaSummary>()
+        for (var id in ids) {
+            var found = byId.get(id)
+            if (found != null) {
+                out.add(found)
+            }
+        }
+        return out
+    }
+}
+
+// pending-port: notifications. Default inserts into `notifications` exactly like
+// NotificationService.create / createCounted (no push: the push channel belongs to that domain).
+class GroupNotifications {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    create(userId: String, kind: String, actorId: String, title: String, body: String, href: String, ctaLabel: String) {
+        this.insert(userId, kind, null, actorId, title, body, href, ctaLabel)
+    }
+    // While the person has an unread notification of `groupKey`, each call updates it ("3 novas
+    // publicações em X": count + countedSuffix) and moves it to the top; once read, the next starts over.
+    createCounted(userId: String, kind: String, groupKey: String, actorId: String, title: String, body: String, countedSuffix: String, href: String, ctaLabel: String) {
+        var unread = store.queryOptional("select id, actor_count from notifications where user_id = ? and group_key = ? and is_read = false order by created_at desc limit 1", DbParams().bindStr(userId).bindStr(groupKey))
+        if (unread == null) {
+            this.insert(userId, kind, groupKey, actorId, title, body, href, ctaLabel)
+            return
+        }
+        var count = unread.getInt("actor_count") + 1
+        store.execute("update notifications set actor_id = ?, actor_count = ?, body = ?, href = ?, is_read = false, created_at = ? where id = ?", DbParams().bindStr(actorId).bindInt(count).bindStr(count + countedSuffix).bindStr(href).bindInstant(Time.nowIso()).bindStr(unread.getStr("id")))
+    }
+    insert(userId: String, kind: String, groupKey: String?, actorId: String, title: String, body: String, href: String, ctaLabel: String) {
+        store.execute("insert into notifications (id, user_id, kind, actor_id, title, body, href, cta_label, is_read, created_at, group_key, actor_count) values (?, ?, ?, ?, ?, ?, ?, ?, false, ?, ?, 1)", DbParams().bindStr(Ids.prefixed("notification_")).bindStr(userId).bindStr(kind).bindStr(actorId).bindStr(title).bindStr(body).bindStr(href).bindStr(ctaLabel).bindInstant(Time.nowIso()).bindStrOrNull(groupKey))
+    }
+}
+
+// pending-port: coin. CoinService.recordPresence (daily presence streak). Default: nothing.
+class GroupCoins {
+    recordPresence(userId: String);
+}
+
+// What the moderation domain needs to turn a GROUP_POST / GROUP_COMMENT report into text and author.
+record GroupReportContent(String content, String authorId)
+
+class GroupReportReader {
+    GroupContentStore content
+    public constructor(content: GroupContentStore) {
+        this.content = content
+    }
+    // targetType GROUP_POST or GROUP_COMMENT; null for anything else or an unknown id.
+    GroupReportContent? read(targetType: String, targetId: String) {
+        if (targetType == "GROUP_POST") {
+            var post = content.findPost(targetId)
+            if (post == null) {
+                return null
+            }
+            return GroupReportContent(post.content(), post.authorId())
+        }
+        if (targetType == "GROUP_COMMENT") {
+            var comment = content.findComment(targetId)
+            if (comment == null) {
+                return null
+            }
+            return GroupReportContent(comment.content(), comment.authorId())
+        }
+        return null
+    }
+}

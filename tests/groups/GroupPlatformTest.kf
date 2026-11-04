@@ -1,0 +1,47 @@
+import kernel.testkit.*
+import groups.*
+
+// Port of GroupPlatformTests: states of the group by the PLATFORM (restricted, suspended, reactivated).
+TestResponse setStatus(admin: String, groupId: String, value: String) = GroupsTestKit.post("/groups/" + groupId + "/status", admin, "{\"status\":\"" + value + "\",\"reason\":\"revisao da plataforma\"}")
+
+test "the platform restricts, suspends and reactivates" {
+    var owner = GroupsTestKit.login("gplat-dono")
+    var admin = GroupsTestKit.loginAdmin("group-admin")
+    var member = GroupsTestKit.login("gplat-membro")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Plataforma", "OPEN")
+    GroupsTestKit.joinOk(member, groupId)
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    // Who is not a platform admin does not change the state.
+    Check.status(GroupsTestKit.post("/groups/" + groupId + "/status", member, "{\"status\":\"SUSPENDED\"}"), 403)
+    // RESTRICTED: people stop entering, the content goes on.
+    var restricted = GroupsTestKit.post("/groups/" + groupId + "/status", admin, "{\"status\":\"RESTRICTED\",\"reason\":\"revisao\"}")
+    Check.status(restricted, 200)
+    Check.jsonEq(restricted, "status", "RESTRICTED")
+    var newcomer = GroupsTestKit.login("gplat-novato")
+    Check.apiError(GroupsTestKit.post("/groups/" + groupId + "/join", newcomer, ""), 409, "GROUP_NOT_ACCEPTING_MEMBERS")
+    Check.status(GroupsTestKit.publishRaw(owner, groupId, topicId, "publica no restrito"), 201)
+    // SUSPENDED: content freezes, leaves discovery, reading goes on for members.
+    var suspended = GroupsTestKit.post("/groups/" + groupId + "/status", admin, "{\"status\":\"SUSPENDED\",\"reason\":\"investigacao\"}")
+    Check.status(suspended, 200)
+    Check.jsonEq(suspended, "status", "SUSPENDED")
+    Check.apiError(GroupsTestKit.publishRaw(owner, groupId, topicId, "nao pode publicar"), 409, "GROUP_NOT_ACCEPTING_CONTENT")
+    var hidden = GroupsTestKit.get("/groups?query=Plataforma", null)
+    Check.status(hidden, 200)
+    Check.eqInt("discovery while suspended", 0, hidden.jsonSize("items"))
+    Check.status(GroupsTestKit.get("/groups/" + groupId + "/posts", member), 200)
+    // Reactivated: everything comes back.
+    var active = GroupsTestKit.post("/groups/" + groupId + "/status", admin, "{\"status\":\"ACTIVE\",\"reason\":\"liberado\"}")
+    Check.status(active, 200)
+    Check.jsonEq(active, "status", "ACTIVE")
+    Check.status(GroupsTestKit.publishRaw(owner, groupId, topicId, "publica de novo"), 201)
+    var back = GroupsTestKit.get("/groups?query=Plataforma", null)
+    Check.eqInt("discovery after", 1, back.jsonSize("items"))
+}
+
+test "an unknown state and closing by the platform are refused" {
+    var owner = GroupsTestKit.login("gplat-dono2")
+    var admin = GroupsTestKit.loginAdmin("group-admin")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Estados", "OPEN")
+    Check.apiError(setStatus(admin, groupId, "NAO_EXISTE"), 400, "INVALID_STATUS")
+    Check.apiError(setStatus(admin, groupId, "CLOSED"), 400, "INVALID_STATUS")
+}

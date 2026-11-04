@@ -1,0 +1,121 @@
+import kernel.testkit.*
+import groups.*
+
+// Port of GroupFlowTests: life cycle and join of the group, end to end.
+test "create puts the owner in and discovery shows only the presentation" {
+    var owner = GroupsTestKit.login("grupo-dono")
+    var groupId = GroupsTestKit.createGroup(owner, "Turma do Café", "APPROVAL")
+    // The group page (public) shows the owner as a member.
+    var page = GroupsTestKit.get("/groups/turma-do-cafe", owner)
+    Check.status(page, 200)
+    Check.jsonEq(page, "id", groupId)
+    Check.jsonEq(page, "joined", "true")
+    Check.jsonEq(page, "viewerRole", "OWNER")
+    Check.jsonEq(page, "members", "1")
+    // Discovery is public and lists the group; without a session nobody shows as a member.
+    var list = GroupsTestKit.get("/groups?query=caf%C3%A9", null)
+    Check.status(list, 200)
+    Check.jsonEq(list, "items.0.slug", "turma-do-cafe")
+    Check.jsonEq(list, "items.0.joined", "false")
+    assert(list.jsonIsNull("items.0.viewerRole"))
+}
+
+test "open entry becomes a member at once and joining again is 409" {
+    var owner = GroupsTestKit.login("grupo-aberto-dono")
+    var person = GroupsTestKit.login("grupo-aberto-pessoa")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Aberto", "OPEN")
+    var joined = GroupsTestKit.post("/groups/" + groupId + "/join", person, "")
+    Check.status(joined, 200)
+    Check.jsonEq(joined, "status", "MEMBER")
+    var page = GroupsTestKit.get("/groups/grupo-aberto", person)
+    Check.status(page, 200)
+    Check.jsonEq(page, "joined", "true")
+    Check.jsonEq(page, "viewerRole", "MEMBER")
+    Check.jsonEq(page, "members", "2")
+    Check.apiError(GroupsTestKit.post("/groups/" + groupId + "/join", person, ""), 409, "ALREADY_MEMBER")
+}
+
+test "approval entry stays pending and approves only once" {
+    var owner = GroupsTestKit.login("grupo-aprov-dono")
+    var person = GroupsTestKit.login("grupo-aprov-pessoa")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Fechado", "APPROVAL")
+    var first = GroupsTestKit.post("/groups/" + groupId + "/join", person, "")
+    Check.status(first, 200)
+    Check.jsonEq(first, "status", "PENDING")
+    var again = GroupsTestKit.post("/groups/" + groupId + "/join", person, "")
+    Check.apiError(again, 409, "REQUEST_ALREADY_PENDING")
+    assert(again.body.contains("REQUEST_ALREADY_PENDING"))
+    // The person is not a member yet, but the page knows the request is pending.
+    var page = GroupsTestKit.get("/groups/grupo-fechado", person)
+    Check.jsonEq(page, "joined", "false")
+    Check.jsonEq(page, "requestPending", "true")
+    // Who manages sees the request.
+    var list = GroupsTestKit.get("/groups/" + groupId + "/requests", owner)
+    Check.status(list, 200)
+    Check.eqInt("pending requests", 1, list.jsonSize("items"))
+    var requestId = list.json("items.0.id")
+    var approved = GroupsTestKit.post("/groups/" + groupId + "/requests/" + requestId + "/approve", owner, "")
+    Check.status(approved, 200)
+    Check.jsonEq(approved, "status", "APPROVED")
+    // Approving again does not create a second membership.
+    Check.apiError(GroupsTestKit.post("/groups/" + groupId + "/requests/" + requestId + "/approve", owner, ""), 409, "REQUEST_ALREADY_DECIDED")
+    var after = GroupsTestKit.get("/groups/grupo-fechado", person)
+    Check.jsonEq(after, "joined", "true")
+    Check.jsonEq(after, "members", "2")
+}
+
+test "who does not manage cannot edit nor see the members" {
+    var owner = GroupsTestKit.login("grupo-regra-dono")
+    var person = GroupsTestKit.login("grupo-regra-pessoa")
+    var stranger = GroupsTestKit.login("grupo-regra-estranho")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Regras", "OPEN")
+    GroupsTestKit.joinOk(person, groupId)
+    // A plain member does not edit.
+    Check.apiError(GroupsTestKit.patch("/groups/" + groupId, person, "{\"name\":\"Nome trocado\"}"), 403, "FORBIDDEN")
+    // A non-member does not see the member list (authorization is in the backend).
+    Check.status(GroupsTestKit.get("/groups/" + groupId + "/members", stranger), 403)
+    // The owner does.
+    var members = GroupsTestKit.get("/groups/" + groupId + "/members", owner)
+    Check.status(members, 200)
+    Check.eqInt("members", 2, members.jsonSize("items"))
+}
+
+test "the owner does not leave without transferring the ownership" {
+    var owner = GroupsTestKit.login("grupo-dono-sai")
+    var person = GroupsTestKit.login("grupo-dono-pessoa")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Saida", "OPEN")
+    GroupsTestKit.joinOk(person, groupId)
+    Check.apiError(GroupsTestKit.delete("/groups/" + groupId + "/members/me", owner), 409, "OWNERSHIP_TRANSFER_REQUIRED")
+    Check.status(GroupsTestKit.post("/groups/" + groupId + "/transfer", owner, "{\"userId\":\"" + person + "\"}"), 200)
+    // Now the old owner is ADMIN and can leave; the new owner stays.
+    Check.status(GroupsTestKit.delete("/groups/" + groupId + "/members/me", owner), 200)
+    var page = GroupsTestKit.get("/groups/grupo-saida", person)
+    Check.jsonEq(page, "viewerRole", "OWNER")
+    Check.jsonEq(page, "members", "1")
+}
+
+test "removing a member needs permission and never removes the owner" {
+    var owner = GroupsTestKit.login("grupo-rem-dono")
+    var person = GroupsTestKit.login("grupo-rem-pessoa")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Remocao", "OPEN")
+    GroupsTestKit.joinOk(person, groupId)
+    // A plain member removes nobody.
+    Check.status(GroupsTestKit.delete("/groups/" + groupId + "/members/" + owner, person), 403)
+    // The owner cannot be removed.
+    Check.apiError(GroupsTestKit.delete("/groups/" + groupId + "/members/" + owner, owner), 409, "CANNOT_REMOVE_OWNER")
+    // The owner removes the plain member.
+    Check.status(GroupsTestKit.delete("/groups/" + groupId + "/members/" + person, owner), 200)
+    Check.eqInt("members left", 1, GroupsTestKit.get("/groups/" + groupId + "/members", owner).jsonSize("items"))
+    // Removed, access to the private content is revoked at once.
+    Check.status(GroupsTestKit.get("/groups/" + groupId + "/members", person), 403)
+}
+
+test "equal names get different addresses" {
+    var owner = GroupsTestKit.login("grupo-slug-dono")
+    GroupsTestKit.createGroup(owner, "Programação Funcional", "OPEN")
+    GroupsTestKit.createGroup(owner, "Programação Funcional", "OPEN")
+    var list = GroupsTestKit.get("/groups?query=programa%C3%A7%C3%A3o", null)
+    Check.status(list, 200)
+    Check.eqInt("two groups", 2, list.jsonSize("items"))
+    assert(list.json("items.0.slug") != list.json("items.1.slug"))
+}

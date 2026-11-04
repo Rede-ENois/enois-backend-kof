@@ -1,0 +1,34 @@
+package studypairs
+
+import kernel.*
+import kernel.log.*
+import kernel.security.*
+
+// Composition of the study pairs domain: store, service, routes and the weekly reminder job.
+// Main.kf calls StudyPairsModule.install(platform, shared, hooks) after Security.install; a domain that
+// owns a seam (profile, preferences, notifications) calls installWith with its subclass instead.
+class StudyPairsModule {
+    StudyPairService service
+    public constructor(service: StudyPairService) {
+        this.service = service
+    }
+    static StudyPairsModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks) = StudyPairsModule.installWith(platform, shared, StudyPairProfiles(platform.db), StudyPairAgePolicy(platform.db), StudyPairPreferences(platform.db), StudyPairNotifier(platform.db))
+    static StudyPairsModule installWith(platform: Platform, shared: SharedServices, profiles: StudyPairProfiles, agePolicy: StudyPairAgePolicy, preferences: StudyPairPreferences, notifier: StudyPairNotifier) {
+        var service = StudyPairService(platform.db, StudyPairStore(platform.db), profiles, shared.blockedUsers, agePolicy, shared.sanctionGate, shared.sanctionReader, notifier, preferences)
+        StudyPairRoutes.register(platform.server, service, shared.idempotency)
+        // Thursday 18:00 in Brasilia by default; "-" turns it off. Safe on several replicas: each
+        // reminder is claimed in study_pair_reminders.
+        shared.jobs.cron("study-pair-reminders", StudyPairsModule.reminderCron(platform), "America/Sao_Paulo", () -> StudyPairsModule.remind(service))
+        return StudyPairsModule(service)
+    }
+    static String reminderCron(platform: Platform) = platform.cfg.getStr("REDE_STUDY_PAIRS_REMINDER_CRON", "0 0 18 * * THU")
+    static remind(service: StudyPairService) {
+        var log = Log("studypairs.reminder")
+        try {
+            var sent = service.sendWeeklyReminders()
+            log.info("study_pair_reminders_sent count=" + sent)
+        } catch (String e) {
+            log.warn("study_pair_reminders_failed error=" + e)
+        }
+    }
+}

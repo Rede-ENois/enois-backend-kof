@@ -1,0 +1,66 @@
+package studypairs
+
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+
+// HTTP adapter of /study-pairs (StudyPairController). Every write honours Idempotency-Key.
+class StudyPairRoutes {
+    static register(server: HttpServer, service: StudyPairService, idem: Idempotency) {
+        server.get("/study-pairs/me", () -> json.encode(service.mine(Auth.requireUser())))
+        server.get("/study-pairs/goals/popular", () -> StudyPairRoutes.popular(service))
+        server.get("/study-pairs/search", () -> StudyPairRoutes.search(service))
+        server.post("/study-pairs/requests", () -> StudyPairRoutes.request(service, idem))
+        server.delete("/study-pairs/requests/current", () -> StudyPairRoutes.cancel(service, idem))
+        server.post("/study-pairs/:pairId/checkins", () -> StudyPairRoutes.checkin(service, idem))
+        server.post("/study-pairs/:pairId/end", () -> StudyPairRoutes.end(service, idem))
+    }
+    static String popular(service: StudyPairService) {
+        Auth.requireUser()
+        return json.encode(StudyPairPopularItems(service.popularGoals()))
+    }
+    // Anonymous search: no id of the request nor of who asked.
+    static String search(service: StudyPairService) {
+        var userId = Auth.requireUser()
+        return json.encode(StudyPairSearchItems(service.search(userId, Req.queryStr("q", ""), Req.queryInt("limit", 20))))
+    }
+    static String request(service: StudyPairService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var body = StudyPairRoutes.goalBody()
+        return idem.handle(userId, "POST", "/api/study-pairs/requests", Idempotency.hash(Req.bodyText()), 201, () -> json.encode(service.request(userId, body.goal(), body.topic())))
+    }
+    static String cancel(service: StudyPairService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        return idem.handle(userId, "DELETE", "/api/study-pairs/requests/current", Idempotency.hash("{\"op\":\"cancel\"}"), 200, () -> json.encode(StudyPairStatusView(service.cancelCurrentRequest(userId), "CANCELLED")))
+    }
+    static String checkin(service: StudyPairService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var pairId = Req.pathParam("pairId")
+        var body = StudyPairRoutes.checkinBody()
+        return idem.handle(userId, "POST", "/api/study-pairs/{pairId}/checkins", Idempotency.hash("{\"pairId\":\"" + pairId + "\",\"request\":" + Req.bodyText() + "}"), 200, () -> json.encode(service.checkin(userId, pairId, body.note())))
+    }
+    static String end(service: StudyPairService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var pairId = Req.pathParam("pairId")
+        return idem.handle(userId, "POST", "/api/study-pairs/{pairId}/end", Idempotency.hash("{\"pairId\":\"" + pairId + "\"}"), 200, () -> StudyPairRoutes.endBody(service, userId, pairId))
+    }
+    static String endBody(service: StudyPairService, userId: String, pairId: String) {
+        service.end(userId, pairId)
+        return json.encode(StudyPairStatusView(pairId, "ENDED"))
+    }
+    static StudyPairGoalRequest goalBody() {
+        try {
+            return json.decode<StudyPairGoalRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static StudyPairCheckinRequest checkinBody() {
+        try {
+            return json.decode<StudyPairCheckinRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

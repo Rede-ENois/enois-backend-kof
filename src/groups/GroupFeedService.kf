@@ -1,0 +1,415 @@
+package groups
+
+import kernel.audit.*
+import kernel.error.*
+import kernel.id.*
+import kernel.outbox.*
+import kernel.sanctions.*
+import kernel.text.*
+import kernel.time.*
+
+// Topics and the private feed of the group (GroupFeedService).
+//
+// Same capability table as the rest of the module: reading needs membership (VIEW_PRIVATE_CONTENT),
+// managing topics MANAGE_TOPICS, publishing PUBLISH. Publishing ALWAYS checks that the topic belongs to
+// that group: an id existing is not enough (V81 has no composite foreign key, so the check lives here).
+class GroupFeedService {
+    GroupStore groups
+    GroupContentStore content
+    Audit audit
+    GroupNotifier notifier
+    Outbox outbox
+    GroupAgeGate ageGate
+    SanctionGate sanctionGate
+    public constructor(groups: GroupStore, content: GroupContentStore, audit: Audit, notifier: GroupNotifier, outbox: Outbox, ageGate: GroupAgeGate, sanctionGate: SanctionGate) {
+        this.groups = groups
+        this.content = content
+        this.audit = audit
+        this.notifier = notifier
+        this.outbox = outbox
+        this.ageGate = ageGate
+        this.sanctionGate = sanctionGate
+    }
+    static Int topicNameMax() = 80
+    static Int topicDescriptionMax() = 300
+    static Int maxPage() = 50
+    static Int maxContent() = 1200
+    List<GroupTopicRow> listTopics(groupId: String, actorId: String) {
+        this.requireReadable(groupId)
+        this.requireMember(groupId, actorId)
+        return content.listTopics(groupId)
+    }
+    GroupTopicRow createTopic(groupId: String, actorId: String, name: String?, description: String?) {
+        this.require(this.roleOf(groupId, actorId), "MANAGE_TOPICS")
+        if (GroupRules.blank(name)) {
+            throw Errors.api(400, "INVALID_TOPIC_NAME", "Nome do topico e obrigatorio.")
+        }
+        var finalName = GroupRules.orEmpty(name).trim()
+        if (finalName.length() > GroupFeedService.topicNameMax()) {
+            throw Errors.api(400, "INVALID_TOPIC_NAME", "Nome do topico deve ter ate 80 caracteres.")
+        }
+        if (GroupRules.orEmpty(description).trim().length() > GroupFeedService.topicDescriptionMax()) {
+            throw Errors.api(400, "INVALID_TOPIC_DESCRIPTION", "Descricao do topico deve ter ate 300 caracteres.")
+        }
+        if (content.topicNameExists(groupId, finalName)) {
+            throw Errors.api(409, "TOPIC_EXISTS", "Ja existe um topico com esse nome.")
+        }
+        var now = Time.nowIso()
+        var topic = GroupTopicRow(Ids.prefixed("group_topic_"), groupId, finalName, GroupRules.trimToNull(description), content.nextTopicPosition(groupId), "OPEN", now, now)
+        content.insertTopic(topic)
+        return topic
+    }
+    // Name null keeps; description null keeps, empty clears.
+    GroupTopicRow updateTopic(groupId: String, topicId: String, name: String?, description: String?, actorId: String) {
+        this.require(this.roleOf(groupId, actorId), "MANAGE_TOPICS")
+        var topic = this.requireTopic(groupId, topicId)
+        var finalName = topic.name()
+        if (name != null) {
+            var trimmed = name.trim()
+            if (trimmed.length() == 0) {
+                throw Errors.api(400, "INVALID_TOPIC_NAME", "Nome do topico e obrigatorio.")
+            }
+            if (trimmed.length() > GroupFeedService.topicNameMax()) {
+                throw Errors.api(400, "INVALID_TOPIC_NAME", "Nome do topico deve ter ate 80 caracteres.")
+            }
+            if (trimmed.toLowerCase() != topic.name().toLowerCase() && content.topicNameExists(groupId, trimmed)) {
+                throw Errors.api(409, "TOPIC_EXISTS", "Ja existe um topico com esse nome.")
+            }
+            finalName = trimmed
+        }
+        var finalDescription = topic.description()
+        if (description != null) {
+            var trimmedDescription = description.trim()
+            if (trimmedDescription.length() > GroupFeedService.topicDescriptionMax()) {
+                throw Errors.api(400, "INVALID_TOPIC_DESCRIPTION", "Descricao do topico deve ter ate 300 caracteres.")
+            }
+            finalDescription = trimmedDescription
+        }
+        var updated = GroupTopicRow(topic.id(), topic.groupId(), finalName, finalDescription, topic.position(), topic.status(), topic.createdAt(), Time.nowIso())
+        content.updateTopic(updated)
+        return updated
+    }
+    GroupTopicRow archiveTopic(groupId: String, topicId: String, actorId: String) {
+        this.require(this.roleOf(groupId, actorId), "MANAGE_TOPICS")
+        var topic = this.requireTopic(groupId, topicId)
+        var archived = GroupTopicRow(topic.id(), topic.groupId(), topic.name(), topic.description(), topic.position(), "ARCHIVED", topic.createdAt(), Time.nowIso())
+        content.updateTopic(archived)
+        return archived
+    }
+    // Reorders the whole list: the order sent must contain EVERY topic of the group, once.
+    List<GroupTopicRow> reorderTopics(groupId: String, orderedTopicIds: List<String>?, actorId: String) {
+        this.require(this.roleOf(groupId, actorId), "MANAGE_TOPICS")
+        var current = content.listTopics(groupId)
+        if (orderedTopicIds == null) {
+            throw Errors.api(400, "INVALID_ORDER", "A ordem precisa listar todos os topicos do grupo.")
+        }
+        var existing = current.map((t: GroupTopicRow) -> t.id())
+        var same = existing.size() == orderedTopicIds.size()
+        for (var id in orderedTopicIds) {
+            if (!existing.contains(id) || orderedTopicIds.indexOf(id) != orderedTopicIds.lastIndexOf(id)) {
+                same = false
+            }
+        }
+        if (!same) {
+            throw Errors.api(400, "INVALID_ORDER", "A ordem precisa listar todos os topicos do grupo.")
+        }
+        var now = Time.nowIso()
+        var index = 0
+        for (var topicId in orderedTopicIds) {
+            var found = GroupNil.topic()
+            for (var topic in current) {
+                if (topic.id() == topicId) {
+                    found = topic
+                }
+            }
+            if (found == null) {
+                throw Errors.api(400, "INVALID_ORDER", "Topico desconhecido na ordem.")
+            }
+            content.updateTopic(GroupTopicRow(found.id(), found.groupId(), found.name(), found.description(), index, found.status(), found.createdAt(), now))
+            index = index + 1
+        }
+        return content.listTopics(groupId)
+    }
+    GroupPostRow publish(groupId: String, topicId: String?, actorId: String, text: String?, mediaIds: List<String>?) {
+        // The same gates as the main feed: ECA (a minor without authorization does not publish) and the
+        // moderation sanction (a restricted account does not publish). Without them the group post was a
+        // hole around the feed rule.
+        ageGate.requireCanWrite(actorId)
+        sanctionGate.requireNotRestricted(actorId)
+        var group = this.requireGroup(groupId)
+        this.require(this.roleOf(groupId, actorId), "PUBLISH")
+        if (!GroupStatuses.acceptsNewContent(group.status())) {
+            throw Errors.api(409, "GROUP_NOT_ACCEPTING_CONTENT", "Este grupo nao esta aceitando publicacoes.")
+        }
+        if (topicId == null) {
+            throw Errors.api(404, "TOPIC_NOT_FOUND", "Topico nao encontrado neste grupo.")
+        }
+        var topic = this.requireTopic(groupId, topicId)
+        if (topic.status() != "OPEN") {
+            throw Errors.api(409, "TOPIC_ARCHIVED", "Este topico esta arquivado.")
+        }
+        if (GroupRules.blank(text)) {
+            throw Errors.api(400, "EMPTY_CONTENT", "Escreva alguma coisa antes de publicar.")
+        }
+        var clean = GroupRules.orEmpty(PlainText.defuse(GroupRules.orEmpty(text).trim()))
+        if (clean.length() > GroupFeedService.maxContent()) {
+            throw Errors.api(400, "CONTENT_TOO_LONG", "Publicacao de grupo deve ter ate 1.200 caracteres.")
+        }
+        var media = listOf<String>()
+        if (mediaIds != null) {
+            media = mediaIds
+        }
+        var now = Time.nowIso()
+        var post = GroupPostRow(Ids.prefixed("group_post_"), groupId, topicId, actorId, clean, media, "PUBLISHED", false, 0, 0, now, now)
+        content.insertPost(post)
+        // The members are told by the outbox worker, off this request: the fan-out grows with the group.
+        outbox.append(GroupNotifier.postPublished(), post.id(), "{\"postId\":\"" + post.id() + "\"}")
+        return post
+    }
+    List<GroupPostRow> listPosts(groupId: String, topicId: String?, actorId: String, before: String?, limit: Int) {
+        this.requireReadable(groupId)
+        this.requireMember(groupId, actorId)
+        var topic = GroupNil.str()
+        if (!GroupRules.blank(topicId)) {
+            topic = topicId
+        }
+        return content.listPosts(groupId, topic, before, GroupFeedService.clamp(limit, GroupFeedService.maxPage()))
+    }
+    // Removal (local moderation or the author). The author deletes their own; who moderates deletes
+    // other people's (MODERATE_CONTENT). The post becomes REMOVED, leaves the feed and listings, and the
+    // action goes to the platform audit.
+    removePost(groupId: String, postId: String, actorId: String) {
+        var post = this.requirePost(groupId, postId)
+        if (post.status() != "PUBLISHED") {
+            throw Errors.api(404, "POST_NOT_FOUND", "Publicacao nao encontrada neste grupo.")
+        }
+        if (post.authorId() != actorId) {
+            this.require(this.roleOf(groupId, actorId), "MODERATE_CONTENT")
+        }
+        var group = this.requireGroup(groupId)
+        content.updatePost(GroupPostRow(post.id(), post.groupId(), post.topicId(), post.authorId(), post.content(), post.mediaIds(), "REMOVED", post.pinned(), post.reactions(), post.comments(), post.createdAt(), Time.nowIso()))
+        audit.write(actorId, "GROUP_POST_REMOVED", postId, "{\"groupId\":\"" + groupId + "\"}")
+        notifier.contentRemoved(group, post.authorId(), actorId, "publicação")
+    }
+    // Comment: the author deletes their own; who moderates deletes other people's.
+    removeComment(groupId: String, postId: String, commentId: String, actorId: String) {
+        var post = this.requirePost(groupId, postId)
+        var comment = this.requirePublishedComment(postId, commentId)
+        if (comment.authorId() != actorId) {
+            this.require(this.roleOf(groupId, actorId), "MODERATE_CONTENT")
+        }
+        var group = this.requireGroup(groupId)
+        content.updateComment(GroupCommentRow(comment.id(), comment.postId(), comment.groupId(), comment.authorId(), comment.parentId(), comment.content(), "REMOVED", comment.createdAt(), Time.nowIso()))
+        this.refreshCounters(post)
+        audit.write(actorId, "GROUP_COMMENT_REMOVED", commentId, "{\"groupId\":\"" + groupId + "\",\"postId\":\"" + postId + "\"}")
+        notifier.contentRemoved(group, comment.authorId(), actorId, "comentário")
+    }
+    // Pins ONE post at the top of the group. clearPinned runs in the same transaction: never more than
+    // one pinned, and the previous one goes back to its chronological place.
+    GroupPostRow pinPost(groupId: String, postId: String, actorId: String) {
+        var post = this.requirePost(groupId, postId)
+        if (post.status() != "PUBLISHED") {
+            throw Errors.api(404, "POST_NOT_FOUND", "Publicacao nao encontrada neste grupo.")
+        }
+        this.require(this.roleOf(groupId, actorId), "PIN_CONTENT")
+        content.clearPinned(groupId)
+        var pinned = GroupPostRow(post.id(), post.groupId(), post.topicId(), post.authorId(), post.content(), post.mediaIds(), post.status(), true, post.reactions(), post.comments(), post.createdAt(), post.updatedAt())
+        content.updatePost(pinned)
+        audit.write(actorId, "GROUP_POST_PINNED", postId, "{\"groupId\":\"" + groupId + "\"}")
+        return pinned
+    }
+    unpinPost(groupId: String, postId: String, actorId: String) {
+        var post = this.requirePost(groupId, postId)
+        this.require(this.roleOf(groupId, actorId), "PIN_CONTENT")
+        if (!post.pinned()) {
+            return
+        }
+        content.updatePost(GroupPostRow(post.id(), post.groupId(), post.topicId(), post.authorId(), post.content(), post.mediaIds(), post.status(), false, post.reactions(), post.comments(), post.createdAt(), post.updatedAt()))
+        audit.write(actorId, "GROUP_POST_UNPINNED", postId, "{\"groupId\":\"" + groupId + "\"}")
+    }
+    GroupPostRow? pinnedPost(groupId: String, actorId: String) {
+        this.requireReadable(groupId)
+        this.requireMember(groupId, actorId)
+        var pinned = content.findPinned(groupId)
+        if (pinned == null) {
+            return null
+        }
+        if (pinned.status() != "PUBLISHED") {
+            return null
+        }
+        return pinned
+    }
+    GroupCommentRow comment(groupId: String, postId: String, authorId: String, text: String?, parentCommentId: String?) {
+        // Same gates as the feed comment (ECA and moderation sanction).
+        ageGate.requireCanWrite(authorId)
+        sanctionGate.requireNotRestricted(authorId)
+        var group = this.requireGroup(groupId)
+        var post = this.requirePost(groupId, postId)
+        this.require(this.roleOf(groupId, authorId), "INTERACT")
+        var clean = this.cleanComment(text)
+        var parent = GroupNil.comment()
+        if (!GroupRules.blank(parentCommentId)) {
+            // A reply only points at a comment of THIS post (not another post nor another group).
+            parent = this.requirePublishedComment(postId, GroupRules.orEmpty(parentCommentId))
+        }
+        var parentId = GroupNil.str()
+        var parentAuthor = GroupNil.str()
+        if (parent != null) {
+            parentId = parent.id()
+            parentAuthor = parent.authorId()
+        }
+        var now = Time.nowIso()
+        var created = GroupCommentRow(Ids.prefixed("group_comment_"), postId, groupId, authorId, parentId, clean, "PUBLISHED", now, now)
+        content.insertComment(created)
+        this.refreshCounters(post)
+        notifier.comment(group, post, authorId, parentAuthor)
+        return created
+    }
+    // Only the author edits their comment (who moderates removes, does not rewrite what the other said).
+    // Goes through the same gates as commenting: ECA, moderation sanction and permission to interact.
+    GroupCommentRow editComment(groupId: String, postId: String, commentId: String, actorId: String, text: String?) {
+        ageGate.requireCanWrite(actorId)
+        sanctionGate.requireNotRestricted(actorId)
+        this.requireGroup(groupId)
+        this.requirePost(groupId, postId)
+        var comment = this.requirePublishedComment(postId, commentId)
+        if (comment.authorId() != actorId) {
+            throw Errors.api(403, "FORBIDDEN", "Voce so pode editar o seu proprio comentario.")
+        }
+        this.require(this.roleOf(groupId, actorId), "INTERACT")
+        var clean = this.cleanComment(text)
+        var edited = GroupCommentRow(comment.id(), comment.postId(), comment.groupId(), comment.authorId(), comment.parentId(), clean, comment.status(), comment.createdAt(), Time.nowIso())
+        content.updateComment(edited)
+        audit.write(actorId, "GROUP_COMMENT_EDITED", commentId, "{\"groupId\":\"" + groupId + "\",\"postId\":\"" + postId + "\"}")
+        return edited
+    }
+    List<GroupCommentRow> listComments(groupId: String, postId: String, actorId: String, limit: Int) {
+        this.requireMember(groupId, actorId)
+        this.requirePost(groupId, postId)
+        return content.listComments(postId, GroupFeedService.clamp(limit, 100))
+    }
+    // Toggles the reaction: the same one again removes, another one swaps. One per person per post.
+    // Answers true when the reaction stayed active.
+    Bool toggleReaction(groupId: String, postId: String, actorId: String, type: String?) {
+        var post = this.requirePost(groupId, postId)
+        this.require(this.roleOf(groupId, actorId), "INTERACT")
+        var parsed = GroupFeedService.parseReaction(type)
+        var active = true
+        var existing = content.findReactionType(postId, actorId)
+        if (existing == parsed) {
+            content.removeReaction(postId, actorId)
+            active = false
+        }
+        else {
+            content.saveReaction(GroupReactionRow(Ids.prefixed("group_reaction_"), postId, actorId, parsed, Time.nowIso()))
+        }
+        this.refreshCounters(post)
+        return active
+    }
+    // The reader's reactions per post: one query, so the list is not an N+1.
+    Map<String,String> myReactions(groupId: String, actorId: String, postIds: List<String>) {
+        this.requireMember(groupId, actorId)
+        return content.reactionsByUser(actorId, postIds)
+    }
+    // Removes the reaction for good (POST toggles; this is the explicit "do not want it anymore").
+    removeReaction(groupId: String, postId: String, actorId: String) {
+        var post = this.requirePost(groupId, postId)
+        this.require(this.roleOf(groupId, actorId), "INTERACT")
+        content.removeReaction(postId, actorId)
+        this.refreshCounters(post)
+    }
+    String cleanComment(text: String?) {
+        if (GroupRules.blank(text)) {
+            throw Errors.api(400, "EMPTY_COMMENT", "Escreva alguma coisa antes de comentar.")
+        }
+        var clean = GroupRules.orEmpty(PlainText.defuse(GroupRules.orEmpty(text).trim()))
+        if (clean.length() > GroupFeedService.maxContent()) {
+            throw Errors.api(400, "CONTENT_TOO_LONG", "Comentario deve ter ate 1.200 caracteres.")
+        }
+        return clean
+    }
+    GroupPostRow requirePost(groupId: String, postId: String) {
+        var post = content.findPost(postId)
+        if (post != null) {
+            if (post.groupId() == groupId) {
+                return post
+            }
+        }
+        throw Errors.api(404, "POST_NOT_FOUND", "Publicacao nao encontrada neste grupo.")
+    }
+    GroupCommentRow requirePublishedComment(postId: String, commentId: String) {
+        var comment = content.findComment(commentId)
+        if (comment != null) {
+            if (comment.postId() == postId && comment.status() == "PUBLISHED") {
+                return comment
+            }
+        }
+        throw Errors.api(404, "COMMENT_NOT_FOUND", "Comentario nao encontrado nesta publicacao.")
+    }
+    // The denormalised counters come from the reaction/comment tables, in the same transaction. updated_at
+    // does not move: reacting or commenting does not edit the post.
+    refreshCounters(post: GroupPostRow) {
+        content.updatePost(GroupPostRow(post.id(), post.groupId(), post.topicId(), post.authorId(), post.content(), post.mediaIds(), post.status(), post.pinned(), content.countReactions(post.id()) as Int, content.countComments(post.id()) as Int, post.createdAt(), post.updatedAt()))
+    }
+    // Reaction catalog of the main feed (ReactionType).
+    static List<String> reactionTypes() = listOf("LIKE", "LOVE", "LAUGH", "WOW", "SAD", "CELEBRATE", "SUPPORT", "INSIGHTFUL", "ROFL", "ANGRY", "DISGUST", "SKEPTICAL", "EYES", "NOTE", "FIRE", "CLAP", "CLOWN", "NAILS")
+    static String parseReaction(type: String?) {
+        if (type == null) {
+            throw Errors.api(400, "INVALID_REACTION", "Reacao desconhecida.")
+        }
+        var upper = type.trim().toUpperCase()
+        if (!GroupFeedService.reactionTypes().contains(upper)) {
+            throw Errors.api(400, "INVALID_REACTION", "Reacao desconhecida.")
+        }
+        return upper
+    }
+    static Int clamp(limit: Int, max: Int) {
+        if (limit < 1) {
+            return 1
+        }
+        if (limit > max) {
+            return max
+        }
+        return limit
+    }
+    // A closed group delivers no content, not even to a member: it leaves discovery and disappears for
+    // reading. The platform team investigates by another path.
+    GroupRow requireReadable(groupId: String) {
+        var group = this.requireGroup(groupId)
+        if (!GroupStatuses.readableByMembers(group.status())) {
+            throw Errors.api(404, "GROUP_NOT_FOUND", "Grupo nao encontrado.")
+        }
+        return group
+    }
+    GroupRow requireGroup(groupId: String) {
+        var group = groups.findById(groupId)
+        if (group == null) {
+            throw Errors.api(404, "GROUP_NOT_FOUND", "Grupo nao encontrado.")
+        }
+        return group
+    }
+    GroupTopicRow requireTopic(groupId: String, topicId: String) {
+        var topic = content.findTopic(topicId)
+        if (topic != null) {
+            if (topic.groupId() == groupId) {
+                return topic
+            }
+        }
+        throw Errors.api(404, "TOPIC_NOT_FOUND", "Topico nao encontrado neste grupo.")
+    }
+    String? roleOf(groupId: String, actorId: String) {
+        var member = groups.findMember(groupId, actorId)
+        if (member == null) {
+            return null
+        }
+        return member.role()
+    }
+    requireMember(groupId: String, actorId: String) {
+        this.require(this.roleOf(groupId, actorId), "VIEW_PRIVATE_CONTENT")
+    }
+    require(role: String?, capability: String) {
+        if (!GroupPermissions.can(role, capability)) {
+            throw Errors.api(403, "FORBIDDEN", "Voce nao tem permissao para isso neste grupo.")
+        }
+    }
+}

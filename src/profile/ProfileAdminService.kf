@@ -1,0 +1,60 @@
+package profile
+
+import kernel.error.*
+import kernel.log.*
+
+// Admin role management (AdminUserService): an admin lists, promotes and revokes other admins. The role
+// lives in the immutable `users.is_admin` column; this is the only door fora manual database operation.
+// Nobody revokes their own account through the API.
+class ProfileAdminService {
+    ProfileDirectory directory
+    ProfileStore writes
+    ProfileNotifier notifier
+    Log log = Log("profile.admin")
+    public constructor(directory: ProfileDirectory, writes: ProfileStore, notifier: ProfileNotifier) {
+        this.directory = directory
+        this.writes = writes
+        this.notifier = notifier
+    }
+    List<ProfileAdminView> admins() {
+        var out = listOf<ProfileAdminView>()
+        for (var p in directory.findAdmins()) {
+            out.add(ProfileAdminView(p.id, p.username, p.name))
+        }
+        return out
+    }
+    ProfileAdminView promote(username: String?, byAdmin: String) {
+        var target = this.target(username)
+        if (target.admin) {
+            throw Errors.api(409, "ALREADY_ADMIN", "Este usuário já é admin.")
+        }
+        writes.updateAdmin(target.id, true)
+        notifier.notify(target.id, "MODERACAO", byAdmin, "Você agora é admin", "Um administrador promoveu sua conta. O painel completo está liberado.", "/moderador", "Abrir painel")
+        log.info("admin_role_change acao=promovido alvo=" + target.id + " por=" + byAdmin)
+        return ProfileAdminView(target.id, target.username, target.name)
+    }
+    ProfileAdminView revoke(username: String?, byAdmin: String) {
+        var target = this.target(username)
+        if (target.id == byAdmin) {
+            throw Errors.api(400, "CANNOT_REVOKE_SELF", "Não dá para revogar a própria conta pela API — operação manual no banco.")
+        }
+        if (!target.admin) {
+            throw Errors.api(409, "NOT_ADMIN", "Este usuário não é admin.")
+        }
+        writes.updateAdmin(target.id, false)
+        notifier.notify(target.id, "MODERACAO", byAdmin, "Papel de admin revogado", "Um administrador revogou o acesso administrativo da sua conta.", "/feed", "Voltar ao feed")
+        log.info("admin_role_change acao=revogado alvo=" + target.id + " por=" + byAdmin)
+        return ProfileAdminView(target.id, target.username, target.name)
+    }
+    ProfileRecord target(username: String?) {
+        var name = ""
+        if (username != null) {
+            name = username.trim()
+        }
+        var p = directory.findByUsername(name)
+        if (p == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuário não encontrado.")
+        }
+        return p
+    }
+}

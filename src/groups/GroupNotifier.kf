@@ -1,0 +1,132 @@
+package groups
+
+import kernel.outbox.*
+
+// Notifications of the Groups context (GroupNotifier).
+//
+// Privacy rule: the body NEVER carries the text of a post or comment. The inbox is read outside the
+// group and the destination (the group page) is what demands authorization in the backend, so only the
+// group name, already public metadata of discovery, travels.
+//
+// Whoever manages the group receives with their own kind/cta; the author of an action is never told.
+class GroupNotifier extends OutboxEventHandler {
+    GroupStore groups
+    GroupContentStore content
+    GroupProfileLookup profiles
+    GroupNotifications notifications
+    public constructor(groups: GroupStore, content: GroupContentStore, profiles: GroupProfileLookup, notifications: GroupNotifications) {
+        super()
+        this.groups = groups
+        this.content = content
+        this.profiles = profiles
+        this.notifications = notifications
+    }
+    // Outbox event appended when a post is published; its aggregate id is the post id.
+    static String postPublished() = "GroupPostPublished"
+    handle(eventType: String, aggregateId: String, payload: String) {
+        if (eventType == GroupNotifier.postPublished()) {
+            var post = content.findPost(aggregateId)
+            if (post != null) {
+                this.newPost(post)
+            }
+        }
+    }
+    // Every other member hears about a new post, one notification per group: while unread, the next
+    // posts update it ("3 novas publicações em X") instead of piling up. A post removed (or a group
+    // closed) before the worker ran notifies nobody.
+    // ponytail: one lookup and one write per member inside the outbox worker transaction; fine for
+    // groups of a few thousand members, batch the upsert per group if groups grow past that.
+    newPost(post: GroupPostRow) {
+        if (post.status() != "PUBLISHED") {
+            return
+        }
+        var group = groups.findById(post.groupId())
+        if (group == null) {
+            return
+        }
+        if (!GroupStatuses.readableByMembers(group.status())) {
+            return
+        }
+        var authorName = profiles.nameOf(post.authorId())
+        var groupKey = "GROUP_NEW_POST:group:" + group.id()
+        for (var member in groups.listMembers(group.id())) {
+            if (member.userId() == post.authorId()) {
+                continue
+            }
+            notifications.createCounted(member.userId(), "GROUP_NEW_POST", groupKey, post.authorId(), "Novas publicações em " + group.name(), authorName + " publicou em " + group.name() + ".", " novas publicações em " + group.name() + ".", GroupNotifier.href(group), "Abrir grupo")
+        }
+    }
+    // Open join: tells who manages (the approval request already tells them).
+    memberJoined(group: GroupRow, memberId: String) {
+        this.notifyManagers(group, memberId, "GROUP_MEMBER_JOINED", "Novo membro", " entrou em " + group.name() + ".", "Ver grupo")
+    }
+    // Pending request: tells who manages; the requester is not a member yet and gets nothing.
+    joinRequested(group: GroupRow, requesterId: String) {
+        this.notifyManagers(group, requesterId, "GROUP_JOIN_REQUEST", "Pedido de entrada", " pediu para entrar em " + group.name() + ".", "Analisar pedido")
+    }
+    requestDecided(group: GroupRow, requesterId: String, actorId: String, approved: Bool) {
+        var kind = "GROUP_JOIN_REJECTED"
+        var title = "Entrada recusada"
+        var body = "Seu pedido para entrar em " + group.name() + " foi recusado."
+        var cta = "Ver grupo"
+        if (approved) {
+            kind = "GROUP_JOIN_APPROVED"
+            title = "Entrada aprovada"
+            body = "Seu pedido para entrar em " + group.name() + " foi aprovado."
+            cta = "Abrir grupo"
+        }
+        notifications.create(requesterId, kind, actorId, title, body, GroupNotifier.href(group), cta)
+    }
+    memberRemoved(group: GroupRow, targetUserId: String, actorId: String) {
+        if (targetUserId == actorId) {
+            return
+        }
+        notifications.create(targetUserId, "GROUP_MEMBER_REMOVED", actorId, "Removido do grupo", "Você foi removido de " + group.name() + ".", GroupNotifier.href(group), "Ver grupo")
+    }
+    ownershipTransferred(group: GroupRow, newOwnerId: String, actorId: String) {
+        if (newOwnerId == actorId) {
+            return
+        }
+        notifications.create(newOwnerId, "GROUP_OWNERSHIP_TRANSFERRED", actorId, "Você agora é dono", "A propriedade do grupo " + group.name() + " passou para você.", GroupNotifier.href(group), "Abrir grupo")
+    }
+    // Comment: tells the post author and, on a reply, the author of the parent comment too.
+    comment(group: GroupRow, post: GroupPostRow, commentAuthorId: String, parentAuthorId: String?) {
+        if (post.authorId() != commentAuthorId) {
+            notifications.create(post.authorId(), "NEW_GROUP_COMMENT", commentAuthorId, "Novo comentário", profiles.nameOf(commentAuthorId) + " comentou na sua publicação em " + group.name() + ".", GroupNotifier.href(group), "Abrir grupo")
+        }
+        if (parentAuthorId == null) {
+            return
+        }
+        if (parentAuthorId != commentAuthorId && parentAuthorId != post.authorId()) {
+            notifications.create(parentAuthorId, "NEW_GROUP_REPLY", commentAuthorId, "Nova resposta", profiles.nameOf(commentAuthorId) + " respondeu ao seu comentário em " + group.name() + ".", GroupNotifier.href(group), "Abrir grupo")
+        }
+    }
+    // Local moderation: whoever had content removed by someone else is told.
+    contentRemoved(group: GroupRow, authorId: String, actorId: String, what: String) {
+        if (authorId == actorId) {
+            return
+        }
+        notifications.create(authorId, "GROUP_CONTENT_REMOVED", actorId, "Conteúdo removido", "Sua " + what + " em " + group.name() + " foi removida pela moderação.", GroupNotifier.href(group), "Ver grupo")
+    }
+    // Status change by the platform: the owner answers for the group and needs to know.
+    statusChanged(group: GroupRow, status: String, reason: String?, actorId: String) {
+        var body = "O grupo " + group.name() + " agora está " + status + "."
+        if (reason != null && reason.trim().length() > 0) {
+            body = body + " Motivo: " + reason.trim()
+        }
+        notifications.create(group.ownerId(), "GROUP_STATUS_CHANGED", actorId, "Estado do grupo alterado", body, GroupNotifier.href(group), "Ver grupo")
+    }
+    notifyManagers(group: GroupRow, actorId: String, kind: String, title: String, suffix: String, cta: String) {
+        var actorName = profiles.nameOf(actorId)
+        for (var member in groups.listMembers(group.id())) {
+            if (member.role() != "OWNER" && member.role() != "ADMIN") {
+                continue
+            }
+            if (member.userId() == actorId) {
+                continue
+            }
+            notifications.create(member.userId(), kind, actorId, title, actorName + suffix, GroupNotifier.href(group), cta)
+        }
+    }
+    static String href(group: GroupRow) = "/grupos/" + group.slug()
+}
