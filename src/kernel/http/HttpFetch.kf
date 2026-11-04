@@ -1,0 +1,120 @@
+package kernel.http
+
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
+import kernel.files.*
+
+// Status (0 = unreachable) and text body of a call.
+record HttpReply(Int status, String body)
+
+// Result of a HEAD/GET probe: status (0 = unreachable) and the Content-Type header ("" when absent).
+record FetchProbe(Int status, String contentType)
+
+// Outbound HTTP for the media workers: a public-URL probe and a size-capped download to a temp file.
+// The caller checks the URL with OutboundUrlGuard first; nothing here follows a redirect on download.
+class HttpFetch {
+    // A request with text body and "Name: value" headers; the reply body is read for any status.
+    static HttpReply send(method: String, url: String, headers: List<String>, body: String?, timeoutMs: Int) {
+        try {
+            var connection = new URL(url).openConnection() as HttpURLConnection
+            connection.setRequestMethod(method)
+            connection.setConnectTimeout(5000)
+            connection.setReadTimeout(timeoutMs)
+            for (var h in headers) {
+                var colon = h.indexOf(":")
+                connection.setRequestProperty(h.substring(0, colon).trim(), h.substring(colon + 1).trim())
+            }
+            if (body != null) {
+                var payload = body.getBytes()
+                connection.setDoOutput(true)
+                connection.setFixedLengthStreamingMode(payload.length)
+                var out = connection.getOutputStream()
+                out.write(payload, 0, payload.length)
+                out.close()
+            }
+            var status = connection.getResponseCode()
+            var stream = connection.getErrorStream()
+            if (status < 400) {
+                stream = connection.getInputStream()
+            }
+            var text = ""
+            if (stream != null) {
+                text = new String(stream.readAllBytes(), "UTF-8")
+            }
+            return HttpReply(status, text)
+        } catch (IOException e) {
+            return HttpReply(0, "")
+        }
+    }
+    // HEAD, and a one-byte ranged GET when the server answers 405. Redirects are followed (a CDN may
+    // redirect to its edge).
+    static FetchProbe probe(url: String, timeoutMs: Int) {
+        var first = HttpFetch.probeOnce(url, "HEAD", timeoutMs)
+        if (first.status() == 405) {
+            return HttpFetch.probeOnce(url, "GET", timeoutMs)
+        }
+        return first
+    }
+    static FetchProbe probeOnce(url: String, method: String, timeoutMs: Int) {
+        try {
+            var connection = new URL(url).openConnection() as HttpURLConnection
+            connection.setRequestMethod(method)
+            connection.setConnectTimeout(5000)
+            connection.setReadTimeout(timeoutMs)
+            connection.setInstanceFollowRedirects(true)
+            if (method == "GET") {
+                connection.setRequestProperty("Range", "bytes=0-0")
+            }
+            var status = connection.getResponseCode()
+            var type = connection.getContentType()
+            if (type == null) {
+                type = ""
+            }
+            return FetchProbe(status, type)
+        } catch (IOException e) {
+            return FetchProbe(0, "")
+        }
+    }
+    // Downloads `url` (200 only, no redirects) into a new temp file and returns its path. Throws
+    // "download falhou: ..." (the Java message) on any refusal; an empty body or one above `maxBytes`
+    // is refused and the temp file removed.
+    static String download(url: String, maxBytes: Long) {
+        var path = ""
+        var failure = ""
+        try {
+            var connection = new URL(url).openConnection() as HttpURLConnection
+            connection.setRequestMethod("GET")
+            connection.setConnectTimeout(10000)
+            connection.setReadTimeout(180000)
+            connection.setInstanceFollowRedirects(false)
+            var status = connection.getResponseCode()
+            if (status != 200) {
+                failure = "origem respondeu " + status
+            } else {
+                path = TempFiles.create("media-migration-", ".bin")
+                var stream = ByteStream(connection.getInputStream())
+                var total = stream.copyToFile(path, maxBytes)
+                stream.close()
+                if (total == 0L) {
+                    failure = "origem respondeu vazio"
+                }
+            }
+        } catch (IOException e) {
+            failure = "io"
+        } catch (String e) {
+            if (e == "STREAM_TOO_LARGE") {
+                failure = "objeto maior que o teto de migracao"
+            } else {
+                failure = e
+            }
+        }
+        if (failure.length() > 0) {
+            if (path.length() > 0) {
+                TempFiles.delete(path)
+            }
+            throw "download falhou: " + failure
+        }
+        return path
+    }
+}

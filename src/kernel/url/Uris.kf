@@ -1,0 +1,122 @@
+package kernel.url
+
+import java.net.URI
+import java.util.Base64
+import kernel.bytes.*
+
+// Percent-encoding over the UTF-8 bytes of a string (the part of Spring's `UriUtils` and the AWS
+// signature rules the platform needs).
+class Uris {
+    static String unreserved() = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+    // RFC 3986 `pchar` without the percent sign: what `UriUtils.encodePathSegment` leaves alone.
+    static String pathSegmentSafe() = Uris.unreserved() + "!$&'()*+,;=:@"
+    // Encodes everything that is not in `safe` (ASCII characters); multi-byte characters always encode.
+    static String encode(text: String, safe: String) {
+        var bytes = text.getBytes()
+        var out = ""
+        var i = 0
+        while (i < bytes.length) {
+            var v = Bytes.at(bytes, i)
+            if (v < 128 && safe.indexOf("" + (v as Char)) >= 0) {
+                out = out + (v as Char)
+            } else {
+                var hex = Integer.toHexString(v).toUpperCase()
+                if (hex.length() < 2) {
+                    hex = "0" + hex
+                }
+                out = out + "%" + hex
+            }
+            i = i + 1
+        }
+        return out
+    }
+    static String encodePathSegment(segment: String) = Uris.encode(segment, Uris.pathSegmentSafe())
+    // AWS Signature V4 encoding of one path segment or query component: unreserved characters only.
+    static String encodeAws(text: String) = Uris.encode(text, Uris.unreserved())
+    // `%XX` -> the byte, `+` stays a plus (`UriUtils.decode`). A malformed escape returns `text` unchanged.
+    static String decode(text: String) {
+        if (text.indexOf("%") < 0) {
+            return text
+        }
+        var raw = text.getBytes()
+        var sink = ByteSink()
+        var i = 0
+        while (i < raw.length) {
+            var v = Bytes.at(raw, i)
+            if (v == 37) {
+                if (i + 2 > raw.length - 1) {
+                    return text
+                }
+                var hi = Uris.hexValue(Bytes.at(raw, i + 1))
+                var lo = Uris.hexValue(Bytes.at(raw, i + 2))
+                if (hi < 0 || lo < 0) {
+                    return text
+                }
+                sink.addByte(hi * 16 + lo)
+                i = i + 3
+            } else {
+                sink.addByte(v)
+                i = i + 1
+            }
+        }
+        return new String(sink.toBytes() as Byte[], "UTF-8")
+    }
+    // Standard base64 of the UTF-8 bytes (HTTP basic credentials).
+    static String base64(text: String) = Base64.getEncoder().encodeToString(text.getBytes())
+    // Host of an absolute URL (lower case), "" when there is none or the URL is malformed.
+    static String host(url: String) {
+        try {
+            var h = URI.create(url).getHost()
+            if (h == null) {
+                return ""
+            }
+            return h.toLowerCase()
+        } catch (String e) {
+            return ""
+        }
+    }
+    // Path of an absolute URL, "" when there is none.
+    static String path(url: String) {
+        try {
+            var p = URI.create(url).getPath()
+            if (p == null) {
+                return ""
+            }
+            return p
+        } catch (String e) {
+            return ""
+        }
+    }
+    // Whether the text parses as a URI at all.
+    static Bool parses(url: String) {
+        try {
+            URI.create(url)
+            return true
+        } catch (String e) {
+            return false
+        }
+    }
+    static String scheme(url: String) {
+        try {
+            var s = URI.create(url).getScheme()
+            if (s == null) {
+                return ""
+            }
+            return s.toLowerCase()
+        } catch (String e) {
+            return ""
+        }
+    }
+    static Int hexValue(c: Int) {
+        if (c >= 48 && c <= 57) {
+            return c - 48
+        }
+        if (c >= 65 && c <= 70) {
+            return c - 55
+        }
+        if (c >= 97 && c <= 102) {
+            return c - 87
+        }
+        return -1
+    }
+}

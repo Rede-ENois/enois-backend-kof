@@ -1,0 +1,342 @@
+package kernel.storage
+
+import java.io.FileInputStream
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.HttpURLConnection
+import java.net.URI
+import java.net.URL
+import java.security.MessageDigest
+import java.util.HexFormat
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+import kernel.config.*
+import kernel.files.*
+import kernel.time.*
+import kernel.url.*
+
+// An object read from the bucket: the body stream and the headers the proxy relays.
+class S3Object {
+    ByteStream body
+    Long length
+    String contentType
+    String? contentRange
+    String? eTag
+    public constructor(body: ByteStream, length: Long, contentType: String, contentRange: String?, eTag: String?) {
+        this.body = body
+        this.length = length
+        this.contentType = contentType
+        this.contentRange = contentRange
+        this.eTag = eTag
+    }
+}
+
+// S3 over plain REST with AWS Signature V4 (any S3-compatible endpoint, path-style or virtual-hosted).
+//
+// Why not the AWS SDK for Java v2: its fluent builders do not compile from Kof (KOF_GAPS G160: methods
+// inherited from generic super-interfaces, `Cannot resolve method 'region' on type 'S3ClientBuilder'`,
+// and boxed `Boolean` parameters reject `Bool`). Bodies are streamed from and to files; the payload hash
+// is the SHA-256 of the file, so gateways that do not decode the SDK's aws-chunked trailer are fine.
+//
+// Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN. The web-identity
+// (IRSA) provider of the SDK default chain is not implemented here.
+class S3Rest {
+    String endpoint
+    String region
+    String bucket
+    Bool pathStyle
+    String accessKey
+    String secretKey
+    String sessionToken
+    // Tests pin the clock (ISO instant); "" = now.
+    static String clockOverride = ""
+    public constructor(endpoint: String, region: String, bucket: String, pathStyle: Bool, accessKey: String, secretKey: String, sessionToken: String) {
+        this.endpoint = endpoint
+        this.region = region
+        this.bucket = bucket
+        this.pathStyle = pathStyle
+        this.accessKey = accessKey
+        this.secretKey = secretKey
+        this.sessionToken = sessionToken
+    }
+    // REDE_MEDIA_S3_ENDPOINT, REDE_MEDIA_S3_REGION (us-east-1), REDE_MEDIA_S3_BUCKET,
+    // REDE_MEDIA_S3_FORCE_PATH_STYLE, AWS_* credentials.
+    static S3Rest fromConfig(cfg: Config) {
+        return S3Rest(cfg.getStr("REDE_MEDIA_S3_ENDPOINT", ""), cfg.getStr("REDE_MEDIA_S3_REGION", "us-east-1"), cfg.getStr("REDE_MEDIA_S3_BUCKET", "").trim(), cfg.getBool("REDE_MEDIA_S3_FORCE_PATH_STYLE", false), cfg.getStr("AWS_ACCESS_KEY_ID", ""), cfg.getStr("AWS_SECRET_ACCESS_KEY", ""), cfg.getStr("AWS_SESSION_TOKEN", ""))
+    }
+    // ---------------------------------------------------------------- addressing
+    String scheme() {
+        if (endpoint.length() == 0) {
+            return "https"
+        }
+        return URI.create(endpoint).getScheme()
+    }
+    // Host header value (`host` or `host:port`), virtual-hosted style prepends the bucket.
+    String hostHeader() {
+        var host = "s3." + region + ".amazonaws.com"
+        var port = -1
+        if (endpoint.length() > 0) {
+            var uri = URI.create(endpoint)
+            host = uri.getHost()
+            port = uri.getPort()
+        }
+        if (!pathStyle) {
+            host = bucket + "." + host
+        }
+        if (port > 0) {
+            return host + ":" + port
+        }
+        return host
+    }
+    // Encoded absolute path of an object (`/bucket/a/b` path-style, `/a/b` virtual-hosted).
+    String canonicalPath(key: String) {
+        var segments = key.split("/")
+        var path = ""
+        for (var s in segments) {
+            path = path + "/" + Uris.encodeAws(s)
+        }
+        if (pathStyle) {
+            return "/" + Uris.encodeAws(bucket) + path
+        }
+        return path
+    }
+    String objectUrl(key: String, query: String) {
+        var u = scheme() + "://" + hostHeader() + canonicalPath(key)
+        if (query.length() > 0) {
+            u = u + "?" + query
+        }
+        return u
+    }
+    // ---------------------------------------------------------------- signing (pure, tested on the AWS vectors)
+    static String sha256Hex(data: Byte[]) = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(data))
+    static Byte[] hmac(key: Byte[], data: String) {
+        var mac = Mac.getInstance("HmacSHA256")
+        mac.init(new SecretKeySpec(key, "HmacSHA256"))
+        return mac.doFinal(data.getBytes())
+    }
+    static String signature(secret: String, date8: String, region: String, stringToSign: String) {
+        var kDate = S3Rest.hmac(("AWS4" + secret).getBytes(), date8)
+        var kRegion = S3Rest.hmac(kDate, region)
+        var kService = S3Rest.hmac(kRegion, "s3")
+        var kSigning = S3Rest.hmac(kService, "aws4_request")
+        return HexFormat.of().formatHex(S3Rest.hmac(kSigning, stringToSign))
+    }
+    // headerNames: lower-case, sorted; headerValues in the same order.
+    static String canonicalRequest(method: String, canonicalUri: String, canonicalQuery: String, headerNames: List<String>, headerValues: List<String>, payloadHash: String) {
+        var headers = ""
+        var i = 0
+        while (i < headerNames.size()) {
+            headers = headers + headerNames.get(i) + ":" + headerValues.get(i).trim() + "\n"
+            i = i + 1
+        }
+        return method + "\n" + canonicalUri + "\n" + canonicalQuery + "\n" + headers + "\n" + String.join(";", headerNames) + "\n" + payloadHash
+    }
+    static String stringToSign(amzDate: String, region: String, canonical: String) {
+        return "AWS4-HMAC-SHA256\n" + amzDate + "\n" + amzDate.substring(0, 8) + "/" + region + "/s3/aws4_request\n" + S3Rest.sha256Hex(canonical.getBytes())
+    }
+    static String nowAmz() {
+        var iso = S3Rest.clockOverride
+        if (iso.length() == 0) {
+            iso = Time.nowIso()
+        }
+        var compact = iso.replace("-", "").replace(":", "")
+        return compact.substring(0, 15) + "Z"
+    }
+    // The headers every request signs (sorted): host, x-amz-content-sha256, x-amz-date, [x-amz-security-token].
+    List<String> signedNames() {
+        var names = listOf("host", "x-amz-content-sha256", "x-amz-date")
+        if (sessionToken.length() > 0) {
+            names.add("x-amz-security-token")
+        }
+        return names
+    }
+    List<String> signedValues(payloadHash: String, amzDate: String) {
+        var values = listOf(hostHeader(), payloadHash, amzDate)
+        if (sessionToken.length() > 0) {
+            values.add(sessionToken)
+        }
+        return values
+    }
+    String authHeader(method: String, key: String, payloadHash: String, amzDate: String) {
+        var names = signedNames()
+        var canonical = S3Rest.canonicalRequest(method, canonicalPath(key), "", names, signedValues(payloadHash, amzDate), payloadHash)
+        var sig = S3Rest.signature(secretKey, amzDate.substring(0, 8), region, S3Rest.stringToSign(amzDate, region, canonical))
+        return "AWS4-HMAC-SHA256 Credential=" + accessKey + "/" + amzDate.substring(0, 8) + "/" + region + "/s3/aws4_request, SignedHeaders=" + String.join(";", names) + ", Signature=" + sig
+    }
+    // A URL that lets the holder PUT `key` with `contentType` for `expiresSeconds` (query-signed).
+    String presignPut(key: String, contentType: String, expiresSeconds: Int) {
+        requireCredentials()
+        var amzDate = S3Rest.nowAmz()
+        var scope = amzDate.substring(0, 8) + "/" + region + "/s3/aws4_request"
+        var params = listOf("X-Amz-Algorithm=AWS4-HMAC-SHA256", "X-Amz-Credential=" + Uris.encodeAws(accessKey + "/" + scope), "X-Amz-Date=" + amzDate, "X-Amz-Expires=" + expiresSeconds, "X-Amz-SignedHeaders=content-type%3Bhost")
+        if (sessionToken.length() > 0) {
+            params.add("X-Amz-Security-Token=" + Uris.encodeAws(sessionToken))
+        }
+        var query = S3Rest.sortedJoin(params)
+        var canonical = S3Rest.canonicalRequest("PUT", canonicalPath(key), query, listOf("content-type", "host"), listOf(contentType, hostHeader()), "UNSIGNED-PAYLOAD")
+        var sig = S3Rest.signature(secretKey, amzDate.substring(0, 8), region, S3Rest.stringToSign(amzDate, region, canonical))
+        return this.objectUrl(key, query + "&X-Amz-Signature=" + sig)
+    }
+    static String sortedJoin(params: List<String>) {
+        var sorted = listOf<String>()
+        for (var p in params) {
+            sorted.add(p)
+        }
+        var i = 1
+        while (i < sorted.size()) {
+            var cur = sorted.get(i)
+            var j = i - 1
+            while (j >= 0 && sorted.get(j).compareTo(cur) > 0) {
+                sorted.set(j + 1, sorted.get(j))
+                j = j - 1
+            }
+            sorted.set(j + 1, cur)
+            i = i + 1
+        }
+        return String.join("&", sorted)
+    }
+    requireCredentials() {
+        if (accessKey.length() == 0 || secretKey.length() == 0) {
+            throw "S3_CREDENTIALS_MISSING"
+        }
+    }
+    // ---------------------------------------------------------------- operations
+    HttpURLConnection open(method: String, key: String, payloadHash: String, timeoutMs: Int) {
+        requireCredentials()
+        var amzDate = S3Rest.nowAmz()
+        var connection = new URL(this.objectUrl(key, "")).openConnection() as HttpURLConnection
+        connection.setRequestMethod(method)
+        connection.setConnectTimeout(10000)
+        connection.setReadTimeout(timeoutMs)
+        connection.setRequestProperty("x-amz-content-sha256", payloadHash)
+        connection.setRequestProperty("x-amz-date", amzDate)
+        if (sessionToken.length() > 0) {
+            connection.setRequestProperty("x-amz-security-token", sessionToken)
+        }
+        connection.setRequestProperty("Authorization", authHeader(method, key, payloadHash, amzDate))
+        return connection
+    }
+    // Streams the file at `path` to the object (replaces it). Throws S3_FAILED status=N on a refusal.
+    putFile(key: String, contentType: String, path: String) {
+        var hash = S3Rest.sha256OfFile(path)
+        var length = TempFiles.size(path)
+        var status = 0
+        var failure = ""
+        try {
+            var connection = open("PUT", key, hash, 600000)
+            if (contentType.length() > 0) {
+                connection.setRequestProperty("Content-Type", contentType)
+            }
+            connection.setDoOutput(true)
+            connection.setFixedLengthStreamingMode(length)
+            var out = connection.getOutputStream()
+            var input = new FileInputStream(path)
+            var buffer = new Byte[65536]
+            var reading = true
+            while (reading) {
+                var n = input.read(buffer)
+                if (n < 0) {
+                    reading = false
+                } else {
+                    out.write(buffer, 0, n)
+                }
+            }
+            input.close()
+            out.close()
+            status = connection.getResponseCode()
+        } catch (IOException e) {
+            failure = "S3_FAILED io"
+        }
+        if (failure.length() > 0) {
+            throw failure
+        }
+        if (status < 200 || status >= 300) {
+            throw "S3_FAILED status=" + status
+        }
+    }
+    // Reads the object, or the `range` of it (`bytes=0-99`); 200 or 206. Missing or refused: S3_FAILED status=N.
+    S3Object get(key: String, range: String?) {
+        var status = 0
+        var failure = ""
+        var result = S3Object(ByteStream.ofBytes("".getBytes()), 0L, "", null, null)
+        try {
+            var connection = open("GET", key, "UNSIGNED-PAYLOAD", 600000)
+            if (range != null) {
+                connection.setRequestProperty("Range", range)
+            }
+            status = connection.getResponseCode()
+            if (status == 200 || status == 206) {
+                var type = connection.getContentType()
+                if (type == null) {
+                    type = "application/octet-stream"
+                }
+                result = S3Object(ByteStream(connection.getInputStream()), connection.getContentLengthLong(), type, connection.getHeaderField("Content-Range"), connection.getHeaderField("ETag"))
+            }
+        } catch (IOException e) {
+            failure = "S3_FAILED io"
+        }
+        if (failure.length() > 0) {
+            throw failure
+        }
+        if (status != 200 && status != 206) {
+            throw "S3_FAILED status=" + status
+        }
+        return result
+    }
+    // Content length of the object, -1 when it does not exist.
+    Long head(key: String) {
+        var status = 0
+        var length = -1L
+        var failure = ""
+        try {
+            var connection = open("HEAD", key, "UNSIGNED-PAYLOAD", 30000)
+            status = connection.getResponseCode()
+            length = connection.getContentLengthLong()
+        } catch (IOException e) {
+            failure = "S3_FAILED io"
+        }
+        if (failure.length() > 0) {
+            throw failure
+        }
+        if (status == 404) {
+            return -1L
+        }
+        if (status < 200 || status >= 300) {
+            throw "S3_FAILED status=" + status
+        }
+        return length
+    }
+    delete(key: String) {
+        var status = 0
+        var failure = ""
+        try {
+            var connection = open("DELETE", key, "UNSIGNED-PAYLOAD", 30000)
+            status = connection.getResponseCode()
+        } catch (IOException e) {
+            failure = "S3_FAILED io"
+        }
+        if (failure.length() > 0) {
+            throw failure
+        }
+        if (status != 404 && (status < 200 || status >= 300)) {
+            throw "S3_FAILED status=" + status
+        }
+    }
+    static String sha256OfFile(path: String) {
+        var digest = MessageDigest.getInstance("SHA-256")
+        var input = new FileInputStream(path)
+        var buffer = new Byte[65536]
+        var reading = true
+        while (reading) {
+            var n = input.read(buffer)
+            if (n < 0) {
+                reading = false
+            } else {
+                digest.update(buffer, 0, n)
+            }
+        }
+        input.close()
+        return HexFormat.of().formatHex(digest.digest())
+    }
+}
