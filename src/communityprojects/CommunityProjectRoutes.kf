@@ -1,0 +1,155 @@
+package communityprojects
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+
+// HTTP adapter of CommunityProjectController: public catalogue, creator page, submit/edit, review.
+class CommunityProjectRoutes {
+    static register(server: HttpServer, service: CommunityProjectService, moderators: CommunityProjectModerators) {
+        server.get("/community-projects", () -> CommunityProjectRoutes.catalog(service))
+        server.get("/community-projects/:username", () -> CommunityProjectRoutes.byUser(service))
+        server.get("/community-projects/:username/:projectSlug", () -> CommunityProjectRoutes.bySlug(service))
+        server.get("/me/community-projects", () -> CommunityProjectRoutes.mine(service))
+        server.post("/community-projects", () -> CommunityProjectRoutes.submit(service))
+        server.patch("/community-projects/:projectId", () -> CommunityProjectRoutes.edit(service))
+        server.delete("/community-projects/:projectId", () -> CommunityProjectRoutes.remove(service))
+        server.post("/community-projects/:projectId/resubmit", () -> CommunityProjectRoutes.resubmit(service))
+        server.get("/moderation/community-projects", () -> CommunityProjectRoutes.pending(service, moderators))
+        server.post("/moderation/community-projects/:projectId/approve", () -> CommunityProjectRoutes.approve(service, moderators))
+        server.post("/moderation/community-projects/:projectId/reject", () -> CommunityProjectRoutes.reject(service, moderators))
+        server.post("/admin/community-projects/:projectId/suspend", () -> CommunityProjectRoutes.suspend(service))
+        server.post("/admin/community-projects/:projectId/unsuspend", () -> CommunityProjectRoutes.unsuspend(service))
+    }
+    static String catalog(service: CommunityProjectService) {
+        var size = CommunityProjectRules.clamp(Req.queryInt("limit", 24), 1, 48)
+        var offset = CommunityProjectRoutes.parseCursor(Req.queryStr("cursor", ""))
+        var page = service.search(Req.queryStr("query", ""), Req.queryStr("order", ""), size, offset)
+        var items = CommunityProjectRoutes.views(service, page.items(), Auth.viewerIdOrNull())
+        return json.encode(CommunityProjectPageView(items, CommunityProjectRoutes.nextCursor(page.hasMore(), offset + size)))
+    }
+    static String byUser(service: CommunityProjectService) {
+        var viewer = Auth.viewerIdOrNull()
+        return json.encode(CommunityProjectRoutes.views(service, service.publishedByUser(Req.pathParam("username")), viewer))
+    }
+    static String bySlug(service: CommunityProjectService) {
+        var viewer = Auth.viewerIdOrNull()
+        var project = service.byUserAndSlug(Req.pathParam("username"), Req.pathParam("projectSlug"), viewer)
+        return json.encode(CommunityProjectRules.view(project, service.usernameOf(project.userId()), viewer))
+    }
+    static String mine(service: CommunityProjectService) {
+        var userId = Auth.requireUser()
+        return json.encode(CommunityProjectRoutes.views(service, service.ownedBy(userId), userId))
+    }
+    static String submit(service: CommunityProjectService) {
+        var userId = Auth.requireUser()
+        var body = CommunityProjectRoutes.submitBody()
+        var project = service.submit(userId, body.slug(), body.title(), body.description(), body.shortDescription(), body.cover(), body.url(), body.repoUrl(), body.tags(), body.category())
+        return json.encode(CommunityProjectRules.view(project, service.usernameOf(userId), userId))
+    }
+    static String edit(service: CommunityProjectService) {
+        var userId = Auth.requireUser()
+        var body = CommunityProjectRoutes.submitBody()
+        var project = service.edit(Req.pathParam("projectId"), userId, body.title(), body.description(), body.shortDescription(), body.cover(), body.url(), body.repoUrl(), body.tags(), body.category(), body.slug())
+        return json.encode(CommunityProjectRules.view(project, service.usernameOf(userId), userId))
+    }
+    static String remove(service: CommunityProjectService) {
+        var userId = Auth.requireUser()
+        var id = Req.pathParam("projectId")
+        service.remove(id, userId)
+        return json.encode(CommunityProjectStatusView(id, "DELETED"))
+    }
+    static String resubmit(service: CommunityProjectService) {
+        var userId = Auth.requireUser()
+        return CommunityProjectRoutes.statusBody(service.resubmit(Req.pathParam("projectId"), userId))
+    }
+    static String pending(service: CommunityProjectService, moderators: CommunityProjectModerators) {
+        CommunityProjectRoutes.requireModerator(Auth.requireUser(), moderators)
+        return json.encode(CommunityProjectRoutes.views(service, service.pending(Req.queryInt("limit", 30)), null))
+    }
+    static String approve(service: CommunityProjectService, moderators: CommunityProjectModerators) {
+        var userId = Auth.requireUser()
+        CommunityProjectRoutes.requireModerator(userId, moderators)
+        return CommunityProjectRoutes.statusBody(service.approve(Req.pathParam("projectId"), userId, CommunityProjectRoutes.optionalNote()))
+    }
+    // The reject body is required (400 without one), like @RequestBody in Java.
+    static String reject(service: CommunityProjectService, moderators: CommunityProjectModerators) {
+        var userId = Auth.requireUser()
+        CommunityProjectRoutes.requireModerator(userId, moderators)
+        if (Req.bodyText().trim().length() == 0) {
+            throw Errors.badRequest()
+        }
+        return CommunityProjectRoutes.statusBody(service.reject(Req.pathParam("projectId"), userId, CommunityProjectRoutes.optionalNote()))
+    }
+    static String suspend(service: CommunityProjectService) {
+        var userId = Auth.requireAdmin()
+        return CommunityProjectRoutes.statusBody(service.suspend(Req.pathParam("projectId"), userId, CommunityProjectRoutes.optionalNote()))
+    }
+    static String unsuspend(service: CommunityProjectService) {
+        var userId = Auth.requireAdmin()
+        return CommunityProjectRoutes.statusBody(service.unsuspend(Req.pathParam("projectId"), userId))
+    }
+    // Admins and approved moderators; the message is the Java one.
+    static requireModerator(userId: String, moderators: CommunityProjectModerators) {
+        var guard = Auth.adminGuard
+        if (guard != null) {
+            if (guard.isAdmin(userId)) {
+                return
+            }
+        }
+        if (moderators.isApprovedModerator(userId)) {
+            return
+        }
+        throw Errors.api(403, "FORBIDDEN", "Acesso restrito à moderação.")
+    }
+    static String statusBody(p: CommunityProject) = json.encode(CommunityProjectStatusView(p.id(), p.status()))
+    // One query for the creators' usernames of the whole list.
+    static List<CommunityProjectView> views(service: CommunityProjectService, list: List<CommunityProject>, viewerId: String?) {
+        var ids = new java.util.ArrayList<String>()
+        for (var p in list) {
+            if (!ids.contains(p.userId())) {
+                ids.add(p.userId())
+            }
+        }
+        var names = service.usernamesOf(ids)
+        var out = new java.util.ArrayList<CommunityProjectView>()
+        for (var p in list) {
+            out.add(CommunityProjectRules.view(p, names.get(p.userId()), viewerId))
+        }
+        return out
+    }
+    static String? nextCursor(hasMore: Bool, next: Int) {
+        if (!hasMore) {
+            return null
+        }
+        return "" + next
+    }
+    // Offset cursor: blank or malformed means the first page.
+    static Int parseCursor(cursor: String) {
+        if (cursor.trim().length() == 0) {
+            return 0
+        }
+        try {
+            return CommunityProjectRules.clamp(Integer.parseInt(cursor.trim()), 0, 2147483647)
+        } catch (String e) {
+            return 0
+        }
+    }
+    static CommunityProjectSubmitBody submitBody() {
+        try {
+            return json.decode<CommunityProjectSubmitBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String? optionalNote() {
+        if (Req.bodyText().trim().length() == 0) {
+            return null
+        }
+        try {
+            return json.decode<CommunityProjectReviewBody>(Req.bodyText()).note()
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

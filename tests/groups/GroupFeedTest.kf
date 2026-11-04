@@ -1,0 +1,85 @@
+import kernel.db.*
+import kernel.testkit.*
+import groups.*
+
+// Port of GroupFeedTests: topics and the private feed of the group.
+test "a visitor sees neither topics nor posts" {
+    var owner = GroupsTestKit.login("gfeed-dono")
+    var stranger = GroupsTestKit.login("gfeed-estranho")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Fechado Feed", "OPEN")
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    Check.status(GroupsTestKit.get("/groups/" + groupId + "/topics", stranger), 403)
+    Check.status(GroupsTestKit.get("/groups/" + groupId + "/posts", stranger), 403)
+    // Without a session neither.
+    Check.status(GroupsTestKit.get("/groups/" + groupId + "/topics", null), 401)
+    // And does not publish.
+    Check.status(GroupsTestKit.publishRaw(stranger, groupId, topicId, "nao deveria entrar"), 403)
+}
+
+test "a member publishes but does not administer topics" {
+    var owner = GroupsTestKit.login("gfeed-dono2")
+    var member = GroupsTestKit.login("gfeed-membro2")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Membro Feed", "OPEN")
+    GroupsTestKit.joinOk(member, groupId)
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Duvidas")
+    var published = GroupsTestKit.publishRaw(member, groupId, topicId, "Minha duvida no grupo")
+    Check.status(published, 201)
+    Check.jsonEq(published, "authorUsername", "gfeed-membro2")
+    Check.jsonEq(published, "topicId", topicId)
+    // A member does not create a topic.
+    Check.status(GroupsTestKit.post("/groups/" + groupId + "/topics", member, "{\"name\":\"Nao posso\"}"), 403)
+    // Listing by topic returns the post.
+    var list = GroupsTestKit.get("/groups/" + groupId + "/posts?topicId=" + topicId, member)
+    Check.status(list, 200)
+    Check.eqInt("posts", 1, list.jsonSize("items"))
+    Check.jsonEq(list, "items.0.content", "Minha duvida no grupo")
+}
+
+test "a group post does not leak into the main feed tables" {
+    var owner = GroupsTestKit.login("gfeed-dono3")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Isolado", "OPEN")
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    var marker = "conteudo-secreto-do-grupo-isolado"
+    GroupsTestKit.publish(owner, groupId, topicId, marker)
+    // Structural isolation: the text lives only in group_posts; the posts of the main feed (and so
+    // /feed, public search and profiles) never see it.
+    var db = GroupsTestKit.db()
+    assert(db.queryLong("select count(*) from group_posts where content = ?", DbParams().bindStr(marker)) == 1L)
+    assert(db.queryLong("select count(*) from posts where content like ?", DbParams().bindStr("%" + marker + "%")) == 0L)
+}
+
+test "a topic of another group and an archived one are refused" {
+    var owner = GroupsTestKit.login("gfeed-dono4")
+    var member = GroupsTestKit.login("gfeed-membro4")
+    var groupA = GroupsTestKit.createGroup(owner, "Grupo A Feed", "OPEN")
+    var groupB = GroupsTestKit.createGroup(owner, "Grupo B Feed", "OPEN")
+    GroupsTestKit.joinOk(member, groupA)
+    var topicOfB = GroupsTestKit.createTopic(owner, groupB, "Geral B")
+    // A topic of another group: 404, not "publishes in the wrong group".
+    Check.apiError(GroupsTestKit.publishRaw(member, groupA, topicOfB, "cruzando grupos"), 404, "TOPIC_NOT_FOUND")
+    // An archived topic does not take posts.
+    var topicOfA = GroupsTestKit.createTopic(owner, groupA, "Avisos")
+    var archived = GroupsTestKit.post("/groups/" + groupA + "/topics/" + topicOfA + "/archive", owner, "")
+    Check.status(archived, 200)
+    Check.jsonEq(archived, "status", "ARCHIVED")
+    Check.apiError(GroupsTestKit.publishRaw(member, groupA, topicOfA, "topico arquivado"), 409, "TOPIC_ARCHIVED")
+}
+
+test "reordering demands the complete order of the group" {
+    var owner = GroupsTestKit.login("gfeed-dono5")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Ordem", "OPEN")
+    var first = GroupsTestKit.createTopic(owner, groupId, "Primeiro")
+    var second = GroupsTestKit.createTopic(owner, groupId, "Segundo")
+    // An incomplete order is refused.
+    Check.apiError(GroupsTestKit.post("/groups/" + groupId + "/topics/reorder", owner, "{\"topicIds\":[\"" + first + "\"]}"), 400, "INVALID_ORDER")
+    // The complete order inverts.
+    var reordered = GroupsTestKit.post("/groups/" + groupId + "/topics/reorder", owner, "{\"topicIds\":[\"" + second + "\",\"" + first + "\"]}")
+    Check.status(reordered, 200)
+    Check.jsonEq(reordered, "items.0.id", second)
+    Check.jsonEq(reordered, "items.0.position", "0")
+    // Renaming a topic works (and a repeated name is refused).
+    var renamed = GroupsTestKit.patch("/groups/" + groupId + "/topics/" + first, owner, "{\"name\":\"Renomeado\"}")
+    Check.status(renamed, 200)
+    Check.jsonEq(renamed, "name", "Renomeado")
+    Check.apiError(GroupsTestKit.patch("/groups/" + groupId + "/topics/" + first, owner, "{\"name\":\"Segundo\"}"), 409, "TOPIC_EXISTS")
+}

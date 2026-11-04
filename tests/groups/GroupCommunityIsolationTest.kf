@@ -1,0 +1,29 @@
+import communities.*
+import kernel.testkit.*
+import kernel.time.*
+import groups.*
+
+// Port of GroupCommunityIsolationTests (criterion 11, section 21): isolation between Groups and
+// Communities. They use separate structures (posts/community vs group_posts/group); each read path is
+// proven with marked content and each one brings its own (no "empty for the wrong reason"). The
+// community post is seeded in `posts` as the feed leaves it (POST /feed/posts belongs to the feed port).
+test "the community feed and the group feed do not mix" {
+    var owner = GroupsTestKit.login("gci-dono")
+    var community = GroupsTestKit.post("/communities", owner, "{\"name\":\"Comunidade Isolada\"}")
+    Check.status(community, 201)
+    var communityId = community.json("id")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Isolado", "OPEN")
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    var communityMarker = "marcador-que-pertence-a-comunidade"
+    var groupMarker = "marcador-que-pertence-ao-grupo"
+    CommunityTestApp.seedPost(GroupsTestKit.app(), "gci-post-comunidade", owner, communityId, GroupNil.str(), communityMarker, "ACTIVE", Time.nowIso())
+    GroupsTestKit.publish(owner, groupId, topicId, groupMarker)
+    var communityFeed = GroupsTestKit.get("/communities/" + communityId + "/feed", owner)
+    Check.status(communityFeed, 200)
+    assert(communityFeed.body.contains(communityMarker))
+    assert(!communityFeed.body.contains(groupMarker))
+    var groupFeed = GroupsTestKit.get("/groups/" + groupId + "/posts", owner)
+    Check.status(groupFeed, 200)
+    assert(groupFeed.body.contains(groupMarker))
+    assert(!groupFeed.body.contains(communityMarker))
+}

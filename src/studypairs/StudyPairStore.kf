@@ -1,0 +1,131 @@
+package studypairs
+
+import kernel.db.*
+import kernel.error.*
+
+// Plain SQL on study_pair_requests, study_pairs, study_checkins and study_pair_reminders (V216, V228).
+class StudyPairStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String requestColumns() = "id, user_id, goal_key, goal_text, topic, status, created_at"
+    static String pairColumns() = "id, user_a, user_b, goal_key, goal_text, topic, status, started_at, ended_at"
+    static String checkinColumns() = "pair_id, user_id, week_key, note, created_at, updated_at"
+    // The users row is only a handle: two concurrent requests for the same person line up here.
+    lockUser(userId: String) {
+        store.queryList("select id from users where id = ? for update", DbParams().bindStr(userId))
+    }
+    saveRequest(r: StudyPairRequest) {
+        store.execute("insert into study_pair_requests (" + StudyPairStore.requestColumns() + ", open_user_id) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(r.id()).bindStr(r.userId()).bindStr(r.goalKey()).bindStr(r.goalText()).bindStrOrNull(r.topic()).bindStr(r.status()).bindInstant(r.createdAt()).bindStrOrNull(this.openUserOf(r)))
+    }
+    String? openUserOf(r: StudyPairRequest) {
+        if (r.status() == "OPEN") {
+            return r.userId()
+        }
+        return null
+    }
+    StudyPairRequest? findOpenRequest(userId: String) {
+        var rows = this.requests("select " + StudyPairStore.requestColumns() + " from study_pair_requests where user_id = ? and status = \'OPEN\' order by created_at", DbParams().bindStr(userId))
+        if (rows.size() == 0) {
+            return null
+        }
+        return rows.get(0)
+    }
+    List<StudyPairRequest> findOpenByGoal(goalKey: String, limit: Int) = this.requests("select " + StudyPairStore.requestColumns() + " from study_pair_requests where goal_key = ? and status = \'OPEN\' order by created_at, id limit ?", DbParams().bindStr(goalKey).bindInt(limit))
+    // goal_key is stored folded; the topic is a taxonomy constant ("QUALIDADE_VIDA"), so the underscore
+    // is folded to a dash before the comparison and "qualidade" still finds it.
+    List<StudyPairRequest> searchOpenRequests(term: String, limit: Int) {
+        var like = "%" + term + "%"
+        return this.requests("select " + StudyPairStore.requestColumns() + " from study_pair_requests where status = \'OPEN\' and (goal_key like ? or replace(lower(coalesce(topic, \'\')), \'_\', \'-\') like ?) order by created_at, id limit ?", DbParams().bindStr(like).bindStr(like).bindInt(limit))
+    }
+    // Atomic claim of an OPEN request.
+    Bool closeOpenRequest(requestId: String, status: String) = store.execute("update study_pair_requests set status = ?, open_user_id = null where id = ? and status = \'OPEN\'", DbParams().bindStr(status).bindStr(requestId)) == 1
+    savePair(p: StudyPair) {
+        store.execute("insert into study_pairs (" + StudyPairStore.pairColumns() + ", active_pair_key) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(p.id()).bindStr(p.userA()).bindStr(p.userB()).bindStr(p.goalKey()).bindStr(p.goalText()).bindStrOrNull(p.topic()).bindStr(p.status()).bindInstant(p.startedAt()).bindInstantOrNull(p.endedAt()).bindStrOrNull(this.activePairKey(p)))
+    }
+    String? activePairKey(p: StudyPair) {
+        if (p.status() != "ACTIVE") {
+            return null
+        }
+        if (p.userA().compareTo(p.userB()) <= 0) {
+            return p.userA() + ":" + p.userB()
+        }
+        return p.userB() + ":" + p.userA()
+    }
+    StudyPair? findPair(pairId: String) {
+        var rows = this.pairs("select " + StudyPairStore.pairColumns() + " from study_pairs where id = ?", DbParams().bindStr(pairId))
+        if (rows.size() == 0) {
+            return null
+        }
+        return rows.get(0)
+    }
+    List<StudyPair> findActivePairs(userId: String) = this.pairs("select " + StudyPairStore.pairColumns() + " from study_pairs where status = \'ACTIVE\' and (user_a = ? or user_b = ?) order by started_at", DbParams().bindStr(userId).bindStr(userId))
+    List<StudyPair> findAllActivePairs() = this.pairs("select " + StudyPairStore.pairColumns() + " from study_pairs where status = \'ACTIVE\'", DbParams())
+    Bool endPair(pairId: String, endedAt: String) = store.execute("update study_pairs set status = \'ENDED\', ended_at = ?, active_pair_key = null where id = ? and status = \'ACTIVE\'", DbParams().bindInstant(endedAt).bindStr(pairId)) == 1
+    StudyCheckin? findCheckin(pairId: String, userId: String, weekKey: String) {
+        var rows = this.checkins("select " + StudyPairStore.checkinColumns() + " from study_checkins where pair_id = ? and user_id = ? and week_key = ?", DbParams().bindStr(pairId).bindStr(userId).bindStr(weekKey))
+        if (rows.size() == 0) {
+            return null
+        }
+        return rows.get(0)
+    }
+    insertCheckin(c: StudyCheckin) {
+        store.execute("insert into study_checkins (" + StudyPairStore.checkinColumns() + ") values (?, ?, ?, ?, ?, ?)", DbParams().bindStr(c.pairId()).bindStr(c.userId()).bindStr(c.weekKey()).bindStrOrNull(c.note()).bindInstant(c.createdAt()).bindInstant(c.updatedAt()))
+    }
+    updateCheckinNote(pairId: String, userId: String, weekKey: String, note: String, updatedAt: String) {
+        store.execute("update study_checkins set note = ?, updated_at = ? where pair_id = ? and user_id = ? and week_key = ?", DbParams().bindStr(note).bindInstant(updatedAt).bindStr(pairId).bindStr(userId).bindStr(weekKey))
+    }
+    List<StudyCheckin> findCheckins(pairId: String, weekKeys: List<String>) {
+        if (weekKeys.size() == 0) {
+            return listOf<StudyCheckin>()
+        }
+        var params = DbParams().bindStr(pairId)
+        for (var w in weekKeys) {
+            params.bindStr(w)
+        }
+        return this.checkins("select " + StudyPairStore.checkinColumns() + " from study_checkins where pair_id = ? and week_key in (" + StudyPairSql.marks(weekKeys.size()) + ") order by week_key desc, created_at", params)
+    }
+    List<StudyPairPopularGoal> popularOpenGoals(limit: Int) {
+        var out = listOf<StudyPairPopularGoal>()
+        for (var r in store.queryList("select goal_key, min(goal_text) as goal_text, max(topic) as topic, count(*) as open_requests from study_pair_requests where status = \'OPEN\' group by goal_key order by open_requests desc, goal_key limit ?", DbParams().bindInt(limit))) {
+            out.add(StudyPairPopularGoal(r.getStr("goal_key"), r.getStr("goal_text"), r.getStrOrNull("topic"), r.getInt("open_requests")))
+        }
+        return out
+    }
+    // The insert is the claim: every replica runs the cron, only one row wins.
+    Bool claimReminder(pairId: String, userId: String, weekKey: String, at: String) {
+        var claimed = true
+        try {
+            store.execute("insert into study_pair_reminders (pair_id, user_id, week_key, created_at) values (?, ?, ?, ?)", DbParams().bindStr(pairId).bindStr(userId).bindStr(weekKey).bindInstant(at))
+        } catch (String e) {
+            if (!Errors.hasCode(e, "CONFLICT")) {
+                throw e
+            }
+            claimed = false
+        }
+        return claimed
+    }
+    // Rows are mapped in loops: a lambda returning a record of a package fails at runtime (KOF_GAPS G196).
+    List<StudyPairRequest> requests(sql: String, p: DbParams) {
+        var out = listOf<StudyPairRequest>()
+        for (var r in store.queryList(sql, p)) {
+            out.add(StudyPairRequest(r.getStr("id"), r.getStr("user_id"), r.getStr("goal_key"), r.getStr("goal_text"), r.getStrOrNull("topic"), r.getStr("status"), r.getInstant("created_at")))
+        }
+        return out
+    }
+    List<StudyPair> pairs(sql: String, p: DbParams) {
+        var out = listOf<StudyPair>()
+        for (var r in store.queryList(sql, p)) {
+            out.add(StudyPair(r.getStr("id"), r.getStr("user_a"), r.getStr("user_b"), r.getStr("goal_key"), r.getStr("goal_text"), r.getStrOrNull("topic"), r.getStr("status"), r.getInstant("started_at"), r.getInstantOrNull("ended_at")))
+        }
+        return out
+    }
+    List<StudyCheckin> checkins(sql: String, p: DbParams) {
+        var out = listOf<StudyCheckin>()
+        for (var r in store.queryList(sql, p)) {
+            out.add(StudyCheckin(r.getStr("pair_id"), r.getStr("user_id"), r.getStr("week_key"), r.getStrOrNull("note"), r.getInstant("created_at"), r.getInstant("updated_at")))
+        }
+        return out
+    }
+}

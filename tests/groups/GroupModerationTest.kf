@@ -1,0 +1,73 @@
+import kernel.testkit.*
+import groups.*
+
+// Port of GroupModerationTests: local moderation of the group.
+test "the author deletes their own and another member does not" {
+    var owner = GroupsTestKit.login("gmod-dono")
+    var member = GroupsTestKit.login("gmod-membro")
+    var other = GroupsTestKit.login("gmod-outro")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Moderacao", "OPEN")
+    GroupsTestKit.joinOk(member, groupId)
+    GroupsTestKit.joinOk(other, groupId)
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    var postOfMember = GroupsTestKit.publish(member, groupId, topicId, "Post do membro")
+    Check.status(GroupsTestKit.delete("/groups/" + groupId + "/posts/" + postOfMember, other), 403)
+    var removed = GroupsTestKit.delete("/groups/" + groupId + "/posts/" + postOfMember, member)
+    Check.status(removed, 200)
+    Check.jsonEq(removed, "status", "REMOVED")
+    Check.eqInt("posts left", 0, GroupsTestKit.get("/groups/" + groupId + "/posts", owner).jsonSize("items"))
+}
+
+test "the administration removes a comment and the counter follows" {
+    var owner = GroupsTestKit.login("gmod-dono2")
+    var member = GroupsTestKit.login("gmod-membro2")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Comentarios", "OPEN")
+    GroupsTestKit.joinOk(member, groupId)
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    var postId = GroupsTestKit.publish(owner, groupId, topicId, "Post para moderar")
+    var commentId = GroupsTestKit.comment(member, groupId, postId, "Comentario removivel", null)
+    Check.status(GroupsTestKit.delete("/groups/" + groupId + "/posts/" + postId + "/comments/" + commentId, owner), 200)
+    Check.eqInt("comments left", 0, GroupsTestKit.get("/groups/" + groupId + "/posts/" + postId + "/comments", owner).jsonSize("items"))
+    Check.jsonEq(GroupsTestKit.get("/groups/" + groupId + "/posts", owner), "items.0.comments", "0")
+}
+
+test "only the author edits their own comment" {
+    var owner = GroupsTestKit.login("gmod-dono4")
+    var member = GroupsTestKit.login("gmod-membro4")
+    var other = GroupsTestKit.login("gmod-outro4")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Edicao", "OPEN")
+    GroupsTestKit.joinOk(member, groupId)
+    GroupsTestKit.joinOk(other, groupId)
+    var topicId = GroupsTestKit.createTopic(owner, groupId, "Geral")
+    var postId = GroupsTestKit.publish(owner, groupId, topicId, "Post para editar")
+    var commentId = GroupsTestKit.comment(member, groupId, postId, "Comentario original", null)
+    var path = "/groups/" + groupId + "/posts/" + postId + "/comments/" + commentId
+    Check.status(GroupsTestKit.patch(path, other, "{\"content\":\"tentativa\"}"), 403)
+    // Who moderates removes, but does not rewrite what the other said.
+    Check.status(GroupsTestKit.patch(path, owner, "{\"content\":\"tentativa\"}"), 403)
+    Check.status(GroupsTestKit.patch(path, member, "{\"content\":\"   \"}"), 400)
+    var edited = GroupsTestKit.patch(path, member, "{\"content\":\"Comentario corrigido\"}")
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "id", commentId)
+    Check.jsonEq(edited, "content", "Comentario corrigido")
+    var list = GroupsTestKit.get("/groups/" + groupId + "/posts/" + postId + "/comments", owner)
+    Check.eqInt("comments", 1, list.jsonSize("items"))
+    Check.jsonEq(list, "items.0.content", "Comentario corrigido")
+    Check.status(GroupsTestKit.delete(path, member), 200)
+    Check.status(GroupsTestKit.patch(path, member, "{\"content\":\"tarde demais\"}"), 404)
+}
+
+test "the owner closes the group and it disappears for reading" {
+    var owner = GroupsTestKit.login("gmod-dono3")
+    var member = GroupsTestKit.login("gmod-membro3")
+    var groupId = GroupsTestKit.createGroup(owner, "Grupo Encerrado", "OPEN")
+    GroupsTestKit.joinOk(member, groupId)
+    Check.status(GroupsTestKit.post("/groups/" + groupId + "/close", member, ""), 403)
+    var closed = GroupsTestKit.post("/groups/" + groupId + "/close", owner, "")
+    Check.status(closed, 200)
+    Check.jsonEq(closed, "status", "CLOSED")
+    var list = GroupsTestKit.get("/groups?query=Encerrado", null)
+    Check.status(list, 200)
+    Check.eqInt("discovery", 0, list.jsonSize("items"))
+    Check.status(GroupsTestKit.get("/groups/" + groupId + "/topics", owner), 404)
+}

@@ -1,0 +1,61 @@
+package communityprojects
+
+import kernel.db.*
+
+// Caller-owned seams (PORTING_GUIDE). The defaults read the owners' tables read-only with the same SQL
+// the owners use; the owner subclasses them when ported and Main.kf passes the subclass in.
+// pending-port: profile. UserProfileRepository.findById/findByUsername/findAllByIds, reduced to the
+// one column this domain shows (users.username).
+class CommunityProjectProfiles {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // Username of an account, null when the account does not exist.
+    String? usernameOf(userId: String) {
+        var row = store.queryOptional("select username from users where id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return row.getStrOrNull("username")
+    }
+    // Account id of a username (exact match), null when nobody has it.
+    String? idOfUsername(username: String) {
+        var row = store.queryOptional("select id from users where username = ?", DbParams().bindStr(username))
+        if (row == null) {
+            return null
+        }
+        return row.getStr("id")
+    }
+    // id -> username for a whole list in one query (no N+1).
+    Map<String,String> usernamesOf(userIds: List<String>) {
+        var names = new java.util.HashMap<String, String>()
+        if (userIds.size() == 0) {
+            return names
+        }
+        var marks = new java.util.ArrayList<String>()
+        var params = DbParams()
+        for (var id in userIds) {
+            marks.add("?")
+            params.bindStr(id)
+        }
+        var rows = store.queryList("select id, username from users where id in (" + String.join(",", marks) + ")", params)
+        for (var row in rows) {
+            var name = row.getStrOrNull("username")
+            if (name != null) {
+                names.put(row.getStr("id"), name)
+            }
+        }
+        return names
+    }
+}
+
+// pending-port: moderation. ModeratorApplicationRepository.findApprovedByUser (moderator_applications).
+class CommunityProjectModerators {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // Does the account have an APPROVED moderator application?
+    Bool isApprovedModerator(userId: String) = store.queryLong("select count(*) from moderator_applications where user_id = ? and status = \'APPROVED\'", DbParams().bindStr(userId)) > 0L
+}

@@ -1,0 +1,34 @@
+package communities
+
+import kernel.*
+import kernel.http.*
+import kernel.security.*
+
+// Entry point of the communities domain: builds stores, services and routes and returns the module so
+// other domains can use `directory` / `channelDirectory` (the feed's PostCommunityReader and
+// CommunityChannelReader) and `service`.
+//
+//   var communities = CommunitiesModule.install(platform, shared, hooks)
+//   // seams with another owner: CommunitiesModule.installWith(platform, shared, hooks, profiles, feed, coins)
+class CommunitiesModule {
+    CommunityService service
+    CommunityChannelService channelService
+    CommunityDirectory directory
+    CommunityChannelDirectory channelDirectory
+    public constructor(service: CommunityService, channelService: CommunityChannelService, directory: CommunityDirectory, channelDirectory: CommunityChannelDirectory) {
+        this.service = service
+        this.channelService = channelService
+        this.directory = directory
+        this.channelDirectory = channelDirectory
+    }
+    static CommunitiesModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks) = CommunitiesModule.installWith(platform, shared, hooks, CommunityProfileLookup(platform.db), CommunityFeedLookup(platform.db), CommunityCoins())
+    static CommunitiesModule installWith(platform: Platform, shared: SharedServices, hooks: SecurityHooks, profiles: CommunityProfileLookup, feed: CommunityFeedLookup, coins: CommunityCoins) {
+        var store = CommunityStore(platform.db)
+        var channels = CommunityChannelStore(platform.db)
+        var service = CommunityService(store, feed, shared.sanctionReader, shared.suspiciousText, coins)
+        var channelService = CommunityChannelService(channels, service)
+        var admin = AdminGuard(platform.db, platform.cfg)
+        CommunityRoutes.register(platform.server, service, channelService, shared.idempotency, profiles, feed, admin)
+        return CommunitiesModule(service, channelService, CommunityDirectory(store), CommunityChannelDirectory(channels))
+    }
+}

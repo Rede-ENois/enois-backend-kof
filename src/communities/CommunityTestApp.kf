@@ -1,0 +1,77 @@
+package communities
+
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Test support for the communities suites (like kernel.testkit.SecurityApp): a booted platform with the
+// whole request pipeline and the communities module, plus fixtures. One app per test file.
+class CommunityTestApp {
+    static CommunitiesModule? moduleSlot = null
+    static TestApp? sharedAppSlot = null
+    // One booted app per test file (a file is one process).
+    static TestApp app() {
+        var cur = CommunityTestApp.sharedAppSlot
+        if (cur != null) {
+            return cur
+        }
+        var created = CommunityTestApp.boot("communities")
+        CommunityTestApp.sharedAppSlot = created
+        return created
+    }
+    static TestApp boot(name: String) = TestApp.bootWith(name, mapOf("REDE_ORIGINS_ENFORCE", "false"), (p: Platform) -> CommunityTestApp.wire(p))
+    static wire(p: Platform) {
+        var shared = SharedServices.create(p)
+        var hooks = SecurityHooks.defaults(p.db)
+        Security.install(p, hooks)
+        CommunityTestApp.moduleSlot = CommunitiesModule.install(p, shared, hooks)
+        // The scheduler threads are not daemons: stopped here, or the test process (and the suite runner) never exits.
+        shared.stop()
+    }
+    static CommunitiesModule module() {
+        var m = CommunityTestApp.moduleSlot
+        if (m == null) {
+            throw "CommunityTestApp: boot first"
+        }
+        return m
+    }
+    // A verified user whose id and username are `name`, with a live session; returns the token.
+    static String login(app: TestApp, name: String) {
+        var token = "tok-" + name + "-1234567890"
+        SecurityFixtures.login(app.db(), name, token)
+        return token
+    }
+    // JSON of a request body without escaping by hand.
+    static String body(name: String?, description: String?, topic: String?, city: String?, state: String?) = json.encode(CommunityBody(name, description, topic, CommunityNull.str(), CommunityNull.str(), CommunityNull.str(), city, state))
+    // Ids of `items`, in order.
+    static List<String> itemIds(res: TestResponse) {
+        var out = listOf<String>()
+        var i = 0
+        while (i < res.jsonSize("items")) {
+            out.add(res.json("items." + i + ".id"))
+            i = i + 1
+        }
+        return out
+    }
+    // `ids` filtered to the ones in `mine`, keeping the order of `ids`.
+    static List<String> only(ids: List<String>, mine: List<String>) = ids.filter((id: String) -> mine.contains(id))
+    static List<String> auth(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+    // An authenticated write with an Idempotency-Key.
+    static TestResponse write(app: TestApp, method: String, path: String, token: String, key: String, body: String) = app.client.send(method, path, listOf("X-Session-Token: " + token, "Idempotency-Key: " + key, "Content-Type: application/json"), "", body)
+    static TestResponse read(app: TestApp, path: String, token: String) = app.client.getWith(path, listOf("X-Session-Token: " + token))
+    // Creates a community and returns its id.
+    static String create(app: TestApp, token: String, key: String, body: String) {
+        var res = CommunityTestApp.write(app, "POST", "/communities", token, key, body)
+        Check.status(res, 201)
+        return res.json("id")
+    }
+    static joinCommunity(app: TestApp, token: String, key: String, communityId: String) {
+        Check.status(CommunityTestApp.write(app, "POST", "/communities/" + communityId + "/members", token, key, ""), 200)
+    }
+    // A row of `posts` as the feed would leave it.
+    static seedPost(app: TestApp, id: String, authorId: String, communityId: String?, channelId: String?, content: String, status: String, createdAt: String) {
+        app.db().execute("insert into posts (id, author_id, type, content, created_at, visibility, reactions, comments, saves, shares, status, community_id, channel_id) values (?, ?, \'INSIGHT\', ?, ?, \'PUBLIC\', 0, 0, 0, 0, ?, ?, ?)", DbParams().bindStr(id).bindStr(authorId).bindStr(content).bindInstant(createdAt).bindStr(status).bindStrOrNull(communityId).bindStrOrNull(channelId))
+    }
+}

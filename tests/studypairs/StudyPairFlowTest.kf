@@ -1,0 +1,421 @@
+import kernel.*
+import kernel.db.*
+import kernel.id.*
+import kernel.jobs.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import studypairs.*
+
+// Port of StudyPairFlowTests (MockMvc) as HTTP-level tests on a booted app: the real request pipeline
+// (Security.install), shared services and the study pairs module over H2 with every migration.
+class SpFlowHolder {
+    static TestApp? spFlowCache = null
+    static StudyPairsModule? spFlowModule = null
+    static SharedServices? spFlowShared = null
+}
+
+spFlowWire(p: Platform) {
+    SecurityClock.reset()
+    var hooks = SecurityHooks.defaults(p.db)
+    Security.install(p, hooks)
+    var shared = SharedServices.create(p)
+    SpFlowHolder.spFlowShared = shared
+    SpFlowHolder.spFlowModule = StudyPairsModule.install(p, shared, hooks)
+    // The scheduler threads are not daemons: stopped here, or the test process (and the suite runner) never exits.
+    shared.stop()
+}
+
+TestApp spApp() {
+    var cur = SpFlowHolder.spFlowCache
+    if (cur != null) {
+        return cur
+    }
+    var created = TestApp.bootWith("studypairs", mapOf("REDE_ORIGINS_ENFORCE", "false", "GLOBAL_RATE_LIMIT_PER_MINUTE", "0", "POST_USER_RATE_LIMIT", "100000", "POST_IP_RATE_LIMIT", "100000"), (p: Platform) -> spFlowWire(p))
+    SpFlowHolder.spFlowCache = created
+    return created
+}
+
+StudyPairService spService() {
+    spApp()
+    var m = SpFlowHolder.spFlowModule
+    if (m == null) {
+        throw "module not wired"
+    }
+    return m.service
+}
+
+Db spDb() = spApp().db()
+
+// A verified adult with a live session; returns the session token.
+String spLogin(id: String) {
+    var token = "tok-" + id + "-1234567890"
+    SecurityFixtures.login(spDb(), id, token)
+    spDb().execute("update users set birth_date = ? where id = ?", DbParams().bindDate("1990-01-01").bindStr(id))
+    return token
+}
+
+TestResponse spSend(method: String, path: String, token: String, body: String) = spApp().client.send(method, path, listOf("X-Session-Token: " + token, "Idempotency-Key: sp-" + Ids.uuid(), "Content-Type: application/json"), "", body)
+
+TestResponse spGet(path: String, token: String) = spApp().client.getWith(path, listOf("X-Session-Token: " + token))
+
+TestResponse spRequest(token: String, goal: String) = spSend("POST", "/study-pairs/requests", token, json.encode(StudyPairGoalRequest(goal, null)))
+
+TestResponse spCheckin(token: String, pairId: String, note: String) = spSend("POST", "/study-pairs/" + pairId + "/checkins", token, json.encode(StudyPairCheckinRequest(note)))
+
+TestResponse spEnd(token: String, pairId: String) = spSend("POST", "/study-pairs/" + pairId + "/end", token, "")
+
+TestResponse spMe(token: String) {
+    var res = spGet("/study-pairs/me", token)
+    Check.status(res, 200)
+    return res
+}
+
+// a asks first (OPEN), b asks the same goal (MATCHED): returns the pair id.
+String spPair(a: String, b: String, goal: String) {
+    var first = spRequest(a, goal)
+    Check.jsonEq(first, "status", "OPEN")
+    var second = spRequest(b, goal)
+    Check.jsonEq(second, "status", "MATCHED")
+    return second.json("pairId")
+}
+
+Long spNotifications(userId: String, kind: String) = spDb().queryLong("select count(*) from notifications where user_id = ? and kind = ?", DbParams().bindStr(userId).bindStr(kind))
+
+spBlock(blocker: String, blocked: String) {
+    spDb().execute("insert into user_blocks (blocker_id, blocked_id, created_at) values (?, ?, ?)", DbParams().bindStr(blocker).bindStr(blocked).bindInstant(Time.nowIso()))
+}
+
+spMute(muter: String, muted: String) {
+    spDb().execute("insert into user_mutes (muter_id, muted_id, created_at, expires_at) values (?, ?, ?, ?)", DbParams().bindStr(muter).bindStr(muted).bindInstant(Time.nowIso()).bindInstantOrNull(null))
+}
+
+// The preferences domain owns PUT /me/preferences: the row it would write is seeded here.
+spDisableModule(userId: String) {
+    spDb().execute("insert into user_preferences (user_id, updated_at, disabled_modules) values (?, ?, ?)", DbParams().bindStr(userId).bindInstant(Time.nowIso()).bindStr("STUDY_PAIRS"))
+}
+
+spSetBirthDate(userId: String, date: String) {
+    spDb().execute("update users set birth_date = ? where id = ?", DbParams().bindDate(date).bindStr(userId))
+}
+
+String spYearsAgo(years: Int) {
+    var today = Time.todayIso()
+    return today.substring(0, 4).toInt() - years + today.substring(4, 10)
+}
+
+test "goal key folds case accents and punctuation and week key is the ISO week" {
+    Check.eqStr("accents", "aprender-rust", StudyGoal.key("  Aprender RÚST!! "))
+    Check.eqStr("case", "aprender-rust", StudyGoal.key("aprender rust"))
+    Check.eqStr("symbols", "", StudyGoal.key("?!"))
+    Check.eqStr("week 44", "2026-W44", StudyGoal.weekKey("2026-10-30"))
+    Check.eqStr("week 53", "2026-W53", StudyGoal.weekKey("2027-01-01"))
+    Check.eqStr("monday", "2026-W45", StudyGoal.weekKey("2026-11-02"))
+    Check.eqStr("year start", "2025-W01", StudyGoal.weekKey("2024-12-30"))
+}
+
+test "matches on the same normalized goal and notifies both" {
+    var a = spLogin("sp-match-a")
+    var b = spLogin("sp-match-b")
+    var first = spRequest(a, "Aprender Rust sp-match")
+    Check.status(first, 201)
+    Check.jsonEq(first, "status", "OPEN")
+    var second = spRequest(b, "aprender rúst SP-MATCH")
+    Check.status(second, 201)
+    Check.jsonEq(second, "status", "MATCHED")
+    var pairId = second.json("pairId")
+    Check.eqInt("matched a", 1, spNotifications("sp-match-a", "STUDY_PAIR_MATCHED") as Int)
+    Check.eqInt("matched b", 1, spNotifications("sp-match-b", "STUDY_PAIR_MATCHED") as Int)
+    var me = spMe(a)
+    Check.isTrue("no open request", me.jsonIsNull("openRequest"))
+    Check.jsonEq(me, "pairs.0.id", pairId)
+    Check.jsonEq(me, "pairs.0.goal", "Aprender Rust sp-match")
+    Check.jsonEq(me, "pairs.0.partner.id", "sp-match-b")
+    Check.jsonEq(me, "pairs.0.myCheckinThisWeek", "false")
+}
+
+test "matches FIFO and never across a block" {
+    var first = spLogin("sp-fifo-first")
+    var blocked = spLogin("sp-fifo-blocked")
+    var third = spLogin("sp-fifo-third")
+    spBlock("sp-fifo-first", "sp-fifo-blocked")
+    Check.jsonEq(spRequest(first, "goal sp-fifo"), "status", "OPEN")
+    // Blocked by the first one: stays waiting instead of pairing.
+    Check.jsonEq(spRequest(blocked, "goal sp-fifo"), "status", "OPEN")
+    Check.jsonEq(spRequest(third, "goal sp-fifo"), "status", "MATCHED")
+    Check.jsonEq(spMe(third), "pairs.0.partner.id", "sp-fifo-first")
+    var mine = spMe(blocked)
+    Check.jsonEq(mine, "openRequest.goal", "goal sp-fifo")
+    Check.eqInt("no pairs", 0, mine.jsonSize("pairs"))
+}
+
+test "minors cannot request and are never matched" {
+    var minor = spLogin("sp-minor-a")
+    spSetBirthDate("sp-minor-a", spYearsAgo(15))
+    Check.apiError(spRequest(minor, "goal sp-minor"), 403, "STUDY_PAIRS_ADULTS_ONLY")
+    // A request left in the queue by someone who is now known to be a minor is skipped.
+    var waiting = spLogin("sp-minor-waiting")
+    var adult = spLogin("sp-minor-adult")
+    Check.jsonEq(spRequest(waiting, "goal sp-minor"), "status", "OPEN")
+    spSetBirthDate("sp-minor-waiting", spYearsAgo(16))
+    Check.jsonEq(spRequest(adult, "goal sp-minor"), "status", "OPEN")
+}
+
+test "an undeclared birth date blocks the request" {
+    var a = spLogin("sp-nobirth-a")
+    spDb().execute("update users set birth_date = null where id = ?", DbParams().bindStr("sp-nobirth-a"))
+    Check.apiError(spRequest(a, "goal sp-nobirth"), 403, "BIRTH_DATE_REQUIRED")
+}
+
+test "one open request at a time and cancel" {
+    var a = spLogin("sp-one-a")
+    Check.status(spRequest(a, "goal sp-one"), 201)
+    Check.apiError(spRequest(a, "other goal sp-one"), 409, "STUDY_REQUEST_ALREADY_OPEN")
+    var cancelled = spSend("DELETE", "/study-pairs/requests/current", a, "")
+    Check.status(cancelled, 200)
+    Check.jsonEq(cancelled, "status", "CANCELLED")
+    Check.status(spSend("DELETE", "/study-pairs/requests/current", a, ""), 404)
+    Check.status(spRequest(a, "other goal sp-one"), 201)
+}
+
+test "blank goal and unknown topic are rejected" {
+    var a = spLogin("sp-invalid-a")
+    Check.apiError(spRequest(a, " ?! "), 400, "STUDY_GOAL_REQUIRED")
+    Check.apiError(spSend("POST", "/study-pairs/requests", a, "{\"goal\":\"goal sp-invalid\",\"topic\":\"NOPE\"}"), 400, "INVALID_TOPIC")
+    Check.status(spSend("POST", "/study-pairs/requests", a, "{\"goal\":\"goal sp-invalid\",\"topic\":\"tecnologia\"}"), 201)
+}
+
+test "at most two active pairs" {
+    var a = spLogin("sp-limit-a")
+    var b = spLogin("sp-limit-b")
+    var c = spLogin("sp-limit-c")
+    spPair(a, b, "goal sp-limit-1")
+    spPair(a, c, "goal sp-limit-2")
+    Check.apiError(spRequest(a, "goal sp-limit-3"), 409, "STUDY_PAIR_LIMIT")
+}
+
+test "check-in once per week, editable, notifies once" {
+    var a = spLogin("sp-checkin-a")
+    var b = spLogin("sp-checkin-b")
+    var pairId = spPair(a, b, "goal sp-checkin")
+    var one = spCheckin(a, pairId, "estudei ownership")
+    Check.status(one, 200)
+    Check.jsonEq(one, "note", "estudei ownership")
+    Check.status(spCheckin(a, pairId, "estudei ownership e borrowing"), 200)
+    Check.eqInt("notified once", 1, spNotifications("sp-checkin-b", "STUDY_PAIR_CHECKIN") as Int)
+    Check.eqInt("one row", 1, spDb().queryLong("select count(*) from study_checkins where pair_id = ? and user_id = ?", DbParams().bindStr(pairId).bindStr("sp-checkin-a")) as Int)
+    var me = spMe(b)
+    Check.jsonEq(me, "pairs.0.partnerCheckinThisWeek", "true")
+    Check.jsonEq(me, "pairs.0.myCheckinThisWeek", "false")
+    Check.jsonEq(me, "pairs.0.checkins.0.note", "estudei ownership e borrowing")
+    Check.apiError(spCheckin(a, pairId, strings.repeat("abc ", 126)), 400, "STUDY_NOTE_TOO_LONG")
+}
+
+test "non members are forbidden" {
+    var a = spLogin("sp-member-a")
+    var b = spLogin("sp-member-b")
+    var outsider = spLogin("sp-member-out")
+    var pairId = spPair(a, b, "goal sp-member")
+    Check.status(spCheckin(outsider, pairId, "oi"), 403)
+    Check.status(spEnd(outsider, pairId), 403)
+    Check.apiError(spEnd(a, "sp_missing"), 404, "STUDY_PAIR_NOT_FOUND")
+}
+
+test "either member ends the pair and the partner is told" {
+    var a = spLogin("sp-end-a")
+    var b = spLogin("sp-end-b")
+    var pairId = spPair(a, b, "goal sp-end")
+    var ended = spEnd(b, pairId)
+    Check.status(ended, 200)
+    Check.jsonEq(ended, "status", "ENDED")
+    Check.eqInt("ended notice", 1, spNotifications("sp-end-a", "STUDY_PAIR_ENDED") as Int)
+    Check.status(spEnd(a, pairId), 409)
+    Check.status(spCheckin(a, pairId, "ainda aqui"), 409)
+    Check.eqInt("no pairs", 0, spMe(a).jsonSize("pairs"))
+}
+
+test "the reminder goes only to members without this week's check-in" {
+    var a = spLogin("sp-remind-a")
+    var b = spLogin("sp-remind-b")
+    var pairId = spPair(a, b, "goal sp-remind")
+    Check.status(spCheckin(a, pairId, "feito"), 200)
+    spService().sendWeeklyReminders()
+    // A second run in the same week (another replica, a restart) sends nothing new.
+    spService().sendWeeklyReminders()
+    Check.eqInt("a", 0, spNotifications("sp-remind-a", "STUDY_PAIR_REMINDER") as Int)
+    Check.eqInt("b", 1, spNotifications("sp-remind-b", "STUDY_PAIR_REMINDER") as Int)
+}
+
+test "a block after the match ends the pair quietly" {
+    var a = spLogin("sp-postblock-a")
+    var b = spLogin("sp-postblock-b")
+    var pairId = spPair(a, b, "goal sp-postblock")
+    spBlock("sp-postblock-a", "sp-postblock-b")
+    Check.status(spCheckin(b, pairId, "oi"), 409)
+    Check.eqInt("no pairs", 0, spMe(b).jsonSize("pairs"))
+    Check.eqInt("quiet", 0, spNotifications("sp-postblock-b", "STUDY_PAIR_ENDED") as Int)
+}
+
+test "a mute in either direction prevents pairing" {
+    var muter = spLogin("sp-mute-muter")
+    var muted = spLogin("sp-mute-muted")
+    spMute("sp-mute-muter", "sp-mute-muted")
+    // The muter waits; the muted one asks later and must not be paired with them.
+    Check.jsonEq(spRequest(muter, "goal sp-mute"), "status", "OPEN")
+    Check.jsonEq(spRequest(muted, "goal sp-mute"), "status", "OPEN")
+}
+
+test "a mute after the match ends the pair quietly" {
+    var a = spLogin("sp-postmute-a")
+    var b = spLogin("sp-postmute-b")
+    var pairId = spPair(a, b, "goal sp-postmute")
+    spMute("sp-postmute-b", "sp-postmute-a")
+    // The muted side (a) is the one asking: the check must look both ways.
+    Check.eqInt("no pairs", 0, spMe(a).jsonSize("pairs"))
+    Check.status(spCheckin(a, pairId, "oi"), 409)
+    Check.eqInt("quiet", 0, spNotifications("sp-postmute-a", "STUDY_PAIR_ENDED") as Int)
+}
+
+test "a disabled module rejects requests, pauses matching and silences reminders" {
+    var off = spLogin("sp-off-a")
+    spDisableModule("sp-off-a")
+    Check.apiError(spRequest(off, "goal sp-off"), 409, "STUDY_PAIRS_DISABLED")
+    // A request opened before turning the module off is paused: nobody is matched with it.
+    var waiting = spLogin("sp-off-waiting")
+    var other = spLogin("sp-off-other")
+    Check.jsonEq(spRequest(waiting, "goal sp-off-2"), "status", "OPEN")
+    spDisableModule("sp-off-waiting")
+    Check.jsonEq(spRequest(other, "goal sp-off-2"), "status", "OPEN")
+    // An active pair keeps going, but the member who turned it off gets no reminder.
+    var a = spLogin("sp-off-pair-a")
+    var b = spLogin("sp-off-pair-b")
+    spPair(a, b, "goal sp-off-3")
+    spDisableModule("sp-off-pair-a")
+    spService().sendWeeklyReminders()
+    Check.eqInt("a", 0, spNotifications("sp-off-pair-a", "STUDY_PAIR_REMINDER") as Int)
+    Check.eqInt("b", 1, spNotifications("sp-off-pair-b", "STUDY_PAIR_REMINDER") as Int)
+}
+
+test "popular goals carry no personal data" {
+    var a = spLogin("sp-popular-a")
+    Check.status(spRequest(a, "Goal SP-Popular"), 201)
+    var res = spGet("/study-pairs/goals/popular", a)
+    Check.status(res, 200)
+    var found = -1
+    var i = 0
+    while (i < res.jsonSize("items")) {
+        if (res.jsonStr("items." + i + ".goalKey") == "goal-sp-popular") {
+            found = i
+        }
+        i = i + 1
+    }
+    Check.isTrue("goal listed", found >= 0)
+    Check.jsonEq(res, "items." + found + ".openRequests", "1")
+    Check.isTrue("no user id", !res.body.contains("sp-popular-a"))
+}
+
+test "an unverified e-mail cannot look for a pair" {
+    var a = spLogin("sp-unverified-a")
+    spDb().execute("update users set email_verified_at = null where id = ?", DbParams().bindStr("sp-unverified-a"))
+    Check.apiError(spRequest(a, "goal sp-unverified"), 403, "EMAIL_NOT_VERIFIED")
+    // Without a confirmed e-mail even the session turns read-only: nothing of the module answers 200.
+    Check.status(spGet("/study-pairs/me", a), 403)
+}
+
+test "semantically different goals never merge" {
+    var rust = spLogin("sp-dist-rust")
+    var advanced = spLogin("sp-dist-advanced")
+    Check.jsonEq(spRequest(rust, "aprender rust sp-dist"), "status", "OPEN")
+    Check.jsonEq(spRequest(advanced, "aprender rust avançado sp-dist"), "status", "OPEN")
+    Check.eqInt("no pair", 0, spDb().queryLong("select count(*) from study_pairs where user_a in (?, ?) or user_b in (?, ?)", DbParams().bindStr("sp-dist-rust").bindStr("sp-dist-advanced").bindStr("sp-dist-rust").bindStr("sp-dist-advanced")) as Int)
+}
+
+test "search folds accents and punctuation like the goal key" {
+    var owner = spLogin("sp-fold-owner")
+    var viewer = spLogin("sp-fold-viewer")
+    Check.jsonEq(spRequest(owner, "Química Orgânica sp-fold"), "status", "OPEN")
+    for (var term in listOf("quimica%20organica%20sp-fold", "QU%C3%8DMICA%20ORG%C3%82NICA%20SP-FOLD", "Qu%C3%ADmica%2C%20Org%C3%A2nica%20sp-fold")) {
+        var res = spGet("/study-pairs/search?q=" + term, viewer)
+        Check.status(res, 200)
+        Check.eqInt("items for " + term, 1, res.jsonSize("items"))
+        Check.jsonEq(res, "items.0.goal", "Química Orgânica sp-fold")
+    }
+}
+
+test "a check-in accepts exactly five hundred characters" {
+    var a = spLogin("sp-limit500-a")
+    var b = spLogin("sp-limit500-b")
+    var pairId = spPair(a, b, "goal sp-limit500")
+    // Real text: defuse cuts repetitions above 12, so "aaaa..." would measure 12, not 500.
+    var base = "Estudei ownership, borrowing e lifetimes em Rust. "
+    var fiveHundred = strings.repeat(base, 10).trim() + "!"
+    Check.eqInt("length", 500, fiveHundred.length())
+    var ok = spCheckin(a, pairId, fiveHundred)
+    Check.status(ok, 200)
+    Check.eqInt("stored", 500, ok.json("note").length())
+    Check.apiError(spCheckin(a, pairId, fiveHundred + "!"), 400, "STUDY_NOTE_TOO_LONG")
+}
+
+test "the reminder runs on Thursday at six in Brasilia time" {
+    spApp()
+    var cron = StudyPairsModule.reminderCron(spApp().platform)
+    Check.eqStr("default cron", "0 0 18 * * THU", cron)
+    // 2026-11-04T12:00:00Z is Wednesday 09:00 in Sao Paulo: the next fire is Thursday 18:00 (21:00Z).
+    var base = 1793793600000L
+    Check.isTrue("next fire", Cron.parse(cron).next(base, "America/Sao_Paulo") == base + 118800000L)
+    Check.isTrue("job registered", spFlowScheduler().runs.containsKey("study-pair-reminders"))
+}
+
+Scheduler spFlowScheduler() {
+    spApp()
+    var shared = SpFlowHolder.spFlowShared
+    if (shared == null) {
+        throw "shared services not wired"
+    }
+    return shared.jobs
+}
+
+test "a check-in still notifies in-app when push is off" {
+    // The push service belongs to notifications (not ported): the in-app row is what the module owns.
+    var a = spLogin("sp-pushoff-a")
+    var b = spLogin("sp-pushoff-b")
+    var pairId = spPair(a, b, "goal sp-pushoff")
+    Check.status(spCheckin(a, pairId, "estudei sem push"), 200)
+    Check.eqInt("notified", 1, spNotifications("sp-pushoff-b", "STUDY_PAIR_CHECKIN") as Int)
+}
+
+test "check-in notes never reach someone outside the pair" {
+    var a = spLogin("sp-private-a")
+    var b = spLogin("sp-private-b")
+    var outsider = spLogin("sp-private-out")
+    var pairId = spPair(a, b, "goal sp-private")
+    Check.status(spCheckin(a, pairId, "nota privada sp-private"), 200)
+    Check.isTrue("partner sees it", spMe(b).body.contains("nota privada sp-private"))
+    var others = spMe(outsider)
+    Check.isTrue("outsider note", !others.body.contains("nota privada sp-private"))
+    Check.isTrue("outsider pair", !others.body.contains(pairId))
+}
+
+test "search finds open goals without revealing who asked" {
+    var owner = spLogin("sp-search-owner")
+    var viewer = spLogin("sp-search-viewer")
+    var created = spRequest(owner, "Estudar Kotlin para Android sp-search")
+    Check.status(created, 201)
+    Check.jsonEq(created, "status", "OPEN")
+    var found = spGet("/study-pairs/search?q=kotlin", viewer)
+    Check.status(found, 200)
+    Check.eqInt("one result", 1, found.jsonSize("items"))
+    Check.isTrue("goal", found.json("items.0.goal").contains("Kotlin"))
+    // The result is anonymous: neither the request id nor who asked.
+    Check.isTrue("no userId", !found.jsonHas("items.0.userId"))
+    Check.isTrue("no id", !found.jsonHas("items.0.id"))
+    // The own request is not listed to who searched.
+    Check.eqInt("own hidden", 0, spGet("/study-pairs/search?q=kotlin", owner).jsonSize("items"))
+    // A short term searches nothing (no table scan on every keystroke).
+    Check.eqInt("short term", 0, spGet("/study-pairs/search?q=k", viewer).jsonSize("items"))
+    // Who was blocked does not show up in the search.
+    var blocker = spLogin("sp-search-blocker")
+    Check.status(spRequest(blocker, "Estudar Elixir sp-search"), 201)
+    spBlock("sp-search-viewer", "sp-search-blocker")
+    Check.eqInt("blocked hidden", 0, spGet("/study-pairs/search?q=elixir", viewer).jsonSize("items"))
+}
