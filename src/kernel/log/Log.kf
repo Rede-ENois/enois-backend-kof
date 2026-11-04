@@ -1,0 +1,88 @@
+package kernel.log
+
+import java.lang.System
+import java.time.Instant
+import java.util.regex.Pattern
+
+// Mirror of shared PiiMask: panel/log output never carries e-mail addresses.
+class PiiMask {
+    static String email(value: String) {
+        if (value.trim().length() == 0) {
+            return value
+        }
+        return "***"
+    }
+    // Free text may carry a pasted address; it is masked too.
+    static String text(value: String) = Pattern.compile("[\\w.+-]+@[\\w.-]+\\.[A-Za-z]{2,}").matcher(value).replaceAll("***")
+}
+
+// One JSON object per line on stdout: {"ts","level","logger","message", ...fields}.
+// Message and field values pass through PiiMask.text. Level comes from LOG_LEVEL (default INFO).
+class Log {
+    String name
+    Int threshold
+    public constructor(name: String) {
+        this.name = name
+        this.threshold = Log.levelRank(Log.configuredLevel())
+    }
+    static String configuredLevel() {
+        var v = System.getenv("LOG_LEVEL")
+        if (v == null || v.trim().length() == 0) {
+            return "INFO"
+        }
+        return v.trim().toUpperCase()
+    }
+    static Int levelRank(level: String) {
+        if (level == "DEBUG") {
+            return 10
+        }
+        if (level == "INFO") {
+            return 20
+        }
+        if (level == "WARN") {
+            return 30
+        }
+        return 40
+    }
+    debug(message: String) {
+        write("DEBUG", message, mapOf())
+    }
+    info(message: String) {
+        write("INFO", message, mapOf())
+    }
+    warn(message: String) {
+        write("WARN", message, mapOf())
+    }
+    error(message: String) {
+        write("ERROR", message, mapOf())
+    }
+    debugWith(message: String, fields: Map<String,String>) {
+        write("DEBUG", message, fields)
+    }
+    infoWith(message: String, fields: Map<String,String>) {
+        write("INFO", message, fields)
+    }
+    warnWith(message: String, fields: Map<String,String>) {
+        write("WARN", message, fields)
+    }
+    errorWith(message: String, fields: Map<String,String>) {
+        write("ERROR", message, fields)
+    }
+    String render(level: String, message: String, fields: Map<String,String>) {
+        var line = "{\"ts\":" + json.encode(Instant.now().toString())
+        line = line + ",\"level\":" + json.encode(level)
+        line = line + ",\"logger\":" + json.encode(name)
+        line = line + ",\"message\":" + json.encode(PiiMask.text(message))
+        for (var k in fields.keys()) {
+            var v = fields.getOrDefault(k, "")
+            line = line + "," + json.encode(k) + ":" + json.encode(PiiMask.text(v))
+        }
+        return line + "}"
+    }
+    write(level: String, message: String, fields: Map<String,String>) {
+        if (Log.levelRank(level) < threshold) {
+            return
+        }
+        println(render(level, message, fields))
+    }
+}
