@@ -1,0 +1,56 @@
+package kernel.url
+
+import java.net.URI
+import kernel.error.*
+
+// Normalizes and validates a browser origin a developer registers (scheme, host, port; no path, query, fragment or
+// credentials). The Java DeveloperOriginService.normalizeOrigin, kept in the kernel because it needs java.net.URI.
+//
+//   OriginNormalizer.normalize("https://App.Example/")   // "https://app.example"
+//   OriginNormalizer.normalize("http://app.example")     // 400 INVALID_ORIGIN (http only for localhost)
+class OriginNormalizer {
+    static String normalize(raw: String?) {
+        if (raw == null) {
+            throw OriginNormalizer.invalid("Informe a origem do seu app.")
+        }
+        if (raw.trim().length() == 0) {
+            throw OriginNormalizer.invalid("Informe a origem do seu app.")
+        }
+        var clean = raw.trim()
+        if (clean.length() > 200 || clean == "*") {
+            throw OriginNormalizer.invalid("Origem invalida.")
+        }
+        var uri = SafeUrl.parse(clean)
+        if (uri == null) {
+            throw OriginNormalizer.invalid("Origem invalida (use https://seuapp.com).")
+        }
+        var scheme = OriginNormalizer.lower(uri.getScheme())
+        var host = OriginNormalizer.lower(uri.getHost())
+        var local = host == "localhost" || host == "127.0.0.1" || host == "::1"
+        if (scheme != "https" && !(local && scheme == "http")) {
+            throw OriginNormalizer.invalid("A origem precisa ser https (http so para localhost).")
+        }
+        if (host.length() == 0 || uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null) {
+            throw OriginNormalizer.invalid("Origem invalida.")
+        }
+        var path = uri.getPath()
+        if (path != null && path.length() > 0 && path != "/") {
+            throw OriginNormalizer.invalid("A origem nao pode ter caminho; use so o dominio.")
+        }
+        var normalized = scheme + "://" + host
+        if (uri.getPort() > 0) {
+            normalized = normalized + ":" + uri.getPort()
+        }
+        if (normalized.length() > 200) {
+            throw OriginNormalizer.invalid("Origem invalida.")
+        }
+        return normalized
+    }
+    static String lower(text: String?) {
+        if (text == null) {
+            return ""
+        }
+        return text.toLowerCase()
+    }
+    static String invalid(message: String) = Errors.api(400, "INVALID_ORIGIN", message)
+}
