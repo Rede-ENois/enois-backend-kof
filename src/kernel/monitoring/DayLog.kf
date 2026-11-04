@@ -1,0 +1,213 @@
+package kernel.monitoring
+
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
+import java.time.LocalDate
+import java.util.concurrent.locks.ReentrantLock
+import kernel.log.*
+import kernel.time.*
+
+// One JSONL file per UTC day (`events-YYYY-MM-DD.jsonl`) in a directory, append-only, read newest first.
+// The Java FileEventSink: observability never uses the database pool, a disk failure never breaks a request, rotation
+// drops the days past the retention, and the reader walks the files BACKWARD in blocks (never loading a day whole).
+//
+//   var log = DayLog("/app/data/monitoring", 7)
+//   log.append("{...}")                                  // best effort
+//   log.scan((line: String) -> keep(line))               // newest line first, stop when the consumer says false
+//   log.rotate()                                         // close yesterday's file, delete past the retention
+//
+// The reader decodes each block as ISO-8859-1 (one byte, one char, lossless) and turns a complete line back into
+// UTF-8: a multi-byte character cut between two blocks is never decoded half way.
+class DayLog {
+    String dir
+    Int retentionDays
+    ReentrantLock gate = new ReentrantLock()
+    // At most one open stream (a list because a field cannot be set back to null).
+    List<FileOutputStream> streams = listOf<FileOutputStream>()
+    String openDay = ""
+    Log log = Log("kernel.monitoring")
+    public constructor(dir: String, retentionDays: Int) {
+        this.dir = dir
+        this.retentionDays = retentionDays
+        if (retentionDays < 1) {
+            this.retentionDays = 1
+        }
+    }
+    static Int blockBytes() = 65536
+    // The scan stops after this many lines (deep paging is bounded by latency).
+    static Int maxScanLines() = 500000
+    // LocalDate.now(ZoneOffset) resolves to the Clock overload (KOF_GAPS): the UTC date comes from the instant.
+    static String today() = Time.todayIso()
+    static String fileName(day: String) = "events-" + day + ".jsonl"
+    // Appends one line; a disk failure is logged and swallowed.
+    append(line: String) {
+        gate.lock()
+        try {
+            var out = this.streamFor(DayLog.today())
+            // A named text, not `(line + "\n").getBytes()`: kof fmt drops those parentheses and changes the meaning.
+            var text = line + "\n"
+            var bytes = text.getBytes()
+            out.write(bytes, 0, bytes.length)
+            out.flush()
+        } catch (String failure) {
+            this.closeLocked()
+            log.warn("monitoramento em arquivo indisponivel")
+        }
+        gate.unlock()
+    }
+    FileOutputStream streamFor(day: String) {
+        if (streams.size() > 0 && day == openDay) {
+            return streams.get(0)
+        }
+        this.closeLocked()
+        new java.io.File(dir).mkdirs()
+        var created = new FileOutputStream(dir + "/" + DayLog.fileName(day), true)
+        streams.add(created)
+        openDay = day
+        return created
+    }
+    closeLocked() {
+        for (var open in streams) {
+            try {
+                open.close()
+            } catch (String ignored) {
+            }
+        }
+        streams.clear()
+        openDay = ""
+    }
+    // Closes the previous day's file and deletes the days past the retention.
+    rotate() {
+        gate.lock()
+        if (DayLog.today() != openDay) {
+            this.closeLocked()
+        }
+        gate.unlock()
+        var cutoff = LocalDate.parse(DayLog.today()).minusDays(retentionDays as Long).toString()
+        for (var name in this.dayFiles()) {
+            var day = name.substring(7, 17)
+            // ISO dates compare as text; a name outside the pattern is not ours and stays.
+            if (this.isDay(day) && day.compareTo(cutoff) < 0) {
+                try {
+                    new java.io.File(dir + "/" + name).delete()
+                } catch (String ignored) {
+                }
+            }
+        }
+    }
+    Bool isDay(text: String) {
+        if (text.length() != 10) {
+            return false
+        }
+        try {
+            LocalDate.parse(text)
+            return true
+        } catch (String e) {
+            return false
+        }
+    }
+    // File names `events-YYYY-MM-DD.jsonl`, newest day first.
+    List<String> dayFiles() {
+        var out = listOf<String>()
+        var folder = new java.io.File(dir)
+        if (!folder.isDirectory()) {
+            return out
+        }
+        var names = folder.list()
+        if (names == null) {
+            return out
+        }
+        for (var name in names) {
+            if (name.startsWith("events-") && name.endsWith(".jsonl") && name.length() == 23) {
+                out.add(name)
+            }
+        }
+        // Newest first: insertion sort on the name (the day is in it).
+        var i = 1
+        while (i < out.size()) {
+            var j = i
+            while (j > 0 && out.get(j - 1).compareTo(out.get(j)) < 0) {
+                var above = out.get(j - 1)
+                out.set(j - 1, out.get(j))
+                out.set(j, above)
+                j = j - 1
+            }
+            i = i + 1
+        }
+        return out
+    }
+    // Every retained day, newest file first and the newest line first inside it, until the consumer says false.
+    scan(consumer: (String) -> Bool) {
+        var scanned = 0
+        for (var name in this.dayFiles()) {
+            var keepGoing = this.scanFile(dir + "/" + name, consumer, scanned)
+            scanned = this.scannedSoFar
+            if (!keepGoing || scanned > DayLog.maxScanLines()) {
+                return
+            }
+        }
+    }
+    Int scannedSoFar = 0
+    // Walks one file backward in blocks. `carry` is the head of the block read last (a line cut by the block
+    // boundary); it is glued to the end of the next, earlier block.
+    Bool scanFile(path: String, consumer: (String) -> Bool, already: Int) {
+        var scanned = already
+        var carry = ""
+        var keepGoing = true
+        try {
+            var raf = new RandomAccessFile(path, "r")
+            var pos = raf.length()
+            var buf = new byte[DayLog.blockBytes()]
+            while (pos > 0L && keepGoing) {
+                var size = DayLog.blockBytes()
+                if (pos < size as Long) {
+                    size = pos as Int
+                }
+                pos = pos - size as Long
+                raf.seek(pos)
+                raf.readFully(buf, 0, size)
+                var combined = new String(buf, 0, size, "ISO-8859-1") + carry
+                var firstNewline = combined.indexOf("\n")
+                if (firstNewline < 0) {
+                    carry = combined
+                }
+                else {
+                    carry = combined.substring(0, firstNewline)
+                    var lines = combined.substring(firstNewline + 1).split("\n")
+                    var at = lines.length - 1
+                    while (at >= 0 && keepGoing) {
+                        scanned = scanned + 1
+                        if (scanned > DayLog.maxScanLines()) {
+                            keepGoing = false
+                        }
+                        else {
+                            keepGoing = this.offer(lines[at], consumer)
+                        }
+                        at = at - 1
+                    }
+                }
+            }
+            if (keepGoing && carry.length() > 0) {
+                keepGoing = this.offer(carry, consumer)
+            }
+            raf.close()
+        } catch (String ignored) {
+        }
+        scannedSoFar = scanned
+        return keepGoing
+    }
+    // A complete line (latin1 text) decoded back to UTF-8; blank lines are skipped.
+    Bool offer(raw: String, consumer: (String) -> Bool) {
+        var bytes = new byte[raw.length()]
+        var i = 0
+        while (i < raw.length()) {
+            bytes[i] = raw.charAt(i) as Int as Byte
+            i = i + 1
+        }
+        var line = new String(bytes, "UTF-8").trim()
+        if (line.length() == 0) {
+            return true
+        }
+        return consumer(line)
+    }
+}

@@ -1,0 +1,340 @@
+package kernel.monitoring
+
+import java.lang.Math
+import java.time.Instant
+import java.util.Collections
+import java.util.HashMap
+import java.util.concurrent.locks.ReentrantLock
+
+record MonitoringCount(String label, Long count)
+
+// One minute of the 60-minute window the panel draws.
+record MonitoringMinutePoint(String minute, Long requests, Long requests2xx, Long requests3xx, Long errors4xx, Long errors5xx, Long p95Ms, Long p99Ms, Long maxMs, Long slowRequests, Long rateLimited, Long cpuPercent, Long heapMb)
+
+// The request side of the panel's overview, computed from the in-memory buckets at `nowMs`.
+record MetricsOverview(List<MonitoringMinutePoint> series, Long requestsLastMinute, Long errors4xxLastMinute, Long errors5xxLastMinute, Double errorRate, Long p50Ms, Long p95Ms, Long p99Ms, Long maxMs, Long slowLastMinute, Long rateLimitedLastMinute, List<MonitoringCount> statusCounts, List<MonitoringCount> methodCounts, List<MonitoringCount> topRoutes, Double requestsPerSecond, Int inFlight, Int peakInFlight, Long requestsTotal)
+
+// What one minute of traffic looked like. Mutated only under RequestMetrics.gate.
+class MetricsBucket {
+    Long requests = 0L
+    Long ok2xx = 0L
+    Long redirects3xx = 0L
+    Long errors4xx = 0L
+    Long errors5xx = 0L
+    Long slow = 0L
+    Long rateLimited = 0L
+    Long maxDuration = 0L
+    // Ring of the last durations of the minute (the Java deque capped at 2000).
+    List<Long> durations = listOf<Long>()
+    Int nextSlot = 0
+    Map<String,Long> methods = new HashMap<String, Long>()
+    Map<String,Long> routes = new HashMap<String, Long>()
+    Long cpuPercent = -1L
+    Long heapUsed = -1L
+    // Insertion order of the maps (the Java LinkedHashMap): ties in the top lists keep it.
+    List<String> methodOrder = listOf<String>()
+    List<String> routeOrder = listOf<String>()
+}
+
+// In-memory request metrics of the admin panel: 60 one-minute buckets plus per-second counts, a request in-flight gauge
+// and the totals. Per instance, never persisted, no database. One coarse lock: every operation is a few map steps.
+// The Java MonitoringService metrics half (recordRequest/overview/pruneMinutes).
+//
+//   metrics.started()                                   // a request began
+//   metrics.observe("GET", "/feed/posts/:id", 200, 42L, nowMs)
+//   metrics.disconnected()                              // the client gave up: only the gauge goes down
+//   var view = metrics.overview(nowMs)
+class RequestMetrics {
+    ReentrantLock gate = new ReentrantLock()
+    Map<Long,MetricsBucket> minutes = new HashMap<Long, MetricsBucket>()
+    Map<Long,Long> seconds = new HashMap<Long, Long>()
+    Long requestsTotal = 0L
+    Int inFlight = 0
+    Int peakInFlight = 0
+    static Long minuteMs() = 60000L
+    static Long slowMs() = 2000L
+    static Int maxDurationsPerMinute() = 2000
+    started() {
+        gate.lock()
+        inFlight = inFlight + 1
+        if (inFlight > peakInFlight) {
+            peakInFlight = inFlight
+        }
+        gate.unlock()
+    }
+    // A client that aborted (closed tab, interrupted video) only ends the in-flight request: counting it as an error
+    // or an event would turn a normal disconnect into a false alarm.
+    disconnected() {
+        gate.lock()
+        this.finishedLocked()
+        gate.unlock()
+    }
+    finishedLocked() {
+        if (inFlight > 0) {
+            inFlight = inFlight - 1
+        }
+    }
+    MetricsBucket bucketLocked(minute: Long) {
+        var found = minutes.get(minute)
+        if (found != null) {
+            return found
+        }
+        var fresh = MetricsBucket()
+        minutes.put(minute, fresh)
+        return fresh
+    }
+    static bump(counts: Map<String,Long>, order: List<String>, key: String) {
+        var current = counts.get(key)
+        if (current == null) {
+            counts.put(key, 1L)
+            order.add(key)
+        }
+        else {
+            counts.put(key, current + 1L)
+        }
+    }
+    // Every request counts; the caller turns only the interesting ones into events.
+    observe(method: String?, route: String?, status: Int, durationMs: Long, nowMs: Long) {
+        gate.lock()
+        this.finishedLocked()
+        requestsTotal = requestsTotal + 1L
+        var bucket = this.bucketLocked(nowMs / RequestMetrics.minuteMs())
+        bucket.requests = bucket.requests + 1L
+        if (status >= 500) {
+            bucket.errors5xx = bucket.errors5xx + 1L
+        }
+        else if (status >= 400) {
+            bucket.errors4xx = bucket.errors4xx + 1L
+        }
+        else if (status >= 300) {
+            bucket.redirects3xx = bucket.redirects3xx + 1L
+        }
+        else {
+            bucket.ok2xx = bucket.ok2xx + 1L
+        }
+        if (status == 429) {
+            bucket.rateLimited = bucket.rateLimited + 1L
+        }
+        if (durationMs >= RequestMetrics.slowMs()) {
+            bucket.slow = bucket.slow + 1L
+        }
+        if (bucket.durations.size() < RequestMetrics.maxDurationsPerMinute()) {
+            bucket.durations.add(durationMs)
+        }
+        else {
+            bucket.durations.set(bucket.nextSlot % RequestMetrics.maxDurationsPerMinute(), durationMs)
+        }
+        bucket.nextSlot = bucket.nextSlot + 1
+        if (durationMs > bucket.maxDuration) {
+            bucket.maxDuration = durationMs
+        }
+        var methodKey = "?"
+        if (method != null) {
+            methodKey = method
+        }
+        var routeKey = "UNMATCHED"
+        if (route != null) {
+            routeKey = route
+        }
+        RequestMetrics.bump(bucket.methods, bucket.methodOrder, methodKey)
+        RequestMetrics.bump(bucket.routes, bucket.routeOrder, routeKey)
+        var second = nowMs / 1000L
+        var perSecond = seconds.get(second)
+        if (perSecond == null) {
+            seconds.put(second, 1L)
+        }
+        else {
+            seconds.put(second, perSecond + 1L)
+        }
+        gate.unlock()
+    }
+    // The once-a-minute resource sample of the chart (CPU percent of the process, heap in use in bytes).
+    sampleResources(nowMs: Long, cpuPercent: Long, heapUsedBytes: Long) {
+        gate.lock()
+        var bucket = this.bucketLocked(nowMs / RequestMetrics.minuteMs())
+        bucket.cpuPercent = cpuPercent
+        bucket.heapUsed = heapUsedBytes
+        gate.unlock()
+    }
+    // Drops the minutes past the window and the seconds past two minutes.
+    prune(nowMs: Long) {
+        gate.lock()
+        this.pruneLocked(nowMs)
+        gate.unlock()
+    }
+    pruneLocked(nowMs: Long) {
+        var nowBucket = nowMs / RequestMetrics.minuteMs()
+        var oldMinutes = listOf<Long>()
+        for (var minute in minutes.keys()) {
+            if (minute < nowBucket - 61L) {
+                oldMinutes.add(minute)
+            }
+        }
+        for (var minute in oldMinutes) {
+            minutes.remove(minute)
+        }
+        var nowSecond = nowMs / 1000L
+        var oldSeconds = listOf<Long>()
+        for (var second in seconds.keys()) {
+            if (second < nowSecond - 120L) {
+                oldSeconds.add(second)
+            }
+        }
+        for (var second in oldSeconds) {
+            seconds.remove(second)
+        }
+    }
+    static Long percentile(values: List<Long>, fraction: Double) {
+        if (values.size() == 0) {
+            return 0L
+        }
+        var copy = listOf<Long>()
+        for (var v in values) {
+            copy.add(v)
+        }
+        Collections.sort(copy)
+        var index = (Math.ceil(copy.size().toDouble() * fraction) as Int) - 1
+        if (index > copy.size() - 1) {
+            index = copy.size() - 1
+        }
+        if (index < 0) {
+            index = 0
+        }
+        return copy.get(index)
+    }
+    // A map as a list of counts, largest first; ties keep the insertion order. `limit` <= 0 keeps all.
+    static List<MonitoringCount> top(counts: Map<String,Long>, order: List<String>, limit: Int) {
+        var out = listOf<MonitoringCount>()
+        for (var key in order) {
+            var count = counts.get(key)
+            if (count != null) {
+                out.add(MonitoringCount(key, count))
+                var at = out.size() - 1
+                while (at > 0 && out.get(at - 1).count() < out.get(at).count()) {
+                    var above = out.get(at - 1)
+                    out.set(at - 1, out.get(at))
+                    out.set(at, above)
+                    at = at - 1
+                }
+            }
+        }
+        if (limit > 0 && out.size() > limit) {
+            var cut = listOf<MonitoringCount>()
+            for (var c in out) {
+                if (cut.size() < limit) {
+                    cut.add(c)
+                }
+            }
+            return cut
+        }
+        return out
+    }
+    MetricsOverview overview(nowMs: Long) {
+        gate.lock()
+        this.pruneLocked(nowMs)
+        var nowBucket = nowMs / RequestMetrics.minuteMs()
+        var series = listOf<MonitoringMinutePoint>()
+        var total2xx = 0L
+        var total3xx = 0L
+        var total4xx = 0L
+        var total5xx = 0L
+        var totalRequests = 0L
+        var latency = listOf<Long>()
+        var methodTotals = new HashMap<String, Long>()
+        var methodOrder = listOf<String>()
+        var bucketAt = nowBucket - 59L
+        var lastPoint = MonitoringMinutePoint("", 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L)
+        while (bucketAt <= nowBucket) {
+            var minuteIso = Instant.ofEpochMilli(bucketAt * RequestMetrics.minuteMs()).toString()
+            var bucket = minutes.get(bucketAt)
+            if (bucket == null) {
+                lastPoint = MonitoringMinutePoint(minuteIso, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L)
+            }
+            else {
+                totalRequests = totalRequests + bucket.requests
+                total2xx = total2xx + bucket.ok2xx
+                total3xx = total3xx + bucket.redirects3xx
+                total4xx = total4xx + bucket.errors4xx
+                total5xx = total5xx + bucket.errors5xx
+                if (bucketAt >= nowBucket - 4L) {
+                    for (var d in bucket.durations) {
+                        latency.add(d)
+                    }
+                }
+                for (var method in bucket.methodOrder) {
+                    var add = bucket.methods.get(method)
+                    if (add != null) {
+                        var have = methodTotals.get(method)
+                        if (have == null) {
+                            methodTotals.put(method, add)
+                            methodOrder.add(method)
+                        }
+                        else {
+                            methodTotals.put(method, have + add)
+                        }
+                    }
+                }
+                var cpu = bucket.cpuPercent
+                if (cpu < 0L) {
+                    cpu = 0L
+                }
+                var heapMb = 0L
+                if (bucket.heapUsed > 0L) {
+                    heapMb = bucket.heapUsed / 1024L / 1024L
+                }
+                lastPoint = MonitoringMinutePoint(minuteIso, bucket.requests, bucket.ok2xx, bucket.redirects3xx, bucket.errors4xx, bucket.errors5xx, RequestMetrics.percentile(bucket.durations, 0.95), RequestMetrics.percentile(bucket.durations, 0.99), bucket.maxDuration, bucket.slow, bucket.rateLimited, cpu, heapMb)
+            }
+            series.add(lastPoint)
+            bucketAt = bucketAt + 1L
+        }
+        var errorRate = 0.0
+        if (totalRequests > 0L) {
+            errorRate = (total4xx + total5xx).toDouble() * 100.0 / totalRequests.toDouble()
+        }
+        // The busiest routes of the last 16 minutes.
+        var routeTotals = new HashMap<String, Long>()
+        var routeOrder = listOf<String>()
+        var routeAt = nowBucket - 15L
+        if (routeAt < 0L) {
+            routeAt = 0L
+        }
+        while (routeAt <= nowBucket) {
+            var bucket = minutes.get(routeAt)
+            if (bucket != null) {
+                for (var route in bucket.routeOrder) {
+                    var add = bucket.routes.get(route)
+                    if (add != null) {
+                        var have = routeTotals.get(route)
+                        if (have == null) {
+                            routeTotals.put(route, add)
+                            routeOrder.add(route)
+                        }
+                        else {
+                            routeTotals.put(route, have + add)
+                        }
+                    }
+                }
+            }
+            routeAt = routeAt + 1L
+        }
+        var nowSecond = nowMs / 1000L
+        var last10s = 0L
+        var secondAt = nowSecond - 9L
+        while (secondAt <= nowSecond) {
+            var count = seconds.get(secondAt)
+            if (count != null) {
+                last10s = last10s + count
+            }
+            secondAt = secondAt + 1L
+        }
+        var maxLatency = 0L
+        for (var d in latency) {
+            if (d > maxLatency) {
+                maxLatency = d
+            }
+        }
+        var view = MetricsOverview(series, lastPoint.requests(), lastPoint.errors4xx(), lastPoint.errors5xx(), errorRate, RequestMetrics.percentile(latency, 0.50), RequestMetrics.percentile(latency, 0.95), RequestMetrics.percentile(latency, 0.99), maxLatency, lastPoint.slowRequests(), lastPoint.rateLimited(), listOf(MonitoringCount("2xx", total2xx), MonitoringCount("3xx", total3xx), MonitoringCount("4xx", total4xx), MonitoringCount("5xx", total5xx)), RequestMetrics.top(methodTotals, methodOrder, 0), RequestMetrics.top(routeTotals, routeOrder, 10), last10s.toDouble() / 10.0, inFlight, peakInFlight, requestsTotal)
+        gate.unlock()
+        return view
+    }
+}

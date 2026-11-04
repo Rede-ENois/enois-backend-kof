@@ -824,3 +824,14 @@ Java interop for the identity flows lives here; domain code only sees Strings.
 - `Outbound.request(method, url, headers, body, timeoutMs)` / `postForm` / `get`: status and body, throws
   `OUTBOUND_FAILED: ...` on connect or IO failure. Wrap it in an overridable class and stub that in tests.
 - `UrlCodec.encode(value)` / `decode(value)`: form url encoding, UTF-8.
+## Leaf-domain kernel additions
+
+- `Req.queryAll(name)`, `Req.queryParam(name)`, `Req.formDecode(raw)`; `queryStr/queryInt/queryLong/queryBool` read the raw query (`+` is a space, `%2B` a plus, repeated names supported).
+- `Regexes.matches(regex, text)`, `Texts.fromHex4`, `Numbers.round/round2/pow`, `Contrast.ratio/over/wholePart` (WCAG contrast with the integer-division message of the Java service).
+- `OutboundHttp.postJson/get/call(...)` returning `OutboundReply(status, body)`; throws `"OUTBOUND_FAILED"`.
+- `HtmlTemplate.render(template, vars)`: Thymeleaf subset (`th:text`, `th:href`, drops `xmlns:th`).
+- `OriginNormalizer.normalize(raw)`: developer origin validation (`INVALID_ORIGIN`).
+- `ZoneDates.dayOf/startOfDay/plusDays/today(zone)`: calendar days in a named zone.
+- `Log.installTap(LogTap)`: observer of every written line (a line logged inside the tap is not tapped again).
+- `Db.poolStats()`: `DbPoolStats(active, idle, total, waiting, max, min)` or null.
+- `kernel.monitoring`: `DayLog(dir, retentionDays)` (UTC day JSONL files, `append`, `rotate`, `scan` newest first in blocks), `RequestMetrics` (60 minute buckets, per-second counts, in-flight gauge, `overview(nowMs)`), `EventBuffer` (bounded queue, recent window, per-minute cap, level/type counters), `HostResources` (JVM, system memory from `/proc/meminfo`, cgroup memory and CPU, pool).

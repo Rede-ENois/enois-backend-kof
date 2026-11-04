@@ -328,3 +328,52 @@ onboarding joins need the real communities, groups and network services (`Onboar
   `createFederated` write every column default explicitly because the Kof insert has no JPA defaults.
 - Provider env names: property style (`REDE_OAUTH_GOOGLE_CLIENT_ID`) first, then the short ones the Java profiles read
   (`GOOGLE_CLIENT_ID`).
+## Leaf domains: ops, apiv1, stats, search, themes, projects, notices, releasenotes, suggestions, blog
+
+Slug `leaves`, branch `port/leaves`. Modules installed in `Main.kf`: `OpsModule` and `ApiV1Module` BEFORE `Security.install` (the pipeline captures `hooks.monitoring` and `hooks.origins` by value), the other eight after it.
+
+| Domain | Endpoints ported/total | Kof tests | Java tests ported/total |
+|---|---|---|---|
+| ops (`src/ops`) | 4/4 (`GET /admin/monitoring/overview`, `/users`, `/events`, `GET /admin/emails`) | `tests/ops/*` (19), `tests/kernel/{DayLog,HostResources,RequestMetrics,EventBuffer,Numbers,ZoneDates}Test` | 12/12 |
+| apiv1 (`src/apiv1`) | 7/7 (`GET /v1`, `GET/POST/DELETE /developers/origins`, `GET /admin/developers/origins`, `POST .../{id}/block`, `.../unblock`) | `tests/apiv1/ApiV1Test` (9) | 27/27 (gate-only tests live in `tests/security/OriginTest` and `IdentityRateLimitTest`, the rest in `tests/apiv1`) |
+| stats | 1/1 | `StatsTest` (2) | 2/2 |
+| search | 1/1 | `SearchTest` (7) | 5/6 (the `/mentors` search belongs to the mentoring domain) |
+| themes | 8/8 | `ThemeTest` (9) | 7/7 |
+| projects | 5/5 | `ProjectsTest` (10) | 9/9 |
+| notices | 3/3 | `NoticeTest` (8) | 8/8 |
+| releasenotes | 3/3 | `ReleaseNoteTest` (6) | 6/6 |
+| suggestions | 5/5 | `SuggestionFlowTest` (9), `SuggestionIssueClientTest` (6) | 12/12 |
+| blog | 12/12 | `BlogFlowTest` (9), `BlogNewsletterTest` (7) | 14/14 |
+
+Total: 49 of 49 endpoints, 102 of 103 Java tests ported.
+
+### Pending seams (concrete classes, safe default, `// pending-port: <owner>`)
+
+| Seam | Owner | Default |
+|---|---|---|
+| `ProjectsProfiles` (`idByUsername`) | profile | reads `users` read-only (same SQL; `ProjectsModule.withProfiles` takes a profile subclass) |
+| `SuggestionsGithubToken` | support | `GITHUB_ISSUES_TOKEN` from the environment |
+| `BlogFeedPointers` (`publish`, `delete`) | feed | mints the post id and logs `blog_feed_pointer_pending`; the feed owner writes the BLOG pointer post (tag `blog`, visible only in "Para voce" of subscribers) |
+| `BlogNotifier` (`notifyNewPost`) | notifications | logs `blog_notification_pending`; the owner writes the `NEW_BLOG_POST` notification |
+| `BlogCoins` (`recordPresence`) | coin | no-op |
+| `BlogEmailSender` (`sendHtml`) | identity (EmailService) | cannot send: records a FAILED `email_log` row `EMAIL_SENDER_NOT_WIRED` |
+| `BlogModule.withSeams` | feed, notifications, coin, identity | wiring point for the four blog seams above; `BlogService.authorsFollowedBy` is what the feed adds to "Para voce" |
+| ops hooks | kernel | `OpsMonitoring` replaces `hooks.monitoring`; `OpsLogTap` replaces the Java logback appender and `GlobalExceptionHandler` calls (`Log.installTap`) |
+| apiv1 hooks | kernel | `DeveloperOriginService` calls `hooks.origins.invalidate()` after every table change |
+
+### Decisions and deliberate differences
+
+- **No OpenAPI document.** The Java `V1ApiController` note says "a API nao publica documento OpenAPI (nao existe /openapi.json)". The note text is kept verbatim and `GET /openapi.json` answers 200 with an empty body (the unknown-path rule); asserted in `ApiV1Test`.
+- **`GET /v1` index** is built from `server.routes`: `/v1`-prefixed aliases are skipped, `:id` is shown as `{id}`, sorted by path then method.
+- **ops, capture**: Kof has no logback; `Log` has a tap (`Log.installTap`) that feeds WARN/ERROR lines of every logger and the `audit` logger. `kernel.http` `unhandled_exception` and 5xx `api_error` lines become EXCEPTION events with the request (method, path, requestId, user) from `LogContext`. Loggers `ops.*`, `kernel.monitoring*` and `kernel.http.access` are not captured. The "stack trace" of an exception event is the redacted thrown text (Kof exceptions are strings).
+- **ops, file reader**: the Java `FileEventSink.readFileBackward` processed the block head as a whole line and carried the wrong end, losing one event per 64 KiB block boundary. `DayLog` carries the cut head into the next (earlier) block instead (tested across block boundaries with multibyte text). Everything else (UTC day files, 7-day retention, 16384 line cap, 500 recent, queue 5000, 1000 events/min cap, flush 500 ms draining 200) is unchanged.
+- **ops, jobs** on `kernel.jobs`: `monitoring-flush` (500 ms), `monitoring-sample-resources` (60 s, 5 s initial delay), `monitoring-prune-minutes` (300 s), `monitoring-purge-old` (3600 s, 60 s initial delay). Env: `REDE_MONITORING_FILE_DIR`, `REDE_MONITORING_RETENTION_DAYS`, `REDE_MONITORING_MAX_EVENTS_PER_MINUTE`.
+- **ops, `/admin/emails`** keeps the Java rules: moderator or admin, TWO_FACTOR rows hidden, recipient masked (`***`), subject and error scrubbed of addresses. The writer (`EmailLogStore.append`) is what the identity port's e-mail sender calls.
+- **blog, newsletter** runs on the shared outbox (event `BLOG_POST_PUBLISHED`, worker every 5 s) instead of a Java executor, so nothing is sent if the publish transaction reverts. Rules unchanged (first publish only, verified e-mails only, never the author, Reply-To the author, `List-Unsubscribe`). Needs `REDE_SECURITY_ENCRYPTION_KEY` (otherwise logged and skipped, as in Java). The unsubscribe token is the standard-base64 `cipher.encrypt(blogId:userId)` made URL-safe without padding and converted back before decrypting, so tokens issued by the Java service keep working. The template `resources/templates/email-blog-post.html` is rendered by the kernel `HtmlTemplate` (Thymeleaf subset: `th:text`, `th:href`).
+- **themes**: the JSON literal `null` as a package is a 400 (Java answered 500).
+- **blog tests**: the Java feed and notification assertions of `BlogFlowTests` are asserted against fakes of the `BlogFeedPointers`/`BlogNotifier` seams (a pointer per post, one `NEW_BLOG_POST` per subscriber with href `/blog/<username>/<postId>`); the real `/feed` and `/notifications` checks move to the feed/notifications ports. The Mockito spy assertions of `BlogDirectoryTests` ("no per-blog query") cannot be written over HTTP; the directory instead uses bulk queries (`bannedAmong`, one grouped post count, one author batch) and the behaviour (counts, banned author left out) is asserted.
+- **suggestions**: the moderator approve/reject path is covered in `tests/security` (`SecurityModerators` defaults to nobody here).
+
+### Kernel files added or changed by this slice
+
+`kernel/http/Req.kf` (`queryAll`, `queryParam`, `formDecode`, raw-query decoding), `kernel/http/OutboundHttp.kf`, `kernel/text/{Regexes,Texts,Contrast,HtmlTemplate,Numbers}.kf`, `kernel/url/OriginNormalizer.kf`, `kernel/time/ZoneDates.kf`, `kernel/log/Log.kf` (`LogTap`), `kernel/db/Db.kf` (`poolStats`), `kernel/monitoring/{DayLog,HostResources,RequestMetrics,EventBuffer}.kf`. Gaps found: G220 to G230 in `KOF_GAPS.md`.

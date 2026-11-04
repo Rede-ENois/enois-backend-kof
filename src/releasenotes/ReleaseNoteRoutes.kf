@@ -1,0 +1,48 @@
+package releasenotes
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+
+// GET /novidades/atual is public and answers 204 when nothing is published. PUT and DELETE live under
+// /admin/**: the route guard already closes them, and requireAdmin is the usual defence in depth.
+class ReleaseNoteRoutes {
+    static register(server: HttpServer, service: ReleaseNoteService) {
+        server.get("/novidades/atual", () -> ReleaseNoteRoutes.current(service))
+        server.put("/admin/novidades", () -> ReleaseNoteRoutes.publish(service))
+        server.delete("/admin/novidades", () -> ReleaseNoteRoutes.retire(service))
+    }
+    static String current(service: ReleaseNoteService) {
+        var note = service.current()
+        if (note == null) {
+            return status(204, "")
+        }
+        return json.encode(note)
+    }
+    static String publish(service: ReleaseNoteService) {
+        Auth.requireAdmin()
+        var request = ReleaseNoteRoutes.parse()
+        if (request == null) {
+            return json.encode(service.publish(null))
+        }
+        return json.encode(service.publish(request.items()))
+    }
+    static String retire(service: ReleaseNoteService) {
+        Auth.requireAdmin()
+        service.retire()
+        return status(204, "")
+    }
+    static ReleaseNotePublishRequest? parse() {
+        SafeLinks.checkRequest()
+        var text = Req.bodyText()
+        if (text.trim().length() == 0) {
+            return null
+        }
+        try {
+            return json.decode<ReleaseNotePublishRequest>(text)
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

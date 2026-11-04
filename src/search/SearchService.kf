@@ -1,0 +1,68 @@
+package search
+
+import kernel.blocks.*
+import kernel.error.*
+
+// Global search over users, communities, jobs, events and mentors. Blocked and muted users never show for
+// a signed-in viewer.
+class SearchService {
+    SearchStore store
+    BlockedUsers blocked
+    public constructor(store: SearchStore, blocked: BlockedUsers) {
+        this.store = store
+        this.blocked = blocked
+    }
+    static List<String> validTypes() = listOf("users", "communities", "jobs", "events", "mentors")
+    // `types` empty or absent means every type. `viewerId` is null without a session.
+    List<SearchResult> search(query: String?, types: List<String>, rawLimit: Int, viewerId: String?) {
+        var results = listOf<SearchResult>()
+        if (query == null) {
+            return results
+        }
+        if (query.trim().length() == 0) {
+            return results
+        }
+        // The limit used to go unbounded to the five queries; the search is a showcase and 50 per type is
+        // more than the screen uses.
+        var limit = rawLimit
+        if (limit < 1) {
+            limit = 1
+        }
+        if (limit > 50) {
+            limit = 50
+        }
+        var wanted = types
+        if (wanted.size() == 0) {
+            wanted = SearchService.validTypes()
+        }
+        for (var type in wanted) {
+            if (!SearchService.validTypes().contains(type)) {
+                throw Errors.api(400, "INVALID_SEARCH_TYPE", "Tipo de busca invalido: " + type)
+            }
+        }
+        var q = query.trim()
+        if (wanted.contains("users")) {
+            results.addAll(store.searchUsers(q, limit))
+        }
+        if (wanted.contains("communities")) {
+            results.addAll(store.searchCommunities(q, limit))
+        }
+        if (wanted.contains("jobs")) {
+            results.addAll(store.searchJobs(q, limit))
+        }
+        if (wanted.contains("events")) {
+            results.addAll(store.searchEvents(q, limit))
+        }
+        if (wanted.contains("mentors")) {
+            results.addAll(store.searchMentors(q, limit))
+        }
+        var hidden = blocked.hiddenIdsFor(viewerId)
+        var shown = listOf<SearchResult>()
+        for (var r in results) {
+            if (!hidden.contains(r.id()) && shown.size() < limit) {
+                shown.add(r)
+            }
+        }
+        return shown
+    }
+}

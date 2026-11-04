@@ -1,0 +1,111 @@
+package ops
+
+import kernel.db.*
+import kernel.text.*
+import kernel.time.*
+
+// Community accounts on the monitoring panel: how many there are, how many joined per day, the pace of growth and
+// the projection. Two cheap queries (the total and the creation dates of the window) cached for a minute: the panel
+// refreshes every 30 s and the account count does not move at that scale, so polling would only spend pool
+// connections. Dates are grouped in Sao Paulo time, not UTC: a sign-up at 22:00 belongs to today, not to tomorrow.
+class UserMetricsService {
+    Db store
+    UsersView? cached = null
+    Long cachedAt = 0L
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String zone() = "America/Sao_Paulo"
+    static Int windowDays() = 30
+    static Long cacheMs() = 60000L
+    static List<Int> projectionDays() = listOf(7, 30, 90)
+    UsersView users() {
+        var now = Time.nowMillis()
+        var current = cached
+        if (current != null && now - cachedAt < UserMetricsService.cacheMs()) {
+            return current
+        }
+        var computed = this.compute()
+        cached = computed
+        cachedAt = now
+        return computed
+    }
+    UsersView compute() {
+        var now = Time.nowIso()
+        var window = UserMetricsService.windowDays()
+        var today = ZoneDates.dayOf(now, UserMetricsService.zone())
+        var firstDay = ZoneDates.plusDays(today, 1 - window)
+        var windowStart = ZoneDates.startOfDay(firstDay, UserMetricsService.zone())
+        var total = store.queryLong("select count(*) from users", DbParams())
+        var days = listOf<String>()
+        var newPerDay = listOf<Long>()
+        var d = 0
+        while (d < window) {
+            days.add(ZoneDates.plusDays(firstDay, d))
+            newPerDay.add(0L)
+            d = d + 1
+        }
+        for (var row in store.queryList("select created_at from users where created_at >= ?", DbParams().bindInstant(windowStart))) {
+            var at = days.indexOf(ZoneDates.dayOf(row.getInstant("created_at"), UserMetricsService.zone()))
+            if (at >= 0) {
+                newPerDay.set(at, newPerDay.get(at) + 1L)
+            }
+        }
+        // fromDay[i] = accounts created from day i to today: the end-of-day total of day d is the total minus
+        // whoever was born after it.
+        var fromDay = listOf<Long>()
+        d = 0
+        while (d <= window) {
+            fromDay.add(0L)
+            d = d + 1
+        }
+        d = window - 1
+        while (d >= 0) {
+            fromDay.set(d, fromDay.get(d + 1) + newPerDay.get(d))
+            d = d - 1
+        }
+        var series = listOf<UserDailyPoint>()
+        d = 0
+        while (d < window) {
+            var born = newPerDay.get(d)
+            var totalEndOfDay = total - fromDay.get(d + 1)
+            var base = totalEndOfDay - born
+            series.add(UserDailyPoint(ZoneDates.plusDays(firstDay, d), born, totalEndOfDay, UserMetricsService.percent(born, base)))
+            d = d + 1
+        }
+        var newToday = newPerDay.get(window - 1)
+        var newSevenDays = 0L
+        d = window - 7
+        while (d < window) {
+            newSevenDays = newSevenDays + newPerDay.get(d)
+            d = d + 1
+        }
+        var newThirtyDays = fromDay.get(0)
+        var averageSeven = newSevenDays.toDouble() / 7.0
+        var averageThirty = newThirtyDays.toDouble() / window.toDouble()
+        var projections = listOf<UserProjection>()
+        for (var days in UserMetricsService.projectionDays()) {
+            // Linear on the pace of the last week: the whole month dilutes a launch week and hides the current trend.
+            var projected = total + Numbers.round(averageSeven * days.toDouble())
+            if (projected < total) {
+                projected = total
+            }
+            projections.add(UserProjection(days, projected, UserMetricsService.percent(projected - total, total)))
+        }
+        return UsersView(now, total, newToday, newSevenDays, newThirtyDays, UserMetricsService.percent(newToday, total - newToday), UserMetricsService.compound(total, total - newSevenDays, 7), UserMetricsService.compound(total, total - newThirtyDays, window), UserMetricsService.round2(averageSeven), UserMetricsService.round2(averageThirty), series, projections)
+    }
+    static Double percent(part: Long, base: Long) {
+        if (base <= 0L) {
+            return 0.0
+        }
+        return UserMetricsService.round2(part.toDouble() * 100.0 / base.toDouble())
+    }
+    // The average daily rate that took the base to today's total.
+    static Double compound(total: Long, base: Long, days: Int) {
+        if (base <= 0L || days <= 0 || total <= base) {
+            return 0.0
+        }
+        return UserMetricsService.round2((Numbers.pow(total.toDouble() / base.toDouble(), 1.0 / days.toDouble()) - 1.0) * 100.0)
+    }
+    static Double round2(value: Double) = Numbers.round2(value)
+}

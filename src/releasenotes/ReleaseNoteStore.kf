@@ -1,0 +1,31 @@
+package releasenotes
+
+import kernel.db.*
+
+// The single row of the current release notes (fixed id `ativo`, V225). Items are a JSON array of
+// {title, description} in `items_json`.
+class ReleaseNoteStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String rowId() = "ativo"
+    ReleaseNoteView? findCurrent() {
+        var row = store.queryOptional("select id, items_json, published_at, updated_at from release_note where id = ?", DbParams().bindStr(ReleaseNoteStore.rowId()))
+        if (row == null) {
+            return null
+        }
+        return ReleaseNoteView(row.getStr("id"), ReleaseNoteStore.decodeItems(row.getStr("items_json")), row.getInstant("published_at"), row.getInstant("updated_at"))
+    }
+    static List<ReleaseNoteItem> decodeItems(text: String) = json.decode<List<ReleaseNoteItem>>(text)
+    save(note: ReleaseNoteView) {
+        var items = json.encode(note.items())
+        var updated = store.execute("update release_note set items_json = ?, published_at = ?, updated_at = ? where id = ?", DbParams().bindStr(items).bindInstant(note.publishedAt()).bindInstant(note.updatedAt()).bindStr(note.id()))
+        if (updated == 0) {
+            store.execute("insert into release_note (id, items_json, published_at, updated_at) values (?, ?, ?, ?)", DbParams().bindStr(note.id()).bindStr(items).bindInstant(note.publishedAt()).bindInstant(note.updatedAt()))
+        }
+    }
+    clear() {
+        store.execute("delete from release_note where id = ?", DbParams().bindStr(ReleaseNoteStore.rowId()))
+    }
+}

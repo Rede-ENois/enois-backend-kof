@@ -1,0 +1,139 @@
+import kernel.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+import suggestions.*
+
+// Port of SuggestionIssueClientTests (the token is read on every call and each target turns on only with a
+// valid repository) plus the HTTP half against a local stand-in of the GitHub API.
+class FixedToken extends SuggestionsGithubToken {
+    String current = ""
+    public constructor(app: TestApp) {
+        super(app.db(), SecretCipher("", false), "")
+    }
+    String token() = current
+}
+
+class GithubStub {
+    static TestApp? app = null
+    static List<String> seenBodies = listOf<String>()
+    static List<String> seenAuth = listOf<String>()
+    static List<String> seenVersion = listOf<String>()
+    // Records the call like the real API would see it, then answers.
+    static String answer(reply: String, code: Int) {
+        GithubStub.seenBodies.add(Req.bodyText())
+        var bearer = Req.bearerToken()
+        if (bearer == null) {
+            GithubStub.seenAuth.add("none")
+        }
+        else {
+            GithubStub.seenAuth.add(bearer)
+        }
+        var version = Req.headerOrNull("x-github-api-version")
+        if (version == null) {
+            GithubStub.seenVersion.add("none")
+        }
+        else {
+            GithubStub.seenVersion.add(version)
+        }
+        return status(code, reply)
+    }
+}
+
+TestApp githubApp() {
+    var cur = GithubStub.app
+    if (cur != null) {
+        return cur
+    }
+    var created = TestApp.bootWire("githubstub", (p: Platform) -> {
+    p.server.post("/repos/org/backend/issues", () -> GithubStub.answer("{\"number\":5,\"html_url\":\"https://github.com/org/backend/issues/5\"}", 201))
+    p.server.post("/repos/org/nourl/issues", () -> GithubStub.answer("{\"number\":6,\"html_url\":\"\"}", 201))
+    p.server.post("/repos/org/boom/issues", () -> GithubStub.answer("{\"message\":\"secret detail\"}", 500))
+    p.server.post("/repos/org/zero/issues", () -> GithubStub.answer("{\"number\":0}", 201))
+    p.server.post("/repos/org/garbage/issues", () -> GithubStub.answer("not json", 201))
+})
+    GithubStub.app = created
+    return created
+}
+
+SuggestionIssueClient client(app: TestApp, tokens: FixedToken, backend: String, frontend: String, designSystem: String) = SuggestionIssueClient(tokens, "http://127.0.0.1:" + app.port, backend, frontend, designSystem)
+
+test "only the targets with a repository turn on when there is a support token" {
+    var app = githubApp()
+    var tokens = FixedToken(app)
+    tokens.current = "token-do-suporte"
+    var c = client(app, tokens, "org/backend", "", "org/design-system")
+    assert(c.enabled("BACKEND"))
+    assert(!c.enabled("FRONTEND"))
+    assert(c.enabled("DESIGN_SYSTEM"))
+}
+
+test "without the support token every target is off" {
+    var app = githubApp()
+    var tokens = FixedToken(app)
+    var c = client(app, tokens, "org/backend", "org/frontend", "org/design-system")
+    for (var target in SuggestionViews.targets()) {
+        assert(!c.enabled(target))
+    }
+}
+
+test "a repository outside the owner/name format turns the target off" {
+    var app = githubApp()
+    var tokens = FixedToken(app)
+    tokens.current = "token-do-suporte"
+    var c = client(app, tokens, "https://github.com/org/backend", "org", "org/design system")
+    for (var target in SuggestionViews.targets()) {
+        assert(!c.enabled(target))
+    }
+}
+
+test "changing the token in the panel is valid on the next call without a restart" {
+    var app = githubApp()
+    var tokens = FixedToken(app)
+    var c = client(app, tokens, "org/backend", "", "")
+    tokens.current = ""
+    assert(!c.enabled("BACKEND"))
+    tokens.current = "token-novo"
+    assert(c.enabled("BACKEND"))
+    tokens.current = "   "
+    assert(!c.enabled("BACKEND"))
+}
+
+test "an issue is opened with the bearer token and the answer number and url come back" {
+    var app = githubApp()
+    var tokens = FixedToken(app)
+    tokens.current = " token-do-suporte "
+    var c = client(app, tokens, "org/backend", "", "")
+    var issue = c.createIssue("BACKEND", "Titulo da ideia", "Corpo da ideia")
+    assert(issue != null)
+    if (issue != null) {
+        assert(issue.number() == 5)
+        Check.eqStr("url", "https://github.com/org/backend/issues/5", "" + issue.url())
+    }
+    var last = GithubStub.seenBodies.size() - 1
+    Check.eqStr("payload", "{\"title\":\"Titulo da ideia\",\"body\":\"Corpo da ideia\"}", GithubStub.seenBodies.get(last))
+    Check.eqStr("bearer", "token-do-suporte", GithubStub.seenAuth.get(last))
+    Check.eqStr("api version", "2022-11-28", GithubStub.seenVersion.get(last))
+}
+
+test "every failure of GitHub is an empty answer and a disabled target is never called" {
+    var app = githubApp()
+    var tokens = FixedToken(app)
+    tokens.current = "t"
+    var c = SuggestionIssueClient(tokens, "http://127.0.0.1:" + app.port, "org/boom", "org/zero", "org/garbage")
+    assert(c.createIssue("BACKEND", "a", "b") == null)
+    assert(c.createIssue("FRONTEND", "a", "b") == null)
+    assert(c.createIssue("DESIGN_SYSTEM", "a", "b") == null)
+    var down = SuggestionIssueClient(tokens, "http://127.0.0.1:1", "org/backend", "", "")
+    assert(down.createIssue("BACKEND", "a", "b") == null)
+    var before = GithubStub.seenBodies.size()
+    var off = client(app, tokens, "org/backend", "", "")
+    assert(off.createIssue("FRONTEND", "a", "b") == null)
+    Check.eqInt("no call for a disabled target", before, GithubStub.seenBodies.size())
+    var nourl = SuggestionIssueClient(tokens, "http://127.0.0.1:" + app.port, "org/nourl", "", "")
+    var ref = nourl.createIssue("BACKEND", "a", "b")
+    assert(ref != null)
+    if (ref != null) {
+        assert(ref.url() == null)
+    }
+}

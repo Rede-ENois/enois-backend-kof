@@ -1,0 +1,55 @@
+import kernel.monitoring.*
+
+test "offered events are drained oldest first in batches" {
+    var buffer = EventBuffer(1000)
+    var i = 0
+    while (i < 5) {
+        buffer.offer("line " + i, "INFO", "REQUEST", 1000L)
+        i = i + 1
+    }
+    var first = buffer.drain(3)
+    assert(first.size() == 3)
+    assert(first.get(0) == "line 0")
+    var second = buffer.drain(3)
+    assert(second.size() == 2)
+    assert(buffer.drain(3).size() == 0)
+}
+
+test "recent keeps the newest events and caps at 500" {
+    var buffer = EventBuffer(100000)
+    var i = 0
+    while (i < 700) {
+        buffer.offer("line " + i, "INFO", "REQUEST", 1000L)
+        i = i + 1
+    }
+    var recent = buffer.recent(1000)
+    assert(recent.size() == 500)
+    assert(recent.get(0) == "line 699")
+    assert(buffer.recent(2).get(1) == "line 698")
+    assert(buffer.recent(0).size() == 1)
+}
+
+test "the per-minute cap drops the excess and counts it, the next minute starts over" {
+    var buffer = EventBuffer(3)
+    var accepted = 0
+    var i = 0
+    while (i < 5) {
+        if (buffer.offer("x" + i, "INFO", "REQUEST", 60000L)) {
+            accepted = accepted + 1
+        }
+        i = i + 1
+    }
+    assert(accepted == 3)
+    assert(buffer.droppedCount() == 2L)
+    assert(buffer.offer("later", "INFO", "REQUEST", 120000L))
+}
+
+test "level and type counters group the kept window" {
+    var buffer = EventBuffer(1000)
+    buffer.offer("a", "ERROR", "EXCEPTION", 0L)
+    buffer.offer("b", "INFO", "REQUEST", 0L)
+    buffer.offer("c", "INFO", "REQUEST", 0L)
+    var levels = buffer.levels(100000L)
+    assert(levels.get(0).label() == "INFO" && levels.get(0).count() == 2L)
+    assert(buffer.types(100000L).get(1).label() == "EXCEPTION")
+}

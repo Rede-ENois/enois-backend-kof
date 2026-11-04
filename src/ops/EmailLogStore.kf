@@ -1,0 +1,65 @@
+package ops
+
+import kernel.db.*
+import kernel.id.*
+import kernel.log.*
+import kernel.time.*
+
+// Metadata of an e-mail the platform sent: to whom, subject, kind and whether the send worked. The body is
+// not stored: the panel shows the delivery of the notices without turning into an archive of personal messages.
+// status is SENT or FAILED.
+record EmailLogRecord(String id, String toEmail, String subject, String kind, String status, String? error, String createdAt)
+
+// table email_log. The sender never fails because the log did: record() swallows its own failure.
+class EmailLogStore {
+    Db store
+    Log log = Log("ops.emaillog")
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String truncate(value: String?, max: Int) {
+        if (value == null) {
+            return ""
+        }
+        if (value.length() <= max) {
+            return value
+        }
+        return value.substring(0, max)
+    }
+    // Same rules as EmailService.recordEmail: the 2FA code never reaches the log (the subject is redacted by
+    // kind) and a failure to write the log never disturbs the send.
+    append(toEmail: String, subject: String, kind: String, sent: Bool, error: String?) {
+        var safeSubject = subject
+        if (kind == "TWO_FACTOR") {
+            safeSubject = "Seu código de acesso (redigido)"
+        }
+        var state = "FAILED"
+        if (sent) {
+            state = "SENT"
+        }
+        try {
+            var message = ""
+            if (error != null) {
+                message = EmailLogStore.truncate(error, 500)
+            }
+            store.execute("insert into email_log (id, to_email, subject, kind, status, error, created_at) values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(Ids.prefixed("email_")).bindStr(EmailLogStore.truncate(toEmail, 180)).bindStr(EmailLogStore.truncate(safeSubject, 200)).bindStr(kind).bindStr(state).bindStrOrNull(message).bindInstant(Time.nowIso()))
+        } catch (String failure) {
+            log.warn("Nao foi possivel registrar o envio de e-mail")
+        }
+    }
+    // Newest first; the panel shows 1..100.
+    List<EmailLogRecord> findRecent(limit: Int) {
+        var size = limit
+        if (size > 100) {
+            size = 100
+        }
+        if (size < 1) {
+            size = 1
+        }
+        var out = listOf<EmailLogRecord>()
+        for (var r in store.queryList("select id, to_email, subject, kind, status, error, created_at from email_log order by created_at desc limit ?", DbParams().bindInt(size))) {
+            out.add(EmailLogRecord(r.getStr("id"), r.getStr("to_email"), r.getStr("subject"), r.getStr("kind"), r.getStr("status"), r.getStrOrNull("error"), r.getInstant("created_at")))
+        }
+        return out
+    }
+}

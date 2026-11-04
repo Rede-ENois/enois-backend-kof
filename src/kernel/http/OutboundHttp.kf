@@ -1,0 +1,68 @@
+package kernel.http
+
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+
+// What an outbound call answered: the status line code and the body text (the error body of a 4xx/5xx too).
+record OutboundReply(Int status, String body)
+
+// A minimal blocking HTTP client for the few server-to-server calls (GitHub issues, ...): kof.http returns
+// only the body and throws on a 5xx (KOF_GAPS G15), java.net.http needs nested classes Kof cannot name (G24).
+// Plain JSON POST/GET, no redirects followed, bounded timeouts. A transport failure (refused, timeout, bad
+// URL) throws "OUTBOUND_FAILED: ..." with no URL or header in the message.
+class OutboundHttp {
+    // `headers` are "Name: value" lines. The body is sent as UTF-8.
+    static OutboundReply postJson(url: String, headers: List<String>, body: String, timeoutMs: Int) = OutboundHttp.call("POST", url, headers, body, timeoutMs)
+    static OutboundReply get(url: String, headers: List<String>, timeoutMs: Int) = OutboundHttp.call("GET", url, headers, "", timeoutMs)
+    static OutboundReply call(method: String, url: String, headers: List<String>, body: String, timeoutMs: Int) {
+        var failure = ""
+        var status = 0
+        var text = ""
+        try {
+            var conn = new URL(url).openConnection() as HttpURLConnection
+            conn.setInstanceFollowRedirects(false)
+            conn.setConnectTimeout(timeoutMs)
+            conn.setReadTimeout(timeoutMs)
+            conn.setRequestMethod(method)
+            for (var line in headers) {
+                var colon = line.indexOf(":")
+                if (colon > 0) {
+                    conn.setRequestProperty(line.substring(0, colon).trim(), line.substring(colon + 1).trim())
+                }
+            }
+            if (body.length() > 0) {
+                conn.setDoOutput(true)
+                var out = conn.getOutputStream() as OutputStream
+                out.write(body.getBytes())
+                out.close()
+            }
+            status = conn.getResponseCode()
+            if (status >= 400) {
+                text = OutboundHttp.readAll(conn.getErrorStream() as InputStream)
+            }
+            else {
+                text = OutboundHttp.readAll(conn.getInputStream() as InputStream)
+            }
+            conn.disconnect()
+        } catch (String e) {
+            failure = "OUTBOUND_FAILED"
+        } catch (java.io.IOException e) {
+            failure = "OUTBOUND_FAILED"
+        }
+        if (failure.length() > 0) {
+            throw failure
+        }
+        return OutboundReply(status, text)
+    }
+    // An absent error stream (a 4xx with no body) reads as "".
+    static String readAll(stream: InputStream?) {
+        if (stream == null) {
+            return ""
+        }
+        var bytes = stream.readAllBytes()
+        stream.close()
+        return new String(bytes as Byte[], "UTF-8")
+    }
+}

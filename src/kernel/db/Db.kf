@@ -11,6 +11,8 @@ import kernel.config.*
 import kernel.error.*
 import kernel.log.*
 
+record DbPoolStats(Int active, Int idle, Int total, Int waiting, Int max, Int min)
+
 // Connection pool + JDBC access. Domain code never touches java.sql.
 //
 //   db.execute("update t set a = ? where id = ?", DbParams().bindStr("x").bindLong(1L))
@@ -48,6 +50,14 @@ class Db {
     static Db fromConfig(cfg: Config) = Db.connect(DbSettings.url(cfg), DbSettings.user(cfg), DbSettings.password(cfg), DbSettings.poolMax(cfg), DbSettings.poolMinIdle(cfg))
     close() {
         ds.close()
+    }
+    // Pool counters for the monitoring panel; null while the pool has not opened its first connection.
+    DbPoolStats? poolStats() {
+        var mx = ds.getHikariPoolMXBean()
+        if (mx == null) {
+            return null
+        }
+        return DbPoolStats(mx.getActiveConnections(), mx.getIdleConnections(), mx.getTotalConnections(), mx.getThreadsAwaitingConnection(), ds.getMaximumPoolSize(), ds.getMinimumIdle())
     }
     Bool inTransaction() = current.get() != null
     Connection acquire() {

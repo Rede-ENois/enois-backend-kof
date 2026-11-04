@@ -1,0 +1,116 @@
+package blog
+
+import kernel.db.*
+import kernel.id.*
+import kernel.log.*
+import ops.*
+
+// Seams to the domains the blog calls. Each is a base class with a safe default (a Kof interface cannot be
+// implemented across packages, KOF_GAPS G30); the owner extends it and Main.kf passes the subclass in.
+// pending-port: profile. The author data of the page header and the newsletter; the default reads `users`
+// read-only with the same columns the profile repository maps.
+class BlogProfiles {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, username, name, avatar, email, email_verified_at, badge, badges, name_theme, name_font, name_color, nameplate"
+    BlogAuthor? findById(id: String) {
+        var row = store.queryOptional("select " + BlogProfiles.columns() + " from users where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return BlogProfiles.map(row)
+    }
+    List<BlogAuthor> findAllByIds(ids: List<String>) {
+        var out = listOf<BlogAuthor>()
+        if (ids.size() == 0) {
+            return out
+        }
+        var marks = "?"
+        var params = DbParams().bindStr(ids.get(0))
+        var i = 1
+        while (i < ids.size()) {
+            marks = marks + ", ?"
+            params = params.bindStr(ids.get(i))
+            i = i + 1
+        }
+        for (var r in store.queryList("select " + BlogProfiles.columns() + " from users where id in (" + marks + ")", params)) {
+            out.add(BlogProfiles.map(r))
+        }
+        return out
+    }
+    static BlogAuthor map(r: DbRow) = BlogAuthor(r.getStr("id"), r.getStr("username"), r.getStr("name"), r.getStrOrNull("avatar"), r.getStrOrNull("email"), !r.isNull("email_verified_at"), BlogProfiles.badgesOf(r), BlogProfiles.styleOf(r))
+    // All badges in the chosen order; an empty list falls back to the old single `badge` column.
+    static List<String> badgesOf(r: DbRow) {
+        var out = listOf<String>()
+        var list = r.getStrOrNull("badges")
+        if (list != null && list.trim().length() > 0) {
+            for (var part in list.split("\n")) {
+                out.add(part)
+            }
+            return out
+        }
+        var single = r.getStrOrNull("badge")
+        if (single != null && single.trim().length() > 0) {
+            out.add(single)
+        }
+        return out
+    }
+    static BlogNameStyle? styleOf(r: DbRow) {
+        var theme = r.getStrOrNull("name_theme")
+        var font = r.getStrOrNull("name_font")
+        var color = r.getStrOrNull("name_color")
+        var nameplate = r.getStrOrNull("nameplate")
+        if (theme == null && font == null && color == null && nameplate == null) {
+            return null
+        }
+        return BlogNameStyle(theme, font, color, nameplate)
+    }
+}
+
+// pending-port: feed. A blog post is also a pointer post in the feed (type BLOG, tag "blog") that only the
+// subscribers see in "Para voce", never in "Tudo". publish returns the id of the pointer, which becomes the
+// id of the blog post; the default only mints that id (the feed owner writes the real post).
+class BlogFeedPointers {
+    Log log = Log("blog.feed")
+    public constructor() {}
+    String publish(userId: String, title: String) {
+        var id = Ids.prefixed("post_")
+        log.warn("blog_feed_pointer_pending postId=" + id)
+        return id
+    }
+    // The pointer leaves the feed with its post (soft delete, as any post the author deletes).
+    delete(userId: String, postId: String, reason: String) {
+        log.warn("blog_feed_pointer_delete_pending postId=" + postId)
+    }
+}
+
+// pending-port: notifications. The in-app "NEW_BLOG_POST" notification of a subscriber.
+class BlogNotifier {
+    Log log = Log("blog.notifications")
+    public constructor() {}
+    notifyNewPost(subscriberId: String, authorId: String, title: String, body: String, href: String) {
+        log.warn("blog_notification_pending kind=NEW_BLOG_POST")
+    }
+}
+
+// pending-port: coin. The presence credit for whoever publishes.
+class BlogCoins {
+    public constructor() {}
+    recordPresence(userId: String);
+}
+
+// pending-port: identity (EmailService). Sends one HTML e-mail and logs its metadata. The default cannot
+// send: it records the attempt as FAILED in `email_log` so the admin panel shows the newsletter did not go
+// out, and answers false.
+class BlogEmailSender {
+    EmailLogStore emailLog
+    public constructor(emailLog: EmailLogStore) {
+        this.emailLog = emailLog
+    }
+    Bool sendHtml(toEmail: String, subject: String, html: String, fromName: String, replyTo: String?, unsubscribeLink: String, kind: String) {
+        emailLog.append(toEmail, subject, kind, false, "EMAIL_SENDER_NOT_WIRED")
+        return false
+    }
+}

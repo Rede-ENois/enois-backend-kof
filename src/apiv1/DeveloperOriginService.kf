@@ -1,0 +1,88 @@
+package apiv1
+
+import kernel.error.*
+import kernel.id.*
+import kernel.security.*
+import kernel.time.*
+import kernel.url.*
+
+// Origins a developer registered to call the public API from a browser. The app's OWN origins (config allowlist,
+// wildcard subdomains) are "trusted" and never come through here: this table holds third-party origins only, which
+// register themselves and may be blocked automatically on suspicious traffic (the kernel's OriginAbuseGuard).
+// Every change tells the origin gate (hooks.origins) to drop its 30 s cache.
+class DeveloperOriginService {
+    DeveloperOriginStore store
+    OriginDirectory directory
+    public constructor(store: DeveloperOriginStore, directory: OriginDirectory) {
+        this.store = store
+        this.directory = directory
+    }
+    static Int maxPerUser() = 5
+    List<DeveloperOriginView> list(userId: String) = store.ofUser(userId)
+    List<DeveloperOriginAdminView> listAll(limit: Int) {
+        var size = limit
+        if (size > 200) {
+            size = 200
+        }
+        if (size < 1) {
+            size = 1
+        }
+        return store.listAll(size)
+    }
+    DeveloperOriginAdminView byId(id: String) {
+        var found = store.byId(id)
+        if (found == null) {
+            throw Errors.api(404, "ORIGIN_NOT_FOUND", "Origem nao encontrada.")
+        }
+        return found
+    }
+    DeveloperOriginView add(userId: String, rawOrigin: String?) {
+        var origin = OriginNormalizer.normalize(rawOrigin)
+        if (store.countOf(userId) >= DeveloperOriginService.maxPerUser() as Long) {
+            throw Errors.api(400, "TOO_MANY_ORIGINS", "Voce pode cadastrar no maximo " + DeveloperOriginService.maxPerUser() + " origens.")
+        }
+        var id = Ids.prefixed("origin_")
+        var now = Time.nowIso()
+        try {
+            store.insert(id, userId, origin, now)
+        } catch (String e) {
+            if (Errors.hasCode(e, "CONFLICT")) {
+                throw Errors.api(409, "ORIGIN_ALREADY_REGISTERED", "Esta origem ja esta cadastrada.")
+            }
+            throw e
+        }
+        directory.invalidate()
+        return DeveloperOriginView(id, origin, now, false, null, null)
+    }
+    remove(userId: String, id: String) {
+        if (store.delete(userId, id) == 0) {
+            throw Errors.api(404, "ORIGIN_NOT_FOUND", "Origem nao encontrada.")
+        }
+        directory.invalidate()
+    }
+    blockById(id: String, reason: String?) {
+        if (store.block(id, DeveloperOriginService.trimReason(reason), Time.nowIso()) == 0) {
+            throw Errors.api(404, "ORIGIN_NOT_FOUND", "Origem ativa nao encontrada.")
+        }
+        directory.invalidate()
+    }
+    unblock(id: String) {
+        if (store.unblock(id) == 0) {
+            throw Errors.api(404, "ORIGIN_NOT_BLOCKED", "Origem bloqueada nao encontrada.")
+        }
+        directory.invalidate()
+    }
+    static String trimReason(reason: String?) {
+        if (reason == null) {
+            return "Atividade suspeita"
+        }
+        var clean = reason.trim()
+        if (clean.length() == 0) {
+            return "Atividade suspeita"
+        }
+        if (clean.length() > 200) {
+            return clean.substring(0, 200)
+        }
+        return clean
+    }
+}

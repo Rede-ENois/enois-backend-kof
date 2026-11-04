@@ -1,0 +1,177 @@
+import kernel.monitoring.*
+import kernel.security.*
+import kernel.time.*
+import ops.*
+
+// Port of FileEventSinkTests and MonitoringSearchWindowTests: the panel reads the whole retained history, newest
+// first, and pages by cursor; the search reaches an incident that already left the recent window. The Java tests
+// call the sink directly; here the same behaviour is asserted through MonitoringService.events (the sink's only
+// reader).
+String freshDir(name: String) = "/tmp/kof-monitoring-file-" + name + "-" + uuid.v4()
+
+String eventLine(day: String, i: Int) {
+    var hour = 11 + i / 60
+    var minute = i % 60
+    var at = day + "T" + pad(hour) + ":" + pad(minute) + ":00Z"
+    var level = "INFO"
+    if (i % 10 == 0) {
+        level = "ERROR"
+    }
+    return "{\"id\":\"" + day + "-" + i + "\",\"createdAt\":\"" + at + "\",\"level\":\"" + level + "\",\"type\":\"HTTP\",\"message\":\"evento " + i + "\",\"path\":\"/api/x\"}"
+}
+
+String pad(n: Int) {
+    if (n < 10) {
+        return "0" + n
+    }
+    return "" + n
+}
+
+// Append-only, like the real file: the newest event at the end.
+writeDay(dir: String, day: String, count: Int) {
+    var text = ""
+    var i = 0
+    while (i < count) {
+        text = text + eventLine(day, i) + "\n"
+        i = i + 1
+    }
+    File(dir + "/events-" + day + ".jsonl").writeText(text)
+}
+
+MonitoringService serviceOn(dir: String) {
+    // Creating the sink's folder: the first append makes it.
+    var sink = DayLog(dir, 7)
+    sink.append("")
+    return MonitoringService(null, sink, 100000)
+}
+
+flushAll(service: MonitoringService) {
+    var i = 0
+    while (i < 10) {
+        service.flush()
+        i = i + 1
+    }
+}
+
+test "the panel pages by cursor across the days" {
+    var dir = freshDir("page")
+    var service = serviceOn(dir)
+    writeDay(dir, "2026-10-28", 120)
+    writeDay(dir, "2026-10-27", 120)
+
+    var first = service.events(null, null, null, null, null, null, 100)
+    assert(first.size() == 100)
+    assert(first.get(0).createdAt().startsWith("2026-10-28"))
+    var cursor = first.get(99).createdAt()
+    var second = service.events(null, null, null, null, null, cursor, 100)
+    assert(second.size() == 100)
+    assert(Time.toMillis(second.get(0).createdAt()) < Time.toMillis(cursor))
+    var cursor2 = second.get(99).createdAt()
+    var third = service.events(null, null, null, null, null, cursor2, 100)
+    assert(third.size() == 40)
+    assert(third.get(39).createdAt().startsWith("2026-10-27"))
+}
+
+test "the level filter works over the whole file" {
+    var dir = freshDir("level")
+    var service = serviceOn(dir)
+    writeDay(dir, "2026-10-28", 60)
+    var errors = service.events("ERROR", null, null, null, null, null, 100)
+    assert(errors.size() == 6)
+    for (var e in errors) {
+        assert(e.level() == "ERROR")
+    }
+}
+
+test "the scan stops when it crosses the start of the window" {
+    var dir = freshDir("window")
+    var service = serviceOn(dir)
+    writeDay(dir, "2026-10-28", 30)
+    writeDay(dir, "2026-10-27", 30)
+    var today = service.events(null, null, null, "2026-10-28T00:00:00Z", null, null, 100)
+    assert(today.size() == 30)
+    for (var e in today) {
+        assert(e.createdAt().startsWith("2026-10-28"))
+    }
+}
+
+test "a search by term reaches an incident outside the recent window" {
+    var service = serviceOn(freshDir("term"))
+    var marker = "incidente-" + uuid.v4()
+    service.recordEvent("ERROR", "EXCEPTION", marker, mapOf("origem", "teste"))
+    var i = 0
+    while (i < 600) {
+        service.recordEvent("INFO", "REQUEST", "ruido " + i, mapOf())
+        i = i + 1
+    }
+    flushAll(service)
+    var found = service.events(null, null, marker, null, null, null, 50)
+    assert(found.size() == 1)
+    assert(found.get(0).message() == marker)
+}
+
+test "a search by period reaches an old incident" {
+    var service = serviceOn(freshDir("period"))
+    var marker = "janela-" + uuid.v4()
+    service.recordEvent("ERROR", "EXCEPTION", marker, mapOf())
+    var i = 0
+    while (i < 600) {
+        service.recordEvent("INFO", "REQUEST", "ruido " + i, mapOf())
+        i = i + 1
+    }
+    flushAll(service)
+    var since = Time.fromMillis(Time.nowMillis() - 3600000L)
+    var found = service.events("ERROR", null, null, since, null, null, 50)
+    var seen = false
+    for (var e in found) {
+        if (e.message() == marker) {
+            seen = true
+        }
+    }
+    assert(seen)
+}
+
+test "events over the per minute cap are dropped and counted" {
+    var sink = DayLog(freshDir("cap"), 7)
+    var service = MonitoringService(null, sink, 5)
+    var i = 0
+    while (i < 8) {
+        service.recordEvent("INFO", "TEST", "e" + i, mapOf())
+        i = i + 1
+    }
+    assert(service.overview().droppedEvents() == 3L)
+    assert(service.recentEvents(100).size() == 5)
+}
+
+test "redaction hides e-mails and secrets and caps the size" {
+    assert(MonitoringService.safe("falha para a@b.com") == "falha para ***@***")
+    assert(MonitoringService.safe("Authorization: abc123 depois") == "Authorization: *** depois")
+    assert(MonitoringService.safe("senha=segredo, ok") == "senha=***, ok")
+    assert(MonitoringService.safe("linha\u0001quebrada") == "linha quebrada")
+    assert(MonitoringService.safe(null) == "")
+    assert(MonitoringService.safe(strings.repeat("x", 2000)).length() == 1000)
+    assert(MonitoringService.normalizeLevel("warn") == "WARN")
+    assert(MonitoringService.normalizeLevel("weird") == "INFO")
+    assert(MonitoringService.normalizeType(null) == "SYSTEM")
+    assert(MonitoringService.normalizeType(strings.repeat("t", 40)).length() == 32)
+}
+
+test "the log tap turns server errors into exception events and skips its own loggers" {
+    var service = serviceOn(freshDir("tap"))
+    var tap = OpsLogTap(service)
+    tap.accept("ERROR", "kernel.http", "unhandled_exception boom for user@x.com")
+    tap.accept("ERROR", "kernel.http", "api_error status=503 code=UPSTREAM_DOWN message=gateway timeout")
+    tap.accept("ERROR", "ops.monitoring", "never captured")
+    tap.accept("INFO", "kernel.http.access", "http_request ...")
+    tap.accept("WARN", "kernel.jobs", "job_failed name=x")
+    tap.accept("INFO", "kernel.jobs", "job started")
+    var events = service.recentEvents(10)
+    assert(events.size() == 3)
+    // Newest first.
+    assert(events.get(0).type() == "LOG")
+    assert(events.get(1).type() == "EXCEPTION")
+    assert(events.get(1).status() == 503)
+    assert(events.get(1).message() == "UPSTREAM_DOWN: gateway timeout")
+    assert(events.get(2).message() == "INTERNAL_ERROR: boom for ***@***")
+    assert(events.get(2).status() == 500)
+}

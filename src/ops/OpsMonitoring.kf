@@ -1,0 +1,76 @@
+package ops
+
+import kernel.log.*
+import kernel.security.*
+
+// The request pipeline reports to the monitoring service through this subclass of the kernel seam (installed as
+// hooks.monitoring before Security.install captures it).
+class OpsMonitoring extends SecurityMonitoring {
+    MonitoringService service
+    public constructor(service: MonitoringService) {
+        super()
+        this.service = service
+    }
+    requestStarted() {
+        service.requestStarted()
+    }
+    recordRequest(method: String, uri: String, route: String, status: Int, durationMs: Long, requestId: String, userId: String, clientIp: String, deviceId: String) {
+        service.recordRequest(method, uri, route, status, durationMs, OpsMonitoring.orNull(requestId), OpsMonitoring.orNull(userId), OpsMonitoring.orNull(clientIp), OpsMonitoring.orNull(deviceId))
+    }
+    recordClientDisconnect() {
+        service.recordClientDisconnect()
+    }
+    // The pipeline passes "" for an absent value.
+    static String? orNull(value: String) {
+        if (value.length() == 0) {
+            return null
+        }
+        return value
+    }
+}
+
+// Captures what the panel shows from the log: WARN/ERROR lines of the app and the audit logger. The 5xx the HTTP layer
+// logs (`unhandled_exception`, `api_error`) become EXCEPTION events with the request they belong to (the Java
+// GlobalExceptionHandler recorded them directly). The monitoring's own loggers and the access line are left out, so
+// capturing never feeds itself and a request is not reported twice.
+class OpsLogTap extends LogTap {
+    MonitoringService service
+    public constructor(service: MonitoringService) {
+        super()
+        this.service = service
+    }
+    accept(level: String, logger: String, message: String) {
+        if (logger.startsWith("ops.") || logger.startsWith("kernel.monitoring") || logger == "kernel.http.access") {
+            return
+        }
+        var requestId = LogContext.get("requestId")
+        var userId = LogContext.get("userId")
+        var path = LogContext.get("http.path")
+        if (logger == "kernel.http") {
+            this.exception(message, requestId, userId, path)
+            return
+        }
+        if (logger == "audit" || level == "WARN" || level == "ERROR") {
+            service.recordLog(level, logger, message, requestId, userId, path)
+        }
+    }
+    exception(message: String, requestId: String?, userId: String?, path: String?) {
+        var method = LogContext.get("http.method")
+        if (message.startsWith("unhandled_exception ")) {
+            var thrown = message.substring("unhandled_exception ".length())
+            service.recordException(500, "INTERNAL_ERROR", thrown, method, path, requestId, userId, thrown)
+        }
+        else 
+            if (message.startsWith("api_error status=")) {
+                var rest = message.substring("api_error status=".length())
+                var space = rest.indexOf(" code=")
+                var text = rest.indexOf(" message=")
+                if (space > 0 && text > space && rest.substring(0, space).matches("[0-9]+")) {
+                    var status = rest.substring(0, space).toInt()
+                    var code = rest.substring(space + " code=".length(), text)
+                    var detail = rest.substring(text + " message=".length())
+                    service.recordException(status, code, detail, method, path, requestId, userId, detail)
+                }
+            }
+    }
+}

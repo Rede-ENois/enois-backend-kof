@@ -1,0 +1,150 @@
+package blog
+
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+import kernel.time.*
+
+// Blogs: the showcase and the public page of each person's corner. Reads are public on purpose (the link people
+// share must not push a visitor to login); the session, when present, only adds the viewer's state.
+class BlogRoutes {
+    static register(server: HttpServer, service: BlogService, newsletter: BlogNewsletterService, idem: Idempotency, frontendUrl: String) {
+        server.get("/blogs", () -> BlogRoutes.directory(service))
+        // Literal paths before `:slug`.
+        server.get("/blogs/descadastrar", () -> BlogRoutes.unsubscribePage(newsletter))
+        server.post("/blogs/descadastrar", () -> BlogRoutes.unsubscribeOneClick(newsletter))
+        server.get("/blogs/me", () -> BlogRoutes.mine(service))
+        server.put("/blogs/me", () -> BlogRoutes.save(service, idem))
+        server.post("/blogs/me/posts", () -> BlogRoutes.publish(service, idem))
+        server.patch("/blogs/me/posts/:postId", () -> BlogRoutes.edit(service, idem))
+        server.delete("/blogs/me/posts/:postId", () -> BlogRoutes.deletePost(service))
+        server.get("/blogs/:slug", () -> BlogRoutes.blog(service))
+        server.get("/blogs/:slug/feed.xml", () -> BlogRoutes.feed(service, frontendUrl))
+        server.post("/blogs/:slug/subscription", () -> BlogRoutes.subscribe(service))
+        server.delete("/blogs/:slug/subscription", () -> BlogRoutes.unsubscribe(service))
+    }
+    static String directory(service: BlogService) {
+        var limit = Req.queryInt("limit", 50)
+        if (limit < 1) {
+            limit = 1
+        }
+        if (limit > 100) {
+            limit = 100
+        }
+        return json.encode(service.directory(Req.queryParam("query"), limit))
+    }
+    static String blog(service: BlogService) {
+        var found = service.blogOf(Req.pathParam("slug"), Auth.viewerIdOrNull())
+        if (found == null) {
+            throw Errors.api(404, "BLOG_NOT_FOUND", "Blog nao encontrado.")
+        }
+        return json.encode(found)
+    }
+    static String feed(service: BlogService, frontendUrl: String) {
+        var found = service.blogOf(Req.pathParam("slug"), null)
+        if (found == null) {
+            throw Errors.api(404, "BLOG_NOT_FOUND", "Blog nao encontrado.")
+        }
+        ResponseHeaders.set("Content-Type", BlogAtomFeed.contentType())
+        ResponseHeaders.set("Cache-Control", "public, max-age=300")
+        return BlogAtomFeed.render(found, frontendUrl, Time.nowIso())
+    }
+    // My blog, for the editor. No blog yet = 200 with an empty body (the screen offers to create it).
+    static String mine(service: BlogService) {
+        var userId = Auth.requireUser()
+        var found = service.mine(userId)
+        if (found == null) {
+            return status(200, "")
+        }
+        return json.encode(found)
+    }
+    static String save(service: BlogService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var request = BlogRoutes.parseBlog()
+        return idem.handle(userId, "PUT", "/api/blogs/me", Idempotency.hash(json.encode(request)), 200, () -> json.encode(BlogViews.withoutItems(service.saveMine(userId, request.title(), request.description(), request.themeHtml()))))
+    }
+    static String publish(service: BlogService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var request = BlogRoutes.parsePost()
+        var format = BlogRoutes.formatOf(request.format())
+        return idem.handle(userId, "POST", "/api/blogs/me/posts", Idempotency.hash(json.encode(request)), 201, () -> json.encode(service.publish(userId, request.title(), request.body(), format, request.notifySubscribers() != false)))
+    }
+    static String edit(service: BlogService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var postId = Req.pathParam("postId")
+        var request = BlogRoutes.parsePost()
+        var format = BlogRoutes.formatOf(request.format())
+        return idem.handle(userId, "PATCH", "/api/blogs/me/posts/" + postId, Idempotency.hash(json.encode(request)), 200, () -> json.encode(service.edit(userId, postId, request.title(), request.body(), format)))
+    }
+    static String deletePost(service: BlogService) {
+        var userId = Auth.requireUser()
+        var postId = Req.pathParam("postId")
+        service.delete(userId, postId)
+        return json.encode(BlogStatus(postId, "DELETED"))
+    }
+    static String subscribe(service: BlogService) {
+        var userId = Auth.requireUser()
+        var slug = Req.pathParam("slug")
+        service.subscribe(userId, slug)
+        return json.encode(BlogStatus(slug, "SUBSCRIBED"))
+    }
+    static String unsubscribe(service: BlogService) {
+        var userId = Auth.requireUser()
+        var slug = Req.pathParam("slug")
+        service.unsubscribe(userId, slug)
+        return json.encode(BlogStatus(slug, "NOT_SUBSCRIBED"))
+    }
+    // One-click unsubscribe from the newsletter e-mail (no session): a small HTML page.
+    static String unsubscribePage(newsletter: BlogNewsletterService) {
+        var ok = newsletter.unsubscribeByToken(Req.queryParam("token"))
+        var title = "Link inválido"
+        var message = "Este link de descadastro não é válido (ou já foi usado). Abra o blog no Énóis e cancele por lá."
+        if (ok) {
+            title = "Inscrição cancelada"
+            message = "Pronto: você não vai mais receber os e-mails deste blog. A inscrição no Énóis segue, e você pode voltar quando quiser."
+        }
+        ResponseHeaders.set("Content-Type", "text/html;charset=UTF-8")
+        var code = 400
+        if (ok) {
+            code = 200
+        }
+        return status(code, BlogRoutes.confirmationPage(title, message))
+    }
+    // RFC 8058: the mail client POSTs "List-Unsubscribe=One-Click" to the List-Unsubscribe URL.
+    static String unsubscribeOneClick(newsletter: BlogNewsletterService) {
+        if (newsletter.unsubscribeByToken(Req.queryParam("token"))) {
+            return status(200, "")
+        }
+        return status(400, "")
+    }
+    static String confirmationPage(title: String, message: String) = "<!DOCTYPE html><html lang=\"pt-BR\"><head><meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><title>" + title + "</title></head>\n<body style=\"margin:0;background:#f8f7ff;font-family:\'Inter\',system-ui,sans-serif;display:grid;place-items:center;min-height:100vh\">\n<div style=\"max-width:440px;background:#fff;border-radius:16px;padding:32px;margin:16px;box-shadow:0 8px 24px -8px rgba(99,102,241,.15);text-align:center\">\n<h1 style=\"margin:0 0 12px;color:#1a1a2e;font-size:20px\">" + title + "</h1>\n<p style=\"margin:0 0 20px;color:#4b5563;font-size:14px;line-height:1.6\">" + message + "</p>\n<a href=\"https://enois.ia.br\" style=\"display:inline-block;padding:12px 24px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;text-decoration:none;border-radius:999px;font-weight:600;font-size:14px\">Ir para o Énóis</a>\n</div></body></html>\n"
+    // An unknown format string is a malformed body (400), like the Java enum binding.
+    static String? formatOf(format: String?) {
+        if (format == null) {
+            return null
+        }
+        for (var f in BlogViews.formats()) {
+            if (f == format) {
+                return format
+            }
+        }
+        throw Errors.badRequest()
+    }
+    static BlogRequest parseBlog() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<BlogRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static BlogPostRequest parsePost() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<BlogPostRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

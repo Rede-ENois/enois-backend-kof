@@ -1,0 +1,93 @@
+package projects
+
+import kernel.db.*
+
+// user_projects. The stack is stored one technology per line (neither a URL nor a technology has a line
+// break) and the diary as a JSON array of {date, text}.
+class ProjectStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, user_id, position, title, description, banner, icon, stack, repo_url, status, diary, html, created_at, updated_at"
+    List<ProjectRecord> findByUser(userId: String) {
+        var out = listOf<ProjectRecord>()
+        for (var r in store.queryList("select " + ProjectStore.columns() + " from user_projects where user_id = ? order by position asc, created_at asc", DbParams().bindStr(userId))) {
+            out.add(ProjectStore.mapRow(r))
+        }
+        return out
+    }
+    Int countByUser(userId: String) = store.queryLong("select count(*) from user_projects where user_id = ?", DbParams().bindStr(userId)) as Int
+    ProjectRecord? findById(id: String) {
+        var row = store.queryOptional("select " + ProjectStore.columns() + " from user_projects where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return ProjectStore.mapRow(row)
+    }
+    // Insert or rewrite the card (the whole row, creation date included, as the Java save did).
+    save(p: ProjectRecord) {
+        var params = DbParams().bindStr(p.userId()).bindInt(p.position()).bindStr(p.title()).bindStrOrNull(p.description()).bindStrOrNull(p.banner()).bindStrOrNull(p.icon()).bindStr(ProjectStore.joinStack(p.stack())).bindStrOrNull(p.repoUrl()).bindStrOrNull(p.status()).bindStrOrNull(ProjectStore.diaryJson(p.diary())).bindStrOrNull(p.html()).bindInstant(p.createdAt()).bindInstant(p.updatedAt()).bindStr(p.id())
+        var updated = store.execute("update user_projects set user_id = ?, position = ?, title = ?, description = ?, banner = ?, icon = ?, stack = ?, repo_url = ?, status = ?, diary = ?, html = ?, created_at = ?, updated_at = ? where id = ?", params)
+        if (updated == 0) {
+            store.execute("insert into user_projects (user_id, position, title, description, banner, icon, stack, repo_url, status, diary, html, created_at, updated_at, id) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", params)
+        }
+    }
+    delete(id: String) {
+        store.execute("delete from user_projects where id = ?", DbParams().bindStr(id))
+    }
+    static String joinStack(stack: List<String>) {
+        var out = ""
+        var first = true
+        for (var item in stack) {
+            if (!first) {
+                out = out + "\n"
+            }
+            out = out + item
+            first = false
+        }
+        return out
+    }
+    static List<String> splitStack(text: String) {
+        var out = listOf<String>()
+        if (text.trim().length() == 0) {
+            return out
+        }
+        for (var part in text.split("\n")) {
+            out.add(part)
+        }
+        return out
+    }
+    // null for an empty diary, like the JPA entity.
+    static String? diaryJson(diary: List<ProjectDiaryEntry>) {
+        if (diary.size() == 0) {
+            return null
+        }
+        return json.encode(diary)
+    }
+    // A diary that is not readable is an empty one.
+    static List<ProjectDiaryEntry> parseDiary(text: String?) {
+        var out = listOf<ProjectDiaryEntry>()
+        if (text == null) {
+            return out
+        }
+        if (text.trim().length() == 0) {
+            return out
+        }
+        try {
+            for (var e in json.decode<List<ProjectDiaryInput>>(text)) {
+                out.add(ProjectDiaryEntry(ProjectStore.orEmpty(e.date()), ProjectStore.orEmpty(e.text())))
+            }
+        } catch (String bad) {
+            return listOf<ProjectDiaryEntry>()
+        }
+        return out
+    }
+    static String orEmpty(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    static ProjectRecord mapRow(r: DbRow) = ProjectRecord(r.getStr("id"), r.getStr("user_id"), r.getInt("position"), r.getStr("title"), r.getStrOrNull("description"), r.getStrOrNull("banner"), r.getStrOrNull("icon"), ProjectStore.splitStack(r.getStr("stack")), r.getStrOrNull("repo_url"), r.getStrOrNull("status"), ProjectStore.parseDiary(r.getStrOrNull("diary")), r.getStrOrNull("html"), r.getInstant("created_at"), r.getInstant("updated_at"))
+}

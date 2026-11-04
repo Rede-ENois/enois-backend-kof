@@ -1,0 +1,73 @@
+package releasenotes
+
+import kernel.error.*
+import kernel.text.*
+import kernel.time.*
+
+// The single "what's new" release notes: publishing replaces, retiring removes. Same shape as the admin
+// notice, with plain text items instead of HTML: the popup is a short list, not a page.
+class ReleaseNoteService {
+    ReleaseNoteStore notes
+    public constructor(notes: ReleaseNoteStore) {
+        this.notes = notes
+    }
+    static Int maxItems() = 8
+    static Int maxTitle() = 80
+    static Int maxDescription() = 240
+    ReleaseNoteView? current() = notes.findCurrent()
+    // Publishes (or rewrites) the current notes. `publishedAt` of the previous version is kept;
+    // `updatedAt` is always now, so an edit reopens the popup for people who closed the old one.
+    ReleaseNoteView publish(rawItems: List<ReleaseNoteItemInput>?) {
+        if (rawItems == null) {
+            throw ReleaseNoteService.invalidItems()
+        }
+        if (rawItems.size() == 0 || rawItems.size() > ReleaseNoteService.maxItems()) {
+            throw ReleaseNoteService.invalidItems()
+        }
+        var items = listOf<ReleaseNoteItem>()
+        for (var raw in rawItems) {
+            items.add(ReleaseNoteService.clean(raw))
+        }
+        var now = Time.nowIso()
+        var publishedAt = now
+        var previous = notes.findCurrent()
+        if (previous != null) {
+            publishedAt = previous.publishedAt()
+        }
+        var note = ReleaseNoteView(ReleaseNoteStore.rowId(), items, publishedAt, now)
+        notes.save(note)
+        return note
+    }
+    static String invalidItems() = Errors.api(400, "INVALID_RELEASE_ITEMS", "A novidade precisa de 1 a " + ReleaseNoteService.maxItems() + " itens.")
+    retire() {
+        notes.clear()
+    }
+    // Same text defence as a post (PlainText), checked after defusing so invisible-only input is empty.
+    static ReleaseNoteItem clean(raw: ReleaseNoteItemInput) {
+        var title = ReleaseNoteService.defuse(raw.title())
+        var description = ReleaseNoteService.defuse(raw.description())
+        if (title.length() == 0) {
+            throw Errors.api(400, "RELEASE_ITEM_TITLE_REQUIRED", "Cada item precisa de um titulo.")
+        }
+        if (title.length() > ReleaseNoteService.maxTitle()) {
+            throw Errors.api(400, "RELEASE_ITEM_TITLE_TOO_LONG", "O titulo do item tem no maximo " + ReleaseNoteService.maxTitle() + " caracteres.")
+        }
+        if (description.length() == 0) {
+            throw Errors.api(400, "RELEASE_ITEM_DESCRIPTION_REQUIRED", "Cada item precisa de uma descricao.")
+        }
+        if (description.length() > ReleaseNoteService.maxDescription()) {
+            throw Errors.api(400, "RELEASE_ITEM_DESCRIPTION_TOO_LONG", "A descricao do item tem no maximo " + ReleaseNoteService.maxDescription() + " caracteres.")
+        }
+        return ReleaseNoteItem(title, description)
+    }
+    static String defuse(raw: String?) {
+        if (raw == null) {
+            return ""
+        }
+        var cleaned = PlainText.defuse(raw.trim())
+        if (cleaned == null) {
+            return ""
+        }
+        return cleaned.trim()
+    }
+}

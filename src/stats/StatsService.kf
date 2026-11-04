@@ -1,0 +1,25 @@
+package stats
+
+import kernel.cache.*
+import kernel.time.*
+
+// Community numbers for the landing. The result is cached (`communityStats`, 10 minutes): counting
+// active users scans sessions, posts and comments, and the landing is visited without a session, so the
+// number may lag the database by up to ~10 minutes (the front shows "updated X ago").
+class StatsService {
+    StatsStore store
+    TtlCache communityCache
+    public constructor(store: StatsStore, communityCache: TtlCache) {
+        this.store = store
+        this.communityCache = communityCache
+    }
+    // The "active user" window: changing it changes the number shown on the landing.
+    static Int activeWindowDays() = 30
+    // JSON text of the cached StatsCommunity (a cache holds Strings, KOF_GAPS G43).
+    String communityJson() = communityCache.getOrLoad("community", () -> json.encode(this.compute()))
+    StatsCommunity compute() {
+        var now = Time.nowIso()
+        var since = Time.plusSeconds(now, 0L - StatsService.activeWindowDays() * 86400L)
+        return StatsCommunity(store.countActiveSince(since), store.countUsers(), StatsService.activeWindowDays(), now)
+    }
+}

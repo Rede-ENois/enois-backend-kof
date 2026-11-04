@@ -25,3 +25,25 @@ test "time helpers round trip iso instants" {
     assert(Time.fromDbTimestamp("2026-11-04 16:05:00.120000") == "2026-11-04T16:05:00.120Z")
     assert(Time.nowIso().endsWith("Z"))
 }
+
+class RecordingTap extends LogTap {
+    List<String> seen = listOf<String>()
+    public constructor() {
+        super()
+    }
+    accept(level: String, logger: String, message: String) {
+        seen.add(level + "|" + logger + "|" + message)
+        // A line logged from inside the tap is not tapped again.
+        Log("tap.inner").warn("from inside")
+    }
+}
+
+test "log taps see every written line once and never loop" {
+    var tap = RecordingTap()
+    Log.installTap(tap)
+    Log("tap.test").warn("careful")
+    Log("tap.test").debug("below the threshold")
+    Log.installTap(LogTap())
+    assert(tap.seen.size() == 1)
+    assert(tap.seen.get(0) == "WARN|tap.test|careful")
+}

@@ -1,0 +1,33 @@
+package suggestions
+
+import kernel.db.*
+import kernel.security.*
+
+// Seam to the support domain: the GitHub token of the support issues, which the suggestions reuse (the
+// team standard, rotated together). It is read on every use, so a change in the panel takes effect without a
+// restart. pending-port: support. The default reads what `SupportGithubConfig` reads: the encrypted value in
+// `support_settings` (name `github_token`), then the GITHUB_ISSUES_TOKEN fallback.
+class SuggestionsGithubToken {
+    Db store
+    SecretCipher cipher
+    String envToken
+    public constructor(store: Db, cipher: SecretCipher, envToken: String) {
+        this.store = store
+        this.cipher = cipher
+        this.envToken = envToken.trim()
+    }
+    String token() {
+        try {
+            var row = store.queryOptional("select value_cipher from support_settings where name = ?", DbParams().bindStr("github_token"))
+            if (row != null) {
+                var plain = cipher.decrypt(row.getStr("value_cipher"))
+                if (plain.trim().length() > 0) {
+                    return plain.trim()
+                }
+            }
+        } catch (String e) {
+        }
+        // key missing or changed: it does not take support down, it only turns the mirror off
+        return envToken
+    }
+}

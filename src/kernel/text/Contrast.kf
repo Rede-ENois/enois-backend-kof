@@ -1,0 +1,64 @@
+package kernel.text
+
+import java.lang.Math
+
+// WCAG contrast between two `#rrggbb` colours: the same arithmetic as the contrast auditor of the front end.
+// A colour that cannot be read measures 0 (the caller then refuses the pair).
+class Contrast {
+    static String digits() = "0123456789abcdef"
+    // 0..255 of the two hex digits at `at` (after the `#`).
+    static Int channel(hex: String, at: Int) {
+        var h = hex.toLowerCase()
+        var hi = Contrast.digits().indexOf(h.substring(at, at + 1))
+        var lo = Contrast.digits().indexOf(h.substring(at + 1, at + 2))
+        if (hi < 0 || lo < 0) {
+            throw "COLOR_INVALID: " + hex
+        }
+        return hi * 16 + lo
+    }
+    static Double linear(channelValue: Int) {
+        var v = channelValue / 255.0
+        if (v <= 0.03928) {
+            return v / 12.92
+        }
+        return Math.pow((v + 0.055) / 1.055, 2.4)
+    }
+    static Double luminance(hex: String) = 0.2126 * Contrast.linear(Contrast.channel(hex, 1)) + 0.7152 * Contrast.linear(Contrast.channel(hex, 3)) + 0.0722 * Contrast.linear(Contrast.channel(hex, 5))
+    // (lighter + 0.05) / (darker + 0.05); 0 when a colour is malformed.
+    static Double ratio(fg: String, bg: String) {
+        try {
+            var a = Contrast.luminance(fg)
+            var b = Contrast.luminance(bg)
+            var hi = a
+            var lo = b
+            if (b > a) {
+                hi = b
+                lo = a
+            }
+            return (hi + 0.05) / (lo + 0.05)
+        } catch (String e) {
+            return 0.0
+        }
+    }
+    // A translucent `hex` laid over `backdropHex` with opacity `alpha` (0..1): the colour the text sits on.
+    static String over(hex: String, backdropHex: String, alpha: Double) {
+        if (alpha >= 1.0) {
+            return hex
+        }
+        var out = "#"
+        var at = 1
+        while (at <= 5) {
+            var f = Contrast.channel(hex, at)
+            var b = Contrast.channel(backdropHex, at)
+            var mixed = (Math.floor(f * alpha + b * (1.0 - alpha) + 0.5) as Int)
+            out = out + Contrast.digits().substring(mixed / 16, mixed / 16 + 1) + Contrast.digits().substring(mixed % 16, mixed % 16 + 1)
+            at = at + 2
+        }
+        return out
+    }
+    // Math.round(ratio * 100) / 100 with the integer division the Java message used: 4.37 reads "4".
+    static Long wholePart(ratio: Double) {
+        var hundredths = (Math.floor(ratio * 100.0 + 0.5) as Long)
+        return hundredths / 100L
+    }
+}

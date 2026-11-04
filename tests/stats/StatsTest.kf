@@ -1,0 +1,58 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import leaves.*
+
+// Port of CommunityStatsTests (HTTP): public counter, the 30 day window and the cache.
+class StatsHolder {
+    static TestApp? app = null
+}
+
+TestApp statsApp() {
+    var cur = StatsHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = LeavesApp.boot("stats", mapOf("X", "1"))
+    StatsHolder.app = created
+    return created
+}
+
+clearStatsCache() {
+    LeavesApp.shared().caches.get("communityStats").clear()
+}
+
+test "the counter exposes the active window and needs no session" {
+    var app = statsApp()
+    clearStatsCache()
+    var res = app.client.get("/stats/community")
+    Check.status(res, 200)
+    Check.jsonEq(res, "windowDays", "30")
+    Check.isTrue("computedAt is present", res.jsonHas("computedAt"))
+    Check.isTrue("totalUsers is a number", res.jsonStr("totalUsers") != null)
+    Check.isTrue("activeUsers is a number", res.jsonStr("activeUsers") != null)
+    var v1 = app.client.get("/v1/stats/community")
+    Check.status(v1, 200)
+    Check.jsonEq(v1, "windowDays", "30")
+}
+
+test "the count is cached and picks up new activity after the cache expires" {
+    var app = statsApp()
+    clearStatsCache()
+    var activeBefore = app.client.get("/stats/community").jsonStr("activeUsers")
+    var totalBefore = app.client.get("/stats/community").jsonStr("totalUsers")
+    Check.isTrue("counts present", activeBefore != null && totalBefore != null)
+    // A new user with a live session (a login issues a session whose refresh token is valid).
+    SecurityFixtures.login(app.db(), "user_stats_active", "tok-stats-active-123")
+    app.db().execute("update auth_sessions set refresh_expires_at = ? where user_id = ?", DbParams().bindInstant(Time.plusSeconds(Time.nowIso(), 3600L)).bindStr("user_stats_active"))
+    // Warm cache: the number does NOT change (it is what keeps the landing from hitting the database).
+    Check.eqStr("cached active", "" + activeBefore, "" + app.client.get("/stats/community").jsonStr("activeUsers"))
+    // Expired cache: the number follows the database again.
+    clearStatsCache()
+    var refreshed = app.client.get("/stats/community")
+    Check.eqStr("total moved by one", "" + (("" + totalBefore).toLong() + 1L), "" + refreshed.jsonStr("totalUsers"))
+    Check.isTrue("active grew", ("" + refreshed.jsonStr("activeUsers")).toLong() >= ("" + activeBefore).toLong() + 1L)
+    Check.isTrue("active never above total", ("" + refreshed.jsonStr("activeUsers")).toLong() <= ("" + refreshed.jsonStr("totalUsers")).toLong())
+}

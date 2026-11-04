@@ -1,0 +1,62 @@
+import kernel.monitoring.*
+
+test "requests feed the minute series, the status groups and the top routes" {
+    var metrics = RequestMetrics()
+    var now = 1790000000000L
+    metrics.started()
+    metrics.started()
+    metrics.observe("GET", "/a", 200, 10L, now)
+    metrics.observe("GET", "/a", 500, 3000L, now)
+    metrics.observe("POST", "/b", 429, 5L, now)
+    var view = metrics.overview(now)
+    assert(view.series().size() == 60)
+    assert(view.requestsLastMinute() == 3L)
+    assert(view.errors5xxLastMinute() == 1L)
+    assert(view.errors4xxLastMinute() == 1L)
+    assert(view.rateLimitedLastMinute() == 1L)
+    assert(view.slowLastMinute() == 1L)
+    assert(view.requestsTotal() == 3L)
+    assert(view.statusCounts().get(0).label() == "2xx" && view.statusCounts().get(0).count() == 1L)
+    assert(view.topRoutes().get(0).label() == "/a" && view.topRoutes().get(0).count() == 2L)
+    assert(view.methodCounts().get(0).label() == "GET")
+    assert(view.maxMs() == 3000L)
+    // 3 completions after 2 starts: the gauge never goes negative.
+    assert(view.inFlight() == 0)
+    assert(view.peakInFlight() == 2)
+}
+
+test "percentiles use the nearest rank and an empty window is zero" {
+    assert(RequestMetrics.percentile(listOf<Long>(), 0.95) == 0L)
+    var values = listOf<Long>()
+    var i = 1
+    while (i <= 100) {
+        values.add(i as Long)
+        i = i + 1
+    }
+    assert(RequestMetrics.percentile(values, 0.50) == 50L)
+    assert(RequestMetrics.percentile(values, 0.95) == 95L)
+    assert(RequestMetrics.percentile(values, 0.99) == 99L)
+}
+
+test "a client disconnect only ends the in-flight request" {
+    var metrics = RequestMetrics()
+    metrics.started()
+    metrics.disconnected()
+    var view = metrics.overview(1790000000000L)
+    assert(view.requestsTotal() == 0L)
+    assert(view.inFlight() == 0)
+    assert(view.requestsLastMinute() == 0L)
+}
+
+test "old minutes leave the window and the resource sample shows on the chart" {
+    var metrics = RequestMetrics()
+    var then = 1790000000000L
+    metrics.observe("GET", "/old", 200, 1L, then)
+    var later = then + 3600000L + 120000L
+    metrics.sampleResources(later, 37L, 256L * 1024L * 1024L)
+    var view = metrics.overview(later)
+    assert(view.topRoutes().size() == 0)
+    assert(view.series().get(59).cpuPercent() == 37L)
+    assert(view.series().get(59).heapMb() == 256L)
+    assert(view.requestsLastMinute() == 0L)
+}
