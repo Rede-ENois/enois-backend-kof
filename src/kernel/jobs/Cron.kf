@@ -1,0 +1,147 @@
+package kernel.jobs
+
+import java.time.Instant
+import java.time.ZoneId
+import java.time.ZonedDateTime
+
+// A Spring-style six-field cron expression: `second minute hour day-of-month month day-of-week`
+// (`0 0 9 * * MON`, `0 20 * * * *`). Supports `*`, `?`, values, `a-b`, `*/n`, `a-b/n`, `a/n`,
+// comma lists, month names (JAN..DEC) and weekday names (MON..SUN). Weekdays are 1=MON..7=SUN
+// (0 is Sunday too). Day-of-month and day-of-week must both match, like Spring's CronExpression.
+class Cron {
+    List<Int> seconds
+    List<Int> minutes
+    List<Int> hours
+    List<Int> days
+    List<Int> months
+    List<Int> weekdays
+    public constructor(seconds: List<Int>, minutes: List<Int>, hours: List<Int>, days: List<Int>, months: List<Int>, weekdays: List<Int>) {
+        this.seconds = seconds
+        this.minutes = minutes
+        this.hours = hours
+        this.days = days
+        this.months = months
+        this.weekdays = weekdays
+    }
+    static Cron parse(expr: String) {
+        var parts = expr.trim().split("\\s+")
+        if (parts.length != 6) {
+            throw "CRON_INVALID: expected 6 fields, got " + parts.length + " in [" + expr + "]"
+        }
+        var weekdays = Cron.field(parts[5], 0, 7, true)
+        var normalized = listOf<Int>()
+        for (var d in weekdays) {
+            var v = d
+            if (v == 0) {
+                v = 7
+            }
+            if (!normalized.contains(v)) {
+                normalized.add(v)
+            }
+        }
+        return Cron(Cron.field(parts[0], 0, 59, false), Cron.field(parts[1], 0, 59, false), Cron.field(parts[2], 0, 23, false), Cron.field(parts[3], 1, 31, false), Cron.field(parts[4], 1, 12, false), normalized)
+    }
+    static Int name(token: String, weekday: Bool) {
+        var t = token.toUpperCase()
+        var months = listOf("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+        var days = listOf("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
+        if (weekday) {
+            var i = days.indexOf(t)
+            if (i >= 0) {
+                return i + 1
+            }
+        }
+        else {
+            var i = months.indexOf(t)
+            if (i >= 0) {
+                return i + 1
+            }
+        }
+        if (token.matches("[0-9]+")) {
+            return token.toInt()
+        }
+        throw "CRON_INVALID: bad value [" + token + "]"
+    }
+    // Expands one field to its allowed values. `weekday` also resolves MON..SUN; the month field
+    // resolves JAN..DEC (names are tried for the right field by range).
+    static List<Int> field(spec: String, min: Int, max: Int, weekday: Bool) {
+        var out = listOf<Int>()
+        for (var item in spec.split(",")) {
+            var step = 1
+            var range = item
+            var slash = item.indexOf("/")
+            if (slash >= 0) {
+                step = item.substring(slash + 1).toInt()
+                range = item.substring(0, slash)
+            }
+            if (step < 1) {
+                throw "CRON_INVALID: bad step in [" + spec + "]"
+            }
+            var lo = min
+            var hi = max
+            if (range == "*" || range == "?") {
+                lo = min
+                hi = max
+            }
+            else 
+                if (range.contains("-")) {
+                    var ab = range.split("-")
+                    lo = Cron.name(ab[0], weekday)
+                    hi = Cron.name(ab[1], weekday)
+                }
+                else {
+                    lo = Cron.name(range, weekday)
+                    if (slash >= 0) {
+                        hi = max
+                    }
+                    else {
+                        hi = lo
+                    }
+                }
+            if (lo < min || hi > max || lo > hi) {
+                throw "CRON_INVALID: value out of range in [" + spec + "]"
+            }
+            var v = lo
+            while (v <= hi) {
+                if (!out.contains(v)) {
+                    out.add(v)
+                }
+                v = v + step
+            }
+        }
+        return out
+    }
+    // Next fire time strictly after `afterMillis`, in `zone` (e.g. America/Sao_Paulo), as epoch millis.
+    Long next(afterMillis: Long, zone: String) {
+        ZonedDateTime t = ZonedDateTime.ofInstant(Instant.ofEpochMilli(afterMillis), ZoneId.of(zone))
+        t = t.withNano(0)
+        t = t.plusSeconds(1L)
+        var guard = 0
+        while (guard < 100000) {
+            guard = guard + 1
+            if (!months.contains(t.getMonthValue())) {
+                t = t.withDayOfMonth(1).withHour(0).withMinute(0).withSecond(0).plusMonths(1L)
+            }
+            else 
+                if (!days.contains(t.getDayOfMonth()) || !weekdays.contains(t.getDayOfWeek().getValue())) {
+                    t = t.withHour(0).withMinute(0).withSecond(0).plusDays(1L)
+                }
+                else 
+                    if (!hours.contains(t.getHour())) {
+                        t = t.withMinute(0).withSecond(0).plusHours(1L)
+                    }
+                    else 
+                        if (!minutes.contains(t.getMinute())) {
+                            t = t.withSecond(0).plusMinutes(1L)
+                        }
+                        else 
+                            if (!seconds.contains(t.getSecond())) {
+                                t = t.plusSeconds(1L)
+                            }
+                            else {
+                                return t.toInstant().toEpochMilli()
+                            }
+        }
+        throw "CRON_INVALID: no fire time found within the search horizon"
+    }
+}

@@ -1,0 +1,127 @@
+import kernel.jobs.*
+import java.util.concurrent.atomic.AtomicInteger
+
+AtomicInteger counter() = new AtomicInteger(0)
+
+test "fixed rate runs repeatedly and stops on demand" {
+    var jobs = Scheduler()
+    var hits = counter()
+    jobs.fixedRate("rate", 0L, 40L, () -> {
+    hits.incrementAndGet()
+})
+    time.sleep(400)
+    jobs.stop()
+    var seen = hits.get()
+    assert(seen >= 4)
+    assert(jobs.runCount("rate") == seen)
+    time.sleep(200)
+    assert(hits.get() <= seen + 1)
+}
+
+test "fixed delay waits after each run" {
+    var jobs = Scheduler()
+    var hits = counter()
+    jobs.fixedDelay("delay", 0L, 100L, () -> {
+    hits.incrementAndGet()
+    time.sleep(60)
+})
+    time.sleep(500)
+    jobs.stop()
+    var n = hits.get()
+    assert(n >= 2)
+    assert(n <= 4)
+}
+
+test "initial delay postpones the first run" {
+    var jobs = Scheduler()
+    var hits = counter()
+    jobs.fixedRate("late", 300L, 1000L, () -> {
+    hits.incrementAndGet()
+})
+    time.sleep(100)
+    assert(hits.get() == 0)
+    time.sleep(500)
+    assert(hits.get() == 1)
+    jobs.stop()
+}
+
+test "a failing job is logged and keeps running" {
+    var jobs = Scheduler()
+    var hits = counter()
+    jobs.fixedRate("boom", 0L, 50L, () -> {
+    hits.incrementAndGet()
+    if (hits.get() >= 1) {
+        throw "job exploded"
+    }
+})
+    time.sleep(400)
+    jobs.stop()
+    assert(hits.get() >= 3)
+    assert(jobs.failureCount("boom") == jobs.runCount("boom"))
+}
+
+test "duplicate job names are rejected" {
+    var jobs = Scheduler()
+    jobs.fixedRate("dup", 10000L, 10000L, () -> {
+})
+    var failed = false
+    try {
+        jobs.fixedRate("dup", 10000L, 10000L, () -> {
+})
+    } catch (String e) {
+        failed = e.startsWith("JOB_DUPLICATE")
+    }
+    jobs.stop()
+    assert(failed)
+}
+
+test "cron fires on the next matching second" {
+    var jobs = Scheduler()
+    var hits = counter()
+    jobs.cron("every-second", "* * * * * *", "America/Sao_Paulo", () -> {
+    hits.incrementAndGet()
+})
+    time.sleep(2600)
+    jobs.stop()
+    assert(hits.get() >= 2)
+}
+
+test "disabled cron is not scheduled" {
+    var jobs = Scheduler()
+    jobs.cron("off", "-", "America/Sao_Paulo", () -> {
+})
+    assert(jobs.runCount("off") == 0)
+    jobs.stop()
+}
+
+test "cron computes next fire times in the zone" {
+    // 2026-11-04T12:00:00Z is 09:00 in Sao Paulo (UTC-3, no DST): a Wednesday.
+    var base = 1793793600000L
+    var daily = Cron.parse("0 0 9 * * *")
+    assert(daily.next(base - 1000L, "America/Sao_Paulo") == base)
+    assert(daily.next(base, "America/Sao_Paulo") == base + 86400000L)
+    var monday = Cron.parse("0 0 9 * * MON")
+    // next Monday 2026-11-09 09:00 -03:00 = 12:00Z
+    assert(monday.next(base, "America/Sao_Paulo") == base + 5L * 86400000L)
+    var hourly = Cron.parse("0 20 * * * *")
+    assert(hourly.next(base, "America/Sao_Paulo") == base + 20L * 60000L)
+    var step = Cron.parse("0 */15 * * * *")
+    assert(step.next(base, "America/Sao_Paulo") == base + 15L * 60000L)
+    var list = Cron.parse("30 0 10,14 * * *")
+    assert(list.next(base, "America/Sao_Paulo") == base + 3600000L + 30000L)
+}
+
+test "invalid cron expressions fail fast" {
+    var bad = 0
+    try {
+        Cron.parse("* * * *")
+    } catch (String e) {
+        bad = bad + 1
+    }
+    try {
+        Cron.parse("61 * * * * *")
+    } catch (String e) {
+        bad = bad + 1
+    }
+    assert(bad == 2)
+}

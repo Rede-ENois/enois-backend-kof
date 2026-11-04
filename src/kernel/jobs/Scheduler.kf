@@ -1,0 +1,128 @@
+package kernel.jobs
+
+import java.lang.System
+import java.util.HashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import kernel.log.*
+
+// Background jobs on virtual threads. Each job owns one loop, so a job never overlaps itself
+// (single-instance per process; there is no cross-process lock). A job that throws is logged
+// and keeps its schedule. stop() ends every loop within ~50 ms (tests, shutdown).
+//
+//   var jobs = Scheduler()
+//   jobs.fixedRate("refresh", 5000L, 60000L, () -> refresh())            // initial delay, period (ms)
+//   jobs.fixedDelay("sweep", 0L, 30000L, () -> sweep())                  // delay after each run ends
+//   jobs.cron("digest", "0 0 9 * * MON", "America/Sao_Paulo", () -> digest())
+class Scheduler {
+    AtomicBoolean stopped = new AtomicBoolean(false)
+    Map<String,AtomicInteger> runs = new HashMap<String, AtomicInteger>()
+    Map<String,AtomicInteger> failures = new HashMap<String, AtomicInteger>()
+    Log log = Log("kernel.jobs")
+    AtomicInteger register(name: String) {
+        if (runs.containsKey(name)) {
+            throw "JOB_DUPLICATE: job " + name + " is already scheduled"
+        }
+        var counter = new AtomicInteger(0)
+        runs.put(name, counter)
+        failures.put(name, new AtomicInteger(0))
+        return counter
+    }
+    // Times the job has started (including failed runs).
+    Int runCount(name: String) {
+        var c = runs.get(name)
+        if (c == null) {
+            return 0
+        }
+        return c.get()
+    }
+    Int failureCount(name: String) {
+        var c = failures.get(name)
+        if (c == null) {
+            return 0
+        }
+        return c.get()
+    }
+    Bool isStopped() = stopped.get()
+    stop() {
+        stopped.set(true)
+    }
+    // Sleeps `ms` in short slices so stop() is honoured promptly.
+    sleepOrStop(ms: Long) {
+        var left = ms
+        while (left > 0L && !stopped.get()) {
+            var slice = 50L
+            if (left < slice) {
+                slice = left
+            }
+            time.sleep(slice as Int)
+            left = left - slice
+        }
+    }
+    runOnce(name: String, job: () -> void) {
+        var started = runs.get(name)
+        if (started != null) {
+            started.incrementAndGet()
+        }
+        try {
+            job()
+        } catch (String e) {
+            var failed = failures.get(name)
+            if (failed != null) {
+                failed.incrementAndGet()
+            }
+            log.error("job_failed name=" + name + " message=" + e)
+        }
+    }
+    // First run after `initialDelayMs`, then every `periodMs` measured start to start.
+    fixedRate(name: String, initialDelayMs: Long, periodMs: Long, job: () -> void) {
+        register(name)
+        var self = this
+        spawn self.rateLoop(name, initialDelayMs, periodMs, job)
+    }
+    rateLoop(name: String, initialDelayMs: Long, periodMs: Long, job: () -> void) {
+        sleepOrStop(initialDelayMs)
+        while (!stopped.get()) {
+            var started = System.currentTimeMillis()
+            runOnce(name, job)
+            var wait = periodMs - (System.currentTimeMillis() - started)
+            if (wait > 0L) {
+                sleepOrStop(wait)
+            }
+        }
+    }
+    // First run after `initialDelayMs`, then `delayMs` after each run finishes.
+    fixedDelay(name: String, initialDelayMs: Long, delayMs: Long, job: () -> void) {
+        register(name)
+        var self = this
+        spawn self.delayLoop(name, initialDelayMs, delayMs, job)
+    }
+    delayLoop(name: String, initialDelayMs: Long, delayMs: Long, job: () -> void) {
+        sleepOrStop(initialDelayMs)
+        while (!stopped.get()) {
+            runOnce(name, job)
+            sleepOrStop(delayMs)
+        }
+    }
+    // Spring-style cron in `zone`. The expression "-" disables the job (Spring's CRON_DISABLED).
+    cron(name: String, expr: String, zone: String, job: () -> void) {
+        if (expr.trim() == "-") {
+            log.info("job_disabled name=" + name)
+            return
+        }
+        var parsed = Cron.parse(expr)
+        register(name)
+        var self = this
+        spawn self.cronLoop(name, parsed, zone, job)
+    }
+    cronLoop(name: String, parsed: Cron, zone: String, job: () -> void) {
+        while (!stopped.get()) {
+            var now = System.currentTimeMillis()
+            var at = parsed.next(now, zone)
+            sleepOrStop(at - now)
+            if (!stopped.get()) {
+                runOnce(name, job)
+            }
+        }
+    }
+}
