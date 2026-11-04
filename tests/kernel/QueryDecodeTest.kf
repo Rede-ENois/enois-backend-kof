@@ -1,0 +1,42 @@
+import kernel.*
+import kernel.http.*
+import kernel.testkit.*
+
+// Spring decodes a query string as a form: `+` is a space, `%2B` is a plus, repeated names add up. The
+// web runtime keeps `+` literal, so Req reads the raw query.
+class QueryDecodeHolder {
+    static TestApp? app = null
+}
+
+TestApp queryApp() {
+    var cur = QueryDecodeHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = TestApp.bootWire("querydecode", (p: Platform) -> {
+    p.server.get("/probe/q", () -> "[" + Req.queryStr("q", "none") + "]")
+    p.server.get("/probe/all", () -> "[" + Req.queryAll("t").size() + ":" + Req.queryAll("t").get(0) + "]")
+    p.server.get("/probe/n", () -> "[" + Req.queryInt("n", 7) + "]")
+})
+    QueryDecodeHolder.app = created
+    return created
+}
+
+test "a plus is a space and an encoded plus stays a plus" {
+    var app = queryApp()
+    Check.eqStr("plus", "[a b]", app.client.get("/probe/q?q=a+b").body)
+    Check.eqStr("percent space", "[a b]", app.client.get("/probe/q?q=a%20b").body)
+    Check.eqStr("encoded plus", "[a+b]", app.client.get("/probe/q?q=a%2Bb").body)
+    Check.eqStr("utf-8", "[ça]", app.client.get("/probe/q?q=%C3%A7a").body)
+    Check.eqStr("encoded ampersand", "[a&b]", app.client.get("/probe/q?q=a%26b").body)
+    Check.eqStr("absent", "[none]", app.client.get("/probe/q").body)
+    Check.eqStr("first wins", "[x]", app.client.get("/probe/q?q=x&q=y").body)
+}
+
+test "repeated parameters are all visible and numbers still parse" {
+    var app = queryApp()
+    Check.eqStr("two values", "[2:a]", app.client.get("/probe/all?t=a&t=b").body)
+    Check.eqStr("number", "[12]", app.client.get("/probe/n?n=12").body)
+    Check.eqStr("default", "[7]", app.client.get("/probe/n").body)
+    Check.apiError(app.client.get("/probe/n?n=abc"), 400, "BAD_REQUEST")
+}
