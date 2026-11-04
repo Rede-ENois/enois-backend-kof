@@ -1,0 +1,178 @@
+import java.util.concurrent.atomic.AtomicInteger
+import kernel.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import studypairs.*
+
+// Port of StudyPairConcurrencyTests: the invariants only the database can hold under real
+// concurrency (one open request per person, two active pairs at most, never the same duo twice).
+// The calls go out together (start gate) from two virtual threads, each in its own transaction:
+// the shape of a double tap, two devices or two replicas.
+class SpcHolder {
+    static TestApp? spcCache = null
+    static AtomicInteger spcGate = new AtomicInteger(0)
+}
+
+spcWire(p: Platform) {
+    SecurityClock.reset()
+    var hooks = SecurityHooks.defaults(p.db)
+    Security.install(p, hooks)
+    var shared = SharedServices.create(p)
+    StudyPairsModule.install(p, shared, hooks)
+}
+
+TestApp spcApp() {
+    var cur = SpcHolder.spcCache
+    if (cur != null) {
+        return cur
+    }
+    var created = TestApp.bootWith("studypairsrace", mapOf("REDE_ORIGINS_ENFORCE", "false", "GLOBAL_RATE_LIMIT_PER_MINUTE", "0", "POST_USER_RATE_LIMIT", "100000", "POST_IP_RATE_LIMIT", "100000"), (p: Platform) -> spcWire(p))
+    SpcHolder.spcCache = created
+    return created
+}
+
+Db spcDb() = spcApp().db()
+
+String spcLogin(id: String) {
+    var token = "tok-" + id + "-1234567890"
+    SecurityFixtures.login(spcDb(), id, token)
+    spcDb().execute("update users set birth_date = ? where id = ?", DbParams().bindDate("1990-01-01").bindStr(id))
+    return token
+}
+
+TestResponse spcSend(method: String, path: String, token: String, body: String) = spcApp().client.send(method, path, listOf("X-Session-Token: " + token, "Idempotency-Key: spc-" + Ids.uuid(), "Content-Type: application/json"), "", body)
+
+TestResponse spcRequest(token: String, goal: String) = spcSend("POST", "/study-pairs/requests", token, json.encode(StudyPairGoalRequest(goal, null)))
+
+TestResponse spcCheckin(token: String, pairId: String, note: String) = spcSend("POST", "/study-pairs/" + pairId + "/checkins", token, json.encode(StudyPairCheckinRequest(note)))
+
+waitGate() {
+    var waited = 0
+    while (SpcHolder.spcGate.get() == 0 && waited < 10000) {
+        time.sleep(1)
+        waited = waited + 1
+    }
+}
+
+Int spcGatedRequest(token: String, goal: String) {
+    waitGate()
+    return spcRequest(token, goal).status
+}
+
+Int spcGatedCheckin(token: String, pairId: String, note: String) {
+    waitGate()
+    return spcCheckin(token, pairId, note).status
+}
+
+String spcPairId(token: String, goal: String) {
+    var res = spcRequest(token, goal)
+    Check.status(res, 201)
+    return res.json("pairId")
+}
+
+Int spcCount(sql: String, a: String) = spcDb().queryLong(sql, DbParams().bindStr(a)) as Int
+
+Int spcOpen(userId: String) = spcCount("select count(*) from study_pair_requests where user_id = ? and status = \'OPEN\'", userId)
+
+Int spcMatched(userId: String) = spcCount("select count(*) from study_pair_requests where user_id = ? and status = \'MATCHED\'", userId)
+
+Int spcActivePairs(userId: String) = spcDb().queryLong("select count(*) from study_pairs where status = \'ACTIVE\' and (user_a = ? or user_b = ?)", DbParams().bindStr(userId).bindStr(userId)) as Int
+
+test "two requests from the same person at once keep exactly one open request" {
+    var me = spcLogin("sp-race-self")
+    SpcHolder.spcGate.set(0)
+    var one = __kof_spawn_expr(spcGatedRequest(me, "primeiro objetivo sp-race-self"))
+    var two = __kof_spawn_expr(spcGatedRequest(me, "segundo objetivo sp-race-self"))
+    SpcHolder.spcGate.set(1)
+    var s1 = __kof_await(one)
+    var s2 = __kof_await(two)
+    Check.isTrue("one created, one conflict", s1 == 201 && s2 == 409 || s1 == 409 && s2 == 201)
+    Check.eqInt("rows", 1, spcCount("select count(*) from study_pair_requests where user_id = ?", "sp-race-self"))
+    Check.eqInt("open", 1, spcOpen("sp-race-self"))
+}
+
+test "two people asking the same goal at once pair with the waiting request only once" {
+    var waiting = spcLogin("sp-race-wait")
+    var first = spcLogin("sp-race-first")
+    var second = spcLogin("sp-race-second")
+    Check.status(spcRequest(waiting, "objetivo sp-race-goal"), 201)
+    SpcHolder.spcGate.set(0)
+    var one = __kof_spawn_expr(spcGatedRequest(first, "objetivo sp-race-goal"))
+    var two = __kof_spawn_expr(spcGatedRequest(second, "objetivo sp-race-goal"))
+    SpcHolder.spcGate.set(1)
+    Check.eqInt("first", 201, __kof_await(one))
+    Check.eqInt("second", 201, __kof_await(two))
+    // The waiting request left the queue exactly once, so only one pair was created for the goal.
+    Check.eqInt("one pair", 1, spcCount("select count(*) from study_pairs where goal_key = ? and status = \'ACTIVE\'", "objetivo-sp-race-goal"))
+    Check.eqInt("waiting matched once", 1, spcMatched("sp-race-wait"))
+    // One of the two got the pair; the other is still in the queue waiting.
+    Check.eqInt("matched", 1, spcMatched("sp-race-first") + spcMatched("sp-race-second"))
+    Check.eqInt("still open", 1, spcOpen("sp-race-first") + spcOpen("sp-race-second"))
+}
+
+test "the database refuses a second active pair between the same two people" {
+    var a = spcLogin("sp-race-duo-a")
+    var b = spcLogin("sp-race-duo-b")
+    Check.status(spcRequest(a, "objetivo sp-race-duo"), 201)
+    Check.status(spcRequest(b, "objetivo sp-race-duo"), 201)
+    var duplicateKey = "sp-race-duo-a:sp-race-duo-b"
+    var refused = false
+    try {
+        spcDb().execute("insert into study_pairs (id, user_a, user_b, goal_key, goal_text, topic, status, started_at, ended_at, active_pair_key) values (?, ?, ?, ?, ?, null, \'ACTIVE\', current_timestamp, null, ?)", DbParams().bindStr(Ids.prefixed("sp_duplicate_")).bindStr("sp-race-duo-b").bindStr("sp-race-duo-a").bindStr("objetivo-sp-race-duo").bindStr("objetivo sp-race-duo").bindStr(duplicateKey))
+    } catch (String e) {
+        refused = Errors.hasCode(e, "CONFLICT")
+    }
+    Check.isTrue("duplicate refused", refused)
+}
+
+test "the database refuses a second open request for the same person" {
+    var me = spcLogin("sp-race-index")
+    Check.status(spcRequest(me, "objetivo sp-race-index"), 201)
+    var refused = false
+    try {
+        spcDb().execute("insert into study_pair_requests (id, user_id, goal_key, goal_text, topic, status, created_at, open_user_id) values (?, ?, ?, ?, null, \'OPEN\', current_timestamp, ?)", DbParams().bindStr(Ids.prefixed("spr_duplicate_")).bindStr("sp-race-index").bindStr("outro-objetivo").bindStr("outro objetivo").bindStr("sp-race-index"))
+    } catch (String e) {
+        refused = Errors.hasCode(e, "CONFLICT")
+    }
+    Check.isTrue("duplicate refused", refused)
+    Check.eqInt("open", 1, spcOpen("sp-race-index"))
+}
+
+test "two check-ins at once keep one row and notify the partner once" {
+    var a = spcLogin("sp-race-checkin-a")
+    var b = spcLogin("sp-race-checkin-b")
+    Check.status(spcRequest(a, "objetivo sp-race-checkin"), 201)
+    var pairId = spcPairId(b, "objetivo sp-race-checkin")
+    // Double tap: two writes with different Idempotency-Keys both reach the service and only the
+    // primary key (pair, member, week) decides who inserted the row.
+    SpcHolder.spcGate.set(0)
+    var one = __kof_spawn_expr(spcGatedCheckin(a, pairId, "primeira nota"))
+    var two = __kof_spawn_expr(spcGatedCheckin(a, pairId, "segunda nota"))
+    SpcHolder.spcGate.set(1)
+    Check.eqInt("first", 200, __kof_await(one))
+    Check.eqInt("second", 200, __kof_await(two))
+    Check.eqInt("one row", 1, spcDb().queryLong("select count(*) from study_checkins where pair_id = ? and user_id = ?", DbParams().bindStr(pairId).bindStr("sp-race-checkin-a")) as Int)
+    // The partner hears about the week once, not once per write.
+    Check.eqInt("notified once", 1, spcCount("select count(*) from notifications where user_id = ? and kind = \'STUDY_PAIR_CHECKIN\'", "sp-race-checkin-b"))
+}
+
+test "an ended pair frees the slot and a closed request frees the queue" {
+    var a = spcLogin("sp-race-slot-a")
+    var b = spcLogin("sp-race-slot-b")
+    var c = spcLogin("sp-race-slot-c")
+    Check.status(spcRequest(a, "objetivo sp-race-slot-1"), 201)
+    var matched = spcPairId(b, "objetivo sp-race-slot-1")
+    Check.status(spcRequest(a, "objetivo sp-race-slot-2"), 201)
+    Check.status(spcRequest(c, "objetivo sp-race-slot-2"), 201)
+    // Two active pairs: the ceiling answers with the explicit error, not a third pair.
+    Check.status(spcRequest(a, "objetivo sp-race-slot-3"), 409)
+    Check.eqInt("two active", 2, spcActivePairs("sp-race-slot-a"))
+    spcSend("POST", "/study-pairs/" + matched + "/end", a, "")
+    Check.eqInt("one active", 1, spcActivePairs("sp-race-slot-a"))
+    Check.status(spcRequest(a, "objetivo sp-race-slot-3"), 201)
+    Check.eqInt("still one", 1, spcActivePairs("sp-race-slot-a"))
+}
