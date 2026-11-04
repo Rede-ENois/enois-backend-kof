@@ -76,6 +76,14 @@ Measured limits (each one has a minimal repro in `docs/KOF_GAPS.md`):
 5. Qualified Java names are not receivers: `import java.x.Y` then `Y.call()`.
 6. **One `main()` per module directory.** Probes and scratch programs live outside `src/`.
 7. `kof check` does not see `kofdeps` jars; validate with `scripts/kof-test`/`scripts/kof-run`.
+8. **Static fields and top-level names share one namespace with every field/variable of the module
+   (G35):** a static `seen` in the kernel broke tests that had their own `seen`. Name static fields
+   uniquely after their owner (`responseHeadersSlot`, `authUserSlot`), never `seen`/`values`/`count`.
+9. Never name a variable `db`, `query` or `transaction` (G17); call your own methods with `this.`.
+10. No `finally` after a rethrow (G12): capture the failure, release resources, then rethrow.
+11. Interfaces from another package cannot be implemented (G30) and lambdas returning another
+    package's class fail (G33): cross-domain seams are concrete classes with overridable no-op
+    methods, subclassed with `extends`.
 
 When you hit a new compiler/runtime bug: write the smallest repro, add it to `docs/KOF_GAPS.md`
 (symptom, repro, workaround), apply the workaround **inside the kernel when possible**, move on.

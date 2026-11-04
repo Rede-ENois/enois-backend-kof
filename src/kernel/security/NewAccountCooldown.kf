@@ -1,0 +1,32 @@
+package kernel.security
+
+import kernel.config.*
+import kernel.db.*
+import kernel.error.*
+import kernel.time.*
+
+// A brand-new account cannot publish at once: bots create an account and post within milliseconds,
+// people browse and set up a profile first. REDE_SECURITY_NEW_ACCOUNT_COOLDOWN_SECONDS (default 30,
+// 0 disables). Reads users.created_at directly (the profile domain owns the table).
+class NewAccountCooldown {
+    Db store
+    Long cooldownSeconds
+    public constructor(store: Db, cfg: Config) {
+        this.store = store
+        this.cooldownSeconds = cfg.getLong("REDE_SECURITY_NEW_ACCOUNT_COOLDOWN_SECONDS", 30L)
+    }
+    // Throws 429 ACCOUNT_TOO_NEW while the account is younger than the cooldown.
+    require(userId: String) {
+        if (cooldownSeconds <= 0L) {
+            return
+        }
+        var row = store.queryOptional("select created_at from users where id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return
+        }
+        var ageSeconds = (SecurityClock.nowMillis() - Time.toMillis(row.getInstant("created_at"))) / 1000L
+        if (ageSeconds < cooldownSeconds) {
+            throw Errors.api(429, "ACCOUNT_TOO_NEW", "Sua conta foi criada ha poucos segundos. Aguarde um momento antes de publicar.")
+        }
+    }
+}

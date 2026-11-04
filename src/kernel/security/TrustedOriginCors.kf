@@ -1,0 +1,27 @@
+package kernel.security
+
+import java.lang.ThreadLocal
+import kernel.http.*
+
+// CORS headers for responses that filters write before the MVC-level CORS handling runs (429, CSRF
+// 403). The origin gate is the only place that decides trust: it marks the request, and only a marked
+// origin is reflected here with credentials, so an arbitrary site never gets a credentialed CORS grant.
+class TrustedOriginCors {
+    static ThreadLocal trustedCorsSlot = new ThreadLocal()
+    static reset() {
+        trustedCorsSlot.remove()
+    }
+    // Called by the origin gate once the request's Origin is one of the app's own.
+    static markTrusted(origin: String) {
+        trustedCorsSlot.set(origin)
+    }
+    // Reflects the origin with credentials when the origin gate marked it trusted; otherwise nothing.
+    static apply() {
+        var origin = trustedCorsSlot.get()
+        if (origin != null) {
+            ResponseHeaders.set("Access-Control-Allow-Origin", origin.toString())
+            ResponseHeaders.set("Access-Control-Allow-Credentials", "true")
+            ResponseHeaders.add("Vary", "Origin")
+        }
+    }
+}

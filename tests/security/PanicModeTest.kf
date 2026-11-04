@@ -1,0 +1,104 @@
+import kernel.*
+import kernel.config.*
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+
+// Port of PanicModeTests (HTTP). The unit half (PanicModeServiceTests) lives in LimitersTest.
+wirePanic(s: HttpServer) {
+    s.post("/feed/posts", () -> status(201, "{\"id\":\"p1\"}"))
+    s.get("/feed", () -> "{\"items\":[]}")
+    s.post("/auth/login", () -> status(401, "{\"code\":\"INVALID_CREDENTIALS\",\"message\":\"x\"}"))
+    s.post("/auth/refresh", () -> status(401, "{\"code\":\"UNAUTHENTICATED\",\"message\":\"x\"}"))
+    s.post("/auth/2fa/verify", () -> status(401, "{\"code\":\"X\",\"message\":\"x\"}"))
+    s.post("/auth/signup", () -> status(400, "{\"code\":\"X\",\"message\":\"x\"}"))
+    s.delete("/feed/posts/:id", () -> "{}")
+}
+
+class PanicHolder {
+    static TestApp? app = null
+}
+
+TestApp panicApp() {
+    var cur = PanicHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = SecurityApp.boot("panic", mapOf("X", "1"), (s: HttpServer) -> wirePanic(s))
+    PanicHolder.app = created
+    return created
+}
+
+List<String> tok(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+
+test "panic blocks writes and can be turned off by an admin" {
+    var app = panicApp()
+    SecurityFixtures.login(app.db(), "panic_admin", "tok-panic-admin-12")
+    app.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr("panic_admin"))
+    SecurityFixtures.login(app.db(), "panic_user", "tok-panic-user-123")
+    var on = app.client.send("POST", "/admin/panic", tok("tok-panic-admin-12"), "", "{\"active\":true}")
+    Check.status(on, 200)
+    Check.jsonEq(on, "active", "true")
+    Check.jsonEq(on, "envLocked", "false")
+    Check.jsonEq(on, "message", "Modo pânico ativo: toda escrita está respondendo 429.")
+    var blocked = app.client.send("POST", "/feed/posts", tok("tok-panic-user-123"), "", "{\"content\":\"x\"}")
+    Check.apiError(blocked, 429, "PANIC_MODE")
+    Check.jsonEq(blocked, "message", "Escritas temporariamente bloqueadas pelo modo panico. Tente novamente em instantes.")
+    Check.apiError(app.client.remove("/feed/posts/p1"), 429, "PANIC_MODE")
+    Check.apiError(app.client.postJson("/v1/feed/posts", "{}"), 429, "PANIC_MODE")
+    Check.apiError(app.client.postJson("/caminho_que_nao_existe", "{}"), 429, "PANIC_MODE")
+    var read = app.client.getWith("/feed", tok("tok-panic-user-123"))
+    Check.status(read, 200)
+    var status = app.client.send("GET", "/admin/panic", tok("tok-panic-admin-12"), "", "")
+    Check.jsonEq(status, "active", "true")
+    var off = app.client.send("POST", "/admin/panic", tok("tok-panic-admin-12"), "", "{\"active\":false}")
+    Check.status(off, 200)
+    Check.jsonEq(off, "active", "false")
+    Check.jsonEq(off, "message", "Modo pânico desligado: a aplicação está aceitando escritas.")
+    var after = app.client.send("POST", "/feed/posts", tok("tok-panic-user-123"), "", "{\"content\":\"agora entra\"}")
+    Check.status(after, 201)
+}
+
+test "login, refresh, second factor and the panic endpoint stay reachable while panic is on" {
+    var app = panicApp()
+    SecurityFixtures.login(app.db(), "panic_admin2", "tok-panic-admin2-12")
+    app.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr("panic_admin2"))
+    app.client.send("POST", "/admin/panic", tok("tok-panic-admin2-12"), "", "{\"active\":true}")
+    Check.status(app.client.postJson("/auth/login", "{}"), 401)
+    Check.status(app.client.postJson("/auth/refresh", "{}"), 401)
+    Check.status(app.client.postJson("/auth/2fa/verify", "{}"), 401)
+    Check.status(app.client.postJson("/v1/auth/login", "{}"), 401)
+    Check.apiError(app.client.postJson("/auth/signup", "{}"), 429, "PANIC_MODE")
+    var off = app.client.send("POST", "/admin/panic", tok("tok-panic-admin2-12"), "", "{\"active\":false}")
+    Check.jsonEq(off, "active", "false")
+}
+
+test "the panic endpoint is admin only and rejects a malformed body" {
+    var app = panicApp()
+    SecurityFixtures.login(app.db(), "panic_plain", "tok-panic-plain-123")
+    SecurityFixtures.login(app.db(), "panic_admin3", "tok-panic-admin3-12")
+    app.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr("panic_admin3"))
+    Check.apiError(app.client.get("/admin/panic"), 401, "UNAUTHENTICATED")
+    Check.apiError(app.client.getWith("/admin/panic", tok("tok-panic-plain-123")), 403, "FORBIDDEN")
+    Check.apiError(app.client.send("POST", "/admin/panic", tok("tok-panic-plain-123"), "", "{\"active\":true}"), 403, "FORBIDDEN")
+    Check.apiError(app.client.send("POST", "/admin/panic", tok("tok-panic-admin3-12"), "", "not json"), 400, "BAD_REQUEST")
+    var status = app.client.getWith("/admin/panic", tok("tok-panic-admin3-12"))
+    Check.jsonEq(status, "active", "false")
+}
+
+test "panic mode born from the PANIC_MODE variable cannot be switched off by the panel" {
+    var env = SecurityApp.boot("panicenv", mapOf("PANIC_MODE", "yes"), (s: HttpServer) -> wirePanic(s))
+    SecurityFixtures.login(env.db(), "panic_env_admin", "tok-panic-env-12345")
+    env.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr("panic_env_admin"))
+    var blocked = env.client.send("POST", "/feed/posts", tok("tok-panic-env-12345"), "", "{}")
+    Check.apiError(blocked, 429, "PANIC_MODE")
+    var off = env.client.send("POST", "/admin/panic", tok("tok-panic-env-12345"), "", "{\"active\":false}")
+    Check.status(off, 200)
+    Check.jsonEq(off, "active", "true")
+    Check.jsonEq(off, "envLocked", "true")
+    Check.jsonEq(off, "message", "Modo pânico ATIVADO pela variável de ambiente PANIC_MODE: o painel não consegue desligar.")
+    Check.apiError(env.client.send("POST", "/feed/posts", tok("tok-panic-env-12345"), "", "{}"), 429, "PANIC_MODE")
+    Check.status(env.client.getWith("/feed", tok("tok-panic-env-12345")), 200)
+    env.stop()
+}

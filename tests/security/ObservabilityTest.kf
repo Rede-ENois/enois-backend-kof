@@ -1,0 +1,217 @@
+import kernel.*
+import kernel.config.*
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+
+// Port of RequestObservabilityFilterTests plus the access-log contract of the filter.
+class CountingMonitoring extends SecurityMonitoring {
+    Int started = 0
+    List<String> recorded = listOf<String>()
+    requestStarted() {
+        started = started + 1
+    }
+    recordRequest(method: String, uri: String, route: String, status: Int, durationMs: Long, requestId: String, userId: String, clientIp: String, deviceId: String) {
+        recorded.add(method + " " + uri + " " + route + " " + status + " user=" + userId + " ip=" + clientIp + " device=" + deviceId)
+    }
+}
+
+class ObsHolder {
+    static TestApp? app = null
+    static CountingMonitoring monitoring = CountingMonitoring()
+}
+
+String contextBody() {
+    LogContext.put("userId", "user_1")
+    return "{\"requestId\":\"" + LogContext.getOr("requestId", "") + "\",\"clientIp\":\"" + LogContext.getOr("clientIp", "") + "\",\"method\":\"" + LogContext.getOr("http.method", "") + "\",\"path\":\"" + LogContext.getOr("http.path", "") + "\",\"device\":\"" + LogContext.getOr("deviceId", "") + "\",\"user\":\"" + LogContext.getOr("userId", "") + "\"}"
+}
+
+String peekBody() = "{\"user\":\"" + LogContext.getOr("userId", "") + "\",\"requestId\":\"" + LogContext.getOr("requestId", "") + "\"}"
+
+String slowBody() {
+    time.sleep(2100)
+    return "{}"
+}
+
+String boomBody() {
+    throw Errors.api(503, "UPSTREAM_DOWN", "Indisponivel.")
+}
+
+wireObs(s: HttpServer) {
+    s.get("/feed", () -> contextBody())
+    s.get("/peek", () -> peekBody())
+    s.get("/slow", () -> slowBody())
+    s.get("/boom", () -> boomBody())
+    s.post("/admin/reports/:id/ban", () -> "{\"banned\":true}")
+    s.get("/admin/reports", () -> "{\"reports\":[]}")
+    s.get("/admin/monitoring/series", () -> "{}")
+    s.get("/livez", () -> "{\"up\":true}")
+    s.get("/me", () -> meBody())
+}
+
+String meBody() = "{\"user\":\"" + Auth.requireUser() + "\"}"
+
+TestApp obsApp() {
+    var cur = ObsHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = TestApp.bootWith("obs", mapOf("REDE_ORIGINS_ENFORCE", "false"), (p: Platform) -> {
+    var hooks = SecurityHooks.defaults(p.db)
+    hooks.monitoring = ObsHolder.monitoring
+    Security.install(p, hooks)
+    wireObs(p.server)
+})
+    ObsHolder.app = created
+    RequestObservability.startCapture()
+    return created
+}
+
+List<String> drain() = RequestObservability.drainCapture()
+
+Bool anyContains(lines: List<String>, needle: String) {
+    for (var l in lines) {
+        if (l.contains(needle)) {
+            return true
+        }
+    }
+    return false
+}
+
+test "the request context is visible during the request, echoed in the header and gone for the next request" {
+    var app = obsApp()
+    drain()
+    var res = app.client.getWith("/feed", listOf("X-Forwarded-For: 6.6.6.6, 203.0.113.7"))
+    Check.status(res, 200)
+    Check.jsonEq(res, "clientIp", "203.0.113.7")
+    Check.jsonEq(res, "method", "GET")
+    Check.jsonEq(res, "path", "/feed")
+    Check.isTrue("has request id", res.json("requestId").length() > 0)
+    Check.eqStr("header", res.json("requestId"), res.header("X-Request-Id"))
+    var next = app.client.get("/peek")
+    Check.jsonEq(next, "user", "")
+    Check.isTrue("a fresh request id", next.json("requestId") != res.json("requestId"))
+    var lines = drain()
+    Check.isTrue("no audit line for a read", !anyContains(lines, "admin_action"))
+}
+
+test "a client request id is kept only when it is a safe identifier" {
+    var app = obsApp()
+    var ok = app.client.getWith("/feed", listOf("X-Request-Id: client.req-12345"))
+    Check.eqStr("kept", "client.req-12345", ok.header("X-Request-Id"))
+    Check.jsonEq(ok, "requestId", "client.req-12345")
+    var brief = app.client.getWith("/feed", listOf("X-Request-Id: abc"))
+    Check.isTrue("short replaced", brief.header("X-Request-Id") != "abc")
+    var spaced = app.client.getWith("/feed", listOf("X-Request-Id: bad id with spaces"))
+    Check.isTrue("spaces replaced", !spaced.header("X-Request-Id").contains(" "))
+    Check.eqInt("generated length", 32, spaced.header("X-Request-Id").length())
+    var huge = app.client.getWith("/feed", listOf("X-Request-Id: " + strings.repeat("a", 65)))
+    Check.eqInt("long replaced", 32, huge.header("X-Request-Id").length())
+}
+
+test "the device id is read only when it has the app format" {
+    var app = obsApp()
+    var ok = app.client.getWith("/feed", listOf("X-Device-Id: device-1234567890ab"))
+    Check.jsonEq(ok, "device", "device-1234567890ab")
+    var bad = app.client.getWith("/feed", listOf("X-Device-Id: short"))
+    Check.jsonEq(bad, "device", "")
+    Check.status(bad, 200)
+    var weird = app.client.getWith("/feed", listOf("X-Device-Id: has spaces and symbols !!!!!"))
+    Check.jsonEq(weird, "device", "")
+}
+
+test "one access line per request with status, duration, ip and user" {
+    var app = obsApp()
+    SecurityFixtures.login(app.db(), "obs_user", "tok-obs-user-12345")
+    drain()
+    var res = app.client.getWith("/me", listOf("X-Session-Token: tok-obs-user-12345", "User-Agent: Test/1.0"))
+    Check.status(res, 200)
+    var lines = drain()
+    Check.eqInt("one line", 1, lines.size())
+    var line = lines.get(0)
+    assert(line.startsWith("http_request|INFO|http_request requestId="))
+    assert(line.contains(" method=GET path=/me status=200 durationMs="))
+    assert(line.contains(" clientIp=127.0.0.1 userId=obs_user deviceId="))
+}
+
+test "a 403 for an unverified account is still attributed to the user" {
+    var app = obsApp()
+    SecurityFixtures.user(app.db(), "obs_unverified", false, false)
+    SecurityFixtures.session(app.db(), "obs_unverified", "tok-obs-unver-12345", 3600L)
+    drain()
+    var res = app.client.getWith("/me", listOf("X-Session-Token: tok-obs-unver-12345"))
+    Check.apiError(res, 403, "EMAIL_NOT_VERIFIED")
+    var lines = drain()
+    assert(lines.get(0).contains(" status=403 "))
+    assert(lines.get(0).contains(" userId=obs_unverified "))
+}
+
+test "5xx is logged at ERROR, probes only at DEBUG, unknown paths are logged" {
+    var app = obsApp()
+    drain()
+    Check.status(app.client.get("/boom"), 503)
+    app.client.get("/livez")
+    app.client.get("/nao_existe_nunca")
+    var lines = drain()
+    assert(lines.get(0).startsWith("http_request|ERROR|"))
+    assert(lines.get(0).contains(" status=503 "))
+    assert(lines.get(1).startsWith("http_request|DEBUG|"))
+    assert(lines.get(2).contains(" path=/nao_existe_nunca status=200 "))
+}
+
+test "a slow request adds a slow_request warning" {
+    var app = obsApp()
+    drain()
+    Check.status(app.client.get("/slow"), 200)
+    var lines = drain()
+    Check.eqInt("two lines", 2, lines.size())
+    assert(lines.get(1).startsWith("slow_request|WARN|slow_request requestId="))
+    assert(lines.get(1).contains(" route=/slow status=200 "))
+}
+
+test "admin mutations are audited with the actor, admin reads are not" {
+    var app = obsApp()
+    SecurityFixtures.login(app.db(), "obs_admin", "tok-obs-admin-1234")
+    app.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr("obs_admin"))
+    drain()
+    var res = app.client.send("POST", "/admin/reports/r1/ban", listOf("X-Session-Token: tok-obs-admin-1234", "Content-Type: application/json"), "", "{}")
+    Check.status(res, 200)
+    var lines = drain()
+    var audits = listOf<String>()
+    for (var l in lines) {
+        if (l.startsWith("audit|")) {
+            audits.add(l)
+        }
+    }
+    Check.eqInt("one audit line", 1, audits.size())
+    assert(audits.get(0).startsWith("audit|INFO|admin_action actor=obs_admin action=POST /admin/reports/:id/ban path=/admin/reports/r1/ban status=200"))
+    drain()
+    Check.status(app.client.getWith("/admin/reports", listOf("X-Session-Token: tok-obs-admin-1234")), 200)
+    Check.isTrue("no audit for a read", !anyContains(drain(), "admin_action"))
+}
+
+test "the monitoring hook sees every tracked request but not probes or the monitoring panel" {
+    var app = obsApp()
+    SecurityFixtures.login(app.db(), "obs_mon_admin", "tok-obs-mon-123456")
+    app.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr("obs_mon_admin"))
+    var startedBefore = ObsHolder.monitoring.started
+    var recordedBefore = ObsHolder.monitoring.recorded.size()
+    app.client.get("/livez")
+    app.client.getWith("/admin/monitoring/series", listOf("X-Session-Token: tok-obs-mon-123456"))
+    Check.eqInt("untracked", startedBefore, ObsHolder.monitoring.started)
+    Check.eqInt("untracked records", recordedBefore, ObsHolder.monitoring.recorded.size())
+    app.client.getWith("/feed", listOf("X-Device-Id: device-1234567890ab"))
+    Check.eqInt("tracked", startedBefore + 1, ObsHolder.monitoring.started)
+    var last = ObsHolder.monitoring.recorded.get(ObsHolder.monitoring.recorded.size() - 1)
+    assert(last.startsWith("GET /feed /feed 200 user=user_1 ip=127.0.0.1 device=device-1234567890ab"))
+}
+
+test "the user agent in the log line is capped and stripped of control characters" {
+    var app = obsApp()
+    var res = app.client.getWith("/feed", listOf("User-Agent: " + strings.repeat("u", 500)))
+    Check.status(res, 200)
+    Check.eqInt("capped", 200, RequestObservability.cleanUserAgent(strings.repeat("u", 500)).length())
+    Check.eqStr("controls removed", "forgedline", RequestObservability.cleanUserAgent("forged\nline"))
+    Check.eqStr("normal", "Test/1.0 (x)", RequestObservability.cleanUserAgent("Test/1.0 (x)"))
+}

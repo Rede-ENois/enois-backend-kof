@@ -1,0 +1,65 @@
+package kernel.security
+
+import kernel.config.*
+import kernel.db.*
+import kernel.error.*
+
+// Authorises administration by the IMMUTABLE role stored in users.is_admin (V171). Never by username or
+// e-mail (both editable: that allowlist allowed escalation). Promotion to admin is a database
+// operation, not a signup. The historic team usernames are RESERVED so nobody takes the name later.
+// TESTS ONLY: REDE_ADMIN_BOOTSTRAP_ENABLED=true + REDE_ADMIN_EMAILS enables an e-mail allowlist; in a
+// deployed profile production admins are users.is_admin rows.
+class AdminGuard {
+    Db store
+    List<String> bootstrapEmails = listOf<String>()
+    public constructor(store: Db, cfg: Config) {
+        this.store = store
+        if (cfg.getBool("REDE_ADMIN_BOOTSTRAP_ENABLED", false)) {
+            for (var part in cfg.getStr("REDE_ADMIN_EMAILS", "").split(",")) {
+                if (part.trim().length() > 0) {
+                    bootstrapEmails.add(part.trim().toLowerCase())
+                }
+            }
+        }
+    }
+    // Team handles and staff-like names: nobody can sign up or rename to them.
+    static List<String> reservedUsernames() = listOf("aminadojava", "mrfoxxo", "admin", "admins", "administrator", "administrador", "administracao", "root", "superuser", "sysadmin", "system", "sistema", "staff", "equipe", "moderator", "moderador", "moderacao", "mod", "support", "suporte", "security", "seguranca", "enois", "enois-admin", "enois-team", "enois-suporte", "official", "oficial")
+    static Bool isReservedUsername(username: String) = AdminGuard.reservedUsernames().contains(username.trim().toLowerCase())
+    // 403 FORBIDDEN unless the user is an admin.
+    requireAdmin(userId: String) {
+        if (!isAdmin(userId)) {
+            throw Errors.api(403, "FORBIDDEN", "Acesso restrito a administradores.")
+        }
+    }
+    // Same rule, for screens that decide what to show.
+    Bool isAdmin(userId: String) {
+        var row = store.queryOptional("select is_admin, email from users where id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return false
+        }
+        if (row.getBool("is_admin")) {
+            return true
+        }
+        var email = row.getStrOrNull("email")
+        if (email == null) {
+            return false
+        }
+        return bootstrapEmails.contains(email.toLowerCase())
+    }
+}
+
+class ModeratorGuard {
+    AdminGuard admin
+    SecurityModerators moderators
+    public constructor(admin: AdminGuard, moderators: SecurityModerators) {
+        this.admin = admin
+        this.moderators = moderators
+    }
+    // 403 FORBIDDEN unless the user is an admin or a moderator.
+    requireModerator(userId: String) {
+        if (!isModerator(userId)) {
+            throw Errors.api(403, "FORBIDDEN", "Acesso restrito a moderadores.")
+        }
+    }
+    Bool isModerator(userId: String) = admin.isAdmin(userId) || moderators.isModerator(userId)
+}

@@ -96,9 +96,42 @@ class Req {
         return out
     }
     static String? cookie(name: String) = Req.cookies().get(name)
+    // The Authorization header of the current request. The web runtime answers 401 to ANY request that
+    // carries one before it reaches a route (KOF_GAPS G28), so HttpServer moves it out of the request
+    // headers at the start of every request and keeps it here.
+    static ThreadLocal authorization = new ThreadLocal()
+    static captureAuthorization() {
+        var raw = header("authorization")
+        if (raw == null) {
+            authorization.remove()
+        }
+        else {
+            authorization.set(raw)
+        }
+        try {
+            var c = Class.forName("dev.kof.runtime.KofRuntime")
+            var f = c.getDeclaredField("KOF_WEB_REQUEST")
+            f.setAccessible(true)
+            var tl = f.get(null) as ThreadLocal
+            var req = tl.get()
+            var hf = req.getClass().getDeclaredField("headers")
+            hf.setAccessible(true)
+            var m = hf.get(req) as HashMap
+            m.remove("authorization")
+        } catch (String e) {
+            authorization.remove()
+        }
+    }
+    static String? authorizationHeader() {
+        var v = authorization.get()
+        if (v == null) {
+            return null
+        }
+        return v.toString()
+    }
     // Bearer token of `Authorization: Bearer <token>`, or null.
     static String? bearerToken() {
-        var h = header("authorization")
+        var h = Req.authorizationHeader()
         if (h == null) {
             return null
         }
@@ -106,6 +139,21 @@ class Req {
             return h.substring(7).trim()
         }
         return null
+    }
+    // Raw query string of the current request (no leading `?`), "" when absent.
+    static String rawQuery() {
+        try {
+            var c = Class.forName("dev.kof.runtime.KofRuntime")
+            var f = c.getDeclaredField("KOF_WEB_REQUEST")
+            f.setAccessible(true)
+            var tl = f.get(null) as ThreadLocal
+            var req = tl.get()
+            var qf = req.getClass().getDeclaredField("query")
+            qf.setAccessible(true)
+            return qf.get(req).toString()
+        } catch (String e) {
+            return ""
+        }
     }
     // The TCP peer of the current request (the runtime does not expose it, see KOF_GAPS G14).
     static String peerAddress() {

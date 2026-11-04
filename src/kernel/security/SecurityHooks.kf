@@ -1,0 +1,119 @@
+package kernel.security
+
+import java.util.HashMap
+import kernel.db.*
+import kernel.log.*
+import kernel.time.*
+
+// Seams to the domains that own data the request pipeline needs. Each is a concrete class with a safe
+// default; the owning domain extends it and replaces the field of SecurityHooks in Main.kf (a Kof
+// interface in a package cannot be implemented, KOF_GAPS G30). Listed in docs/PORTING_STATUS.md.
+// moderation: is this user a moderator (moderators table / ModeratorService)? Default: nobody.
+class SecurityModerators {
+    Bool isModerator(userId: String) = false
+}
+
+// ops/monitoring: counters and events for the admin monitoring panel. Default: nothing.
+class SecurityMonitoring {
+    requestStarted();
+    recordRequest(method: String, uri: String, route: String, status: Int, durationMs: Long, requestId: String, userId: String, clientIp: String, deviceId: String);
+    recordClientDisconnect();
+}
+
+// apiv1 developer origins: third-party origins that registered themselves (table developer_origins).
+// The default knows none: only the app's own origins pass the origin gate.
+class OriginDirectory {
+    List<String> allowedOrigins() = listOf<String>()
+    Bool isBlocked(origin: String) = false
+    // Temporary automatic block of a third-party origin (reason is trimmed to 200 chars).
+    block(origin: String, reason: String, minutes: Long);
+    // The owner of the table calls this after changing it, so the gate sees the change at once.
+    invalidate();
+}
+
+// developer_origins read through a 30 s cache (the gate cannot hit the database on every request).
+// The DeveloperOriginService of apiv1 (registration, admin panel) comes with that domain and shares
+// this table; the cache is invalidated by block(), the owner invalidates through `invalidate`.
+class JdbcOriginDirectory extends OriginDirectory {
+    Db store
+    List<String> cachedAllowed = listOf<String>()
+    List<String> cachedBlocked = listOf<String>()
+    Long cachedAt = 0L
+    Log log = Log("kernel.security.origins")
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static Long cacheMs() = 30000L
+    List<String> allowedOrigins() {
+        refreshIfNeeded()
+        return cachedAllowed
+    }
+    Bool isBlocked(origin: String) {
+        refreshIfNeeded()
+        return cachedBlocked.contains(origin)
+    }
+    invalidate() {
+        cachedAt = 0L
+    }
+    block(origin: String, reason: String, minutes: Long) {
+        var clean = reason.trim()
+        if (clean.length() == 0) {
+            clean = "Atividade suspeita"
+        }
+        if (clean.length() > 200) {
+            clean = clean.substring(0, 200)
+        }
+        var now = Time.nowIso()
+        var updated = store.execute("update developer_origins set blocked = true, blocked_reason = ?, blocked_at = ?, blocked_until = ?, strikes = strikes + 1 where origin = ? and blocked = false", DbParams().bindStr(clean).bindInstant(now).bindInstant(Time.plusSeconds(now, minutes * 60L)).bindStr(origin))
+        if (updated > 0) {
+            log.warn("origin_blocked origin=" + origin + " minutes=" + minutes + " reason=" + clean)
+        }
+        cachedAt = 0L
+    }
+    // Gives back the origins whose temporary block expired.
+    releaseExpired() {
+        var released = store.execute("update developer_origins set blocked = false, blocked_reason = null, blocked_at = null, blocked_until = null where blocked = true and blocked_until is not null and blocked_until <= ?", DbParams().bindInstant(Time.nowIso()))
+        if (released > 0) {
+            log.info("origin_block_expired released=" + released)
+        }
+    }
+    refreshIfNeeded() {
+        if (SecurityClock.nowMillis() - cachedAt > JdbcOriginDirectory.cacheMs()) {
+            refresh()
+        }
+    }
+    refresh() {
+        try {
+            releaseExpired()
+            var now = Time.nowIso()
+            var allowed = listOf<String>()
+            for (var row in store.queryList("select distinct origin from developer_origins where blocked = false or (blocked_until is not null and blocked_until <= ?)", DbParams().bindInstant(now))) {
+                allowed.add(row.getStr("origin"))
+            }
+            var blocked = listOf<String>()
+            for (var row in store.queryList("select distinct origin from developer_origins where blocked = true and (blocked_until is null or blocked_until > ?)", DbParams().bindInstant(now))) {
+                blocked.add(row.getStr("origin"))
+            }
+            cachedAllowed = allowed
+            cachedBlocked = blocked
+            cachedAt = SecurityClock.nowMillis()
+        } catch (String e) {
+            // database down: keep the last known sets, and do not retry on every request
+            cachedAt = SecurityClock.nowMillis()
+        }
+    }
+}
+
+// What Security.install needs from the other domains. Main.kf builds the defaults and each domain port
+// replaces its own field before install.
+class SecurityHooks {
+    SecurityModerators moderators = SecurityModerators()
+    SecurityMonitoring monitoring = SecurityMonitoring()
+    SecurityAutoReports reports = SecurityAutoReports()
+    OriginDirectory origins = OriginDirectory()
+    static SecurityHooks defaults(store: Db) {
+        var h = SecurityHooks()
+        h.origins = JdbcOriginDirectory(store)
+        return h
+    }
+}

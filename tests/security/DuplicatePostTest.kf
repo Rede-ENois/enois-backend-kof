@@ -1,0 +1,158 @@
+import java.util.concurrent.atomic.AtomicInteger
+import kernel.*
+import kernel.config.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+
+// Port of DuplicatePostFilterTests: a concurrent identical POST waits for the first and replays its
+// response; the handler runs once.
+class DupState {
+    static AtomicInteger executions = new AtomicInteger(0)
+    static AtomicInteger firstDone = new AtomicInteger(0)
+    static Int firstStatus = 0
+    static String firstBody = ""
+}
+
+String slowMessage() {
+    DupState.executions.incrementAndGet()
+    time.sleep(700)
+    return status(201, "{\"id\":\"msg_" + DupState.executions.get() + "\"}")
+}
+
+wireDup(s: HttpServer) {
+    s.post("/conversations/:id/messages", () -> slowMessage())
+    s.get("/conversations/:id/messages", () -> "{\"items\":[]}")
+    s.post("/upload", () -> slowMessage())
+}
+
+class DupHolder {
+    static TestApp? app = null
+}
+
+TestApp dupApp() {
+    var cur = DupHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = SecurityApp.boot("dup", mapOf("POST_GUARD_ENABLED", "false"), (s: HttpServer) -> wireDup(s))
+    DupHolder.app = created
+    SecurityFixtures.login(created.db(), "dup_user", "tok-dup-user-123456")
+    SecurityFixtures.login(created.db(), "dup_user2", "tok-dup-user2-12345")
+    return created
+}
+
+TestResponse sendMessage(token: String, path: String, body: String) = dupApp().client.send("POST", path, listOf("X-Session-Token: " + token, "Content-Type: application/json"), "", body)
+
+firstCall(token: String, path: String, body: String) {
+    var res = sendMessage(token, path, body)
+    DupState.firstStatus = res.status
+    DupState.firstBody = res.body
+    DupState.firstDone.set(1)
+}
+
+waitStarted(n: Int) {
+    var waited = 0
+    while (DupState.executions.get() < n && waited < 5000) {
+        time.sleep(10)
+        waited = waited + 10
+    }
+}
+
+test "a concurrent identical post replays the first response and runs once" {
+    dupApp()
+    DupState.executions.set(0)
+    DupState.firstDone.set(0)
+    spawn () -> {
+    firstCall("tok-dup-user-123456", "/conversations/conv_1/messages", "{\"content\":\"oi\"}")
+}
+    waitStarted(1)
+    time.sleep(100)
+    var second = sendMessage("tok-dup-user-123456", "/conversations/conv_1/messages", "{\"content\":\"oi\"}")
+    var waited = 0
+    while (DupState.firstDone.get() == 0 && waited < 5000) {
+        time.sleep(10)
+        waited = waited + 10
+    }
+    Check.eqInt("executions", 1, DupState.executions.get())
+    Check.eqInt("replayed status", 201, second.status)
+    Check.eqStr("replayed body", "{\"id\":\"msg_1\"}", second.body)
+    Check.eqInt("first status", 201, DupState.firstStatus)
+    Check.eqStr("first body", "{\"id\":\"msg_1\"}", DupState.firstBody)
+}
+
+test "after the first one finishes an identical post runs again" {
+    dupApp()
+    DupState.executions.set(0)
+    var first = sendMessage("tok-dup-user-123456", "/conversations/conv_2/messages", "{\"content\":\"de novo\"}")
+    var second = sendMessage("tok-dup-user-123456", "/conversations/conv_2/messages", "{\"content\":\"de novo\"}")
+    Check.eqInt("executions", 2, DupState.executions.get())
+    Check.eqStr("first", "{\"id\":\"msg_1\"}", first.body)
+    Check.eqStr("second", "{\"id\":\"msg_2\"}", second.body)
+}
+
+test "another body, another route or another session is not a duplicate" {
+    dupApp()
+    DupState.executions.set(0)
+    DupState.firstDone.set(0)
+    spawn () -> {
+    firstCall("tok-dup-user-123456", "/conversations/conv_3/messages", "{\"content\":\"a\"}")
+}
+    waitStarted(1)
+    var otherBody = sendMessage("tok-dup-user-123456", "/conversations/conv_3/messages", "{\"content\":\"b\"}")
+    var otherSession = sendMessage("tok-dup-user2-12345", "/conversations/conv_3/messages", "{\"content\":\"a\"}")
+    var otherRoute = sendMessage("tok-dup-user-123456", "/conversations/conv_4/messages", "{\"content\":\"a\"}")
+    var waited = 0
+    while (DupState.firstDone.get() == 0 && waited < 5000) {
+        time.sleep(10)
+        waited = waited + 10
+    }
+    Check.eqInt("executions", 4, DupState.executions.get())
+    Check.eqInt("a", 201, otherBody.status)
+    Check.eqInt("b", 201, otherSession.status)
+    Check.eqInt("c", 201, otherRoute.status)
+}
+
+test "the v1 alias and the plain path are the same route for the duplicate check" {
+    dupApp()
+    DupState.executions.set(0)
+    DupState.firstDone.set(0)
+    spawn () -> {
+    firstCall("tok-dup-user-123456", "/conversations/conv_5/messages", "{\"content\":\"v\"}")
+}
+    waitStarted(1)
+    var viaV1 = sendMessage("tok-dup-user-123456", "/v1/conversations/conv_5/messages", "{\"content\":\"v\"}")
+    var waited = 0
+    while (DupState.firstDone.get() == 0 && waited < 5000) {
+        time.sleep(10)
+        waited = waited + 10
+    }
+    Check.eqInt("executions", 1, DupState.executions.get())
+    Check.eqInt("status", 201, viaV1.status)
+    Check.eqStr("replayed body", "{\"id\":\"msg_1\"}", viaV1.body)
+}
+
+test "reads are never deduplicated and multipart is left alone" {
+    var a = dupApp()
+    Check.status(a.client.getWith("/conversations/c/messages", listOf("X-Session-Token: tok-dup-user-123456")), 200)
+    DupState.executions.set(0)
+    DupState.firstDone.set(0)
+    spawn () -> {
+    var res = a.client.send("POST", "/upload", listOf("X-Session-Token: tok-dup-user-123456", "Content-Type: multipart/form-data; boundary=x"), "", "--x--")
+    DupState.firstDone.set(1)
+}
+    waitStarted(1)
+    var second = a.client.send("POST", "/upload", listOf("X-Session-Token: tok-dup-user-123456", "Content-Type: multipart/form-data; boundary=x"), "", "--x--")
+    var waited = 0
+    while (DupState.firstDone.get() == 0 && waited < 5000) {
+        time.sleep(10)
+        waited = waited + 10
+    }
+    Check.eqInt("both ran", 2, DupState.executions.get())
+    Check.eqInt("status", 201, second.status)
+}
+
+test "the filter can be switched off" {
+    Check.isTrue("default on", DuplicatePostFilter(Config.of(mapOf("X", "1"))).enabled)
+    Check.isTrue("off", !DuplicatePostFilter(Config.of(mapOf("REDE_SECURITY_DUPLICATE_POST_ENABLED", "false"))).enabled)
+}

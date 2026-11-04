@@ -1,0 +1,111 @@
+package kernel.security
+
+import java.util.concurrent.locks.ReentrantLock
+import kernel.config.*
+import kernel.db.*
+import kernel.log.*
+import kernel.time.*
+
+// Where the panic flag lives (table system_flags, shared by the pods). Tests plug a fake in.
+abstract class PanicFlagStore {
+    // The stored flag_value rows for `panic_mode` (empty when never set).
+    List<String> read() = listOf<String>()
+    write(value: Bool);
+}
+
+class JdbcPanicFlagStore extends PanicFlagStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    List<String> read() {
+        var out = listOf<String>()
+        for (var row in store.queryList("select flag_value from system_flags where name = ?", DbParams().bindStr("panic_mode"))) {
+            out.add(row.getStr("flag_value"))
+        }
+        return out
+    }
+    write(value: Bool) {
+        var text = "false"
+        if (value) {
+            text = "true"
+        }
+        var now = Time.nowIso()
+        var updated = store.execute("update system_flags set flag_value = ?, updated_at = ? where name = ?", DbParams().bindStr(text).bindInstant(now).bindStr("panic_mode"))
+        if (updated == 0) {
+            try {
+                store.execute("insert into system_flags (name, flag_value, updated_at) values (?, ?, ?)", DbParams().bindStr("panic_mode").bindStr(text).bindInstant(now))
+            } catch (String race) {
+                // another pod inserted at the same time: the update now finds the row
+                store.execute("update system_flags set flag_value = ?, updated_at = ? where name = ?", DbParams().bindStr(text).bindInstant(now).bindStr("panic_mode"))
+            }
+        }
+    }
+}
+
+// Panic mode: while on, EVERY write answers 429 (PanicModeFilter). The state lives in system_flags and
+// each instance keeps an in-memory copy refreshed every 2 s: the request path never waits on the
+// database (least of all during an attack). A request that finds the copy stale tries the refresh lock
+// and moves on when somebody else holds it, so a slow query never parks every request thread. The
+// refresh window also covers a FAILED read: with the database down the last known state stays and
+// requests do not repeat the query. PANIC_MODE (yes/true/on/1) is a hard override: only changing the
+// variable and restarting turns it off.
+class PanicModeService {
+    PanicFlagStore flags
+    Bool envEnabled
+    Bool flag = false
+    Long refreshedAt = 0L
+    ReentrantLock refreshLock = new ReentrantLock()
+    Log log = Log("kernel.security.panic")
+    static Long refreshMs() = 2000L
+    public constructor(flags: PanicFlagStore, envValue: String) {
+        this.flags = flags
+        var clean = envValue.trim().toLowerCase()
+        this.envEnabled = clean == "yes" || clean == "true" || clean == "on" || clean == "1"
+    }
+    Bool active() {
+        if (envEnabled) {
+            return true
+        }
+        if (SecurityClock.nowMillis() - refreshedAt > PanicModeService.refreshMs()) {
+            refreshIfIdle()
+        }
+        return flag
+    }
+    Bool envLocked() = envEnabled
+    refreshIfIdle() {
+        if (!refreshLock.tryLock()) {
+            return
+        }
+        load()
+        refreshLock.unlock()
+    }
+    setActive(value: Bool) {
+        refreshLock.lock()
+        var failure = ""
+        try {
+            flags.write(value)
+            flag = value
+            refreshedAt = SecurityClock.nowMillis()
+            log.warn("panic_mode changed active=" + value)
+        } catch (String e) {
+            failure = e
+        }
+        refreshLock.unlock()
+        if (failure.length() > 0) {
+            throw failure
+        }
+    }
+    load() {
+        try {
+            var values = flags.read()
+            flag = false
+            if (values.size() > 0) {
+                flag = values.get(0).toLowerCase() == "true"
+            }
+        } catch (String e) {
+            log.warn("panic_mode refresh_failed keeping=" + flag)
+        }
+        refreshedAt = SecurityClock.nowMillis()
+    }
+}

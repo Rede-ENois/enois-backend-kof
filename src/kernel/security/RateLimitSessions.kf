@@ -1,0 +1,94 @@
+package kernel.security
+
+import java.util.HashMap
+import java.util.concurrent.locks.ReentrantLock
+import kernel.http.*
+
+// Which user a session token belongs to, for keying rate-limit buckets.
+//
+// Only a live session earns its own bucket; an invented token is counted against its IP. Live sessions
+// are cached for a minute so the limiters do not hit the database on every request, and each IP gets a
+// small budget of lookups for tokens that are not cached: a real session costs one lookup, while a
+// stream of invented tokens runs out of budget and stops reaching the database. A session revoked
+// inside the cache window keeps its bucket for that window; authentication itself is still checked per
+// request by Auth.
+class RateLimitSessions {
+    SessionLookup lookup
+    Int sharedMultiplier
+    Map<String,String> knownUser = new HashMap<String, String>()
+    Map<String,Long> knownUntil = new HashMap<String, Long>()
+    Map<String,Long> windowStart = new HashMap<String, Long>()
+    Map<String,Int> windowCount = new HashMap<String, Int>()
+    ReentrantLock gate = new ReentrantLock()
+    static Long ttlMs() = 60000L
+    static Int maxEntries() = 100000
+    // One real person needs one lookup per live session per minute; 60 is ample for a home connection.
+    static Int lookupsPerWindow() = 60
+    public constructor(lookup: SessionLookup, sharedMultiplier: Int) {
+        this.lookup = lookup
+        this.sharedMultiplier = sharedMultiplier
+        if (sharedMultiplier < 1) {
+            this.sharedMultiplier = 1
+        }
+    }
+    // User id of a live session, or null. `ip` is the caller's resolved address.
+    String? userId(token: String, ip: String) {
+        var trimmed = token.trim()
+        var hash = SecurityDigest.sha256Hex(trimmed)
+        var now = SecurityClock.nowMillis()
+        gate.lock()
+        var until = knownUntil.get(hash)
+        var cached = knownUser.get(hash)
+        gate.unlock()
+        if (until != null && cached != null) {
+            if (until > now) {
+                return cached
+            }
+        }
+        if (!takeLookup(ip, now)) {
+            return null
+        }
+        var found = lookup.findActiveUserId(trimmed)
+        if (found == null) {
+            return null
+        }
+        gate.lock()
+        if (knownUser.size() > RateLimitSessions.maxEntries()) {
+            knownUser.clear()
+            knownUntil.clear()
+        }
+        knownUser.put(hash, found)
+        knownUntil.put(hash, now + RateLimitSessions.ttlMs())
+        gate.unlock()
+        return found
+    }
+    Bool takeLookup(ip: String, now: Long) {
+        gate.lock()
+        if (windowStart.size() > RateLimitSessions.maxEntries()) {
+            windowStart.clear()
+            windowCount.clear()
+        }
+        var start = windowStart.get(ip)
+        var count = windowCount.get(ip)
+        var n = 1
+        var fresh = true
+        if (start != null) {
+            if (count != null) {
+                if (now - start < RateLimitSessions.ttlMs()) {
+                    fresh = false
+                    n = count + 1
+                }
+            }
+        }
+        if (fresh) {
+            windowStart.put(ip, now)
+        }
+        windowCount.put(ip, n)
+        gate.unlock()
+        var budget = RateLimitSessions.lookupsPerWindow()
+        if (Req.resolver.isTrustedProxy(ip)) {
+            budget = budget * sharedMultiplier
+        }
+        return n <= budget
+    }
+}

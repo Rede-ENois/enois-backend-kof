@@ -1,0 +1,44 @@
+package kernel.security
+
+import kernel.http.*
+import kernel.time.*
+
+// Session transport for browsers: HttpOnly cookies, so no script on the origin can read the tokens.
+// The access cookie is SameSite=Lax (top-level navigations keep the login); the refresh cookie is
+// Strict because only the app itself calls /auth/refresh. Writes still need the CSRF header, see
+// Auth.csrfFilter. Mirror of shared SessionCookies.
+class SessionCookies {
+    static Bool secureFlag = true
+    static String session() = "enois_session"
+    static String refresh() = "enois_refresh"
+    // REDE_AUTH_COOKIE_SECURE (default true; the dev profile turns it off for plain http).
+    static configure(secure: Bool) {
+        SessionCookies.secureFlag = secure
+    }
+    // Set-Cookie lines that carry a freshly issued session. Instants are ISO-8601 (Time.nowIso()).
+    static List<String> issueLines(token: String, expiresAt: String, refreshToken: String, refreshExpiresAt: String) {
+        var now = Time.nowMillis()
+        return listOf(SessionCookies.line(SessionCookies.session(), token, "Lax", SessionCookies.seconds(now, expiresAt)), SessionCookies.line(SessionCookies.refresh(), refreshToken, "Strict", SessionCookies.seconds(now, refreshExpiresAt)))
+    }
+    static List<String> clearLines() = listOf(SessionCookies.line(SessionCookies.session(), "", "Lax", 0L), SessionCookies.line(SessionCookies.refresh(), "", "Strict", 0L))
+    // Adds both cookies to the current response (one Set-Cookie line each, see KOF_GAPS G13).
+    static issue(token: String, expiresAt: String, refreshToken: String, refreshExpiresAt: String) {
+        for (var line in SessionCookies.issueLines(token, expiresAt, refreshToken, refreshExpiresAt)) {
+            Cookies.add(line)
+        }
+    }
+    // Deletes both cookies on the current response.
+    static clear() {
+        for (var line in SessionCookies.clearLines()) {
+            Cookies.add(line)
+        }
+    }
+    static String line(name: String, value: String, sameSite: String, maxAge: Long) = Cookies.build(name, value, maxAge, true, SessionCookies.secureFlag, sameSite, "/")
+    static Long seconds(nowMs: Long, untilIso: String) {
+        var delta = (Time.toMillis(untilIso) - nowMs) / 1000L
+        if (delta < 0L) {
+            return 0L
+        }
+        return delta
+    }
+}

@@ -1,0 +1,367 @@
+import kernel.*
+import kernel.config.*
+import kernel.db.*
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of DeveloperOriginTests (the gate), OptionsAlwaysAllowedTests, AdminPreflightTests,
+// OriginAbuseGuardTests and CorsConfigTests. The registration CRUD of /developers/origins belongs to the
+// apiv1 port: rows are seeded in developer_origins directly.
+String developersBody() = "{\"user\":\"" + Auth.requireUser() + "\"}"
+
+wireOrigins(s: HttpServer) {
+    s.get("/developers/origins", () -> developersBody())
+    s.get("/v1", () -> "{\"index\":true}")
+    s.get("/admin/support", () -> "{\"support\":true}")
+    s.get("/admin/support/github", () -> "{\"infra\":true}")
+    s.get("/moderation/me", () -> "{\"me\":true}")
+    s.get("/feed/posts/:id/reactions", () -> "{}")
+    s.post("/feed/posts/:id/reactions", () -> "{}")
+    s.get("/admin/appeals", () -> "{}")
+    s.post("/webhooks/github", () -> status(503, "{\"code\":\"WEBHOOK_DISABLED\",\"message\":\"x\"}"))
+    s.get("/blogs/descadastrar", () -> status(400, "{\"code\":\"BAD_REQUEST\",\"message\":\"x\"}"))
+    s.get("/blogs/:slug/feed.xml", () -> status(404, "{\"code\":\"NOT_FOUND\",\"message\":\"x\"}"))
+    s.post("/blogs/:slug/feed.xml", () -> "{}")
+    s.get("/blogs/:slug", () -> "{}")
+    s.get("/media/:id", () -> status(404, "{\"code\":\"NOT_FOUND\",\"message\":\"x\"}"))
+    s.get("/pages/:id", () -> status(404, "{\"code\":\"NOT_FOUND\",\"message\":\"x\"}"))
+    s.get("/emotes/image/:provider/:id", () -> status(404, "{\"code\":\"NOT_FOUND\",\"message\":\"x\"}"))
+    s.get("/emotes", () -> "{}")
+    s.get("/emotes/index", () -> "{}")
+    s.get("/auth/oauth/google/start", () -> "{\"start\":true}")
+    s.get("/auth/oauth/google/callback", () -> "{\"cb\":true}")
+    s.get("/identity/govbr/callback", () -> "{\"govbr\":true}")
+}
+
+class OriginHolder {
+    static TestApp? app = null
+    static OriginDirectory? directory = null
+}
+
+TestApp originApp() {
+    var cur = OriginHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var overrides = mapOf("REDE_ORIGINS_ENFORCE", "true", "CORS_ALLOWED_ORIGINS", "https://enois.ia.br", "REDE_ORIGINS_MAX_FAILURES", "3", "REDE_ORIGINS_WINDOW_SECONDS", "60")
+    var created = TestApp.bootWith("origins", overrides, (p: Platform) -> {
+    var hooks = SecurityHooks.defaults(p.db)
+    OriginHolder.directory = hooks.origins
+    Security.install(p, hooks)
+    wireOrigins(p.server)
+})
+    OriginHolder.app = created
+    return created
+}
+
+register(app: TestApp, id: String, origin: String) {
+    var owner = "origin_owner_" + id
+    SecurityFixtures.user(app.db(), owner, true, false)
+    app.db().execute("insert into developer_origins (id, user_id, origin, created_at) values (?, ?, ?, ?)", DbParams().bindStr("origin_" + id).bindStr(owner).bindStr(origin).bindInstant(Time.nowIso()))
+    invalidateOrigins()
+}
+
+invalidateOrigins() {
+    var d = OriginHolder.directory
+    if (d != null) {
+        d.invalidate()
+    }
+}
+
+List<String> app() = listOf("X-Client-Origin: https://enois.ia.br")
+
+test "every non-exempt request needs a registered origin" {
+    var a = originApp()
+    SecurityFixtures.login(a.db(), "origin_user", "tok-origin-user-123")
+    var token = "X-Session-Token: tok-origin-user-123"
+    var none = a.client.getWith("/developers/origins", listOf(token))
+    Check.filterError(none, 403, "ORIGIN_REQUIRED")
+    Check.jsonEq(none, "message", "Toda requisicao precisa de origem cadastrada. O navegador envia Origin; chamadas de servidor devem enviar X-Client-Origin com uma origem cadastrada.")
+    Check.eqStr("no-store", "no-store", none.header("Cache-Control"))
+    Check.eqStr("vary", "Origin", none.header("Vary"))
+    Check.status(a.client.getWith("/developers/origins", listOf(token, "X-Client-Origin: https://enois.ia.br")), 200)
+    var evil = a.client.getWith("/developers/origins", listOf(token, "Origin: https://evil.example"))
+    Check.filterError(evil, 403, "ORIGIN_NOT_ALLOWED")
+    Check.jsonEq(evil, "message", "Cadastre a origem do seu app em /developers/origins para usar a API.")
+    var forged = a.client.getWith("/developers/origins", listOf(token, "Origin: https://evil.example", "X-Client-Origin: https://enois.ia.br"))
+    Check.filterError(forged, 403, "ORIGIN_NOT_ALLOWED")
+    Check.status(a.client.getWith("/developers/origins", listOf(token, "Origin: https://enois.ia.br")), 200)
+    Check.status(a.client.getWith("/developers/origins", listOf(token, "Origin: HTTPS://ENOIS.IA.BR/")), 200)
+}
+
+test "infrastructure and third-party flows keep working without an origin" {
+    var a = originApp()
+    Check.status(a.client.get("/version"), 200)
+    Check.status(a.client.get("/health"), 200)
+    Check.status(a.client.get("/v1/health"), 200)
+    Check.status(a.client.postJson("/webhooks/github", "{}"), 503)
+    Check.status(a.client.get("/blogs/descadastrar?token=invalido"), 400)
+    Check.status(a.client.get("/blogs/nao-existe/feed.xml"), 404)
+    Check.filterError(a.client.get("/blogs/nao-existe"), 403, "ORIGIN_REQUIRED")
+    Check.filterError(a.client.postJson("/blogs/nao-existe/feed.xml", "{}"), 403, "ORIGIN_REQUIRED")
+    Check.status(a.client.get("/media/nao-existe"), 404)
+    Check.status(a.client.get("/pages/nao-existe"), 404)
+    Check.status(a.client.get("/emotes/image/XYZ/1"), 404)
+    Check.filterError(a.client.get("/emotes?page=1"), 403, "ORIGIN_REQUIRED")
+    Check.filterError(a.client.get("/emotes/index"), 403, "ORIGIN_REQUIRED")
+    Check.status(a.client.get("/auth/oauth/google/start"), 200)
+    Check.status(a.client.postJson("/auth/oauth/google/callback", "{}"), 405)
+    Check.status(a.client.get("/auth/oauth/google/callback"), 200)
+    Check.status(a.client.get("/identity/govbr/callback"), 200)
+}
+
+test "a registered origin gets CORS, an unregistered one is refused, a server client needs no CORS" {
+    var a = originApp()
+    register(a, "app1", "https://app.example")
+    var preflight = a.client.send("OPTIONS", "/v1", listOf("Origin: https://app.example", "Access-Control-Request-Method: GET", "Access-Control-Request-Headers: X-Session-Token"), "", "")
+    Check.status(preflight, 204)
+    Check.eqStr("allow origin", "https://app.example", preflight.header("Access-Control-Allow-Origin"))
+    var evilPreflight = a.client.send("OPTIONS", "/v1", listOf("Origin: https://evil.example", "Access-Control-Request-Method: GET"), "", "")
+    Check.status(evilPreflight, 204)
+    Check.filterError(a.client.getWith("/v1", listOf("Origin: https://evil.example")), 403, "ORIGIN_NOT_ALLOWED")
+    var ok = a.client.getWith("/v1", listOf("Origin: https://app.example"))
+    Check.status(ok, 200)
+    Check.eqStr("cors on the answer", "https://app.example", ok.header("Access-Control-Allow-Origin"))
+    Check.eqStr("no credential for a third party", "", ok.header("Access-Control-Allow-Credentials"))
+    var server = a.client.getWith("/v1", listOf("X-Client-Origin: https://app.example"))
+    Check.status(server, 200)
+    Check.eqStr("no cors header", "", server.header("Access-Control-Allow-Origin"))
+    Check.filterError(a.client.get("/v1"), 403, "ORIGIN_REQUIRED")
+}
+
+test "admin and moderation only accept the front end origin" {
+    var a = originApp()
+    register(a, "third", "https://terceiro.example")
+    var admin = a.client.getWith("/admin/support", listOf("Origin: https://terceiro.example"))
+    Check.filterError(admin, 403, "ORIGIN_NOT_TRUSTED")
+    Check.jsonEq(admin, "message", "Rotas de administracao e moderacao aceitam apenas a origem do frontend.")
+    Check.eqStr("cors on the refusal", "https://terceiro.example", admin.header("Access-Control-Allow-Origin"))
+    Check.filterError(a.client.getWith("/moderation/me", listOf("X-Client-Origin: https://terceiro.example")), 403, "ORIGIN_NOT_TRUSTED")
+    register(a, "third2", "https://terceiro2.example")
+    Check.filterError(a.client.getWith("/v1/admin/support", listOf("X-Client-Origin: https://terceiro2.example")), 403, "ORIGIN_NOT_TRUSTED")
+    Check.filterError(a.client.getWith("/v1/moderation/me", listOf("Origin: https://terceiro2.example")), 403, "ORIGIN_NOT_TRUSTED")
+    Check.apiError(a.client.getWith("/admin/support", app()), 401, "UNAUTHENTICATED")
+    Check.filterError(a.client.getWith("/admin/support", listOf("X-Client-Origin: https://painel.b7cloud.com.br")), 403, "ORIGIN_NOT_TRUSTED")
+    Check.filterError(a.client.getWith("/admin/support", listOf("X-Client-Origin: https://b7cloud.com.br")), 403, "ORIGIN_NOT_ALLOWED")
+}
+
+test "encoded, matrix and prefixed spellings of an admin path are not served at all" {
+    var a = originApp()
+    register(a, "enc", "https://encoded.example")
+    for (var p in listOf("/%61dmin/support", "/admin/%73upport", "/%6doderation/me", "/api/%61dmin/support", "/admin;v=1/support/github", "/admin/support/github;v=1")) {
+        var res = a.client.getWith(p, listOf("Origin: https://encoded.example"))
+        Check.eqInt("status " + p, 200, res.status)
+        Check.eqStr("body " + p, "", res.body)
+    }
+    var front = a.client.getWith("/%61dmin/support", app())
+    Check.status(front, 200)
+    Check.eqStr("front end body", "", front.body)
+}
+
+test "a manual or automatic block turns the origin away with ORIGIN_BLOCKED until it is lifted" {
+    var a = originApp()
+    register(a, "manual", "https://manual.example")
+    a.db().execute("update developer_origins set blocked = true, blocked_reason = ?, blocked_at = ? where id = ?", DbParams().bindStr("teste de bloqueio manual").bindInstant(Time.nowIso()).bindStr("origin_manual"))
+    invalidateOrigins()
+    var blocked = a.client.getWith("/v1", listOf("Origin: https://manual.example"))
+    Check.filterError(blocked, 403, "ORIGIN_BLOCKED")
+    Check.jsonEq(blocked, "message", "Esta origem foi bloqueada por atividade suspeita. Remova-a em /developers/origins.")
+    a.db().execute("update developer_origins set blocked = false, blocked_reason = null, blocked_at = null, blocked_until = null where id = ?", DbParams().bindStr("origin_manual"))
+    invalidateOrigins()
+    Check.status(a.client.getWith("/v1", listOf("Origin: https://manual.example")), 200)
+}
+
+test "a temporary block expires by itself" {
+    var a = originApp()
+    register(a, "temp", "https://temp.example")
+    var d = OriginHolder.directory
+    if (d == null) {
+        throw "origin directory not booted"
+    }
+    d.block("https://temp.example", "Atividade suspeita: teste", 30L)
+    Check.filterError(a.client.getWith("/v1", listOf("Origin: https://temp.example")), 403, "ORIGIN_BLOCKED")
+    Check.eqInt("strikes", 1, a.db().queryOne("select strikes from developer_origins where id = ?", DbParams().bindStr("origin_temp")).getInt("strikes"))
+    a.db().execute("update developer_origins set blocked_until = ? where id = ?", DbParams().bindInstant(Time.plusSeconds(Time.nowIso(), -5L)).bindStr("origin_temp"))
+    d.invalidate()
+    Check.status(a.client.getWith("/v1", listOf("Origin: https://temp.example")), 200)
+    Check.eqStr("released", "false", "" + a.db().queryOne("select blocked from developer_origins where id = ?", DbParams().bindStr("origin_temp")).getBool("blocked"))
+}
+
+test "a suspicious third-party origin is blocked automatically after three refusals" {
+    var a = originApp()
+    register(a, "abuse", "https://abuso.example")
+    var i = 0
+    while (i < 3) {
+        var res = a.client.getWith("/developers/origins", listOf("Origin: https://abuso.example"))
+        Check.eqInt("refusal", 401, res.status)
+        i = i + 1
+    }
+    Check.filterError(a.client.getWith("/v1", listOf("Origin: https://abuso.example")), 403, "ORIGIN_BLOCKED")
+    Check.eqStr("persisted", "true", "" + a.db().queryOne("select blocked from developer_origins where id = ?", DbParams().bindStr("origin_abuse")).getBool("blocked"))
+}
+
+test "the apps own origin is never blocked by the abuse guard" {
+    var a = originApp()
+    var i = 0
+    while (i < 6) {
+        Check.eqInt("401", 401, a.client.getWith("/developers/origins", listOf("Origin: https://enois.ia.br")).status)
+        i = i + 1
+    }
+    Check.status(a.client.getWith("/v1", listOf("Origin: https://enois.ia.br")), 200)
+}
+
+test "a forged X-Client-Origin next to a registered Origin counts as suspicious" {
+    var a = originApp()
+    register(a, "forge", "https://forger.example")
+    var i = 0
+    while (i < 3) {
+        a.client.getWith("/v1", listOf("Origin: https://forger.example", "X-Client-Origin: https://enois.ia.br"))
+        i = i + 1
+    }
+    Check.filterError(a.client.getWith("/v1", listOf("Origin: https://forger.example")), 403, "ORIGIN_BLOCKED")
+}
+
+// OptionsAlwaysAllowedTests
+test "an unknown origin gets its preflight answered" {
+    var a = originApp()
+    var res = a.client.send("OPTIONS", "/feed/posts/x/reactions", listOf("Origin: https://exemplo-nao-cadastrado.test", "Access-Control-Request-Method: POST", "Access-Control-Request-Headers: content-type,x-session-token,idempotency-key"), "", "")
+    assert(res.status >= 200 && res.status < 300)
+    Check.eqStr("origin", "https://exemplo-nao-cadastrado.test", res.header("Access-Control-Allow-Origin"))
+    assert(res.header("Access-Control-Allow-Methods").contains("OPTIONS"))
+    assert(res.header("Access-Control-Allow-Headers").contains("x-session-token"))
+    Check.eqStr("max age", "600", res.header("Access-Control-Max-Age"))
+}
+
+test "a trusted origin preflight carries credentials" {
+    var a = originApp()
+    var res = a.client.send("OPTIONS", "/feed/posts/x/reactions", listOf("Origin: https://enois.ia.br", "Access-Control-Request-Method: POST", "Access-Control-Request-Headers: content-type"), "", "")
+    assert(res.status >= 200 && res.status < 300)
+    Check.eqStr("origin", "https://enois.ia.br", res.header("Access-Control-Allow-Origin"))
+    Check.eqStr("credentials", "true", res.header("Access-Control-Allow-Credentials"))
+}
+
+test "an unknown origin preflight does not carry credentials" {
+    var a = originApp()
+    var res = a.client.send("OPTIONS", "/feed/posts/x/reactions", listOf("Origin: https://exemplo-nao-cadastrado.test", "Access-Control-Request-Method: POST"), "", "")
+    assert(res.status >= 200 && res.status < 300)
+    Check.eqStr("credentials", "", res.header("Access-Control-Allow-Credentials"))
+}
+
+test "a wildcard subdomain preflight does not carry credentials" {
+    var a = originApp()
+    var res = a.client.send("OPTIONS", "/feed/posts/x/reactions", listOf("Origin: https://outro.b7cloud.tech", "Access-Control-Request-Method: POST"), "", "")
+    assert(res.status >= 200 && res.status < 300)
+    Check.eqStr("credentials", "", res.header("Access-Control-Allow-Credentials"))
+    Check.eqStr("origin", "https://outro.b7cloud.tech", res.header("Access-Control-Allow-Origin"))
+}
+
+test "a path that does not exist also gets its preflight answered" {
+    var a = originApp()
+    var res = a.client.send("OPTIONS", "/caminho/que/nao/existe", listOf("Origin: https://enois.ia.br", "Access-Control-Request-Method: POST"), "", "")
+    assert(res.status >= 200 && res.status < 300)
+}
+
+test "a preflight without an origin is not rejected" {
+    var a = originApp()
+    var res = a.client.send("OPTIONS", "/feed/posts/x/reactions", listOf("Access-Control-Request-Method: POST"), "", "")
+    assert(res.status >= 200 && res.status < 300)
+    Check.eqStr("no origin header", "", res.header("Access-Control-Allow-Origin"))
+}
+
+// AdminPreflightTests
+test "the preflight of an admin route answers 2xx with CORS and credentials" {
+    var a = originApp()
+    var res = a.client.send("OPTIONS", "/admin/appeals", listOf("Origin: https://enois.ia.br", "Access-Control-Request-Method: GET", "Access-Control-Request-Headers: x-client-origin"), "", "")
+    assert(res.status >= 200 && res.status < 300)
+    Check.eqStr("origin", "https://enois.ia.br", res.header("Access-Control-Allow-Origin"))
+    Check.eqStr("credentials", "true", res.header("Access-Control-Allow-Credentials"))
+}
+
+test "a wildcard subdomain passes the gate but the router CORS refuses it on a real request" {
+    var a = originApp()
+    var res = a.client.getWith("/v1", listOf("Origin: https://outro.b7cloud.tech"))
+    Check.status(res, 403)
+    Check.eqStr("body", "Invalid CORS request", res.body)
+}
+
+// OriginAbuseGuardTests
+test "the abuse guard builds with both lists, and with an empty trusted list" {
+    var failed = false
+    try {
+        OriginAbuseGuard(OriginDirectory(), "https://enois.ia.br,http://localhost:5173", "https://*.b7cloud.com.br", 60, 300L, 30L)
+        OriginAbuseGuard(OriginDirectory(), "https://enois.ia.br", "", 60, 300L, 30L)
+    } catch (String e) {
+        failed = true
+    }
+    assert(!failed)
+}
+
+class RecordingOrigins extends OriginDirectory {
+    List<String> blocks = listOf<String>()
+    block(origin: String, reason: String, minutes: Long) {
+        blocks.add(origin + "|" + minutes)
+    }
+}
+
+test "the abuse guard blocks a third party at the ceiling and never an app origin" {
+    var origins = RecordingOrigins()
+    var guard = OriginAbuseGuard(origins, "https://enois.ia.br", "https://*.b7cloud.com.br", 3, 60L, 30L)
+    var i = 0
+    while (i < 50) {
+        guard.recordFailure("https://enois.ia.br")
+        guard.recordFailure("https://x.b7cloud.com.br")
+        i = i + 1
+    }
+    Check.eqInt("app origins", 0, origins.blocks.size())
+    guard.recordFailure("https://third.example")
+    guard.recordFailure("https://third.example")
+    Check.eqInt("below the ceiling", 0, origins.blocks.size())
+    guard.recordFailure("https://third.example")
+    Check.eqInt("blocked", 1, origins.blocks.size())
+    Check.eqStr("what", "https://third.example|30", origins.blocks.get(0))
+    var off = OriginAbuseGuard(origins, "https://enois.ia.br", "", 0, 60L, 30L)
+    off.recordFailure("https://third.example")
+    off.recordFailure("https://third.example")
+    Check.eqInt("disabled", 1, origins.blocks.size())
+}
+
+// CorsConfigTests
+test "wildcard allowed or trusted origins are rejected at boot" {
+    var bad = listOf("*", "https://enois.ia.br, *", "https://*", "http://*")
+    for (var allowed in bad) {
+        var thrown = false
+        try {
+            CorsPolicy.rejectWildcards(allowed, "https://*.b7cloud.com.br")
+        } catch (String e) {
+            thrown = e.startsWith("CONFIG_INVALID")
+        }
+        Check.isTrue("rejects allowed " + allowed, thrown)
+    }
+    for (var trusted in listOf("*", "https://*")) {
+        var thrown = false
+        try {
+            CorsPolicy.rejectWildcards("https://enois.ia.br", trusted)
+        } catch (String e) {
+            thrown = true
+        }
+        Check.isTrue("rejects trusted " + trusted, thrown)
+    }
+}
+
+test "explicit origins and subdomain patterns are accepted, and the credentialed list has no wildcard" {
+    for (var allowed in listOf("", "https://enois.ia.br", "https://enois.ia.br,http://localhost:5173")) {
+        CorsPolicy.rejectWildcards(allowed, "https://*.b7cloud.com.br")
+    }
+    var policy = CorsPolicy("https://enois.ia.br,http://localhost:5173", "https://*.b7cloud.com.br,https://api.enois.ia.br")
+    assert(policy.allows("https://enois.ia.br"))
+    assert(policy.allows("http://localhost:5173"))
+    assert(policy.allows("https://api.enois.ia.br/"))
+    assert(!policy.allows("https://x.b7cloud.com.br"))
+    assert(!policy.allows("https://evil.example"))
+    var blank = CorsPolicy("", "https://*.b7cloud.com.br")
+    assert(blank.allows("https://enois.ia.br"))
+    assert(!blank.allows("http://localhost:5173"))
+}

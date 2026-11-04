@@ -1,0 +1,155 @@
+package kernel.security
+
+import kernel.error.*
+import kernel.http.*
+
+// Central authorisation lock for EVERY /admin/**, whether the controller remembers or not (the
+// controllers also call requireAdmin, but that check is manual and a new admin route can forget it).
+// No session is 401; a valid session that is not an admin is 403. The controller check stays as
+// defence in depth. Cost: one session query and one profile query per admin request, a small surface.
+// Like the Spring interceptor it only acts on a request that matched a handler (an unknown method is a
+// 405 first) and never on a preflight.
+class AdminRouteGuard {
+    HttpServer server
+    AdminGuard admin
+    ModeratorGuard moderators
+    public constructor(server: HttpServer, admin: AdminGuard, moderators: ModeratorGuard) {
+        this.server = server
+        this.admin = admin
+        this.moderators = moderators
+    }
+    // Paths of /admin the moderation panel opens to MODERATORS (besides the admin): queues, appeals,
+    // disputes, user actions, IPs and the monitoring panel. Everything else stays admin-only,
+    // including applications and moderator management.
+    static List<String> moderatorPrefixes() = listOf("/admin/appeals", "/admin/support", "/admin/suggestions", "/admin/emails", "/admin/blocked-ips", "/admin/monitoring")
+    // Sub-paths of /admin/support that stay admin-only (infrastructure).
+    static String supportAdminOnly() = "/admin/support/github"
+    static List<String> userActions() = listOf("sanction", "sanitize", "ips")
+    static Bool isAdminPath(p: String) = p == "/admin" || p.startsWith("/admin/")
+    // `prefix/**` matches the prefix itself and anything below it.
+    static Bool under(p: String, prefix: String) = p == prefix || p.startsWith(prefix + "/")
+    static Bool openToModerator(p: String) {
+        if (AdminRouteGuard.under(p, AdminRouteGuard.supportAdminOnly())) {
+            return false
+        }
+        for (var prefix in AdminRouteGuard.moderatorPrefixes()) {
+            if (AdminRouteGuard.under(p, prefix)) {
+                return true
+            }
+        }
+        // /admin/users/*/sanction | sanitize | ips
+        var parts = p.split("/")
+        return parts.length == 5 && parts[1] == "admin" && parts[2] == "users" && parts[3].length() > 0 && AdminRouteGuard.userActions().contains(parts[4])
+    }
+    String run() {
+        var m = method().toUpperCase()
+        if (m == "OPTIONS" || !server.knowsMethod(m, path())) {
+            return Http.next()
+        }
+        var p = RequestPath.current()
+        if (!AdminRouteGuard.isAdminPath(p)) {
+            return Http.next()
+        }
+        var userId = Auth.resolve(Auth.sessionToken())
+        if (AdminRouteGuard.openToModerator(p)) {
+            moderators.requireModerator(userId)
+        }
+        else {
+            admin.requireAdmin(userId)
+        }
+        return Http.next()
+    }
+}
+
+// Fail-closed writes: every POST/PUT/PATCH/DELETE needs a session, except the public flows listed here
+// (sign in, sign up, recover password, confirm e-mail, OAuth, the games token). A new write route is
+// born protected even if its handler forgets. The handler still validates owner/role; this is the
+// safety net. /admin/** is left to the AdminRouteGuard, which is stricter (admin, not just a session).
+class WriteGate {
+    HttpServer server
+    public constructor(server: HttpServer) {
+        this.server = server
+    }
+    // Flows that exist precisely for someone without a session. Kept in step with the catalogue the
+    // AutomatedWritePaths test pins: opening one more public flow by accident breaks that test.
+    static List<String> publicWrites() = listOf("/auth/signup", "/auth/login", "/auth/refresh", "/auth/logout", "/auth/email/verify", "/auth/email/resend", "/auth/password/forgot", "/auth/password/reset", "/auth/2fa/verify", "/auth/2fa/resend", "/auth/2fa/email/request", "/auth/2fa/email/confirm", "/contributors/applications", "/auth/oauth/*/callback", "/auth/oauth/*/token", "/games/tokens/validate", "/webhooks/github", "/blogs/descadastrar", "/notifications/digest/unsubscribe")
+    // A `*` is one whole segment (AntPathMatcher).
+    static Bool matchesPattern(pattern: String, p: String) {
+        var a = pattern.split("/")
+        var b = p.split("/")
+        if (a.length != b.length) {
+            return false
+        }
+        var i = 0
+        while (i < a.length) {
+            if (a[i] != "*" && a[i] != b[i]) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    static Bool isPublicWrite(p: String) {
+        for (var pattern in WriteGate.publicWrites()) {
+            if (WriteGate.matchesPattern(pattern, p)) {
+                return true
+            }
+        }
+        return false
+    }
+    String run() {
+        var m = method().toUpperCase()
+        if (!RateFilters.isWrite(m) || !server.knowsMethod(m, path())) {
+            return Http.next()
+        }
+        var p = RequestPath.current()
+        if (AdminRouteGuard.isAdminPath(p) || WriteGate.isPublicWrite(p)) {
+            return Http.next()
+        }
+        Auth.resolve(Auth.sessionToken())
+        return Http.next()
+    }
+}
+
+record PanicRequest(Bool active)
+
+record PanicView(Bool active, Bool envLocked, String message)
+
+// The panic button of the admin panel: switches the global write block on and off. Admin only. The
+// endpoint is OUTSIDE the block of panic mode itself (see PanicModeFilter), or there would be no way off.
+class PanicRoutes {
+    static register(server: HttpServer, panic: PanicModeService, admin: AdminGuard) {
+        server.get("/admin/panic", () -> PanicRoutes.status(panic, admin))
+        server.post("/admin/panic", () -> PanicRoutes.toggle(panic, admin))
+    }
+    static String status(panic: PanicModeService, admin: AdminGuard) {
+        admin.requireAdmin(Auth.resolve(Auth.sessionToken()))
+        return PanicRoutes.view(panic)
+    }
+    static String toggle(panic: PanicModeService, admin: AdminGuard) {
+        admin.requireAdmin(Auth.resolve(Auth.sessionToken()))
+        var request = PanicRoutes.parse()
+        panic.setActive(request.active())
+        return PanicRoutes.view(panic)
+    }
+    static PanicRequest parse() {
+        try {
+            return json.decode<PanicRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String view(panic: PanicModeService) {
+        var active = panic.active()
+        var locked = panic.envLocked()
+        var message = "Modo pânico desligado: a aplicação está aceitando escritas."
+        if (locked) {
+            message = "Modo pânico ATIVADO pela variável de ambiente PANIC_MODE: o painel não consegue desligar."
+        }
+        else 
+            if (active) {
+                message = "Modo pânico ativo: toda escrita está respondendo 429."
+            }
+        return json.encode(PanicView(active, locked, message))
+    }
+}

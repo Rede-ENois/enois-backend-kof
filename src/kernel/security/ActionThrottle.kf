@@ -1,0 +1,20 @@
+package kernel.security
+
+import kernel.error.*
+
+// Frequency limit per ACTION and per USER (sliding window in memory): how many times the SAME account
+// may repeat an action in a window (reports, recommendations). Not fingerprinting, not an IP block.
+// Callers pass the ceiling and the window, so one instance serves every action.
+class ActionThrottle {
+    SlidingWindows windows = SlidingWindows(50000, 0L)
+    // Consumes one attempt. Throws 429 ACTION_THROTTLED once `max` happened inside `windowMs`.
+    requireAllowed(action: String, user: String, max: Int, windowMs: Long) {
+        var who = user
+        if (who.length() == 0) {
+            who = "anon"
+        }
+        if (!windows.tryAcquireWithin(action + ":" + who, SecurityClock.nowMillis(), max, windowMs)) {
+            throw Errors.api(429, "ACTION_THROTTLED", "Muitas ações deste tipo em pouco tempo. Tente de novo mais tarde.")
+        }
+    }
+}

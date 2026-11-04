@@ -1,0 +1,495 @@
+import kernel.*
+import kernel.config.*
+import kernel.db.*
+import kernel.error.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of AuthThrottleKeyTests, PanicModeServiceTests (unit part) and the limiter primitives.
+Int limitIn(limits: Map<String,Int>, key: String) {
+    var v = limits.get(key)
+    if (v == null) {
+        return -1
+    }
+    return v
+}
+
+Long windowIn(windows: Map<String,SlidingWindows>, key: String) {
+    var v = windows.get(key)
+    if (v == null) {
+        return -1L
+    }
+    return v.windowMs
+}
+
+Long periodIn(periods: Map<String,Long>, key: String) {
+    var v = periods.get(key)
+    if (v == null) {
+        return -1L
+    }
+    return v
+}
+
+Bool throwsApi(code: String, body: () -> void) {
+    try {
+        body()
+    } catch (String e) {
+        return Errors.hasCode(e, code)
+    }
+    return false
+}
+
+test "failures from one ip do not delay another ip" {
+    var throttle = AuthThrottle(1, 10, 50000)
+    var i = 0
+    while (i < 3) {
+        throttle.recordLoginFailure("victim@test.com", "198.51.100.1")
+        i = i + 1
+    }
+    var start = Time.nowMillis()
+    throttle.requireLoginAllowed("victim@test.com", "203.0.113.7")
+    assert(Time.nowMillis() - start < 100L)
+    var failed = false
+    try {
+        throttle.requireLoginAllowed("victim@test.com", "198.51.100.1")
+    } catch (String e) {
+        failed = true
+        assert(Errors.hasCode(e, "LOGIN_THROTTLED"))
+        assert(Errors.parse(e).status() == 429)
+        assert(Errors.parse(e).retryAfterSeconds() > 0L)
+    }
+    assert(failed)
+}
+
+test "spraying one account refuses the spraying networks but never the owner" {
+    var throttle = AuthThrottle(5, 10, 50000)
+    var i = 0
+    while (i < 19) {
+        throttle.recordLoginFailure("sprayed@test.com", "198.51.100." + i)
+        i = i + 1
+    }
+    assert(!throttle.accountThrottled("sprayed@test.com", "198.51.100.1"))
+    throttle.recordLoginFailure("sprayed@test.com", "198.51.100.19")
+    assert(throttle.accountThrottled("sprayed@test.com", "198.51.100.1"))
+    assert(throwsApi("LOGIN_THROTTLED", () -> throttle.requireLoginAllowed("sprayed@test.com", "198.51.100.1")))
+    assert(!throttle.accountThrottled("sprayed@test.com", "203.0.113.7"))
+    assert(throttle.loginDelayMillis("sprayed@test.com", "203.0.113.7") == 0L)
+    assert(!throttle.accountThrottled("other@test.com", "198.51.100.1"))
+    throttle.clearLogin("sprayed@test.com", "203.0.113.7")
+    assert(!throttle.accountThrottled("sprayed@test.com", "198.51.100.1"))
+}
+
+test "a flood of new keys never resets the attacked account" {
+    var throttle = AuthThrottle(5, 10, 100)
+    var i = 0
+    while (i < 5) {
+        throttle.recordLoginFailure("target@test.com", "198.51.100.1")
+        i = i + 1
+    }
+    i = 0
+    while (i < 1000) {
+        throttle.recordLoginFailure("flood" + i + "@test.com", "203.0.113." + i % 250)
+        i = i + 1
+    }
+    assert(throttle.loginDelayMillis("target@test.com", "198.51.100.1") == 1000L)
+}
+
+test "account and ip delay still applies on its own" {
+    var throttle = AuthThrottle(5, 10, 50000)
+    var i = 0
+    while (i < 5) {
+        throttle.recordLoginFailure("target@test.com", "198.51.100.1")
+        i = i + 1
+    }
+    assert(throttle.loginDelayMillis("target@test.com", "198.51.100.1") == 1000L)
+    assert(throttle.loginDelayMillis("target@test.com", "203.0.113.7") == 0L)
+}
+
+test "login throttle windows expire and signup is capped per ip and fingerprint" {
+    var throttle = AuthThrottle(2, 2, 50000)
+    throttle.recordLoginFailure("a@test.com", "198.51.100.1")
+    throttle.recordLoginFailure("a@test.com", "198.51.100.1")
+    assert(throttle.loginDelayMillis("a@test.com", "198.51.100.1") == 400L)
+    SecurityClock.advanceSeconds(61L)
+    assert(throttle.loginDelayMillis("a@test.com", "198.51.100.1") == 0L)
+    throttle.requireSignupAllowed("203.0.113.9", "")
+    throttle.requireSignupAllowed("203.0.113.9", "")
+    var res = false
+    try {
+        throttle.requireSignupAllowed("203.0.113.9", "")
+    } catch (String e) {
+        res = Errors.hasCode(e, "SIGNUP_THROTTLED") && Errors.parse(e).status() == 429
+    }
+    assert(res)
+    throttle.requireSignupAllowed("203.0.113.10", "fp-1")
+    throttle.requireSignupAllowed("203.0.113.11", "fp-1")
+    assert(throwsApi("SIGNUP_THROTTLED", () -> throttle.requireSignupAllowed("203.0.113.12", "fp-1")))
+    SecurityClock.advanceSeconds(3601L)
+    throttle.requireSignupAllowed("203.0.113.9", "")
+    SecurityClock.reset()
+}
+
+test "the login delay message counts seconds" {
+    var throttle = AuthThrottle(1, 10, 50000)
+    throttle.recordLoginFailure("m@test.com", "198.51.100.5")
+    var msg = ""
+    try {
+        throttle.requireLoginAllowed("m@test.com", "198.51.100.5")
+    } catch (String e) {
+        msg = Errors.parse(e).message()
+    }
+    assert(msg == "Aguarde 1 segundo e tente de novo.")
+}
+
+class ScriptedFlags extends PanicFlagStore {
+    Int reads = 0
+    Bool failing = false
+    Int entered = 0
+    Int release = 1
+    Bool gated = false
+    Bool stored = false
+    public constructor(failing: Bool, gated: Bool) {
+        this.failing = failing
+        this.gated = gated
+        this.release = 1
+        if (gated) {
+            this.release = 0
+        }
+    }
+    List<String> read() {
+        reads = reads + 1
+        entered = entered + 1
+        var waited = 0
+        while (release == 0 && waited < 5000) {
+            time.sleep(10)
+            waited = waited + 10
+        }
+        if (failing) {
+            throw "banco fora"
+        }
+        return listOf<String>()
+    }
+    write(value: Bool) {
+        stored = value
+    }
+}
+
+test "a failed read is not repeated on every request" {
+    SecurityClock.reset()
+    var flags = ScriptedFlags(true, false)
+    var service = PanicModeService(flags, "")
+    var i = 0
+    while (i < 100) {
+        service.active()
+        i = i + 1
+    }
+    assert(flags.reads == 1)
+    assert(!service.active())
+}
+
+test "a request does not wait for a refresh already running" {
+    SecurityClock.reset()
+    var flags = ScriptedFlags(false, true)
+    var service = PanicModeService(flags, "")
+    spawn () -> {
+    service.active()
+}
+    var waited = 0
+    while (flags.entered == 0 && waited < 5000) {
+        time.sleep(10)
+        waited = waited + 10
+    }
+    assert(flags.entered == 1)
+    var start = Time.nowMillis()
+    var active = service.active()
+    assert(Time.nowMillis() - start < 200L)
+    assert(!active)
+    flags.release = 1
+}
+
+test "the env var turns panic on without touching the database" {
+    var flags = ScriptedFlags(false, false)
+    var service = PanicModeService(flags, "yes")
+    assert(service.active())
+    assert(service.active())
+    assert(flags.reads == 0)
+    assert(service.envLocked())
+    assert(PanicModeService(flags, "TRUE").envLocked())
+    assert(PanicModeService(flags, "on").envLocked())
+    assert(PanicModeService(flags, "1").envLocked())
+    assert(!PanicModeService(flags, "").envLocked())
+    assert(!PanicModeService(flags, "no").envLocked())
+}
+
+test "the panic flag round-trips through system_flags" {
+    SecurityClock.reset()
+    var app = TestApp.shared()
+    var service = PanicModeService(JdbcPanicFlagStore(app.db()), "")
+    assert(!service.active())
+    service.setActive(true)
+    assert(service.active())
+    var other = PanicModeService(JdbcPanicFlagStore(app.db()), "")
+    assert(other.active())
+    service.setActive(false)
+    assert(!service.active())
+    assert(app.db().queryLong("select count(*) from system_flags where name = \'panic_mode\'", DbParams()) == 1L)
+    SecurityClock.advanceSeconds(3L)
+    assert(!other.active())
+    SecurityClock.reset()
+}
+
+test "per-ip limiter blocks the same ip, not another one, and does not count rejections" {
+    var cfg = Config.of(mapOf("LOGIN_RATE_LIMIT", "3", "REDE_SECURITY_RATE_LIMIT_LOGIN_WINDOW_MINUTES", "5"))
+    var limiter = IpRateLimiter(cfg)
+    assert(limiter.tryAcquire("login", "203.0.113.10"))
+    assert(limiter.tryAcquire("login", "203.0.113.10"))
+    assert(limiter.tryAcquire("login", "203.0.113.10"))
+    assert(!limiter.tryAcquire("login", "203.0.113.10"))
+    assert(!limiter.tryAcquire("login", "203.0.113.10"))
+    assert(limiter.tryAcquire("login", "203.0.113.11"))
+    assert(limiter.tryAcquire("signup", "203.0.113.10"))
+    SecurityClock.advanceSeconds(301L)
+    assert(limiter.tryAcquire("login", "203.0.113.10"))
+    assert(limiter.tryAcquire("unknown-action", "203.0.113.10"))
+    SecurityClock.reset()
+}
+
+test "per-ip limiter defaults are the application.properties values" {
+    var limiter = IpRateLimiter(Config.of(mapOf("X", "1")))
+    assert(limitIn(limiter.limits, "signup") == 10)
+    assert(limitIn(limiter.limits, "login") == 60)
+    assert(limitIn(limiter.limits, "password") == 5)
+    assert(limitIn(limiter.limits, "email") == 5)
+    assert(limitIn(limiter.limits, "2fa") == 20)
+    assert(limitIn(limiter.limits, "contribution") == 5)
+    assert(limitIn(limiter.limits, "refresh") == 120)
+    assert(windowIn(limiter.windows, "signup") == 3600000L)
+    assert(windowIn(limiter.windows, "login") == 900000L)
+    assert(windowIn(limiter.windows, "contribution") == 3600000L)
+}
+
+test "a limit or window of zero disables the ip limiter" {
+    var limiter = IpRateLimiter(Config.of(mapOf("LOGIN_RATE_LIMIT", "0")))
+    var i = 0
+    while (i < 10) {
+        assert(limiter.tryAcquire("login", "203.0.113.1"))
+        i = i + 1
+    }
+}
+
+class RecordingReports extends SecurityAutoReports {
+    List<String> captured = listOf<String>()
+    report(userId: String, reason: String, description: String) {
+        captured.add(userId + "|" + reason + "|" + description)
+    }
+}
+
+test "user limiter rejects over the limit and reports the third rejection of the hour" {
+    SecurityClock.reset()
+    var reports = RecordingReports()
+    var limiter = UserRateLimiter(Config.of(mapOf("REDE_RATE_POST_LIMIT", "2")), reports)
+    limiter.require("user_1", "create_post")
+    limiter.require("user_1", "create_post")
+    var codes = listOf<String>()
+    var i = 0
+    while (i < 4) {
+        try {
+            limiter.require("user_1", "create_post")
+        } catch (String e) {
+            codes.add(Errors.parse(e).code() + Errors.parse(e).status() + Errors.parse(e).message())
+        }
+        i = i + 1
+    }
+    assert(codes.size() == 4)
+    assert(codes.get(0) == "RATE_LIMIT_EXCEEDED429Voce atingiu o limite desta acao. Tente novamente em alguns minutos.")
+    assert(reports.captured.size() == 1)
+    assert(reports.captured.get(0).startsWith("user_1|SPAM|[auto] Usuario rejeitado pelo rate limiter 3 vezes em 1 hora (ultima acao: create_post)"))
+    limiter.require("user_2", "create_post")
+    limiter.require("user_1", "create_comment")
+    SecurityClock.advanceSeconds(3601L)
+    limiter.require("user_1", "create_post")
+    SecurityClock.reset()
+}
+
+test "user limiter defaults follow application.properties" {
+    var limiter = UserRateLimiter(Config.of(mapOf("X", "1")), SecurityAutoReports())
+    assert(limitIn(limiter.limits, "create_post") == 10)
+    assert(limitIn(limiter.limits, "create_comment") == 30)
+    assert(limitIn(limiter.limits, "apply_job") == 100)
+    assert(limitIn(limiter.limits, "send_message") == 60)
+    assert(limitIn(limiter.limits, "sync_github") == 3)
+    assert(limitIn(limiter.limits, "start_call") == 20)
+    assert(windowIn(limiter.windows, "send_message") == 60000L)
+    assert(windowIn(limiter.windows, "apply_job") == 1800000L)
+}
+
+test "action throttle caps repeats per user and action inside the window" {
+    SecurityClock.reset()
+    var throttle = ActionThrottle()
+    throttle.requireAllowed("report", "u1", 2, 60000L)
+    throttle.requireAllowed("report", "u1", 2, 60000L)
+    var res = false
+    try {
+        throttle.requireAllowed("report", "u1", 2, 60000L)
+    } catch (String e) {
+        res = Errors.hasCode(e, "ACTION_THROTTLED") && Errors.parse(e).status() == 429 && Errors.parse(e).message() == "Muitas ações deste tipo em pouco tempo. Tente de novo mais tarde."
+    }
+    assert(res)
+    throttle.requireAllowed("report", "u2", 2, 60000L)
+    throttle.requireAllowed("recommendation", "u1", 2, 60000L)
+    throttle.requireAllowed("report", "", 1, 60000L)
+    assert(throwsApi("ACTION_THROTTLED", () -> throttle.requireAllowed("report", "", 1, 60000L)))
+    SecurityClock.advanceSeconds(61L)
+    throttle.requireAllowed("report", "u1", 2, 60000L)
+    SecurityClock.reset()
+}
+
+test "new accounts wait out the cooldown" {
+    SecurityClock.reset()
+    var app = TestApp.shared()
+    SecurityFixtures.user(app.db(), "cooldown_new", true, false)
+    var cooldown = NewAccountCooldown(app.db(), Config.of(mapOf("REDE_SECURITY_NEW_ACCOUNT_COOLDOWN_SECONDS", "30")))
+    var res = false
+    try {
+        cooldown.require("cooldown_new")
+    } catch (String e) {
+        res = Errors.hasCode(e, "ACCOUNT_TOO_NEW") && Errors.parse(e).status() == 429
+    }
+    assert(res)
+    SecurityClock.advanceSeconds(31L)
+    cooldown.require("cooldown_new")
+    cooldown.require("cooldown_missing_user")
+    SecurityClock.reset()
+    var off = NewAccountCooldown(app.db(), Config.of(mapOf("REDE_SECURITY_NEW_ACCOUNT_COOLDOWN_SECONDS", "0")))
+    SecurityFixtures.user(app.db(), "cooldown_new2", true, false)
+    off.require("cooldown_new2")
+}
+
+test "timing guard flags metronome cadence and ignores human cadence" {
+    SecurityClock.reset()
+    var guard = BehavioralTimingGuard()
+    var i = 0
+    while (i < 10) {
+        guard.recordAction("bot_1")
+        SecurityClock.advanceSeconds(2L)
+        i = i + 1
+    }
+    assert(guard.looksAutomated("bot_1"))
+    var gaps = listOf(1L, 7L, 2L, 13L, 3L, 9L, 5L, 21L, 4L, 8L)
+    for (var gap in gaps) {
+        guard.recordAction("human_1")
+        SecurityClock.advanceSeconds(gap)
+    }
+    assert(!guard.looksAutomated("human_1"))
+    assert(!guard.looksAutomated("nobody"))
+    guard.recordAction("short_1")
+    assert(!guard.looksAutomated("short_1"))
+    var steady = listOf(1000L, 2000L, 3000L, 4000L)
+    assert(BehavioralTimingGuard.stdDevOfIntervals(steady) == 0.0)
+    var uneven = listOf(0L, 1000L, 3000L)
+    assert(BehavioralTimingGuard.stdDevOfIntervals(uneven) == 500.0)
+    SecurityClock.reset()
+}
+
+test "named rate limiters fail at once over the permits and refill each period" {
+    SecurityClock.reset()
+    var limiters = NamedRateLimiters(Config.of(mapOf("RESILIENCE4J_RATELIMITER_INSTANCES_REFRESH_LIMIT_FOR_PERIOD", "2")))
+    limiters.require("refresh")
+    limiters.require("refresh")
+    var res = false
+    try {
+        limiters.require("refresh")
+    } catch (String e) {
+        res = Errors.hasCode(e, "RATE_LIMITED") && Errors.parse(e).status() == 429 && Errors.parse(e).retryAfterSeconds() == 60L && Errors.parse(e).message() == "Limite de requisicoes excedido."
+    }
+    assert(res)
+    limiters.require("auth")
+    SecurityClock.advanceSeconds(61L)
+    limiters.require("refresh")
+    SecurityClock.reset()
+}
+
+test "named rate limiter defaults and period parsing" {
+    var limiters = NamedRateLimiters(Config.of(mapOf("X", "1")))
+    assert(limitIn(limiters.limits, "auth") == 300)
+    assert(limitIn(limiters.limits, "twofa") == 60)
+    assert(limitIn(limiters.limits, "refresh") == 120)
+    assert(limitIn(limiters.limits, "search") == 120)
+    assert(limitIn(limiters.limits, "email-sending") == 200)
+    assert(periodIn(limiters.periods, "auth") == 60000L)
+    assert(periodIn(limiters.periods, "email-sending") == 900000L)
+    assert(NamedRateLimiters.parsePeriod("30s") == 30000L)
+    assert(NamedRateLimiters.parsePeriod("2h") == 7200000L)
+    assert(NamedRateLimiters.parsePeriod("500ms") == 500L)
+    var bad = false
+    try {
+        NamedRateLimiters.parsePeriod("soon")
+    } catch (String e) {
+        bad = e.startsWith("CONFIG_INVALID")
+    }
+    assert(bad)
+    var unknown = false
+    try {
+        limiters.tryAcquire("nope")
+    } catch (String e) {
+        unknown = true
+    }
+    assert(unknown)
+}
+
+// RateLimitSessionsTests
+class CountingLookup extends SessionLookup {
+    Int calls = 0
+    Bool live = false
+    String? findActiveUserId(token: String) {
+        calls = calls + 1
+        if (live && token == "live") {
+            return "user_a"
+        }
+        return null
+    }
+}
+
+test "a live session is looked up once and then served from the cache" {
+    SecurityClock.reset()
+    var lookup = CountingLookup()
+    lookup.live = true
+    var sessions = RateLimitSessions(lookup, 50)
+    assert(sessions.userId("live", "203.0.113.1") == "user_a")
+    assert(sessions.userId("live", "203.0.113.1") == "user_a")
+    assert(lookup.calls == 1)
+    SecurityClock.advanceSeconds(61L)
+    assert(sessions.userId("live", "203.0.113.1") == "user_a")
+    assert(lookup.calls == 2)
+    SecurityClock.reset()
+}
+
+test "invented tokens stop reaching the database once the ip lookup budget is spent" {
+    SecurityClock.reset()
+    var lookup = CountingLookup()
+    var sessions = RateLimitSessions(lookup, 50)
+    var i = 0
+    while (i < 200) {
+        assert(sessions.userId("invented-" + i, "203.0.113.2") == null)
+        i = i + 1
+    }
+    assert(lookup.calls == 60)
+    sessions.userId("invented-x", "203.0.113.3")
+    assert(lookup.calls == 61)
+    SecurityClock.advanceSeconds(61L)
+    sessions.userId("invented-y", "203.0.113.2")
+    assert(lookup.calls == 62)
+    SecurityClock.reset()
+}
+
+test "a trusted proxy address gets the shared multiplier" {
+    var lookup = CountingLookup()
+    var sessions = RateLimitSessions(lookup, 50)
+    var i = 0
+    while (i < 61) {
+        sessions.userId("behind-proxy-" + i, "10.0.0.1")
+        i = i + 1
+    }
+    assert(lookup.calls == 61)
+}

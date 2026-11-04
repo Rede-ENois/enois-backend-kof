@@ -1,0 +1,103 @@
+package kernel.security
+
+import java.lang.ThreadLocal
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
+import kernel.config.*
+import kernel.error.*
+import kernel.http.*
+
+// What the first execution of a POST answered, kept for the identical POST that arrived while it ran.
+class DuplicateSlot {
+    AtomicInteger state = new AtomicInteger(0)
+    Int status = 0
+    String body = ""
+}
+
+// Safety net against a double click or a retry on EVERY POST.
+//
+// The front sends a fresh Idempotency-Key per click, so key-based idempotency does not catch two sends
+// fired at the same instant. Here the key is derived from the CONTENT: same session (or IP), same route
+// and same body while the first one is still running returns exactly the answer of the first execution;
+// the second never reaches the handler. The slot lives only as long as the first request is in flight.
+// Multipart is left out (big bodies, not a double click target) and so is a body over 1 MB. Nothing of
+// the body is logged. REDE_SECURITY_DUPLICATE_POST_ENABLED (default true).
+class DuplicatePostFilter {
+    Bool enabled
+    Map<String,DuplicateSlot> inFlight = new ConcurrentHashMap<String, DuplicateSlot>()
+    ReentrantLock gate = new ReentrantLock()
+    static ThreadLocal dupPostSlot = new ThreadLocal()
+    static Int maxBody() = 1000000
+    static Int waitMs() = 10000
+    public constructor(cfg: Config) {
+        this.enabled = cfg.getBool("REDE_SECURITY_DUPLICATE_POST_ENABLED", true)
+    }
+    String run() {
+        dupPostSlot.remove()
+        if (!enabled || method().toUpperCase() != "POST") {
+            return Http.next()
+        }
+        var contentType = Req.headerOrNull("content-type")
+        if (contentType != null) {
+            if (contentType.toLowerCase().startsWith("multipart/")) {
+                return Http.next()
+            }
+        }
+        var text = Req.bodyText()
+        if (text.length() > DuplicatePostFilter.maxBody()) {
+            return Http.next()
+        }
+        var key = keyOf(text)
+        var slot = DuplicateSlot()
+        gate.lock()
+        var existing = inFlight.get(key)
+        if (existing == null) {
+            inFlight.put(key, slot)
+        }
+        gate.unlock()
+        if (existing == null) {
+            dupPostSlot.set(key)
+            return Http.next()
+        }
+        return replay(existing)
+    }
+    // After hook of the first execution: publish its answer and free the slot.
+    afterResponse(status: Int, body: String) {
+        var key = dupPostSlot.get()
+        if (key == null) {
+            return
+        }
+        dupPostSlot.remove()
+        var name = key.toString()
+        var slot = inFlight.get(name)
+        if (slot == null) {
+            return
+        }
+        slot.status = status
+        slot.body = body
+        slot.state.set(1)
+        inFlight.remove(name)
+    }
+    String replay(slot: DuplicateSlot) {
+        var waited = 0
+        while (slot.state.get() == 0 && waited < DuplicatePostFilter.waitMs()) {
+            time.sleep(10)
+            waited = waited + 10
+        }
+        if (slot.state.get() == 0) {
+            return status(409, "{\"code\":\"DUPLICATE_IN_PROGRESS\",\"message\":\"A mesma requisicao ainda esta em processamento.\"}")
+        }
+        return status(slot.status, slot.body)
+    }
+    String keyOf(text: String) {
+        var token = Auth.sessionToken()
+        var identity = "ip:" + Req.clientIp()
+        if (token != null) {
+            if (token.trim().length() > 0) {
+                identity = "session:" + SecurityDigest.sha256Hex(token.trim())
+            }
+        }
+        return SecurityDigest.sha256Hex(identity + "\n" + method() + "\n" + RequestPath.current() + "\n" + Req.rawQuery() + "\n" + SecurityDigest.sha256Hex(text))
+    }
+}

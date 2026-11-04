@@ -1,0 +1,41 @@
+package kernel.http
+
+import java.lang.ThreadLocal
+import java.util.HashMap
+
+// Response headers of the current request, remembered so later filters can ask what an earlier one
+// set (the Spring CORS processor skips a response that already carries Access-Control-Allow-Origin).
+// The web runtime only offers headerSet(name, value), which cannot be read back.
+class ResponseHeaders {
+    static ThreadLocal responseHeadersSlot = new ThreadLocal()
+    static HashMap<String,String> map() {
+        var m = responseHeadersSlot.get()
+        if (m == null) {
+            var fresh = new HashMap<String, String>()
+            responseHeadersSlot.set(fresh)
+            return fresh
+        }
+        return m as HashMap<String,String>
+    }
+    // Called at the start of every request by the HttpServer.
+    static reset() {
+        responseHeadersSlot.set(new HashMap<String, String>())
+    }
+    static set(name: String, value: String) {
+        ResponseHeaders.map().put(name.toLowerCase(), value)
+        headerSet(name, value)
+    }
+    // addHeader semantics for list headers such as Vary: values are comma-joined.
+    static add(name: String, value: String) {
+        var current = ResponseHeaders.get(name)
+        if (current == null) {
+            ResponseHeaders.set(name, value)
+            return
+        }
+        if (!current.contains(value)) {
+            ResponseHeaders.set(name, current + ", " + value)
+        }
+    }
+    static String? get(name: String) = ResponseHeaders.map().get(name.toLowerCase())
+    static Bool has(name: String) = ResponseHeaders.get(name) != null
+}

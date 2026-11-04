@@ -1,0 +1,165 @@
+package kernel.security
+
+import java.lang.ThreadLocal
+import kernel.config.*
+import kernel.db.*
+import kernel.error.*
+import kernel.http.*
+
+// Current-user resolution for every route handler. Mirror of CurrentUserResolver + SessionCookieFilter.
+//
+//   var userId = Auth.requireUser()            // 401 UNAUTHENTICATED / 403 EMAIL_NOT_VERIFIED
+//   var viewer = Auth.viewerIdOrNull()         // public reads: the viewer or null, never throws
+//
+// The token comes from the X-Session-Token header (non-browser clients, always wins), then
+// `Authorization: Bearer`, then the HttpOnly `enois_session` cookie. Cookie-authenticated writes also
+// need `X-CSRF-Protection: 1` (Auth.csrfFilter). Auth.install wires the store and the CSRF filter.
+class Auth {
+    static AuthStore? authStore = null
+    static AdminGuard? adminGuard = null
+    static ModeratorGuard? moderatorGuard = null
+    static ThreadLocal authUserSlot = new ThreadLocal()
+    // Wires the session store and registers the CSRF filter (the SessionCookieFilter slot).
+    static install(server: HttpServer, store: Db, cfg: Config) {
+        Auth.authStore = AuthStore(store)
+        SessionCookies.configure(Auth.cookieSecure(cfg))
+        server.use("session-csrf", Auth.csrfOrder(), () -> Auth.csrfFilter())
+    }
+    // Called by Security.install once the guards exist.
+    static useGuards(admin: AdminGuard, moderators: ModeratorGuard) {
+        Auth.adminGuard = admin
+        Auth.moderatorGuard = moderators
+    }
+    // The current user, who must be an admin (403 FORBIDDEN "Acesso restrito a administradores.").
+    static String requireAdmin() {
+        var userId = Auth.requireUser()
+        var guard = Auth.adminGuard
+        if (guard == null) {
+            throw "AUTH_NOT_CONFIGURED: call Security.install at boot"
+        }
+        guard.requireAdmin(userId)
+        return userId
+    }
+    // The current user, who must be an admin or a moderator (403 FORBIDDEN "Acesso restrito a moderadores.").
+    static String requireModerator() {
+        var userId = Auth.requireUser()
+        var guard = Auth.moderatorGuard
+        if (guard == null) {
+            throw "AUTH_NOT_CONFIGURED: call Security.install at boot"
+        }
+        guard.requireModerator(userId)
+        return userId
+    }
+    // Same slot as SessionCookieFilter: after the origin gate, before the limiters.
+    static Int csrfOrder() = -980
+    // The dev profile (SPRING_PROFILES_ACTIVE=dev, explicit) serves plain http. Anything else is Secure.
+    static Bool cookieSecure(cfg: Config) {
+        var explicit = cfg.lookup("REDE_AUTH_COOKIE_SECURE")
+        if (explicit != null) {
+            return cfg.getBool("REDE_AUTH_COOKIE_SECURE", true)
+        }
+        return cfg.getStr("SPRING_PROFILES_ACTIVE", "") != "dev"
+    }
+    static AuthStore authStoreOrFail() {
+        var s = Auth.authStore
+        if (s == null) {
+            throw "AUTH_NOT_CONFIGURED: call Auth.install at boot"
+        }
+        return s
+    }
+    // Called by RequestObservability at the start of every request.
+    static resetRequest() {
+        authUserSlot.remove()
+    }
+    // The raw session token of the current request, or null.
+    static String? sessionToken() {
+        var explicit = Req.headerOrNull("x-session-token")
+        if (explicit != null && explicit.trim().length() > 0) {
+            return explicit
+        }
+        var bearer = Req.bearerToken()
+        if (bearer != null && bearer.length() > 0) {
+            return bearer
+        }
+        return Auth.cookieValue(SessionCookies.session())
+    }
+    // First non-blank cookie with that name (the Java filter skips blank duplicates).
+    static String? cookieValue(name: String) {
+        var raw = Req.headerOrNull("cookie")
+        if (raw == null) {
+            return null
+        }
+        for (var part in raw.split(";")) {
+            var eq = part.indexOf("=")
+            if (eq > 0 && part.substring(0, eq).trim() == name) {
+                var v = part.substring(eq + 1).trim()
+                if (v.length() > 0) {
+                    return v
+                }
+            }
+        }
+        return null
+    }
+    // Writes: 401 UNAUTHENTICATED without a live session, 403 EMAIL_NOT_VERIFIED for an unverified
+    // account. Returns the user id.
+    static String requireUser() = Auth.resolve(Auth.sessionToken())
+    // Same rules for a token the caller already has (CurrentUserResolver.resolve).
+    static String resolve(token: String?) {
+        if (token == null) {
+            throw Errors.api(401, "UNAUTHENTICATED", "Sessao invalida ou expirada.")
+        }
+        var t = token.trim()
+        if (t.length() == 0) {
+            throw Errors.api(401, "UNAUTHENTICATED", "Sessao invalida ou expirada.")
+        }
+        var digest = SecurityDigest.sha256Hex(t)
+        var hit = authUserSlot.get()
+        if (hit != null) {
+            var entry = hit.toString()
+            if (entry.startsWith(digest + "|")) {
+                return entry.substring(65)
+            }
+        }
+        var store = Auth.authStoreOrFail()
+        var userId = store.findActiveUserId(t)
+        if (userId == null) {
+            throw Errors.api(401, "UNAUTHENTICATED", "Sessao invalida ou expirada.")
+        }
+        // Set before the verification check so a 403 is still attributed to the user in the access log.
+        LogContext.put("userId", userId)
+        if (!store.identityVerified(userId)) {
+            throw Errors.api(403, "EMAIL_NOT_VERIFIED", "Confirme seu e-mail ou ative a verificacao em duas etapas para usar a plataforma.")
+        }
+        authUserSlot.set(digest + "|" + userId)
+        return userId
+    }
+    // Tolerant variant for public reads: the viewer's id, or null for anonymous, an invalid session or
+    // any failure (the Java viewerIdOrNull swallowed every exception).
+    static String? viewerIdOrNull() {
+        try {
+            return Auth.requireUser()
+        } catch (String e) {
+            return null
+        }
+    }
+    // SessionCookieFilter: a write authenticated by cookie must carry X-CSRF-Protection: 1. A custom
+    // header forces a CORS preflight, which only the app's allowlisted origins pass. An explicit
+    // X-Session-Token is not a cookie credential and is never subject to it.
+    static String csrfFilter() {
+        var explicit = Req.headerOrNull("x-session-token")
+        if (explicit != null && explicit.trim().length() > 0) {
+            return Http.next()
+        }
+        var cookieAuth = Auth.cookieValue(SessionCookies.session()) != null || Auth.cookieValue(SessionCookies.refresh()) != null
+        if (cookieAuth && !Auth.safeMethod(method()) && Req.headerOrNull("x-csrf-protection") != "1") {
+            ResponseHeaders.set("Cache-Control", "no-store")
+            TrustedOriginCors.apply()
+            return status(403, "{\"code\":\"CSRF_REQUIRED\",\"message\":\"Requisicao recusada. Recarregue a pagina e tente de novo.\"}")
+        }
+        return Http.next()
+    }
+    static Bool safeMethod(m: String) {
+        var u = m.toUpperCase()
+        return u == "GET" || u == "HEAD" || u == "OPTIONS"
+    }
+}

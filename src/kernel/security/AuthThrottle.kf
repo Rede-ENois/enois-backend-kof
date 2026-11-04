@@ -1,0 +1,222 @@
+package kernel.security
+
+import java.util.ArrayList
+import java.util.Collections
+import java.util.HashMap
+import java.util.concurrent.locks.ReentrantLock
+import kernel.config.*
+import kernel.error.*
+
+// Marks per key with the last one remembered, bounded: when the map is full, expired keys go first,
+// then the tenth with the fewest hits (oldest first). A flood of one-off keys evicts itself, never
+// the account that is actually being attacked.
+class ThrottleMap {
+    Map<String,List<Long>> marks = new HashMap<String, List<Long>>()
+    Map<String,Long> last = new HashMap<String, Long>()
+    ReentrantLock gate = new ReentrantLock()
+    Int maxKeys
+    public constructor(maxKeys: Int) {
+        this.maxKeys = maxKeys
+    }
+    // Marks of the key inside the window (strictly older ones are dropped).
+    Int recent(key: String, windowMs: Long) {
+        gate.lock()
+        var list = marks.get(key)
+        if (list == null) {
+            gate.unlock()
+            return 0
+        }
+        var now = SecurityClock.nowMillis()
+        var kept = listOf<Long>()
+        for (var t in list) {
+            if (now - t <= windowMs) {
+                kept.add(t)
+            }
+        }
+        marks.put(key, kept)
+        gate.unlock()
+        return kept.size()
+    }
+    // Counts one more mark; a key idle for longer than the window starts over.
+    register(key: String, windowMs: Long) {
+        var now = SecurityClock.nowMillis()
+        gate.lock()
+        makeRoom(windowMs, now)
+        var existing = marks.get(key)
+        var seen = last.get(key)
+        var list = listOf<Long>()
+        if (existing != null) {
+            list = existing
+            if (seen != null) {
+                if (now - seen > windowMs) {
+                    list = listOf<Long>()
+                }
+            }
+        }
+        list.add(now)
+        marks.put(key, list)
+        last.put(key, now)
+        gate.unlock()
+    }
+    remove(key: String) {
+        gate.lock()
+        marks.remove(key)
+        last.remove(key)
+        gate.unlock()
+    }
+    Int size() = marks.size()
+    makeRoom(windowMs: Long, now: Long) {
+        if (marks.size() < maxKeys) {
+            return
+        }
+        var dead = listOf<String>()
+        for (var key in marks.keys()) {
+            var seen = last.get(key)
+            if (seen == null || now - seen > windowMs) {
+                dead.add(key)
+            }
+        }
+        for (var key in dead) {
+            remove(key)
+        }
+        if (marks.size() < maxKeys) {
+            return
+        }
+        var scores = new ArrayList<Long>()
+        for (var key in marks.keys()) {
+            scores.add(score(key))
+        }
+        Collections.sort(scores)
+        var cut = maxKeys / 10
+        if (cut < 1) {
+            cut = 1
+        }
+        var threshold = scores.get(cut - 1)
+        var evict = listOf<String>()
+        for (var key in marks.keys()) {
+            if (score(key) <= threshold && evict.size() < cut) {
+                evict.add(key)
+            }
+        }
+        for (var key in evict) {
+            remove(key)
+        }
+    }
+    // hits first, then age: count * 1e13 + last mark (ms since epoch stays below 1e13 until year 2286).
+    Long score(key: String) {
+        var list = marks.get(key)
+        var seen = last.get(key)
+        var hits = 0L
+        if (list != null) {
+            hits = list.size() * 1L
+        }
+        var at = 0L
+        if (seen != null) {
+            at = seen
+        }
+        return hits * 10000000000000L + at
+    }
+}
+
+// Credential throttle (pentest F-02/F-04): the global "auth" limiter is shared by every user and does
+// not hold back a brute force against ONE account or mass signup from ONE IP. Windows per KEY (account
+// + IP at login, IP at signup), in memory with expiry: the app stays stateless.
+//
+// Login: after N failures in one minute for the same account AND IP each attempt is refused with a
+// growing Retry-After (never a lock; a success clears the counters). Once failures against the account
+// from any network pass 4 x N, a network that itself failed on the account in the last minute is refused
+// at once (429 LOGIN_THROTTLED, no thread held asleep): spraying one account from many IPs stops, while
+// the owner on a network with no recent failure on it is never refused. Signup: N per hour per IP (and
+// per device fingerprint when given).
+// Env: REDE_AUTH_THROTTLE_LOGIN_MAX_FAILURES (5), REDE_AUTH_THROTTLE_SIGNUP_PER_HOUR (10); the explicit
+// dev profile opens them (100 / 100000) because the suite creates hundreds of accounts from one IP.
+class AuthThrottle {
+    Int loginMaxFailures
+    Int signupPerWindow
+    ThrottleMap loginFailures
+    ThrottleMap accountFailures
+    ThrottleMap signups
+    static Long loginWindowMs() = 60000L
+    static Long signupWindowMs() = 3600000L
+    static Int accountFailureFactor() = 4
+    static Long maxDelayMs() = 2000L
+    public constructor(loginMaxFailures: Int, signupPerWindow: Int, maxKeys: Int) {
+        this.loginMaxFailures = loginMaxFailures
+        this.signupPerWindow = signupPerWindow
+        this.loginFailures = ThrottleMap(maxKeys)
+        this.accountFailures = ThrottleMap(maxKeys)
+        this.signups = ThrottleMap(maxKeys)
+    }
+    static AuthThrottle fromConfig(cfg: Config) {
+        var dev = cfg.getStr("SPRING_PROFILES_ACTIVE", "") == "dev"
+        var loginDefault = 5
+        var signupDefault = 10
+        if (dev) {
+            loginDefault = 100
+            signupDefault = 100000
+        }
+        return AuthThrottle(cfg.getInt("REDE_AUTH_THROTTLE_LOGIN_MAX_FAILURES", loginDefault), cfg.getInt("REDE_AUTH_THROTTLE_SIGNUP_PER_HOUR", signupDefault), 50000)
+    }
+    // Throws 429 LOGIN_THROTTLED (with Retry-After when it is a delay) when this attempt is refused.
+    requireLoginAllowed(email: String, ip: String) {
+        if (accountThrottled(email, ip)) {
+            throw Errors.api(429, "LOGIN_THROTTLED", "Muitas tentativas de entrar nesta conta. Aguarde um minuto e tente de novo.")
+        }
+        var millis = loginDelayMillis(email, ip)
+        if (millis <= 0L) {
+            return
+        }
+        var seconds = (millis + 999L) / 1000L
+        if (seconds < 1L) {
+            seconds = 1L
+        }
+        var unit = " segundo"
+        if (seconds > 1L) {
+            unit = " segundos"
+        }
+        throw Errors.apiRetry(429, "LOGIN_THROTTLED", "Aguarde " + seconds + unit + " e tente de novo.", seconds)
+    }
+    // Progressive delay for this account from this network; 0 below the failure limit.
+    Long loginDelayMillis(email: String, ip: String) {
+        var byNetwork = loginFailures.recent(loginKey(email, ip), AuthThrottle.loginWindowMs())
+        if (byNetwork >= loginMaxFailures) {
+            var delay = 200L * byNetwork
+            if (delay > AuthThrottle.maxDelayMs()) {
+                return AuthThrottle.maxDelayMs()
+            }
+            return delay
+        }
+        return 0L
+    }
+    // The account is under a spray AND this network took part in it.
+    Bool accountThrottled(email: String, ip: String) {
+        if (accountFailures.recent(normalize(email), AuthThrottle.loginWindowMs()) < loginMaxFailures * AuthThrottle.accountFailureFactor()) {
+            return false
+        }
+        return loginFailures.recent(loginKey(email, ip), AuthThrottle.loginWindowMs()) > 0
+    }
+    // A credentials failure counts in the window (a success clears it).
+    recordLoginFailure(email: String, ip: String) {
+        loginFailures.register(loginKey(email, ip), AuthThrottle.loginWindowMs())
+        accountFailures.register(normalize(email), AuthThrottle.loginWindowMs())
+    }
+    clearLogin(email: String, ip: String) {
+        loginFailures.remove(loginKey(email, ip))
+        accountFailures.remove(normalize(email))
+    }
+    // Throws 429 SIGNUP_THROTTLED over the per-hour ceiling; counts the attempt otherwise.
+    requireSignupAllowed(ip: String, deviceFingerprint: String) {
+        if (deviceFingerprint.trim().length() > 0) {
+            checkSignupWindow("fp:" + normalize(deviceFingerprint))
+        }
+        checkSignupWindow("ip:" + normalize(ip))
+    }
+    checkSignupWindow(key: String) {
+        if (signups.recent(key, AuthThrottle.signupWindowMs()) >= signupPerWindow) {
+            throw Errors.api(429, "SIGNUP_THROTTLED", "Muitas contas criadas a partir desta rede. Tenta de novo mais tarde.")
+        }
+        signups.register(key, AuthThrottle.signupWindowMs())
+    }
+    String loginKey(email: String, ip: String) = normalize(email) + "|" + normalize(ip)
+    String normalize(value: String) = value.trim().toLowerCase()
+}

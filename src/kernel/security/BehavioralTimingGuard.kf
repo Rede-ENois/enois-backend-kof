@@ -1,0 +1,92 @@
+package kernel.security
+
+import java.lang.Math
+import java.util.HashMap
+import java.util.concurrent.locks.ReentrantLock
+import kernel.log.*
+
+// Detects automation from the spread of the intervals between one user's actions: people are
+// irregular, bots are metronomes. Keeps the last 10 actions per user in memory; a standard deviation
+// under 500 ms is suspicious. Never blocks: it only logs (the risk engine combines this signal with
+// the others and files the report) and answers looksAutomated.
+class BehavioralTimingGuard {
+    Map<String,List<Long>> actions = new HashMap<String, List<Long>>()
+    Map<String,Long> lastReported = new HashMap<String, Long>()
+    ReentrantLock gate = new ReentrantLock()
+    Log log = Log("kernel.security.timing-guard")
+    static Int windowSize() = 10
+    static Double stdDevThresholdMs() = 500.0
+    // Records an action and analyses the cadence.
+    recordAction(userId: String) {
+        var now = SecurityClock.nowMillis()
+        gate.lock()
+        if (actions.size() > 50000) {
+            actions.clear()
+        }
+        var existing = actions.get(userId)
+        var marks = listOf<Long>()
+        if (existing != null) {
+            marks = existing
+        }
+        marks.add(now)
+        if (marks.size() > BehavioralTimingGuard.windowSize()) {
+            marks = marks.drop(marks.size() - BehavioralTimingGuard.windowSize())
+        }
+        actions.put(userId, marks)
+        if (marks.size() < BehavioralTimingGuard.windowSize()) {
+            gate.unlock()
+            return
+        }
+        var dev = BehavioralTimingGuard.stdDevOfIntervals(marks)
+        gate.unlock()
+        if (dev < BehavioralTimingGuard.stdDevThresholdMs()) {
+            reportIfCooldownExpired(userId, dev, now)
+        }
+    }
+    // Does this account's cadence look automated right now? In-memory, publishes nothing.
+    Bool looksAutomated(userId: String) {
+        gate.lock()
+        var marks = actions.get(userId)
+        if (marks == null) {
+            gate.unlock()
+            return false
+        }
+        if (marks.size() < BehavioralTimingGuard.windowSize()) {
+            gate.unlock()
+            return false
+        }
+        var dev = BehavioralTimingGuard.stdDevOfIntervals(marks)
+        gate.unlock()
+        return dev < BehavioralTimingGuard.stdDevThresholdMs()
+    }
+    static Double stdDevOfIntervals(marks: List<Long>) {
+        var n = marks.size() - 1
+        var sum = 0.0
+        var i = 1
+        while (i < marks.size()) {
+            sum = sum + (marks.get(i) - marks.get(i - 1)) * 1.0
+            i = i + 1
+        }
+        var mean = sum / n
+        var variance = 0.0
+        i = 1
+        while (i < marks.size()) {
+            var diff = (marks.get(i) - marks.get(i - 1)) * 1.0 - mean
+            variance = variance + diff * diff
+            i = i + 1
+        }
+        return Math.sqrt(variance / n)
+    }
+    // At most one log line per user per hour.
+    reportIfCooldownExpired(userId: String, dev: Double, now: Long) {
+        gate.lock()
+        var last = lastReported.get(userId)
+        if (last != null && now - last < 3600000L) {
+            gate.unlock()
+            return
+        }
+        lastReported.put(userId, now)
+        gate.unlock()
+        log.warn("automated_behaviour user=" + userId + " stdDevMs=" + (dev as Int))
+    }
+}

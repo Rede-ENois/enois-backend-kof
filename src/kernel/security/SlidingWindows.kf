@@ -1,0 +1,100 @@
+package kernel.security
+
+import java.util.HashMap
+import java.util.concurrent.locks.ReentrantLock
+
+// Sliding-window counters keyed by string: the primitive behind the in-memory limiters (the Java
+// ConcurrentHashMap<String, Deque<Long>> + synchronized blocks). One coarse lock per instance: every
+// operation is a few list steps. A rejected attempt is NOT counted (a client at the ceiling must not
+// feed its own window).
+// ponytail: single lock per limiter, shard by key hash if a profile ever shows contention.
+class SlidingWindows {
+    Map<String,List<Long>> hits = new HashMap<String, List<Long>>()
+    ReentrantLock gate = new ReentrantLock()
+    Int maxKeys
+    Long windowMs
+    Long widest = 0L
+    public constructor(maxKeys: Int, windowMs: Long) {
+        this.maxKeys = maxKeys
+        this.windowMs = windowMs
+    }
+    // Marks inside the window ending at `now`.
+    List<Long> recent(key: String, now: Long) = recentWithin(key, now, windowMs)
+    List<Long> recentWithin(key: String, now: Long, window: Long) {
+        var kept = listOf<Long>()
+        var marks = hits.get(key)
+        if (marks == null) {
+            return kept
+        }
+        for (var t in marks) {
+            if (now - t < window) {
+                kept.add(t)
+            }
+        }
+        return kept
+    }
+    // Registers the attempt and says whether it passes.
+    Bool tryAcquire(key: String, now: Long, limit: Int) = tryAcquireWithin(key, now, limit, windowMs)
+    // Same with a window chosen by the caller (ActionThrottle: one instance, many actions).
+    Bool tryAcquireWithin(key: String, now: Long, limit: Int, window: Long) {
+        gate.lock()
+        if (window > widest) {
+            widest = window
+        }
+        if (hits.size() > maxKeys) {
+            sweepLocked(now)
+        }
+        var kept = recentWithin(key, now, window)
+        if (kept.size() >= limit) {
+            hits.put(key, kept)
+            gate.unlock()
+            return false
+        }
+        kept.add(now)
+        hits.put(key, kept)
+        gate.unlock()
+        return true
+    }
+    // Registers without checking (a counter, not a gate).
+    Int add(key: String, now: Long) {
+        gate.lock()
+        var kept = recent(key, now)
+        kept.add(now)
+        hits.put(key, kept)
+        gate.unlock()
+        return kept.size()
+    }
+    Int count(key: String, now: Long) {
+        gate.lock()
+        var n = recent(key, now).size()
+        gate.unlock()
+        return n
+    }
+    remove(key: String) {
+        gate.lock()
+        hits.remove(key)
+        gate.unlock()
+    }
+    Int size() = hits.size()
+    // Drops the keys whose marks have all expired.
+    sweep(now: Long) {
+        gate.lock()
+        sweepLocked(now)
+        gate.unlock()
+    }
+    sweepLocked(now: Long) {
+        var dead = listOf<String>()
+        var span = windowMs
+        if (widest > span) {
+            span = widest
+        }
+        for (var key in hits.keys()) {
+            if (recentWithin(key, now, span).size() == 0) {
+                dead.add(key)
+            }
+        }
+        for (var key in dead) {
+            hits.remove(key)
+        }
+    }
+}

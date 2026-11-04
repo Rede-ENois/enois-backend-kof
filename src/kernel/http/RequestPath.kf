@@ -1,0 +1,59 @@
+package kernel.http
+
+import java.io.ByteArrayOutputStream
+
+// Mirror of shared RequestPath. The web runtime hands filters the RAW path (no query string, no
+// decoding, no normalisation) and matches routes on it literally, so a path that is not spelled
+// exactly like a registered route is an unknown path (answered 200 empty) and never reaches a guard.
+// These helpers exist for guards that must compare paths the way Java did.
+class RequestPath {
+    // `%XX` decoded once as UTF-8; `+` stays a plus. A malformed escape throws REQUEST_PATH_MALFORMED.
+    static String decode(raw: String) {
+        if (raw.indexOf("%") < 0) {
+            return raw
+        }
+        var out = new ByteArrayOutputStream()
+        var i = 0
+        while (i < raw.length()) {
+            var c = raw.substring(i, i + 1)
+            if (c == "%") {
+                if (i + 2 >= raw.length()) {
+                    throw "REQUEST_PATH_MALFORMED"
+                }
+                var hi = "0123456789abcdef".indexOf(raw.substring(i + 1, i + 2).toLowerCase())
+                var lo = "0123456789abcdef".indexOf(raw.substring(i + 2, i + 3).toLowerCase())
+                if (hi < 0 || lo < 0) {
+                    throw "REQUEST_PATH_MALFORMED"
+                }
+                out.write(hi * 16 + lo)
+                i = i + 3
+            }
+            else {
+                var bytes = c.getBytes()
+                out.write(bytes, 0, bytes.length)
+                i = i + 1
+            }
+        }
+        return out.toString("UTF-8")
+    }
+    // Decoded once, separators preserved (`/auth//config` stays).
+    static String routing(raw: String) = RequestPath.decode(raw)
+    // Decoded once and `//` collapsed: the form the guards compare.
+    static String application(raw: String) {
+        var p = RequestPath.decode(raw)
+        while (p.contains("//")) {
+            p = p.replace("//", "/")
+        }
+        return p
+    }
+    // `/v1/feed/posts` -> `/feed/posts` (the alias is registered under both prefixes). The bare
+    // `/v1` index and `/v1x` are left alone.
+    static String stripAlias(p: String) {
+        if (p.startsWith("/v1/")) {
+            return p.substring(3)
+        }
+        return p
+    }
+    // Path of the current request without the /v1 alias: what every guard rule is written against.
+    static String current() = RequestPath.stripAlias(path())
+}

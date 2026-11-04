@@ -1,0 +1,151 @@
+package kernel.security
+
+import java.lang.ThreadLocal
+import java.util.concurrent.ConcurrentHashMap
+import kernel.config.*
+import kernel.http.*
+import kernel.log.*
+
+// The answer to scanning: whoever collects too many ERROR responses in a short time is refused at once.
+//
+// The global limiter counts REQUESTS and sees no difference between a scanner and someone scrolling
+// the feed; every "wrong" attempt (404 on a route that does not exist, 401/403 on private endpoints,
+// 405/415) cost nothing. Here the count is per ERROR RESPONSE: over the ceiling in a short window the
+// IP enters a timed denial (429 + Retry-After) that escalates on recurrence and expires by itself.
+// Reads, /auth/** and probes are outside the count (a visitor produces a 401 on every page, and a
+// blocked IP could not even log in). 400 and 409 are normal validation outcomes and 429 only escalates
+// a block that already exists: none of them count. REDE_SECURITY_ABUSE_MAX_ERRORS (0 = off, default),
+// _WINDOW_SECONDS (180), _FIRST_BLOCK_MINUTES (15), _MAX_BLOCK_MINUTES (360).
+class AbuseGuardFilter {
+    SlidingWindows errors
+    Map<String,Long> blockedUntil = new ConcurrentHashMap<String, Long>()
+    Map<String,Int> episodes = new ConcurrentHashMap<String, Int>()
+    Int errorLimit
+    Long firstBlockMs
+    Long maxBlockMs
+    static ThreadLocal abuseGuardSlot = new ThreadLocal()
+    Log log = Log("kernel.security.abuse-guard")
+    public constructor(cfg: Config) {
+        this.errorLimit = cfg.getInt("REDE_SECURITY_ABUSE_MAX_ERRORS", 0)
+        if (this.errorLimit < 0) {
+            this.errorLimit = 0
+        }
+        var windowSeconds = cfg.getLong("REDE_SECURITY_ABUSE_WINDOW_SECONDS", 180L)
+        if (windowSeconds < 1L) {
+            windowSeconds = 1L
+        }
+        var first = cfg.getLong("REDE_SECURITY_ABUSE_FIRST_BLOCK_MINUTES", 15L)
+        if (first < 1L) {
+            first = 1L
+        }
+        this.firstBlockMs = first * 60000L
+        this.maxBlockMs = cfg.getLong("REDE_SECURITY_ABUSE_MAX_BLOCK_MINUTES", 360L) * 60000L
+        if (this.maxBlockMs < this.firstBlockMs) {
+            this.maxBlockMs = this.firstBlockMs
+        }
+        this.errors = SlidingWindows(100000, windowSeconds * 1000L)
+    }
+    Bool skips() {
+        var uri = path()
+        if (RateFilters.isProbe(uri)) {
+            return true
+        }
+        if (RateFilters.isRead(method())) {
+            return true
+        }
+        return RequestPath.current().startsWith("/auth/")
+    }
+    String run() {
+        abuseGuardSlot.remove()
+        if (skips() || errorLimit <= 0) {
+            return Http.next()
+        }
+        var ip = Req.clientIp()
+        var now = SecurityClock.nowMillis()
+        var until = blockedUntil.get(ip)
+        if (until != null) {
+            if (until > now) {
+                return deny(until - now)
+            }
+        }
+        abuseGuardSlot.set(ip)
+        return Http.next()
+    }
+    // After hook: counts the response of a request that passed the guard.
+    afterResponse(status: Int) {
+        var ip = abuseGuardSlot.get()
+        if (ip == null) {
+            return
+        }
+        abuseGuardSlot.remove()
+        if (!AbuseGuardFilter.counts(status)) {
+            return
+        }
+        var now = SecurityClock.nowMillis()
+        var key = ip.toString()
+        if (errors.add(key, now) >= errorLimit) {
+            errors.remove(key)
+            blockFor(key, now, status)
+        }
+    }
+    // What counts as a scan error: 404, 401/403, 405/415.
+    static Bool counts(status: Int) = status == 404 || status == 401 || status == 403 || status == 405 || status == 415
+    blockFor(ip: String, now: Long, status: Int) {
+        if (blockedUntil.size() > 100000) {
+            var dead = listOf<String>()
+            for (var k in blockedUntil.keys()) {
+                var u = blockedUntil.get(k)
+                if (u != null && u < now - maxBlockMs) {
+                    dead.add(k)
+                }
+            }
+            for (var k in dead) {
+                blockedUntil.remove(k)
+            }
+        }
+        // The episode does not vanish when the block expires: it is what makes recurrence last longer.
+        var previous = episodes.get(ip)
+        var episode = 1
+        if (previous != null) {
+            episode = previous + 1
+        }
+        var shift = episode - 1
+        if (shift > 10) {
+            shift = 10
+        }
+        var span = firstBlockMs * AbuseGuardFilter.pow2(shift)
+        if (span > maxBlockMs) {
+            span = maxBlockMs
+        }
+        blockedUntil.put(ip, now + span)
+        episodes.put(ip, episode)
+        log.warn("abuse_guard blocked minutes=" + span / 60000L + " episode=" + episode + " lastStatus=" + status)
+    }
+    static Long pow2(n: Int) {
+        var r = 1L
+        var i = 0
+        while (i < n) {
+            r = r * 2L
+            i = i + 1
+        }
+        return r
+    }
+    // 429 with the wait time: the honest client knows when to come back, the scanner gains nothing.
+    // The CORS header is the origin that asked (no credentials), or the browser would turn this into a
+    // network error.
+    String deny(remainingMs: Long) {
+        var seconds = (remainingMs + 999L) / 1000L
+        if (seconds < 1L) {
+            seconds = 1L
+        }
+        ResponseHeaders.set("Retry-After", "" + seconds)
+        var origin = Req.headerOrNull("origin")
+        if (origin != null) {
+            if (origin.trim().length() > 0) {
+                ResponseHeaders.set("Access-Control-Allow-Origin", origin)
+                ResponseHeaders.set("Vary", "Origin")
+            }
+        }
+        return status(429, "{\"code\":\"RATE_LIMITED\",\"message\":\"Muitas requisicoes invalidas. Tente novamente mais tarde.\"}")
+    }
+}

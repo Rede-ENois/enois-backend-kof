@@ -1,0 +1,342 @@
+package kernel.security
+
+import java.lang.ThreadLocal
+import kernel.config.*
+import kernel.http.*
+import kernel.log.*
+
+// Origin comparison with subdomain wildcard support (`https://*.b7cloud.com.br`). Origins arrive
+// normalised (no trailing slash, lower-case); the wildcard is only for the trust allowlist, never for
+// what a developer registers.
+class OriginPatterns {
+    static List<String> parse(raw: String) {
+        var out = listOf<String>()
+        for (var part in raw.split(",")) {
+            if (part.trim().length() > 0) {
+                out.add(OriginPatterns.normalize(part))
+            }
+        }
+        return out
+    }
+    static String normalize(pattern: String) {
+        var clean = pattern.trim().toLowerCase()
+        while (clean.endsWith("/")) {
+            clean = clean.substring(0, clean.length() - 1)
+        }
+        return clean
+    }
+    static Bool matchesAny(origin: String, patterns: List<String>) {
+        for (var p in patterns) {
+            if (OriginPatterns.matches(origin, p)) {
+                return true
+            }
+        }
+        return false
+    }
+    static Bool matches(origin: String, pattern: String) {
+        if (pattern == origin) {
+            return true
+        }
+        if (pattern == "*") {
+            return true
+        }
+        var star = pattern.indexOf("*")
+        if (star < 0) {
+            return false
+        }
+        var prefix = pattern.substring(0, star)
+        var suffix = pattern.substring(star + 1)
+        // the wildcard part must be a real host: "https://.b7cloud.com.br" is not one
+        return origin.startsWith(prefix) && origin.endsWith(suffix) && origin.length() > prefix.length() + suffix.length()
+    }
+    // CORS_ALLOWED_ORIGINS. Defaults follow the Java profiles: prd/qa name their own site, dev adds the
+    // local front end (only when SPRING_PROFILES_ACTIVE=dev is explicit).
+    static String allowedFrom(cfg: Config) {
+        var profile = cfg.getStr("SPRING_PROFILES_ACTIVE", "")
+        var fallback = "https://enois.ia.br,https://enois-qa.b7cloud.tech"
+        if (profile == "prd") {
+            fallback = "https://enois.ia.br"
+        }
+        if (profile == "qa") {
+            fallback = "https://enois-qa.b7cloud.tech"
+        }
+        if (profile == "dev") {
+            fallback = "https://enois.ia.br,https://enois-qa.b7cloud.tech,http://localhost:5173"
+        }
+        return cfg.getStr("CORS_ALLOWED_ORIGINS", fallback)
+    }
+    // REDE_TRUSTED_ORIGINS: accepted on every route, /admin and /moderation included.
+    static String trustedFrom(cfg: Config) = cfg.getStr("REDE_TRUSTED_ORIGINS", "https://*.b7cloud.com.br,https://*.b7cloud.tech,https://enois-qa.b7cloud.tech,https://enois.ia.br,https://api.enois.ia.br")
+}
+
+// Knocks a THIRD-PARTY origin down when it piles up refusals (401/403/429) in a short window: the
+// pattern of someone probing endpoints or using a stolen credential. The app's OWN origins are never
+// dropped (the platform's users share them: that is what took the whole site down on 23/10, when the
+// attacker's refusals were counted together with the users'). REDE_ORIGINS_MAX_FAILURES (60, 0 off),
+// REDE_ORIGINS_WINDOW_SECONDS (300), REDE_ORIGINS_BLOCK_MINUTES (30).
+class OriginAbuseGuard {
+    OriginDirectory origins
+    List<String> appOrigins = listOf<String>()
+    Int maxFailures
+    Long blockMinutes
+    SlidingWindows failures
+    public constructor(origins: OriginDirectory, allowed: String, trusted: String, maxFailures: Int, windowSeconds: Long, blockMinutes: Long) {
+        this.origins = origins
+        for (var p in OriginPatterns.parse(allowed)) {
+            appOrigins.add(p)
+        }
+        for (var p in OriginPatterns.parse(trusted)) {
+            appOrigins.add(p)
+        }
+        this.maxFailures = maxFailures
+        var window = windowSeconds
+        if (window < 1L) {
+            window = 1L
+        }
+        this.blockMinutes = blockMinutes
+        if (this.blockMinutes < 1L) {
+            this.blockMinutes = 1L
+        }
+        this.failures = SlidingWindows(100000, window * 1000L)
+    }
+    static OriginAbuseGuard fromConfig(cfg: Config, origins: OriginDirectory) = OriginAbuseGuard(origins, OriginPatterns.allowedFrom(cfg), OriginPatterns.trustedFrom(cfg), cfg.getInt("REDE_ORIGINS_MAX_FAILURES", 60), cfg.getLong("REDE_ORIGINS_WINDOW_SECONDS", 300L), cfg.getLong("REDE_ORIGINS_BLOCK_MINUTES", 30L))
+    recordFailure(origin: String) {
+        if (maxFailures <= 0 || origin.trim().length() == 0) {
+            return
+        }
+        if (OriginPatterns.matchesAny(origin.toLowerCase(), appOrigins)) {
+            return
+        }
+        var count = failures.add(origin, SecurityClock.nowMillis())
+        if (count < maxFailures) {
+            return
+        }
+        failures.remove(origin)
+        try {
+            origins.block(origin, "Atividade suspeita: " + count + " respostas 401/403/429 em " + failures.windowMs / 1000L + "s", blockMinutes)
+        } catch (String e) {
+            Log("kernel.security.origin-abuse").warn("origin_block_failed")
+        }
+    }
+}
+
+// Every request needs a registered origin to be served.
+//
+// Two classes of origin. TRUSTED: the app's own (CORS_ALLOWED_ORIGINS) and the REDE_TRUSTED_ORIGINS
+// patterns (e.g. https://*.b7cloud.com.br), accepted on every route, /admin and /moderation included.
+// REGISTERED: a third party's origin registered in /developers/origins, accepted on the normal routes,
+// NEVER on admin/moderation, and blocked automatically by OriginAbuseGuard when it produces refusals in
+// series. The browser sends Origin; server calls (SSR, curl, integrations) send X-Client-Origin. When
+// Origin is present it is the authority and X-Client-Origin does not replace it: it only serves to
+// detect a spoofing attempt (counted as suspicious).
+//
+// Flows of third parties / infrastructure without an app origin (GitHub webhook, OAuth and gov.br
+// callbacks, health/version, public pages, media GET, unsubscribe) are exempt. REDE_ORIGINS_ENFORCE
+// (default true) switches the gate off for local diagnosis only.
+class RequestOriginGate {
+    OriginDirectory origins
+    OriginAbuseGuard abuse
+    List<String> staticOrigins
+    List<String> trustedPatterns
+    List<String> credentialed = listOf<String>()
+    Bool enforce
+    static ThreadLocal pendingOrigin = new ThreadLocal()
+    public constructor(cfg: Config, origins: OriginDirectory, abuse: OriginAbuseGuard) {
+        this.origins = origins
+        this.abuse = abuse
+        this.staticOrigins = OriginPatterns.parse(OriginPatterns.allowedFrom(cfg))
+        this.trustedPatterns = OriginPatterns.parse(OriginPatterns.trustedFrom(cfg))
+        // Origins that receive CORS with credentials: only the explicit ones, never a wildcard.
+        for (var p in staticOrigins) {
+            if (!p.contains("*")) {
+                credentialed.add(p)
+            }
+        }
+        for (var p in trustedPatterns) {
+            if (!p.contains("*")) {
+                credentialed.add(p)
+            }
+        }
+        this.enforce = cfg.getBool("REDE_ORIGINS_ENFORCE", true)
+    }
+    static String clientOriginHeader() = "x-client-origin"
+    String run() {
+        pendingOrigin.remove()
+        // Marked even when enforcement is off: filters that answer early reflect only these origins.
+        var browserOrigin = Req.headerOrNull("origin")
+        var credentialedBrowserOrigin = false
+        if (RequestOriginGate.hasText(browserOrigin)) {
+            if (isCredentialed(RequestOriginGate.matchForm(RequestOriginGate.orEmpty(browserOrigin)))) {
+                credentialedBrowserOrigin = true
+                TrustedOriginCors.markTrusted(RequestOriginGate.orEmpty(browserOrigin))
+            }
+        }
+        if (!enforce) {
+            return Http.next()
+        }
+        var p = RequestPath.current()
+        var m = method().toUpperCase()
+        // A preflight is answered for ANY origin: it executes nothing and returns no data, and the real
+        // operation still goes through this gate. Refusing the OPTIONS only turns the refusal into a CORS
+        // failure in the browser. The credential is echoed only for the app's own explicit origins.
+        if (m == "OPTIONS") {
+            if (RequestOriginGate.hasText(browserOrigin)) {
+                setCors(RequestOriginGate.orEmpty(browserOrigin))
+                if (credentialedBrowserOrigin) {
+                    ResponseHeaders.set("Access-Control-Allow-Credentials", "true")
+                }
+            }
+            return preflightAnswer()
+        }
+        if (bypass(m, p)) {
+            return Http.next()
+        }
+        var origin = Req.headerOrNull("origin")
+        var clientOrigin = Req.headerOrNull(RequestOriginGate.clientOriginHeader())
+        var declared = clientOrigin
+        if (RequestOriginGate.hasText(origin)) {
+            declared = origin
+        }
+        if (!RequestOriginGate.hasText(declared)) {
+            if (allowsNoOrigin(m, p)) {
+                return Http.next()
+            }
+            return reject("ORIGIN_REQUIRED", "Toda requisicao precisa de origem cadastrada. O navegador envia Origin; chamadas de servidor devem enviar X-Client-Origin com uma origem cadastrada.")
+        }
+        var normalized = RequestOriginGate.matchForm(RequestOriginGate.orEmpty(declared))
+        var trusted = isTrusted(normalized)
+        var cred = isCredentialed(normalized)
+        var registered = false
+        if (!trusted) {
+            registered = origins.allowedOrigins().contains(normalized)
+        }
+        // Origin present + a different X-Client-Origin: an attempt to declare another origin.
+        if (RequestOriginGate.hasText(origin) && RequestOriginGate.hasText(clientOrigin)) {
+            var originForm = RequestOriginGate.matchForm(RequestOriginGate.orEmpty(origin))
+            if (originForm != RequestOriginGate.matchForm(RequestOriginGate.orEmpty(clientOrigin))) {
+                if (origins.allowedOrigins().contains(originForm)) {
+                    abuse.recordFailure(originForm)
+                }
+            }
+        }
+        if (!trusted && !registered) {
+            if (origins.isBlocked(normalized)) {
+                return reject("ORIGIN_BLOCKED", "Esta origem foi bloqueada por atividade suspeita. Remova-a em /developers/origins.")
+            }
+            return reject("ORIGIN_NOT_ALLOWED", "Cadastre a origem do seu app em /developers/origins para usar a API.")
+        }
+        // Admin and moderation: only the front end's explicit origin, never a third party or a wildcard subdomain.
+        if (isAdminPath(p) && !cred) {
+            if (RequestOriginGate.hasText(origin)) {
+                setCors(RequestOriginGate.orEmpty(origin))
+            }
+            abuse.recordFailure(normalized)
+            return reject("ORIGIN_NOT_TRUSTED", "Rotas de administracao e moderacao aceitam apenas a origem do frontend.")
+        }
+        if (trusted) {
+            return Http.next()
+        }
+        // A registered third-party origin: answer its CORS and count refusals for the automatic block.
+        if (RequestOriginGate.hasText(origin)) {
+            setCors(RequestOriginGate.orEmpty(origin))
+        }
+        pendingOrigin.set(normalized)
+        return Http.next()
+    }
+    // After hook: refusals of a registered origin feed the automatic block.
+    afterResponse(status: Int) {
+        var origin = pendingOrigin.get()
+        if (origin == null) {
+            return
+        }
+        pendingOrigin.remove()
+        if (status == 401 || status == 403 || status == 429) {
+            abuse.recordFailure(origin.toString())
+        }
+    }
+    Bool isTrusted(normalized: String) = OriginPatterns.matchesAny(normalized, staticOrigins) || OriginPatterns.matchesAny(normalized, trustedPatterns)
+    // CORS with credentials: only an explicit origin; a subdomain wildcard does not qualify.
+    Bool isCredentialed(normalized: String) = OriginPatterns.matchesAny(normalized, credentialed)
+    String preflightAnswer() {
+        ResponseHeaders.set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+        var requested = Req.headerOrNull("access-control-request-headers")
+        var allow = "*"
+        if (RequestOriginGate.hasText(requested)) {
+            allow = RequestOriginGate.orEmpty(requested)
+        }
+        ResponseHeaders.set("Access-Control-Allow-Headers", allow)
+        ResponseHeaders.set("Access-Control-Max-Age", "600")
+        return status(204, "")
+    }
+    setCors(origin: String) {
+        ResponseHeaders.set("Access-Control-Allow-Origin", origin)
+        ResponseHeaders.set("Vary", "Origin")
+    }
+    // Routes that belong to another system (GitHub, OAuth providers, gov.br) or to the infrastructure:
+    // they authenticate on their own (HMAC, state/nonce) and carry no app origin.
+    Bool bypass(m: String, p: String) {
+        if (p == "/health" || p == "/version") {
+            return true
+        }
+        if (p.startsWith("/actuator") || p.startsWith("/webhooks/") || p.startsWith("/identity/govbr/")) {
+            return true
+        }
+        // GET start and callbacks of OAuth: navigation/redirect of the provider, no app origin.
+        return p.startsWith("/auth/oauth/") && (m == "GET" || p.endsWith("/callback"))
+    }
+    // Public content that can be opened straight in the browser, loaded as an image or clicked from an
+    // e-mail. If an origin does come, it is still validated.
+    Bool allowsNoOrigin(m: String, p: String) {
+        var read = m == "GET" || m == "HEAD"
+        if (p.startsWith("/pages/")) {
+            return true
+        }
+        if (p.startsWith("/media/") && m == "GET") {
+            return true
+        }
+        // media served by the app itself (bucket proxy): <img> and <video> do not send Origin
+        if (p.startsWith("/storage/") && read) {
+            return true
+        }
+        // chat sticker image: same case. The catalogue DATA routes keep requiring an origin.
+        if (p.startsWith("/emotes/image/") && read) {
+            return true
+        }
+        // link to confirm the new e-mail: a click in the mail client
+        if (p == "/auth/email/change/confirm" && m == "GET") {
+            return true
+        }
+        // RSS/Atom feed of the blog: a reader without a browser, so no Origin. Only the feed read opens.
+        if (read && isBlogFeedPath(p)) {
+            return true
+        }
+        // unsubscribe links (blog newsletter and weekly digest): a click in the mail client
+        return p == "/blogs/descadastrar" || p == "/notifications/digest/unsubscribe"
+    }
+    Bool isBlogFeedPath(p: String) {
+        var parts = p.split("/")
+        return parts.length == 4 && parts[0].length() == 0 && parts[1] == "blogs" && parts[2].length() > 0 && parts[3] == "feed.xml"
+    }
+    // Panel routes: only the trusted origin of the front end.
+    Bool isAdminPath(p: String) = p == "/admin" || p.startsWith("/admin/") || p == "/moderation" || p.startsWith("/moderation/")
+    // The refusal: not cacheable (a CDN or proxy must not keep a block and serve it to a valid origin).
+    String reject(code: String, message: String) {
+        ResponseHeaders.set("Cache-Control", "no-store")
+        ResponseHeaders.set("Vary", "Origin")
+        return status(403, "{\"code\":\"" + code + "\",\"message\":\"" + message + "\"}")
+    }
+    static Bool hasText(v: String?) {
+        if (v == null) {
+            return false
+        }
+        return v.trim().length() > 0
+    }
+    static String orEmpty(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    // Comparison form: lower-case scheme/host, no trailing slash.
+    static String matchForm(origin: String) = OriginPatterns.normalize(origin)
+}
