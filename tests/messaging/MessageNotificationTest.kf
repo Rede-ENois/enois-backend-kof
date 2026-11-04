@@ -1,0 +1,120 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import messaging.*
+import notifications.*
+import push.*
+
+class MessageNoticeHolder {
+    static TestApp? cached = null
+    static RecordingPushSender sender = RecordingPushSender()
+}
+
+TestApp msgApp() {
+    var cur = MessageNoticeHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = DomainTestKit.boot("msgnotice", mapOf<String, String>(), (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+    var notifications = NotificationsModule.install(p, s, SecurityHooks(), parts)
+    PushModule.installWith(p, notifications, PushStore(p.db), MessageNoticeHolder.sender, PushPresence(p.db), true)
+    MessagingModule.install(p, s, SecurityHooks(), parts, notifications)
+})
+    MessageNoticeHolder.cached = created
+    return created
+}
+
+String who(id: String) = DomainTestKit.loginAdult(msgApp(), id)
+
+// The ids of the person's NEW_MESSAGE notices, newest first, with their read flag and body.
+List<String> notices(token: String) {
+    var res = MessagingTestKit.get(msgApp(), token, "/notifications")
+    Check.status(res, 200)
+    var out = listOf<String>()
+    var n = res.jsonSize("items")
+    var i = 0
+    while (i < n) {
+        if ("" + res.jsonStr("items." + i + ".kind") == "NEW_MESSAGE") {
+            out.add("" + res.jsonStr("items." + i + ".read") + "|" + res.jsonStr("items." + i + ".body"))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+test "the recipient with the conversation on screen is not notified" {
+    var app = msgApp()
+    var sender = who("msgnotif_open_sender")
+    var reader = who("msgnotif_open_reader")
+    var id = MessagingTestKit.direct(app, sender, "msgnotif-open-direct", "msgnotif_open_reader")
+    Check.status(MessagingTestKit.call(app, reader, "msgnotif-open-view", "/conversations/" + id + "/viewing", ""), 204)
+    MessagingTestKit.sendOk(app, sender, "msgnotif-open-1", id, "chegou com a conversa aberta")
+    Check.eqInt("notices while viewing", 0, notices(reader).size())
+    Check.eqInt("pushes while viewing", 0, MessageNoticeHolder.sender.countFor("msgnotif_open_reader"))
+    Check.status(app.client.send("DELETE", "/conversations/" + id + "/viewing", DomainTestKit.auth(reader), "", ""), 204)
+    MessagingTestKit.sendOk(app, sender, "msgnotif-open-2", id, "chegou com a conversa fechada")
+    Check.eqInt("notices after leaving", 1, notices(reader).size())
+    Check.eqInt("pushes after leaving", 1, MessageNoticeHolder.sender.countFor("msgnotif_open_reader"))
+}
+
+test "the messages of one conversation share one notice and every push carries the conversation tag" {
+    var app = msgApp()
+    var sender = who("msgnotif_group_sender")
+    var reader = who("msgnotif_group_reader")
+    var id = MessagingTestKit.direct(app, sender, "msgnotif-group-direct", "msgnotif_group_reader")
+    MessagingTestKit.sendOk(app, sender, "msgnotif-group-1", id, "primeira")
+    MessagingTestKit.sendOk(app, sender, "msgnotif-group-2", id, "segunda")
+    MessagingTestKit.sendOk(app, sender, "msgnotif-group-3", id, "terceira")
+    var found = notices(reader)
+    Check.eqInt("one notice", 1, found.size())
+    Check.eqStr("notice", "false|3 novas mensagens", found.get(0))
+    var bodies = listOf<String>()
+    for (var m in MessageNoticeHolder.sender.messages) {
+        if (m.tag() == "conversation:" + id) {
+            bodies.add(m.body())
+        }
+    }
+    Check.eqInt("pushes", 3, MessageNoticeHolder.sender.countFor("msgnotif_group_reader"))
+    Check.eqStr("push bodies", "primeira|2 novas mensagens|3 novas mensagens", bodies.get(0) + "|" + bodies.get(1) + "|" + bodies.get(2))
+}
+
+test "reading the conversation reads its notices" {
+    var app = msgApp()
+    var sender = who("msgnotif_read_sender")
+    var reader = who("msgnotif_read_reader")
+    var id = MessagingTestKit.direct(app, sender, "msgnotif-read-direct", "msgnotif_read_reader")
+    MessagingTestKit.sendOk(app, sender, "msgnotif-read-1", id, "antes de ler")
+    Check.eqStr("unread", "false|antes de ler", notices(reader).get(0))
+    Check.status(MessagingTestKit.call(app, reader, "msgnotif-read-mark", "/conversations/" + id + "/read", ""), 200)
+    Check.eqStr("read", "true|antes de ler", notices(reader).get(0))
+    MessagingTestKit.sendOk(app, sender, "msgnotif-read-2", id, "depois de ler")
+    var found = notices(reader)
+    Check.eqInt("two notices", 2, found.size())
+    Check.eqStr("newest", "false|depois de ler", found.get(0))
+    Check.eqStr("oldest", "true|antes de ler", found.get(1))
+}
+
+test "only participants can mark a conversation as on screen" {
+    var app = msgApp()
+    var sender = who("msgnotif_outsider_sender")
+    who("msgnotif_outsider_reader")
+    var outsider = who("msgnotif_outsider")
+    var id = MessagingTestKit.direct(app, sender, "msgnotif-outsider-direct", "msgnotif_outsider_reader")
+    Check.apiError(MessagingTestKit.call(app, outsider, "msgnotif-outsider-view", "/conversations/" + id + "/viewing", ""), 403, "NOT_PARTICIPANT")
+}
+
+test "a work conversation notifies with the professional kind" {
+    var app = msgApp()
+    var sender = who("msgnotif_work_sender")
+    DomainTestKit.professional(app, "msgnotif_work_sender", "ACTIVE")
+    var reader = who("msgnotif_work_reader")
+    var res = MessagingTestKit.call(app, sender, "msgnotif-work-direct", "/conversations/business-direct", "{\"userId\":\"msgnotif_work_reader\"}")
+    Check.status(res, 200)
+    MessagingTestKit.sendOk(app, sender, "msgnotif-work-1", "" + res.jsonStr("id"), "proposta")
+    var list = MessagingTestKit.get(app, reader, "/notifications")
+    Check.jsonEq(list, "items.0.kind", "NEW_WORK_MESSAGE")
+    Check.jsonEq(list, "items.0.context", "PROFESSIONAL")
+    Check.jsonEq(list, "items.0.ctaLabel", "Responder")
+}

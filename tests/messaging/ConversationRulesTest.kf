@@ -1,0 +1,330 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import messaging.*
+import notifications.*
+
+class MessagingHolder {
+    static TestApp? cached = null
+    static MessagingModule? module = null
+    static Bool membersReady = false
+}
+
+TestApp msgApp() {
+    var cur = MessagingHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = DomainTestKit.boot("msgrules", mapOf<String, String>(), (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+    var notifications = NotificationsModule.install(p, s, SecurityHooks(), parts)
+    MessagingHolder.module = MessagingModule.install(p, s, SecurityHooks(), parts, notifications)
+})
+    MessagingHolder.cached = created
+    return created
+}
+
+String who(id: String) = DomainTestKit.loginAdult(msgApp(), id)
+
+String createBody(kind: String, title: String, participants: List<String>) = "{\"kind\":" + json.encode(kind) + ",\"title\":" + json.encode(title) + ",\"participantIds\":" + json.encode(participants) + "}"
+
+TestResponse createConversation(token: String, key: String, body: String) = MessagingTestKit.call(msgApp(), token, key, "/conversations", body)
+
+// ---- ConversationCreationRulesTests
+test "a group with someone who blocked the creator is refused" {
+    var app = msgApp()
+    var creator = who("ccr_creator")
+    who("ccr_blocker")
+    who("ccr_other")
+    DomainTestKit.block(app, "ccr_blocker", "ccr_creator")
+    Check.apiError(createConversation(creator, "ccr-group-1", createBody("GROUP", "grupo", listOf("ccr_other", "ccr_blocker"))), 403, "USER_BLOCKED")
+}
+
+test "a group with an unconnected minor is refused" {
+    var app = msgApp()
+    var creator = who("ccr_minor_creator")
+    who("ccr_minor_target")
+    DomainTestKit.makeMinor(app, "ccr_minor_target")
+    Check.apiError(createConversation(creator, "ccr-minor-1", createBody("GROUP", "grupo", listOf("ccr_minor_target"))), 403, "MINOR_DM_RESTRICTED")
+}
+
+test "other group members cannot message a minor they are not connected to" {
+    var app = msgApp()
+    var creator = who("ccr_g_creator")
+    var stranger = who("ccr_g_stranger")
+    who("ccr_g_minor")
+    DomainTestKit.makeMinor(app, "ccr_g_minor")
+    DomainTestKit.connect(app, "ccr_g_minor", "ccr_g_creator", "ACCEPTED")
+    var created = createConversation(creator, "ccr-g-1", createBody("GROUP", "grupo", listOf("ccr_g_minor", "ccr_g_stranger")))
+    Check.status(created, 201)
+    var id = "" + created.jsonStr("id")
+    Check.apiError(MessagingTestKit.send(app, stranger, "ccr-g-msg-1", id, "oi"), 403, "MINOR_DM_RESTRICTED")
+}
+
+test "a pending request does not unlock a minor until it is accepted" {
+    var app = msgApp()
+    var adult = who("ccr_pending_adult")
+    who("ccr_pending_minor")
+    DomainTestKit.makeMinor(app, "ccr_pending_minor")
+    DomainTestKit.connect(app, "ccr_pending_adult", "ccr_pending_minor", "PENDING")
+    Check.apiError(createConversation(adult, "ccr-pending-dm", "{\"kind\":\"DIRECT\",\"participantIds\":[\"ccr_pending_minor\"]}"), 403, "MINOR_DM_RESTRICTED")
+    Check.apiError(createConversation(adult, "ccr-pending-group", createBody("GROUP", "grupo", listOf("ccr_pending_minor"))), 403, "MINOR_DM_RESTRICTED")
+    app.db().execute("update user_connections set status = \'ACCEPTED\' where requester_user_id = ? and receiver_user_id = ?", DbParams().bindStr("ccr_pending_adult").bindStr("ccr_pending_minor"))
+    var ok = createConversation(adult, "ccr-accepted-dm", "{\"kind\":\"DIRECT\",\"participantIds\":[\"ccr_pending_minor\"]}")
+    assert(ok.status >= 200 && ok.status < 300)
+}
+
+test "missing participants is a bad request" {
+    var creator = who("ccr_empty")
+    Check.apiError(createConversation(creator, "ccr-empty-1", "{\"kind\":\"GROUP\"}"), 400, "INVALID_PARTICIPANTS")
+}
+
+test "system kinds cannot be created through the generic endpoint" {
+    var creator = who("ccr_kind")
+    who("ccr_kind_other")
+    Check.apiError(createConversation(creator, "ccr-kind-1", "{\"kind\":\"JOB\",\"participantIds\":[\"ccr_kind_other\"]}"), 400, "INVALID_CONVERSATION_KIND")
+}
+
+// ---- GroupCreationQueryCountTests (the behaviour; the mock call counts have no HTTP equivalent)
+String groupCreator() {
+    var app = msgApp()
+    var creator = "tok-gq_creator-1234567890"
+    if (!MessagingHolder.membersReady) {
+        creator = who("gq_creator")
+        var i = 0
+        while (i < 99) {
+            who("gq_member_" + i)
+            i = i + 1
+        }
+        MessagingHolder.membersReady = true
+    }
+    return creator
+}
+
+List<String> groupMembers() {
+    var out = listOf<String>()
+    var i = 0
+    while (i < 99) {
+        out.add("gq_member_" + i)
+        i = i + 1
+    }
+    return out
+}
+
+test "a large group with one connected minor is created" {
+    var app = msgApp()
+    var creator = groupCreator()
+    DomainTestKit.makeMinor(app, "gq_member_7")
+    DomainTestKit.connect(app, "gq_member_7", "gq_creator", "ACCEPTED")
+    var res = createConversation(creator, "gq-large-1", createBody("GROUP", "Grupo", groupMembers()))
+    Check.status(res, 201)
+    Check.eqInt("participants", 100, res.jsonSize("participantIds"))
+}
+
+test "an unconnected minor in a large group is still refused" {
+    var app = msgApp()
+    var creator = groupCreator()
+    DomainTestKit.makeMinor(app, "gq_member_3")
+    Check.apiError(createConversation(creator, "gq-minor-1", createBody("GROUP", "Grupo", groupMembers())), 403, "MINOR_DM_RESTRICTED")
+}
+
+test "a blocked member in a large group is still refused" {
+    var app = msgApp()
+    var creator = groupCreator()
+    DomainTestKit.block(app, "gq_creator", "gq_member_42")
+    Check.apiError(createConversation(creator, "gq-blocked-1", createBody("GROUP", "Grupo", groupMembers())), 403, "USER_BLOCKED")
+}
+
+test "more than 100 participants is refused" {
+    var creator = who("gq_too_many")
+    var ids = listOf<String>()
+    var i = 0
+    while (i < 101) {
+        ids.add("ghost_" + i)
+        i = i + 1
+    }
+    Check.apiError(createConversation(creator, "gq-many-1", createBody("GROUP", "Grupo", ids)), 400, "TOO_MANY_PARTICIPANTS")
+}
+
+// ---- DirectConversationTests
+test "opens and reuses the same direct conversation" {
+    var app = msgApp()
+    var a = who("dm_user_a")
+    var b = who("dm_user_b")
+    var first = MessagingTestKit.direct(app, a, "dm-a-1", "dm_user_b")
+    Check.isTrue("first not blank", first.length() > 0)
+    Check.eqStr("second open", first, MessagingTestKit.direct(app, a, "dm-a-2", "dm_user_b"))
+    Check.eqStr("inverse order", first, MessagingTestKit.direct(app, b, "dm-b-1", "dm_user_a"))
+}
+
+test "starting a direct message from the inbox search reuses the same conversation" {
+    var app = msgApp()
+    var a = who("dm_search_a")
+    who("dm_search_b")
+    var direct = MessagingTestKit.direct(app, a, "dm-search-1", "dm_search_b")
+    var res = createConversation(a, "dm-search-2", "{\"kind\":\"DIRECT\",\"participantIds\":[\"dm_search_b\"]}")
+    Check.jsonEq(res, "id", direct)
+    Check.jsonEq(res, "context", "SOCIAL")
+}
+
+test "the inbox filters by context and rejects an unknown one" {
+    var app = msgApp()
+    var a = who("dm_ctx_a")
+    who("dm_ctx_b")
+    var direct = MessagingTestKit.direct(app, a, "dm-ctx-1", "dm_ctx_b")
+    var social = MessagingTestKit.get(app, a, "/conversations?context=SOCIAL")
+    Check.status(social, 200)
+    assert(DomainTestKit.indexOfId(social, "items", direct) >= 0)
+    Check.eqStr("context", "SOCIAL", "" + DomainTestKit.itemStr(social, "items", direct, "context"))
+    var professional = MessagingTestKit.get(app, a, "/conversations?context=PROFESSIONAL")
+    Check.status(professional, 200)
+    assert(DomainTestKit.indexOfId(professional, "items", direct) < 0)
+    var all = MessagingTestKit.get(app, a, "/conversations")
+    assert(DomainTestKit.indexOfId(all, "items", direct) >= 0)
+    var unread = MessagingTestKit.get(app, a, "/conversations/unread-count?context=PROFESSIONAL")
+    Check.status(unread, 200)
+    Check.jsonEq(unread, "count", "0")
+    Check.apiError(MessagingTestKit.get(app, a, "/conversations?context=WORK"), 400, "INVALID_CONTEXT")
+}
+
+test "rejects a conversation with yourself" {
+    var app = msgApp()
+    var a = who("dm_self")
+    Check.apiError(MessagingTestKit.call(app, a, "dm-self-1", "/conversations/direct", "{\"userId\":\"dm_self\"}"), 400, "INVALID_RECIPIENT")
+    Check.apiError(MessagingTestKit.call(app, a, "dm-self-2", "/conversations/direct", "{}"), 400, "INVALID_RECIPIENT")
+}
+
+test "rejects a conversation with a blocked user" {
+    var app = msgApp()
+    var a = who("dm_blocker")
+    who("dm_blocked")
+    DomainTestKit.block(app, "dm_blocker", "dm_blocked")
+    Check.apiError(MessagingTestKit.call(app, a, "dm-blocked-1", "/conversations/direct", "{\"userId\":\"dm_blocked\"}"), 403, "USER_BLOCKED")
+}
+
+test "a new message moves the conversation to the top" {
+    var app = msgApp()
+    var a = who("dm_top_a")
+    who("dm_top_b")
+    who("dm_top_c")
+    var ab = MessagingTestKit.direct(app, a, "dm-top-ab", "dm_top_b")
+    var ac = MessagingTestKit.direct(app, a, "dm-top-ac", "dm_top_c")
+    assert(ab != ac)
+    MessagingTestKit.sendOk(app, a, "dm-top-send", ab, "mensagem nova")
+    var list = MessagingTestKit.get(app, a, "/conversations")
+    Check.jsonEq(list, "items.0.id", ab)
+}
+
+// ---- BusinessDirectTests
+test "business direct requires an active professional profile" {
+    var app = msgApp()
+    var sender = who("biz_v2_no_profile")
+    who("biz_v2_receiver1")
+    Check.apiError(MessagingTestKit.call(app, sender, "biz-v2-no-prof", "/conversations/business-direct", "{\"userId\":\"biz_v2_receiver1\"}"), 403, "NO_ACTIVE_CORPORATE_PROFILE")
+}
+
+test "business direct with an active profile succeeds" {
+    var app = msgApp()
+    var sender = who("biz_v2_sender2")
+    DomainTestKit.professional(app, "biz_v2_sender2", "ACTIVE")
+    who("biz_v2_receiver2")
+    var res = MessagingTestKit.call(app, sender, "biz-v2-ok", "/conversations/business-direct", "{\"userId\":\"biz_v2_receiver2\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "kind", "BUSINESS_DIRECT")
+    Check.jsonEq(res, "context", "PROFESSIONAL")
+}
+
+test "business direct and direct are separate conversations" {
+    var app = msgApp()
+    var a = who("biz_v2_sep_a")
+    DomainTestKit.professional(app, "biz_v2_sep_a", "ACTIVE")
+    who("biz_v2_sep_b")
+    var d = MessagingTestKit.call(app, a, "biz-v2-sep-direct", "/conversations/direct", "{\"userId\":\"biz_v2_sep_b\"}")
+    Check.status(d, 200)
+    Check.jsonEq(d, "kind", "DIRECT")
+    var b = MessagingTestKit.call(app, a, "biz-v2-sep-business", "/conversations/business-direct", "{\"userId\":\"biz_v2_sep_b\"}")
+    Check.status(b, 200)
+    Check.jsonEq(b, "kind", "BUSINESS_DIRECT")
+    assert("" + d.jsonStr("id") != "" + b.jsonStr("id"))
+    var social = MessagingTestKit.get(app, a, "/conversations?context=SOCIAL")
+    Check.eqStr("social kind", "DIRECT", "" + DomainTestKit.itemStr(social, "items", "" + d.jsonStr("id"), "kind"))
+    assert(DomainTestKit.indexOfId(social, "items", "" + b.jsonStr("id")) < 0)
+    var pro = MessagingTestKit.get(app, a, "/conversations?context=PROFESSIONAL")
+    Check.eqStr("pro kind", "BUSINESS_DIRECT", "" + DomainTestKit.itemStr(pro, "items", "" + b.jsonStr("id"), "kind"))
+}
+
+test "the receiver without a professional profile can reply in business direct" {
+    var app = msgApp()
+    var sender = who("biz_v2_reply_sender")
+    DomainTestKit.professional(app, "biz_v2_reply_sender", "ACTIVE")
+    var receiver = who("biz_v2_reply_receiver")
+    var res = MessagingTestKit.call(app, sender, "biz-v2-reply-create", "/conversations/business-direct", "{\"userId\":\"biz_v2_reply_receiver\"}")
+    Check.status(res, 200)
+    MessagingTestKit.sendOk(app, receiver, "biz-v2-reply-send", "" + res.jsonStr("id"), "recebi!")
+}
+
+test "the initiator cannot send after deactivating the profile" {
+    var app = msgApp()
+    var sender = who("biz_v2_deact_sender")
+    DomainTestKit.professional(app, "biz_v2_deact_sender", "ACTIVE")
+    who("biz_v2_deact_receiver")
+    var res = MessagingTestKit.call(app, sender, "biz-v2-deact-create", "/conversations/business-direct", "{\"userId\":\"biz_v2_deact_receiver\"}")
+    Check.status(res, 200)
+    app.db().execute("update corporate_profiles set status = \'INACTIVE\' where user_id = ?", DbParams().bindStr("biz_v2_deact_sender"))
+    Check.apiError(MessagingTestKit.send(app, sender, "biz-v2-deact-send", "" + res.jsonStr("id"), "oi"), 403, "NO_ACTIVE_CORPORATE_PROFILE")
+}
+
+test "sending in a social conversation works without a professional profile" {
+    var app = msgApp()
+    var a = who("biz_v2_social_a")
+    who("biz_v2_social_b")
+    var id = MessagingTestKit.direct(app, a, "biz-v2-social-create", "biz_v2_social_b")
+    MessagingTestKit.sendOk(app, a, "biz-v2-social-send", id, "oi")
+}
+
+test "a professional conversation shows the corporate identity" {
+    var app = msgApp()
+    var sender = who("biz_v2_identity_sender")
+    DomainTestKit.professional(app, "biz_v2_identity_sender", "ACTIVE")
+    who("biz_v2_identity_receiver")
+    var res = MessagingTestKit.call(app, sender, "biz-v2-identity-create", "/conversations/business-direct", "{\"userId\":\"biz_v2_identity_receiver\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "identities.biz_v2_identity_sender.identity", "CORPORATE")
+    assert(!res.jsonHas("identities.biz_v2_identity_receiver"))
+}
+
+// ---- HideConversationsTests
+test "hiding only affects the requester" {
+    var app = msgApp()
+    var a = who("hide_user_a")
+    var b = who("hide_user_b")
+    var id = MessagingTestKit.createDirect(app, a, "hide-conv-a", "hide_user_b")
+    var res = MessagingTestKit.call(app, a, "hide-1", "/conversations/hide", MessagingTestKit.idsJson(listOf(id)))
+    Check.status(res, 200)
+    Check.jsonEq(res, "hidden", "1")
+    assert(!MessagingTestKit.conversationIds(app, a, "/conversations").contains(id))
+    assert(MessagingTestKit.conversationIds(app, b, "/conversations").contains(id))
+}
+
+test "the archived list shows it and unhide brings it back" {
+    var app = msgApp()
+    var a = who("hide_user_d")
+    who("hide_user_e")
+    var id = MessagingTestKit.createDirect(app, a, "hide-conv-d", "hide_user_e")
+    Check.status(MessagingTestKit.call(app, a, "hide-archive-1", "/conversations/hide", MessagingTestKit.idsJson(listOf(id))), 200)
+    assert(!MessagingTestKit.conversationIds(app, a, "/conversations").contains(id))
+    assert(MessagingTestKit.conversationIds(app, a, "/conversations/archived").contains(id))
+    var res = MessagingTestKit.call(app, a, "unhide-1", "/conversations/unhide", MessagingTestKit.idsJson(listOf(id)))
+    Check.status(res, 200)
+    Check.jsonEq(res, "restored", "1")
+    assert(MessagingTestKit.conversationIds(app, a, "/conversations").contains(id))
+    assert(!MessagingTestKit.conversationIds(app, a, "/conversations/archived").contains(id))
+}
+
+test "an empty selection is rejected" {
+    var app = msgApp()
+    var a = who("hide_user_c")
+    Check.apiError(MessagingTestKit.call(app, a, "hide-empty", "/conversations/hide", "{\"ids\":[]}"), 400, "EMPTY_CONVERSATION_LIST")
+    Check.apiError(MessagingTestKit.call(app, a, "unhide-empty", "/conversations/unhide", "{}"), 400, "EMPTY_CONVERSATION_LIST")
+}
