@@ -96,3 +96,25 @@ escalation text instead of reading the `reports` table; `IntelligentCacheTests` 
 behaviours on `TtlCache`/`Caches` (reuse, expiry loads nothing on its own, renew after expiry, a write
 clears after commit, a failed write leaves the cache alone, one load for concurrent callers, closed list of
 caches with their policy) because `EventService` is not ported.
+
+## linkedin
+
+| Domain | Endpoints ported / total | Tests ported / total | Gaps |
+|---|---|---|---|
+| linkedin (share on LinkedIn) | 2 / 2 (`GET`, `PUT /me/integrations/linkedin`) | 15 / 15 Java tests (11 Kof tests in `LinkedInApiTest`, 9 in `LinkedInServiceTest`: one per Java test plus extras: bad body 400s, encrypted-at-rest row and unlink, the real HTTP client against a local stub) | G176 to G178 |
+
+`LinkedInModule.install(platform, shared, hooks)` registers the routes and the `PostPublished` handler
+(`shared.outbox.register`). The token is stored with `shared.cipher` (nothing is stored without the key).
+`service.remember(userId, memberSub, accessToken, expiresAtIso)` and `service.remove(userId)` are for identity's OAuth link,
+login and unlink (the Java callback code is not in this domain).
+
+Seams (defaults in `LinkedInModule.install`):
+
+| Seam | Default | Owner / what it needs |
+|---|---|---|
+| `LinkedInPostLookup.findById` | reads `posts` (id, author_id, content, status, type, author_identity) read-only | feed: `// pending-port: feed`; extend it when the feed store exists |
+| `LinkedInShareClient.share` | `LinkedInHttpShareClient` (POST `https://api.linkedin.com/v2/ugcPosts` via `kernel.http.HttpPostClient`) | tests extend it with a stub; the endpoint is a constructor argument |
+| `LinkedInClock.nowIso` | `Time.nowIso()` | tests extend it to fix the clock (Java `Clock.fixed`) |
+
+Kernel: one NEW file, `src/kernel/http/HttpPostClient.kf` (outbound POST with status, G178). Base URL of the share link: `REDE_FRONTEND_BASE_URL` (default `https://enois.ia.br`, the Java `rede.frontend.base-url`).
+
