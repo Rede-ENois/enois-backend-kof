@@ -1,0 +1,931 @@
+package feed
+
+import kernel.*
+import kernel.audit.*
+import kernel.blocks.*
+import kernel.db.*
+import kernel.error.*
+import kernel.html.*
+import kernel.id.*
+import kernel.log.*
+import kernel.outbox.*
+import kernel.risk.*
+import kernel.sanctions.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+
+// Posts, comments, reactions, saves, shares and polls (PublishPostService, PostInteractionService,
+// DeletePostService, DeleteCommentService, PollVoteService, the read side of GetFeedService for one post).
+class FeedService {
+    Db store
+    FeedStore posts
+    FeedAuthors authors
+    FeedMedia media
+    FeedCommunities communities
+    FeedNotifier notifier
+    FeedAgeGate ageGate
+    FeedCoins coins
+    FeedCorporate corporate
+    BlockedUsers blocked
+    SanctionGate sanctions
+    RiskEngine risk
+    ContentDuplicationGuard duplication
+    Outbox outbox
+    Audit audit
+    UserRateLimiter limiter
+    NewAccountCooldown cooldown
+    BehavioralTimingGuard timing
+    public constructor(store: Db, posts: FeedStore, authors: FeedAuthors, media: FeedMedia, communities: FeedCommunities, notifier: FeedNotifier, ageGate: FeedAgeGate, coins: FeedCoins, corporate: FeedCorporate, blocked: BlockedUsers, sanctions: SanctionGate, risk: RiskEngine, duplication: ContentDuplicationGuard, outbox: Outbox, audit: Audit, parts: SecurityParts) {
+        this.store = store
+        this.posts = posts
+        this.authors = authors
+        this.media = media
+        this.communities = communities
+        this.notifier = notifier
+        this.ageGate = ageGate
+        this.coins = coins
+        this.corporate = corporate
+        this.blocked = blocked
+        this.sanctions = sanctions
+        this.risk = risk
+        this.duplication = duplication
+        this.outbox = outbox
+        this.audit = audit
+        this.limiter = parts.userLimiter
+        this.cooldown = parts.newAccountCooldown
+        this.timing = parts.timingGuard
+    }
+    // ---- shared guards ----
+    guardWrite(userId: String, action: String) {
+        ageGate.requireCanWrite(userId)
+        sanctions.requireNotRestricted(userId)
+        cooldown.require(userId)
+        limiter.require(userId, action)
+        timing.recordAction(userId)
+    }
+    FeedPostRow activePost(postId: String) {
+        var p = posts.post(postId)
+        if (p == null) {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+        }
+        if (p.status() != "ACTIVE") {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+        }
+        return p
+    }
+    List<String> hiddenFor(viewerId: String?) = new ArrayList<String>(blocked.hiddenIdsFor(viewerId))
+    // GetFeedService.visiblePost: active, not by a blocked author, private channel only for members.
+    FeedPostRow visiblePost(postId: String, viewerId: String?) {
+        var p = this.activePost(postId)
+        if (viewerId != null && this.hiddenFor(viewerId).contains(p.authorId())) {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+        }
+        if (p.channelId() != null) {
+            var ref = this.refOf(p.communityId(), viewerId)
+            var joined = false
+            if (ref != null) {
+                joined = ref.joined()
+            }
+            if (!joined) {
+                throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+            }
+        }
+        return p
+    }
+    FeedCommunityRef? refOf(communityId: String?, viewerId: String?) {
+        if (communityId == null) {
+            return null
+        }
+        if (viewerId == null) {
+            return null
+        }
+        return communities.byId(communityId, viewerId)
+    }
+    FeedNameStyle? styleOf(a: FeedAuthor?, social: Bool) {
+        if (a == null) {
+            return null
+        }
+        if (!social) {
+            return null
+        }
+        if (a.nameTheme() == null && a.nameFont() == null && a.nameColor() == null && a.nameplate() == null) {
+            return null
+        }
+        return FeedNameStyle(a.nameTheme(), a.nameFont(), a.nameColor(), a.nameplate())
+    }
+    FeedContributorTag? tagOf(a: FeedAuthor?, social: Bool, contributor: Bool) {
+        if (a == null) {
+            return null
+        }
+        if (!social || !contributor) {
+            return null
+        }
+        return FeedContributorTag(a.contributorTagColor())
+    }
+    FeedCommunityView? communityViewOf(ref: FeedCommunityRef?) {
+        if (ref == null) {
+            return null
+        }
+        return FeedCommunityView(ref.id(), ref.name(), ref.joined())
+    }
+    FeedCommunityRef? refIn(refs: Map<String,FeedCommunityRef>, communityId: String?) {
+        if (communityId == null) {
+            return null
+        }
+        return refs.get(communityId)
+    }
+    FeedPollView? pollOf(options: List<String>?, counts: Map<Int,Long>?, myVote: Int?) {
+        if (options == null) {
+            return null
+        }
+        return this.pollView(options, counts, myVote)
+    }
+    String? firstOf(list: List<String>) {
+        if (list.size() == 0) {
+            return null
+        }
+        return list.get(0)
+    }
+    requireVisible(postId: String, viewerId: String?) {
+        var p = this.visiblePost(postId, viewerId)
+    }
+    // ---- views ----
+    FeedPostView baseView(p: FeedPostRow, tags: List<String>, mediaIds: List<String>, author: FeedAuthor?, contributor: Bool) {
+        var social = p.authorIdentity() == "SOCIAL"
+        var badges = listOf<String>()
+        if (author != null) {
+            badges = author.badges()
+        }
+        return FeedPostView(p.id(), p.authorId(), this.usernameOf(author), this.nameOf(author, p.authorId()), this.avatarOf(author), this.firstOf(badges), badges, p.type(), p.content(), null, null, tags, mediaIds, p.createdAt(), FeedRules.counters(p), null, p.communityId(), null, p.editedAt(), p.expiresAt(), p.authorIdentity(), this.frameOf(author), p.topic(), p.repostOf(), p.repostOfAuthor(), p.repostWithOpinion(), null, listOf<String>(), null, p.mediaSpoiler(), this.styleOf(author, social), this.tagOf(author, social, contributor), listOf<String>(), null, p.acceptedCommentId(), null, null, false, listOf<FeedMediaSummary>(), p.acceptedCommentId() != null)
+    }
+    String? usernameOf(a: FeedAuthor?) {
+        if (a == null) {
+            return null
+        }
+        return a.username()
+    }
+    String? nameOf(a: FeedAuthor?, fallback: String) {
+        if (a == null) {
+            return fallback
+        }
+        return a.name()
+    }
+    String? plainNameOf(a: FeedAuthor?) {
+        if (a == null) {
+            return null
+        }
+        return a.name()
+    }
+    String? avatarOf(a: FeedAuthor?) {
+        if (a == null) {
+            return null
+        }
+        return a.avatar()
+    }
+    String? frameOf(a: FeedAuthor?) {
+        if (a == null) {
+            return null
+        }
+        return a.avatarFrame()
+    }
+    List<FeedMediaSummary> mediaIn(order: List<String>, byId: Map<String,FeedMediaSummary>) {
+        var out = listOf<FeedMediaSummary>()
+        for (var id in order) {
+            var m = byId.get(id)
+            if (m != null) {
+                out.add(m)
+            }
+        }
+        return out
+    }
+    FeedPollView pollView(options: List<String>, counts: Map<Int,Long>?, myVote: Int?) {
+        var per = listOf<Long>()
+        var total = 0L
+        var i = 0
+        while (i < options.size()) {
+            var n = 0L
+            if (counts != null) {
+                var c = counts.get(i)
+                if (c != null) {
+                    n = c
+                }
+            }
+            per.add(n)
+            total = total + n
+            i = i + 1
+        }
+        return FeedPollView(options, per, myVote, total)
+    }
+    // GetFeedService.enrich for a page: author, reaction pills, viewer reaction, community, poll, media.
+    List<FeedPostView> enrich(rows: List<FeedPostRow>, viewerId: String?) {
+        var out = listOf<FeedPostView>()
+        if (rows.size() == 0) {
+            return out
+        }
+        var hidden = this.hiddenFor(viewerId)
+        var visible = listOf<FeedPostRow>()
+        for (var r in rows) {
+            if (!hidden.contains(r.authorId())) {
+                visible.add(r)
+            }
+        }
+        if (visible.size() == 0) {
+            return out
+        }
+        var ids = listOf<String>()
+        var authorIds = listOf<String>()
+        var communityIds = listOf<String>()
+        for (var r in visible) {
+            ids.add(r.id())
+            if (!authorIds.contains(r.authorId())) {
+                authorIds.add(r.authorId())
+            }
+            var cid = r.communityId()
+            if (cid != null && !communityIds.contains(cid)) {
+                communityIds.add(cid)
+            }
+        }
+        var profiles = authors.byIds(authorIds)
+        var contributors = authors.contributorIds(authorIds)
+        var corporates = authors.corporateByIds(authorIds)
+        var tags = posts.tagsOf(ids)
+        var medias = posts.mediaOf(ids)
+        var mediaFlat = listOf<String>()
+        for (var r in visible) {
+            var ms = medias.get(r.id())
+            if (ms != null) {
+                for (var m in ms) {
+                    mediaFlat.add(m)
+                }
+            }
+        }
+        var mediaById = media.visibleByIds(mediaFlat)
+        var reactions = new HashMap<String, String>()
+        if (viewerId != null) {
+            reactions = posts.userReactions(viewerId, ids)
+        }
+        var summaries = posts.reactionSummaries(ids, hidden)
+        var optionsByPost = posts.pollOptions(ids)
+        var pollIds = listOf<String>()
+        for (var k in optionsByPost.keys()) {
+            pollIds.add(k)
+        }
+        var pollCounts = posts.pollCounts(pollIds)
+        var myVotes = new HashMap<String, Int>()
+        if (viewerId != null) {
+            myVotes = posts.pollVotesOf(viewerId, pollIds)
+        }
+        var refs = new HashMap<String, FeedCommunityRef>()
+        for (var cid in communityIds) {
+            var ref = communities.byId(cid, viewerId)
+            if (ref != null) {
+                refs.put(cid, ref)
+            }
+        }
+        for (var r in visible) {
+            var t = FeedRules.orEmpty(tags.get(r.id()))
+            var m = FeedRules.orEmpty(medias.get(r.id()))
+            var author = profiles.get(r.authorId())
+            var corp = corporates.get(r.authorId())
+            var shown = author
+            if (r.authorIdentity() == "CORPORATE" && corp != null) {
+                shown = corp
+            }
+            var v = this.baseView(r, t, m, shown, contributors.contains(r.authorId()))
+            var summary = FeedRules.orNone(summaries.get(r.id()))
+            var community = this.communityViewOf(this.refIn(refs, r.communityId()))
+            var poll = this.pollOf(optionsByPost.get(r.id()), pollCounts.get(r.id()), myVotes.get(r.id()))
+            out.add(FeedPostView(v.id(), v.authorId(), v.authorUsername(), v.authorName(), v.authorAvatar(), v.authorBadge(), v.authorBadges(), v.type(), v.content(), null, null, v.tags(), v.mediaIds(), v.createdAt(), v.counters(), reactions.get(r.id()), v.communityId(), community, v.editedAt(), v.expiresAt(), v.authorIdentity(), v.authorAvatarFrame(), v.topic(), v.repostOf(), v.repostOfAuthor(), v.repostWithOpinion(), null, listOf<String>(), summary, v.mediaSpoiler(), v.authorStyle(), v.authorContributor(), listOf<String>(), null, v.acceptedCommentId(), poll, null, false, this.mediaIn(m, mediaById), v.resolved()))
+        }
+        return out
+    }
+    FeedPostView withPage(v: FeedPostView, pageHtml: String?, articleBody: String?) = FeedPostView(v.id(), v.authorId(), v.authorUsername(), v.authorName(), v.authorAvatar(), v.authorBadge(), v.authorBadges(), v.type(), v.content(), pageHtml, articleBody, v.tags(), v.mediaIds(), v.createdAt(), v.counters(), v.currentUserReaction(), v.communityId(), v.community(), v.editedAt(), v.expiresAt(), v.authorIdentity(), v.authorAvatarFrame(), v.topic(), v.repostOf(), v.repostOfAuthor(), v.repostWithOpinion(), v.repostOfContent(), v.repostOfMediaIds(), v.reactionSummary(), v.mediaSpoiler(), v.authorStyle(), v.authorContributor(), v.communityNotes(), v.myNote(), v.acceptedCommentId(), v.poll(), v.repostedBy(), v.currentUserReposted(), v.media(), v.resolved())
+    // GET /feed/posts/{id}: public read; the page HTML and the article body only travel here.
+    FeedPostView getPost(postId: String, viewerId: String?) {
+        var p = this.visiblePost(postId, viewerId)
+        var views = this.enrich(listOf(p), viewerId)
+        var view = this.baseView(p, listOf<String>(), listOf<String>(), null, false)
+        if (views.size() > 0) {
+            view = views.get(0)
+        }
+        return this.withPage(view, p.pageHtml(), posts.articleBody(p.id()))
+    }
+    // ---- publish ----
+    String? textOf(type: String, content: String?) {
+        if (type == "PAGE") {
+            if (FeedRules.hasText(content)) {
+                return FeedRules.trimmed(content)
+            }
+            return ""
+        }
+        return PlainText.defuse(FeedRules.trimmed(content))
+    }
+    List<String> pollOptionsOf(type: String, raw: List<String>?) {
+        var out = listOf<String>()
+        if (type != "POLL") {
+            return out
+        }
+        if (raw != null) {
+            for (var o in raw) {
+                out.add(PlainText.defuse(o.trim()))
+            }
+        }
+        if (out.size() < 2) {
+            throw Errors.api(400, "POLL_TOO_FEW_OPTIONS", "Enquete precisa de pelo menos 2 alternativas.")
+        }
+        if (out.size() > 6) {
+            throw Errors.api(400, "POLL_TOO_MANY_OPTIONS", "Enquete aceita no maximo 6 alternativas.")
+        }
+        var lowered = listOf<String>()
+        for (var o in out) {
+            if (o.trim().length() == 0) {
+                throw Errors.api(400, "POLL_EMPTY_OPTION", "Toda alternativa da enquete precisa de texto.")
+            }
+            if (o.length() > 120) {
+                throw Errors.api(400, "POLL_OPTION_TOO_LONG", "Cada alternativa aceita no maximo 120 caracteres.")
+            }
+            if (lowered.contains(o.toLowerCase())) {
+                throw Errors.api(400, "POLL_DUPLICATE_OPTION", "As alternativas da enquete nao podem se repetir.")
+            }
+            lowered.add(o.toLowerCase())
+        }
+        return out
+    }
+    FeedPostView publish(userId: String, b: FeedPublishBody) {
+        this.guardWrite(userId, UserRateLimiter.createPost())
+        risk.assess(userId, "publish", b.content())
+        var type = b.type()
+        if (type == null) {
+            throw Errors.api(400, "INVALID_POST_TYPE", "Tipo de post obrigatorio.")
+        }
+        if (!FeedRules.postTypes().contains(type)) {
+            // an unknown enum spelling never reaches the service in Java (Jackson 400)
+            throw Errors.badRequest()
+        }
+        var content = b.content()
+        if (type != "PAGE" && !FeedRules.hasText(content)) {
+            throw Errors.api(400, "INVALID_CONTENT", "Conteudo obrigatorio.")
+        }
+        var limit = FeedRules.contentLimit(type)
+        if (content != null && content.trim().length() > limit) {
+            throw Errors.api(400, "CONTENT_TOO_LONG", "Este tipo de post aceita no maximo " + limit + " caracteres.")
+        }
+        var tags = FeedRules.cleanList(b.tags())
+        if (tags.size() > 5) {
+            throw Errors.api(400, "TOO_MANY_TAGS", "Post deve ter no maximo 5 tags.")
+        }
+        var mediaIds = FeedRules.cleanList(b.mediaIds())
+        if (mediaIds.size() > 5) {
+            throw Errors.api(400, "TOO_MANY_MEDIA", "Post deve ter no maximo 5 midias.")
+        }
+        var pollOptions = this.pollOptionsOf(type, b.pollOptions())
+        media.requireOwned(userId, mediaIds)
+        var communityId = FeedRules.trimmedOrNull(b.communityId())
+        var identity = "SOCIAL"
+        if (type == "BUSINESS") {
+            if (!corporate.hasActiveProfile(userId)) {
+                throw Errors.api(403, "NO_ACTIVE_CORPORATE_PROFILE", "Você precisa de um perfil profissional ativo para publicar no feed corporativo.")
+            }
+            identity = "CORPORATE"
+            if (communityId != null) {
+                throw Errors.api(400, "BUSINESS_NOT_IN_COMMUNITY", "Publicação corporativa não vai para comunidades. Publique no seu feed corporativo.")
+            }
+        }
+        var community = this.requireCommunity(communityId, userId, b)
+        var channelId = FeedRules.trimmedOrNull(b.channelId())
+        var topic = this.resolveTopic(b, communityId, channelId, community)
+        if (content != null) {
+            if (FeedRules.hasText(content)) {
+                duplication.require(userId, content)
+            }
+        }
+        var pageHtml = this.pageHtmlOf(type, b.pageHtml())
+        var articleBody = this.articleBodyOf(type, b.articleBody())
+        var now = Time.nowIso()
+        var expires = this.expiryOf(type, now)
+        var id = Ids.prefixed("post_")
+        var row = FeedPostRow(id, userId, type, FeedRules.nz(this.textOf(type, content)), pageHtml, communityId, channelId, null, null, false, null, now, "PUBLIC", 0, 0, 0, 0, 0, "ACTIVE", null, null, expires, identity, topic, b.mediaSpoiler() == true)
+        posts.insertPost(row, tags, mediaIds)
+        if (articleBody != null) {
+            posts.insertArticle(id, articleBody, now)
+        }
+        var position = 0
+        for (var o in pollOptions) {
+            posts.insertPollOption(Ids.prefixed("poll_option_"), id, position, o)
+            position = position + 1
+        }
+        outbox.append("PostPublished", id, "{\"postId\":\"" + id + "\"}")
+        this.notifyMentions(b.mentionedUserIds(), userId, id, "post")
+        var authorMap = authors.byIds(listOf(userId))
+        var author = authorMap.get(userId)
+        var isContributor = authors.contributorIds(listOf(userId)).contains(userId)
+        var view = this.baseView(row, tags, mediaIds, author, isContributor)
+        var summaries = media.visibleByIds(mediaIds)
+        return FeedPostView(view.id(), view.authorId(), view.authorUsername(), view.authorName(), view.authorAvatar(), view.authorBadge(), view.authorBadges(), view.type(), view.content(), null, null, view.tags(), view.mediaIds(), view.createdAt(), view.counters(), null, view.communityId(), null, view.editedAt(), view.expiresAt(), view.authorIdentity(), view.authorAvatarFrame(), view.topic(), null, null, false, null, listOf<String>(), null, view.mediaSpoiler(), view.authorStyle(), view.authorContributor(), listOf<String>(), null, null, null, null, false, this.mediaIn(mediaIds, summaries), false)
+    }
+    String? expiryOf(type: String, now: String) {
+        if (type == "MOMENT") {
+            return Time.plusSeconds(now, 86400L)
+        }
+        return null
+    }
+    String? pageHtmlOf(type: String, raw: String?) {
+        if (type == "PAGE") {
+            return SafeHtml.requirePageHtml(raw)
+        }
+        return null
+    }
+    String? articleBodyOf(type: String, raw: String?) {
+        if (type != "ARTICLE") {
+            return null
+        }
+        if (raw == null) {
+            throw Errors.api(400, "INVALID_ARTICLE_BODY", "Artigo precisa do texto do artigo.")
+        }
+        if (!FeedRules.hasText(raw)) {
+            throw Errors.api(400, "INVALID_ARTICLE_BODY", "Artigo precisa do texto do artigo.")
+        }
+        var body = raw.trim()
+        if (body.length() > FeedRules.maxArticleBody()) {
+            throw Errors.api(400, "ARTICLE_BODY_TOO_LONG", "Texto do artigo deve ter no maximo " + FeedRules.maxArticleBody() + " caracteres.")
+        }
+        return body
+    }
+    // Publishing inside a community needs a member; returns the community (null when there is none).
+    FeedCommunityRef? requireCommunity(communityId: String?, userId: String, b: FeedPublishBody) {
+        if (communityId == null) {
+            return null
+        }
+        var community = communities.byId(communityId, userId)
+        if (community == null) {
+            throw Errors.api(404, "COMMUNITY_NOT_FOUND", "Comunidade nao encontrada.")
+        }
+        if (!community.joined()) {
+            throw Errors.api(403, "NOT_A_MEMBER", "Entre na comunidade para publicar nela.")
+        }
+        if (!FeedRules.hasText(b.channelId()) && FeedRules.hasText(b.topic())) {
+            throw Errors.api(400, "TOPIC_FROM_COMMUNITY", "Post em comunidade herda o assunto dela — o compositor não escolhe assunto aqui.")
+        }
+        return community
+    }
+    // The topic of a post: the channel's, else the community's, else the one the author declared.
+    String? resolveTopic(b: FeedPublishBody, communityId: String?, channelId: String?, community: FeedCommunityRef?) {
+        if (channelId != null) {
+            if (communityId == null) {
+                throw Errors.api(400, "CHANNEL_REQUIRES_COMMUNITY", "Canal só existe dentro de uma comunidade.")
+            }
+            if (FeedRules.hasText(b.topic())) {
+                throw Errors.api(400, "TOPIC_FROM_CHANNEL", "Post de canal herda o tema do canal — o compositor não escolhe assunto aqui.")
+            }
+            var channel = communities.channel(channelId)
+            if (channel == null) {
+                throw Errors.api(404, "CHANNEL_NOT_FOUND", "Canal não encontrado.")
+            }
+            if (channel.communityId() != communityId) {
+                throw Errors.api(404, "CHANNEL_NOT_FOUND", "Canal não encontrado nesta comunidade.")
+            }
+            var channelTopic = channel.topic()
+            if (channelTopic != null) {
+                return channelTopic
+            }
+            if (community != null) {
+                return community.topic()
+            }
+            return null
+        }
+        if (community != null) {
+            return community.topic()
+        }
+        if (FeedRules.hasText(b.topic())) {
+            var declared = FeedRules.trimmed(b.topic()).toUpperCase()
+            if (!FeedRules.topics().contains(declared)) {
+                throw Errors.api(400, "INVALID_TOPIC", "Assunto inválido: escolha um da lista.")
+            }
+            return declared
+        }
+        return null
+    }
+    notifyMentions(mentioned: List<String>?, actorId: String, postId: String, kind: String) {
+        if (mentioned == null) {
+            return
+        }
+        var clean = FeedRules.cleanList(mentioned)
+        var known = authors.byIds(clean)
+        for (var m in clean) {
+            if (m == actorId || known.get(m) == null) {
+                continue
+            }
+            var what = "comentário"
+            var title = "Menção em comentário"
+            if (kind == "post") {
+                what = "publicação"
+                title = "Menção em publicação"
+            }
+            notifier.notify(m, "MENTION", actorId, title, "Você foi mencionado em um " + what + ".", "/api/feed/posts/" + postId, "Ver")
+        }
+    }
+    // ---- delete ----
+    FeedDeleteResult deletePost(userId: String, postId: String, reason: String?) {
+        var p = posts.post(postId)
+        if (p == null) {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+        }
+        if (p.authorId() != userId) {
+            throw Errors.api(403, "POST_OWNER_MISMATCH", "Post nao pertence ao usuario autenticado.")
+        }
+        if (p.status() != "ACTIVE" && p.status() != "QUARANTINED") {
+            return FeedDeleteResult(p.id(), "ALREADY_DELETED")
+        }
+        var now = Time.nowIso()
+        posts.markDeleted(p.id(), now)
+        for (var rid in posts.activeRepostIds(p.id())) {
+            posts.markDeleted(rid, now)
+        }
+        outbox.append("PostDeleted", p.id(), "{\"postId\":\"" + p.id() + "\"}")
+        this.releaseMedia(p)
+        audit.write(userId, "POST_DELETED", p.id(), FeedRules.trimmedOrNull(reason))
+        return FeedDeleteResult(p.id(), "DELETED")
+    }
+    releaseMedia(p: FeedPostRow) {
+        var mediaIds = posts.mediaOf(listOf(p.id())).get(p.id())
+        if (mediaIds == null) {
+            return
+        }
+        media.requestPostMediaDeletion(p.authorId(), p.id(), mediaIds)
+    }
+    // ---- reactions, saves, shares ----
+    FeedActionResult react(userId: String, postId: String, type: String?) {
+        if (type == null) {
+            throw Errors.api(400, "INVALID_REACTION_TYPE", "Tipo de reacao obrigatorio.")
+        }
+        if (!FeedRules.reactionTypes().contains(type)) {
+            throw Errors.badRequest()
+        }
+        var p = this.activePost(postId)
+        var previous = posts.reactionTypeOf(p.id(), userId)
+        var status = "REACTED"
+        if (previous != null) {
+            posts.deleteReaction(p.id(), userId)
+            if (previous == type) {
+                status = "REACTION_REMOVED"
+            }
+            else {
+                status = "REACTION_CHANGED"
+            }
+        }
+        if (status != "REACTION_REMOVED") {
+            posts.insertReaction(Ids.prefixed("reaction_"), p.id(), userId, type, Time.nowIso())
+        }
+        if (status == "REACTED") {
+            posts.bump(p.id(), "reactions", true)
+            outbox.append("PostReacted", p.id(), "{\"postId\":\"" + p.id() + "\",\"authorId\":\"" + userId + "\"}")
+            coins.recordPresence(userId)
+        }
+        else 
+            if (status == "REACTION_REMOVED") {
+                posts.bump(p.id(), "reactions", false)
+                outbox.append("PostReactionRemoved", p.id(), "{\"postId\":\"" + p.id() + "\"}")
+            }
+        return this.result(p.id(), status)
+    }
+    FeedActionResult result(postId: String, status: String) {
+        var fresh = posts.post(postId)
+        if (fresh == null) {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post nao encontrado.")
+        }
+        return FeedActionResult(postId, status, FeedRules.counters(fresh))
+    }
+    FeedActionResult removeReaction(userId: String, postId: String) {
+        var p = this.activePost(postId)
+        var removed = posts.deleteReaction(p.id(), userId) > 0
+        if (removed) {
+            posts.bump(p.id(), "reactions", false)
+            outbox.append("PostReactionRemoved", p.id(), "{\"postId\":\"" + p.id() + "\"}")
+            return this.result(p.id(), "REACTION_REMOVED")
+        }
+        return this.result(p.id(), "REACTION_NOT_FOUND")
+    }
+    FeedActionResult save(userId: String, postId: String) {
+        var p = this.activePost(postId)
+        if (posts.saveExists(p.id(), userId)) {
+            return this.result(p.id(), "ALREADY_SAVED")
+        }
+        posts.insertSave(Ids.prefixed("saved_post_"), p.id(), userId, Time.nowIso())
+        posts.bump(p.id(), "saves", true)
+        outbox.append("PostSaved", p.id(), "{\"postId\":\"" + p.id() + "\"}")
+        return this.result(p.id(), "SAVED")
+    }
+    FeedActionResult removeSave(userId: String, postId: String) {
+        var p = this.activePost(postId)
+        if (posts.deleteSave(p.id(), userId) > 0) {
+            posts.bump(p.id(), "saves", false)
+            outbox.append("PostSaveRemoved", p.id(), "{\"postId\":\"" + p.id() + "\"}")
+            return this.result(p.id(), "SAVE_REMOVED")
+        }
+        return this.result(p.id(), "SAVE_NOT_FOUND")
+    }
+    FeedActionResult share(userId: String, postId: String) {
+        var p = this.activePost(postId)
+        if (posts.shareExists(p.id(), userId)) {
+            return this.result(p.id(), "ALREADY_SHARED")
+        }
+        posts.insertShare(Ids.prefixed("post_share_"), p.id(), userId, Time.nowIso())
+        posts.bump(p.id(), "shares", true)
+        outbox.append("PostShared", p.id(), "{\"postId\":\"" + p.id() + "\"}")
+        return this.result(p.id(), "SHARED")
+    }
+    // GET /feed/posts/{id}/reactions: the latest 50 plus exact counts, blocked users hidden.
+    FeedReactionList listReactions(postId: String, viewerId: String?) {
+        this.requireVisible(postId, viewerId)
+        var hidden = this.hiddenFor(viewerId)
+        var items = listOf<FeedReactionItem>()
+        for (var r in posts.reactionsOfPost(postId, 50)) {
+            if (!hidden.contains(r.getStr("user_id"))) {
+                items.add(FeedReactionItem(r.getStr("user_id"), r.getStr("reaction_type"), r.getInstant("created_at")))
+            }
+        }
+        var summary = FeedRules.orNone(posts.reactionSummaries(listOf(postId), hidden).get(postId))
+        return FeedReactionList(postId, summary, items)
+    }
+    FeedCommentReactionList listCommentReactions(postId: String, commentId: String, viewerId: String?) {
+        this.requireVisible(postId, viewerId)
+        var hidden = this.hiddenFor(viewerId)
+        var items = listOf<FeedReactionItem>()
+        Map<String,Long> summary = new LinkedHashMap<String, Long>()
+        for (var r in posts.reactionsOfComment(commentId)) {
+            if (hidden.contains(r.getStr("user_id"))) {
+                continue
+            }
+            var type = r.getStr("reaction_type")
+            items.add(FeedReactionItem(r.getStr("user_id"), type, r.getInstant("created_at")))
+            summary.put(type, FeedRules.plusOne(summary.get(type)))
+        }
+        return FeedCommentReactionList(commentId, summary, items)
+    }
+    // POST comment reaction: toggle. Returns "REACTED" or "REMOVED".
+    String reactToComment(userId: String, postId: String, commentId: String, type: String?) {
+        var kind = ""
+        if (type != null) {
+            kind = type
+        }
+        var existing = posts.commentReactionTypeOf(commentId, userId)
+        if (existing != null) {
+            posts.deleteCommentReaction(commentId, userId)
+            if (existing == kind) {
+                return "REMOVED"
+            }
+        }
+        if (kind.length() == 0 || !FeedRules.reactionTypes().contains(kind)) {
+            // reaction_type is a not-null enum column: Java rejects the unknown spelling with a 400
+            throw Errors.badRequest()
+        }
+        posts.insertCommentReaction(Ids.prefixed("creact_"), commentId, userId, kind, Time.nowIso())
+        outbox.append("CommentReacted", commentId, "{\"commentId\":\"" + commentId + "\",\"postId\":\"" + postId + "\",\"authorId\":\"" + userId + "\"}")
+        coins.recordPresence(userId)
+        return "REACTED"
+    }
+    String removeCommentReaction(userId: String, commentId: String) {
+        if (posts.deleteCommentReaction(commentId, userId) > 0) {
+            return "REMOVED"
+        }
+        return "NO_REACTION"
+    }
+    // ---- comments ----
+    List<String> commentMedia(userId: String, raw: List<String>?) {
+        var ids = FeedRules.cleanList(raw)
+        if (ids.size() == 0) {
+            return ids
+        }
+        if (ids.size() > 4) {
+            throw Errors.api(400, "COMMENT_TOO_MANY_MEDIA", "Comentario aceita no maximo 4 midias.")
+        }
+        media.requireOwned(userId, ids)
+        return ids
+    }
+    FeedCommentView comment(userId: String, postId: String, b: FeedCommentBody) {
+        this.guardWrite(userId, UserRateLimiter.createComment())
+        risk.assess(userId, "comment", b.content())
+        var raw = b.content()
+        if (raw != null) {
+            if (FeedRules.hasText(raw)) {
+                duplication.require(userId, raw)
+            }
+        }
+        var p = this.activePost(postId)
+        var mediaIds = this.commentMedia(userId, b.mediaIds())
+        var content = ""
+        if (!FeedRules.hasText(b.content())) {
+            if (mediaIds.size() == 0) {
+                throw Errors.api(400, "INVALID_COMMENT_CONTENT", "Conteudo obrigatorio.")
+            }
+        }
+        else {
+            content = FeedRules.nz(PlainText.defuse(FeedRules.trimmed(b.content())))
+            if (content.length() > FeedRules.maxCommentLength()) {
+                throw Errors.api(400, "COMMENT_TOO_LONG", "Comentario deve ter no maximo 800 caracteres.")
+            }
+        }
+        var parentId = this.parentOf(b.parentCommentId(), p.id())
+        var row = FeedCommentRow(Ids.prefixed("comment_"), p.id(), userId, parentId, content, Time.nowIso(), "ACTIVE", null, false, b.mediaSpoiler() == true)
+        posts.insertComment(row, mediaIds)
+        posts.bump(p.id(), "comments", true)
+        outbox.append("PostCommented", p.id(), "{\"postId\":\"" + p.id() + "\",\"commentId\":\"" + row.id() + "\",\"authorId\":\"" + userId + "\"}")
+        this.notifyReply(parentId, p, userId)
+        this.notifyMentions(b.mentionedUserIds(), userId, p.id(), "comment")
+        coins.recordPresence(userId)
+        var views = this.commentViews(listOf(row), userId, listOf<String>(), p.acceptedCommentId())
+        return views.get(0)
+    }
+    String? parentOf(raw: String?, postId: String) {
+        if (!FeedRules.hasText(raw)) {
+            return null
+        }
+        var parent = posts.comment(FeedRules.trimmed(raw))
+        if (parent == null) {
+            throw Errors.api(404, "PARENT_COMMENT_NOT_FOUND", "Comentario pai nao encontrado.")
+        }
+        if (parent.postId() != postId || parent.status() != "ACTIVE") {
+            throw Errors.api(404, "PARENT_COMMENT_NOT_FOUND", "Comentario pai nao encontrado.")
+        }
+        return parent.id()
+    }
+    notifyReply(parentId: String?, p: FeedPostRow, actorId: String) {
+        if (parentId == null) {
+            return
+        }
+        var parent = posts.comment(parentId)
+        if (parent == null) {
+            return
+        }
+        if (parent.authorId() == actorId || parent.authorId() == p.authorId()) {
+            return
+        }
+        var actor = authors.byIds(listOf(actorId)).get(actorId)
+        var who = "Alguem"
+        if (actor != null) {
+            who = actor.name()
+        }
+        notifier.notify(parent.authorId(), "NEW_REPLY", actorId, "Nova resposta", who + " respondeu ao seu comentario.", "/api/feed/posts/" + p.id(), "Ver")
+    }
+    List<FeedCommentView> commentViews(rows: List<FeedCommentRow>, viewerId: String?, hidden: List<String>, acceptedId: String?) {
+        var out = listOf<FeedCommentView>()
+        var ids = listOf<String>()
+        var authorIds = listOf<String>()
+        for (var c in rows) {
+            if (hidden.contains(c.authorId())) {
+                continue
+            }
+            ids.add(c.id())
+            if (!authorIds.contains(c.authorId())) {
+                authorIds.add(c.authorId())
+            }
+        }
+        var profiles = authors.byIds(authorIds)
+        var contributors = authors.contributorIds(authorIds)
+        var medias = posts.commentMediaOf(ids)
+        var mine = new HashMap<String, String>()
+        if (viewerId != null) {
+            mine = posts.userCommentReactions(viewerId, ids)
+        }
+        var summaries = posts.commentReactionSummaries(ids, hidden)
+        for (var c in rows) {
+            if (hidden.contains(c.authorId())) {
+                continue
+            }
+            var a = profiles.get(c.authorId())
+            var badges = listOf<String>()
+            if (a != null) {
+                badges = a.badges()
+            }
+            var summary = FeedRules.orNone(summaries.get(c.id()))
+            var sum = 0L
+            for (var n in summary.values()) {
+                sum = sum + n
+            }
+            var total = sum as Int
+            var cm = FeedRules.orEmpty(medias.get(c.id()))
+            out.add(FeedCommentView(c.id(), c.postId(), c.authorId(), this.plainNameOf(a), this.usernameOf(a), this.avatarOf(a), this.firstOf(badges), badges, c.parentCommentId(), c.content(), cm, c.createdAt(), c.editedAt(), mine.get(c.id()), this.frameOf(a), total, c.pinned(), c.mediaSpoiler(), this.styleOf(a, true), this.tagOf(a, true, contributors.contains(c.authorId())), summary, acceptedId != null && acceptedId == c.id()))
+        }
+        return out
+    }
+    FeedCommentsPage comments(postId: String, cursor: String?, limitRaw: Int, viewerId: String?) {
+        var limit = limitRaw
+        if (limit < 1) {
+            limit = 20
+        }
+        if (limit > 50) {
+            limit = 50
+        }
+        var p = this.activePost(postId)
+        var hidden = this.hiddenFor(viewerId)
+        var before = "9999-12-31T23:59:59Z"
+        if (cursor != null) {
+            before = cursor
+        }
+        var all = listOf<FeedCommentRow>()
+        if (cursor == null) {
+            var pinned = posts.pinnedComment(p.id())
+            if (pinned != null) {
+                all.add(pinned)
+            }
+        }
+        var fetched = posts.activeCommentsExcludingPinned(p.id(), before, limit)
+        for (var c in fetched) {
+            all.add(c)
+        }
+        var items = this.commentViews(all, viewerId, hidden, p.acceptedCommentId())
+        return FeedCommentsPage(items, this.cursorAfter(fetched, limit))
+    }
+    String? cursorAfter(fetched: List<FeedCommentRow>, limit: Int) {
+        if (fetched.size() == limit) {
+            return fetched.get(fetched.size() - 1).createdAt()
+        }
+        return null
+    }
+    deleteComment(userId: String, commentId: String) {
+        var c = posts.comment(commentId)
+        if (c == null) {
+            throw Errors.api(404, "COMMENT_NOT_FOUND", "Comentario nao encontrado.")
+        }
+        if (c.authorId() != userId) {
+            throw Errors.api(403, "NOT_AUTHORIZED", "Voce nao pode deletar este comentario.")
+        }
+        posts.deleteComment(commentId)
+        if (c.status() == "ACTIVE") {
+            posts.bump(c.postId(), "comments", false)
+        }
+    }
+    pinComment(userId: String, postId: String, commentId: String, pinned: Bool) {
+        var p = this.activePost(postId)
+        var c = posts.comment(commentId)
+        if (c == null) {
+            throw Errors.api(404, "COMMENT_NOT_FOUND", "Comentario nao encontrado.")
+        }
+        if (c.postId() != postId || c.status() != "ACTIVE" || c.parentCommentId() != null) {
+            throw Errors.api(404, "COMMENT_NOT_FOUND", "Comentario nao encontrado.")
+        }
+        if (p.authorId() != userId && c.authorId() != userId) {
+            throw Errors.api(403, "NOT_AUTHORIZED", "So o autor do post ou do comentario pode fixar este comentario.")
+        }
+        if (pinned) {
+            posts.unpinAll(postId)
+            posts.setPinned(commentId, true)
+        }
+        else 
+            if (c.pinned()) {
+                posts.setPinned(commentId, false)
+            }
+    }
+    FeedCommentEdited editComment(userId: String, commentId: String, content: String?, mediaIdsRaw: List<String>?) {
+        var c = posts.comment(commentId)
+        if (c == null) {
+            throw Errors.api(404, "COMMENT_NOT_FOUND", "Comentario nao encontrado.")
+        }
+        if (c.authorId() != userId) {
+            throw Errors.api(403, "NOT_AUTHORIZED", "Voce nao pode editar este comentario.")
+        }
+        var mediaIds = FeedRules.orEmpty(posts.commentMediaOf(listOf(commentId)).get(commentId))
+        if (mediaIdsRaw != null) {
+            mediaIds = this.commentMedia(userId, mediaIdsRaw)
+        }
+        var text = ""
+        if (content != null) {
+            text = content.trim()
+        }
+        if (text.length() == 0 && mediaIds.size() == 0 || text.length() > 1024) {
+            throw Errors.api(422, "INVALID_COMMENT", "O comentario precisa ter de 1 a 1024 caracteres.")
+        }
+        var at = Time.nowIso()
+        posts.updateComment(commentId, text, at, mediaIdsRaw != null, mediaIds)
+        return FeedCommentEdited("COMMENT_EDITED", text, mediaIds, at)
+    }
+    // ---- polls ----
+    FeedPollView vote(userId: String, postId: String, option: Int) {
+        this.guardWrite(userId, UserRateLimiter.createComment())
+        risk.assess(userId, "poll_vote", null)
+        var p = this.activePost(postId)
+        if (p.type() != "POLL") {
+            throw Errors.api(400, "NOT_A_POLL", "Este post nao e uma enquete.")
+        }
+        var options = FeedRules.orEmpty(posts.pollOptions(listOf(p.id())).get(p.id()))
+        if (option < 0 || option >= options.size()) {
+            throw Errors.api(400, "INVALID_POLL_OPTION", "Alternativa da enquete invalida.")
+        }
+        var already = "Voce ja votou nesta enquete — o voto nao pode ser trocado."
+        if (posts.pollVotesOf(userId, listOf(p.id())).get(p.id()) != null) {
+            throw Errors.api(409, "ALREADY_VOTED", already)
+        }
+        // the unique (post_id, user_id) decides a race: the loser's insert is a conflict
+        posts.insertPollVote(Ids.prefixed("poll_vote_"), p.id(), userId, option, Time.nowIso())
+        return this.pollView(options, posts.pollCounts(listOf(p.id())).get(p.id()), option)
+    }
+}
+
+record FeedReactionItem(String userId, String type, String createdAt)
+
+record FeedReactionList(String postId, Map<String,Long> summary, List<FeedReactionItem> reactions)
+
+record FeedCommentReactionList(String commentId, Map<String,Long> summary, List<FeedReactionItem> reactions)
+
+record FeedCommentEdited(String status, String content, List<String> mediaIds, String editedAt)
