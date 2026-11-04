@@ -1,0 +1,67 @@
+package kernel.security
+
+import java.lang.String
+import java.security.MessageDigest
+import java.security.SecureRandom
+import java.util.Base64
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+
+// Random credentials and signed payloads for the identity flows: opaque session / reset / verification
+// tokens (base64url of SecureRandom bytes, like AuthService.newToken) and the HMAC-SHA256 of the signup
+// challenge. Java crypto stays here, domain code only sees Strings.
+class Tokens {
+    // base64url (no padding) of `size` random bytes: 32 for session tokens, 48 for reset / verify links.
+    static String random(size: Int) {
+        var bytes = new byte[size]
+        new SecureRandom().nextBytes(bytes)
+        return Base64.getUrlEncoder().encodeToString(bytes).replace("=", "")
+    }
+    // Uniform random int in [0, bound).
+    static Int randomInt(bound: Int) = new SecureRandom().nextInt(bound)
+    // HmacSHA256(base64-decoded key, message) as base64url without padding.
+    static String hmacSha256Url(keyBase64: String, message: String) {
+        var key = Base64.getDecoder().decode(keyBase64.trim()) as Byte[]
+        var mac = Mac.getInstance("HmacSHA256")
+        mac.init(new SecretKeySpec(key, "HmacSHA256"))
+        var out = mac.doFinal(message.getBytes()) as Byte[]
+        return Base64.getUrlEncoder().encodeToString(out).replace("=", "")
+    }
+    // Constant-time comparison of two texts (MessageDigest.isEqual).
+    static Bool safeEquals(a: String, b: String) = MessageDigest.isEqual(a.getBytes(), b.getBytes())
+    static String base64UrlEncode(text: String) = Base64.getUrlEncoder().encodeToString(text.getBytes()).replace("=", "")
+    // The decoded text, or null when the value is not valid base64url.
+    static String? base64UrlDecode(value: String) {
+        var out = ""
+        var ok = true
+        try {
+            var raw = Base64.getUrlDecoder().decode(value) as Byte[]
+            out = new String(raw, "UTF-8")
+        } catch (String e) {
+            ok = false
+        }
+        if (!ok) {
+            return null
+        }
+        return out
+    }
+    // A key is usable when it is base64 of at least 16 bytes (SignupChallengeService.resolveSecret).
+    static Bool validKey(keyBase64: String) {
+        var text = keyBase64.trim()
+        var ok = true
+        try {
+            var raw = Base64.getDecoder().decode(text) as Byte[]
+        } catch (String e) {
+            ok = false
+        }
+        var padding = 0
+        if (text.endsWith("==")) {
+            padding = 2
+        }
+        else 
+            if (text.endsWith("=")) {
+                padding = 1
+            }
+        return ok && text.length() / 4 * 3 - padding >= 16
+    }
+}

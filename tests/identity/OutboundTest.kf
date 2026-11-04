@@ -1,0 +1,45 @@
+import kernel.*
+import kernel.http.*
+import kernel.testkit.*
+
+wireOutbound(p: Platform) {
+    p.server.post("/probe/echo", () -> "got=" + Req.bodyText() + " ct=" + Req.headerOrNull("content-type"))
+    p.server.get("/probe/fail", () -> failBody())
+}
+
+String failBody() = status(503, "{\"code\":\"X\"}")
+
+class OutboundHolder {
+    static TestApp? app = null
+}
+
+TestApp outboundApp() {
+    var cur = OutboundHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = TestApp.bootWire("outbound", (p: Platform) -> wireOutbound(p))
+    OutboundHolder.app = created
+    return created
+}
+
+test "postForm sends the form body and returns status and text" {
+    var app = outboundApp()
+    var res = Outbound.postForm("http://127.0.0.1:" + app.port + "/probe/echo", "a=1&b=2", 3000)
+    Check.eqInt("status", 200, res.status())
+    Check.eqStr("body", "got=a=1&b=2 ct=application/x-www-form-urlencoded", res.body())
+}
+
+test "an error status keeps its body and a dead port throws OUTBOUND_FAILED" {
+    var app = outboundApp()
+    var bad = Outbound.get("http://127.0.0.1:" + app.port + "/probe/fail", listOf<String>(), 3000)
+    Check.eqInt("status", 503, bad.status())
+    Check.isTrue("body " + bad.body(), bad.body().indexOf("\"code\":\"X\"") >= 0)
+    var failed = ""
+    try {
+        Outbound.get("http://127.0.0.1:1/x", listOf<String>(), 500)
+    } catch (String e) {
+        failed = e
+    }
+    Check.isTrue("expected OUTBOUND_FAILED, got " + failed, failed.startsWith("OUTBOUND_FAILED"))
+}
