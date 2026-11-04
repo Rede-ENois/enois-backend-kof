@@ -1,0 +1,127 @@
+package studypairs
+
+import kernel.text.*
+import kernel.time.*
+
+// Study pairs: two people with the same goal, one check-in a week.
+// status: ACTIVE | ENDED
+record StudyPair(String id, String userA, String userB, String goalKey, String goalText, String? topic, String status, String startedAt, String? endedAt)
+
+// status: OPEN | MATCHED | CANCELLED
+record StudyPairRequest(String id, String userId, String goalKey, String goalText, String? topic, String status, String createdAt)
+
+record StudyCheckin(String pairId, String userId, String weekKey, String? note, String createdAt, String updatedAt)
+
+// Aggregate over open requests: no user id, no author, only the goal and how many wait on it.
+record StudyPairPopularGoal(String goalKey, String goal, String? topic, Int openRequests)
+
+// Minimal projection of a person (users row) the module needs; owned by the profile domain.
+record StudyPairPerson(String id, String username, String name, String? avatar, Bool emailVerified)
+
+record StudyPairSearchResult(String goal, String? topic, String createdAt)
+
+record StudyPairRequestResult(String requestId, String status, String? pairId)
+
+record StudyPairOpenRequestView(String id, String goal, String goalKey, String? topic, String createdAt)
+
+record StudyPairPartnerView(String id, String? username, String? name, String? avatar)
+
+record StudyPairCheckinView(String userId, String weekKey, String? note, String createdAt, String updatedAt)
+
+record StudyPairView(String id, String goal, String goalKey, String? topic, String startedAt, String weekKey, StudyPairPartnerView partner, Bool myCheckinThisWeek, Bool partnerCheckinThisWeek, List<StudyPairCheckinView> checkins)
+
+record StudyPairMine(StudyPairOpenRequestView? openRequest, List<StudyPairView> pairs)
+
+record StudyPairGoalRequest(String? goal, String? topic)
+
+record StudyPairCheckinRequest(String? note)
+
+record StudyPairStatusView(String id, String status)
+
+record StudyPairSearchItems(List<StudyPairSearchResult> items)
+
+record StudyPairPopularItems(List<StudyPairPopularGoal> items)
+
+class StudyPairRules {
+    static String module() = "STUDY_PAIRS"
+    static Int maxActivePairs() = 2
+    static Int noteMaxLength() = 500
+    static Int historyWeeks() = 4
+    static Int goalMaxLength() = 120
+    static String href() = "/par-de-estudo"
+    // Same list as ContentTaxonomy.TOPICS (preferences domain).
+    static List<String> topics() = listOf("TECNOLOGIA", "ENGENHARIA", "DESIGN", "PRODUTO", "LIDERANCA", "CARREIRA", "FREELANCE", "OUTROS", "GAMES", "ART", "MUSIC", "EDUCACAO", "CIENCIA", "EMPREENDER", "FINANCAS", "MARKETING", "RH", "DADOS", "FUN", "QUALIDADE_VIDA", "SAUDE", "VIAGEM", "COMIDA", "ESPORTES", "CINEMA", "LIVROS", "FOTOGRAFIA", "CASA", "PETS", "PARENTALIDADE", "RELACIONAMENTOS", "MODA", "POLITICA", "RELIGIAO")
+}
+
+// The two keys the module matches on. The goal key folds case and accents ("Aprender Rust" and
+// "aprender rust" become "aprender-rust"); the week key is the ISO week ("2026-W44") of a date in
+// America/Sao_Paulo.
+class StudyGoal {
+    // Normalized slug of the goal; empty when the text has no letter or digit.
+    static String key(goal: String?) {
+        if (goal == null) {
+            return ""
+        }
+        var slug = Texts.stripAccents(goal).toLowerCase().replaceAll("[^a-z0-9]+", "-").replaceAll("(^-|-$)", "")
+        if (slug.length() > StudyPairRules.goalMaxLength()) {
+            return slug.substring(0, StudyPairRules.goalMaxLength()).replaceAll("-+$", "")
+        }
+        return slug
+    }
+    // Days since 1970-01-01 of a yyyy-MM-dd date (proleptic Gregorian).
+    static Int epochDay(date: String) {
+        var y = date.substring(0, 4).toInt()
+        var m = date.substring(5, 7).toInt()
+        var d = date.substring(8, 10).toInt()
+        if (m <= 2) {
+            y = y - 1
+        }
+        var era = y / 400
+        var yoe = y - era * 400
+        var shifted = m + 9
+        if (m > 2) {
+            shifted = m - 3
+        }
+        var doy = (153 * shifted + 2) / 5 + d - 1
+        var doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+        return era * 146097 + doe - 719468
+    }
+    // Civil year of an epoch day.
+    static Int yearOf(day: Int) {
+        var z = day + 719468
+        var era = z / 146097
+        var doe = z - era * 146097
+        var yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+        var y = yoe + era * 400
+        var doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+        var mp = (5 * doy + 2) / 153
+        if (mp >= 10) {
+            return y + 1
+        }
+        return y
+    }
+    static String pad2(n: Int) {
+        if (n < 10) {
+            return "0" + n
+        }
+        return "" + n
+    }
+    // ISO-8601 week key ("2026-W44") of a yyyy-MM-dd date.
+    static String weekKey(date: String) = StudyGoal.weekKeyOfDay(StudyGoal.epochDay(date))
+    static String weekKeyOfDay(day: Int) {
+        var weekday = (day + 3) % 7 + 1
+        var thursday = day - weekday + 4
+        var year = StudyGoal.yearOf(thursday)
+        var jan1 = StudyGoal.epochDay(year + "-01-01")
+        var week = (thursday - jan1) / 7 + 1
+        return year + "-W" + StudyGoal.pad2(week)
+    }
+    // Today in America/Sao_Paulo (fixed UTC-3: Brazil has no daylight saving since 2019).
+    static Int todayDay() = StudyGoal.epochDay(StudyGoal.today())
+    static String today() = Time.fromMillis(Time.nowMillis() - 10800000L).substring(0, 10)
+    // Minor on `today` for a declared birth date (full years < 18, like Period.between).
+    static Bool minorOn(birthDate: String, today: String) {
+        var turns18 = birthDate.substring(0, 4).toInt() + 18 + birthDate.substring(4, 10)
+        return turns18.compareTo(today) > 0
+    }
+}

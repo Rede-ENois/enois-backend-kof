@@ -1,0 +1,133 @@
+package studypairs
+
+import java.util.HashSet
+import kernel.db.*
+import kernel.id.*
+import kernel.time.*
+
+// Cross-domain seams owned by this module. Each is a concrete class with an overridable default that
+// reads (or, for notifications, inserts into) the owner's table with the same SQL the owner uses; the
+// owner extends it when ported and Main.kf passes the subclass in (docs/PORTING_GUIDE.md).
+class StudyPairSql {
+    // "?, ?, ?" for an IN list.
+    static String marks(count: Int) {
+        var out = ""
+        var i = 0
+        while (i < count) {
+            if (i > 0) {
+                out = out + ", "
+            }
+            out = out + "?"
+            i = i + 1
+        }
+        return out
+    }
+}
+
+// pending-port: profile (UserProfileRepository.findById / findAllByIds).
+class StudyPairProfiles {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    StudyPairPerson? find(userId: String) {
+        var row = store.queryOptional("select id, username, name, avatar, email_verified_at from users where id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return this.person(row)
+    }
+    List<StudyPairPerson> findAll(userIds: List<String>) {
+        if (userIds.size() == 0) {
+            return listOf<StudyPairPerson>()
+        }
+        var params = DbParams()
+        for (var id in userIds) {
+            params.bindStr(id)
+        }
+        var out = listOf<StudyPairPerson>()
+        for (var r in store.queryList("select id, username, name, avatar, email_verified_at from users where id in (" + StudyPairSql.marks(userIds.size()) + ")", params)) {
+            out.add(this.person(r))
+        }
+        return out
+    }
+    StudyPairPerson person(r: DbRow) = StudyPairPerson(r.getStr("id"), r.getStr("username"), r.getStr("name"), r.getStrOrNull("avatar"), !r.isNull("email_verified_at"))
+}
+
+// pending-port: profile (AgePolicyAdapter over users.birth_date; ECA Digital). The age is computed in
+// America/Sao_Paulo.
+class StudyPairAgePolicy {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    String? birthDate(userId: String) {
+        var row = store.queryOptional("select birth_date from users where id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return row.getDateOrNull("birth_date")
+    }
+    Bool birthDateDeclared(userId: String) = this.birthDate(userId) != null
+    Bool isMinor(userId: String) {
+        var born = this.birthDate(userId)
+        if (born == null) {
+            return false
+        }
+        return StudyGoal.minorOn(born, StudyGoal.today())
+    }
+    HashSet<String> minorIds(userIds: List<String>) {
+        var out = new HashSet<String>()
+        if (userIds.size() == 0) {
+            return out
+        }
+        var params = DbParams()
+        for (var id in userIds) {
+            params.bindStr(id)
+        }
+        var today = StudyGoal.today()
+        var rows = store.queryList("select id, birth_date from users where birth_date is not null and id in (" + StudyPairSql.marks(userIds.size()) + ")", params)
+        for (var r in rows) {
+            if (StudyGoal.minorOn(r.getDate("birth_date"), today)) {
+                out.add(r.getStr("id"))
+            }
+        }
+        return out
+    }
+}
+
+// pending-port: preferences (PersonalizationService.of(userId).disabledModules()).
+class StudyPairPreferences {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    Bool moduleDisabled(userId: String) {
+        var row = store.queryOptional("select disabled_modules from user_preferences where user_id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return false
+        }
+        var csv = row.getStrOrNull("disabled_modules")
+        if (csv == null) {
+            return false
+        }
+        for (var item in csv.split(",")) {
+            if (item.trim() == StudyPairRules.module()) {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// pending-port: notifications (NotificationService.create: the row; the push event after commit is not
+// delivered until that domain is ported).
+class StudyPairNotifier {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    create(userId: String, kind: String, actorId: String, title: String, body: String, href: String, ctaLabel: String) {
+        store.execute("insert into notifications (id, user_id, kind, actor_id, title, body, href, cta_label, is_read, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, false, ?)", DbParams().bindStr(Ids.prefixed("notification_")).bindStr(userId).bindStr(kind).bindStr(actorId).bindStr(title).bindStr(body).bindStr(href).bindStr(ctaLabel).bindInstant(Time.nowIso()))
+    }
+}
