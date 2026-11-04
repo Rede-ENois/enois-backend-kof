@@ -1,0 +1,108 @@
+package calls
+
+import kernel.db.*
+import kernel.error.*
+import messaging.*
+
+// pending-port: groups (GroupService.roleOf / memberIds). The role of a person in a group and the members
+// a "Tamo junto" call announces to. The default reads `group_members` read-only.
+class CallGroups {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    // OWNER|ADMIN|MODERATOR|MEMBER, or null when the person is not a member.
+    String? roleOf(groupId: String, userId: String) {
+        var row = database.queryOptional("select role from group_members where group_id = ? and user_id = ?", DbParams().bindStr(groupId).bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return row.getStr("role")
+    }
+    List<String> memberIds(groupId: String) {
+        var out = listOf<String>()
+        for (var r in database.queryList("select user_id from group_members where group_id = ? order by joined_at, user_id", DbParams().bindStr(groupId))) {
+            out.add(r.getStr("user_id"))
+        }
+        return out
+    }
+}
+
+// pending-port: profile (UserProfileRepository.displayName). The name shown in the call and in the token:
+// the social name when there is one, otherwise the registration name, "Alguem" for an unknown id.
+class CallProfiles {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    String displayName(userId: String) {
+        var row = database.queryOptional("select name, social_name from users where id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return "Alguem"
+        }
+        var social = row.getStrOrNull("social_name")
+        if (social != null) {
+            if (social.trim().length() > 0) {
+                return social
+            }
+        }
+        return row.getStr("name")
+    }
+}
+
+// Who can ring, who can enter and who may know a call exists (CallAudience). The single door of
+// authorization: the link of the call (conversation or group) is read from the database at every check.
+class CallAudience {
+    MessagingService messaging
+    CallGroups groups
+    public constructor(messaging: MessagingService, groups: CallGroups) {
+        this.messaging = messaging
+        this.groups = groups
+    }
+    Bool isParticipant(conversationId: String, userId: String) = messaging.isParticipant(conversationId, userId)
+    // The whole list, in the order they enter the call.
+    List<String> participantsOf(conversationId: String) {
+        var ids = listOf<String>()
+        for (var p in messaging.getParticipants(conversationId)) {
+            ids.add(p.userId())
+        }
+        ids.sort()
+        return ids
+    }
+    String? roleIn(groupId: String, userId: String) = groups.roleOf(groupId, userId)
+    List<String> groupMembers(groupId: String) = groups.memberIds(groupId)
+    // Needs to be able to act: who creates is in the link, who enters is in the link and, in a group, a member.
+    requireMember(call: CallRecord, userId: String) {
+        var conversationId = call.conversationId()
+        if (conversationId != null) {
+            if (!isParticipant(conversationId, userId)) {
+                throw Errors.api(403, "NOT_PARTICIPANT", "Voce nao participa desta conversa.")
+            }
+            return
+        }
+        var groupId = call.groupId()
+        if (groupId != null) {
+            if (roleIn(groupId, userId) == null) {
+                throw Errors.api(403, "NOT_GROUP_MEMBER", "Voce nao e membro deste grupo.")
+            }
+            return
+        }
+        // No link proves nothing: deny instead of opening.
+        throw Errors.api(403, "CALL_NOT_ALLOWED", "Chamada sem vinculo de conversa ou grupo.")
+    }
+    // The link is checked before anything else; in a group, being a member is enough.
+    requireCanJoin(call: CallRecord, userId: String) {
+        requireMember(call, userId)
+    }
+    List<String> audienceOf(call: CallRecord) {
+        var conversationId = call.conversationId()
+        if (conversationId != null) {
+            return participantsOf(conversationId)
+        }
+        var groupId = call.groupId()
+        if (groupId != null) {
+            return groupMembers(groupId)
+        }
+        return listOf<String>()
+    }
+}

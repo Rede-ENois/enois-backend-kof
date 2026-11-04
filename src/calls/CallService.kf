@@ -1,0 +1,507 @@
+package calls
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.security.*
+import kernel.time.*
+import notifications.*
+
+// The wall clock of the calls (the Java tests moved a java.time.Clock). Tests move the security clock.
+class CallClock {
+    public constructor() {}
+    String now() = Time.fromMillis(SecurityClock.nowMillis())
+}
+
+// Audio and video calls, 1:1 and "Tamo junto" (group). The server decides who can start, who can enter, in
+// which state the call is and for how long; the client only asks. Concurrent transitions are conditional
+// in the database, so two taps never leave a call in two states nor count a person twice.
+//
+//   - a direct call rings (RINGING) with a short deadline and turns MISSED by itself
+//   - a group call rings nobody: it is born "live" and goes away when the last person leaves
+//   - leaving a group call does not end it for the others; in a direct call leaving ends it
+//   - recording is never on (the entry token turns recording and broadcasting off)
+class CallService {
+    Db database
+    CallsStore store
+    CallAudience audience
+    MeetingTokenIssuer tokens
+    Notifications notifications
+    CallProfiles profiles
+    UserRateLimiter rateLimiter
+    CallClock clock
+    public constructor(database: Db, store: CallsStore, audience: CallAudience, tokens: MeetingTokenIssuer, notifications: Notifications, profiles: CallProfiles, rateLimiter: UserRateLimiter, clock: CallClock) {
+        this.database = database
+        this.store = store
+        this.audience = audience
+        this.tokens = tokens
+        this.notifications = notifications
+        this.profiles = profiles
+        this.rateLimiter = rateLimiter
+        this.clock = clock
+    }
+    static String callHref(callId: String) = "/call/" + callId
+    static String newId() = Ids.prefixed("call_")
+    // A random room: guessing somebody's @ gives access to nothing.
+    static String newRoomId() = Ids.uuid().replace("-", "")
+    static CallView blank() = CallView("", "AUDIO", "DIRECT", null, null, "", "", "ENDED", "", null, null, null, null, 0, false, null)
+    // ------------------------------------------------------------------ views
+    CallView view(call: CallRecord, actorId: String) = CallView(call.id(), call.kind(), call.modality(), call.conversationId(), call.groupId(), call.initiatorId(), call.displayName(), call.state(), call.createdAt(), call.answeredAt(), call.endedAt(), call.endReason(), call.expiresAt(), store.countPresent(call.id()), call.initiatorId() == actorId, store.participantState(call.id(), actorId))
+    // Nobody is listening for call changes until the event stream exists (G201): the hook stays so the
+    // stream adapter has one place to attach.
+    publish(call: CallRecord, userIds: List<String>);
+    List<String> audienceOf(call: CallRecord) {
+        var conversationId = call.conversationId()
+        if (conversationId != null) {
+            return audience.participantsOf(conversationId)
+        }
+        var groupId = call.groupId()
+        if (groupId != null) {
+            return audience.groupMembers(groupId)
+        }
+        return listOf<String>()
+    }
+    Bool isAudience(call: CallRecord, actorId: String) {
+        var conversationId = call.conversationId()
+        if (conversationId != null) {
+            return audience.isParticipant(conversationId, actorId)
+        }
+        var groupId = call.groupId()
+        if (groupId != null) {
+            return audience.roleIn(groupId, actorId) != null
+        }
+        return false
+    }
+    CallRecord requireCall(callId: String, actorId: String) {
+        var call = store.findById(callId)
+        if (call == null) {
+            throw Errors.api(404, "CALL_NOT_FOUND", "Chamada nao encontrada ou expirada.")
+        }
+        audience.requireMember(call, actorId)
+        return call
+    }
+    requireConfigured() {
+        if (!tokens.isConfigured()) {
+            throw MeetingTokenIssuer.notConfigured()
+        }
+    }
+    CallView existing(call: CallRecord, actorId: String) {
+        if (!isAudience(call, actorId)) {
+            throw Errors.api(403, "NOT_PARTICIPANT", "Chamada sem vinculo com voce.")
+        }
+        return view(call, actorId)
+    }
+    // ------------------------------------------------------------------ start
+    CallView startDirect(conversationId: String, actorId: String, kind: String) {
+        var self = this
+        var result = CallService.blank()
+        database.transaction(() -> {
+    result = self.startDirectIn(conversationId, actorId, kind)
+})
+        return result
+    }
+    CallView startDirectIn(conversationId: String, actorId: String, kind: String) {
+        requireConfigured()
+        if (!audience.isParticipant(conversationId, actorId)) {
+            throw Errors.api(403, "NOT_PARTICIPANT", "Voce nao participa desta conversa.")
+        }
+        var participants = audience.participantsOf(conversationId)
+        if (participants.size() != 2) {
+            throw Errors.api(409, "NOT_A_DIRECT_CONVERSATION", "Esta conversa tem mais de duas pessoas: use a chamada do grupo.")
+        }
+        rateLimiter.require(actorId, UserRateLimiter.startCall())
+        var now = clock.now()
+        // The existing call of the link comes back instead of creating another: repeating the request
+        // (two taps, a network retry) leads to the same call.
+        var open = store.openByConversation(conversationId)
+        if (open != null) {
+            return existing(open, actorId)
+        }
+        var recipients = listOf<String>()
+        for (var id in participants) {
+            if (id != actorId) {
+                recipients.add(id)
+            }
+        }
+        var call = CallTransitions.start(CallService.newId(), kind, "DIRECT", conversationId, null, actorId, CallService.newRoomId(), profiles.displayName(actorId), now)
+        store.create(call, participants, now)
+        notifyIncoming(call, actorId, recipients)
+        publish(call, participants)
+        return view(call, actorId)
+    }
+    CallView startGroup(groupId: String, actorId: String, kind: String) {
+        var self = this
+        var result = CallService.blank()
+        database.transaction(() -> {
+    result = self.startGroupIn(groupId, actorId, kind)
+})
+        return result
+    }
+    CallView startGroupIn(groupId: String, actorId: String, kind: String) {
+        requireConfigured()
+        if (audience.roleIn(groupId, actorId) == null) {
+            throw Errors.api(403, "NOT_GROUP_MEMBER", "Voce nao e membro deste grupo.")
+        }
+        rateLimiter.require(actorId, UserRateLimiter.startCall())
+        var now = clock.now()
+        var members = audience.groupMembers(groupId)
+        var open = store.openByGroup(groupId)
+        if (open != null) {
+            return existing(open, actorId)
+        }
+        var call = CallTransitions.start(CallService.newId(), kind, "GROUP", null, groupId, actorId, CallService.newRoomId(), profiles.displayName(actorId), now)
+        store.create(call, members, now)
+        // No ringing in a group: only the "the group is live" notice, once per call.
+        notifyGroupLive(call, actorId, members)
+        publish(call, members)
+        return view(call, actorId)
+    }
+    // ------------------------------------------------------------------ answer (1:1)
+    CallView answer(callId: String, actorId: String) {
+        var self = this
+        var result = CallService.blank()
+        database.transaction(() -> {
+    result = self.answerIn(callId, actorId)
+})
+        return result
+    }
+    CallView answerIn(callId: String, actorId: String) {
+        var call = requireCall(callId, actorId)
+        if (call.modality() != "DIRECT") {
+            throw Errors.api(409, "NOT_A_DIRECT_CALL", "Chamadas de grupo sao atendidas entrando na sala.")
+        }
+        if (call.state() == "DECLINED") {
+            throw Errors.api(409, "CALL_DECLINED", "A chamada ja foi recusada.")
+        }
+        if (call.state() == "MISSED") {
+            throw Errors.api(409, "CALL_MISSED", "A chamada nao foi atendida a tempo.")
+        }
+        if (call.state() == "CANCELLED") {
+            throw Errors.api(409, "CALL_CANCELLED", "Quem ligou desistiu da chamada.")
+        }
+        var now = clock.now()
+        var from = call.state()
+        var moved = CallTransitions.extendTo(CallTransitions.moveTo(call, "CONNECTING", now, null), now, CallTransitions.emptyGroupTimeout())
+        if (!store.advance(moved, from)) {
+            // Another tab or action decided first: read again and answer the real state.
+            var current = requireCall(callId, actorId)
+            if (CallStates.allowsJoin(current.state())) {
+                return view(current, actorId)
+            }
+            throw Errors.api(409, "CALL_STATE_CONFLICT", "A chamada mudou de estado.")
+        }
+        store.decide(callId, actorId, "JOINED", now)
+        store.joinParticipant(callId, actorId, now)
+        publish(moved, audienceOf(moved))
+        return view(moved, actorId)
+    }
+    CallView decline(callId: String, actorId: String) {
+        var self = this
+        var result = CallService.blank()
+        database.transaction(() -> {
+    result = self.declineIn(callId, actorId)
+})
+        return result
+    }
+    CallView declineIn(callId: String, actorId: String) {
+        var call = requireCall(callId, actorId)
+        if (call.initiatorId() == actorId) {
+            return cancelIn(callId, actorId)
+        }
+        if (CallStates.isTerminal(call.state())) {
+            // Declining twice (a tab repeating the event) answers the same result.
+            return view(call, actorId)
+        }
+        if (!CallStates.allowsJoin(call.state()) && call.state() != "RINGING") {
+            throw Errors.api(409, "CALL_STATE_CONFLICT", "A chamada nao esta tocando.")
+        }
+        var now = clock.now()
+        var from = call.state()
+        var closed = CallTransitions.closeBy(call, actorId, "DECLINED", now, "DECLINED")
+        if (!store.advance(closed, from)) {
+            return view(requireCall(callId, actorId), actorId)
+        }
+        store.decide(callId, actorId, "DECLINED", now)
+        store.settleInvites(callId, "MISSED", now)
+        notifyEnded(closed, actorId)
+        publish(closed, audienceOf(closed))
+        return view(closed, actorId)
+    }
+    CallView cancel(callId: String, actorId: String) {
+        var self = this
+        var result = CallService.blank()
+        database.transaction(() -> {
+    result = self.cancelIn(callId, actorId)
+})
+        return result
+    }
+    CallView cancelIn(callId: String, actorId: String) {
+        var call = requireCall(callId, actorId)
+        if (CallStates.isTerminal(call.state())) {
+            // The caller repeated the request: the same result, no error.
+            return view(call, actorId)
+        }
+        if (call.initiatorId() != actorId) {
+            throw Errors.api(403, "NOT_CALL_INITIATOR", "So quem ligou pode cancelar a chamada.")
+        }
+        var now = clock.now()
+        var from = call.state()
+        var closed = CallTransitions.closeBy(call, actorId, "CANCELLED", now, "CANCELLED")
+        if (!store.advance(closed, from)) {
+            return view(requireCall(callId, actorId), actorId)
+        }
+        store.settleInvites(callId, "MISSED", now)
+        publish(closed, audienceOf(closed))
+        return view(closed, actorId)
+    }
+    // ------------------------------------------------------------------ room
+    // Authorizes the entry and issues a short token for THIS room. The token is never stored: it is good
+    // for this entry and expires by itself.
+    CallJoinView join(callId: String, actorId: String) {
+        var self = this
+        var result = CallJoinView("", "AUDIO", "DIRECT", "", 0L, "", "", CallService.blank())
+        database.transaction(() -> {
+    result = self.joinIn(callId, actorId)
+})
+        return result
+    }
+    CallJoinView joinIn(callId: String, actorId: String) {
+        requireConfigured()
+        var call = requireCall(callId, actorId)
+        audience.requireCanJoin(call, actorId)
+        if (!CallStates.allowsJoin(call.state())) {
+            logEntry(callId, actorId, false, call.state())
+            throw Errors.api(409, CallStates.terminalCode(call.state()), CallStates.terminalMessage(call.state()))
+        }
+        var now = clock.now()
+        var from = call.state()
+        // Entering twice (page reload, network retry) is the same entry, not a second participant.
+        store.joinParticipant(callId, actorId, now)
+        var current = CallTransitions.extendTo(call, now, CallTransitions.abandonTimeout())
+        if (from == "CONNECTING") {
+            current = CallTransitions.moveTo(current, "ACTIVE", now, null)
+        }
+        store.advance(current, from)
+        logEntry(callId, actorId, true, current.state())
+        var moderator = current.initiatorId() == actorId
+        var token = tokens.tokenFor(current.roomId(), actorId, profiles.displayName(actorId), moderator, now)
+        publish(current, audienceOf(current))
+        return CallJoinView(current.id(), current.kind(), current.modality(), tokens.host(), tokens.ttlSeconds, current.roomId(), token, view(current, actorId))
+    }
+    // Operational log without personal data: the call, who, granted or denied and the reason.
+    logEntry(callId: String, userId: String, granted: Bool, reason: String) {
+        log.info("call-entry call=" + callId + " user=" + userId + " granted=" + granted + " reason=" + reason)
+    }
+    CallView leave(callId: String, actorId: String) {
+        var self = this
+        var result = CallService.blank()
+        database.transaction(() -> {
+    result = self.leaveIn(callId, actorId)
+})
+        return result
+    }
+    CallView leaveIn(callId: String, actorId: String) {
+        var call = requireCall(callId, actorId)
+        var now = clock.now()
+        if (CallStates.isTerminal(call.state())) {
+            store.leaveParticipant(callId, actorId, now)
+            return view(call, actorId)
+        }
+        if (call.modality() == "DIRECT") {
+            return view(endOpenCall(call, actorId, "LEFT"), actorId)
+        }
+        store.leaveParticipant(callId, actorId, now)
+        if (store.countPresent(callId) == 0) {
+            return view(endOpenCall(call, actorId, "GROUP_EMPTY"), actorId)
+        }
+        publish(call, audienceOf(call))
+        return view(call, actorId)
+    }
+    CallView end(callId: String, actorId: String) {
+        var self = this
+        var result = CallService.blank()
+        database.transaction(() -> {
+    result = self.endIn(callId, actorId)
+})
+        return result
+    }
+    CallView endIn(callId: String, actorId: String) {
+        var call = requireCall(callId, actorId)
+        if (CallStates.isTerminal(call.state())) {
+            // Ending again (another tab, a retry) answers the same result without an error on screen.
+            store.leaveParticipant(callId, actorId, clock.now())
+            return view(call, actorId)
+        }
+        return view(endOpenCall(call, actorId, "ENDED"), actorId)
+    }
+    // A connection failure declared by the client (the screen lost the media): the person leaves the room
+    // instead of hanging as if inside. In a direct call, or in a group left empty, the call ends with an
+    // explicit failure; in a group with people, only who dropped leaves.
+    CallView fail(callId: String, actorId: String) {
+        var self = this
+        var result = CallService.blank()
+        database.transaction(() -> {
+    result = self.failIn(callId, actorId)
+})
+        return result
+    }
+    CallView failIn(callId: String, actorId: String) {
+        var call = requireCall(callId, actorId)
+        var now = clock.now()
+        if (CallStates.isTerminal(call.state())) {
+            store.leaveParticipant(callId, actorId, now)
+            return view(call, actorId)
+        }
+        if (call.modality() == "GROUP") {
+            store.leaveParticipant(callId, actorId, now)
+            if (store.countPresent(callId) > 0) {
+                publish(call, audienceOf(call))
+                return view(call, actorId)
+            }
+        }
+        var from = call.state()
+        var closed = CallTransitions.closeBy(call, actorId, "FAILED", now, "CONNECTION_LOST")
+        if (!store.advance(closed, from)) {
+            return view(requireCall(callId, actorId), actorId)
+        }
+        store.settleInvites(callId, "MISSED", now)
+        publish(closed, audienceOf(closed))
+        return view(closed, actorId)
+    }
+    // ------------------------------------------------------------------ reading
+    CallView get(callId: String, actorId: String) = view(requireCall(callId, actorId), actorId)
+    // What this person has open now: how to come back to the call from another page.
+    List<CallView> openFor(actorId: String) {
+        var out = listOf<CallView>()
+        for (var call in store.openByParticipant(actorId)) {
+            if (isAudience(call, actorId)) {
+                out.add(view(call, actorId))
+            }
+        }
+        return out
+    }
+    // The open call of a link, when the one asking can see it; null otherwise.
+    CallView? openOf(conversationId: String?, groupId: String?, actorId: String) {
+        var open = openCall(conversationId, groupId)
+        if (open == null) {
+            return null
+        }
+        if (!isAudience(open, actorId)) {
+            return null
+        }
+        return view(open, actorId)
+    }
+    CallRecord? openCall(conversationId: String?, groupId: String?) {
+        if (conversationId != null) {
+            return store.openByConversation(conversationId)
+        }
+        if (groupId != null) {
+            return store.openByGroup(groupId)
+        }
+        return null
+    }
+    // ------------------------------------------------------------------ worker
+    // Closes what expired (a 1:1 nobody answered, an empty group, a silent session). Idempotent.
+    Int expire(expired: List<CallRecord>, now: String) {
+        var self = this
+        var closed = 0
+        for (var call in expired) {
+            var done = false
+            database.transaction(() -> {
+    done = self.expireOne(call, now)
+})
+            if (done) {
+                closed = closed + 1
+            }
+        }
+        return closed
+    }
+    Bool expireOne(call: CallRecord, now: String) {
+        var from = call.state()
+        var reason = "TIMEOUT"
+        if (from == "CONNECTING") {
+            reason = "NO_CONNECTION"
+        }
+        var next = CallTransitions.expire(call, now, reason)
+        if (next.state() == from) {
+            return false
+        }
+        if (from == "ACTIVE") {
+            store.abandon(next, from, now, next.endReason())
+        }
+        else {
+            if (!store.advance(next, from)) {
+                return false
+            }
+        }
+        if (next.modality() == "DIRECT") {
+            store.settleInvites(next.id(), "MISSED", now)
+            notifyMissed(next)
+        }
+        publish(next, audienceOf(next))
+        return true
+    }
+    // ------------------------------------------------------------------ internal
+    CallRecord endOpenCall(call: CallRecord, actorId: String, reason: String) {
+        var now = clock.now()
+        var from = call.state()
+        var next = "ENDED"
+        if (from == "CONNECTING") {
+            next = "FAILED"
+        }
+        var closed = CallTransitions.closeBy(call, actorId, next, now, reason)
+        if (!store.advance(closed, from)) {
+            return call
+        }
+        store.settleInvites(call.id(), "MISSED", now)
+        notifyEnded(closed, actorId)
+        publish(closed, audienceOf(closed))
+        return closed
+    }
+    notifyIncoming(call: CallRecord, actorId: String, recipients: List<String>) {
+        var title = "Chamada de audio"
+        if (call.kind() == "VIDEO") {
+            title = "Chamada de video"
+        }
+        var body = call.displayName() + " esta ligando para voce."
+        for (var userId in recipients) {
+            notifications.create(userId, "CALL_INCOMING", actorId, title, body, CallService.callHref(call.id()), "Atender")
+        }
+    }
+    notifyGroupLive(call: CallRecord, actorId: String, members: List<String>) {
+        var live = "🔴 O grupo esta ao vivo! Entre na chamada quando quiser."
+        for (var userId in members) {
+            if (userId == actorId) {
+                continue
+            }
+            // One notice per call (the key is the call itself): it does not repeat at every entry.
+            notifications.createCounted(userId, "CALL_GROUP_LIVE", "call_live:" + call.id(), actorId, "Tamo junto ao vivo", live, (count: Int) -> live, CallService.callHref(call.id()), "Entrar")
+        }
+    }
+    notifyMissed(call: CallRecord) {
+        if (call.state() != "MISSED") {
+            return
+        }
+        for (var userId in audienceOf(call)) {
+            if (store.participantState(call.id(), userId) == "MISSED") {
+                notifications.create(userId, "CALL_MISSED", call.initiatorId(), "Chamada perdida", "Voce perdeu uma chamada de " + call.displayName() + ".", CallService.callHref(call.id()), "Ligar de volta")
+            }
+        }
+    }
+    notifyEnded(call: CallRecord, actorId: String) {
+        if (call.state() != "ENDED" && call.state() != "DECLINED") {
+            return
+        }
+        var href = CallService.callHref(call.id())
+        var conversationId = call.conversationId()
+        if (conversationId != null) {
+            href = "/api/conversations/" + conversationId
+        }
+        for (var userId in audienceOf(call)) {
+            if (userId == actorId) {
+                continue
+            }
+            notifications.create(userId, "CALL_ENDED", actorId, "Chamada encerrada", "A chamada de " + call.displayName() + " foi encerrada.", href, "Ver conversa")
+        }
+    }
+}

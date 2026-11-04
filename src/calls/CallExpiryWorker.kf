@@ -1,0 +1,35 @@
+package calls
+
+import kernel.config.*
+import kernel.jobs.*
+
+// Closes what nobody closed: a 1:1 nobody answered, an empty group call and a silent session. Without it
+// a call never answered would ring forever on somebody's screen. Every call is closed in its own
+// transaction and the transition is conditional: if a person decides first (answer, cancel, end), the
+// worker loses the race and does nothing.
+class CallExpiryWorker {
+    CallsStore store
+    CallService service
+    CallClock clock
+    public constructor(store: CallsStore, service: CallService, clock: CallClock) {
+        this.store = store
+        this.service = service
+        this.clock = clock
+    }
+    static Int batch() = 100
+    // The same path as the schedule, callable on demand (tests and support).
+    Int sweepOnce() {
+        var now = clock.now()
+        return service.expire(store.findExpired(now, CallExpiryWorker.batch()), now)
+    }
+    // @Scheduled(fixedDelay = 5s, initialDelay = 10s)
+    schedule(jobs: Scheduler, cfg: Config) {
+        var self = this
+        jobs.fixedDelay("call-expiry", cfg.getLong("REDE_CALLS_EXPIRY_INITIAL_DELAY_MS", 10000L), cfg.getLong("REDE_CALLS_EXPIRY_DELAY_MS", 5000L), () -> {
+    var closed = self.sweepOnce()
+    if (closed > 0) {
+        log.info("Chamadas expiradas fechadas: " + closed)
+    }
+})
+    }
+}
