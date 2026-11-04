@@ -1,0 +1,45 @@
+package projects
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+
+// Public read by username (the profile screen fetches it in parallel) and the owner's CRUD under
+// /me/projects. The card HTML goes through the sanitiser on write; the read hands it over ready.
+class ProjectsRoutes {
+    static register(server: HttpServer, service: ProjectsService) {
+        server.get("/users/:username/projects", () -> json.encode(ProjectViews.all(service.byUsername(Req.pathParam("username")))))
+        server.get("/me/projects", () -> ProjectsRoutes.mine(service))
+        server.post("/me/projects", () -> ProjectsRoutes.create(service))
+        server.put("/me/projects/:projectId", () -> ProjectsRoutes.update(service))
+        server.delete("/me/projects/:projectId", () -> ProjectsRoutes.delete(service))
+    }
+    static String mine(service: ProjectsService) {
+        var userId = Auth.requireUser()
+        return json.encode(ProjectViews.all(service.of(userId)))
+    }
+    static String create(service: ProjectsService) {
+        var userId = Auth.requireUser()
+        var request = ProjectsRoutes.parse()
+        return status(201, json.encode(ProjectViews.of(service.create(userId, request))))
+    }
+    static String update(service: ProjectsService) {
+        var userId = Auth.requireUser()
+        var request = ProjectsRoutes.parse()
+        return json.encode(ProjectViews.of(service.update(userId, Req.pathParam("projectId"), request)))
+    }
+    static String delete(service: ProjectsService) {
+        var userId = Auth.requireUser()
+        service.delete(userId, Req.pathParam("projectId"))
+        return status(204, "")
+    }
+    static ProjectRequest parse() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ProjectRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

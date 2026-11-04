@@ -1,0 +1,194 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import leaves.*
+
+// Port of UserProjectsTests (HTTP): the owner's CRUD, the public read by username, the limits and the
+// sanitising of the card HTML.
+class ProjectsHolder {
+    static TestApp? app = null
+}
+
+TestApp projectsApp() {
+    var cur = ProjectsHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = LeavesApp.boot("projects", mapOf("X", "1"))
+    ProjectsHolder.app = created
+    return created
+}
+
+List<String> asToken(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+
+// A verified user with a live session; its username is its id.
+String owner(app: TestApp, id: String) {
+    var token = "tok-" + id + "-1234567890"
+    if (app.db().queryLong("select count(*) from users where id = ?", DbParams().bindStr(id)) == 0L) {
+        SecurityFixtures.login(app.db(), id, token)
+    }
+    return token
+}
+
+String projectBody(title: String) = "{\"title\":" + json.encode(title) + ",\"stack\":[\"Java\",\"Spring Boot\"],\"repoUrl\":\"https://github.com/eu/projeto\",\"status\":\"em andamento\",\"diary\":[{\"date\":\"2026-10-17\",\"text\":\"primeiro commit\"}],\"html\":null}"
+
+TestResponse post(app: TestApp, token: String, payload: String) = app.client.send("POST", "/me/projects", asToken(token), "", payload)
+
+TestResponse put(app: TestApp, token: String, projectId: String, payload: String) = app.client.send("PUT", "/me/projects/" + projectId, asToken(token), "", payload)
+
+String createProject(app: TestApp, token: String, title: String) {
+    var res = post(app, token, projectBody(title))
+    Check.status(res, 201)
+    return "" + res.jsonStr("id")
+}
+
+test "create, list, public read by username, edit and delete" {
+    var app = projectsApp()
+    var token = owner(app, "user_proj_a")
+    var projectId = createProject(app, token, "Meu compilador")
+    Check.isTrue("proj_ id", projectId.startsWith("proj_"))
+    // Public read by username: stack, status, diary and repo are available.
+    var read = app.client.get("/users/user_proj_a/projects")
+    Check.status(read, 200)
+    Check.eqInt("one project", 1, read.jsonSize(""))
+    Check.jsonEq(read, "0.title", "Meu compilador")
+    Check.eqInt("stack", 2, read.jsonSize("0.stack"))
+    Check.eqInt("diary", 1, read.jsonSize("0.diary"))
+    Check.jsonEq(read, "0.repoUrl", "https://github.com/eu/projeto")
+    Check.jsonEq(read, "0.status", "em andamento")
+    Check.jsonEq(read, "0.diary.0.text", "primeiro commit")
+    Check.status(app.client.get("/v1/users/user_proj_a/projects"), 200)
+    var mine = app.client.getWith("/me/projects", asToken(token))
+    Check.eqInt("mine", 1, mine.jsonSize(""))
+    var edited = put(app, token, projectId, projectBody("Meu compilador v2"))
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "title", "Meu compilador v2")
+    Check.status(app.client.send("DELETE", "/me/projects/" + projectId, asToken(token), "", ""), 204)
+    var after = app.client.get("/users/user_proj_a/projects")
+    Check.status(after, 200)
+    Check.eqInt("none left", 0, after.jsonSize(""))
+    Check.apiError(app.client.get("/users/nobody_proj_here/projects"), 404, "PROFILE_NOT_FOUND")
+}
+
+test "the project HTML is sanitised" {
+    var app = projectsApp()
+    var token = owner(app, "user_proj_b")
+    var res = post(app, token, "{\"title\":\"Card HTML\",\"stack\":[],\"repoUrl\":null,\"status\":null,\"diary\":[],\"html\":\"<h2 style=\\\"color:red\\\">Meu projeto</h2><script>alert(1)</script>\"}")
+    Check.status(res, 201)
+    Check.isTrue("html is a string", res.jsonStr("html") != null)
+    Check.isTrue("no script", !res.body.contains("<script"))
+    Check.isTrue("content kept", res.body.contains("Meu projeto"))
+}
+
+test "a title that is too long and a non-https repository are refused" {
+    var app = projectsApp()
+    var token = owner(app, "user_proj_c")
+    var longTitle = strings.repeat("projeto-de-teste-", 8) + "x"
+    Check.apiError(post(app, token, "{\"title\":\"" + longTitle + "\"}"), 400, "FIELD_TOO_LONG")
+    Check.apiError(post(app, token, "{\"title\":\"X\",\"repoUrl\":\"http://inseguro.com/x\"}"), 400, "INVALID_REPO_URL")
+    Check.apiError(post(app, token, "{\"title\":\"  \"}"), 400, "INVALID_TITLE")
+    Check.apiError(post(app, token, "{}"), 400, "INVALID_TITLE")
+    Check.apiError(post(app, token, "{\"title\":\"X\",\"icon\":\"http://x/y.png\"}"), 400, "INVALID_ICON")
+    Check.apiError(post(app, token, "{\"title\":\"X\",\"stack\":[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\",\"j\",\"k\"]}"), 400, "INVALID_STACK")
+    Check.apiError(post(app, token, "{\"title\":\"X\",\"stack\":[\"" + strings.repeat("ab", 21) + "\"]}"), 400, "FIELD_TOO_LONG")
+    Check.apiError(post(app, token, "{\"title\":\"X\",\"description\":\"" + strings.repeat("ab", 251) + "\"}"), 400, "FIELD_TOO_LONG")
+    Check.apiError(post(app, token, "{\"title\":\"X\",\"status\":\"" + strings.repeat("ab", 21) + "\"}"), 400, "FIELD_TOO_LONG")
+    Check.apiError(post(app, token, "{\"title\":\"X\",\"diary\":[{\"date\":\"2026-10-17-extra\",\"text\":\"t\"}]}"), 400, "FIELD_TOO_LONG")
+    Check.apiError(post(app, token, "{\"title\":\"X\",\"html\":\"<script>alert(1)</script>\"}"), 400, "INVALID_PROJECT_HTML")
+    Check.apiError(post(app, token, "not json"), 400, "BAD_REQUEST")
+    Check.eqStr("title message", "Titulo deve ter no maximo 120 caracteres.", "" + post(app, token, "{\"title\":\"" + longTitle + "\"}").jsonStr("message"))
+    Check.eqStr("stack message", "Sao no maximo 10 tecnologias.", "" + post(app, token, "{\"title\":\"X\",\"stack\":[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\",\"j\",\"k\"]}").jsonStr("message"))
+}
+
+test "only the owner can edit and a stranger gets a 404" {
+    var app = projectsApp()
+    var ownerToken = owner(app, "user_proj_owner")
+    var stranger = owner(app, "user_proj_stranger")
+    var projectId = createProject(app, ownerToken, "Do dono")
+    // Another user: 404 (it does not reveal that it exists).
+    Check.apiError(put(app, stranger, projectId, projectBody("Hackeado")), 404, "PROJECT_NOT_FOUND")
+    Check.apiError(app.client.send("DELETE", "/me/projects/" + projectId, asToken(stranger), "", ""), 404, "PROJECT_NOT_FOUND")
+    Check.apiError(put(app, ownerToken, "proj_missing", projectBody("Nada")), 404, "PROJECT_NOT_FOUND")
+    Check.jsonEq(app.client.get("/users/user_proj_owner/projects"), "0.title", "Do dono")
+}
+
+test "a large project HTML is allowed" {
+    var app = projectsApp()
+    var token = owner(app, "user_proj_large_html")
+    // About 9,000 characters (over 5,000, inside the 20,000 ceiling).
+    var large = "<div><h2>Projeto Grande</h2><p style=\"color:#fff\">" + strings.repeat("Bloco de conteudo explicativo detalhado sobre a plataforma. ", 150) + "</p></div>"
+    Check.isTrue("over 5000", large.length() > 5000)
+    Check.isTrue("under 20000", large.length() < 20000)
+    var res = post(app, token, "{\"title\":\"NeoToons\",\"html\":" + json.encode(large) + ",\"stack\":[],\"diary\":[]}")
+    Check.status(res, 201)
+    Check.jsonEq(res, "title", "NeoToons")
+    Check.isTrue("content kept", res.body.contains("Projeto Grande"))
+}
+
+test "the banner and the icon round trip and refuse non-https" {
+    var app = projectsApp()
+    var token = owner(app, "user_proj_banner")
+    var res = post(app, token, "{\"title\":\"Com banner\",\"description\":\"card com imagem\",\"banner\":\"https://images.example/banner.png\",\"icon\":\"https://images.example/icon.png\",\"stack\":[],\"diary\":[]}")
+    Check.status(res, 201)
+    Check.jsonEq(res, "banner", "https://images.example/banner.png")
+    Check.jsonEq(res, "icon", "https://images.example/icon.png")
+    var projectId = "" + res.jsonStr("id")
+    // Public read by username: the images come out for whoever sees the profile.
+    var read = app.client.get("/users/user_proj_banner/projects")
+    Check.jsonEq(read, "0.id", projectId)
+    Check.jsonEq(read, "0.banner", "https://images.example/banner.png")
+    Check.jsonEq(read, "0.icon", "https://images.example/icon.png")
+    // Without https the banner and the icon refuse (the same guard as the repository).
+    Check.apiError(put(app, token, projectId, "{\"title\":\"Com banner\",\"banner\":\"http://inseguro.example/banner.png\",\"stack\":[],\"diary\":[]}"), 400, "INVALID_BANNER")
+}
+
+test "the project HTML keeps Unicode outside Latin-1" {
+    var app = projectsApp()
+    var token = owner(app, "user_proj_unicode_html")
+    var res = post(app, token, "{\"title\":\"Flecha\",\"html\":\"<p>Conhecer a Flecha →</p>\",\"stack\":[],\"diary\":[]}")
+    Check.status(res, 201)
+    Check.isTrue("arrow kept", res.body.contains("→"))
+}
+
+test "a diary entry accepts the whole LinkedIn description" {
+    var app = projectsApp()
+    var token = owner(app, "user_proj_diary_2000")
+    // A LinkedIn experience has up to 2,000 characters and becomes the first diary entry on import.
+    var description = strings.repeat("Entrega de plataforma com foco em desempenho, integracoes e suporte a times de produto em todos os ciclos. ", 30).substring(0, 2000)
+    var ok = post(app, token, "{\"title\":\"Projeto importado\",\"stack\":[],\"diary\":[{\"date\":\"2026-01-01\",\"text\":" + json.encode(description) + "}]}")
+    Check.status(ok, 201)
+    Check.eqInt("length", 2000, ("" + ok.jsonStr("diary.0.text")).length())
+    var tooLong = post(app, token, "{\"title\":\"Projeto importado 2\",\"stack\":[],\"diary\":[{\"date\":\"2026-01-01\",\"text\":" + json.encode(description + "x") + "}]}")
+    Check.apiError(tooLong, 400, "FIELD_TOO_LONG")
+}
+
+test "writes need a session" {
+    var app = projectsApp()
+    Check.apiError(app.client.send("POST", "/me/projects", listOf("Content-Type: application/json"), "", projectBody("X")), 401, "UNAUTHENTICATED")
+    Check.apiError(app.client.get("/me/projects"), 401, "UNAUTHENTICATED")
+}
+
+test "a profile holds at most 20 projects and the stack and diary are normalised" {
+    var app = projectsApp()
+    var token = owner(app, "user_proj_max")
+    var i = 0
+    while (i < 20) {
+        createProject(app, token, "Projeto " + i)
+        i = i + 1
+    }
+    Check.apiError(post(app, token, projectBody("Um a mais")), 400, "MAX_PROJECTS")
+    var read = app.client.getWith("/me/projects", asToken(token))
+    Check.eqInt("twenty", 20, read.jsonSize(""))
+    Check.jsonEq(read, "0.title", "Projeto 0")
+    var norm = owner(app, "user_proj_norm")
+    var res = post(app, norm, "{\"title\":\"  Normal  \",\"stack\":[\"  Go \",\"\",\"  \",\"Rust\"],\"status\":\"   \",\"diary\":[{\"date\":\" 2026-01-02 \",\"text\":\"x\"},{}]}")
+    Check.status(res, 201)
+    Check.jsonEq(res, "title", "Normal")
+    Check.eqInt("blank stack items dropped", 2, res.jsonSize("stack"))
+    Check.jsonEq(res, "stack.0", "Go")
+    Check.isTrue("blank status is null", res.jsonIsNull("status"))
+    Check.jsonEq(res, "diary.0.date", "2026-01-02")
+    Check.jsonEq(res, "diary.1.date", "")
+    Check.jsonEq(res, "diary.1.text", "")
+}

@@ -1,0 +1,161 @@
+package projects
+
+import kernel.error.*
+import kernel.html.*
+import kernel.id.*
+import kernel.text.*
+import kernel.time.*
+
+// Project cards of the profile: limits are the same for everybody, applied on create and on edit. The HTML,
+// when present, REPLACES the structured part on display (the data stays stored).
+class ProjectsService {
+    ProjectStore projects
+    ProjectsProfiles profiles
+    public constructor(projects: ProjectStore, profiles: ProjectsProfiles) {
+        this.projects = projects
+        this.profiles = profiles
+    }
+    static Int maxStackItems() = 10
+    static Int maxDiaryEntries() = 50
+    // A diary entry fits a LinkedIn project description (up to 2000 characters).
+    static Int maxDiaryText() = 2000
+    static Int maxProjects() = 20
+    // Public projects of someone (the profile screen asks by username).
+    List<ProjectRecord> byUsername(username: String) {
+        var userId = profiles.idByUsername(username)
+        if (userId == null) {
+            throw Errors.api(404, "PROFILE_NOT_FOUND", "Perfil nao encontrado.")
+        }
+        return projects.findByUser(userId)
+    }
+    List<ProjectRecord> of(userId: String) = projects.findByUser(userId)
+    ProjectRecord create(userId: String, input: ProjectRequest) {
+        var count = projects.countByUser(userId)
+        if (count >= ProjectsService.maxProjects()) {
+            throw Errors.api(400, "MAX_PROJECTS", "Sao no maximo " + ProjectsService.maxProjects() + " projetos por perfil.")
+        }
+        var card = ProjectsService.build(Ids.prefixed("proj_"), userId, input, count)
+        projects.save(card)
+        return card
+    }
+    ProjectRecord update(userId: String, projectId: String, input: ProjectRequest) {
+        var existing = this.owned(userId, projectId)
+        var card = ProjectsService.build(existing.id(), userId, input, existing.position())
+        projects.save(card)
+        return card
+    }
+    delete(userId: String, projectId: String) {
+        var existing = this.owned(userId, projectId)
+        projects.delete(existing.id())
+    }
+    // Somebody else's card is as missing as an absent one (it does not reveal that it exists).
+    ProjectRecord owned(userId: String, projectId: String) {
+        var project = projects.findById(projectId)
+        if (project == null) {
+            throw ProjectsService.notFound()
+        }
+        if (project.userId() != userId) {
+            throw ProjectsService.notFound()
+        }
+        return project
+    }
+    static String notFound() = Errors.api(404, "PROJECT_NOT_FOUND", "Projeto nao encontrado.")
+    static ProjectRecord build(id: String, userId: String, input: ProjectRequest, position: Int) {
+        var now = Time.nowIso()
+        var title = PlainText.defuse(input.title())
+        if (title == null) {
+            throw ProjectsService.invalidTitle()
+        }
+        if (title.trim().length() == 0) {
+            throw ProjectsService.invalidTitle()
+        }
+        if (title.length() > 120) {
+            throw Errors.api(400, "FIELD_TOO_LONG", "Titulo deve ter no maximo 120 caracteres.")
+        }
+        var description = PlainText.defuse(input.description())
+        ProjectsService.check(description, 500, "a descricao do projeto")
+        var rawStack = input.stack()
+        var stack = listOf<String>()
+        if (rawStack != null) {
+            if (rawStack.size() > ProjectsService.maxStackItems()) {
+                throw Errors.api(400, "INVALID_STACK", "Sao no maximo " + ProjectsService.maxStackItems() + " tecnologias.")
+            }
+            for (var raw in rawStack) {
+                var item = ProjectsService.trimmed(PlainText.defuse(raw))
+                if (item.length() > 0) {
+                    stack.add(item)
+                }
+            }
+            for (var item in stack) {
+                ProjectsService.check(item, 40, "cada tecnologia")
+            }
+        }
+        var repoUrl = ProjectsService.httpsUrl(input.repoUrl(), "INVALID_REPO_URL", "O link do repositorio deve ser https.")
+        var banner = ProjectsService.httpsUrl(input.banner(), "INVALID_BANNER", "O banner do projeto deve ser uma URL https.")
+        var icon = ProjectsService.httpsUrl(input.icon(), "INVALID_ICON", "O icone do projeto deve ser uma URL https.")
+        var status = PlainText.defuse(input.status())
+        ProjectsService.check(status, 40, "o status")
+        var rawDiary = input.diary()
+        var diary = listOf<ProjectDiaryEntry>()
+        if (rawDiary != null) {
+            if (rawDiary.size() > ProjectsService.maxDiaryEntries()) {
+                throw Errors.api(400, "INVALID_DIARY", "Sao no maximo " + ProjectsService.maxDiaryEntries() + " entradas no diario.")
+            }
+            for (var entry in rawDiary) {
+                var text = PlainText.defuse(entry.text())
+                ProjectsService.check(text, ProjectsService.maxDiaryText(), "cada entrada do diario")
+                var date = ProjectsService.trimmed(entry.date())
+                ProjectsService.check(date, 10, "a data do diario")
+                diary.add(ProjectDiaryEntry(date, ProjectsService.orEmpty(text)))
+            }
+        }
+        var rawHtml = input.html()
+        var html = SafeHtml.sanitizeProjectHtml(rawHtml)
+        if (html == null && rawHtml != null && rawHtml.trim().length() > 0) {
+            throw Errors.api(400, "INVALID_PROJECT_HTML", "HTML do projeto precisa de conteudo valido.")
+        }
+        return ProjectRecord(id, userId, position, title.trim(), description, banner, icon, stack, repoUrl, ProjectsService.blankToNull(status), diary, html, now, now)
+    }
+    static String invalidTitle() = Errors.api(400, "INVALID_TITLE", "O projeto precisa de um titulo.")
+    static String trimmed(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v.trim()
+    }
+    static String orEmpty(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    static String? blankToNull(v: String?) {
+        if (v == null) {
+            return null
+        }
+        if (v.trim().length() == 0) {
+            return null
+        }
+        return v.trim()
+    }
+    // Image or repository link: https only, with its own error.
+    static String? httpsUrl(raw: String?, code: String, message: String) {
+        if (raw == null) {
+            return null
+        }
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        var url = raw.trim()
+        if (!url.startsWith("https://")) {
+            throw Errors.api(400, code, message)
+        }
+        ProjectsService.check(url, 500, "o link")
+        return url
+    }
+    static check(value: String?, max: Int, label: String) {
+        if (value != null && value.length() > max) {
+            throw Errors.api(400, "FIELD_TOO_LONG", label + " deve ter no maximo " + max + " caracteres.")
+        }
+    }
+}
