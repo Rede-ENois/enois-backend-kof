@@ -1,0 +1,210 @@
+package notifications
+
+import java.time.Instant
+import java.util.HashMap
+import java.util.HashSet
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.time.*
+
+// A reaction to a created notification (what the Java code does with an
+// `@TransactionalEventListener(AFTER_COMMIT)` on NotificationCreatedEvent). Extend it, override
+// `onCreated`, register with `Notifications.addListener`. Push is the first listener.
+class NotificationListener {
+    public constructor() {}
+    onCreated(event: NotificationCreatedEvent);
+}
+
+// GET /notifications/unread-summary.
+record NotificationUnreadSummary(Int total, Map<String,Int> byModule, Map<String,Int> byCommunity, Int eventsToday)
+
+// THE API other domains write notifications through (NotificationService). Every create runs in a
+// transaction (a caller's one is joined) and publishes the `NotificationCreatedEvent` after the commit.
+//
+//   notifications.create(userId, "NEW_COMMENT", actorId, "Novo comentario", "Ana comentou.", "/api/feed/posts/p1", "Ver")
+//   notifications.createWithPreview(..., preview)                    // preview: NotificationPreviews.of(content)
+//   notifications.createGrouped(userId, kind, groupKey, actorId, title, body, (n: Int) -> "...", href, groupedHref, cta, preview)
+//   notifications.createCounted(userId, kind, groupKey, actorId, title, body, (n: Int) -> n + " novas", href, cta)
+//   notifications.createCountedAndPushed(...)                        // same, and every increment pushes
+//   notifications.markReadByHref(userId, href)
+class Notifications {
+    Db database
+    NotificationsStore store
+    NotificationPlaces places
+    List<NotificationListener> listeners = listOf<NotificationListener>()
+    public constructor(database: Db, store: NotificationsStore, places: NotificationPlaces) {
+        this.database = database
+        this.store = store
+        this.places = places
+    }
+    addListener(listener: NotificationListener) {
+        listeners.add(listener)
+    }
+    static String newId() = Ids.prefixed("notification_")
+    // Notificacao simples: o aviso e o evento de push.
+    NotificationRecord create(userId: String, kind: String, actorId: String, title: String, body: String, href: String?, ctaLabel: String?) = createWithPreview(userId, kind, actorId, title, body, href, ctaLabel, null)
+    NotificationRecord createWithPreview(userId: String, kind: String, actorId: String, title: String, body: String, href: String?, ctaLabel: String?, preview: String?) {
+        var self = this
+        var id = Notifications.newId()
+        var created = NotificationRecord(id, userId, kind, actorId, title, body, href, ctaLabel, false, Time.nowIso(), null, 1, preview)
+        database.transaction(() -> {
+    self.store.insert(created)
+    self.publish(id, userId, kind, title, body, href, null)
+})
+        return created
+    }
+    // Reactions to the same target share one unread notification: the actor count grows, the body is
+    // rewritten for the count and the notification returns to the top. Only the first one pushes.
+    NotificationRecord createGrouped(userId: String, kind: String, groupKey: String, actorId: String, title: String, body: String, groupedBody: (Int) -> String, href: String?, groupedHref: String?, ctaLabel: String?, preview: String?) {
+        var self = this
+        var result = NotificationRecord("", userId, kind, actorId, title, body, href, ctaLabel, false, Time.nowIso(), groupKey, 1, preview)
+        database.transaction(() -> {
+    var unread = self.store.findUnreadGroup(userId, groupKey)
+    if (unread == null) {
+        result = self.createFirstOfGroup(userId, kind, groupKey, actorId, title, body, href, ctaLabel, null, preview)
+        return
+    }
+    var count = unread.actorCount() + 1
+    if (actorId == unread.actorId()) {
+        count = unread.actorCount()
+    }
+    var nextBody = body
+    var nextHref = href
+    if (count != 1) {
+        nextBody = groupedBody(count)
+        nextHref = groupedHref
+    }
+    var joined = NotificationRecord(unread.id(), unread.userId(), unread.kind(), actorId, unread.title(), nextBody, nextHref, unread.ctaLabel(), false, Time.nowIso(), unread.groupKey(), count, unread.preview())
+    self.store.updateJoined(joined)
+    result = joined
+})
+        return result
+    }
+    // A counter ("3 novas mensagens"): every call counts, the first one pushes.
+    NotificationRecord createCounted(userId: String, kind: String, groupKey: String, actorId: String, title: String, body: String, countedBody: (Int) -> String, href: String?, ctaLabel: String?) = counted(userId, kind, groupKey, actorId, title, body, countedBody, href, ctaLabel, false)
+    // Same, and every increment pushes too (messages), replacing the previous push on the device.
+    NotificationRecord createCountedAndPushed(userId: String, kind: String, groupKey: String, actorId: String, title: String, body: String, countedBody: (Int) -> String, href: String?, ctaLabel: String?) = counted(userId, kind, groupKey, actorId, title, body, countedBody, href, ctaLabel, true)
+    NotificationRecord counted(userId: String, kind: String, groupKey: String, actorId: String, title: String, body: String, countedBody: (Int) -> String, href: String?, ctaLabel: String?, pushEach: Bool) {
+        var self = this
+        var result = NotificationRecord("", userId, kind, actorId, title, body, href, ctaLabel, false, Time.nowIso(), groupKey, 1, null)
+        database.transaction(() -> {
+    var unread = self.store.findUnreadGroup(userId, groupKey)
+    if (unread == null) {
+        result = self.createFirstOfGroup(userId, kind, groupKey, actorId, title, body, href, ctaLabel, Notifications.tagFor(pushEach, groupKey), null)
+        return
+    }
+    var count = unread.actorCount() + 1
+    var joinedBody = countedBody(count)
+    var joined = NotificationRecord(unread.id(), unread.userId(), unread.kind(), actorId, unread.title(), joinedBody, href, unread.ctaLabel(), false, Time.nowIso(), unread.groupKey(), count, unread.preview())
+    self.store.updateJoined(joined)
+    if (pushEach) {
+        self.publish(unread.id(), userId, kind, title, joinedBody, href, groupKey)
+    }
+    result = joined
+})
+        return result
+    }
+    static String? tagFor(pushEach: Bool, groupKey: String) {
+        if (pushEach) {
+            return groupKey
+        }
+        return null
+    }
+    NotificationRecord createFirstOfGroup(userId: String, kind: String, groupKey: String, actorId: String, title: String, body: String, href: String?, ctaLabel: String?, pushTag: String?, preview: String?) {
+        var id = Notifications.newId()
+        var created = NotificationRecord(id, userId, kind, actorId, title, body, href, ctaLabel, false, Time.nowIso(), groupKey, 1, preview)
+        store.insert(created)
+        publish(id, userId, kind, title, body, href, pushTag)
+        return created
+    }
+    // The event goes out after the outermost commit (dropped on rollback), like AFTER_COMMIT.
+    publish(id: String, userId: String, kind: String, title: String, body: String, href: String?, tag: String?) {
+        var self = this
+        var hrefText = ""
+        if (href != null) {
+            hrefText = href
+        }
+        var event = NotificationCreatedEvent(id, userId, kind, title, body, hrefText, tag)
+        database.afterCommit(() -> {
+    for (var listener in self.listeners) {
+        listener.onCreated(event)
+    }
+})
+    }
+    markReadByHref(userId: String, href: String) {
+        store.markReadByHref(userId, href)
+    }
+    // 404 NOTIFICATION_NOT_FOUND, 403 FORBIDDEN when it belongs to someone else.
+    NotificationRecord markRead(notificationId: String, userId: String) {
+        var n = store.findById(notificationId)
+        if (n == null) {
+            throw Errors.api(404, "NOTIFICATION_NOT_FOUND", "Notificacao nao encontrada.")
+        }
+        if (n.userId() != userId) {
+            throw Errors.api(403, "FORBIDDEN", "Esta notificacao nao pertence a voce.")
+        }
+        store.markRead(notificationId)
+        return NotificationRecord(n.id(), n.userId(), n.kind(), n.actorId(), n.title(), n.body(), n.href(), n.ctaLabel(), true, n.createdAt(), n.groupKey(), n.actorCount(), n.preview())
+    }
+    markAllRead(userId: String) {
+        store.markAllRead(userId)
+    }
+    // PageRequest.of(0, limit) refuses a limit under 1: the IllegalArgumentException handler answers 400.
+    List<NotificationRecord> list(userId: String, before: String?, context: String?, limit: Int) {
+        if (limit < 1) {
+            throw Errors.badRequest()
+        }
+        return store.findByUser(userId, before, context, limit)
+    }
+    List<NotificationRecord> listRecent(userId: String, limit: Int) = list(userId, null, null, limit)
+    NotificationUnreadSummary unreadSummary(userId: String, context: String?, hiddenActorIds: HashSet<String>) {
+        var byModule = new HashMap<String, Int>()
+        var countByHref = new HashMap<String, Int>()
+        var total = 0
+        for (var row in store.countUnread(userId, context)) {
+            var actor = row.actorId()
+            if (actor != null && hiddenActorIds.contains(actor)) {
+                continue
+            }
+            if (NotificationModules.hasOwnChannel(row.kind())) {
+                continue
+            }
+            var count = row.count() as Int
+            var module = NotificationModules.of(row.kind())
+            byModule.put(module, byModule.getOrDefault(module, 0) + count)
+            var href = row.href()
+            if (href != null) {
+                countByHref.put(href, countByHref.getOrDefault(href, 0) + count)
+            }
+            total = total + count
+        }
+        var byCommunity = new HashMap<String, Int>()
+        var resolved = places.resolve(countByHref.keys())
+        for (var href in resolved.keys()) {
+            var r = resolved.get(href)
+            if (r == null) {
+                continue
+            }
+            var place = r.place()
+            if (place != null && place.type() == "COMMUNITY") {
+                byCommunity.put(place.id(), byCommunity.getOrDefault(place.id(), 0) + countByHref.getOrDefault(href, 0))
+            }
+        }
+        var eventsToday = 0
+        if (context != "PROFESSIONAL") {
+            eventsToday = places.eventsToday(userId)
+        }
+        return NotificationUnreadSummary(total, Notifications.sorted(byModule), Notifications.sorted(byCommunity), eventsToday)
+    }
+    // Map in key order (EnumMap / TreeMap in Java).
+    static Map<String,Int> sorted(m: Map<String,Int>) {
+        var keys = m.keys()
+        keys.sort()
+        var out = new HashMap<String, Int>()
+        for (var k in keys) {
+            out.put(k, m.getOrDefault(k, 0))
+        }
+        return out
+    }
+}

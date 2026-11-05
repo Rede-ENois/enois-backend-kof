@@ -1,0 +1,83 @@
+package calls
+
+import java.util.Base64
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+import kernel.config.*
+import kernel.error.*
+import kernel.time.*
+
+// The entry token for the self hosted Jitsi (docker-jitsi-meet with AUTH_TYPE=jwt): an HS256 JWT that the
+// Prosody token plugin checks with the same secret as the server. The secret never leaves here.
+//
+// Without an address or with a secret under 32 bytes `isConfigured()` is false and the service answers
+// 503 CALLS_NOT_CONFIGURED instead of pointing the panel to an instance without access control.
+//   REDE_CALLS_JITSI_URL, REDE_CALLS_JITSI_JWT_SECRET, REDE_CALLS_JITSI_JWT_ISSUER (rede),
+//   REDE_CALLS_JITSI_JWT_AUDIENCE (meet.jitsi), REDE_CALLS_JITSI_TOKEN_TTL_MINUTES (120)
+class MeetingTokenIssuer {
+    String url
+    String secret
+    String issuer
+    String audience
+    Long ttlSeconds
+    public constructor(url: String, secret: String, issuer: String, audience: String, ttlMinutes: Long) {
+        this.url = MeetingTokenIssuer.normalize(url)
+        this.secret = secret.trim()
+        this.issuer = MeetingTokenIssuer.blankTo(issuer, "rede")
+        this.audience = MeetingTokenIssuer.blankTo(audience, "meet.jitsi")
+        var minutes = ttlMinutes
+        if (minutes < 1L) {
+            minutes = 1L
+        }
+        this.ttlSeconds = minutes * 60L
+    }
+    static MeetingTokenIssuer fromConfig(cfg: Config) = MeetingTokenIssuer(cfg.getStr("REDE_CALLS_JITSI_URL", ""), cfg.getStr("REDE_CALLS_JITSI_JWT_SECRET", ""), cfg.getStr("REDE_CALLS_JITSI_JWT_ISSUER", "rede"), cfg.getStr("REDE_CALLS_JITSI_JWT_AUDIENCE", "meet.jitsi"), cfg.getLong("REDE_CALLS_JITSI_TOKEN_TTL_MINUTES", 120L))
+    // No trailing slash: the client builds host/room. Blank stays blank (not configured).
+    static String normalize(raw: String) {
+        var t = raw.trim()
+        while (t.endsWith("/")) {
+            t = t.substring(0, t.length() - 1)
+        }
+        return t
+    }
+    static String blankTo(value: String, fallback: String) {
+        if (value.trim().length() == 0) {
+            return fallback
+        }
+        return value.trim()
+    }
+    Bool isConfigured() = url.length() > 0 && secret.getBytes().length >= 32
+    String host() {
+        if (!isConfigured()) {
+            throw MeetingTokenIssuer.notConfigured()
+        }
+        return url
+    }
+    static String notConfigured() = Errors.api(503, "CALLS_NOT_CONFIGURED", "As chamadas ainda nao estao configuradas neste ambiente.")
+    static String b64(bytes: Byte[]) = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+    String features() = "{\"recording\":false,\"livestreaming\":false,\"transcription\":false"
+    // The claims the Jitsi needs: the room in the token (the URL cannot move the person to another
+    // call), the person, and every feature that records or broadcasts switched off.
+    String claims(roomId: String, userId: String, displayName: String, moderator: Bool, now: String) {
+        var name = displayName
+        if (name.trim().length() == 0) {
+            name = "Convidado"
+        }
+        var issued = Time.toMillis(now) / 1000L
+        var user = "{\"id\":" + json.encode(userId) + ",\"name\":" + json.encode(name) + ",\"moderator\":" + moderator + ",\"features\":" + features() + ",\"outbound-call\":false}}"
+        var context = "{\"user\":" + user + ",\"moderator\":" + moderator + ",\"room\":{\"moderator\":false},\"features\":" + features() + "}}"
+        return "{\"iss\":" + json.encode(issuer) + ",\"room\":" + json.encode(roomId) + ",\"sub\":" + json.encode(roomId) + ",\"iat\":" + issued + ",\"nbf\":" + (issued - 30L) + ",\"exp\":" + (issued + ttlSeconds) + ",\"context\":" + context + ",\"aud\":" + json.encode(audience) + "}"
+    }
+    String tokenFor(roomId: String, userId: String, displayName: String, moderator: Bool, now: String) {
+        if (!isConfigured()) {
+            throw MeetingTokenIssuer.notConfigured()
+        }
+        var header = MeetingTokenIssuer.b64("{\"alg\":\"HS256\",\"typ\":\"JWT\"}".getBytes())
+        var payload = MeetingTokenIssuer.b64(claims(roomId, userId, displayName, moderator, now).getBytes())
+        var signingInput = header + "." + payload
+        var key = secret.getBytes() as Byte[]
+        var mac = Mac.getInstance("HmacSHA256")
+        mac.init(new SecretKeySpec(key, "HmacSHA256"))
+        return signingInput + "." + MeetingTokenIssuer.b64(mac.doFinal(signingInput.getBytes()))
+    }
+}

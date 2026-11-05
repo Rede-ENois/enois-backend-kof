@@ -1,0 +1,41 @@
+package push
+
+import kernel.db.*
+import kernel.time.*
+
+// SQL of `push_subscriptions`.
+class PushStore {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    static String columns() = "id, user_id, endpoint, p256dh, auth, created_at, last_seen_at"
+    static PushSubscriptionRecord toRecord(r: DbRow) = PushSubscriptionRecord(r.getStr("id"), r.getStr("user_id"), r.getStr("endpoint"), r.getStr("p256dh"), r.getStr("auth"), r.getInstant("created_at"), r.getInstantOrNull("last_seen_at"))
+    PushSubscriptionRecord? findByEndpoint(endpoint: String) {
+        var row = database.queryOptional("select " + PushStore.columns() + " from push_subscriptions where endpoint = ?", DbParams().bindStr(endpoint))
+        if (row == null) {
+            return null
+        }
+        return PushStore.toRecord(row)
+    }
+    List<PushSubscriptionRecord> findByUser(userId: String) {
+        var out = listOf<PushSubscriptionRecord>()
+        for (var r in database.queryList("select " + PushStore.columns() + " from push_subscriptions where user_id = ? order by created_at, id", DbParams().bindStr(userId))) {
+            out.add(PushStore.toRecord(r))
+        }
+        return out
+    }
+    insert(s: PushSubscriptionRecord) {
+        database.execute("insert into push_subscriptions (" + PushStore.columns() + ") values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(s.id()).bindStr(s.userId()).bindStr(s.endpoint()).bindStr(s.p256dh()).bindStr(s.auth()).bindInstant(s.createdAt()).bindInstantOrNull(s.lastSeenAt()))
+    }
+    // An endpoint that registers again keeps its row and id, and moves to the current account.
+    update(s: PushSubscriptionRecord) {
+        database.execute("update push_subscriptions set user_id = ?, endpoint = ?, p256dh = ?, auth = ?, last_seen_at = ? where id = ?", DbParams().bindStr(s.userId()).bindStr(s.endpoint()).bindStr(s.p256dh()).bindStr(s.auth()).bindInstantOrNull(s.lastSeenAt()).bindStr(s.id()))
+    }
+    deleteById(id: String) {
+        database.execute("delete from push_subscriptions where id = ?", DbParams().bindStr(id))
+    }
+    deleteByEndpointAndUser(endpoint: String, userId: String) {
+        database.execute("delete from push_subscriptions where endpoint = ? and user_id = ?", DbParams().bindStr(endpoint).bindStr(userId))
+    }
+}

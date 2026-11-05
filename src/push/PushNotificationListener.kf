@@ -1,0 +1,72 @@
+package push
+
+import java.util.concurrent.atomic.AtomicInteger
+import kernel.db.*
+import kernel.log.*
+import notifications.*
+
+// pending-port: presence. Does the person accept push right now (PresenceService.allowPush: anything but
+// DO_NOT_DISTURB). The default reads `user_presence` read-only; the presence port may subclass it.
+class PushPresence {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    Bool allowPush(userId: String) {
+        var row = database.queryOptional("select status from user_presence where user_id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return true
+        }
+        return row.getStr("status") != "DO_NOT_DISTURB"
+    }
+}
+
+// Sends the push of a created notification after the commit (PushNotificationListener). Delivery runs
+// on its own task so the request never waits for a push service; at most QUEUE_CAPACITY deliveries are
+// in flight, the rest are dropped with a warning (the notification stays in the inbox). `inline` runs
+// the delivery in the caller instead (tests, like the Java suites that run the executor inline).
+class PushNotificationListener extends NotificationListener {
+    PushSender sender
+    NotificationPreferenceService preferences
+    PushPresence presence
+    Bool inline
+    AtomicInteger inflight = new AtomicInteger(0)
+    Log log = Log("push.listener")
+    public constructor(sender: PushSender, preferences: NotificationPreferenceService, presence: PushPresence, inline: Bool) {
+        super()
+        this.sender = sender
+        this.preferences = preferences
+        this.presence = presence
+        this.inline = inline
+    }
+    static Int queueCapacity() = 500
+    onCreated(event: NotificationCreatedEvent) {
+        if (inline) {
+            deliver(event)
+            return
+        }
+        if (inflight.get() >= PushNotificationListener.queueCapacity()) {
+            log.warn("fila de push cheia; notificacao nao enviada ao celular do usuario " + event.userId())
+            return
+        }
+        inflight.incrementAndGet()
+        spawn this.deliverTracked(event)
+    }
+    deliverTracked(event: NotificationCreatedEvent) {
+        try {
+            deliver(event)
+        } catch (String failed) {
+            log.warn("push_delivery_failed " + failed)
+        }
+        inflight.decrementAndGet()
+    }
+    deliver(event: NotificationCreatedEvent) {
+        if (NotificationCategories.of(event.kind()) != "ALWAYS" && !presence.allowPush(event.userId())) {
+            return
+        }
+        if (!preferences.allowsPush(event.userId(), event.kind())) {
+            return
+        }
+        sender.sendToUser(event.userId(), PushMessage(event.notificationId(), event.title(), event.body(), event.href(), event.tag()))
+    }
+}

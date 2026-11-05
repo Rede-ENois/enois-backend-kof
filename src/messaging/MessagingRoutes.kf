@@ -1,0 +1,478 @@
+package messaging
+
+import java.time.Instant
+import java.util.HashMap
+import kernel.blocks.*
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+import notifications.*
+
+record CreateConversationBody(String? kind, String? title, List<String>? participantIds)
+
+record DirectConversationBody(String? userId)
+
+record HideIdsBody(List<String>? ids)
+
+record SendMessageBody(String? text, List<String>? mediaIds, String? iv, String? replyToId)
+
+record ReactToMessageBody(String? type)
+
+record MessagingHiddenBody(Int hidden)
+
+record MessagingRestoredBody(Int restored)
+
+record MessagingReactionBody(String status)
+
+// HTTP adapter of conversations and messages (MessagingContractController): /conversations/**.
+class MessagingRoutes {
+    static register(server: HttpServer, service: MessagingService, corporate: MessagingCorporate, blocked: BlockedUsers, idempotency: Idempotency) {
+        server.get("/conversations", () -> MessagingRoutes.list(service, corporate, false))
+        server.get("/conversations/unread-count", () -> MessagingRoutes.unreadCount(service))
+        server.get("/conversations/search", () -> MessagingRoutes.search(service, corporate))
+        server.get("/conversations/archived", () -> MessagingRoutes.list(service, corporate, true))
+        server.get("/conversations/stream", () -> MessagingRoutes.stream())
+        server.post("/conversations/direct", () -> MessagingRoutes.direct(service, corporate, blocked, idempotency, false))
+        server.post("/conversations/business-direct", () -> MessagingRoutes.direct(service, corporate, blocked, idempotency, true))
+        server.post("/conversations/hide", () -> MessagingRoutes.hide(service, idempotency, true))
+        server.post("/conversations/unhide", () -> MessagingRoutes.hide(service, idempotency, false))
+        server.post("/conversations", () -> MessagingRoutes.create(service, corporate, idempotency))
+        server.get("/conversations/:conversationId", () -> MessagingRoutes.detail(service, corporate))
+        server.get("/conversations/:conversationId/messages", () -> MessagingRoutes.messages(service))
+        server.post("/conversations/:conversationId/messages/hide", () -> MessagingRoutes.hideMessages(service, idempotency))
+        server.post("/conversations/:conversationId/messages", () -> MessagingRoutes.send(service, idempotency))
+        server.post("/conversations/:conversationId/read", () -> MessagingRoutes.read(service, idempotency))
+        server.post("/conversations/:conversationId/viewing", () -> MessagingRoutes.viewing(service))
+        server.delete("/conversations/:conversationId/viewing", () -> MessagingRoutes.leave(service))
+        server.post("/conversations/:conversationId/messages/:messageId/reactions", () -> MessagingRoutes.react(service, idempotency))
+        server.get("/conversations/:conversationId/messages/:messageId/reactions", () -> MessagingRoutes.reactions(service))
+    }
+    // The text/event-stream channel needs response streaming the Kof runtime lacks (G201): an anonymous caller
+    // gets the bare 401 EventSource needs, a signed in one an immediately closed stream that tells it to retry.
+    static String stream() {
+        var userId = ""
+        try {
+            userId = Auth.requireUser()
+        } catch (String rejected) {
+            return status(401, "")
+        }
+        ResponseHeaders.set("Content-Type", "text/event-stream")
+        ResponseHeaders.set("Cache-Control", "no-cache")
+        ResponseHeaders.set("X-Accel-Buffering", "no")
+        return "retry: 5000\n: connected\n\n"
+    }
+    static String? parseContext(raw: String) {
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        var upper = raw.trim().toUpperCase()
+        if (upper == "SOCIAL" || upper == "PROFESSIONAL") {
+            return upper
+        }
+        throw Errors.api(400, "INVALID_CONTEXT", "Contexto invalido: use SOCIAL ou PROFESSIONAL.")
+    }
+    static String? decodeCursor(raw: String) = NotificationCursor.decode(raw)
+    static String? lastReadOfOthers(participants: List<ParticipantRecord>, viewerId: String) {
+        var best = ""
+        for (var p in participants) {
+            var at = p.lastReadAt()
+            if (p.userId() == viewerId) {
+                continue
+            }
+            if (at != null) {
+                if (best.length() == 0 || Instant.parse(at).isAfter(Instant.parse(best))) {
+                    best = at
+                }
+            }
+        }
+        if (best.length() == 0) {
+            return null
+        }
+        return best
+    }
+    static Map<String,MessagingIdentity> identities(corporate: MessagingCorporate, context: String, participantIds: List<String>) {
+        if (context != "PROFESSIONAL") {
+            return new HashMap<String, MessagingIdentity>()
+        }
+        return corporate.activeByUserIds(participantIds)
+    }
+    static List<String> idsOf(participants: List<ParticipantRecord>) {
+        var out = listOf<String>()
+        for (var p in participants) {
+            out.add(p.userId())
+        }
+        return out
+    }
+    static ConversationView listView(service: MessagingService, corporate: MessagingCorporate, c: ConversationRecord, viewerId: String) {
+        var participants = service.getParticipants(c.id())
+        var ids = MessagingRoutes.idsOf(participants)
+        var last = service.lastMessagePreview(c.id())
+        var context = ConversationContexts.of(c.kind())
+        return ConversationView(c.id(), viewerId, c.kind(), context, c.title(), ids, MessagingRoutes.identities(corporate, context, ids), last.text(), last.time(), service.countUnread(c.id(), viewerId), MessagingRoutes.lastReadOfOthers(participants, viewerId), last.e2e(), last.iv(), last.from())
+    }
+    static ConversationDetailView detailView(service: MessagingService, corporate: MessagingCorporate, c: ConversationRecord, viewerId: String) {
+        var participants = service.getParticipants(c.id())
+        var ids = MessagingRoutes.idsOf(participants)
+        var last = service.lastMessagePreview(c.id())
+        var context = ConversationContexts.of(c.kind())
+        return ConversationDetailView(c.id(), c.kind(), context, c.title(), ids, MessagingRoutes.identities(corporate, context, ids), last.text(), service.countUnread(c.id(), viewerId), MessagingRoutes.lastReadOfOthers(participants, viewerId), last.e2e(), last.iv(), last.from())
+    }
+    static String list(service: MessagingService, corporate: MessagingCorporate, archived: Bool) {
+        var userId = Auth.requireUser()
+        var limit = Req.queryInt("limit", 20)
+        var cap = 100
+        if (archived) {
+            cap = 50
+        }
+        limit = MessagingService.clamp(limit, 1, cap)
+        var before = MessagingRoutes.decodeCursor(Req.queryStr("cursor", ""))
+        var context = MessagingRoutes.parseContext(Req.queryStr("context", ""))
+        var page = service.listConversations(userId, before, context, limit)
+        if (archived) {
+            page = service.listArchived(userId, before, context, limit)
+        }
+        var items = listOf<ConversationView>()
+        for (var c in page) {
+            items.add(MessagingRoutes.listView(service, corporate, c, userId))
+        }
+        return json.encode(ConversationPage(items, MessagingRoutes.nextConversationCursor(page, limit)))
+    }
+    static String unreadCount(service: MessagingService) {
+        var userId = Auth.requireUser()
+        var context = MessagingRoutes.parseContext(Req.queryStr("context", ""))
+        return json.encode(MessagingCountBody(service.countTotalUnread(userId, context)))
+    }
+    static String search(service: MessagingService, corporate: MessagingCorporate) {
+        var userId = Auth.requireUser()
+        var limit = MessagingService.clamp(Req.queryInt("limit", 20), 1, 100)
+        var context = MessagingRoutes.parseContext(Req.queryStr("context", ""))
+        var query = Req.queryStr("q", "").toLowerCase()
+        var items = listOf<ConversationView>()
+        for (var c in service.listConversations(userId, null, context, limit)) {
+            var title = c.title()
+            if (query.length() == 0 || title != null && title.toLowerCase().contains(query)) {
+                items.add(MessagingRoutes.listView(service, corporate, c, userId))
+            }
+        }
+        return json.encode(ConversationPage(items, null))
+    }
+    static String detail(service: MessagingService, corporate: MessagingCorporate) {
+        var userId = Auth.requireUser()
+        var id = Req.pathParam("conversationId")
+        if (!service.isParticipant(id, userId)) {
+            throw MessagingService.notParticipantError()
+        }
+        return json.encode(MessagingRoutes.detailView(service, corporate, service.getConversation(id), userId))
+    }
+    static String? nextConversationCursor(page: List<ConversationRecord>, limit: Int) {
+        if (page.size() == limit) {
+            return page.get(page.size() - 1).updatedAt()
+        }
+        return null
+    }
+    static String? nextMessageCursor(page: List<MessageRecord>, limit: Int) {
+        if (page.size() == limit && !page.isEmpty()) {
+            return page.get(page.size() - 1).createdAt()
+        }
+        return null
+    }
+    static String? mineOf(summary: MessageReactionSummary?) {
+        if (summary == null) {
+            return null
+        }
+        return summary.myReaction()
+    }
+    static Map<String,Int> countsOf(summary: MessageReactionSummary?) {
+        if (summary == null) {
+            return new HashMap<String, Int>()
+        }
+        return summary.counts()
+    }
+    static MessageReplyView? replyOf(m: MessageRecord, replied: Map<String,MessageRecord>) {
+        var replyId = m.replyToId()
+        if (replyId == null) {
+            return null
+        }
+        var target = replied.get(replyId)
+        if (target == null) {
+            return null
+        }
+        return MessageReplyView(target.id(), target.senderId(), MessagingRoutes.shorten(target.text()), target.e2e())
+    }
+    static String shorten(text: String) {
+        if (text.length() > 100) {
+            return text.substring(0, 97) + "..."
+        }
+        return text
+    }
+    static String messages(service: MessagingService) {
+        var userId = Auth.requireUser()
+        var id = Req.pathParam("conversationId")
+        if (!service.isParticipant(id, userId)) {
+            throw MessagingService.notParticipantError()
+        }
+        var limit = MessagingService.clamp(Req.queryInt("limit", 50), 1, 100)
+        var before = MessagingRoutes.decodeCursor(Req.queryStr("cursor", ""))
+        var page = service.getMessages(id, userId, before, limit)
+        var messageIds = listOf<String>()
+        var replyIds = listOf<String>()
+        for (var m in page) {
+            messageIds.add(m.id())
+            var reply = m.replyToId()
+            if (reply != null && !replyIds.contains(reply)) {
+                replyIds.add(reply)
+            }
+        }
+        var summaries = service.reactionSummaries(messageIds, userId)
+        var replied = new HashMap<String, MessageRecord>()
+        if (!replyIds.isEmpty()) {
+            for (var r in service.findMessagesByIds(replyIds)) {
+                replied.put(r.id(), r)
+            }
+        }
+        var items = listOf<MessageView>()
+        for (var m in page) {
+            var summary = summaries.get(m.id())
+            items.add(MessageView(m.id(), m.conversationId(), m.senderId(), m.text(), m.mediaIds(), m.createdAt(), MessagingRoutes.countsOf(summary), MessagingRoutes.mineOf(summary), m.mediaSpoiler(), m.e2e(), m.iv(), m.replyToId(), MessagingRoutes.replyOf(m, replied)))
+        }
+        return json.encode(MessagePage(items, MessagingRoutes.nextMessageCursor(page, limit)))
+    }
+    static List<String> cleanIds(raw: List<String>?) {
+        var out = listOf<String>()
+        if (raw == null) {
+            return out
+        }
+        for (var v in raw) {
+            if (v == null) {
+                continue
+            }
+            var t = v.trim()
+            if (t.length() > 0 && !out.contains(t)) {
+                out.add(t)
+            }
+        }
+        return out
+    }
+    static String idsHash(ids: List<String>, extra: String) = Idempotency.hash("{" + extra + "\"ids\":" + json.encode(ids) + "}")
+    static String hideMessages(service: MessagingService, idempotency: Idempotency) {
+        var userId = Auth.requireUser()
+        var id = Req.pathParam("conversationId")
+        var body = MessagingRoutes.hideBody()
+        if (!service.isParticipant(id, userId)) {
+            throw MessagingService.notParticipantError()
+        }
+        var ids = MessagingRoutes.cleanIds(body.ids())
+        if (ids.isEmpty()) {
+            throw Errors.api(400, "EMPTY_MESSAGE_LIST", "Selecione ao menos uma mensagem.")
+        }
+        var hash = MessagingRoutes.idsHash(ids, "\"conversationId\":" + json.encode(id) + ",")
+        return idempotency.handle(userId, "POST", "/api/conversations/{conversationId}/messages/hide", hash, 200, () -> json.encode(MessagingHiddenBody(service.hideMessages(id, userId, ids))))
+    }
+    static HideIdsBody hideBody() {
+        try {
+            return json.decode<HideIdsBody>(Req.bodyText())
+        } catch (String bad) {
+            throw Errors.badRequest()
+        }
+    }
+    // `mediaSpoiler` and `e2e` are optional booleans: anything but a JSON true is false.
+    static Map<String,String> sendFlags() {
+        var out = new HashMap<String, String>()
+        try {
+            var raw = json.decode<Map<String,Object>>(Req.bodyText())
+            out.put("mediaSpoiler", "" + raw.get("mediaSpoiler"))
+            out.put("e2e", "" + raw.get("e2e"))
+        } catch (String bad) {
+            throw Errors.badRequest()
+        }
+        return out
+    }
+    static SendMessageBody sendBody() {
+        try {
+            return json.decode<SendMessageBody>(Req.bodyText())
+        } catch (String bad) {
+            throw Errors.badRequest()
+        }
+    }
+    static DirectConversationBody directBody() {
+        try {
+            return json.decode<DirectConversationBody>(Req.bodyText())
+        } catch (String bad) {
+            throw Errors.badRequest()
+        }
+    }
+    static CreateConversationBody createBody() {
+        try {
+            return json.decode<CreateConversationBody>(Req.bodyText())
+        } catch (String bad) {
+            throw Errors.badRequest()
+        }
+    }
+    static ReactToMessageBody reactBody() {
+        try {
+            return json.decode<ReactToMessageBody>(Req.bodyText())
+        } catch (String bad) {
+            throw Errors.badRequest()
+        }
+    }
+    static String send(service: MessagingService, idempotency: Idempotency) {
+        var userId = Auth.requireUser()
+        var id = Req.pathParam("conversationId")
+        var body = MessagingRoutes.sendBody()
+        var text = body.text()
+        if (text == null) {
+            text = ""
+        }
+        var media = body.mediaIds()
+        if (media == null) {
+            media = listOf<String>()
+        }
+        var flags = MessagingRoutes.sendFlags()
+        var spoiler = flags.get("mediaSpoiler") == "true"
+        var e2e = flags.get("e2e") == "true"
+        var hash = Idempotency.hash("{\"conversationId\":" + json.encode(id) + ",\"text\":" + json.encode(text) + ",\"mediaIds\":" + json.encode(media) + ",\"mediaSpoiler\":" + spoiler + "}")
+        var replyTo = MessagingRoutes.blankToNull(body.replyToId())
+        return idempotency.handle(userId, "POST", "/api/conversations/{conversationId}/messages", hash, 201, () -> {
+    var msg = service.sendMessage(id, userId, body.text(), body.mediaIds(), spoiler, replyTo)
+    if (e2e) {
+        msg = service.sendE2eMessage(id, userId, body.text(), body.iv(), body.mediaIds(), spoiler, replyTo)
+    }
+    return json.encode(MessageView(msg.id(), msg.conversationId(), msg.senderId(), msg.text(), msg.mediaIds(), msg.createdAt(), new HashMap<String, Int>(), null, msg.mediaSpoiler(), msg.e2e(), msg.iv(), msg.replyToId(), null))
+})
+    }
+    static String? blankToNull(v: String?) {
+        if (v == null) {
+            return null
+        }
+        if (v.trim().length() == 0) {
+            return null
+        }
+        return v.trim()
+    }
+    static String read(service: MessagingService, idempotency: Idempotency) {
+        var userId = Auth.requireUser()
+        var id = Req.pathParam("conversationId")
+        var hash = Idempotency.hash("{\"conversationId\":" + json.encode(id) + "}")
+        return idempotency.handle(userId, "POST", "/api/conversations/{conversationId}/read", hash, 200, () -> {
+    service.markRead(id, userId)
+    return json.encode(MessagingStatusBody(id, "READ"))
+})
+    }
+    static String viewing(service: MessagingService) {
+        var userId = Auth.requireUser()
+        service.viewing(Req.pathParam("conversationId"), userId)
+        return status(204, "")
+    }
+    static String leave(service: MessagingService) {
+        var userId = Auth.requireUser()
+        service.leftConversation(Req.pathParam("conversationId"), userId)
+        return status(204, "")
+    }
+    // The target of /direct and /business-direct: required, not yourself, not blocked either way.
+    static String recipient(blocked: BlockedUsers, userId: String, raw: String?) {
+        var other = ""
+        if (raw != null) {
+            other = raw.trim()
+        }
+        if (other.length() == 0) {
+            throw Errors.api(400, "INVALID_RECIPIENT", "Destinatario obrigatorio.")
+        }
+        if (other == userId) {
+            throw Errors.api(400, "INVALID_RECIPIENT", "Nao da para abrir uma conversa consigo mesmo.")
+        }
+        if (blocked.hiddenIdsFor(userId).contains(other) || blocked.hiddenIdsFor(other).contains(userId)) {
+            throw Errors.api(403, "USER_BLOCKED", "Nao e possivel conversar com este usuario.")
+        }
+        return other
+    }
+    static String direct(service: MessagingService, corporate: MessagingCorporate, blocked: BlockedUsers, idempotency: Idempotency, business: Bool) {
+        var userId = Auth.requireUser()
+        var body = MessagingRoutes.directBody()
+        var other = MessagingRoutes.recipient(blocked, userId, body.userId())
+        var key = "direct"
+        var path = "/api/conversations/direct"
+        if (business) {
+            key = "business-direct"
+            path = "/api/conversations/business-direct"
+        }
+        var hash = Idempotency.hash("{" + json.encode(key) + ":" + json.encode(other) + "}")
+        return idempotency.handle(userId, "POST", path, hash, 200, () -> {
+    var conversationId = service.directConversationBetween(userId, other)
+    if (business) {
+        conversationId = service.businessDirectConversation(userId, other)
+    }
+    return json.encode(MessagingRoutes.detailView(service, corporate, service.getConversation(conversationId), userId))
+})
+    }
+    static String hide(service: MessagingService, idempotency: Idempotency, hiding: Bool) {
+        var userId = Auth.requireUser()
+        var body = MessagingRoutes.hideBody()
+        var ids = MessagingRoutes.cleanIds(body.ids())
+        if (ids.isEmpty()) {
+            throw Errors.api(400, "EMPTY_CONVERSATION_LIST", "Selecione ao menos uma conversa.")
+        }
+        var path = "/api/conversations/hide"
+        if (!hiding) {
+            path = "/api/conversations/unhide"
+        }
+        return idempotency.handle(userId, "POST", path, MessagingRoutes.idsHash(ids, ""), 200, () -> {
+    if (hiding) {
+        return json.encode(MessagingHiddenBody(service.hideConversations(userId, ids)))
+    }
+    return json.encode(MessagingRestoredBody(service.unhideConversations(userId, ids)))
+})
+    }
+    static String create(service: MessagingService, corporate: MessagingCorporate, idempotency: Idempotency) {
+        var userId = Auth.requireUser()
+        var raw = Req.bodyText()
+        var body = MessagingRoutes.createBody()
+        return idempotency.handle(userId, "POST", "/api/conversations", Idempotency.hash(raw), 201, () -> {
+    var c = service.createConversation(body.kind(), body.title(), body.participantIds(), userId)
+    return json.encode(MessagingRoutes.detailView(service, corporate, c, userId))
+})
+    }
+    // Participates in the conversation AND the message belongs to it.
+    static requireMessage(service: MessagingService, conversationId: String, messageId: String, userId: String) {
+        if (!service.isParticipant(conversationId, userId)) {
+            throw MessagingService.notParticipantError()
+        }
+        if (!service.messageBelongsTo(messageId, conversationId)) {
+            throw Errors.api(404, "MESSAGE_NOT_FOUND", "Mensagem nao encontrada nesta conversa.")
+        }
+    }
+    static String react(service: MessagingService, idempotency: Idempotency) {
+        var userId = Auth.requireUser()
+        var conversationId = Req.pathParam("conversationId")
+        var messageId = Req.pathParam("messageId")
+        var body = MessagingRoutes.reactBody()
+        MessagingRoutes.requireMessage(service, conversationId, messageId, userId)
+        var type = body.type()
+        if (type == null) {
+            throw Errors.badRequest()
+        }
+        if (!ConversationContexts.reactionTypes().contains(type)) {
+            throw Errors.badRequest()
+        }
+        var hash = Idempotency.hash("{\"messageId\":" + json.encode(messageId) + ",\"type\":" + json.encode(type) + "}")
+        return idempotency.handle(userId, "POST", "/api/conversations/{conversationId}/messages/{messageId}/reactions", hash, 200, () -> {
+    var status = "REMOVED"
+    if (service.addReaction(messageId, userId, type)) {
+        status = "REACTED"
+    }
+    return json.encode(MessagingReactionBody(status))
+})
+    }
+    static String reactions(service: MessagingService) {
+        var userId = Auth.requireUser()
+        var conversationId = Req.pathParam("conversationId")
+        var messageId = Req.pathParam("messageId")
+        MessagingRoutes.requireMessage(service, conversationId, messageId, userId)
+        var list = service.getReactions(messageId)
+        var summary = new HashMap<String, Int>()
+        for (var r in list) {
+            summary.put(r.type(), summary.getOrDefault(r.type(), 0) + 1)
+        }
+        return json.encode(MessageReactionList(messageId, summary, list))
+    }
+}

@@ -1,0 +1,115 @@
+package messaging
+
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.util.LinkedHashMap
+import kernel.db.*
+import kernel.error.*
+import kernel.log.*
+
+// pending-port: profile (AgeGate + AgePolicyAdapter). Age rules for writing and for messaging minors. The
+// default reads `users.birth_date` and `parental_links` read-only, with the Java rules: a missing birth
+// date blocks writing (403 BIRTH_DATE_REQUIRED), a minor needs an ACTIVE parental link
+// (403 PARENTAL_CONSENT_REQUIRED). The profile port may subclass it.
+class MessagingAgePolicy {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    static String adultCutoff() = Instant.now().atZone(ZoneId.of("America/Sao_Paulo")).toLocalDate().minusYears(18L).toString()
+    Bool birthDateDeclared(userId: String) {
+        var row = database.queryOptional("select birth_date from users where id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return false
+        }
+        return !row.isNull("birth_date")
+    }
+    // Under 18 on the Brazilian calendar day; unknown or undeclared is not a minor.
+    Bool isMinor(userId: String) = minorIds(listOf<String>(userId)).contains(userId)
+    List<String> minorIds(userIds: List<String>) {
+        var out = listOf<String>()
+        if (userIds.isEmpty()) {
+            return out
+        }
+        var params = DbParams()
+        for (var id in userIds) {
+            params.bindStr(id)
+        }
+        params.bindDate(MessagingAgePolicy.adultCutoff())
+        for (var r in database.queryList("select id from users where id in (" + MessagingStore.marks(userIds.size()) + ") and birth_date is not null and birth_date > ?", params)) {
+            out.add(r.getStr("id"))
+        }
+        return out
+    }
+    Bool parentalConsentActive(userId: String) = database.queryLong("select count(*) from parental_links where minor_user_id = ? and status = \'ACTIVE\'", DbParams().bindStr(userId)) > 0L
+    requireCanWrite(userId: String) {
+        if (!birthDateDeclared(userId)) {
+            throw Errors.api(403, "BIRTH_DATE_REQUIRED", "Confirme sua data de nascimento para continuar. É um requisito da plataforma.")
+        }
+        if (isMinor(userId) && !parentalConsentActive(userId)) {
+            throw Errors.api(403, "PARENTAL_CONSENT_REQUIRED", "Sua conta e de menor de 18 anos e precisa da autorizacao de um responsavel para publicar, comentar e enviar mensagens.")
+        }
+    }
+}
+
+// pending-port: network (ConnectionRepository). Accepted connections between people. The default reads
+// `user_connections` read-only.
+class MessagingConnections {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    Bool existsAccepted(userA: String, userB: String) = database.queryLong("select count(*) from user_connections where ((requester_user_id = ? and receiver_user_id = ?) or (requester_user_id = ? and receiver_user_id = ?)) and status = \'ACCEPTED\'", DbParams().bindStr(userA).bindStr(userB).bindStr(userB).bindStr(userA)) > 0L
+    // Which of `others` have an accepted connection with `userId`.
+    List<String> acceptedAmong(userId: String, others: List<String>) {
+        var out = listOf<String>()
+        for (var other in others) {
+            if (existsAccepted(userId, other)) {
+                out.add(other)
+            }
+        }
+        return out
+    }
+}
+
+// pending-port: corporate (CorporateProfileService). The professional identity of a person. The default
+// reads `corporate_profiles` read-only.
+class MessagingCorporate {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    // 403 NO_ACTIVE_CORPORATE_PROFILE unless the account has an ACTIVE professional identity.
+    requireActive(userId: String) {
+        var n = database.queryLong("select count(*) from corporate_profiles where user_id = ? and status = \'ACTIVE\'", DbParams().bindStr(userId))
+        if (n == 0L) {
+            throw Errors.api(403, "NO_ACTIVE_CORPORATE_PROFILE", "Ative o seu perfil profissional para usar os recursos de trabalho.")
+        }
+    }
+    Map<String,MessagingIdentity> activeByUserIds(userIds: List<String>) {
+        var out = new LinkedHashMap<String, MessagingIdentity>()
+        if (userIds.isEmpty()) {
+            return out
+        }
+        var params = DbParams()
+        for (var id in userIds) {
+            params.bindStr(id)
+        }
+        for (var r in database.queryList("select user_id, username, name, avatar from corporate_profiles where status = \'ACTIVE\' and user_id in (" + MessagingStore.marks(userIds.size()) + ")", params)) {
+            var avatar = r.getStrOrNull("avatar")
+            var shown = ""
+            if (avatar != null) {
+                shown = avatar
+            }
+            out.put(r.getStr("user_id"), MessagingIdentity("CORPORATE", r.getStr("username"), r.getStr("name"), shown))
+        }
+        return out
+    }
+}
+
+// pending-port: coin (CoinService.recordPresence: the daily presence streak). The default does nothing.
+class MessagingCoins {
+    public constructor() {}
+    recordPresence(userId: String);
+}

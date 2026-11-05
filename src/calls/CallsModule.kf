@@ -1,0 +1,45 @@
+package calls
+
+import kernel.*
+import kernel.http.*
+import kernel.security.*
+import messaging.*
+import notifications.*
+
+// Seams of the calls domain; the defaults read the owners' tables read-only (see CallsSeams.kf).
+class CallsSeamSet {
+    CallGroups groups
+    CallProfiles profiles
+    MeetingTokenIssuer tokens
+    CallClock clock
+    public constructor(platform: Platform) {
+        this.groups = CallGroups(platform.db)
+        this.profiles = CallProfiles(platform.db)
+        this.tokens = MeetingTokenIssuer.fromConfig(platform.cfg)
+        this.clock = CallClock()
+    }
+}
+
+// Composition of the calls domain: needs the notifications and the messaging modules.
+//
+//   var callsModule = CallsModule.install(platform, shared, hooks, parts, notificationsModule, messagingModule)
+class CallsModule {
+    CallsStore store
+    CallService service
+    CallExpiryWorker worker
+    public constructor(store: CallsStore, service: CallService, worker: CallExpiryWorker) {
+        this.store = store
+        this.service = service
+        this.worker = worker
+    }
+    static CallsModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks, parts: SecurityParts, notificationsModule: NotificationsModule, messagingModule: MessagingModule) = CallsModule.installWith(platform, shared, parts, notificationsModule, messagingModule, CallsSeamSet(platform))
+    static CallsModule installWith(platform: Platform, shared: SharedServices, parts: SecurityParts, notificationsModule: NotificationsModule, messagingModule: MessagingModule, seams: CallsSeamSet) {
+        var store = CallsStore(platform.db)
+        var audience = CallAudience(messagingModule.service, seams.groups)
+        var service = CallService(platform.db, store, audience, seams.tokens, notificationsModule.notifications, seams.profiles, parts.userLimiter, seams.clock)
+        var worker = CallExpiryWorker(store, service, seams.clock)
+        worker.schedule(shared.jobs, platform.cfg)
+        CallsRoutes.register(platform.server, service)
+        return CallsModule(store, service, worker)
+    }
+}

@@ -1,0 +1,115 @@
+package calls
+
+import kernel.db.*
+import kernel.id.*
+
+// SQL of the calls domain: `call_sessions` and `call_participants`. Transitions that can arrive in
+// parallel are compare-and-set: the row changes only while it is still in the expected state, and the
+// answer says whether this caller won the race.
+class CallsStore {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    static String callColumns() = "id, kind, modality, conversation_id, group_id, initiator_id, room_id, display_name, state, created_at, answered_at, ended_at, ended_by, end_reason, expires_at, last_activity_at"
+    static CallRecord toCall(r: DbRow) = CallRecord(r.getStr("id"), r.getStr("kind"), r.getStr("modality"), r.getStrOrNull("conversation_id"), r.getStrOrNull("group_id"), r.getStr("initiator_id"), r.getStr("room_id"), r.getStr("display_name"), r.getStr("state"), r.getInstant("created_at"), r.getInstantOrNull("answered_at"), r.getInstantOrNull("ended_at"), r.getStrOrNull("ended_by"), r.getStrOrNull("end_reason"), r.getInstantOrNull("expires_at"), r.getInstant("last_activity_at"))
+    // The call and the people invited, in the same commit.
+    create(call: CallRecord, invited: List<String>, now: String) {
+        var self = this
+        database.transaction(() -> {
+    self.insertCall(call)
+    for (var userId in invited) {
+        self.insertParticipant(call.id(), userId, now)
+    }
+})
+    }
+    insertCall(call: CallRecord) {
+        database.execute("insert into call_sessions (id, kind, modality, conversation_id, group_id, initiator_id, room_id, display_name, state, created_at, answered_at, ended_at, ended_by, end_reason, expires_at, last_activity_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(call.id()).bindStr(call.kind()).bindStr(call.modality()).bindStrOrNull(call.conversationId()).bindStrOrNull(call.groupId()).bindStr(call.initiatorId()).bindStr(call.roomId()).bindStr(call.displayName()).bindStr(call.state()).bindInstant(call.createdAt()).bindInstantOrNull(call.answeredAt()).bindInstantOrNull(call.endedAt()).bindStrOrNull(call.endedBy()).bindStrOrNull(call.endReason()).bindInstantOrNull(call.expiresAt()).bindInstant(call.lastActivityAt()))
+    }
+    insertParticipant(callId: String, userId: String, now: String) {
+        database.execute("insert into call_participants (id, call_id, user_id, state, invited_at) values (?, ?, ?, \'INVITED\', ?)", DbParams().bindStr(Ids.prefixed("call_participant_")).bindStr(callId).bindStr(userId).bindInstant(now))
+    }
+    // The transition made in the domain, if the row is still in `from`.
+    Bool advance(call: CallRecord, from: String) {
+        var n = database.execute("update call_sessions set state = ?, answered_at = ?, ended_at = ?, ended_by = ?, end_reason = ?, expires_at = ?, last_activity_at = ? where id = ? and state = ?", DbParams().bindStr(call.state()).bindInstantOrNull(call.answeredAt()).bindInstantOrNull(call.endedAt()).bindStrOrNull(call.endedBy()).bindStrOrNull(call.endReason()).bindInstantOrNull(call.expiresAt()).bindInstant(call.lastActivityAt()).bindStr(call.id()).bindStr(from))
+        return n == 1
+    }
+    CallRecord? findById(id: String) {
+        var row = database.queryOptional("select " + CallsStore.callColumns() + " from call_sessions where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return CallsStore.toCall(row)
+    }
+    // The oldest open call of a conversation: two calls in one DM cannot exist.
+    CallRecord? openByConversation(conversationId: String) {
+        var row = database.queryOptional("select " + CallsStore.callColumns() + " from call_sessions where conversation_id = ? and state in " + CallStates.openList() + " order by created_at asc limit 1", DbParams().bindStr(conversationId))
+        if (row == null) {
+            return null
+        }
+        return CallsStore.toCall(row)
+    }
+    CallRecord? openByGroup(groupId: String) {
+        var row = database.queryOptional("select " + CallsStore.callColumns() + " from call_sessions where group_id = ? and state in " + CallStates.openList() + " order by created_at asc limit 1", DbParams().bindStr(groupId))
+        if (row == null) {
+            return null
+        }
+        return CallsStore.toCall(row)
+    }
+    // Open calls the person is inside or was invited to, newest first.
+    List<CallRecord> openByParticipant(userId: String) {
+        var out = listOf<CallRecord>()
+        for (var r in database.queryList("select " + CallsStore.callColumns() + " from call_sessions where state in " + CallStates.openList() + " and id in (select call_id from call_participants where user_id = ?) order by created_at desc", DbParams().bindStr(userId))) {
+            out.add(CallsStore.toCall(r))
+        }
+        return out
+    }
+    String? participantState(callId: String, userId: String) {
+        var row = database.queryOptional("select state from call_participants where call_id = ? and user_id = ?", DbParams().bindStr(callId).bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return row.getStr("state")
+    }
+    // Who is in the room now (JOINED).
+    Int countPresent(callId: String) = database.queryLong("select count(*) from call_participants where call_id = ? and state = \'JOINED\'", DbParams().bindStr(callId)) as Int
+    // Enters the room unless already inside (false = a repeat).
+    Bool joinParticipant(callId: String, userId: String, now: String) {
+        if (moveParticipant(callId, userId, "INVITED", "JOINED", now, true)) {
+            return true
+        }
+        return moveParticipant(callId, userId, "LEFT", "JOINED", now, true)
+    }
+    Bool leaveParticipant(callId: String, userId: String, now: String) = moveParticipant(callId, userId, "JOINED", "LEFT", now, false)
+    // A decision in a direct call (answer, decline): moves only who has not decided yet.
+    Bool decide(callId: String, userId: String, next: String, now: String) = moveParticipant(callId, userId, "INVITED", next, now, false)
+    Bool moveParticipant(callId: String, userId: String, from: String, to: String, now: String, joined: Bool) {
+        var n = 0
+        if (joined) {
+            n = database.execute("update call_participants set state = ?, joined_at = ?, left_at = null, last_seen_at = ? where call_id = ? and user_id = ? and state = ?", DbParams().bindStr(to).bindInstant(now).bindInstant(now).bindStr(callId).bindStr(userId).bindStr(from))
+        }
+        else {
+            n = database.execute("update call_participants set state = ?, joined_at = null, left_at = ?, last_seen_at = ? where call_id = ? and user_id = ? and state = ?", DbParams().bindStr(to).bindInstant(now).bindInstant(now).bindStr(callId).bindStr(userId).bindStr(from))
+        }
+        return n == 1
+    }
+    // Pending invitations become MISSED when the call is over.
+    settleInvites(callId: String, next: String, now: String) {
+        database.execute("update call_participants set state = ?, left_at = ?, last_seen_at = ? where call_id = ? and state = \'INVITED\'", DbParams().bindStr(next).bindInstant(now).bindInstant(now).bindStr(callId))
+    }
+    // Abandoned: everybody inside is marked as gone and the call is concluded in one transaction.
+    abandon(call: CallRecord, from: String, now: String, reason: String?) {
+        var self = this
+        database.transaction(() -> {
+    self.database.execute("update call_participants set state = \'LEFT\', left_at = ?, last_seen_at = ? where call_id = ? and state = \'JOINED\'", DbParams().bindInstant(now).bindInstant(now).bindStr(call.id()))
+    self.database.execute("update call_sessions set state = ?, answered_at = ?, ended_at = ?, ended_by = ?, end_reason = ?, expires_at = ?, last_activity_at = ? where id = ? and state = ?", DbParams().bindStr(call.state()).bindInstantOrNull(call.answeredAt()).bindInstantOrNull(call.endedAt()).bindStrOrNull(call.endedBy()).bindStrOrNull(reason).bindInstantOrNull(call.expiresAt()).bindInstant(now).bindStr(call.id()).bindStr(from))
+})
+    }
+    List<CallRecord> findExpired(now: String, limit: Int) {
+        var out = listOf<CallRecord>()
+        for (var r in database.queryList("select " + CallsStore.callColumns() + " from call_sessions where state in " + CallStates.openList() + " and expires_at < ? order by expires_at limit ?", DbParams().bindInstant(now).bindInt(limit))) {
+            out.add(CallsStore.toCall(r))
+        }
+        return out
+    }
+}

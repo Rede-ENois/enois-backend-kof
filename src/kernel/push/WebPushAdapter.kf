@@ -1,0 +1,130 @@
+package kernel.push
+
+import java.lang.Class
+import java.lang.Exception
+import java.io.Closeable
+import java.lang.Integer
+import org.apache.http.HttpResponse
+import java.util.concurrent.TimeUnit
+import kernel.log.*
+import org.apache.http.client.config.RequestConfig
+import org.apache.http.impl.nio.client.CloseableHttpAsyncClient
+import org.apache.http.impl.nio.client.HttpAsyncClients
+import nl.martijndwars.webpush.Encoding
+import nl.martijndwars.webpush.Notification
+import nl.martijndwars.webpush.PushService
+import org.bouncycastle.jce.provider.BouncyCastleProvider
+
+// The ONLY place that touches nl.martijndwars:web-push (VAPID signing + aes128gcm/aesgcm payload
+// encryption + the HTTP post). Everything above it (push domain) sees strings and a status code, and
+// tests replace `WebPushSender.deliver` instead of reaching the network.
+//
+//   var adapter = WebPushAdapter.create(vapidPublic, vapidPrivate, "mailto:suporte@enois.ia.br")   // null when keys are blank/invalid
+//   var status = adapter.post(endpoint, p256dh, auth, payloadJson, 86400)    // HTTP status of the push service, -1 on failure
+class WebPushAdapter {
+    PushService service
+    String publicKey
+    // Class of the last failure (diagnostics and tests): "" after a success.
+    String lastFailure = ""
+    List<CloseableHttpAsyncClient> clients = listOf<CloseableHttpAsyncClient>()
+    Log log = Log("kernel.push")
+    public constructor(service: PushService, publicKey: String) {
+        this.service = service
+        this.publicKey = publicKey
+    }
+    // Null without keys (push off) or with keys the library cannot load (logged, push stays off).
+    static WebPushAdapter? create(vapidPublic: String, vapidPrivate: String, vapidSubjectRaw: String) {
+        if (vapidPublic.trim().length() == 0 || vapidPrivate.trim().length() == 0) {
+            return null
+        }
+        WebPushAdapter.registerBouncyCastle()
+        var vapidSubject = vapidSubjectRaw
+        if (vapidSubjectRaw.trim().length() == 0) {
+            vapidSubject = "mailto:suporte@enois.ia.br"
+        }
+        var built = listOf<WebPushAdapter>()
+        WebPushAdapter.fill(built, vapidPublic.trim(), vapidPrivate.trim(), vapidSubject)
+        if (built.isEmpty()) {
+            return null
+        }
+        var first = built.get(0)
+        return first
+    }
+    // java.security.Security by reflection: the kernel class kernel.security.Security owns that simple name in
+    // every compilation (KOF_GAPS G52), so `Security.addProvider` would bind to the wrong class.
+    static registerBouncyCastle() {
+        var cls = Class.forName("java.security.Security")
+        var stringType = new Class[1]
+        stringType[0] = Class.forName("java.lang.String")
+        var name = new Object[1]
+        name[0] = "BC" as Object
+        if (cls.getMethod("getProvider", stringType).invoke(null, name) == null) {
+            var providerType = new Class[1]
+            providerType[0] = Class.forName("java.security.Provider")
+            var provider = new Object[1]
+            provider[0] = new BouncyCastleProvider() as Object
+            cls.getMethod("addProvider", providerType).invoke(null, provider)
+        }
+    }
+    // Adds the adapter to `out`, or logs and leaves it empty when the library rejects the keys (a void
+    // method: the compiler cannot build frames for a nullable return around a catch, KOF_GAPS G52).
+    static fill(out: List<WebPushAdapter>, vapidPublic: String, vapidPrivate: String, vapidSubject: String) {
+        try {
+            out.add(WebPushAdapter(new PushService(vapidPublic, vapidPrivate, vapidSubject), vapidPublic))
+        } catch (Exception invalid) {
+            Log("kernel.push").error("VAPID configurado mas invalido; Web Push ficara desligado")
+        }
+    }
+    // Notification(String, String, String, byte[], int) by reflection: the compiler picks the wrong
+    // overload for it (KOF_GAPS G51) and cannot pass byte[] to a constructor.
+    static Notification notificationOf(endpoint: String, p256dh: String, auth: String, payload: String, ttlSeconds: Int) {
+        var cls = Class.forName("nl.martijndwars.webpush.Notification")
+        var strCls = Class.forName("java.lang.String")
+        var types = new Class[5]
+        types[0] = strCls
+        types[1] = strCls
+        types[2] = strCls
+        types[3] = Class.forName("[B")
+        types[4] = Integer.TYPE
+        var args = new Object[5]
+        args[0] = endpoint as Object
+        args[1] = p256dh as Object
+        args[2] = auth as Object
+        args[3] = payload.getBytes() as Object
+        args[4] = ttlSeconds as Object
+        return cls.getConstructor(types).newInstance(args) as Notification
+    }
+    // One async HTTP client, started on the first post (5 s connect, 10 s response, like the Java sender).
+    CloseableHttpAsyncClient openClient() {
+        if (clients.size() > 0) {
+            return clients.get(0)
+        }
+        var config = RequestConfig.custom().setConnectTimeout(5000).setSocketTimeout(10000).build()
+        var created = HttpAsyncClients.custom().setDefaultRequestConfig(config).build()
+        created.start()
+        clients.add(created)
+        return created
+    }
+    // Releases the HTTP client (shutdown, tests: its I/O thread would keep the process alive).
+    close() {
+        for (var c in clients) {
+            (c as Closeable).close()
+        }
+        clients.clear()
+    }
+    // Encrypts `payload` for the device and posts it. Never throws: -1 means the call failed.
+    Int post(endpoint: String, p256dh: String, auth: String, payload: String, ttlSeconds: Int) {
+        try {
+            var notification = WebPushAdapter.notificationOf(endpoint, p256dh, auth, payload, ttlSeconds)
+            var post = service.preparePost(notification, Encoding.AESGCM)
+            var response = openClient().execute(post, null).get(15000L, TimeUnit.MILLISECONDS) as HttpResponse
+            var status = response.getStatusLine().getStatusCode()
+            lastFailure = ""
+            return status
+        } catch (Exception failure) {
+            lastFailure = failure.getClass().getSimpleName()
+            log.warn("web_push_failed " + lastFailure)
+            return -1
+        }
+    }
+}

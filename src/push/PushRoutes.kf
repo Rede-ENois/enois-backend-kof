@@ -1,0 +1,57 @@
+package push
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+
+// GET /push/config (public), POST /push/subscriptions (201), DELETE /push/subscriptions?endpoint= (204).
+class PushRoutes {
+    static register(server: HttpServer, service: PushSubscriptionService) {
+        server.get("/push/config", () -> json.encode(PushConfigView(service.isEnabled(), service.publicKey())))
+        server.post("/push/subscriptions", () -> PushRoutes.subscribe(service))
+        server.delete("/push/subscriptions", () -> PushRoutes.unsubscribe(service))
+    }
+    static PushSubscriptionBody parseBody() {
+        try {
+            return json.decode<PushSubscriptionBody>(Req.bodyText())
+        } catch (String bad) {
+            throw Errors.badRequest()
+        }
+    }
+    static String subscribe(service: PushSubscriptionService) {
+        var userId = Auth.requireUser()
+        var body = PushRoutes.parseBody()
+        var keys = body.keys()
+        var p256dh = ""
+        var auth = ""
+        var hasKeys = false
+        if (keys != null) {
+            hasKeys = true
+            p256dh = PushRoutes.orBlank(keys.p256dh())
+            auth = PushRoutes.orBlank(keys.auth())
+        }
+        var created = service.register(userId, body.endpoint(), PushRoutes.keyOrNull(hasKeys, p256dh), PushRoutes.keyOrNull(hasKeys, auth))
+        return status(201, json.encode(PushSubscriptionView(created.id())))
+    }
+    static String orBlank(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    static String? keyOrNull(hasKeys: Bool, v: String) {
+        if (!hasKeys) {
+            return null
+        }
+        return v
+    }
+    static String unsubscribe(service: PushSubscriptionService) {
+        var userId = Auth.requireUser()
+        var endpoint = query("endpoint")
+        if (endpoint == null) {
+            throw Errors.badRequest()
+        }
+        service.unregister(userId, endpoint)
+        return status(204, "")
+    }
+}

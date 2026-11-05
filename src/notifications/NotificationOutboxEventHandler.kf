@@ -1,0 +1,154 @@
+package notifications
+
+import kernel.log.*
+import kernel.outbox.*
+
+// Turns the feed's outbox events (PostCommented, PostReacted, CommentReacted) into notifications
+// (NotificationOutboxEventHandler). Register it on the kernel Outbox for the three event types:
+//
+//   var handler = NotificationOutboxEventHandler(notifications, sources, actors)
+//   shared.outbox.register("PostCommented", handler)   // + "PostReacted", "CommentReacted"
+//
+// Payloads are the JSON the feed writes: {"postId":"..","commentId":"..","authorId":".."}; authorId is
+// the person who acted, never the owner of the content.
+class NotificationOutboxEventHandler extends OutboxEventHandler {
+    Notifications notifications
+    NotificationSources sources
+    NotificationActors actors
+    Log log = Log("notifications.outbox")
+    public constructor(notifications: Notifications, sources: NotificationSources, actors: NotificationActors) {
+        this.notifications = notifications
+        this.sources = sources
+        this.actors = actors
+    }
+    handle(eventType: String, aggregateId: String, payload: String) {
+        try {
+            if (eventType == "PostCommented") {
+                handlePostCommented(payload)
+            }
+            else 
+                if (eventType == "PostReacted") {
+                    handlePostReacted(payload)
+                }
+                else 
+                    if (eventType == "CommentReacted") {
+                        handleCommentReacted(payload)
+                    }
+        } catch (String e) {
+            log.warn("Erro ao processar evento " + eventType + ": " + e)
+        }
+    }
+    static NotificationOutboxEventHandler forTypes(outbox: Outbox, notifications: Notifications, sources: NotificationSources, actors: NotificationActors) {
+        var handler = NotificationOutboxEventHandler(notifications, sources, actors)
+        outbox.register("PostCommented", handler)
+        outbox.register("PostReacted", handler)
+        outbox.register("CommentReacted", handler)
+        return handler
+    }
+    String actorName(authorId: String) {
+        var name = actors.nameOf(authorId)
+        if (name == null) {
+            return "Alguém"
+        }
+        return name
+    }
+    handlePostCommented(payload: String) {
+        var postId = NotificationOutboxEventHandler.extractValue(payload, "postId")
+        var authorId = NotificationOutboxEventHandler.extractValue(payload, "authorId")
+        if (postId == null) {
+            return
+        }
+        if (authorId == null) {
+            return
+        }
+        var post = sources.post(postId)
+        if (post == null) {
+            return
+        }
+        if (post.authorId() == authorId) {
+            return
+        }
+        notifications.createWithPreview(post.authorId(), "NEW_COMMENT", authorId, "Novo comentário", actorName(authorId) + " comentou no seu post.", "/api/feed/posts/" + postId, "Ver", previewOfComment(NotificationOutboxEventHandler.extractValue(payload, "commentId"), post))
+    }
+    handlePostReacted(payload: String) {
+        var postId = NotificationOutboxEventHandler.extractValue(payload, "postId")
+        var authorId = NotificationOutboxEventHandler.extractValue(payload, "authorId")
+        if (postId == null) {
+            return
+        }
+        if (authorId == null) {
+            return
+        }
+        var post = sources.post(postId)
+        if (post == null) {
+            return
+        }
+        if (post.authorId() == authorId) {
+            return
+        }
+        var name = actorName(authorId)
+        notifications.createGrouped(post.authorId(), "NEW_REACTION", "NEW_REACTION:post:" + postId, authorId, "Nova reação", name + " reagiu ao seu post.", (count: Int) -> NotificationOutboxEventHandler.othersReacted(name, count, "ao seu post"), "/api/feed/posts/" + postId, "/api/feed/posts/" + postId + "?reacoes=1", "Ver", NotificationPreviews.of(post.content()))
+    }
+    handleCommentReacted(payload: String) {
+        var commentId = NotificationOutboxEventHandler.extractValue(payload, "commentId")
+        var postId = NotificationOutboxEventHandler.extractValue(payload, "postId")
+        var authorId = NotificationOutboxEventHandler.extractValue(payload, "authorId")
+        if (commentId == null) {
+            return
+        }
+        if (authorId == null) {
+            return
+        }
+        var comment = sources.comment(commentId)
+        if (comment == null) {
+            return
+        }
+        if (comment.authorId() == authorId) {
+            return
+        }
+        var name = actorName(authorId)
+        var href = NotificationOutboxEventHandler.postHref(postId)
+        notifications.createGrouped(comment.authorId(), "COMMENT_REACTION", "COMMENT_REACTION:comment:" + commentId, authorId, "Reação no comentário", name + " reagiu ao seu comentário.", (count: Int) -> NotificationOutboxEventHandler.othersReacted(name, count, "ao seu comentário"), href, href, "Ver", NotificationPreviews.of(comment.content()))
+    }
+    static String? postHref(postId: String?) {
+        if (postId == null) {
+            return null
+        }
+        return "/api/feed/posts/" + postId
+    }
+    // The comment text; a comment with only media falls back to the post text.
+    String? previewOfComment(commentId: String?, post: NotificationSource) {
+        if (commentId != null) {
+            var comment = sources.comment(commentId)
+            if (comment != null) {
+                var preview = NotificationPreviews.of(comment.content())
+                if (preview != null) {
+                    return preview
+                }
+            }
+        }
+        return NotificationPreviews.of(post.content())
+    }
+    static String othersReacted(actorName: String, count: Int, target: String) {
+        var others = count - 1
+        var noun = " pessoas"
+        if (others == 1) {
+            noun = " pessoa"
+        }
+        return actorName + " e mais " + others + noun + " reagiram " + target + "."
+    }
+    // The value of a string property in the payload, or null (no JSON parser: same scan as Java).
+    static String? extractValue(json: String, key: String) {
+        var search = "\"" + key + "\":\""
+        var start = json.indexOf(search)
+        if (start < 0) {
+            return null
+        }
+        start = start + search.length()
+        var end = json.indexOf("\"", start)
+        if (end < 0) {
+            return null
+        }
+        return json.substring(start, end)
+    }
+}
