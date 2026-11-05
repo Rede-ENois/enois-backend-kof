@@ -88,7 +88,7 @@ or needs several owners. Tests that prove the wiring boot `AppWiring.installAll`
 | `SecurityModerators`, `SecurityAutoReports`, `RiskEscalation` | kernel security and risk | moderation | SWITCHED `ModerationEarly` (hooks set before `Security.install`; `SharedServices.createWith` takes the escalation; all three bound to `ModerationService` at the end) |
 | `ModerationCompanies` | moderation | companies | SWITCHED `ModerationCompaniesBridge` (`CompanyService.contentOf` / `ownerOf` / `closeByModeration`, which also tells the owner) |
 | `/moderation/games`, `/moderation/services` | moderation | games, services | SWITCHED `ModerationReviewRoutes` (the owners' use cases behind the team guard and the own-submission rule) |
-| `MediaImageReviewer`, `ModerationImages` | media, moderation | moderation (MediaSafetyAnalyzer) | OPEN: needs the MediaSafety analyzer (area 6, not ported) |
+| `MediaImageReviewer`, `ModerationImages` | media, moderation | moderation (MediaSafetyAnalyzer) | SWITCHED `ModerationMediaReviewer` (the upload gate's second opinion) and `ModerationMediaImages` (reported images for the triage, the sexual-content flow and the media barrier; bucket or guarded download, reduced to JPEG), both in `src/moderation/ModerationMediaBridge.kf`, wired in `AppWiring`; proved in `ModerationSeamsTest` and `MediaBridgeTest` |
 | `GifCommunityReader` | gifs | feed | KEPT: dead in Java (`CommunityGifProvider` is never registered as a bean), nothing reads it |
 | `MediaPdfCleaner` | media | pdf library | OPEN: PDFBox needs the `loadPDF(byte[])` workaround of G281 and the save path of G164; not attempted in this round |
 | `CallClock`, `PushSender`, `DigestMailer` | calls, push, notifications | none | KEPT: test seams or infrastructure, no owner |
@@ -106,5 +106,5 @@ and onboarding joins a community, asks for a connection and saves a skill throug
 - OPEN rows above.
 - Feed and coins tests still waiting for a wired suite (PORTING_STATUS): the coin-ledger reaction test, the identity
   presentation tests (profile cosmetics frame and name style on a post) and the Mockito media-embedding test.
-- Moderation seams are switched except `MediaImageReviewer` and the reported-image reader (they need the MediaSafety
-  analyzer, see PORTING_STATUS "moderation").
+- Moderation seams are all switched, `MediaImageReviewer` and the reported-image reader included (see PORTING_STATUS
+  "moderation").
