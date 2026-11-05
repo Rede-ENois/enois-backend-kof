@@ -1,0 +1,78 @@
+import feed.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of FeedSeenMarkerTests.
+String agoIso(ms: Long) = Time.fromMillis(Time.nowMillis() - ms)
+
+markSeen(token: String, seenUntil: String) {
+    var res = FeedTestSupport.send("POST", "/feed/seen", token, "seen-" + seenUntil, "{\"seenUntil\":\"" + seenUntil + "\"}")
+    Check.status(res, 204)
+}
+
+String lastSeenAt(token: String) {
+    var res = FeedTestSupport.app().client.getWith("/feed?tab=FOR_YOU", FeedTestSupport.read(token))
+    Check.status(res, 200)
+    return FeedTestSupport.field(res, "lastSeenAt")
+}
+
+test "the first visit has no marker and the next first page returns it" {
+    var t = FeedTestSupport.user("seenmk_first")
+    var first = FeedTestSupport.app().client.getWith("/feed?tab=FOR_YOU", FeedTestSupport.read(t))
+    Check.status(first, 200)
+    Check.isTrue("items is an array", first.jsonSize("items") >= 0)
+    Check.isTrue("no marker yet", first.jsonIsNull("lastSeenAt"))
+    var seenUntil = agoIso(3600000L)
+    markSeen(t, seenUntil)
+    Check.eqStr("marker", seenUntil, lastSeenAt(t))
+}
+
+test "the marker never moves back" {
+    var t = FeedTestSupport.user("seenmk_mono")
+    var newer = agoIso(300000L)
+    markSeen(t, newer)
+    markSeen(t, Time.fromMillis(Time.toMillis(newer) - 172800000L))
+    Check.eqStr("marker", newer, lastSeenAt(t))
+}
+
+test "future values are clamped to now" {
+    var t = FeedTestSupport.user("seenmk_future")
+    markSeen(t, Time.fromMillis(Time.nowMillis() + 259200000L))
+    var stored = Time.toMillis(lastSeenAt(t))
+    Check.isTrue("not in the future", stored <= Time.nowMillis())
+    Check.isTrue("just now", stored > Time.nowMillis() - 60000L)
+}
+
+test "cursor pages do not carry the marker" {
+    var t = FeedTestSupport.user("seenmk_cursor")
+    markSeen(t, agoIso(7200000L))
+    var res = FeedTestSupport.app().client.getWith("/feed?tab=FOR_YOU&cursor=" + Time.nowIso(), FeedTestSupport.read(t))
+    Check.status(res, 200)
+    Check.isTrue("no marker on a cursor page", res.jsonIsNull("lastSeenAt"))
+}
+
+test "only For you carries the marker" {
+    var t = FeedTestSupport.user("seenmk_tabs")
+    markSeen(t, agoIso(7200000L))
+    for (var tab in listOf("ALL", "UNSEEN", "TRENDING", "INTERACTED", "PROJECTS")) {
+        var res = FeedTestSupport.app().client.getWith("/feed?tab=" + tab, FeedTestSupport.read(t))
+        Check.status(res, 200)
+        Check.isTrue("no marker on " + tab, res.jsonIsNull("lastSeenAt"))
+    }
+    var forYou = FeedTestSupport.app().client.getWith("/feed?tab=FOR_YOU", FeedTestSupport.read(t))
+    Check.status(forYou, 200)
+    Check.isTrue("marker on FOR_YOU", !forYou.jsonIsNull("lastSeenAt"))
+}
+
+test "a missing seenUntil is rejected" {
+    var t = FeedTestSupport.user("seenmk_invalid")
+    Check.apiError(FeedTestSupport.send("POST", "/feed/seen", t, "seen-invalid", "{}"), 400, "INVALID_SEEN_UNTIL")
+}
+
+test "anonymous cannot move the marker nor read the feed" {
+    var client = FeedTestSupport.app().client
+    var anon = listOf("Content-Type: application/json")
+    Check.status(client.send("POST", "/feed/seen", anon, "", "{\"seenUntil\":\"" + Time.nowIso() + "\"}"), 401)
+    Check.status(client.get("/feed"), 401)
+    FeedTestSupport.finish()
+}

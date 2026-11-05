@@ -1,0 +1,46 @@
+import feed.*
+import kernel.testkit.*
+
+// Port of PinnedCommentTests.
+test "pinning moves one comment to the top and unpins the previous one" {
+    var author = FeedTestSupport.user("pin_author")
+    var commenter = FeedTestSupport.user("pin_commenter")
+    var intruder = FeedTestSupport.user("pin_intruder")
+    var postId = FeedFixtures.publish(author, "pin-post-1", "Post para testar comentario fixado.")
+    var first = FeedFixtures.comment(commenter, postId, "Primeiro comentario da lista.", "pin-c-1")
+    var second = FeedFixtures.comment(commenter, postId, "Segundo comentario da lista.", "pin-c-2")
+    var base = "/feed/posts/" + postId + "/comments/"
+    // The author of the POST pins any comment.
+    var pin1 = FeedTestSupport.send("POST", base + first + "/pin", author, "pin-1", "")
+    Check.status(pin1, 200)
+    Check.jsonEq(pin1, "status", "COMMENT_PINNED")
+    var list1 = FeedFixtures.comments(author, postId)
+    Check.jsonEq(list1, "items.0.id", first)
+    Check.jsonEq(list1, "items.0.pinned", "true")
+    // The author of the COMMENT may switch the pinned one: the previous unpins itself.
+    Check.status(FeedTestSupport.send("POST", base + second + "/pin", commenter, "pin-2", ""), 200)
+    var list2 = FeedFixtures.comments(author, postId)
+    Check.jsonEq(list2, "items.0.id", second)
+    Check.jsonEq(list2, "items.0.pinned", "true")
+    Check.jsonEq(list2, "items.1.id", first)
+    Check.jsonEq(list2, "items.1.pinned", "false")
+    // Third parties do not pin.
+    Check.status(FeedTestSupport.send("POST", base + first + "/pin", intruder, "pin-3", ""), 403)
+    // Unpinning gives the comment back to the normal order.
+    var unpin = FeedTestSupport.send("DELETE", base + second + "/pin", commenter, "pin-4", "")
+    Check.status(unpin, 200)
+    Check.jsonEq(unpin, "status", "COMMENT_UNPINNED")
+    var list3 = FeedFixtures.comments(author, postId)
+    Check.jsonEq(list3, "items.0.pinned", "false")
+    Check.jsonEq(list3, "items.1.pinned", "false")
+}
+
+test "replies cannot be pinned" {
+    var author = FeedTestSupport.user("pin_reply_author")
+    var commenter = FeedTestSupport.user("pin_reply_user")
+    var postId = FeedFixtures.publish(author, "pin-reply-post", "Post para testar comentario fixado.")
+    var root = FeedFixtures.comment(commenter, postId, "Comentario raiz.", "pin-r-1")
+    var reply = FeedFixtures.reply(commenter, postId, root, "Uma resposta dentro da thread.", "pin-r-2")
+    Check.status(FeedTestSupport.send("POST", "/feed/posts/" + postId + "/comments/" + reply + "/pin", author, "pin-reply", ""), 404)
+    FeedTestSupport.finish()
+}

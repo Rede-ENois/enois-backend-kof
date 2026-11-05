@@ -353,6 +353,7 @@ hooks.reports = ModerationAutoReports(...)          // moderation: SecurityAutoR
 hooks.origins = DeveloperOrigins(...)               // apiv1: OriginDirectory (default: JdbcOriginDirectory on developer_origins)
 var parts = Security.install(platform, hooks)       // filters, routes, statics; returns SecurityParts
 parts.userLimiter.require(userId, UserRateLimiter.createPost())    // limiter instances for the domains
+Security.parts()                                    // the same SecurityParts from a domain module (after Security.install)
 ```
 
 The seams are classes with a safe default, not interfaces: a Kof interface declared in a package cannot be
@@ -699,6 +700,8 @@ other pods, the TTL is the guarantee. Caches: `publicProfiles` (20 s, 5000), `pu
 
 ```kotlin
 import kernel.text.*
+
+Base64Url.encode(text)  Base64Url.decode(encoded)   // URL-safe Base64 without padding (opaque cursors); decode throws on bad input
 
 PlainText.defuse(raw): String?                 // bidi/zero-width removed, <=5 combining marks, runs capped at 12 ("travazap")
 TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "nome", value, 160)   // 400 "O campo nome aceita no máximo 160 caracteres."

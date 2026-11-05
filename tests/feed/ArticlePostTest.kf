@@ -1,0 +1,70 @@
+import feed.*
+import kernel.testkit.*
+
+// Port of ArticlePostsTests.
+String payload(type: String, content: String, extra: String) = "{\"topic\":\"TECNOLOGIA\",\"type\":\"" + type + "\",\"content\":\"" + content + "\",\"tags\":[],\"mediaIds\":[]" + extra + "}"
+
+String? readBody(token: String, postId: String) {
+    var read = FeedTestSupport.app().client.getWith("/feed/posts/" + postId, FeedTestSupport.read(token))
+    Check.status(read, 200)
+    return read.jsonStr("articleBody")
+}
+
+String publishArticle(token: String, title: String, body: String, key: String) {
+    var res = FeedTestSupport.post(token, key, payload("ARTICLE", title, ",\"articleBody\":\"" + body + "\""))
+    Check.status(res, 201)
+    return FeedTestSupport.field(res, "id")
+}
+
+test "an article keeps its body in its own table and out of the listings" {
+    var author = FeedTestSupport.user("user_article_owner1")
+    var body = strings.repeat("Texto do artigo. ", 200)
+    var created = FeedTestSupport.post(author, "article-1", payload("ARTICLE", "Um artigo de verdade", ",\"articleBody\":\"" + body + "\""))
+    Check.status(created, 201)
+    Check.jsonEq(created, "type", "ARTICLE")
+    Check.jsonEq(created, "content", "Um artigo de verdade")
+    Check.isTrue("no body on the answer", created.jsonIsNull("articleBody"))
+    Check.eqStr("body on the single read", body.trim(), FeedRules.nz(readBody(author, FeedTestSupport.field(created, "id"))))
+    var feed = FeedTestSupport.app().client.getWith("/feed", FeedTestSupport.read(author))
+    Check.status(feed, 200)
+    var i = 0
+    while (i < feed.jsonSize("items")) {
+        Check.isTrue("no article body in the listing", feed.jsonIsNull("items." + i + ".articleBody"))
+        i = i + 1
+    }
+}
+
+test "the article body limit is ten thousand" {
+    var author = FeedTestSupport.user("user_article_owner2")
+    Check.apiError(FeedTestSupport.post(author, "article-limit", payload("ARTICLE", "Titulo", ",\"articleBody\":\"" + strings.repeat("a", 10001) + "\"")), 400, "ARTICLE_BODY_TOO_LONG")
+}
+
+test "an article without body is rejected" {
+    var author = FeedTestSupport.user("user_article_owner3")
+    Check.apiError(FeedTestSupport.post(author, "article-nobody", payload("ARTICLE", "Titulo sem corpo", "")), 400, "INVALID_ARTICLE_BODY")
+}
+
+test "other types ignore the article body" {
+    var author = FeedTestSupport.user("user_article_owner4")
+    var created = FeedTestSupport.post(author, "article-ignored", payload("INSIGHT", "Post comum", ",\"articleBody\":\"texto que nao deve ser guardado\""))
+    Check.status(created, 201)
+    Check.isTrue("not stored", readBody(author, FeedTestSupport.field(created, "id")) == null)
+}
+
+test "editing an article requires its body" {
+    var author = FeedTestSupport.user("user_article_owner5")
+    var postId = publishArticle(author, "Titulo original", "Corpo original do artigo.", "article-edit-pub")
+    Check.apiError(FeedTestSupport.send("PATCH", "/feed/posts/" + postId, author, "article-edit-nobody", "{\"content\":\"Titulo revisado\",\"tags\":[],\"mediaIds\":[]}"), 400, "INVALID_ARTICLE_BODY")
+    Check.status(FeedTestSupport.send("PATCH", "/feed/posts/" + postId, author, "article-edit-body", "{\"content\":\"Titulo revisado\",\"articleBody\":\"Corpo revisado.\",\"tags\":[],\"mediaIds\":[]}"), 200)
+    Check.eqStr("revised body", "Corpo revisado.", FeedRules.nz(readBody(author, postId)))
+}
+
+test "the new publication types publish like any other" {
+    var author = FeedTestSupport.user("user_article_owner6")
+    for (var type in listOf("NEWS", "TUTORIAL", "REVIEW", "MOMENT")) {
+        var res = FeedTestSupport.post(author, "type-" + type, payload(type, "Publicacao do tipo " + type, ""))
+        Check.status(res, 201)
+        Check.jsonEq(res, "type", type)
+    }
+    FeedTestSupport.finish()
+}

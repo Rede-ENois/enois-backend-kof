@@ -1,0 +1,80 @@
+import feed.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Port of PostReactionsAndReplyTests. The coin-ledger test (reactions earn the author no sparks) needs
+// the coins domain and is listed in docs/PORTING_STATUS.md.
+test "changing the reaction type does not raise the total" {
+    var author = FeedTestSupport.user("user_react_author")
+    var reactor = FeedTestSupport.user("user_react_actor")
+    var postId = FeedFixtures.publish(author, "r-pub-1", "Post para testar a contagem de reacoes.")
+    Check.eqInt("new reaction", 1, FeedReactions.react(reactor, postId, "LIKE", "r-like-1"))
+    Check.eqInt("changed type", 1, FeedReactions.react(reactor, postId, "LOVE", "r-love-1"))
+    Check.eqInt("removed", 0, FeedReactions.unreact(reactor, postId, "r-del-1"))
+}
+
+test "touching the same reaction again undoes it" {
+    var author = FeedTestSupport.user("user_react_author2")
+    var reactor = FeedTestSupport.user("user_react_actor2")
+    var postId = FeedFixtures.publish(author, "r-pub-2", "Tocar a mesma reacao de novo deve desfazer.")
+    Check.eqInt("on", 1, FeedReactions.react(reactor, postId, "LIKE", "t-like-1"))
+    Check.eqInt("toggled off", 0, FeedReactions.react(reactor, postId, "LIKE", "t-like-2"))
+    Check.eqInt("on again", 1, FeedReactions.react(reactor, postId, "LIKE", "t-like-3"))
+}
+
+test "the reaction summary comes with the post and the list" {
+    var author = FeedTestSupport.user("user_react_author_sum")
+    var a = FeedTestSupport.user("user_react_a_sum")
+    var b = FeedTestSupport.user("user_react_b_sum")
+    var c = FeedTestSupport.user("user_react_c_sum")
+    var postId = FeedFixtures.publish(author, "r-pub-3", "Resumo de reacoes vem junto com o post.")
+    FeedReactions.react(a, postId, "LIKE", "s-a-1")
+    FeedReactions.react(b, postId, "LIKE", "s-b-1")
+    FeedReactions.react(c, postId, "LOVE", "s-c-1")
+    var client = FeedTestSupport.app().client
+    var single = client.getWith("/feed/posts/" + postId, FeedTestSupport.read(author))
+    Check.status(single, 200)
+    Check.jsonEq(single, "reactionSummary.LIKE", "2")
+    Check.jsonEq(single, "reactionSummary.LOVE", "1")
+    var list = client.getWith("/feed/posts/" + postId + "/reactions", FeedTestSupport.read(author))
+    Check.status(list, 200)
+    Check.jsonEq(list, "summary.LIKE", "2")
+    Check.jsonEq(list, "summary.LOVE", "1")
+    Check.eqInt("three reactions", 3, list.jsonSize("reactions"))
+    // A post nobody reacted to still carries the field (empty), so the card knows not to fetch.
+    var quiet = FeedFixtures.publish(author, "r-pub-3b", "Post sem nenhuma reacao ainda.")
+    var empty = client.getWith("/feed/posts/" + quiet, FeedTestSupport.read(author))
+    Check.status(empty, 200)
+    Check.eqInt("empty summary", 0, empty.jsonSize("reactionSummary"))
+}
+
+test "two people, two counts" {
+    var author = FeedTestSupport.user("user_react_author3")
+    var a = FeedTestSupport.user("user_react_a3")
+    var b = FeedTestSupport.user("user_react_b3")
+    var postId = FeedFixtures.publish(author, "r-pub-4", "Duas pessoas, duas contagens.")
+    Check.eqInt("first", 1, FeedReactions.react(a, postId, "LIKE", "m-a-1"))
+    Check.eqInt("second", 2, FeedReactions.react(b, postId, "WOW", "m-b-1"))
+    Check.eqInt("a changes type", 2, FeedReactions.react(a, postId, "SAD", "m-a-2"))
+}
+
+test "a reply notifies the author of the comment" {
+    var postAuthor = FeedTestSupport.user("user_reply_poster")
+    var commenter = FeedTestSupport.user("user_reply_commenter")
+    var postId = FeedFixtures.publish(postAuthor, "rp-pub-1", "Post para conversa de comentarios.")
+    var commentId = FeedFixtures.comment(commenter, postId, "Primeiro comentario.", "c-first-1")
+    FeedFixtures.reply(postAuthor, postId, commentId, "Obrigado pelo comentario!", "c-reply-1")
+    var rows = FeedTestSupport.app().db().queryLong("select count(*) from notifications where user_id = ? and kind = \'NEW_REPLY\' and actor_id = ?", DbParams().bindStr("user_reply_commenter").bindStr("user_reply_poster"))
+    Check.eqInt("reply notification", 1, rows as Int)
+}
+
+test "replying to yourself raises no useless notice" {
+    var postAuthor = FeedTestSupport.user("user_reply_poster2")
+    var commenter = FeedTestSupport.user("user_reply_self")
+    var postId = FeedFixtures.publish(postAuthor, "rp-pub-2", "Responder a si mesmo nao gera aviso inutil.")
+    var commentId = FeedFixtures.comment(commenter, postId, "Comentario proprio.", "c-self-1")
+    FeedFixtures.reply(commenter, postId, commentId, "Complementando meu proprio comentario.", "c-self-2")
+    var rows = FeedTestSupport.app().db().queryLong("select count(*) from notifications where user_id = ? and kind = \'NEW_REPLY\'", DbParams().bindStr("user_reply_self"))
+    Check.eqInt("no notification", 0, rows as Int)
+    FeedTestSupport.finish()
+}

@@ -191,6 +191,60 @@ later than the first even inside one second) on the real clock.
 Deliberate differences: the 100 conversation participants limit, the 10 second duplicate window and the 4 media
 limit are the Java values; `PushService` is `PushSubscriptionService` (G206); a send with `"e2e": true` checks the
 ciphertext (`EMPTY_MESSAGE`, `MESSAGE_TOO_LONG` over 8000) and the IV (`MISSING_IV`) before storing.
+## feed (`src/feed`, tests in `tests/feed/`)
+
+**Ported: 43 / 43 endpoints, 161 / 170 Java tests (163 Kof tests: 2 are Kof-only, `GET /feed/saved` and a trending-cursor check). Gaps G140 to G150.**
+Identical paths, status codes, JSON field order, pt-BR codes/messages and `Idempotency-Key` routes.
+
+Endpoints: post core (`POST /feed/posts` for every type, `GET|PATCH|DELETE /feed/posts/{id}`, restore, bulk-delete,
+comments, comment pins and reactions, post reactions, saves, shares, poll vote, `GET /feed/saved`) plus, in this pass:
+`GET /feed` (tabs ALL, FOR_YOU, UNSEEN, TRENDING with the Base64Url cursor, INTERACTED, FOLLOWING, DISCUSSIONS, RECENT,
+PROJECTS, NEWS, TUTORIALS, OPPORTUNITIES, REVIEWS, FUN; date-window pagination and the "voce esta em dia" marker),
+`GET /users/{username}/posts` (with repost merge), `POST /feed/seen`, `POST|DELETE /feed/posts/{id}/repost`,
+`POST|GET|DELETE /feed/scheduled` with `feed-scheduled-publish` (3 attempts, batches of 20), post seals
+(`/feed/posts/seals`, `/{postId}/seals`, `/{postId}/seals/people`), `GET /feed/corporate`,
+`GET /corporate/{u}/posts`, post notes (`/feed/posts/{id}/notes`, `GET|PATCH /admin/notes`), accepted answers,
+`GET /pages/{postId}` (HTML with the CSP headers) and `GET /pages/{postId}/og.png`.
+Jobs on `kernel.jobs` (`REDE_FEED_WORKERS_ENABLED`, default true): `feed-moment-expiry`, `feed-scheduled-publish`.
+Moderation use cases are exposed on `FeedModule.moderation` (`removeAsModerator`, `quarantine`, `release`,
+`removeCommentAsModerator`, `purgeAllByAuthor`); the purge also clears `post_reposts`, `poll_votes`, `poll_options` and
+`comment_media`, which the Java list missed.
+
+Deliberate differences:
+- `GET /pages/{postId}/og.png` answers 404 for non-pages and 501 `PAGE_CARD_UNAVAILABLE` for pages: the Kof handler
+  writes a String as UTF-8, so no binary body can be served (G145).
+- `FeedDistributionService` and the in-memory feed cache are not ported: in Java `fromCache` is dead code and the cache
+  is write-only, so nothing reads it.
+- `GET /feed/posts/seals` is registered before `/feed/posts/:postId` because routes match in registration order (G147).
+- Counters move with atomic `update ... set n = n + 1`.
+
+Tests not ported (9 of 170, with reason): the two PagePreviewCard tests and the og image test (binary body, G145);
+the actor-style notification test (notifications port); the BanCleanupService test (moderation port); the coin-ledger
+reaction test (coins port; `FeedRecordingCoins` records the answer reward instead); the media-embedding Mockito `verify`
+test (media port); two identity-presentation tests that need the full profile cosmetics wiring.
+Test wiring: `feed.FeedTestSupport` (limits relaxed, duplicate filters off, outbox worker parked with
+`REDE_OUTBOX_WORKER_DELAY_MS`, `FeedTestSupport.finish()` in the last test of each file stops the shared jobs so the
+process exits: the Kof runtime waits for spawned tasks at exit, which the runner fix on main does not cover, G150), fixtures
+through SQL where the owner is not ported. Test helper names must not shadow kernel functions (`status`) or hit
+the parse failure of `audited` (G148, G149).
+
+### Seams owned by the feed (classes in `feed`, defaults wired in `FeedModule.install`)
+
+| Seam | Default | Owner / switch |
+|---|---|---|
+| `FeedAuthors` (`byIds`, `contributorIds`, `corporateByIds`, `idOfUsername`, `plainNames`, `isNewAccount`) | reads `users`, `user_seals`, `corporate_profiles` | profile: `ProfileDirectory` (`findAllByIds`, `findByUsername`, `displayName`, `nameStyle`) is now on main and can replace the reads |
+| `FeedMedia` | reads `media_assets`; deletion request is a no-op | media |
+| `FeedCommunities` (`byId`, `channel`) | reads `communities`, `community_members`, `community_channels` | communities: `CommunityDirectory.byIds(ids, viewerId)` and `CommunityChannelDirectory.byId` are on main and can replace the reads (concrete classes, so the switch is a subclass in `Main.kf`) |
+| `FeedNotifier` | single `notifications` insert; no push | notifications |
+| `FeedAgeGate`, `FeedHoneypot`, `FeedCoins` (`recordPresence`, `rewardAnswer`), `FeedCorporate` (`hasActiveProfile`, `activeUserIdOf`) | allow / never / no-op / read `corporate_profiles` | profile age, moderation, coins, corporate |
+| `FeedGraph`, `FeedBlogs`, `FeedReaderPrefs` | read `follows`/`connections`, `blogs`, `user_preferences` | network (already on main), blogs, preferences (already on main) |
+
+Defaults are kept on purpose: switching them is a one-line `installWith` change once the owner exposes the class, and
+the feed suite keeps passing on the table-level defaults.
+
+Exposed for others: `FeedModule.service`, `.store`, `.reader`, `.moderation`, `.scheduled`, `.notes`, `.seals`.
+Kernel changes: `Security.parts()` (earlier pass) and `kernel/text/Base64Url.kf` (trending cursor); see `docs/KERNEL.md`.
+The G144 root fix lives in the test runner on main; the feed makes no scheduler change.
 
 ## profile (profile, network, preferences, presence)
 

@@ -1,0 +1,68 @@
+import feed.*
+import kernel.testkit.*
+
+// Port of CommentMediaTests (the media assets are rows of the media port's table).
+test "a comment carries media and a reply inherits the flow" {
+    var author = FeedTestSupport.user("cmedia_author")
+    FeedWorld.media("cm_media_1", "cmedia_author")
+    var postId = FeedFixtures.publish(author, "cmedia-pub-1", "Post para comentarios com midia.")
+    var root = FeedTestSupport.send("POST", "/feed/posts/" + postId + "/comments", author, "cmedia-root-1", "{\"content\":\"\",\"mediaIds\":[\"cm_media_1\"],\"mentionedUserIds\":[]}")
+    Check.status(root, 201)
+    Check.jsonEq(root, "mediaIds.0", "cm_media_1")
+    var rootId = FeedTestSupport.field(root, "id")
+    FeedWorld.media("cm_media_2", "cmedia_author")
+    var reply = FeedTestSupport.send("POST", "/feed/posts/" + postId + "/comments", author, "cmedia-reply-1", "{\"content\":\"olha o gif\",\"parentCommentId\":\"" + rootId + "\",\"mediaIds\":[\"cm_media_2\"],\"mentionedUserIds\":[]}")
+    Check.status(reply, 201)
+    Check.jsonEq(reply, "mediaIds.0", "cm_media_2")
+    var replyId = FeedTestSupport.field(reply, "id")
+    var list = FeedTestSupport.app().client.get("/feed/posts/" + postId + "/comments")
+    Check.status(list, 200)
+    var rootHasMedia = false
+    var replyHasMedia = false
+    var i = 0
+    while (i < list.jsonSize("items")) {
+        var id = FeedTestSupport.field(list, "items." + i + ".id")
+        var one = list.jsonSize("items." + i + ".mediaIds") == 1
+        if (id == replyId) {
+            replyHasMedia = one && FeedTestSupport.field(list, "items." + i + ".mediaIds.0") == "cm_media_2"
+        }
+        if (id == rootId) {
+            rootHasMedia = one && FeedTestSupport.field(list, "items." + i + ".mediaIds.0") == "cm_media_1"
+        }
+        i = i + 1
+    }
+    Check.isTrue("root media", rootHasMedia)
+    Check.isTrue("reply media", replyHasMedia)
+}
+
+test "a comment without text nor media is rejected" {
+    var author = FeedTestSupport.user("cmedia_author2")
+    var postId = FeedFixtures.publish(author, "cmedia-pub-2", "Post para recusar comentario vazio.")
+    Check.status(FeedTestSupport.send("POST", "/feed/posts/" + postId + "/comments", author, "cmedia-empty-1", "{\"content\":\"\",\"mediaIds\":[],\"mentionedUserIds\":[]}"), 400)
+}
+
+test "foreign media is rejected" {
+    var author = FeedTestSupport.user("cmedia_author3")
+    FeedTestSupport.user("cmedia_other3")
+    FeedWorld.media("cm_media_foreign", "cmedia_other3")
+    var postId = FeedFixtures.publish(author, "cmedia-pub-3", "Post para recusar midia alheia.")
+    Check.status(FeedTestSupport.send("POST", "/feed/posts/" + postId + "/comments", author, "cmedia-foreign-1", "{\"content\":\"roubei a midia\",\"mediaIds\":[\"cm_media_foreign\"],\"mentionedUserIds\":[]}"), 403)
+}
+
+test "an edit replaces the media" {
+    var author = FeedTestSupport.user("cmedia_author4")
+    FeedWorld.media("cm_media_old", "cmedia_author4")
+    FeedWorld.media("cm_media_new", "cmedia_author4")
+    var postId = FeedFixtures.publish(author, "cmedia-pub-4", "Post para editar comentario com midia.")
+    var created = FeedTestSupport.send("POST", "/feed/posts/" + postId + "/comments", author, "cmedia-edit-1", "{\"content\":\"com midia antiga\",\"mediaIds\":[\"cm_media_old\"],\"mentionedUserIds\":[]}")
+    Check.status(created, 201)
+    var commentId = FeedTestSupport.field(created, "id")
+    var edited = FeedTestSupport.send("PATCH", "/feed/posts/" + postId + "/comments/" + commentId, author, "cmedia-edit-2", "{\"content\":\"texto sem mexer na midia\"}")
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "mediaIds.0", "cm_media_old")
+    var replaced = FeedTestSupport.send("PATCH", "/feed/posts/" + postId + "/comments/" + commentId, author, "cmedia-edit-3", "{\"content\":\"so texto agora\",\"mediaIds\":[\"cm_media_new\"]}")
+    Check.status(replaced, 200)
+    Check.eqInt("one media", 1, replaced.jsonSize("mediaIds"))
+    Check.jsonEq(replaced, "mediaIds.0", "cm_media_new")
+    FeedTestSupport.finish()
+}

@@ -1,0 +1,98 @@
+import feed.*
+import kernel.html.*
+import kernel.testkit.*
+
+// Port of PostPageTests.
+String pagePayload(content: String, html: String) = "{\"topic\":\"TECNOLOGIA\",\"type\":\"PAGE\",\"content\":\"" + content + "\",\"pageHtml\":\"" + html + "\",\"tags\":[],\"mediaIds\":[]}"
+
+String? readPage(token: String, postId: String) {
+    var read = FeedTestSupport.app().client.getWith("/feed/posts/" + postId, FeedTestSupport.read(token))
+    Check.status(read, 200)
+    return read.jsonStr("pageHtml")
+}
+
+String publishPage(token: String, title: String, html: String, key: String) {
+    var res = FeedTestSupport.post(token, key, pagePayload(title, html))
+    Check.status(res, 201)
+    return FeedTestSupport.field(res, "id")
+}
+
+test "publishes a page with sanitized html" {
+    var author = FeedTestSupport.user("user_page_owner1")
+    var created = FeedTestSupport.post(author, "page-1", pagePayload("Minha pagina", "<h1>Ola</h1><script>fetch(\'https://malicioso.test\')</script><p onclick=\\\"alert(1)\\\" style=\\\"color:#123456\\\">corpo</p>"))
+    Check.status(created, 201)
+    Check.jsonEq(created, "type", "PAGE")
+    Check.jsonEq(created, "content", "Minha pagina")
+    Check.isTrue("no page on the answer", created.jsonIsNull("pageHtml"))
+    var html = FeedRules.nz(readPage(author, FeedTestSupport.field(created, "id")))
+    Check.isTrue("heading kept", html.contains("<h1>Ola</h1>"))
+    Check.isTrue("text kept", html.contains("corpo"))
+    Check.isTrue("style kept", html.contains("#123456"))
+    Check.isTrue("no script", !html.contains("<script"))
+    Check.isTrue("no handler", !html.contains("onclick"))
+    Check.isTrue("no payload", !html.contains("malicioso.test"))
+}
+
+test "the feed list does not carry the page body" {
+    var author = FeedTestSupport.user("user_page_list")
+    var postId = publishPage(author, "Pagina do feed", "<p>corpo grande</p>", "page-list-pub")
+    var feed = FeedTestSupport.app().client.getWith("/feed", FeedTestSupport.read(author))
+    Check.status(feed, 200)
+    Check.eqStr("type", "PAGE", FeedRows.fieldOf(feed, postId, "type"))
+    var i = 0
+    while (i < feed.jsonSize("items")) {
+        Check.isTrue("no page body in the listing", feed.jsonIsNull("items." + i + ".pageHtml"))
+        i = i + 1
+    }
+}
+
+test "a page without post text is accepted" {
+    var author = FeedTestSupport.user("user_page_notext")
+    var created = FeedTestSupport.post(author, "page-notext", "{\"topic\":\"TECNOLOGIA\",\"type\":\"PAGE\",\"pageHtml\":\"<h1>So a pagina</h1>\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(created, 201)
+    Check.jsonEq(created, "type", "PAGE")
+    Check.jsonEq(created, "content", "")
+    var postId = FeedTestSupport.field(created, "id")
+    Check.eqStr("page", "<h1>So a pagina</h1>", FeedRules.nz(readPage(author, postId)))
+    Check.status(FeedTestSupport.send("PATCH", "/feed/posts/" + postId, author, "page-notext-edit", "{\"content\":\"\",\"pageHtml\":\"<h1>So a pagina v2</h1>\",\"tags\":[],\"mediaIds\":[]}"), 200)
+    Check.eqStr("page v2", "<h1>So a pagina v2</h1>", FeedRules.nz(readPage(author, postId)))
+}
+
+test "the post text is still required for other types" {
+    var author = FeedTestSupport.user("user_post_notext")
+    Check.apiError(FeedTestSupport.post(author, "post-notext", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"   \",\"tags\":[],\"mediaIds\":[]}"), 400, "INVALID_CONTENT")
+}
+
+test "a page without html is rejected" {
+    var author = FeedTestSupport.user("user_page_owner2")
+    Check.apiError(FeedTestSupport.post(author, "page-2", pagePayload("Pagina sem corpo", "   ")), 400, "INVALID_PAGE_HTML")
+}
+
+test "html sent on another type is discarded" {
+    var author = FeedTestSupport.user("user_page_owner3")
+    var created = FeedTestSupport.post(author, "page-3", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Post normal com html na mochila\",\"pageHtml\":\"<p>nao deveria ser guardado</p>\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(created, 201)
+    Check.isTrue("not stored", readPage(author, FeedTestSupport.field(created, "id")) == null)
+}
+
+test "an edit replaces the page and requires it" {
+    var author = FeedTestSupport.user("user_page_owner4")
+    var postId = publishPage(author, "Pagina original", "<p>versao 1</p>", "page-edit-pub")
+    var edited = FeedTestSupport.send("PATCH", "/feed/posts/" + postId, author, "page-edit-1", "{\"content\":\"Pagina revisada\",\"pageHtml\":\"<p>versao 2</p><script>x()</script>\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "content", "Pagina revisada")
+    Check.eqStr("page v2", "<p>versao 2</p>", FeedRules.nz(readPage(author, postId)))
+    Check.apiError(FeedTestSupport.send("PATCH", "/feed/posts/" + postId, author, "page-edit-2", "{\"content\":\"Pagina revisada\",\"tags\":[],\"mediaIds\":[]}"), 400, "INVALID_PAGE_HTML")
+}
+
+test "the page limit is the same for every user" {
+    var first = FeedTestSupport.user("user_page_owner5")
+    var second = FeedTestSupport.user("user_page_owner6")
+    var big = "<p>" + strings.repeat("a", SafeHtml.maxPageHtml() - 10) + "</p>"
+    Check.status(FeedTestSupport.post(first, "page-5a", pagePayload("Pagina grande", big)), 201)
+    Check.status(FeedTestSupport.post(second, "page-5b", pagePayload("Pagina grande", big)), 201)
+    var tooBig = "<p>" + strings.repeat("a", SafeHtml.maxPageHtml()) + "</p>"
+    Check.apiError(FeedTestSupport.post(first, "page-5-first", pagePayload("Pagina grande demais", tooBig)), 400, "PAGE_HTML_TOO_LONG")
+    Check.apiError(FeedTestSupport.post(second, "page-5-second", pagePayload("Pagina grande demais", tooBig)), 400, "PAGE_HTML_TOO_LONG")
+    FeedTestSupport.finish()
+}

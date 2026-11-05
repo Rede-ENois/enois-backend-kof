@@ -1,0 +1,25 @@
+import feed.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Port of MomentExpiryTests (the 24h deadline, the type limits and the worker deleting a due moment).
+test "a moment carries a 24h deadline, the limits hold and the worker deletes a due moment" {
+    var author = FeedTestSupport.user("mom_author")
+    var created = FeedTestSupport.post(author, "mom-1", "{\"topic\":\"TECNOLOGIA\",\"type\":\"MOMENT\",\"content\":\"Tomando café na varanda ☕\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(created, 201)
+    var postId = FeedTestSupport.field(created, "id")
+    var read = FeedTestSupport.app().client.getWith("/feed/posts/" + postId, FeedTestSupport.read(author))
+    var hours = (Time.toMillis(FeedTestSupport.field(read, "expiresAt")) - Time.nowMillis()) / 3600000L
+    Check.isTrue("24h deadline", hours >= 23L && hours <= 24L)
+    Check.apiError(FeedTestSupport.post(author, "mom-div-long", "{\"topic\":\"TECNOLOGIA\",\"type\":\"DIVERTIDO\",\"content\":\"" + strings.repeat("0123456789", 41) + "\"}"), 400, "CONTENT_TOO_LONG")
+    Check.apiError(FeedTestSupport.post(author, "mom-mom-long", "{\"topic\":\"TECNOLOGIA\",\"type\":\"MOMENT\",\"content\":\"" + strings.repeat("0123456789", 51) + "\"}"), 400, "CONTENT_TOO_LONG")
+    // A moment already past its deadline (inserted directly): the worker deletes it through the normal flow.
+    var database = FeedTestSupport.app().db()
+    var past = Time.plusSeconds(Time.nowIso(), -3600L)
+    database.execute("insert into posts (id, author_id, type, content, created_at, visibility, reactions, comments, saves, shares, reposts, status, author_identity, expires_at, repost_with_opinion, media_spoiler) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", DbParams().bindStr("post_mom_vencido").bindStr("mom_author").bindStr("MOMENT").bindStr("Momento que já passou do prazo").bindInstant(Time.plusSeconds(Time.nowIso(), -90000L)).bindStr("PUBLIC").bindInt(0).bindInt(0).bindInt(0).bindInt(0).bindInt(0).bindStr("ACTIVE").bindStr("SOCIAL").bindInstant(past).bindBool(false).bindBool(false))
+    var module = FeedTestSupport.module()
+    Check.isTrue("worker deleted one", module.service.expireDueMoments(200) >= 1)
+    Check.eqStr("deleted", "DELETED", database.queryOne("select status from posts where id = \'post_mom_vencido\'", DbParams()).getStr("status"))
+    Check.eqStr("recent one stays", "ACTIVE", database.queryOne("select status from posts where id = ?", DbParams().bindStr(postId)).getStr("status"))
+    FeedTestSupport.finish()
+}

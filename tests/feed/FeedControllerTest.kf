@@ -1,0 +1,90 @@
+import feed.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of FeedControllerTests (publish replay, idempotency conflict, delete, interactions).
+String insightBody(content: String) = "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"" + content + "\",\"tags\":[\"Arquitetura\",\"Java\"],\"mediaIds\":[]}"
+
+test "publishes a post and replays the idempotent response" {
+    var t = FeedTestSupport.user("user_feed_replay")
+    var body = insightBody("Arquitetura hexagonal deixa a regra de negocio respirando melhor.")
+    var first = FeedTestSupport.post(t, "feed-replay-1", body)
+    Check.status(first, 201)
+    Check.isTrue("author id", first.jsonStr("authorId") != null)
+    var replay = FeedTestSupport.post(t, "feed-replay-1", body)
+    Check.status(replay, 201)
+    Check.eqStr("replayed body", first.body, replay.body)
+}
+
+test "rejects the same idempotency key with a different payload" {
+    var t = FeedTestSupport.user("user_feed_conflict")
+    Check.status(FeedTestSupport.post(t, "feed-conflict-1", insightBody("Primeira tentativa")), 201)
+    var second = FeedTestSupport.post(t, "feed-conflict-1", insightBody("Outra tentativa"))
+    Check.status(second, 409)
+    Check.jsonEq(second, "code", "IDEMPOTENCY_PAYLOAD_CONFLICT")
+}
+
+test "deletes a post and a deleted post is gone" {
+    var t = FeedTestSupport.user("user_feed_delete")
+    var created = FeedTestSupport.post(t, "feed-delete-create-1", "{\"topic\":\"TECNOLOGIA\",\"type\":\"QUESTION\",\"content\":\"Como voces organizam portas e adaptadores no monolito?\",\"tags\":[\"Backend\"],\"mediaIds\":[]}")
+    Check.status(created, 201)
+    var id = FeedTestSupport.field(created, "id")
+    var del = FeedTestSupport.app().client.send("DELETE", "/feed/posts/" + id, FeedTestSupport.write(t, "feed-delete-1"), "", "")
+    Check.status(del, 200)
+    Check.jsonEq(del, "status", "DELETED")
+    Check.apiError(FeedTestSupport.app().client.getWith("/feed/posts/" + id, FeedTestSupport.read(t)), 404, "POST_NOT_FOUND")
+}
+
+test "handles post interactions with counters and idempotency" {
+    var author = FeedTestSupport.user("user_feed_interactions")
+    var commenter = FeedTestSupport.user("user_feed_commenter")
+    var replier = FeedTestSupport.user("user_feed_author_reply")
+    var reactor = FeedTestSupport.user("user_feed_reactor")
+    var saver = FeedTestSupport.user("user_feed_saver")
+    var sharer = FeedTestSupport.user("user_feed_sharer")
+    var c = FeedTestSupport.app().client
+    var created = FeedTestSupport.post(author, "feed-interactions-create-1", insightBody("Interacoes precisam ser pequenas, transacionais e repetiveis."))
+    var postId = FeedTestSupport.field(created, "id")
+    var path = "/feed/posts/" + postId
+    var comment = c.send("POST", path + "/comments", FeedTestSupport.write(commenter, "feed-comment-1"), "", "{\"content\":\"Concordo com a abordagem.\"}")
+    Check.status(comment, 201)
+    Check.jsonEq(comment, "postId", postId)
+    var again = c.send("POST", path + "/comments", FeedTestSupport.write(commenter, "feed-comment-1"), "", "{\"content\":\"Concordo com a abordagem.\"}")
+    Check.status(again, 201)
+    Check.eqStr("replayed comment", comment.body, again.body)
+    var commentId = FeedTestSupport.field(comment, "id")
+    var reply = c.send("POST", path + "/comments", FeedTestSupport.write(replier, "feed-reply-1"), "", "{\"parentCommentId\":\"" + commentId + "\",\"content\":\"Resposta mantendo a thread no mesmo post.\"}")
+    Check.status(reply, 201)
+    Check.jsonEq(reply, "parentCommentId", commentId)
+    var react = c.send("POST", path + "/reactions", FeedTestSupport.write(reactor, "feed-reaction-1"), "", "{\"type\":\"LIKE\"}")
+    Check.status(react, 200)
+    Check.jsonEq(react, "status", "REACTED")
+    Check.jsonEq(react, "counters.reactions", "1")
+    Check.jsonEq(react, "counters.comments", "2")
+    var save = c.send("POST", path + "/saves", FeedTestSupport.write(saver, "feed-save-1"), "", "")
+    Check.jsonEq(save, "status", "SAVED")
+    Check.jsonEq(save, "counters.saves", "1")
+    var share = c.send("POST", path + "/shares", FeedTestSupport.write(sharer, "feed-share-1"), "", "")
+    Check.jsonEq(share, "status", "SHARED")
+    Check.jsonEq(share, "counters.shares", "1")
+    var list = c.get(path + "/comments")
+    Check.status(list, 200)
+    Check.eqInt("two comments", 2, list.jsonSize("items"))
+    var unreact = c.send("DELETE", path + "/reactions", FeedTestSupport.write(reactor, "feed-reaction-delete-1"), "", "")
+    Check.jsonEq(unreact, "status", "REACTION_REMOVED")
+    Check.jsonEq(unreact, "counters.reactions", "0")
+    var unsave = c.send("DELETE", path + "/saves", FeedTestSupport.write(saver, "feed-save-delete-1"), "", "")
+    Check.jsonEq(unsave, "status", "SAVE_REMOVED")
+    Check.jsonEq(unsave, "counters.saves", "0")
+}
+
+test "the trending feed takes its own cursor and rejects a timestamp cursor" {
+    var t = FeedTestSupport.user("user_feed_trending_cursor")
+    var c = FeedTestSupport.app().client
+    var until = Time.fromMillis(Time.nowMillis() - 60000L)
+    var cursor = FeedTrending.encode(FeedTrendingCursor(until, 0, Time.plusSeconds(until, -1L), "synthetic_cursor_post"))
+    Check.status(c.getWith("/feed?tab=TRENDING&cursor=" + cursor, FeedTestSupport.read(t)), 200)
+    Check.status(c.getWith("/feed?tab=ALL&cursor=" + until, FeedTestSupport.read(t)), 200)
+    Check.apiError(c.getWith("/feed?tab=TRENDING&cursor=" + until, FeedTestSupport.read(t)), 400, "INVALID_CURSOR")
+    FeedTestSupport.finish()
+}

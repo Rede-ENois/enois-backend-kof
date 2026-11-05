@@ -1,0 +1,95 @@
+import feed.*
+import kernel.testkit.*
+
+// Port of ForYouCommunityFilterTests, PersonalizationFeedTests and UnseenFeedTabTests. Friendships, communities and
+// preferences are written into the owner's tables (the network, communities and preferences ports are pending).
+test "for you hides foreign communities and keeps joined ones" {
+    var author = FeedTestSupport.user("foryou_author")
+    var viewer = FeedTestSupport.user("foryou_viewer")
+    FeedWorld.befriend("foryou_author", "foryou_viewer")
+    FeedWorld.community("comm_foryou_joined", "Comunidade Participada For You", "TECNOLOGIA", "foryou_author")
+    FeedWorld.community("comm_foryou_foreign", "Comunidade Estranha For You", "TECNOLOGIA", "foryou_author")
+    FeedWorld.join("comm_foryou_joined", "foryou_viewer", "MEMBER")
+    var postJoined = FeedWorld.publishIn(author, "foryou-post-joined", "comm_foryou_joined", "Post de teste dentro da comunidade (joined).")
+    var postForeign = FeedWorld.publishIn(author, "foryou-post-foreign", "comm_foryou_foreign", "Post de teste dentro da comunidade (foreign).")
+    var postGlobal = FeedWorld.publishTopic(author, "foryou-post-global", "TECNOLOGIA", "Post fora de comunidade foryou.")
+    var forYou = FeedWorld.feedIds(viewer, "tab=FOR_YOU&limit=20")
+    Check.isTrue("joined", FeedWorld.listed(forYou, postJoined))
+    Check.isTrue("global", FeedWorld.listed(forYou, postGlobal))
+    Check.isTrue("foreign hidden", !FeedWorld.listed(forYou, postForeign))
+    var following = FeedWorld.feedIds(viewer, "tab=FOLLOWING&limit=20")
+    Check.isTrue("following keeps joined", FeedWorld.listed(following, postJoined))
+    Check.isTrue("following keeps foreign", FeedWorld.listed(following, postForeign))
+    Check.isTrue("following keeps global", FeedWorld.listed(following, postGlobal))
+}
+
+test "the author sees the own post in a foreign community in for you" {
+    var author = FeedTestSupport.user("foryou_author2")
+    FeedWorld.community("comm_foryou_author2", "Comunidade Autora For You", "TECNOLOGIA", "foryou_author2")
+    var postForeign = FeedWorld.publishIn(author, "foryou2-post", "comm_foryou_author2", "Post de teste dentro da comunidade (foryou2).")
+    var postGlobal = FeedWorld.publishTopic(author, "foryou2-post-global", "TECNOLOGIA", "Post global do autor foryou2.")
+    var forYou = FeedWorld.feedIds(author, "tab=FOR_YOU&limit=20")
+    Check.isTrue("own foreign-community post", FeedWorld.listed(forYou, postForeign))
+    Check.isTrue("own global post", FeedWorld.listed(forYou, postGlobal))
+}
+
+test "a blocked topic leaves the all feed and comes back" {
+    var author = FeedTestSupport.user("persfeed_author")
+    var reader = FeedTestSupport.user("persfeed_reader")
+    FeedWorld.community("comm_persfeed", "PersFeed Tech", "TECNOLOGIA", "persfeed_author")
+    FeedWorld.join("comm_persfeed", "persfeed_reader", "MEMBER")
+    var postId = FeedWorld.publishIn(author, "pers-post-1", "comm_persfeed", "Post de tecnologia da comunidade.")
+    Check.isTrue("visible", FeedWorld.listed(FeedWorld.feedIds(reader, "tab=ALL&limit=50"), postId))
+    FeedWorld.preferences("persfeed_reader", "", "TECNOLOGIA")
+    Check.isTrue("blocked for the reader", !FeedWorld.listed(FeedWorld.feedIds(reader, "tab=ALL&limit=50"), postId))
+    Check.isTrue("still there for the author", FeedWorld.listed(FeedWorld.feedIds(author, "tab=ALL&limit=50"), postId))
+    FeedWorld.preferences("persfeed_reader", "", "")
+    Check.isTrue("back", FeedWorld.listed(FeedWorld.feedIds(reader, "tab=ALL&limit=50"), postId))
+}
+
+test "a liked topic comes first in for you alongside posts without topic" {
+    var author = FeedTestSupport.user("persfeed_liked")
+    FeedWorld.community("comm_persfeed_liked", "PersFeed Liked Tech", "TECNOLOGIA", "persfeed_liked")
+    var likedPost = FeedWorld.publishIn(author, "pers-liked-1", "comm_persfeed_liked", "Post de tecnologia (mais antigo).")
+    var untopicPost = FeedWorld.publishTopic(author, "pers-untopic-1", "OUTROS", "Post sem assunto (mais novo).")
+    FeedWorld.preferences("persfeed_liked", "TECNOLOGIA", "")
+    var csv = FeedWorld.feedIds(author, "tab=FOR_YOU")
+    var likedAt = csv.indexOf("," + likedPost + ",")
+    var untopicAt = csv.indexOf("," + untopicPost + ",")
+    Check.isTrue("both listed", likedAt >= 0 && untopicAt >= 0)
+    Check.isTrue("liked topic first", likedAt < untopicAt)
+}
+
+test "for you pages are date windows boosted inside" {
+    var author = FeedTestSupport.user("persfeed_pages")
+    FeedWorld.community("comm_persfeed_pages", "PersFeed Pages Tech", "TECNOLOGIA", "persfeed_pages")
+    var liked1 = FeedWorld.publishIn(author, "pages-liked-1", "comm_persfeed_pages", "Pages: liked, oldest.")
+    var plain1 = FeedWorld.publishTopic(author, "pages-plain-1", "OUTROS", "Pages: plain, second.")
+    var plain2 = FeedWorld.publishTopic(author, "pages-plain-2", "OUTROS", "Pages: plain, third.")
+    var liked2 = FeedWorld.publishIn(author, "pages-liked-2", "comm_persfeed_pages", "Pages: liked, newest.")
+    FeedWorld.preferences("persfeed_pages", "TECNOLOGIA", "")
+    var all = FeedRows.readAll(author, "FOR_YOU", null, 2)
+    Check.eqInt("count", 4, all.size())
+    Check.eqStr("order", liked2 + "," + plain2 + "," + liked1 + "," + plain1, String.join(",", all))
+}
+
+test "unseen shows the posts the person did not react to nor comment" {
+    var leitor = FeedTestSupport.user("unseen_leitor")
+    var autor = FeedTestSupport.user("unseen_autor")
+    var reagir = FeedFixtures.publish(autor, "unseen-post-1", "Post em que o leitor reage.")
+    var comentar = FeedFixtures.publish(autor, "unseen-post-2", "Post em que o leitor comenta.")
+    var intacto = FeedFixtures.publish(autor, "unseen-post-3", "Post em que o leitor nao encostou.")
+    Check.status(FeedTestSupport.send("POST", "/feed/posts/" + reagir + "/reactions", leitor, "unseen-react-1", "{\"type\":\"LIKE\"}"), 200)
+    Check.status(FeedTestSupport.send("POST", "/feed/posts/" + comentar + "/comments", leitor, "unseen-comment-1", "{\"content\":\"Comentario do leitor.\"}"), 201)
+    var csv = FeedWorld.feedIds(leitor, "tab=UNSEEN")
+    Check.isTrue("untouched is there", FeedWorld.listed(csv, intacto))
+    Check.isTrue("reacted is gone", !FeedWorld.listed(csv, reagir))
+    Check.isTrue("commented is gone", !FeedWorld.listed(csv, comentar))
+}
+
+test "unseen does not show the person's own posts" {
+    var leitor = FeedTestSupport.user("unseen_dono")
+    var proprio = FeedFixtures.publish(leitor, "unseen-own-1", "Post do proprio leitor.")
+    Check.isTrue("own post hidden", !FeedWorld.listed(FeedWorld.feedIds(leitor, "tab=UNSEEN"), proprio))
+    FeedTestSupport.finish()
+}

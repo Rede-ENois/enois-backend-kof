@@ -1,0 +1,559 @@
+package feed
+
+import kernel.blocks.*
+import kernel.error.*
+import kernel.http.*
+import kernel.time.*
+
+// GetFeedService (the page reads) + FeedSeenController: GET /feed (every tab), profile posts, corporate pages.
+// The Java in-memory feed cache (FeedDistributionService / FeedCacheRepository) is not ported: the service never
+// reads it (fromCache is dead code), the tabs below query the database directly.
+class FeedReader {
+    FeedService svc
+    FeedStore posts
+    FeedAuthors authors
+    FeedCommunities communities
+    FeedCorporate corporate
+    FeedGraph graph
+    FeedBlogs blogs
+    FeedReaderPrefs prefs
+    public constructor(svc: FeedService, posts: FeedStore, authors: FeedAuthors, communities: FeedCommunities, corporate: FeedCorporate, graph: FeedGraph, blogs: FeedBlogs, prefs: FeedReaderPrefs) {
+        this.svc = svc
+        this.posts = posts
+        this.authors = authors
+        this.communities = communities
+        this.corporate = corporate
+        this.graph = graph
+        this.blogs = blogs
+        this.prefs = prefs
+    }
+    static List<String> tabs() = listOf("ALL", "FOR_YOU", "UNSEEN", "TRENDING", "INTERACTED", "FOLLOWING", "DISCUSSIONS", "RECENT", "PROJECTS", "NEWS", "TUTORIALS", "OPPORTUNITIES", "REVIEWS", "FUN")
+    static String defaultBefore() = "9999-12-31T23:59:59Z"
+    static Int normalizeLimit(limit: Int) {
+        if (limit < 1) {
+            return 20
+        }
+        if (limit > 50) {
+            return 50
+        }
+        return limit
+    }
+    static String tabOf(raw: String) {
+        var t = raw.trim()
+        if (t.length() == 0) {
+            return "FOR_YOU"
+        }
+        if (!FeedReader.tabs().contains(t)) {
+            throw Errors.badRequest()
+        }
+        return t
+    }
+    // `type` query parameter: repeated and/or comma separated PostType names (Set<PostType> in Spring).
+    static List<String> typesOf(rawQuery: String) {
+        var out = listOf<String>()
+        for (var pair in rawQuery.split("&")) {
+            var eq = pair.indexOf("=")
+            if (eq > 0 && pair.substring(0, eq) == "type") {
+                for (var item in pair.substring(eq + 1).split(",")) {
+                    var t = item.trim()
+                    if (t.length() > 0) {
+                        if (!FeedRules.postTypes().contains(t)) {
+                            throw Errors.badRequest()
+                        }
+                        if (!out.contains(t)) {
+                            out.add(t)
+                        }
+                    }
+                }
+            }
+        }
+        return out
+    }
+    static String beforeOf(cursor: String?) {
+        if (cursor == null) {
+            return FeedReader.defaultBefore()
+        }
+        var decoded = FeedCursor.decode(cursor)
+        if (decoded == null) {
+            return FeedReader.defaultBefore()
+        }
+        return decoded
+    }
+    // Page cursor from the DB page (not the displayed list: blocked authors shrink the display).
+    static String? pageCursor(fetched: List<FeedPostRow>, limit: Int) {
+        if (fetched.size() == limit) {
+            return fetched.get(fetched.size() - 1).createdAt()
+        }
+        return null
+    }
+    FeedPage page(rows: List<FeedPostRow>, viewerId: String?, limit: Int) = FeedPage(svc.enrich(rows, viewerId), FeedReader.pageCursor(rows, limit))
+    // GET /feed. The marker ("voce esta em dia") rides only on the first FOR_YOU page.
+    FeedResponse feed(userId: String, cursor: String?, limit: Int, tabRaw: String, types: List<String>, resolved: Int, trendingRaw: String?) {
+        var tab = FeedReader.tabOf(tabRaw)
+        var withCursor = false
+        if (tab == "TRENDING") {
+            withCursor = trendingRaw != null
+        }
+        else {
+            withCursor = FeedCursor.decode(FeedRules.nz(cursor)) != null
+        }
+        var pageResult = this.getFeed(userId, cursor, limit, tab, types, resolved)
+        var marker = this.markerFor(userId, tab, withCursor)
+        return FeedResponse(pageResult.items(), pageResult.nextCursor(), marker)
+    }
+    String? markerFor(userId: String, tab: String, withCursor: Bool) {
+        if (withCursor) {
+            return null
+        }
+        if (tab != "FOR_YOU") {
+            return null
+        }
+        return posts.lastSeenAt(userId)
+    }
+    FeedPage getFeed(userId: String, cursor: String?, limitRaw: Int, tab: String, types: List<String>, resolved: Int) {
+        var limit = FeedReader.normalizeLimit(limitRaw)
+        if (tab == "TRENDING") {
+            return this.trending(userId, cursor, limit)
+        }
+        var before = FeedReader.beforeOf(cursor)
+        if (tab == "FOR_YOU") {
+            return this.forYou(userId, before, limit)
+        }
+        var rows = listOf<FeedPostRow>()
+        if (tab == "ALL") {
+            if (types.size() > 0) {
+                rows = posts.activeByTypes(types, resolved, before, limit)
+            }
+            else {
+                rows = posts.activeAll(prefs.blockedTopics(userId), before, limit)
+            }
+        }
+        else 
+            if (tab == "UNSEEN") {
+                rows = posts.activeUnseen(userId, prefs.blockedTopics(userId), before, limit)
+            }
+            else 
+                if (tab == "INTERACTED") {
+                    rows = posts.activeInteracted(userId, before, limit)
+                }
+                else 
+                    if (tab == "PROJECTS") {
+                        rows = posts.activeByType("PROJECT", before, limit)
+                    }
+                    else 
+                        if (tab == "NEWS") {
+                            rows = posts.activeByType("NEWS", before, limit)
+                        }
+                        else 
+                            if (tab == "TUTORIALS") {
+                                rows = posts.activeByType("TUTORIAL", before, limit)
+                            }
+                            else 
+                                if (tab == "OPPORTUNITIES") {
+                                    rows = posts.activeByType("OPPORTUNITY", before, limit)
+                                }
+                                else 
+                                    if (tab == "REVIEWS") {
+                                        rows = posts.activeByType("REVIEW", before, limit)
+                                    }
+                                    else 
+                                        if (tab == "FUN") {
+                                            rows = posts.activeByType("DIVERTIDO", before, limit)
+                                        }
+                                        else {
+                                            // FOLLOWING, DISCUSSIONS, RECENT: the author and their connections.
+                                            var authorIds = listOf<String>()
+                                            authorIds.add(userId)
+                                            for (var f in graph.friendIds(userId)) {
+                                                if (!authorIds.contains(f)) {
+                                                    authorIds.add(f)
+                                                }
+                                            }
+                                            rows = posts.activeByAuthors(authorIds, listOf<String>(), before, limit)
+                                        }
+        return this.page(rows, userId, limit)
+    }
+    FeedPage trending(userId: String, cursor: String?, limit: Int) {
+        var after = FeedTrending.decode(FeedRules.nz(cursor))
+        var until = Time.nowIso()
+        if (after != null) {
+            until = after.windowEnd()
+        }
+        var since = Time.fromMillis(Time.toMillis(until) - 86400000L)
+        var fetched = posts.trending(since, until, after, limit + 1)
+        var rows = listOf<FeedPostRow>()
+        for (var r in fetched) {
+            if (rows.size() < limit) {
+                rows.add(r)
+            }
+        }
+        var next = FeedReader.trendingNext(fetched, rows, limit, until)
+        return FeedPage(svc.enrich(rows, userId), next)
+    }
+    static String? trendingNext(fetched: List<FeedPostRow>, rows: List<FeedPostRow>, limit: Int, until: String) {
+        if (fetched.size() <= limit) {
+            return null
+        }
+        var last = rows.get(rows.size() - 1)
+        return FeedTrending.encode(FeedTrendingCursor(until, last.reactions(), last.createdAt(), last.id()))
+    }
+    // "Para voce": own posts, connections' and subscribed blogs', only inside communities the reader joined; the
+    // page is a date window reordered by liked topics (a boost, never a filter).
+    FeedPage forYou(userId: String, before: String, limit: Int) {
+        var authorIds = listOf<String>()
+        authorIds.add(userId)
+        var friends = graph.friendIds(userId)
+        for (var f in friends) {
+            if (!authorIds.contains(f)) {
+                authorIds.add(f)
+            }
+        }
+        for (var b in blogs.authorsFollowedBy(userId)) {
+            if (!authorIds.contains(b)) {
+                authorIds.add(b)
+            }
+        }
+        var blocked = prefs.blockedTopics(userId)
+        var fetched = posts.activeByAuthors(authorIds, blocked, before, limit * 3)
+        var hiddenCommunities = this.communitiesWithoutMembership(fetched, userId)
+        var filtered = listOf<FeedPostRow>()
+        for (var p in fetched) {
+            if (!FeedReader.inCommunities(p, hiddenCommunities)) {
+                filtered.add(p)
+            }
+        }
+        var visible = listOf<FeedPostRow>()
+        for (var p in filtered) {
+            if (visible.size() < limit) {
+                visible.add(p)
+            }
+        }
+        var next = FeedReader.forYouNext(filtered, visible, fetched, limit)
+        var liked = prefs.likedTopics(userId)
+        if (liked.size() > 0 && visible.size() > 1) {
+            visible = FeedReader.boost(visible, liked)
+        }
+        var reposters = new HashMap<String, FeedRepostedBy>()
+        var extra = this.friendReposts(userId, friends, authorIds, visible, hiddenCommunities, blocked, limit, reposters)
+        var enriched = svc.enrich(visible, userId)
+        if (extra.size() > 0) {
+            var all = listOf<FeedPostView>()
+            for (var v in enriched) {
+                all.add(v)
+            }
+            for (var v in svc.enrichWith(extra, userId, reposters)) {
+                all.add(v)
+            }
+            enriched = FeedReader.byEffectiveDate(all)
+        }
+        return FeedPage(enriched, next)
+    }
+    static Bool inCommunities(p: FeedPostRow, ids: List<String>) {
+        var cid = p.communityId()
+        if (cid == null) {
+            return false
+        }
+        return ids.contains(cid)
+    }
+    static String? forYouNext(filtered: List<FeedPostRow>, visible: List<FeedPostRow>, fetched: List<FeedPostRow>, limit: Int) {
+        if (filtered.size() > limit) {
+            return visible.get(visible.size() - 1).createdAt()
+        }
+        if (fetched.size() == limit * 3) {
+            return fetched.get(fetched.size() - 1).createdAt()
+        }
+        return null
+    }
+    // Liked topics first, the rest newest first (stable inside each group).
+    static List<FeedPostRow> boost(rows: List<FeedPostRow>, liked: List<String>) {
+        var first = listOf<FeedPostRow>()
+        var rest = listOf<FeedPostRow>()
+        for (var p in rows) {
+            if (FeedReader.isLiked(p, liked)) {
+                first.add(p)
+            }
+            else {
+                rest.add(p)
+            }
+        }
+        for (var p in rest) {
+            first.add(p)
+        }
+        return first
+    }
+    static Bool isLiked(p: FeedPostRow, liked: List<String>) {
+        var t = p.topic()
+        if (t == null) {
+            return false
+        }
+        return liked.contains(t)
+    }
+    // Communities of the page the reader has not joined (one batch lookup per distinct community).
+    List<String> communitiesWithoutMembership(rows: List<FeedPostRow>, viewerId: String) {
+        var out = listOf<String>()
+        var seen = listOf<String>()
+        for (var p in rows) {
+            var cid = p.communityId()
+            if (cid != null && !seen.contains(cid)) {
+                seen.add(cid)
+                var ref = communities.byId(cid, viewerId)
+                if (ref != null) {
+                    if (!ref.joined()) {
+                        out.add(cid)
+                    }
+                }
+            }
+        }
+        return out
+    }
+    // Pure reposts of the connections that are not already on the page, newest repost per post wins.
+    List<FeedPostRow> friendReposts(userId: String, friends: List<String>, authorIds: List<String>, visible: List<FeedPostRow>, hiddenCommunities: List<String>, blocked: List<String>, limit: Int, reposters: Map<String,FeedRepostedBy>) {
+        var out = listOf<FeedPostRow>()
+        var friendIds = listOf<String>()
+        for (var a in authorIds) {
+            if (a != userId) {
+                friendIds.add(a)
+            }
+        }
+        if (friendIds.size() == 0) {
+            return out
+        }
+        var onPage = listOf<String>()
+        for (var p in visible) {
+            onPage.add(p.id())
+        }
+        var hidden = svc.hiddenFor(userId)
+        var best = new HashMap<String, FeedRepostPointer>()
+        var order = listOf<String>()
+        for (var rp in posts.repostsOfUsers(friendIds)) {
+            if (!onPage.contains(rp.postId()) && !hidden.contains(rp.userId())) {
+                var existing = best.get(rp.postId())
+                if (existing == null) {
+                    best.put(rp.postId(), rp)
+                    order.add(rp.postId())
+                }
+                else 
+                    if (Time.toMillis(rp.createdAt()) > Time.toMillis(existing.createdAt())) {
+                        best.put(rp.postId(), rp)
+                    }
+            }
+        }
+        if (best.size() == 0) {
+            return out
+        }
+        var ids = order
+        var reposterIds = listOf<String>()
+        for (var id in ids) {
+            var rp = best.get(id)
+            if (rp != null && !reposterIds.contains(rp.userId())) {
+                reposterIds.add(rp.userId())
+            }
+        }
+        var profiles = authors.byIds(reposterIds)
+        var names = authors.plainNames(reposterIds)
+        for (var p in posts.posts(ids)) {
+            if (p.status() == "ACTIVE" && !FeedReader.inCommunities(p, hiddenCommunities) && !FeedReader.topicBlocked(p, blocked)) {
+                var pointer = best.get(p.id())
+                if (pointer != null) {
+                    var who = profiles.get(pointer.userId())
+                    if (who != null) {
+                        reposters.put(p.id(), FeedRepostedBy(names.get(pointer.userId()), who.username(), who.avatar(), pointer.createdAt()))
+                        out.add(p)
+                    }
+                }
+            }
+        }
+        return out
+    }
+    static Bool topicBlocked(p: FeedPostRow, blocked: List<String>) {
+        var t = p.topic()
+        if (t == null) {
+            return false
+        }
+        return blocked.contains(t)
+    }
+    // Indexes of `keys` from the largest to the smallest, ties keep their order (a stable descending sort).
+    static List<Int> orderDesc(keys: List<Long>) {
+        var order = listOf<Int>()
+        var taken = listOf<Int>()
+        var n = keys.size()
+        var round = 0
+        while (round < n) {
+            var best = -1
+            var i = 0
+            while (i < n) {
+                if (!taken.contains(i)) {
+                    if (best < 0 || keys.get(i) > keys.get(best)) {
+                        best = i
+                    }
+                }
+                i = i + 1
+            }
+            taken.add(best)
+            order.add(best)
+            round = round + 1
+        }
+        return order
+    }
+    // Newest first by the effective date: the repost instant for reposts, the creation instant otherwise.
+    static List<FeedPostView> byEffectiveDate(views: List<FeedPostView>) {
+        var keys = listOf<Long>()
+        for (var v in views) {
+            keys.add(Time.toMillis(FeedReader.effectiveOf(v)))
+        }
+        var out = listOf<FeedPostView>()
+        for (var i in FeedReader.orderDesc(keys)) {
+            out.add(views.get(i))
+        }
+        return out
+    }
+    static String effectiveOf(v: FeedPostView) {
+        var by = v.repostedBy()
+        if (by != null) {
+            var at = by.at()
+            if (at != null) {
+                return at
+            }
+        }
+        return v.createdAt()
+    }
+    // GET /users/{username}/posts: authored posts plus pure reposts, merged by effective date.
+    FeedPage profilePosts(viewerId: String?, usernameOrId: String, cursor: String?, limitRaw: Int) {
+        var limit = FeedReader.normalizeLimit(limitRaw)
+        var before = FeedReader.beforeOf(cursor)
+        var authorId = authors.idOfUsername(usernameOrId)
+        var authored = posts.activeByAuthor(authorId, before, limit)
+        var pointers = posts.repostsOf(authorId, before, limit)
+        var repostDates = new HashMap<String, String>()
+        var repostedIds = listOf<String>()
+        for (var rp in pointers) {
+            repostDates.put(rp.postId(), rp.createdAt())
+            repostedIds.add(rp.postId())
+        }
+        var authoredIds = listOf<String>()
+        for (var p in authored) {
+            authoredIds.add(p.id())
+        }
+        var merged = listOf<FeedPostRow>()
+        for (var p in authored) {
+            merged.add(p)
+        }
+        for (var p in posts.posts(repostedIds)) {
+            if (p.status() == "ACTIVE" && !authoredIds.contains(p.id())) {
+                merged.add(p)
+            }
+        }
+        var keys = listOf<Long>()
+        for (var p in merged) {
+            keys.add(Time.toMillis(FeedReader.rowDate(p, repostDates)))
+        }
+        var pageRows = listOf<FeedPostRow>()
+        for (var i in FeedReader.orderDesc(keys)) {
+            if (pageRows.size() < limit) {
+                pageRows.add(merged.get(i))
+            }
+        }
+        var reposters = new HashMap<String, FeedRepostedBy>()
+        var owner = authors.byIds(listOf(authorId)).get(authorId)
+        if (owner != null) {
+            for (var p in pageRows) {
+                var at = repostDates.get(p.id())
+                if (at != null && p.authorId() != authorId) {
+                    reposters.put(p.id(), FeedRepostedBy(owner.name(), owner.username(), owner.avatar(), at))
+                }
+            }
+        }
+        var views = svc.enrichWith(pageRows, viewerId, reposters)
+        var next = FeedReader.profileNext(pageRows, repostDates, limit)
+        return FeedPage(views, next)
+    }
+    static String rowDate(p: FeedPostRow, repostDates: Map<String,String>) {
+        var at = repostDates.get(p.id())
+        if (at == null) {
+            return p.createdAt()
+        }
+        return at
+    }
+    static String? profileNext(pageRows: List<FeedPostRow>, repostDates: Map<String,String>, limit: Int) {
+        if (pageRows.size() == 0) {
+            return null
+        }
+        if (pageRows.size() != limit) {
+            return null
+        }
+        return FeedReader.rowDate(pageRows.get(pageRows.size() - 1), repostDates)
+    }
+    // GET /feed/corporate
+    FeedPage corporateFeed(viewerId: String, cursor: String?, limitRaw: Int) {
+        var limit = FeedReader.normalizeLimit(limitRaw)
+        return this.page(posts.activeCorporate(FeedReader.beforeOf(cursor), limit), viewerId, limit)
+    }
+    // GET /corporate/{username}/posts: only what the owner signed as CORPORATE; inactive profiles have no page.
+    FeedPage corporateProfilePosts(username: String, cursor: String?, limitRaw: Int, viewerId: String?) {
+        var limit = FeedReader.normalizeLimit(limitRaw)
+        var before = FeedReader.beforeOf(cursor)
+        var ownerId = corporate.activeUserIdOf(username)
+        if (ownerId == null) {
+            throw Errors.api(404, "PROFILE_NOT_FOUND", "Perfil profissional não encontrado.")
+        }
+        return this.page(posts.activeCorporateByAuthor(ownerId, before, limit), viewerId, limit)
+    }
+    // Exposed for the communities port: the community and private channel feeds.
+    FeedPage communityFeed(communityId: String, cursor: String?, limitRaw: Int, viewerId: String?) {
+        var limit = FeedReader.normalizeLimit(limitRaw)
+        return this.page(posts.activeByCommunity(communityId, FeedReader.beforeOf(cursor), limit), viewerId, limit)
+    }
+    // Private channel feed (members only); a channel post never shows in the other feeds.
+    FeedPage channelFeed(communityId: String, channelId: String, cursor: String?, limitRaw: Int, viewerId: String?) {
+        var limit = FeedReader.normalizeLimit(limitRaw)
+        var before = FeedReader.beforeOf(cursor)
+        var community = this.communityRef(communityId, viewerId)
+        if (community == null) {
+            throw Errors.api(404, "COMMUNITY_NOT_FOUND", "Comunidade nao encontrada.")
+        }
+        if (!community.joined()) {
+            throw Errors.api(403, "NOT_A_MEMBER", "Os canais sao privados: so quem participa da comunidade pode ver.")
+        }
+        var channel = communities.channel(channelId)
+        if (channel == null) {
+            throw Errors.api(404, "CHANNEL_NOT_FOUND", "Canal nao encontrado nesta comunidade.")
+        }
+        if (!FeedRules.same(channel.communityId(), communityId)) {
+            throw Errors.api(404, "CHANNEL_NOT_FOUND", "Canal nao encontrado nesta comunidade.")
+        }
+        return this.page(posts.activeByChannel(channel.id(), before, limit), viewerId, limit)
+    }
+    FeedCommunityRef? communityRef(communityId: String, viewerId: String?) {
+        if (viewerId == null) {
+            return communities.byId(communityId, "")
+        }
+        return communities.byId(communityId, viewerId)
+    }
+    // POST /feed/seen: the marker only moves forward and never into the future.
+    markSeen(userId: String, seenUntilRaw: String?) {
+        if (seenUntilRaw == null) {
+            throw Errors.api(400, "INVALID_SEEN_UNTIL", "Informe até quando o feed foi visto.")
+        }
+        var now = Time.nowIso()
+        var seen = seenUntilRaw
+        try {
+            if (Time.toMillis(seenUntilRaw) > Time.toMillis(now)) {
+                seen = now
+            }
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        posts.advanceSeen(userId, seen, now)
+    }
+    // GetPageDocumentService: only an active PAGE with html has a document to serve.
+    FeedPageDoc pageDocument(postId: String) {
+        var p = posts.post(postId)
+        if (p == null) {
+            throw Errors.api(404, "PAGE_NOT_FOUND", "Pagina nao encontrada.")
+        }
+        if (p.status() != "ACTIVE" || p.type() != "PAGE" || !FeedRules.hasText(p.pageHtml())) {
+            throw Errors.api(404, "PAGE_NOT_FOUND", "Pagina nao encontrada.")
+        }
+        return FeedPageDoc(p.id(), p.authorId(), FeedRules.nz(p.pageHtml()))
+    }
+}

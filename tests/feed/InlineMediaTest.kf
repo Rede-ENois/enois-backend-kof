@@ -1,0 +1,74 @@
+import feed.*
+import kernel.testkit.*
+
+// Port of InlineMediaTests and PostMediaEmbeddingTests.
+test "a marker referencing an own attachment is accepted" {
+    var author = FeedTestSupport.user("inline_author")
+    FeedWorld.media("media_autor_1", "inline_author")
+    var res = FeedTestSupport.post(author, "inline-ok", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Explicando a ideia:\\n\\n{{media:media_autor_1}}\\n\\nE o resultado.\",\"tags\":[],\"mediaIds\":[\"media_autor_1\"]}")
+    Check.status(res, 201)
+    Check.jsonEq(res, "content", "Explicando a ideia:\n\n{{media:media_autor_1}}\n\nE o resultado.")
+}
+
+test "a marker referencing foreign media is rejected" {
+    var author = FeedTestSupport.user("inline_foreign")
+    Check.apiError(FeedTestSupport.post(author, "inline-foreign", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Usando a midia dos outros: {{media:media_alheia}}\",\"tags\":[],\"mediaIds\":[]}"), 400, "INVALID_INLINE_MEDIA")
+}
+
+test "a comment marker also needs the attachment" {
+    var author = FeedTestSupport.user("inline_comment_author")
+    FeedWorld.media("inline_media_1", "inline_comment_author")
+    var postId = FeedFixtures.publish(author, "inline-post", "post para comentario")
+    var path = "/feed/posts/" + postId + "/comments"
+    Check.apiError(FeedTestSupport.send("POST", path, author, "inline-comment-bad", "{\"content\":\"veja {{media:x}}\",\"mediaIds\":[]}"), 400, "INVALID_INLINE_MEDIA")
+    Check.status(FeedTestSupport.send("POST", path, author, "inline-comment-ok", "{\"content\":\"veja {{media:inline_media_1}}\",\"mediaIds\":[\"inline_media_1\"]}"), 201)
+}
+
+test "a post without markers does not validate anything" {
+    var author = FeedTestSupport.user("inline_none")
+    Check.status(FeedTestSupport.post(author, "inline-none", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"post comum sem marcador\",\"tags\":[],\"mediaIds\":[]}"), 201)
+}
+
+String mediaIdsOf(res: TestResponse, path: String) {
+    var out = listOf<String>()
+    var i = 0
+    while (i < res.jsonSize(path)) {
+        out.add(FeedTestSupport.field(res, path + "." + i + ".id"))
+        i = i + 1
+    }
+    return String.join(",", out)
+}
+
+TestResponse publishMedia(token: String, key: String, ids: String) {
+    var res = FeedTestSupport.post(token, key, "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Post com anexos " + key + "\",\"tags\":[],\"mediaIds\":[" + ids + "]}")
+    Check.status(res, 201)
+    return res
+}
+
+test "posts carry the visible media in order" {
+    var author = FeedTestSupport.user("post_media_embed")
+    FeedTestSupport.app().db()
+    FeedWorld.mediaSized("media_postembed_sized", "post_media_embed", "image/png", 1200, 800)
+    FeedWorld.mediaSized("media_postembed_unsized", "post_media_embed", "video/mp4", 0, 0)
+    FeedWorld.mediaSized("media_postembed_removed", "post_media_embed", "image/jpeg", 0, 0)
+    var published = publishMedia(author, "pme-1", "\"media_postembed_unsized\",\"media_postembed_sized\",\"media_postembed_removed\"")
+    Check.eqStr("media in order", "media_postembed_unsized,media_postembed_sized,media_postembed_removed", mediaIdsOf(published, "media"))
+    publishMedia(author, "pme-2", "\"media_postembed_sized\"")
+    FeedWorld.removeMedia("media_postembed_removed")
+    var single = FeedTestSupport.app().client.get("/feed/posts/" + FeedTestSupport.field(published, "id"))
+    Check.status(single, 200)
+    Check.eqInt("media ids kept", 3, single.jsonSize("mediaIds"))
+    Check.eqStr("only the visible ones", "media_postembed_unsized,media_postembed_sized", mediaIdsOf(single, "media"))
+    Check.jsonEq(single, "media.0.mimeType", "video/mp4")
+    Check.isTrue("unsized width", single.jsonIsNull("media.0.width"))
+    Check.jsonEq(single, "media.1.width", "1200")
+    Check.jsonEq(single, "media.1.height", "800")
+    Check.isTrue("address", FeedTestSupport.field(single, "media.1.cdnUrl").endsWith("/media_postembed_sized/file"))
+    var username = FeedTestSupport.field(published, "authorUsername")
+    var page = FeedTestSupport.app().client.get("/users/" + username + "/posts")
+    Check.status(page, 200)
+    Check.eqInt("two posts", 2, page.jsonSize("items"))
+    Check.eqStr("newest", "media_postembed_sized", mediaIdsOf(page, "items.0.media"))
+    Check.eqStr("oldest", "media_postembed_unsized,media_postembed_sized", mediaIdsOf(page, "items.1.media"))
+    FeedTestSupport.finish()
+}

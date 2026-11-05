@@ -1,0 +1,92 @@
+package feed
+
+import kernel.db.*
+import kernel.error.*
+import kernel.time.*
+
+record FeedAcceptBody(String? commentId)
+
+record FeedAcceptedAnswer(String postId, String? acceptedCommentId, Bool resolved)
+
+// QuestionAnswerService: the asker marks the comment that solved the question. The reward goes to who HELPED and is
+// paid once per question for good (FeedCoins.rewardAnswer, a no-op until the coins port).
+class FeedAnswers {
+    Db store
+    FeedStore posts
+    FeedService svc
+    public constructor(store: Db, posts: FeedStore, svc: FeedService) {
+        this.store = store
+        this.posts = posts
+        this.svc = svc
+    }
+    FeedPostRow ownQuestion(postId: String, actorId: String) {
+        var p = posts.post(postId)
+        if (p == null) {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post não encontrado.")
+        }
+        if (p.status() != "ACTIVE") {
+            throw Errors.api(404, "POST_NOT_FOUND", "Post não encontrado.")
+        }
+        if (p.type() != "QUESTION") {
+            throw Errors.api(400, "NOT_A_QUESTION", "Só dúvidas têm resposta aceita.")
+        }
+        if (p.authorId() != actorId) {
+            throw Errors.api(403, "NOT_QUESTION_AUTHOR", "Só quem perguntou escolhe a resposta.")
+        }
+        return p
+    }
+    FeedAcceptedAnswer accept(postId: String, actorId: String, commentIdRaw: String?) {
+        var post = this.ownQuestion(postId, actorId)
+        var comment = this.commentOf(commentIdRaw)
+        if (comment == null) {
+            throw Errors.api(400, "INVALID_ANSWER_COMMENT", "Esse comentário não é uma resposta desta dúvida.")
+        }
+        if (comment.postId() != post.id() || comment.status() != "ACTIVE") {
+            throw Errors.api(400, "INVALID_ANSWER_COMMENT", "Esse comentário não é uma resposta desta dúvida.")
+        }
+        if (comment.authorId() == post.authorId()) {
+            throw Errors.api(400, "OWN_ANSWER", "Você não pode aceitar a sua própria resposta.")
+        }
+        if (FeedRules.same(post.acceptedCommentId(), comment.id())) {
+            return FeedAcceptedAnswer(post.id(), comment.id(), true)
+        }
+        var self = this
+        store.transaction(() -> {
+    self.posts.setAccepted(post.id(), comment.id(), Time.nowIso())
+    self.notifyAnswerer(comment.authorId(), actorId, post.id())
+    if (!self.svc.authors.isNewAccount(comment.authorId()) && !self.svc.authors.isNewAccount(actorId)) {
+        self.rewardAfterCommit(comment.authorId(), actorId, post.id())
+    }
+})
+        return FeedAcceptedAnswer(post.id(), comment.id(), true)
+    }
+    // The reward is a side effect: it runs after the commit and never undoes the acceptance.
+    rewardAfterCommit(answererId: String, askerId: String, postId: String) {
+        var coins = svc.coins
+        store.afterCommit(() -> {
+    coins.rewardAnswer(answererId, askerId, postId)
+})
+    }
+    FeedCommentRow? commentOf(raw: String?) {
+        if (!FeedRules.hasText(raw)) {
+            return null
+        }
+        return posts.comment(FeedRules.trimmed(raw))
+    }
+    notifyAnswerer(answererId: String, actorId: String, postId: String) {
+        var asker = svc.authors.byIds(listOf(actorId)).get(actorId)
+        var name = FeedViews.plainNameOf(asker)
+        var shown = "Alguém"
+        if (name != null) {
+            shown = name
+        }
+        svc.notifier.notify(answererId, "ANSWER_ACCEPTED", actorId, "Sua resposta ajudou", shown + " marcou a sua resposta como a que resolveu a dúvida.", "/api/feed/posts/" + postId, "Ver")
+    }
+    FeedAcceptedAnswer unaccept(postId: String, actorId: String) {
+        var post = this.ownQuestion(postId, actorId)
+        if (post.acceptedCommentId() != null) {
+            posts.setAccepted(post.id(), null, null)
+        }
+        return FeedAcceptedAnswer(post.id(), null, false)
+    }
+}
