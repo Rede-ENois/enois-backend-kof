@@ -1,0 +1,257 @@
+package kernel.image
+
+import java.awt.Color
+import java.awt.Font
+import java.awt.Graphics2D
+import java.awt.RenderingHints
+import java.awt.geom.AffineTransform
+import java.awt.image.BufferedImage
+import java.io.File
+import java.io.FileInputStream
+import java.io.InputStream
+import java.lang.StringBuilder
+import java.lang.Throwable
+import java.lang.reflect.Method
+import java.lang.System
+import java.util.Base64
+import org.jsoup.Jsoup
+
+// The share card of a published page (PagePreviewCardService): a 1200x630 PNG drawn from the TEXT of the page, the
+// first lines as the title, a supporting line, the author and the signature. Java2D lives here, never in a domain;
+// the font ships with the repository (`resources/fonts/LiberationSans-Bold.ttf`, SIL OFL) because a slim container
+// has no system font and would draw an empty card. Deterministic and dependency free; the caller caches it.
+class PageCards {
+    static Int width() = 1200
+    static Int height() = 630
+    static Int titleChars() = 120
+    static Int bodyChars() = 180
+    // The card as PNG bytes. `html` may be blank, `author` null or blank ("alguem"), `fontPath` the TTF.
+    static Byte[] render(html: String?, author: String?, fontPath: String) {
+        System.setProperty("java.awt.headless", "true")
+        var base = PageCards.loadFont(fontPath)
+        var source = ""
+        if (html != null) {
+            source = Jsoup.parse(html).text().trim()
+        }
+        var text = PageCards.keepDrawable(base, source)
+        var title = PageCards.excerpt(text, PageCards.titleChars())
+        var body = ""
+        if (text.length() > PageCards.titleChars()) {
+            body = PageCards.excerpt(text.substring(PageCards.titleChars()), PageCards.bodyChars())
+        }
+        var image = new BufferedImage(PageCards.width(), PageCards.height(), 1)
+        PageCards.paintBackground(image)
+        var g = image.createGraphics()
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+        g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON)
+        g.setColor(new Color(0x1AFFFFFF, true))
+        g.fillRoundRect(56, 56, PageCards.width() - 112, PageCards.height() - 112, 40, 40)
+        g.setFont(PageCards.sized(base, 58.0))
+        g.setColor(new Color(0xFFFFFF))
+        var shown = title
+        if (shown.length() == 0) {
+            shown = "Página no Énóis"
+        }
+        var y = PageCards.drawWrapped(g, shown, 112, 200, PageCards.width() - 224, 3, 74)
+        // The body only enters when there is room above the footer.
+        if (body.length() > 0) {
+            var bodyTop = y + 40
+            var fits = (PageCards.height() - 200 - bodyTop) / 46
+            if (fits > 0) {
+                g.setFont(PageCards.sized(base, 34.0))
+                g.setColor(new Color(0xE9E4FF))
+                var lines = 2
+                if (fits < 2) {
+                    lines = fits
+                }
+                PageCards.drawWrapped(g, body, 112, bodyTop, PageCards.width() - 224, lines, 46)
+            }
+        }
+        g.setFont(PageCards.sized(base, 28.0))
+        g.setColor(new Color(0xC9BCF5))
+        var name = "alguém"
+        if (author != null && author.trim().length() > 0) {
+            name = author
+        }
+        PageCards.drawString(g, "Página de " + name, 112, PageCards.height() - 92)
+        PageCards.drawString(g, "Énóis", PageCards.width() - 200, PageCards.height() - 92)
+        g.dispose()
+        return Images.encode(image, "png")
+    }
+    // The TtlCache keeps text: a card travels through it as base64.
+    static String toText(png: Byte[]) = Base64.getEncoder().encodeToString(png)
+    static Byte[] fromText(text: String) = Base64.getDecoder().decode(text) as Byte[]
+    // Diagonal gradient from #2A0F52 (top left) to #7C3AED (bottom right), pixel by pixel.
+    static paintBackground(image: BufferedImage) {
+        var w = PageCards.width()
+        var h = PageCards.height()
+        // Locals, not inline casts: `kof fmt` drops the parentheses of `(expr) as T` (KOF_GAPS G286).
+        var diagonal = w * w + h * h
+        var span = diagonal as Double
+        var y = 0
+        while (y < h) {
+            var x = 0
+            while (x < w) {
+                var along = x * w + y * h
+                var alongD = along as Double
+                var t = alongD / span
+                var rr = 42.0 + (124.0 - 42.0) * t
+                var r = rr as Int
+                var gg = 15.0 + (58.0 - 15.0) * t
+                var gr = gg as Int
+                var bb = 82.0 + (237.0 - 82.0) * t
+                var b = bb as Int
+                image.setRGB(x, y, r * 65536 + gr * 256 + b)
+                x = x + 1
+            }
+            y = y + 1
+        }
+    }
+    // The bundled font at 1 pt (scaled by `sized`); the logical bold sans when the file is missing.
+    static Font loadFont(path: String) {
+        var file = new File(path)
+        if (file.exists()) {
+            try {
+                var stream = new FileInputStream(path)
+                var font = PageCards.createFont(stream)
+                stream.close()
+                return font
+            } catch (Throwable e) {
+                return new Font("SansSerif", 1, 1)
+            }
+        }
+        return new Font("SansSerif", 1, 1)
+    }
+    // The Java2D calls that are overloaded run by reflection: the compiler emits the wrong overload for them
+    // (`createFont(int, File)` for a stream and the reverse, KOF_GAPS G305).
+    static Font createFont(stream: InputStream) {
+        var types = new Class[2]
+        types[0] = Integer.TYPE
+        types[1] = Class.forName("java.io.InputStream")
+        var args = new Object[2]
+        args[0] = 0 as Object
+        args[1] = stream as Object
+        return Class.forName("java.awt.Font").getMethod("createFont", types).invoke(null, args) as Font
+    }
+    // `base` at `points` (deriveFont(float) is out of reach from Kof: a scale transform of the 1 pt font does the same).
+    static Font sized(base: Font, points: Double) {
+        var types = new Class[1]
+        types[0] = Class.forName("java.awt.geom.AffineTransform")
+        var args = new Object[1]
+        args[0] = AffineTransform.getScaleInstance(points, points) as Object
+        return Class.forName("java.awt.Font").getMethod("deriveFont", types).invoke(base as Object, args) as Font
+    }
+    static drawString(g: Graphics2D, text: String, x: Int, y: Int) {
+        var types = new Class[3]
+        types[0] = Class.forName("java.lang.String")
+        types[1] = Integer.TYPE
+        types[2] = Integer.TYPE
+        var args = new Object[3]
+        args[0] = text as Object
+        args[1] = x as Object
+        args[2] = y as Object
+        Class.forName("java.awt.Graphics2D").getMethod("drawString", types).invoke(g as Object, args)
+    }
+    // Words wrapped to `maxWidth`; returns the y of the last line. An ellipsis marks cut text.
+    static Int drawWrapped(g: Graphics2D, text: String, x: Int, y: Int, maxWidth: Int, maxLines: Int, lineHeight: Int) {
+        var metrics = g.getFontMetrics()
+        var words = PageCards.words(text)
+        var lines = listOf<String>()
+        var current = ""
+        var used = 0
+        var index = 0
+        while (index < words.size() && lines.size() < maxLines) {
+            var word = words.get(index)
+            var candidate = word
+            if (current.length() > 0) {
+                candidate = current + " " + word
+            }
+            if (metrics.stringWidth(candidate) > maxWidth && current.length() > 0) {
+                lines.add(current)
+                used = used + PageCards.words(current).size()
+                current = word
+            }
+            else {
+                current = candidate
+            }
+            index = index + 1
+        }
+        if (lines.size() < maxLines && current.length() > 0) {
+            lines.add(current)
+            used = used + PageCards.words(current).size()
+        }
+        var cursor = y
+        var i = 0
+        while (i < lines.size()) {
+            var line = lines.get(i)
+            if (i == lines.size() - 1 && words.size() > used) {
+                line = line + "…"
+            }
+            PageCards.drawString(g, line, x, cursor)
+            cursor = cursor + lineHeight
+            i = i + 1
+        }
+        return cursor - lineHeight
+    }
+    static List<String> words(text: String) {
+        var out = listOf<String>()
+        for (var part in text.split("\\s+")) {
+            if (part.length() > 0) {
+                out.add(part)
+            }
+        }
+        return out
+    }
+    // Cut at a whole word: a card with a chopped word reads worse.
+    static String excerpt(text: String, limit: Int) {
+        var collapsed = ""
+        for (var word in PageCards.words(text)) {
+            if (collapsed.length() > 0) {
+                collapsed = collapsed + " "
+            }
+            collapsed = collapsed + word
+        }
+        if (collapsed.length() <= limit) {
+            return collapsed
+        }
+        var cut = collapsed.substring(0, limit)
+        var lastSpace = cut.lastIndexOf(" ")
+        if (lastSpace > limit / 2) {
+            return cut.substring(0, lastSpace).trim()
+        }
+        return cut.trim()
+    }
+    // Only what the font can draw (and spaces): an emoji would print as an empty box.
+    static String keepDrawable(font: Font, text: String) {
+        var out = new StringBuilder()
+        var types = new Class[1]
+        types[0] = Integer.TYPE
+        var probe = Class.forName("java.awt.Font").getMethod("canDisplay", types)
+        var index = 0
+        while (index < text.length()) {
+            // The code point at `index` (String has no codePointAt here): a surrogate pair is one character.
+            var unit = text.charAt(index) as Int
+            var cp = unit
+            var width = 1
+            if (unit >= 55296 && unit <= 56319 && index + 1 < text.length()) {
+                var low = text.charAt(index + 1) as Int
+                if (low >= 56320 && low <= 57343) {
+                    var high = unit - 55296
+                    var lower = low - 56320
+                    cp = 65536 + high * 1024 + lower
+                    width = 2
+                }
+            }
+            index = index + width
+            if (Character.isWhitespace(cp) || PageCards.canDisplay(probe, font, cp)) {
+                out.appendCodePoint(cp)
+            }
+        }
+        return out.toString()
+    }
+    static Bool canDisplay(probe: Method, font: Font, cp: Int) {
+        var args = new Object[1]
+        args[0] = cp as Object
+        return "" + probe.invoke(font as Object, args) == "true"
+    }
+}

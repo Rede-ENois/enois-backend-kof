@@ -1,0 +1,40 @@
+import kernel.bytes.*
+import kernel.image.*
+import kernel.testkit.*
+
+// Port of PagePreviewCardServiceTests: the drawing (Java2D, bundled font) is the fragile part, so it is tested alone.
+String fontFile() = "resources/fonts/LiberationSans-Bold.ttf"
+
+test "rendersThePageTextIntoAPng" {
+    var png = PageCards.render("<style>.x{color:red}</style><h1>Meu portfolio de dados</h1><p>Sou analista e escrevo sobre pipelines de dados, series e visualizacao.</p>", "Melissa Monfre", fontFile())
+    Check.isTrue("not empty", png.length > 5000)
+    Check.eqInt("png signature", 137, Bytes.at(png, 0))
+    Check.eqStr("png tag", "PNG", Bytes.ascii(png, 1, 3))
+}
+
+test "rendersEvenWithNoTextAtAll" {
+    var png = PageCards.render("", null, fontFile())
+    Check.eqInt("png signature", 137, Bytes.at(png, 0))
+    var none = PageCards.render(null, "  ", fontFile())
+    Check.eqInt("null html", 137, Bytes.at(none, 0))
+}
+
+test "a long text, emoji and a missing font file still draw a 1200x630 card" {
+    var words = ""
+    var i = 0
+    while (i < 200) {
+        words = words + "palavra" + i + " "
+        i = i + 1
+    }
+    var png = PageCards.render("<p>" + words + "😀 fim</p>", "Ana", fontFile())
+    var size = Images.dimensions(png, 1)
+    Check.isTrue("size", size != null && size.width() == 1200 && size.height() == 630)
+    var fallback = PageCards.render("<p>texto</p>", "Ana", "resources/fonts/does-not-exist.ttf")
+    Check.eqInt("fallback font", 137, Bytes.at(fallback, 0))
+}
+
+test "the excerpt cuts at a whole word and the card text drops what the font cannot draw" {
+    Check.eqStr("short", "a b c", PageCards.excerpt("a   b\n c", 120))
+    Check.eqStr("whole word", "aaaa bbbb", PageCards.excerpt("aaaa bbbb cccc dddd", 12))
+    Check.eqStr("no space to cut at", "aaaaaaaa", PageCards.excerpt("aaaaaaaaaaaaaaaa", 8))
+}

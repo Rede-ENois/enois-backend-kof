@@ -5,22 +5,57 @@ import kernel.http.*
 import kernel.security.*
 
 // HTTP adapter of LinkedinImportController: 6 routes under /me/import/linkedin. The two uploads (the data ZIP at the
-// root and Connections.csv at /contatos) wait for the binary lane: the web runtime only carries UTF-8 String bodies,
-// so a ZIP cannot reach a route. Their whole logic is LinkedinImportService.parseArchive / parseContacts (taking
-// the temp file of the upload) plus LinkedinContactInviteService.importContacts, tested on the service.
+// root and Connections.csv at /contatos) are multipart POSTs, which the web runtime cannot carry (it reads bodies as
+// UTF-8 text), so they are claimed by METHOD and exact path in the binary lane (the neighbours `PUT .../contatos/auto-convite`,
+// `GET .../contatos`, `POST .../texto` stay ordinary routes). `maxUploadBytes` caps the request and the file part
+// (Spring allowed 520 MB, the services then refused above 5 MB / 10 MB: here the lane refuses earlier, see KOF_GAPS G302).
 class LinkedinImportRoutes {
     LinkedinImportService service
     LinkedinContactInviteService contacts
-    public constructor(service: LinkedinImportService, contacts: LinkedinContactInviteService) {
+    Long maxUploadBytes
+    public constructor(service: LinkedinImportService, contacts: LinkedinContactInviteService, maxUploadBytes: Long) {
         this.service = service
         this.contacts = contacts
+        this.maxUploadBytes = maxUploadBytes
     }
+    static String archiveKey() = "POST /me/import/linkedin"
+    static String contactsKey() = "POST /me/import/linkedin/contatos"
     register(server: HttpServer) {
         var self = this
+        BinaryLane.claimRoute("POST", "/me/import/linkedin", maxUploadBytes)
+        BinaryLane.claimRoute("POST", "/me/import/linkedin/contatos", maxUploadBytes)
+        server.post("/me/import/linkedin", () -> self.importArchive())
+        server.post("/me/import/linkedin/contatos", () -> self.importContacts())
         server.post("/me/import/linkedin/texto", () -> self.importText())
         server.get("/me/import/linkedin/contatos/resumo", () -> self.summary())
         server.put("/me/import/linkedin/contatos/auto-convite", () -> self.setAutoInvite())
         server.get("/me/import/linkedin/contatos", () -> self.list())
+    }
+    // The data ZIP: the portrait to review (nothing is saved).
+    String importArchive() {
+        var userId = Auth.requireUser()
+        var form = BinaryUploads.receive(userId, LinkedinImportRoutes.archiveKey())
+        if (form == null) {
+            return BinaryUploads.authorized()
+        }
+        return json.encode(service.parseArchive(LinkedinImportRoutes.filePath(form)))
+    }
+    // Connections.csv (inside the ZIP or alone): queues the invites and answers the counts.
+    String importContacts() {
+        var userId = Auth.requireUser()
+        var form = BinaryUploads.receive(userId, LinkedinImportRoutes.contactsKey())
+        if (form == null) {
+            return BinaryUploads.authorized()
+        }
+        return json.encode(contacts.importContacts(userId, service.parseContacts(LinkedinImportRoutes.filePath(form))))
+    }
+    // The temp file of the `file` part, "" when the form has none (the service answers 400 FILE_REQUIRED).
+    static String filePath(form: MultipartForm) {
+        var file = form.file("file")
+        if (file == null) {
+            return ""
+        }
+        return file.path
     }
     // The path without a file: the person pastes the text of their own profile.
     String importText() {

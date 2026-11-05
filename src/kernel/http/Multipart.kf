@@ -1,0 +1,370 @@
+package kernel.http
+
+import java.io.ByteArrayOutputStream
+import java.io.FileOutputStream
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import kernel.bytes.*
+import kernel.files.*
+
+// One part of a multipart/form-data body: a file part has a `filename` and its bytes in the temp file `path`; a text
+// part has its value in `text` (and an empty `path`).
+record MultipartPart(String name, String filename, String contentType, String path, String text, Long size)
+
+// The parts of a parsed body, in the order they arrived.
+class MultipartForm {
+    List<MultipartPart> parts = listOf<MultipartPart>()
+    public constructor() {}
+    // The first file part called `name`, or null.
+    MultipartPart? file(name: String) {
+        for (var part in parts) {
+            if (part.name == name && part.path.length() > 0) {
+                return part
+            }
+        }
+        return null
+    }
+    // The first text part called `name`, or null.
+    String? text(name: String) {
+        for (var part in parts) {
+            if (part.name == name && part.path.length() == 0) {
+                return part.text
+            }
+        }
+        return null
+    }
+    // Deletes the temp file of every file part (called by the lane when the ticket is discarded).
+    discard() {
+        for (var part in parts) {
+            if (part.path.length() > 0) {
+                TempFiles.delete(part.path)
+            }
+        }
+    }
+}
+
+// Streaming multipart/form-data parser (RFC 7578). Reads exactly `length` bytes (the request Content-Length) from
+// `input` through a fixed 64 KB window, so a 500 MB body never sits in memory: every file part goes straight to its
+// own temp file, text parts are kept as strings. Failures are Strings:
+//   MULTIPART_MALFORMED  no boundary, truncated body, bad part headers, too many parts or an oversized text part
+//   MULTIPART_TOO_LARGE  a file part passed `maxFile`
+//   MULTIPART_IO         the stream or the disk failed
+// On any failure the parts already written are listed in `form`: the caller deletes them (`form.discard()`).
+class MultipartParser {
+    InputStream input
+    Long remaining
+    Byte[] delimiter
+    Long maxFile
+    Byte[] window = new Byte[65536]
+    Int pos = 0
+    Int lim = 0
+    MultipartForm form = MultipartForm()
+    public constructor(input: InputStream, length: Long, boundary: String, maxFile: Long) {
+        this.input = input
+        this.remaining = length
+        // A local: `kof fmt` drops the parentheses of `(a + b).getBytes()` (KOF_GAPS G286).
+        var text = "\r\n--" + boundary
+        this.delimiter = text.getBytes()
+        this.maxFile = maxFile
+    }
+    static Int maxParts() = 16
+    static Int maxTextBytes() = 65536
+    static Int maxHeaderBytes() = 8192
+    // The boundary of a Content-Type header ("" when it is not multipart/form-data or has no boundary).
+    static String boundaryOf(contentType: String) {
+        var lower = contentType.toLowerCase()
+        if (!lower.trim().startsWith("multipart/form-data")) {
+            return ""
+        }
+        var value = MultipartParser.param(contentType, "boundary")
+        if (value == null) {
+            return ""
+        }
+        if (value.length() == 0 || value.length() > 200) {
+            return ""
+        }
+        return value
+    }
+    // `key="value"` (or `key=token`) of a header such as `form-data; name="file"; filename="a.zip"`; null when absent.
+    static String? param(header: String, key: String) {
+        var lower = header.toLowerCase()
+        var needle = key + "="
+        var from = 0
+        while (from < lower.length()) {
+            var at = lower.indexOf(needle, from)
+            if (at < 0) {
+                return null
+            }
+            var before = " "
+            if (at > 0) {
+                before = lower.substring(at - 1, at)
+            }
+            if (before == ";" || before == " " || before == "\t") {
+                var start = at + needle.length()
+                if (start < header.length() && header.substring(start, start + 1) == "\"") {
+                    var end = header.indexOf("\"", start + 1)
+                    if (end < 0) {
+                        return null
+                    }
+                    return header.substring(start + 1, end)
+                }
+                var stop = header.indexOf(";", start)
+                if (stop < 0) {
+                    stop = header.length()
+                }
+                return header.substring(start, stop).trim()
+            }
+            from = at + needle.length()
+        }
+        return null
+    }
+    // The file name without any directory the client put in front of it.
+    static String baseName(raw: String) {
+        var cut = raw.lastIndexOf("/")
+        var back = raw.lastIndexOf("\\")
+        if (back > cut) {
+            cut = back
+        }
+        return raw.substring(cut + 1)
+    }
+    // Reads the whole body into `form`.
+    run() {
+        // The stream starts at the first delimiter: a virtual CRLF in front lets one search find every delimiter.
+        window[0] = 13
+        window[1] = 10
+        pos = 0
+        lim = 2
+        var preamble = new ByteArrayOutputStream()
+        // Typed as the parameter: the call site emits the static type of the argument (KOF_GAPS G300).
+        OutputStream preambleSink = preamble
+        this.readBody(preambleSink, 8192L)
+        var done = false
+        while (!done) {
+            if (!this.ensure(2)) {
+                throw "MULTIPART_MALFORMED"
+            }
+            var a = Bytes.at(window, pos)
+            var b = Bytes.at(window, pos + 1)
+            if (a == 45 && b == 45) {
+                done = true
+            }
+            else {
+                if (a != 13 || b != 10) {
+                    throw "MULTIPART_MALFORMED"
+                }
+                pos = pos + 2
+                if (form.parts.size() >= MultipartParser.maxParts()) {
+                    throw "MULTIPART_MALFORMED"
+                }
+                this.readPart()
+            }
+        }
+    }
+    // Discards what is left of the declared body (the epilogue), up to 16 MB (a bigger remainder is left unread).
+    drain() {
+        var left = remaining
+        if (left > 16777216L) {
+            return
+        }
+        while (this.fill()) {
+            pos = lim
+        }
+    }
+    readPart() {
+        var disposition = ""
+        var type = ""
+        var line = this.readLine()
+        var headers = 0
+        while (line.length() > 0) {
+            headers = headers + 1
+            if (headers > 16) {
+                throw "MULTIPART_MALFORMED"
+            }
+            var colon = line.indexOf(":")
+            if (colon > 0) {
+                var name = line.substring(0, colon).trim().toLowerCase()
+                var value = line.substring(colon + 1).trim()
+                if (name == "content-disposition") {
+                    disposition = value
+                }
+                if (name == "content-type") {
+                    type = value
+                }
+            }
+            line = this.readLine()
+        }
+        var name = MultipartParser.param(disposition, "name")
+        if (name == null) {
+            throw "MULTIPART_MALFORMED"
+        }
+        var filename = MultipartParser.param(disposition, "filename")
+        if (filename == null) {
+            var collected = new ByteArrayOutputStream()
+            OutputStream sink = collected
+            var size = this.readBody(sink, MultipartParser.maxTextBytes() as Long)
+            form.parts.add(MultipartPart(name, "", type, "", collected.toString("UTF-8"), size))
+        }
+        else {
+            var path = TempFiles.create("multipart-", ".part")
+            // Listed before it is written, so a failure while writing still gets the file deleted.
+            var index = form.parts.size()
+            form.parts.add(MultipartPart(name, MultipartParser.baseName(filename), type, path, "", 0L))
+            var failure = ""
+            var size = 0L
+            try {
+                OutputStream file = new FileOutputStream(path)
+                try {
+                    size = this.readBody(file, maxFile)
+                } catch (String e) {
+                    failure = e
+                }
+                file.close()
+            } catch (IOException e) {
+                failure = "MULTIPART_IO"
+            }
+            if (failure.length() > 0) {
+                throw failure
+            }
+            form.parts.set(index, MultipartPart(name, MultipartParser.baseName(filename), type, path, "", size))
+        }
+    }
+    // Bytes up to the next delimiter go to `sink`; the delimiter is consumed. Throws when the body ends first or
+    // more than `limit` bytes come before it.
+    Long readBody(sink: OutputStream, limit: Long) {
+        var total = 0L
+        var found = false
+        while (!found) {
+            var at = this.find()
+            if (at >= 0) {
+                total = total + (at - pos)
+                if (total > limit) {
+                    throw this.overflow(limit)
+                }
+                this.write(sink, at - pos)
+                pos = at + delimiter.length
+                found = true
+            }
+            else {
+                var safe = lim - pos - (delimiter.length - 1)
+                if (safe > 0) {
+                    total = total + safe
+                    if (total > limit) {
+                        throw this.overflow(limit)
+                    }
+                    this.write(sink, safe)
+                }
+                if (!this.fill()) {
+                    throw "MULTIPART_MALFORMED"
+                }
+            }
+        }
+        return total
+    }
+    // A text part over its cap is a malformed body; a file part over its cap is too large.
+    String overflow(limit: Long) {
+        if (limit == maxFile) {
+            return "MULTIPART_TOO_LARGE"
+        }
+        return "MULTIPART_MALFORMED"
+    }
+    write(sink: OutputStream, count: Int) {
+        try {
+            sink.write(window, pos, count)
+        } catch (IOException e) {
+            throw "MULTIPART_IO"
+        }
+        pos = pos + count
+    }
+    // Index of the next delimiter inside the window, -1 when there is none.
+    Int find() {
+        var d = delimiter.length
+        var first = Bytes.at(delimiter, 0)
+        var i = pos
+        while (i + d <= lim) {
+            if (Bytes.at(window, i) == first) {
+                var k = 1
+                while (k < d && Bytes.at(window, i + k) == Bytes.at(delimiter, k)) {
+                    k = k + 1
+                }
+                if (k == d) {
+                    return i
+                }
+            }
+            i = i + 1
+        }
+        return -1
+    }
+    // One header line (without CRLF), UTF-8.
+    String readLine() {
+        var scanned = pos
+        while (true) {
+            var i = scanned
+            while (i < lim) {
+                if (Bytes.at(window, i) == 10) {
+                    var end = i
+                    if (end > pos && Bytes.at(window, end - 1) == 13) {
+                        end = end - 1
+                    }
+                    var raw = new Byte[end - pos]
+                    var k = 0
+                    while (k < raw.length) {
+                        raw[k] = window[pos + k]
+                        k = k + 1
+                    }
+                    pos = i + 1
+                    return new String(raw, "UTF-8")
+                }
+                i = i + 1
+            }
+            if (lim - pos > MultipartParser.maxHeaderBytes()) {
+                throw "MULTIPART_MALFORMED"
+            }
+            var kept = lim - pos
+            if (!this.fill()) {
+                throw "MULTIPART_MALFORMED"
+            }
+            scanned = pos + kept
+        }
+        return ""
+    }
+    // At least `count` unread bytes in the window.
+    Bool ensure(count: Int) {
+        while (lim - pos < count) {
+            if (!this.fill()) {
+                return false
+            }
+        }
+        return true
+    }
+    // Moves the unread bytes to the front and reads more (never past the declared length).
+    Bool fill() {
+        if (remaining <= 0L) {
+            return false
+        }
+        var keep = lim - pos
+        var i = 0
+        while (i < keep) {
+            window[i] = window[pos + i]
+            i = i + 1
+        }
+        pos = 0
+        lim = keep
+        var want = window.length - lim
+        if (want as Long > remaining) {
+            want = remaining as Int
+        }
+        var n = 0
+        try {
+            n = input.read(window, lim, want)
+        } catch (IOException e) {
+            throw "MULTIPART_IO"
+        }
+        if (n <= 0) {
+            return false
+        }
+        lim = lim + n
+        remaining = remaining - n
+        return true
+    }
+}

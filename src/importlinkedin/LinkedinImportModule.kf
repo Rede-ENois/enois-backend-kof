@@ -12,7 +12,8 @@ import profile.*
 // Job on kernel.jobs: `linkedin-contact-invites` sends the queued invites of everyone who turned the automatic
 // invite on (REDE_LINKEDIN_CONTACT_INVITES_WORKER_ENABLED true, _WORKER_DELAY_MS 900000, _WORKER_INITIAL_DELAY_MS
 // 120000, _MAX_PER_RUN 200). Env: REDE_IMPORT_LINKEDIN_MAX_UNCOMPRESSED_BYTES (8388608) caps the total inflated size
-// of the data ZIP.
+// of the data ZIP; REDE_IMPORT_UPLOAD_MAX_BYTES (16777216) caps the body of the multipart upload endpoints (the
+// request and its file part: 413 FILE_TOO_LARGE above it).
 class LinkedinImportModule {
     LinkedinImportService service
     LinkedinContactInviteService invites
@@ -22,12 +23,13 @@ class LinkedinImportModule {
         this.invites = invites
         this.store = store
     }
+    static Long defaultMaxUploadBytes() = 16777216L
     static LinkedinImportModule install(platform: Platform, shared: SharedServices, profiles: ProfileModule) {
         var cfg = platform.cfg
         var service = LinkedinImportService(cfg.getLong("REDE_IMPORT_LINKEDIN_MAX_UNCOMPRESSED_BYTES", LinkedinImportService.defaultMaxTotalBytes()))
         var store = LinkedinInviteStore(platform.db)
         var invites = LinkedinContactInviteService(platform.db, store, profiles.directory, profiles.network, cfg.getInt("REDE_LINKEDIN_CONTACT_INVITES_MAX_PER_RUN", 200))
-        LinkedinImportRoutes(service, invites).register(platform.server)
+        LinkedinImportRoutes(service, invites, cfg.getLong("REDE_IMPORT_UPLOAD_MAX_BYTES", LinkedinImportModule.defaultMaxUploadBytes())).register(platform.server)
         LinkedinImportModule.schedule(shared, cfg, store, invites)
         return LinkedinImportModule(service, invites, store)
     }
