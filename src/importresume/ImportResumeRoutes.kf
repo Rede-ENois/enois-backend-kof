@@ -1,0 +1,59 @@
+package importresume
+
+import kernel.http.*
+import kernel.security.*
+
+// HTTP adapter of ResumeImportController: the two multipart uploads of the resume import. Both are claimed by method
+// and exact path in the binary lane (see BinaryLane.claimRoute): the web runtime cannot carry the file. The routes
+// only unpack the `file` part (temp file, original name, content type); everything else is ResumeImportService
+// (PDF or text to the portrait) and ResumePrefillService (the portrait crossed with the job form).
+class ImportResumeRoutes {
+    ResumeImportService service
+    ResumePrefillService prefill
+    Long maxUploadBytes
+    public constructor(service: ResumeImportService, prefill: ResumePrefillService, maxUploadBytes: Long) {
+        this.service = service
+        this.prefill = prefill
+        this.maxUploadBytes = maxUploadBytes
+    }
+    static String importKey() = "POST /me/import/resume"
+    static String prefillKey() = "POST /me/import/resume/prefill/:jobId"
+    register(server: HttpServer) {
+        var self = this
+        BinaryLane.claimRoute("POST", "/me/import/resume", maxUploadBytes)
+        BinaryLane.claimRoute("POST", "/me/import/resume/prefill/:jobId", maxUploadBytes)
+        server.post("/me/import/resume", () -> self.importResume())
+        server.post("/me/import/resume/prefill/:jobId", () -> self.prefillApplication())
+    }
+    // The resume (PDF or text): the portrait to review (nothing is saved).
+    String importResume() {
+        var userId = Auth.requireUser()
+        var form = BinaryUploads.receive(userId, ImportResumeRoutes.importKey())
+        if (form == null) {
+            return BinaryUploads.authorized()
+        }
+        var file = form.file("file")
+        if (file == null) {
+            return json.encode(service.parse("", null, null))
+        }
+        return json.encode(service.parse(file.path, file.filename, file.contentType))
+    }
+    // The job form filled with what the resume says (suggestions only; the application is POST /jobs/{id}/applications).
+    String prefillApplication() {
+        var userId = Auth.requireUser()
+        var jobId = Req.pathParam("jobId")
+        var form = BinaryUploads.receive(userId, "POST /me/import/resume/prefill/" + jobId)
+        if (form == null) {
+            return BinaryUploads.authorized()
+        }
+        var file = form.file("file")
+        var text = ""
+        if (file == null) {
+            text = service.extractText("", null, null)
+        }
+        else {
+            text = service.extractText(file.path, file.filename, file.contentType)
+        }
+        return json.encode(prefill.prefill(userId, jobId, text))
+    }
+}
