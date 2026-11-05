@@ -1,0 +1,107 @@
+import jobs.*
+import kernel.testkit.*
+
+// Port of ExternalJobSubmissionWebTests: a community member lists an EXTERNAL job; it shows in the "Externas" tab
+// with the "Comunidade" badge, the detail points to the origin link, the author sees and deletes their own.
+
+TestResponse submit(user: String, title: String, company: String, location: String, url: String, key: String) {
+    var body = "{\"title\":" + JobsTestKit.q(title) + ",\"company\":" + JobsTestKit.q(company) + ",\"location\":" + JobsTestKit.q(location) + ",\"url\":" + JobsTestKit.q(url) + ",\"communityAgreement\":true}"
+    return JobsTestKit.send("POST", "/jobs/external", user, body, key)
+}
+
+test "submittedExternalJobIsListedMarkedAsCommunityAndLinksToTheOrigin" {
+    var author = JobsTestKit.login("ext_job_author")
+    var title = "Engenheira de Confiabilidade 1"
+    var url = "https://vagas.exemplo.test/oportunidade/1"
+    var created = submit(author, title, "Empresa Exemplo", "Remoto", url, "ext-create-1")
+    Check.status(created, 201)
+    Check.jsonEq(created, "sourceType", "EXTERNAL")
+    Check.jsonEq(created, "sourcePlatform", "Comunidade")
+    Check.jsonEq(created, "sourceUrl", url)
+    Check.jsonEq(created, "owner", "true")
+    var id = created.json("id")
+    Check.isTrue("ext_com_ id", id.startsWith("ext_com_"))
+
+    var listed = JobsTestKit.get("/jobs?source=EXTERNAL&platform=Comunidade&query=Confiabilidade%201", null)
+    Check.status(listed, 200)
+    Check.eqInt("one item", 1, listed.jsonSize("items"))
+    Check.jsonEq(listed, "items.0.id", id)
+    Check.jsonEq(listed, "items.0.sourceUrl", url)
+
+    var detail = JobsTestKit.get("/jobs/" + id, null)
+    Check.status(detail, 200)
+    Check.jsonEq(detail, "sourceType", "EXTERNAL")
+    Check.jsonEq(detail, "sourceUrl", url)
+
+    var mine = JobsTestKit.get("/jobs/external/mine", author)
+    Check.status(mine, 200)
+    Check.jsonEq(mine, "0.id", id)
+
+    Check.status(JobsTestKit.send("DELETE", "/jobs/external/" + id, author, "", "ext-delete-1"), 204)
+    var after = JobsTestKit.get("/jobs/external/mine", author)
+    Check.status(after, 200)
+    Check.eqInt("mine is empty", 0, after.jsonSize(""))
+    Check.status(JobsTestKit.get("/jobs/" + id, null), 404)
+}
+
+test "theSameLinkCannotBeListedTwice" {
+    var author = JobsTestKit.login("ext_job_dup")
+    var url = "https://vagas.exemplo.test/duplicada/1"
+    Check.status(submit(author, "Vaga duplicada", "Empresa", "Remoto", url, "ext-dup-1"), 201)
+    // A tracking parameter does not fool the dedupe: the canonical URL is the same.
+    Check.apiError(submit(author, "Vaga duplicada", "Empresa", "Remoto", url + "?utm_source=telegram", "ext-dup-2"), 409, "JOB_ALREADY_LISTED")
+}
+
+test "refusesALinkThatIsNotHttps" {
+    var author = JobsTestKit.login("ext_job_http")
+    Check.apiError(submit(author, "Vaga insegura", "Empresa", "Remoto", "http://vagas.exemplo.test/x", "ext-http-1"), 400, "INVALID_EXTERNAL_JOB")
+}
+
+test "anotherUserCannotDeleteMySubmission" {
+    var owner = JobsTestKit.login("ext_job_owner2")
+    var intruder = JobsTestKit.login("ext_job_intruder")
+    var created = submit(owner, "Vaga da dona", "Empresa", "Remoto", "https://vagas.exemplo.test/dona/1", "ext-owner-1")
+    Check.status(created, 201)
+    Check.apiError(JobsTestKit.send("DELETE", "/jobs/external/" + created.json("id"), intruder, "", "ext-owner-delete-intruder"), 403, "NOT_OWNER")
+}
+
+test "submittedJobCarriesActivitiesSalaryAndApplyEmailAndStaysOutOfAggregators" {
+    var author = JobsTestKit.login("ext_job_details")
+    var title = "Vaga com detalhes 1"
+    var url = "https://vagas.exemplo.test/detalhes/1"
+    var payload = "{\"title\":" + JobsTestKit.q(title) + ",\"company\":\"Empresa Detalhes\",\"location\":\"Remoto\",\"url\":" + JobsTestKit.q(url) + ",\"description\":\"Atuar com Java e Spring no time de plataforma.\",\"salaryMin\":\"8000\",\"salaryMax\":\"12000\",\"salaryPeriod\":\"MONTH\",\"applyEmail\":\"vagas@empresa.test\",\"communityAgreement\":true}"
+    var created = JobsTestKit.send("POST", "/jobs/external", author, payload, "ext-details-1")
+    Check.status(created, 201)
+    Check.jsonEq(created, "description", "Atuar com Java e Spring no time de plataforma.")
+    Check.jsonEq(created, "salaryMin", "8000")
+    Check.jsonEq(created, "salaryMax", "12000")
+    Check.jsonEq(created, "salaryPeriod", "MONTH")
+    Check.jsonEq(created, "salaryLabel", "de R$ 8.000 até R$ 12.000 / mês")
+    Check.jsonEq(created, "applyEmail", "vagas@empresa.test")
+    var id = created.json("id")
+
+    // The general aggregator listing does NOT return the community job.
+    var aggregators = JobsTestKit.get("/jobs?source=EXTERNAL&query=Vaga%20com%20detalhes%201", null)
+    Check.status(aggregators, 200)
+    var i = 0
+    while (i < aggregators.jsonSize("items")) {
+        Check.isTrue("not an aggregator job", aggregators.json("items." + i + ".id") != id)
+        i = i + 1
+    }
+    // The own filter ("Criadas no Énóis" = platform Comunidade) returns it.
+    var own = JobsTestKit.get("/jobs?source=EXTERNAL&platform=Comunidade&query=Vaga%20com%20detalhes%201", null)
+    Check.status(own, 200)
+    Check.jsonEq(own, "items.0.id", id)
+}
+
+test "salaryNotInformedIsExplicitClearsTheRangeAndShowsOnTheCard" {
+    var author = JobsTestKit.login("ext_job_no_salary")
+    var payload = "{\"title\":\"Vaga sem faixa 1\",\"company\":\"Empresa Exemplo\",\"location\":\"Remoto\",\"url\":\"https://vagas.exemplo.test/sem-faixa/1\",\"description\":\"Vaga sem faixa divulgada no anúncio original.\",\"salaryMin\":\"1500\",\"salaryMax\":\"2000\",\"salaryPeriod\":\"MONTH\",\"salaryNotInformed\":true,\"communityAgreement\":true}"
+    var created = JobsTestKit.send("POST", "/jobs/external", author, payload, "ext-no-salary")
+    Check.status(created, 201)
+    Check.jsonEq(created, "salaryNotInformed", "true")
+    Check.jsonEq(created, "salaryLabel", "Salário não informado")
+    Check.isTrue("salaryMin null", created.jsonIsNull("salaryMin"))
+    Check.isTrue("salaryMax null", created.jsonIsNull("salaryMax"))
+    JobsTestKit.finish()
+}

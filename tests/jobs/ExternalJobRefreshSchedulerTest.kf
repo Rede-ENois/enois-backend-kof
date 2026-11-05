@@ -1,0 +1,55 @@
+import jobs.*
+import kernel.cache.*
+import kernel.config.*
+import kernel.jobs.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of ExternalJobRefreshSchedulerTest: the boot load runs on a kernel job (it must not hold the readiness), a
+// failing source never escapes the job, and a disabled refresh registers nothing. The Java test mocked the import
+// service; here a real one runs over a stub source on its own scheduler.
+
+Int waitFor(scheduler: Scheduler, name: String, runs: Int) {
+    var waited = 0
+    while (scheduler.runCount(name) < runs && waited < 5000) {
+        Time.sleep(50L)
+        waited = waited + 50
+    }
+    return scheduler.runCount(name)
+}
+
+ExternalJobImportService importer(source: JobTestSource) = ExternalJobImportService(JobsTestKit.db(), listOf<JobImportSource>(source), ExternalJobStore(JobsTestKit.db(), TtlCache("externalJobsScheduler", 0L, 16)), 0)
+
+Config enabled() = Config.of(mapOf("REDE_JOBS_IMPORT_EXTERNAL_REFRESH_ENABLED", "true", "REDE_JOBS_IMPORT_EXTERNAL_REFRESH_CRON", "-"))
+
+test "theFirstLoadRunsAtBootOnItsOwnJob" {
+    var scheduler = Scheduler()
+    var source = JobTestSource("SchedulerSource", listOf<JobSourceItem>())
+    JobsModule.schedule(scheduler, enabled(), importer(source))
+    Check.eqInt("the boot load ran", 1, waitFor(scheduler, "external-jobs-boot-seed", 1))
+    Check.isTrue("the source was asked", source.calls >= 1)
+    scheduler.stop()
+}
+
+// Regression: a failure of the first load never escapes (the Java Error killed the thread with no log).
+test "aFailingSourceDoesNotEscapeTheFirstLoad" {
+    var scheduler = Scheduler()
+    var source = JobTestSource("SchedulerFailing", listOf<JobSourceItem>())
+    source.failing = true
+    JobsModule.schedule(scheduler, enabled(), importer(source))
+    Check.eqInt("the boot load ran", 1, waitFor(scheduler, "external-jobs-boot-seed", 1))
+    Time.sleep(200L)
+    Check.isTrue("the scheduler is alive", !scheduler.isStopped())
+    scheduler.stop()
+}
+
+test "disabledDoesNotImportAtBoot" {
+    var scheduler = Scheduler()
+    var source = JobTestSource("SchedulerOff", listOf<JobSourceItem>())
+    JobsModule.schedule(scheduler, Config.of(mapOf("REDE_JOBS_IMPORT_EXTERNAL_REFRESH_ENABLED", "false")), importer(source))
+    Time.sleep(300L)
+    Check.eqInt("no run", 0, scheduler.runCount("external-jobs-boot-seed"))
+    Check.eqInt("source untouched", 0, source.calls)
+    scheduler.stop()
+    JobsTestKit.finish()
+}

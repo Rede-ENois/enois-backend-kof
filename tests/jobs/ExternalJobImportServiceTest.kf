@@ -1,0 +1,74 @@
+import jobs.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Ports of ExternalJobImportServiceTests, GlobalDedupeTests and CommunitySubmissionImportGuardTests. The sources
+// are stubs (the Java tests registered stub beans); they are set before the app of this file boots.
+
+String sharedUrl() = "https://exemplo.test/vaga/compartilhada"
+String guardUrl() = "https://exemplo.test/vaga/cadastrada-pela-comunidade"
+
+JobSourceItem item(id: String, title: String, company: String?, url: String, platform: String) = JobSourceItem(id, title, company, null, null, null, null, url, url, platform, null)
+
+wireSources() {
+    if (JobsTestKit.jobsKitSources.size() > 0) {
+        return
+    }
+    JobsTestKit.jobsKitSources.add(JobTestSource("StubSource", listOf(
+        JobSourceItem("ext-1", "Vaga Externa Um", "Empresa X", "Remoto", null, null, null, "https://exemplo.test/vaga/1", "https://exemplo.test/vaga/1", "StubSource", null),
+        JobSourceItem("ext-2", "Vaga Externa Dois", null, null, null, null, null, "https://exemplo.test/vaga/2", "https://exemplo.test/vaga/2", "StubSource", null),
+        // Some feeds send HTML-escaped text.
+        JobSourceItem("ext-3", "Dev &amp; Ops", "hims &#038; hers", "Remoto", null, null, null, "https://exemplo.test/vaga/3", "https://exemplo.test/vaga/3", "StubSource", null))))
+    JobsTestKit.jobsKitSources.add(JobTestSource("FonteA", listOf(item("a-1", "Desenvolvedor Java", null, sharedUrl(), "FonteA"))))
+    // Same job, a tracking parameter (canonicalisation removes utm_*) and another id.
+    JobsTestKit.jobsKitSources.add(JobTestSource("FonteB", listOf(item("b-1", "Desenvolvedor Java", null, sharedUrl() + "?utm_source=agregador", "FonteB"))))
+    JobsTestKit.jobsKitSources.add(JobTestSource("FonteGuard", listOf(item("guard-1", "Vaga importada de teste", "Outra Empresa", guardUrl() + "?utm_source=agregador", "FonteGuard"))))
+}
+
+Int rowsOfPlatform(platform: String) = JobsTestKit.db().queryLong("select count(*) from external_jobs where platform = ?", DbParams().bindStr(platform)).toInt()
+
+test "importsIntoItsOwnTableAndDoesNotDuplicateOnRerun" {
+    wireSources()
+    var service = JobsTestKit.module().importService
+    Check.isTrue("imported at least 3", service.refresh() >= 3)
+    Check.eqInt("ext-1 is stored", 1, JobsTestKit.db().queryLong("select count(*) from external_jobs where platform = 'StubSource' and external_id = 'ext-1'", DbParams()).toInt())
+    Check.eqStr("url", "https://exemplo.test/vaga/1", JobsTestKit.str("select url from external_jobs where platform = 'StubSource' and external_id = 'ext-1'", DbParams()))
+    var id = JobsTestKit.str("select id from external_jobs where platform = 'StubSource' and external_id = 'ext-1'", DbParams())
+    service.refresh()
+    // Re-importing does not create another row (same id) and nothing is duplicated.
+    Check.eqStr("same id", id, JobsTestKit.str("select id from external_jobs where platform = 'StubSource' and external_id = 'ext-1'", DbParams()))
+    Check.eqInt("rows of the stub", 3, rowsOfPlatform("StubSource"))
+}
+
+test "storesTheTextAsPeopleReadIt" {
+    wireSources()
+    JobsTestKit.module().importService.refresh()
+    Check.eqStr("company", "hims & hers", JobsTestKit.str("select company from external_jobs where platform = 'StubSource' and external_id = 'ext-3'", DbParams()))
+    Check.eqStr("title", "Dev & Ops", JobsTestKit.str("select title from external_jobs where platform = 'StubSource' and external_id = 'ext-3'", DbParams()))
+}
+
+test "theSameJobFromTwoSourcesIsStoredOnce" {
+    wireSources()
+    JobsTestKit.module().importService.refresh()
+    Check.eqInt("rows for the shared url", 1, JobsTestKit.db().queryLong("select count(*) from external_jobs where canonical_url = ?", DbParams().bindStr(sharedUrl())).toInt())
+}
+
+// A community submission is the source of truth of its own record: an aggregator publishing the same canonical URL
+// does not rewrite title/company nor take over the provenance.
+test "importDoesNotOverwriteNorDuplicateACommunitySubmission" {
+    wireSources()
+    var now = Time.nowIso()
+    JobsTestKit.login("user_guard")
+    // The earlier refreshes of this file already imported the guard source: start from a clean slate for this URL.
+    JobsTestKit.db().execute("delete from external_jobs where canonical_url = ?", DbParams().bindStr(guardUrl()))
+    JobsTestKit.db().execute("insert into external_jobs (id, platform, external_id, title, company, url, imported_at, last_checked_at, external_status, canonical_url, submitted_by) values ('ext_com_guard', 'Comunidade', 'community_guard', 'Vaga cadastrada pela comunidade', 'Empresa da comunidade', ?, ?, ?, 'FOUND', ?, 'user_guard')", DbParams().bindStr(guardUrl()).bindInstant(now).bindInstant(now).bindStr(guardUrl()))
+    JobsTestKit.module().importService.refresh()
+    Check.eqStr("platform", "Comunidade", JobsTestKit.str("select platform from external_jobs where canonical_url = ?", DbParams().bindStr(guardUrl())))
+    Check.eqStr("submitter", "user_guard", JobsTestKit.str("select submitted_by from external_jobs where canonical_url = ?", DbParams().bindStr(guardUrl())))
+    Check.eqStr("title", "Vaga cadastrada pela comunidade", JobsTestKit.str("select title from external_jobs where canonical_url = ?", DbParams().bindStr(guardUrl())))
+    Check.eqStr("company", "Empresa da comunidade", JobsTestKit.str("select company from external_jobs where canonical_url = ?", DbParams().bindStr(guardUrl())))
+    // No duplicate row: the guard is "do not touch", not "update and keep the author".
+    Check.eqInt("one row", 1, JobsTestKit.db().queryLong("select count(*) from external_jobs where canonical_url = ?", DbParams().bindStr(guardUrl())).toInt())
+    JobsTestKit.finish()
+}

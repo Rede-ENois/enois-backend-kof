@@ -1,0 +1,35 @@
+import jobs.*
+import kernel.testkit.*
+
+// Port of JobRadarJobSourceTests (the sitemap parsing; the wire is never touched).
+JobRadarJobSource radar() = JobRadarJobSource("https://jobradar.com.br/sitemap-vagas.xml", "test-agent", true, JobStubTransport())
+
+test "theSitemapSourceIsPublicAndAvailable" {
+    var source = radar()
+    Check.eqStr("name", "JobRadar", source.name())
+    Check.isTrue("available", source.available())
+}
+
+test "parsesJobsFromSitemapDerivingTitleFromSlug" {
+    var xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset>\n  <url><loc>https://jobradar.com.br/vaga/dev-java-senior-remoto-123456</loc></url>\n  <url><loc>https://jobradar.com.br/vaga/designer-de-produto-987654</loc></url>\n  <url><loc>https://jobradar.com.br/pagina-institucional</loc></url>\n</urlset>"
+    var jobs = radar().parse(xml, 10)
+    // The institutional page (no /vaga/) is ignored; no invented data.
+    Check.eqInt("jobs", 2, jobs.size())
+    var first = jobs.get(0)
+    Check.eqStr("title", "Dev Java Senior Remoto", "" + first.title)
+    Check.eqStr("externalId", "123456", first.externalId)
+    Check.eqStr("url", "https://jobradar.com.br/vaga/dev-java-senior-remoto-123456", first.url)
+    Check.eqStr("platform", "JobRadar", first.platform)
+    Check.isTrue("company is null", first.company == null)
+    Check.isTrue("description is null", first.description == null)
+}
+
+test "cleansRealSlugs" {
+    Check.eqStr("slug 1", "Professor (a) Autor (a) Curadoria e Validacao de Conteudo Sommelieria Vinhos do Mundo e Terroir Vitru Educacao", JobRadarJobSource.humanize("professor-a-autor-a-curadoria-e-validacao-de-conteudo-sommelieria-vinhos-do-mundo-e-terroir-edtech-vitru-vitru-educacao"))
+    Check.eqStr("slug 2", "Estagiario (a) de Educacao Fisica Campo Grande Silva Gym", JobRadarJobSource.humanize("estagiario-a-de-educacao-fisica-campo-grande-silva-gym"))
+}
+
+test "respectsTheLimit" {
+    var xml = "<urlset>\n  <url><loc>https://jobradar.com.br/vaga/a-1</loc></url>\n  <url><loc>https://jobradar.com.br/vaga/b-2</loc></url>\n  <url><loc>https://jobradar.com.br/vaga/c-3</loc></url>\n</urlset>"
+    Check.eqInt("limit", 2, radar().parse(xml, 2).size())
+}

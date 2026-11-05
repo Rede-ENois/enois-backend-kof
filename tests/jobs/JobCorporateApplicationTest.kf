@@ -1,0 +1,95 @@
+import jobs.*
+import kernel.testkit.*
+
+// Port of JobCorporateApplicationTests: the application always goes through the professional identity.
+// The corporate domain is not ported yet, so its endpoints are replaced by the row it leaves behind
+// (an ACTIVE corporate_profiles row with the name, headline and industry the person chose).
+
+String corporateJob(owner: String) {
+    var body = "{\"title\":\"Vaga com identidade\",\"company\":\"Énóis\",\"location\":\"Remoto\",\"type\":\"FULL_TIME\",\"level\":\"SENIOR\",\"skills\":[],\"description\":\"Vaga de teste com valor.\",\"salaryMin\":\"1500\",\"communityAgreement\":true}"
+    var res = JobsTestKit.post("/jobs", owner, body)
+    Check.status(res, 201)
+    return res.json("id")
+}
+
+applyTo(applicant: String, jobId: String) {
+    Check.status(JobsTestKit.post("/jobs/" + jobId + "/applications", applicant, "{\"message\":\"Quero a vaga.\"}"), 201)
+}
+
+// How many conversation items of the page are of the given kind.
+Int itemsOfKind(res: TestResponse, kind: String) {
+    var n = 0
+    var i = 0
+    while (i < res.jsonSize("items")) {
+        if (res.json("items." + i + ".kind") == kind) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+test "corporateApplicantUsesTheProfessionalIdentity" {
+    var owner = JobsTestKit.login("jobcorp_owner1")
+    var applicant = JobsTestKit.login("jobcorp_prof")
+    var jobId = corporateJob(owner)
+    JobsTestKit.activateProfessionalAs(applicant, "jobcorp.pro", "Nome Profissional da Pessoa", "Engenheira de plataforma", "Tecnologia")
+    applyTo(applicant, jobId)
+    var list = JobsTestKit.get("/jobs/" + jobId + "/applications", owner)
+    Check.status(list, 200)
+    Check.jsonEq(list, "0.candidate.identity", "CORPORATE")
+    Check.jsonEq(list, "0.candidate.name", "Nome Profissional da Pessoa")
+    Check.jsonEq(list, "0.candidate.headline", "Engenheira de plataforma")
+    Check.jsonEq(list, "0.candidate.industry", "Tecnologia")
+}
+
+test "applicationAndItsConversationLiveInTheProfessionalContext" {
+    var owner = JobsTestKit.login("jobcorp_owner3")
+    var applicant = JobsTestKit.login("jobcorp_ctx")
+    var proUsername = JobsTestKit.activateProfessional(applicant)
+    var jobId = corporateJob(owner)
+    applyTo(applicant, jobId)
+
+    var list = JobsTestKit.get("/jobs/" + jobId + "/applications", owner)
+    Check.status(list, 200)
+    Check.jsonEq(list, "0.candidate.identity", "CORPORATE")
+    Check.jsonEq(list, "0.candidate.username", proUsername)
+
+    // The application conversation is in the professional inbox, with the professional identity.
+    var professional = JobsTestKit.get("/conversations?context=PROFESSIONAL", owner)
+    Check.status(professional, 200)
+    Check.eqInt("job conversations", 1, itemsOfKind(professional, "JOB"))
+    Check.jsonEq(professional, "items.0.context", "PROFESSIONAL")
+    Check.jsonEq(professional, "items.0.identities." + applicant + ".username", proUsername)
+
+    // ... and NOT in the social inbox of either one.
+    Check.eqInt("owner social", 0, itemsOfKind(JobsTestKit.get("/conversations?context=SOCIAL", owner), "JOB"))
+    Check.eqInt("applicant social", 0, itemsOfKind(JobsTestKit.get("/conversations?context=SOCIAL", applicant), "JOB"))
+}
+
+test "socialDirectMessageNeverReusesTheApplicationConversation" {
+    var owner = JobsTestKit.login("jobcorp_owner4")
+    var applicant = JobsTestKit.login("jobcorp_dm")
+    JobsTestKit.activateProfessional(applicant)
+    var jobId = corporateJob(owner)
+    applyTo(applicant, jobId)
+    var professional = JobsTestKit.get("/conversations?context=PROFESSIONAL", applicant)
+    Check.status(professional, 200)
+    var jobConversation = professional.json("items.0.id")
+    var direct = JobsTestKit.post("/conversations/direct", applicant, "{\"userId\":" + JobsTestKit.q(owner) + "}")
+    Check.status(direct, 200)
+    Check.jsonEq(direct, "context", "SOCIAL")
+    Check.isTrue("different conversation", direct.json("id") != jobConversation)
+}
+
+test "applicantWithoutAnActiveProfessionalIdentityIsRefused" {
+    var owner = JobsTestKit.login("jobcorp_owner2")
+    var applicant = JobsTestKit.login("jobcorp_social")
+    var jobId = corporateJob(owner)
+    Check.apiError(JobsTestKit.post("/jobs/" + jobId + "/applications", applicant, "{\"message\":\"Quero a vaga.\"}"), 403, "NO_ACTIVE_CORPORATE_PROFILE")
+    // Nothing was recorded nor delivered on behalf of the social identity.
+    var list = JobsTestKit.get("/jobs/" + jobId + "/applications", owner)
+    Check.status(list, 200)
+    Check.eqInt("no applications", 0, list.jsonSize(""))
+    JobsTestKit.finish()
+}

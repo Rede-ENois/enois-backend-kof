@@ -3,6 +3,7 @@ package jobs
 import identity.*
 import kernel.*
 import kernel.db.*
+import kernel.jobs.*
 import kernel.log.*
 import kernel.security.*
 import messaging.*
@@ -85,21 +86,21 @@ class JobsModule {
         var importService = ExternalJobImportService(platform.db, configured, externalStore, cfg.getInt("REDE_JOBS_IMPORT_EXTERNAL_REFRESH_LIMIT", 0))
         var directory = JobCompanyDirectory(platform.db, externalStore)
         JobRoutes(service, externalService, externalStore, directory, seams.companies, seams.reputation, profiles.directory, shared.idempotency, cfg.getBool("REDE_JOBS_IMPORT_EXTERNAL_LISTING_ENABLED", false), cfg.getInt("REDE_JOBS_IMPORT_EXTERNAL_LISTING_LIMIT", 20)).register(platform.server)
-        JobsModule.schedule(shared, cfg, importService)
+        JobsModule.schedule(shared.jobs, cfg, importService)
         return JobsModule(service, externalService, importService, directory, store)
     }
     // ExternalJobRefreshScheduler: a first load at boot (in the background, it must not hold the readiness) and
     // every day at midnight. A failure never takes the app nor the internal jobs down.
-    static schedule(shared: SharedServices, cfg: Config, importService: ExternalJobImportService) {
+    static schedule(jobs: Scheduler, cfg: Config, importService: ExternalJobImportService) {
         if (!cfg.getBool("REDE_JOBS_IMPORT_EXTERNAL_REFRESH_ENABLED", true)) {
             return
         }
         var log = Log("jobs.external")
-        shared.jobs.fixedDelay("external-jobs-boot-seed", 0L, 315360000000L, () -> {
+        jobs.fixedDelay("external-jobs-boot-seed", 0L, 315360000000L, () -> {
     log.info("external jobs: boot load starting in the background")
     log.info("external jobs boot load: " + importService.refresh())
 })
-        shared.jobs.cron("external-jobs-refresh", cfg.getStr("REDE_JOBS_IMPORT_EXTERNAL_REFRESH_CRON", "0 0 0 * * *"), "UTC", () -> {
+        jobs.cron("external-jobs-refresh", cfg.getStr("REDE_JOBS_IMPORT_EXTERNAL_REFRESH_CRON", "0 0 0 * * *"), "UTC", () -> {
     log.info("external jobs refreshed: " + importService.refresh())
 })
     }

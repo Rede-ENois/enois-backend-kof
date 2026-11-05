@@ -1,0 +1,61 @@
+import jobs.*
+import kernel.error.*
+import kernel.testkit.*
+
+// OpenJobApiSource over a stub transport (no test reaches the network): the root path, the id/title/url rules, the
+// salary text, the default sources and a source that is down.
+
+JobApiSpec spec(url: String, rootIsArray: Bool, rootPath: String?, idPath: String?) = JobApiSpec("Aberta", url, rootIsArray, rootPath, idPath, "title", "company", "where", "salaryText", "min", "max", "cur", "kind", "link", "apply", "when", false, null, "Aberta (https://aberta.test).", "about")
+
+JobStubTransport stub(url: String, body: String) {
+    var t = JobStubTransport()
+    t.bodies.put(url, body)
+    return t
+}
+
+test "readsTheJobsUnderTheRootPathWithTheirFields" {
+    var body = "{\"jobs\":[{\"id\":7,\"title\":\"Backend Go\",\"company\":\"Acme\",\"where\":\"Remoto\",\"salaryText\":\"$80k\",\"kind\":\"full_time\",\"link\":\"https://aberta.test/7\",\"about\":\"Descricao\",\"when\":\"2026-10-01T10:00:00Z\"},{\"id\":8,\"company\":\"Sem titulo\",\"link\":\"https://aberta.test/8\"},{\"id\":9,\"title\":\"Sem link\"}]}"
+    var source = OpenJobApiSource(spec("https://aberta.test/api", false, "jobs", "id"), stub("https://aberta.test/api", body))
+    Check.eqStr("name", "Aberta", source.name())
+    var found = source.discover(0)
+    // No title or no link: nothing to show or redirect to.
+    Check.eqInt("jobs", 1, found.size())
+    var job = found.get(0)
+    Check.eqStr("externalId", "7", job.externalId)
+    Check.eqStr("title", "Backend Go", "" + job.title)
+    Check.eqStr("company", "Acme", "" + job.company)
+    Check.eqStr("location", "Remoto", "" + job.location)
+    Check.eqStr("url", "https://aberta.test/7", job.url)
+    Check.eqStr("platform", "Aberta", job.platform)
+    Check.eqStr("description", "Descricao", "" + job.description)
+    Check.eqStr("salary", "$80k", "" + job.salary)
+}
+
+test "aRootArrayNeedsAnIdAndTheLimitCapsTheList" {
+    var body = "[{\"legal\":\"notice\"},{\"id\":\"a\",\"title\":\"Um\",\"link\":\"https://aberta.test/a\"},{\"id\":\"b\",\"title\":\"Dois\",\"link\":\"https://aberta.test/b\"},{\"id\":\"c\",\"title\":\"Tres\",\"link\":\"https://aberta.test/c\"}]"
+    var source = OpenJobApiSource(spec("https://aberta.test/array", true, null, "id"), stub("https://aberta.test/array", body))
+    Check.eqInt("without limit", 3, source.discover(0).size())
+    Check.eqInt("with limit", 2, source.discover(2).size())
+}
+
+test "aSourceThatIsDownIsA502WithoutLeakingTheAddress" {
+    var source = OpenJobApiSource(spec("https://aberta.test/down", false, "jobs", "id"), JobStubTransport())
+    var failed = ""
+    try {
+        source.discover(0)
+    } catch (String err) {
+        failed = err
+    }
+    Check.isTrue("IMPORT_SOURCE_ERROR", Errors.hasCode(failed, "IMPORT_SOURCE_ERROR"))
+    Check.eqInt("status", 502, Errors.parse(failed).status())
+    Check.isTrue("no address in the failure", !failed.contains("aberta.test"))
+}
+
+test "theDefaultSourcesAreTheFourPublicApis" {
+    var names = ""
+    for (var s in OpenJobApiSource.defaults(JobStubTransport())) {
+        names = names + "|" + s.name()
+        Check.isTrue("available", s.available())
+    }
+    Check.eqStr("names", "|Remotive|Jobicy|RemoteOK|Himalayas", names)
+}

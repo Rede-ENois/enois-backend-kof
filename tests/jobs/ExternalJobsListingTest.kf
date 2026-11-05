@@ -1,0 +1,102 @@
+import jobs.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of ExternalJobsListingTests (external listing enabled, no source running).
+Int externalCount(res: TestResponse) {
+    var n = 0
+    var i = 0
+    while (i < res.jsonSize("items")) {
+        if (res.json("items." + i + ".sourceType") == "EXTERNAL") {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+test "externalJobHasPublicDetailWithItsOriginalUrl" {
+    var id = "ext_detail_1"
+    JobsTestKit.insertExternalJob(id, "Vaga compartilhada", null, null, "https://exemplo.test/vaga/detalhe", Time.nowIso())
+    var job = JobsTestKit.get("/jobs/" + id, null)
+    Check.status(job, 200)
+    Check.jsonEq(job, "id", id)
+    Check.jsonEq(job, "title", "Vaga compartilhada")
+    Check.jsonEq(job, "sourceType", "EXTERNAL")
+    Check.jsonEq(job, "sourceUrl", "https://exemplo.test/vaga/detalhe")
+}
+
+// The company directory sends the click to a search by company NAME: the external search must read it.
+test "searchFindsExternalJobsByCompany" {
+    JobsTestKit.insertExternalJob("ext_company_monzo", "Backend Engineer", "Monzo", "Remoto", "https://exemplo.test/vaga/monzo", Time.nowIso())
+    JobsTestKit.insertExternalJob("ext_company_outra", "Designer", "Outra Empresa", "Remoto", "https://exemplo.test/vaga/outra", Time.nowIso())
+    var res = JobsTestKit.get("/jobs?query=Monzo&limit=50", null)
+    Check.status(res, 200)
+    var found = false
+    var i = 0
+    while (i < res.jsonSize("items")) {
+        if (res.json("items." + i + ".sourceType") == "EXTERNAL") {
+            Check.isTrue("company matches", res.json("items." + i + ".company").toLowerCase().contains("monzo"))
+            found = true
+        }
+        i = i + 1
+    }
+    Check.isTrue("the company search finds its external job", found)
+}
+
+test "unknownExternalJobStillReturnsNotFound" {
+    Check.status(JobsTestKit.get("/jobs/ext_missing_1", null), 404)
+}
+
+test "searchFiltersExternalJobsByTitle" {
+    JobsTestKit.insertExternalJob("ext_search_java", "Desenvolvedor Java Senior", null, null, "https://exemplo.test/vaga/java", Time.nowIso())
+    JobsTestKit.insertExternalJob("ext_search_design", "Designer de Produto", null, null, "https://exemplo.test/vaga/design", Time.nowIso())
+    var res = JobsTestKit.get("/jobs?query=java&limit=50", null)
+    Check.status(res, 200)
+    var found = false
+    var i = 0
+    while (i < res.jsonSize("items")) {
+        if (res.json("items." + i + ".sourceType") == "EXTERNAL") {
+            Check.isTrue("only matching externals", res.json("items." + i + ".title").toLowerCase().contains("java"))
+            found = true
+        }
+        i = i + 1
+    }
+    Check.isTrue("java external found", found)
+}
+
+test "structuralFilterExcludesExternalJobs" {
+    JobsTestKit.insertExternalJob("ext_structural_1", "Vaga Externa Sem Tipo", null, null, "https://exemplo.test/vaga/s", Time.nowIso())
+    var res = JobsTestKit.get("/jobs?type=FULL_TIME&limit=50", null)
+    Check.status(res, 200)
+    Check.eqInt("no external with a type filter", 0, externalCount(res))
+}
+
+test "externalJobsComeAfterInternalOnes" {
+    var internalId = "job_ext_listing_internal"
+    JobsTestKit.insertJob(internalId, "Vaga Interna", "Coiso", "Remoto", "FULL_TIME", "MID", listOf("Java"), Time.plusSeconds(Time.nowIso(), -30L))
+    JobsTestKit.insertExternalJob("ext_listing_1", "Vaga Externa de Teste", null, null, "https://exemplo.test/vaga/1", Time.nowIso())
+    var res = JobsTestKit.get("/jobs?limit=20", null)
+    Check.status(res, 200)
+    var internalIndex = -1
+    var firstExternal = -1
+    var urls = ""
+    var i = 0
+    while (i < res.jsonSize("items")) {
+        if (res.json("items." + i + ".id") == internalId) {
+            internalIndex = i
+        }
+        if (res.json("items." + i + ".sourceType") == "EXTERNAL") {
+            if (firstExternal < 0) {
+                firstExternal = i
+            }
+            urls = urls + "|" + res.json("items." + i + ".sourceUrl")
+        }
+        i = i + 1
+    }
+    Check.isTrue("internal job listed", internalIndex >= 0)
+    Check.isTrue("external job listed", firstExternal >= 0)
+    Check.isTrue("internals come first", internalIndex < firstExternal)
+    JobsTestKit.has("external url", urls, "https://exemplo.test/vaga/1")
+    JobsTestKit.finish()
+}

@@ -1,0 +1,307 @@
+import jobs.*
+import kernel.db.*
+import kernel.error.*
+import kernel.testkit.*
+
+// Port of JobServiceTests (the Java ones mocked the repositories; here the real service runs on H2, and "never
+// saved / never delivered" is read from the tables and the captured mailer).
+
+JobService svc() = JobsTestKit.module().service
+
+JobRecord createJob(userId: String, salary: String?, currency: String?, location: String?, type: String, level: String, agreed: Bool) = svc().create("Pessoa Desenvolvedora", "Acme", null, location, type, level, salary, currency, "1500", null, "MONTH", "Vaga de teste com valor.", listOf("Java"), listOf<JobFieldInput>(), userId, agreed, null)
+
+// The failure (code and message) of an operation that must be refused, "" when it went through.
+String createFailure(userId: String, currency: String, agreed: Bool) {
+    try {
+        svc().create("Vaga", "Acme", null, null, "CLT", "PLENO", "1000", currency, "1500", null, "MONTH", "Vaga de teste com valor.", listOf<String>(), listOf<JobFieldInput>(), userId, agreed, null)
+    } catch (String e) {
+        return e
+    }
+    return ""
+}
+
+String applyFailure(jobId: String, userId: String) {
+    try {
+        svc().apply(jobId, userId, "oi", listOf<JobAnswerInput>())
+    } catch (String e) {
+        return e
+    }
+    return ""
+}
+
+String triageFailure(jobId: String, applicationId: String, userId: String, status: String) {
+    try {
+        svc().updateApplicationStatus(jobId, applicationId, userId, status, null)
+    } catch (String e) {
+        return e
+    }
+    return ""
+}
+
+String closeFailure(jobId: String, userId: String) {
+    try {
+        svc().close(jobId, userId)
+    } catch (String e) {
+        return e
+    }
+    return ""
+}
+
+Int applicationRows(jobId: String) = svc().applicationsCount(jobId)
+
+test "normalizesCurrencySymbolOutOfTheSalaryAndKeepsTheChosenCurrency" {
+    var user = JobsTestKit.login("user_job_tests")
+    var job = createJob(user, "R$ 8.000 – R$ 12.000", "brl", "Remoto", "CLT", "PLENO", true)
+    Check.eqStr("salary", "8.000 – 12.000", "" + job.salary)
+    Check.eqStr("currency", "BRL", job.currency)
+    Check.isTrue("agreement recorded", job.communityAgreedAt != null)
+}
+
+test "dollarSalaryIsAlsoNormalized" {
+    var user = JobsTestKit.login("user_job_tests")
+    var job = createJob(user, "US$ 90,000/year", "usd", "Remote", "PJ", "SENIOR", true)
+    Check.eqStr("salary", "90,000/year", "" + job.salary)
+    Check.eqStr("currency", "USD", job.currency)
+}
+
+test "defaultsToBrlWhenCurrencyIsOmitted" {
+    var user = JobsTestKit.login("user_job_tests")
+    var job = createJob(user, null, null, "São Paulo", "CLT", "JUNIOR", true)
+    Check.eqStr("currency", "BRL", job.currency)
+    Check.isTrue("no salary text", job.salary == null)
+}
+
+test "refusesToPublishWithoutTheCommunityAgreement" {
+    var user = JobsTestKit.login("user_job_tests")
+    var failure = createFailure(user, "BRL", false)
+    JobsTestKit.has("agreement", failure, "regras da comunidade")
+}
+
+test "refusesUnsupportedCurrency" {
+    var user = JobsTestKit.login("user_job_tests")
+    JobsTestKit.has("currency", createFailure(user, "BTC", true), "Moeda nao suportada")
+}
+
+test "keepsTheReputationGate" {
+    var user = JobsTestKit.login("user_job_tests")
+    JobsTestKit.reputation().value = JobRules.minReputation()
+    var failure = createFailure(user, "BRL", true)
+    JobsTestKit.reputation().value = 300
+    JobsTestKit.has("reputation", failure, "reputacao")
+}
+
+// ---------------- Job lifecycle ----------------
+
+JobRecord openJob(owner: String) = createJob(owner, null, null, "Remoto", "CLT", "SENIOR", true)
+
+test "closesTheJobAndRecordsWhen" {
+    var owner = JobsTestKit.login("svc_close_owner")
+    var open = openJob(owner)
+    var closed = svc().close(open.id, owner)
+    Check.eqStr("status", "CLOSED", closed.status)
+    Check.isTrue("closedAt", closed.closedAt != null)
+    Check.eqStr("saved", "CLOSED", svc().getById(open.id).status)
+}
+
+test "refusesCloseFromSomeoneElse" {
+    var owner = JobsTestKit.login("svc_close_owner2")
+    var open = openJob(owner)
+    JobsTestKit.has("not owner", closeFailure(open.id, "user_outro"), "nao criou")
+    Check.eqStr("still open", "OPEN", svc().getById(open.id).status)
+}
+
+test "refusesClosingTwice" {
+    var owner = JobsTestKit.login("svc_close_owner3")
+    var open = openJob(owner)
+    svc().close(open.id, owner)
+    JobsTestKit.has("twice", closeFailure(open.id, owner), "ja esta encerrada")
+}
+
+test "editingDoesNotReopenAClosedJob" {
+    var owner = JobsTestKit.login("svc_edit_closed")
+    var open = openJob(owner)
+    var closed = svc().close(open.id, owner)
+    var updated = svc().update(open.id, "Backend II", "Acme", null, "Remoto", "CLT", "SENIOR", null, "BRL", "1500", null, "MONTH", "Vaga de teste com valor.", listOf("Java"), listOf<JobFieldInput>(), owner)
+    Check.eqStr("status", "CLOSED", updated.status)
+    Check.eqStr("closedAt", "" + closed.closedAt, "" + updated.closedAt)
+}
+
+test "refusesApplicationWhenTheJobIsClosed" {
+    var owner = JobsTestKit.login("svc_apply_closed_owner")
+    var candidate = JobsTestKit.login("svc_apply_closed_cand")
+    JobsTestKit.activateProfessional(candidate)
+    var open = openJob(owner)
+    svc().close(open.id, owner)
+    JobsTestKit.mailer().clearSent()
+    JobsTestKit.has("closed", applyFailure(open.id, candidate), "encerrada")
+    // The point of the rule: nothing is saved and the poster is not notified.
+    Check.eqInt("no application", 0, applicationRows(open.id))
+    Check.eqInt("no delivery", 0, JobsTestKit.mailer().sent().size())
+}
+
+test "stillAcceptsApplicationWhileTheJobIsOpen" {
+    var owner = JobsTestKit.login("svc_apply_open_owner")
+    var candidate = JobsTestKit.login("svc_apply_open_cand")
+    JobsTestKit.activateProfessionalAs(candidate, "melsantos.pro", "Mel Santos", "Engenheira de dados", "Tecnologia")
+    var open = openJob(owner)
+    JobsTestKit.mailer().clearSent()
+    var application = svc().apply(open.id, candidate, "oi", listOf<JobAnswerInput>())
+    Check.eqStr("job", open.id, application.jobId)
+    Check.eqInt("delivered", 1, JobsTestKit.mailer().sent().size())
+}
+
+test "refusesApplicationWithoutAnActiveProfessionalIdentity" {
+    var owner = JobsTestKit.login("svc_noprof_owner")
+    var candidate = JobsTestKit.login("svc_noprof_cand")
+    var open = openJob(owner)
+    JobsTestKit.mailer().clearSent()
+    var failure = applyFailure(open.id, candidate)
+    Check.isTrue("code", Errors.hasCode(failure, "NO_ACTIVE_CORPORATE_PROFILE"))
+    Check.eqInt("no application", 0, applicationRows(open.id))
+    Check.eqInt("no delivery", 0, JobsTestKit.mailer().sent().size())
+}
+
+test "refusesApplicationWhileTheProfessionalIdentityIsStillADraft" {
+    var owner = JobsTestKit.login("svc_draft_owner")
+    var candidate = JobsTestKit.login("svc_draft_cand")
+    JobsTestKit.activateProfessionalAs(candidate, "draft.pro", "Mel Santos", null, null)
+    JobsTestKit.db().execute("update corporate_profiles set status = 'DRAFT' where user_id = ?", DbParams().bindStr(candidate))
+    var open = openJob(owner)
+    Check.isTrue("code", Errors.hasCode(applyFailure(open.id, candidate), "NO_ACTIVE_CORPORATE_PROFILE"))
+}
+
+test "applicationSnapshotCarriesTheProfessionalIdentityAndNeverTheSocialOne" {
+    var owner = JobsTestKit.login("svc_snap_owner")
+    var candidate = JobsTestKit.login("svc_snap_cand")
+    JobsTestKit.activateProfessionalAs(candidate, "melsantos.snap", "Mel Santos", "Engenheira de dados", null)
+    JobsTestKit.db().execute("update corporate_profiles set avatar = 'https://cdn.example/pro.png' where user_id = ?", DbParams().bindStr(candidate))
+    JobsTestKit.db().execute("update users set username = 'aminadojava', name = 'Nome Social de Perfil', avatar = 'https://cdn.example/social.png' where id = ?", DbParams().bindStr(candidate))
+    var open = openJob(owner)
+    var application = svc().apply(open.id, candidate, "oi", listOf<JobAnswerInput>())
+    var snapshot = "" + application.candidateSnapshot
+    Check.eqStr("identity", "CORPORATE", "" + JsonPath.str(snapshot, "identity"))
+    Check.eqStr("username", "melsantos.snap", "" + JsonPath.str(snapshot, "username"))
+    Check.eqStr("name", "Mel Santos", "" + JsonPath.str(snapshot, "name"))
+    Check.eqStr("avatar", "https://cdn.example/pro.png", "" + JsonPath.str(snapshot, "avatar"))
+    JobsTestKit.lacks("social username", snapshot, "aminadojava")
+    JobsTestKit.lacks("social avatar", snapshot, "social.png")
+}
+
+// ---------------- Triage: the application lifecycle ----------------
+
+// Builds an application in the requested state walking the VALID path (the domain refuses shortcuts).
+JobApplicationRecord applicationIn(jobId: String, owner: String, candidate: String, status: String) {
+    var application = svc().apply(jobId, candidate, "oi", listOf<JobAnswerInput>())
+    if (status == "APPLIED") {
+        return application
+    }
+    svc().updateApplicationStatus(jobId, application.id, owner, "IN_REVIEW", null)
+    if (status == "ADVANCED") {
+        svc().updateApplicationStatus(jobId, application.id, owner, "ADVANCED", null)
+    }
+    if (status == "NOT_SELECTED") {
+        svc().updateApplicationStatus(jobId, application.id, owner, "NOT_SELECTED", "Seguimos com outra pessoa.")
+    }
+    return application
+}
+
+String applicationStatus(jobId: String, owner: String, applicationId: String) {
+    for (var a in svc().applicationsOf(jobId, owner, 100)) {
+        if (a.id == applicationId) {
+            return a.status
+        }
+    }
+    return "MISSING"
+}
+
+Int statusNotices(candidate: String) = JobsTestKit.db().queryLong("select count(*) from notifications where user_id = ? and kind = 'JOB_APPLICATION_STATUS'", DbParams().bindStr(candidate)).toInt()
+
+test "newApplicationStartsAsApplied" {
+    var owner = JobsTestKit.login("svc_tri_owner0")
+    var candidate = JobsTestKit.login("svc_tri_cand0")
+    JobsTestKit.activateProfessional(candidate)
+    var job = openJob(owner)
+    Check.eqStr("status", "APPLIED", applicationIn(job.id, owner, candidate, "APPLIED").status)
+}
+
+test "ownerMovesTheApplicationAndTheCandidateIsNotified" {
+    var owner = JobsTestKit.login("svc_tri_owner1")
+    var candidate = JobsTestKit.login("svc_tri_cand1")
+    JobsTestKit.activateProfessional(candidate)
+    var job = openJob(owner)
+    var application = applicationIn(job.id, owner, candidate, "APPLIED")
+    var moved = svc().updateApplicationStatus(job.id, application.id, owner, "IN_REVIEW", null)
+    Check.eqStr("status", "IN_REVIEW", moved.status)
+    Check.eqStr("persisted", "IN_REVIEW", applicationStatus(job.id, owner, application.id))
+    Check.eqInt("candidate notified once", 1, statusNotices(candidate))
+}
+
+test "walksTheWholeHappyPath" {
+    var owner = JobsTestKit.login("svc_tri_owner2")
+    var candidate = JobsTestKit.login("svc_tri_cand2")
+    JobsTestKit.activateProfessional(candidate)
+    var job = openJob(owner)
+    var application = applicationIn(job.id, owner, candidate, "IN_REVIEW")
+    Check.eqStr("advanced", "ADVANCED", svc().updateApplicationStatus(job.id, application.id, owner, "ADVANCED", null).status)
+    // Stepping back a stage is allowed too.
+    Check.eqStr("back", "IN_REVIEW", svc().updateApplicationStatus(job.id, application.id, owner, "IN_REVIEW", null).status)
+}
+
+test "refusesATransitionThatSkipsAStage" {
+    var owner = JobsTestKit.login("svc_tri_owner3")
+    var candidate = JobsTestKit.login("svc_tri_cand3")
+    JobsTestKit.activateProfessional(candidate)
+    var job = openJob(owner)
+    var application = applicationIn(job.id, owner, candidate, "APPLIED")
+    JobsTestKit.has("skip", triageFailure(job.id, application.id, owner, "ADVANCED"), "nao pode passar")
+    // An invalid transition neither saves nor warns the candidate.
+    Check.eqStr("unchanged", "APPLIED", applicationStatus(job.id, owner, application.id))
+    Check.eqInt("no notice", 0, statusNotices(candidate))
+}
+
+test "repeatingTheSameStatusIsRefusedAndDoesNotNotifyAgain" {
+    var owner = JobsTestKit.login("svc_tri_owner4")
+    var candidate = JobsTestKit.login("svc_tri_cand4")
+    JobsTestKit.activateProfessional(candidate)
+    var job = openJob(owner)
+    var application = applicationIn(job.id, owner, candidate, "IN_REVIEW")
+    var before = statusNotices(candidate)
+    Check.isTrue("refused", triageFailure(job.id, application.id, owner, "IN_REVIEW").length() > 0)
+    // This is what stops a repeated click from becoming a repeated message to the candidate.
+    Check.eqInt("no new notice", before, statusNotices(candidate))
+}
+
+test "notSelectedIsTerminal" {
+    var owner = JobsTestKit.login("svc_tri_owner5")
+    var candidate = JobsTestKit.login("svc_tri_cand5")
+    JobsTestKit.activateProfessional(candidate)
+    var job = openJob(owner)
+    var application = applicationIn(job.id, owner, candidate, "NOT_SELECTED")
+    var before = statusNotices(candidate)
+    Check.isTrue("refused", triageFailure(job.id, application.id, owner, "IN_REVIEW").length() > 0)
+    Check.eqInt("no new notice", before, statusNotices(candidate))
+}
+
+test "refusesTriageFromSomeoneElse" {
+    var owner = JobsTestKit.login("svc_tri_owner6")
+    var candidate = JobsTestKit.login("svc_tri_cand6")
+    JobsTestKit.activateProfessional(candidate)
+    var job = openJob(owner)
+    var application = applicationIn(job.id, owner, candidate, "APPLIED")
+    JobsTestKit.has("not owner", triageFailure(job.id, application.id, "user_outro", "IN_REVIEW"), "So quem publicou")
+    Check.eqStr("unchanged", "APPLIED", applicationStatus(job.id, owner, application.id))
+    Check.eqInt("no notice", 0, statusNotices(candidate))
+}
+
+test "refusesAnApplicationThatBelongsToAnotherJob" {
+    var owner = JobsTestKit.login("svc_tri_owner7")
+    var candidate = JobsTestKit.login("svc_tri_cand7")
+    JobsTestKit.activateProfessional(candidate)
+    var job1 = openJob(owner)
+    var job2 = openJob(owner)
+    var application = applicationIn(job2.id, owner, candidate, "APPLIED")
+    // An application of ANOTHER job: the URL path cannot reach someone else's application.
+    JobsTestKit.has("other job", triageFailure(job1.id, application.id, owner, "IN_REVIEW"), "Candidatura nao encontrada")
+    Check.eqInt("no notice", 0, statusNotices(candidate))
+    JobsTestKit.finish()
+}
