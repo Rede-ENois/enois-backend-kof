@@ -826,3 +826,26 @@ Total: 70 of 70 endpoints, 148 of 151 Java behaviours ported as 158 Kof tests; t
 ### Kernel files added or changed by this slice
 
 `kernel/jobs/ProcessLock.kf` (new: the `synchronized` of Java), `kernel/time/ZoneDates.kf` (`localToInstant`, `dayOfWeek`, `weekStart`), both with tests in `tests/kernel`. Config: `COSMETICS_CATALOG` (default `resources/cosmetics/catalog.json`; the deploy must ship the file next to `resources/templates`), `REDE_COSMETICS_EVENTS_{DUEL,HUNT}_{STARTS,ENDS}_AT`, `REDE_MARKETPLACE_*`, `COIN_ECONOMY_*`. Test support in `src/economy/` (`EconomyTestKit`, `CosmeticsTestKit`, `MarketTestKit`, `ServicesTestKit`). Gaps found: G240 to G248 in `KOF_GAPS.md`.
+
+## orgs: corporate, companies, mentoring, freelances, events
+
+Slug `orgs`, branch `port/orgs`, gap range G340 to G359. Test fixtures: `app.OrgsTestKit` (src/app) boots the exact production wiring (`AppWiring.install`) once per test file, so every orgs test also proves the wiring and the seams.
+
+| Domain | Endpoints ported/total | Kof tests | Java tests ported/total |
+|---|---|---|---|
+| corporate (`src/corporate`) | 10/10 (`GET|POST|PATCH /me/business-profile`, `POST .../name`, `.../username`, `GET .../import-preview`, `POST .../import`, `.../activate`, `.../deactivate`, `GET /corporate/{username}`) | `tests/corporate/*` (33, 3 of them cover the bridges) | 31/31 methods |
+
+### corporate notes
+
+- `CorporateProfile.create/withName/withUsername` threw `IllegalArgumentException` (400 `BAD_REQUEST`, or `INVALID_USERNAME` for the nametag change): `CorporateRules` throws a marker the service maps the same way.
+- The unique `@` is the database index; a constraint violation is `USERNAME_TAKEN` only when another account holds that `@`, any other refused value stays the generic `409 CONFLICT` (the Java persistence test asserted "not an ApiException"; here it is "not USERNAME_TAKEN").
+
+### Seams replaced by the corporate port
+
+| Seam | Now |
+|---|---|
+| `FeedCorporate` (feed) | `CorporateFeedBridge` through `FeedModule.installWithCorporate` |
+| `MessagingCorporate` (messaging) | `CorporateMessagingBridge` in `MessagingSeamSet.corporate` |
+| `JobCorporate` (jobs) | `CorporateJobsBridge` in `JobSeamSet.corporate` |
+
+`NotificationActors` and `FeedAuthors.corporateByIds` still read `corporate_profiles` read-only with the same columns (same answers; not swapped).

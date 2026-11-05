@@ -1,0 +1,135 @@
+import app.*
+import corporate.*
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import profile.*
+
+// Port of CorporateProfileTests (domain), CorporateBannerHtmlFitTests and CorporateProfilePersistenceTests. The
+// Java domain threw IllegalArgumentException from `CorporateProfile.create`; the rules here throw their own marker
+// that the service turns into the same 400 BAD_REQUEST.
+String cpNow() = Time.nowIso()
+
+test "a profile is born as a draft with nothing copied from the social one" {
+    var profile = CorporateRules.create("user_1", "mel.santos", "Mel Santos", cpNow())
+    Check.eqStr("status", "DRAFT", profile.status)
+    Check.isTrue("headline empty", profile.headline == null)
+    Check.isTrue("bio empty", profile.bio == null)
+    Check.isTrue("avatar empty", profile.avatar == null)
+    Check.isTrue("banner empty", profile.banner == null)
+    Check.eqStr("username", "mel.santos", profile.username)
+}
+
+test "coherent username formats are accepted and normalised" {
+    Check.eqStr("upper case", "mel.santos", CorporateRules.create("user_1", "Mel.Santos", "Mel Santos", cpNow()).username)
+    Check.eqStr("hyphen", "mel-santos", CorporateRules.create("user_1", "mel-santos", "Mel Santos", cpNow()).username)
+    Check.eqStr("underscore", "mel_santos", CorporateRules.create("user_1", "mel_santos", "Mel Santos", cpNow()).username)
+}
+
+Bool cpRefused(username: String, name: String) {
+    try {
+        CorporateRules.create("user_1", username, name, cpNow())
+        return false
+    } catch (String e) {
+        return true
+    }
+}
+
+test "an invalid username or name is refused" {
+    Check.isTrue("one char", cpRefused("a", "Mel"))
+    Check.isTrue("leading hyphen", cpRefused("-mel", "Mel"))
+    Check.isTrue("space", cpRefused("mel com espaco", "Mel"))
+    Check.isTrue("short name", cpRefused("mel.valido", "Me"))
+}
+
+test "life cycle draft, active, disabled and back without losing data" {
+    var profile = CorporateRules.create("user_1", "mel.santos", "Mel Santos", cpNow())
+    var active = profile.withDetails("Engenheira de software", "Bio profissional", null, null, null, "São Paulo", "Tecnologia", null, cpNow()).withStatus("ACTIVE", cpNow())
+    Check.isTrue("active", active.active())
+    Check.eqStr("headline", "Engenheira de software", active.headline as String)
+    var disabled = active.withStatus("DISABLED", cpNow())
+    Check.eqStr("disabled", "DISABLED", disabled.status)
+    Check.eqStr("data kept", "Engenheira de software", disabled.headline as String)
+    Check.isTrue("reopened", disabled.withStatus("ACTIVE", cpNow()).active())
+}
+
+test "renaming the presentation does not change the @" {
+    var profile = CorporateRules.create("user_1", "mel.santos", "Mel", cpNow())
+    var renamed = profile.withName("Mel de Sousa", cpNow())
+    Check.eqStr("name", "Mel de Sousa", renamed.name)
+    Check.eqStr("username", "mel.santos", renamed.username)
+}
+
+test "banner html fit: text that fits passes whole, empty becomes null" {
+    Check.eqStr("whole", "<div>capa</div>", CorporateService.fitHtml("  <div>capa</div>  ", 20000) as String)
+    Check.isTrue("null", CorporateService.fitHtml(null, 20000) == null)
+    Check.isTrue("blank", CorporateService.fitHtml("   ", 20000) == null)
+}
+
+test "banner html fit: the cut falls at the end of a tag" {
+    var block = "<div class=\"faixa\">conteudo</div>"
+    var big = block + block + block + block + block + block + block + block + block + block + block + block + block + block + block + block + block + block + block + block
+    var cut = CorporateService.fitHtml(big, 100)
+    Check.isTrue("not null", cut != null)
+    var text = cut as String
+    Check.isTrue("within the limit", text.length() <= 100)
+    Check.isTrue("ends with a closing tag", text.endsWith("</div>"))
+}
+
+test "banner html fit: when no tag closes within the limit the field is empty" {
+    Check.eqStr("short tag", "<b>", CorporateService.fitHtml("<b>capa longa</b>", 5) as String)
+    Check.isTrue("long tag", CorporateService.fitHtml("<div class=\"faixa\">capa</div>", 5) == null)
+    Check.isTrue("loose text", CorporateService.fitHtml("texto solto sem tag", 5) == null)
+}
+
+test "the store saves and finds by username and user id" {
+    var store = CorporateStore(OrgsTestKit.db())
+    var saved = store.save(CorporateRules.create("user_corp_1", "mel.santos.store", "Mel Santos", cpNow()).withStatus("ACTIVE", cpNow()))
+    Check.isTrue("by username", store.findByUsername("mel.santos.store") != null)
+    Check.isTrue("by user id", store.findByUserId("user_corp_1") != null)
+    Check.isTrue("exists", store.existsByUsername("mel.santos.store"))
+    var found = store.findByUsername("mel.santos.store")
+    if (found == null) {
+        throw "profile not found"
+    }
+    Check.eqStr("status", "ACTIVE", found.status)
+    Check.eqStr("user id", "user_corp_1", saved.userId)
+}
+
+test "the @ is unique in the database and the refusal is a 409 USERNAME_TAKEN" {
+    var store = CorporateStore(OrgsTestKit.db())
+    store.save(CorporateRules.create("user_corp_2", "nome.unico", "Primeira", cpNow()))
+    var refused = ""
+    try {
+        store.save(CorporateRules.create("user_corp_3", "nome.unico", "Segunda", cpNow()))
+    } catch (String e) {
+        refused = e
+    }
+    var err = Errors.parse(refused)
+    Check.eqInt("status", 409, err.status())
+    Check.eqStr("code", "USERNAME_TAKEN", err.code())
+    Check.isTrue("message names the professional user", err.message().contains("usuário profissional"))
+}
+
+test "another refused write does not pass as a username conflict" {
+    var store = CorporateStore(OrgsTestKit.db())
+    var profile = store.save(CorporateRules.create("user_corp_5", "local.longo", "Local Longo", cpNow()))
+    // location is varchar(200): the database refuses the value, which has nothing to do with the @.
+    var tooLong = profile.withDetails(null, null, null, null, null, strings.repeat("x", 201), null, null, cpNow())
+    var refused = ""
+    try {
+        store.save(tooLong)
+    } catch (String e) {
+        refused = e
+    }
+    Check.isTrue("it failed", refused.length() > 0)
+    Check.isTrue("not USERNAME_TAKEN", !Errors.hasCode(refused, "USERNAME_TAKEN"))
+}
+
+test "the professional namespace does not collide with anything social" {
+    var store = CorporateStore(OrgsTestKit.db())
+    var saved = store.save(CorporateRules.create("user_corp_4", "qualquer.at", "Perfil Profissional", cpNow()))
+    Check.eqStr("username", "qualquer.at", saved.username)
+    OrgsTestKit.finish()
+}

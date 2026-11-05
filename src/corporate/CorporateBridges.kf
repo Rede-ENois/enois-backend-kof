@@ -1,0 +1,75 @@
+package corporate
+
+import feed.*
+import jobs.*
+import kernel.db.*
+import messaging.*
+
+// The seams other domains held for the corporate domain, now backed by CorporateService (AppWiring passes these
+// in). Each one keeps the contract of its seam: same answers and same errors as the table readers they replace.
+// feed: GetFeedService.getCorporateProfilePosts and BUSINESS publishing.
+class CorporateFeedBridge extends FeedCorporate {
+    CorporateService service
+    public constructor(store: Db, service: CorporateService) {
+        super(store)
+        this.service = service
+    }
+    String? activeUserIdOf(username: String) {
+        var p = service.byUsername(username)
+        if (p == null) {
+            return null
+        }
+        if (!p.active()) {
+            return null
+        }
+        return p.userId
+    }
+    Bool hasActiveProfile(userId: String) {
+        var p = service.byUser(userId)
+        if (p == null) {
+            return false
+        }
+        return p.active()
+    }
+}
+
+// messaging: the professional identity of a conversation side.
+class CorporateMessagingBridge extends MessagingCorporate {
+    CorporateService service
+    public constructor(database: Db, service: CorporateService) {
+        super(database)
+        this.service = service
+    }
+    requireActive(userId: String) {
+        service.requireActive(userId)
+    }
+    Map<String,MessagingIdentity> activeByUserIds(userIds: List<String>) {
+        Map<String,MessagingIdentity> out = mapOf()
+        var active = service.activeByUserIds(userIds)
+        for (var id in userIds) {
+            var p = active.get(id)
+            if (p != null) {
+                var shown = ""
+                var avatar = p.avatar
+                if (avatar != null) {
+                    shown = avatar
+                }
+                out.put(id, MessagingIdentity("CORPORATE", p.username, p.name, shown))
+            }
+        }
+        return out
+    }
+}
+
+// jobs: the professional identity every application carries.
+class CorporateJobsBridge extends JobCorporate {
+    CorporateService service
+    public constructor(store: Db, service: CorporateService) {
+        super(store)
+        this.service = service
+    }
+    JobProfessional requireActive(userId: String) {
+        var p = service.requireActive(userId)
+        return JobProfessional(p.userId, p.username, p.name, p.headline, p.avatar, p.location, p.industry)
+    }
+}

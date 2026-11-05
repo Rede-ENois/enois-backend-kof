@@ -40,6 +40,7 @@ import coin.*
 import cosmetics.*
 import marketplace.*
 import services.*
+import corporate.*
 
 // The production composition: every domain module installed on a created platform, in dependency order.
 // Main.kf and tests/integration/BootRoutesTest.kf both call it, so a test boots the exact production wiring.
@@ -64,13 +65,16 @@ class AppWiring {
         // The cosmetics core (catalog + badge ownership) comes first: profile asks it who owns an emblem.
         var cosmeticsCore = CosmeticsCore.create(platform)
         var profiles = ProfileModule.installWith(platform, shared, ProfileNotifier(platform.db), cosmeticsCore.badges, ProfileParentalLinks(platform.db), ProfileForeignCounts(platform.db), PreferencesThemeGallery(platform.db))
+        // corporate (professional identity): after profile, before the domains that read it (feed, messaging, jobs).
+        var corporate = CorporateModule.install(platform, profiles)
         var jobSeams = JobSeamSet(platform, profiles)
+        jobSeams.corporate = CorporateJobsBridge(platform.db, corporate.service)
         var identitySeams = IdentitySeams.defaults(platform, IdentityStore(platform.db))
         identitySeams.reputations = JobsIdentityReputation(jobSeams.reputation)
         var identity = IdentityModule.installWith(platform, shared, hooks, parts, identitySeams)
         var age = AgeModule.install(platform, identity.mailer)
         OnboardingModule.install(platform, age.policy)
-        FeedModule.install(platform, shared, hooks)
+        FeedModule.installWithCorporate(platform, shared, hooks, FeedCoins(), CorporateFeedBridge(platform.db, corporate.service))
         // Domains (one block each, ordered by dependency): notifications is the sink the others write to.
         // economy (coin): the ledger service is built first because the domains below call it (presence, rewards);
         // the routes, the disputes and the jobs come after notifications (CoinModule.install).
@@ -82,6 +86,7 @@ class AppWiring {
         CosmeticsModule.install(platform, cosmeticsCore, coinModule, profiles)
         PushModule.install(platform, shared, hooks, parts, notificationsModule)
         var messagingSeams = MessagingSeamSet(platform)
+        messagingSeams.corporate = CorporateMessagingBridge(platform.db, corporate.service)
         messagingSeams.coins = CoinMessagingCoins(coinCore.service)
         var messagingModule = MessagingModule.installWith(platform, shared, parts, notificationsModule, messagingSeams)
         CallsModule.install(platform, shared, hooks, parts, notificationsModule, messagingModule)

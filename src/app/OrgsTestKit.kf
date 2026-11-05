@@ -1,0 +1,77 @@
+package app
+
+import java.util.HashMap
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import profile.*
+
+// Fixtures of the orgs suites (corporate, companies, mentoring, freelances, events): one app per test file booted
+// with the exact production wiring (AppWiring.install), so a test also proves the wiring and the seams other
+// domains hold for these domains. No background job runs (the outbox worker is stopped), and no test reaches the
+// network.
+//
+//   var app = OrgsTestKit.app()
+//   var ana = OrgsTestKit.login("orgs_ana")            // verified adult with a live session
+//   Check.status(ana.get("/me/business-profile"), 200)
+//   ... last test of the file: OrgsTestKit.finish()
+class OrgsTestKit {
+    static TestApp? orgsKitApp = null
+    static SharedServices? orgsKitShared = null
+    static TestApp app() = OrgsTestKit.bootWith(new HashMap<String, String>())
+    // Boots once per test file; the overrides of the first call win.
+    static TestApp bootWith(overrides: Map<String,String>) {
+        var cur = OrgsTestKit.orgsKitApp
+        if (cur != null) {
+            return cur
+        }
+        var merged = new HashMap<String, String>()
+        merged.put("REDE_SECURITY_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+        merged.put("REDE_ORIGINS_ENFORCE", "false")
+        merged.put("REDE_JOBS_IMPORT_EXTERNAL_REFRESH_ENABLED", "false")
+        merged.put("REDE_JOBS_IMPORT_JOBRADAR_ENABLED", "false")
+        merged.put("REDE_JOBS_IMPORT_OPEN_APIS_ENABLED", "false")
+        merged.put("REDE_CACHE_JOBS_LIST_TTL", "0ms")
+        merged.put("REDE_CACHE_EVENTS_LIST_TTL", "0ms")
+        merged.put("REDE_CACHE_COMMUNITIES_LIST_TTL", "0ms")
+        for (var k in overrides.keys()) {
+            merged.put(k, overrides.getOrDefault(k, ""))
+        }
+        SecurityClock.reset()
+        var created = TestApp.bootWith("orgs", merged, (p: Platform) -> {
+    OrgsTestKit.orgsKitShared = AppWiring.install(p)
+    // The outbox worker and the sweeps would keep the test process alive: tests drive them by hand.
+    var shared = OrgsTestKit.orgsKitShared
+    if (shared != null) {
+        shared.stop()
+    }
+})
+        OrgsTestKit.orgsKitApp = created
+        return created
+    }
+    static Db db() = OrgsTestKit.app().db()
+    // A verified adult (birth date declared) with a live one-hour session; id, username and name are the id.
+    static ProfileCaller login(id: String) {
+        var caller = ProfileTestApp.login(OrgsTestKit.app(), id)
+        OrgsTestKit.db().execute("update users set birth_date = ? where id = ? and birth_date is null", DbParams().bindDate("1990-05-10").bindStr(id))
+        // Past the "new account" window the publishing guards apply to.
+        OrgsTestKit.db().execute("update users set created_at = ? where id = ?", DbParams().bindInstant(Time.plusSeconds(Time.nowIso(), -604800L)).bindStr(id))
+        return caller
+    }
+    static ProfileCaller anonymous() = ProfileTestApp.anonymous(OrgsTestKit.app())
+    static String str(res: TestResponse, path: String) {
+        var v = res.jsonStr(path)
+        if (v == null) {
+            throw "missing json " + path + " in " + res.body
+        }
+        return v
+    }
+    // Last test of a file.
+    static finish() {
+        var shared = OrgsTestKit.orgsKitShared
+        if (shared != null) {
+            shared.stop()
+        }
+    }
+}

@@ -1,0 +1,142 @@
+package corporate
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import profile.*
+
+// HTTP adapter of CorporateProfileController: the professional profile of the signed-in account
+// (`/me/business-profile`, resolved from the session, never from the payload) and the public page
+// `GET /corporate/{username}` (ACTIVE profiles only).
+class CorporateRoutes {
+    static register(server: HttpServer, service: CorporateService, extension: ProfileExtensionStore) {
+        server.get("/me/business-profile", () -> CorporateRoutes.me(service))
+        server.get("/corporate/:username", () -> CorporateRoutes.byUsername(service, extension))
+        server.post("/me/business-profile", () -> CorporateRoutes.create(service))
+        server.patch("/me/business-profile", () -> CorporateRoutes.updateDetails(service))
+        server.post("/me/business-profile/name", () -> CorporateRoutes.rename(service))
+        server.post("/me/business-profile/username", () -> CorporateRoutes.changeUsername(service))
+        server.get("/me/business-profile/import-preview", () -> CorporateRoutes.importPreview(service))
+        server.post("/me/business-profile/import", () -> CorporateRoutes.importFromSocial(service))
+        server.post("/me/business-profile/activate", () -> CorporateRoutes.activate(service))
+        server.post("/me/business-profile/deactivate", () -> CorporateRoutes.deactivate(service))
+    }
+    static String blank(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    static CorporateProfileView view(p: CorporateProfile) = CorporateProfileView(true, p.username, p.name, CorporateRoutes.blank(p.headline), CorporateRoutes.blank(p.bio), CorporateRoutes.blank(p.avatar), CorporateRoutes.blank(p.banner), CorporateRoutes.blank(p.bannerHtml), CorporateRoutes.blank(p.location), CorporateRoutes.blank(p.industry), CorporateRoutes.blank(p.externalLinks), p.status)
+    static String me(service: CorporateService) {
+        var userId = Auth.requireUser()
+        var p = service.byUser(userId)
+        if (p == null) {
+            return json.encode(CorporateMissingView(false))
+        }
+        return json.encode(CorporateRoutes.view(p))
+    }
+    // Public read: only ACTIVE profiles have a page (draft or disabled is 404).
+    static String byUsername(service: CorporateService, extension: ProfileExtensionStore) {
+        var p = service.byUsername(Req.pathParam("username"))
+        if (p == null) {
+            throw Errors.api(404, "PROFILE_NOT_FOUND", "Perfil profissional não encontrado.")
+        }
+        if (!p.active()) {
+            throw Errors.api(404, "PROFILE_NOT_FOUND", "Perfil profissional não encontrado.")
+        }
+        return json.encode(CorporateRoutes.publicView(service, extension, p))
+    }
+    // The work page: the professional presentation plus the public portfolio of the account. Never the social
+    // @, name or avatar, and no reputation, followers or connections.
+    static CorporatePublicView publicView(service: CorporateService, extension: ProfileExtensionStore, p: CorporateProfile) {
+        var account = service.profiles.findById(p.userId)
+        var verified = false
+        var skills = listOf<String>()
+        var look = ProfileAppearances.emptyLook()
+        if (account != null) {
+            verified = account.identityVerified()
+            skills = account.skills
+            look = account.appearance.professional
+        }
+        var v = CorporateRoutes.view(p)
+        return CorporatePublicView(true, v.username(), v.name(), v.headline(), v.bio(), v.avatar(), v.banner(), v.bannerHtml(), v.location(), v.industry(), v.externalLinks(), v.status(), p.userId, verified, p.createdAt, skills, extension.experiences(p.userId, true), extension.educations(p.userId), extension.certifications(p.userId), look)
+    }
+    static String create(service: CorporateService) {
+        var userId = Auth.requireUser()
+        var b = CorporateRoutes.createBody()
+        return json.encode(CorporateRoutes.view(service.create(userId, b.username(), b.name())))
+    }
+    static String updateDetails(service: CorporateService) {
+        var userId = Auth.requireUser()
+        SafeLinks.checkRequest()
+        var b = CorporateRoutes.detailsBody()
+        return json.encode(CorporateRoutes.view(service.updateDetails(userId, b)))
+    }
+    static String rename(service: CorporateService) {
+        var userId = Auth.requireUser()
+        var b = CorporateRoutes.nameBody()
+        return json.encode(CorporateRoutes.view(service.rename(userId, b.name())))
+    }
+    static String changeUsername(service: CorporateService) {
+        var userId = Auth.requireUser()
+        var b = CorporateRoutes.usernameBody()
+        return json.encode(CorporateRoutes.view(service.changeUsername(userId, b.username())))
+    }
+    static String importPreview(service: CorporateService) {
+        var userId = Auth.requireUser()
+        return json.encode(service.importPreview(userId))
+    }
+    static String importFromSocial(service: CorporateService) {
+        var userId = Auth.requireUser()
+        var b = CorporateRoutes.importBody()
+        return json.encode(CorporateRoutes.view(service.importFromSocial(userId, b.fields())))
+    }
+    static String activate(service: CorporateService) {
+        var userId = Auth.requireUser()
+        return json.encode(CorporateRoutes.view(service.activate(userId)))
+    }
+    static String deactivate(service: CorporateService) {
+        var userId = Auth.requireUser()
+        return json.encode(CorporateRoutes.view(service.deactivate(userId)))
+    }
+    static CorporateCreateBody createBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<CorporateCreateBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static CorporateDetailsBody detailsBody() {
+        try {
+            return json.decode<CorporateDetailsBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static CorporateNameBody nameBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<CorporateNameBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static CorporateUsernameBody usernameBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<CorporateUsernameBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static CorporateImportBody importBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<CorporateImportBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}
