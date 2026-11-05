@@ -1,0 +1,96 @@
+import coin.*
+import economy.*
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Port of CoinFlowTests: idempotent genesis, P2P transfer by username (irreversible), both ledgers, insufficient
+// balance, the new-account cap, the admin locks and the closed-loop supply.
+TestApp cfApp() = EconomyTestKit.app("coinflow", mapOf<String, String>())
+
+String cfTransfer(to: String, amount: Int, message: String) {
+    return json.encode(CoinTransferBody(to, amount as Long, message))
+}
+
+test "genesis airdrop, P2P transfer and extract" {
+    var app = cfApp()
+    var sender = EconomyTestKit.login(app, "coin-sender")
+    var receiver = EconomyTestKit.login(app, "coin-receiver")
+
+    Check.status(sender.get("/carteira"), 200)
+    var wallet2 = sender.get("/carteira")
+    Check.status(wallet2, 200)
+    // 100 sparks of airdrop + 5 of the day's presence, in thousandths
+    Check.jsonEq(wallet2, "balance", "105000")
+
+    var sent = sender.callKey("POST", "/carteira/transferencias", "coin-p2p-1", cfTransfer("coin-receiver", 30000, "pelo mockup lindo"))
+    Check.status(sent, 200)
+    Check.jsonEq(sent, "status", "SENT")
+
+    Check.jsonEq(sender.get("/carteira"), "balance", "75000")
+    Check.jsonEq(receiver.get("/carteira"), "balance", "135000")
+
+    var senderWallet = sender.get("/carteira")
+    Check.isTrue("sender ledger has TRANSFER_OUT", senderWallet.body.contains("\"kind\":\"TRANSFER_OUT\""))
+    var receiverWallet = receiver.get("/carteira")
+    Check.isTrue("receiver ledger has TRANSFER_IN", receiverWallet.body.contains("\"kind\":\"TRANSFER_IN\""))
+
+    Check.apiError(sender.callKey("POST", "/carteira/transferencias", "coin-p2p-2", cfTransfer("coin-receiver", 400000, "")), 400, "INSUFFICIENT_SPARKS")
+    Check.apiError(sender.callKey("POST", "/carteira/transferencias", "coin-p2p-3", cfTransfer("coin-receiver", 999999, "")), 403, "NEW_ACCOUNT_LIMIT")
+
+    // same key and same payload: replay, no duplicate
+    Check.status(sender.callKey("POST", "/carteira/transferencias", "coin-p2p-1", cfTransfer("coin-receiver", 30000, "pelo mockup lindo")), 200)
+    Check.jsonEq(sender.get("/carteira"), "balance", "75000")
+
+    Check.status(sender.callKey("POST", "/carteira/transferencias", "coin-p2p-self", cfTransfer("coin-sender", 10, "")), 400)
+}
+
+String cfStr(res: TestResponse, path: String) {
+    var v = res.jsonStr(path)
+    if (v == null) {
+        return "0"
+    }
+    return v
+}
+
+Long cfSupplyCirculation(admin: ProfileCaller) {
+    var res = admin.get("/admin/carteira/supply")
+    Check.status(res, 200)
+    Check.eqStr("total", "2000000000", cfStr(res, "total"))
+    Check.eqStr("coerente", "true", cfStr(res, "coerente"))
+    var total = cfStr(res, "total")
+    var cofre = cfStr(res, "cofre")
+    var circulacao = cfStr(res, "circulacao")
+    var soma = cfStr(res, "somaSaldos")
+    Check.eqStr("total = vault + circulation", total, "" + (cofre.toLong() + circulacao.toLong()))
+    Check.eqStr("sum of all accounts = total", total, soma)
+    return circulacao.toLong()
+}
+
+test "supply is closed loop and admin only" {
+    var app = cfApp()
+    var user = EconomyTestKit.login(app, "coin-supply-plain")
+    var admin = EconomyTestKit.loginAdmin(app, "group-admin")
+    Check.status(admin.get("/carteira"), 200)
+    Check.status(user.get("/carteira"), 200)
+    Check.status(user.get("/admin/carteira/supply"), 403)
+
+    var before = cfSupplyCirculation(admin)
+    Check.status(admin.callKey("POST", "/carteira/transferencias", "coin-supply-transfer", cfTransfer("coin-supply-plain", 500, "")), 200)
+    var after = cfSupplyCirculation(admin)
+    Check.eqStr("a transfer does not change what circulates", "" + before, "" + after)
+}
+
+test "the admin wallet queue is closed to non-admins" {
+    var app = cfApp()
+    var user = EconomyTestKit.login(app, "coin-plain-user")
+    var admin = EconomyTestKit.loginAdmin(app, "group-admin")
+    Check.status(user.get("/admin/carteira/disputas"), 403)
+    Check.status(admin.get("/admin/carteira/disputas"), 200)
+    Check.status(user.get("/admin/carteira/usuarios/coin-plain-user/extrato"), 403)
+    var ledger = admin.get("/admin/carteira/usuarios/coin-plain-user/extrato")
+    Check.status(ledger, 200)
+    Check.jsonEq(ledger, "username", "coin-plain-user")
+    Check.jsonEq(ledger, "balance", "0")
+    EconomyTestKit.finish()
+}

@@ -1,0 +1,279 @@
+package coin
+
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+import kernel.time.*
+import kernel.url.*
+import profile.*
+
+// HTTP adapter of the wallet of the spark (CoinController): balance, extract, Pix style transfers by username,
+// the reference quote (mini exchange), prizes, disputes and the admin panels (supply, economy).
+class CoinRoutes {
+    static register(server: HttpServer, coins: CoinService, rates: CoinRateService, economy: CoinEconomyService, disputes: CoinDisputeService, directory: ProfileDirectory, idem: Idempotency) {
+        // The mini exchange: public, the reference quote and the history that feeds the chart (it is not an exchange).
+        server.get("/coin/cotacao", () -> CoinRoutes.quote(rates))
+        server.post("/coin/cotacao", () -> CoinRoutes.setQuote(rates))
+        server.post("/carteira/premios", () -> CoinRoutes.grantPrize(coins, directory))
+        server.post("/carteira/transacoes/:refId/contestar", () -> CoinRoutes.contest(disputes))
+        server.get("/carteira/contestacoes", () -> CoinRoutes.myContestations(disputes))
+        server.get("/admin/carteira/usuarios/:username/extrato", () -> CoinRoutes.adminExtract(coins, directory))
+        server.get("/admin/carteira/supply", () -> CoinRoutes.supply(coins))
+        server.get("/admin/carteira/economia", () -> CoinRoutes.economyReading(economy))
+        server.post("/admin/carteira/economia/recalcular", () -> CoinRoutes.economyRecalculate(economy))
+        server.get("/admin/carteira/disputas", () -> CoinRoutes.disputesQueue(disputes))
+        server.post("/admin/carteira/disputas/:disputeId/deferir", () -> CoinRoutes.uphold(disputes))
+        server.post("/admin/carteira/disputas/:disputeId/rejeitar", () -> CoinRoutes.reject(disputes))
+        server.get("/carteira", () -> CoinRoutes.wallet(coins, directory))
+        server.get("/me/streak", () -> json.encode(coins.streak(Auth.requireUser())))
+        server.get("/carteira/extrato", () -> CoinRoutes.extract(coins))
+        server.post("/carteira/transferencias", () -> CoinRoutes.transfer(coins, directory, idem))
+    }
+    static String quote(rates: CoinRateService) {
+        var history = Req.queryInt("history", 90)
+        var current = rates.latest()
+        var points = listOf<CoinQuotePoint>()
+        for (var r in rates.history(history)) {
+            points.add(CoinQuotePoint(r.brlCents(), r.brlMicros(), r.effectiveAt()))
+        }
+        return json.encode(CoinQuoteView(current.brlCents(), current.brlMicros(), CoinService.scale(), current.effectiveAt(), points))
+    }
+    // Publishes a new reference quote (administration only). `brlMicros` is the new precision; `brlCents` is still
+    // accepted for the old panel.
+    static String setQuote(rates: CoinRateService) {
+        Auth.requireAdmin()
+        var body = CoinRoutes.quoteBody()
+        var micros = body.brlMicros()
+        if (micros != null) {
+            return CoinRoutes.published(rates.publish(micros, body.note()))
+        }
+        var cents = 1L
+        var sentCents = body.brlCents()
+        if (sentCents != null) {
+            cents = sentCents
+        }
+        return CoinRoutes.published(rates.publishCents(cents, body.note()))
+    }
+    static String published(p: CoinRate) = json.encode(CoinQuotePublished(p.brlCents(), p.brlMicros(), p.effectiveAt()))
+    // Event/community prize (plan C2): granted by a role with permission, every grant is an auditable ledger line.
+    // Idempotent per ref.
+    static String grantPrize(coins: CoinService, directory: ProfileDirectory) {
+        Auth.requireAdmin()
+        var body = CoinRoutes.prizeBody()
+        var toUsername = body.toUsername()
+        var amount = body.amount()
+        var refPart = body.ref()
+        if (toUsername == null) {
+            throw Errors.badRequest()
+        }
+        if (amount == null) {
+            throw Errors.badRequest()
+        }
+        if (refPart == null) {
+            throw Errors.badRequest()
+        }
+        var target = directory.findByUsername(toUsername.trim().toLowerCase())
+        if (target == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuário de destino não encontrado.")
+        }
+        var ref = "premio:" + refPart
+        var message = body.message()
+        if (message == null) {
+            message = "Prêmio de evento"
+        }
+        coins.grantPrize(target.id, amount, ref, message)
+        return json.encode(CoinGrantedView("GRANTED", ref))
+    }
+    // The victim (who sent) disputes the transfer: it goes to the moderation queue.
+    static String contest(disputes: CoinDisputeService) {
+        var userId = Auth.requireUser()
+        var body = CoinRoutes.contestBody()
+        var dispute = disputes.contest(userId, Req.pathParam("refId"), body.reason(), body.description())
+        return json.encode(CoinDisputeStateView(dispute.id(), dispute.state()))
+    }
+    static String myContestations(disputes: CoinDisputeService) {
+        var userId = Auth.requireUser()
+        return CoinRoutes.disputeList(disputes.bySender(userId))
+    }
+    static String disputeList(rows: List<CoinDispute>) {
+        var parts = listOf<String>()
+        for (var d in rows) {
+            parts.add(CoinDisputeService.view(d))
+        }
+        return "[" + String.join(",", parts) + "]"
+    }
+    // Statement of an account for an incident audit (admin): balance + latest movements, without the side effect of
+    // opening the wallet (no genesis/presence for someone under investigation).
+    static String adminExtract(coins: CoinService, directory: ProfileDirectory) {
+        Auth.requireAdmin()
+        var profile = directory.findByUsername(Req.pathParam("username").trim().toLowerCase())
+        if (profile == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuário não encontrado.")
+        }
+        var wallet = coins.walletSnapshot(profile.id, profile.username, Req.queryInt("limit", 100))
+        return json.encode(CoinAdminWalletView(wallet.chave(), wallet.balance(), wallet.escala(), CoinViews.entries(wallet.entries())))
+    }
+    // Supply of the spark: fixed total, what is in the vault and what circulates (observability).
+    static String supply(coins: CoinService) {
+        // The vault balance is financial data: only administration sees it.
+        Auth.requireAdmin()
+        return json.encode(coins.supply())
+    }
+    // How the automatic quote is being calculated: use, issuance, index and the suggested value. A read: publishes
+    // nothing.
+    static String economyReading(economy: CoinEconomyService) {
+        Auth.requireAdmin()
+        return json.encode(CoinViews.reading(economy.snapshot()))
+    }
+    // Runs the calculation NOW (admin). The cadence is the same as the cron: at most ONE publication per period.
+    static String economyRecalculate(economy: CoinEconomyService) {
+        Auth.requireAdmin()
+        return json.encode(CoinViews.recalc(economy.recalculate()))
+    }
+    static String disputesQueue(disputes: CoinDisputeService) {
+        Auth.requireAdmin()
+        return CoinRoutes.disputeList(disputes.pending(Req.queryInt("limit", 30)))
+    }
+    // A TRUE dispute: reverses the transfer and restricts the scammer.
+    static String uphold(disputes: CoinDisputeService) {
+        var admin = Auth.requireAdmin()
+        var saved = disputes.uphold(Req.pathParam("disputeId"), admin, CoinRoutes.decisionNote())
+        return json.encode(CoinDisputeStateView(saved.id(), saved.state()))
+    }
+    // A FALSE dispute: whoever disputed is restricted.
+    static String reject(disputes: CoinDisputeService) {
+        var admin = Auth.requireAdmin()
+        var saved = disputes.reject(Req.pathParam("disputeId"), admin, CoinRoutes.decisionNote())
+        return json.encode(CoinDisputeStateView(saved.id(), saved.state()))
+    }
+    static String wallet(coins: CoinService, directory: ProfileDirectory) {
+        var userId = Auth.requireUser()
+        var wallet = coins.wallet(userId, CoinRoutes.usernameOf(directory, userId))
+        var streak = wallet.streak()
+        if (streak == null) {
+            throw "WALLET_WITHOUT_STREAK"
+        }
+        return json.encode(CoinWalletView(wallet.balance(), wallet.escala(), wallet.cotacaoBrlCents(), wallet.cotacaoBrlMicros(), wallet.chave(), CoinViews.entries(wallet.entries()), streak))
+    }
+    static String usernameOf(directory: ProfileDirectory, userId: String) {
+        var p = directory.findById(userId)
+        if (p == null) {
+            return userId
+        }
+        return p.username
+    }
+    static String extract(coins: CoinService) {
+        var userId = Auth.requireUser()
+        var page = Req.queryInt("page", 0)
+        var size = Req.queryInt("size", 20)
+        if (page < 0 || page > 10000 || size < 1 || size > 100) {
+            throw Errors.api(400, "INVALID_EXTRACT_PAGE", "Informe uma página e um tamanho válidos.")
+        }
+        var start = CoinRoutes.extractDate(Req.queryParam("from"), false)
+        var end = CoinRoutes.extractDate(Req.queryParam("to"), true)
+        if (start != null && end != null) {
+            if (Time.toMillis(start) >= Time.toMillis(end)) {
+                throw CoinRoutes.invalidExtractDate()
+            }
+        }
+        var result = coins.extract(userId, page, size, start, end)
+        return json.encode(CoinExtractView(CoinViews.entries(result.entries()), page, size, result.hasNext()))
+    }
+    static String transferDetailsRequired() = Errors.api(400, "BAD_REQUEST", "Informe o destinatário e o valor.")
+    static String invalidExtractDate() = Errors.api(400, "INVALID_EXTRACT_DATE", "Informe um intervalo de datas válido.")
+    // yyyy-MM-dd of the calendar shown by the front end (Sao Paulo): the start of the day, or of the next one for `to`.
+    static String? extractDate(value: String?, endOfDay: Bool) {
+        if (value == null) {
+            return null
+        }
+        if (!Dates.valid(value) || value.substring(0, 4).toInt() < 1) {
+            throw CoinRoutes.invalidExtractDate()
+        }
+        var day = value
+        if (endOfDay) {
+            day = ZoneDates.plusDays(value, 1)
+        }
+        return ZoneDates.startOfDay(day, "America/Sao_Paulo")
+    }
+    static String transfer(coins: CoinService, directory: ProfileDirectory, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var body = CoinRoutes.transferBody()
+        var toUsername = body.toUsername()
+        var amount = body.amount()
+        if (toUsername == null) {
+            throw CoinRoutes.transferDetailsRequired()
+        }
+        if (amount == null) {
+            throw CoinRoutes.transferDetailsRequired()
+        }
+        if (toUsername.trim().length() == 0) {
+            throw CoinRoutes.transferDetailsRequired()
+        }
+        if (amount <= 0L) {
+            throw CoinRoutes.transferDetailsRequired()
+        }
+        var target = directory.findByUsername(toUsername.trim().toLowerCase())
+        if (target == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuário de destino não encontrado.")
+        }
+        var toUserId = target.id
+        var note = ""
+        var message = body.message()
+        if (message != null) {
+            note = message
+        }
+        var hash = Idempotency.hash(json.encode(CoinTransferHash(toUserId, amount, note)))
+        return idem.handle(userId, "POST", "/api/carteira/transferencias", hash, 200, () -> CoinRoutes.sendTransfer(coins, userId, toUsername, amount, message, toUserId))
+    }
+    static String sendTransfer(coins: CoinService, userId: String, toUsername: String, amount: Long, message: String?, toUserId: String) {
+        var out = coins.transfer(userId, toUsername, amount, message, toUserId, toUsername)
+        return json.encode(CoinTransferSent("SENT", amount, toUsername, out.refId()))
+    }
+    static String? decisionNote() {
+        if (Req.bodyText().trim().length() == 0) {
+            return null
+        }
+        SafeLinks.checkRequest()
+        return CoinRoutes.decisionBody().note()
+    }
+    static CoinQuoteBody quoteBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<CoinQuoteBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static CoinPrizeBody prizeBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<CoinPrizeBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static CoinContestBody contestBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<CoinContestBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static CoinDecisionBody decisionBody() {
+        try {
+            return json.decode<CoinDecisionBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static CoinTransferBody transferBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<CoinTransferBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

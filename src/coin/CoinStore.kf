@@ -1,0 +1,202 @@
+package coin
+
+import kernel.db.*
+import kernel.error.*
+import kernel.text.*
+
+// Plain SQL on coin_accounts, coin_entries (V69), coin_rate_history (V76, V192), coin_disputes (V78) and
+// user_streaks (V212). The ledger is append-only: entries are never updated or deleted.
+class CoinStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String entryColumns() = "id, account_id, amount, kind, ref_id, message, idempotency_key, prev_hash, hash, created_at"
+    static CoinAccount account(r: DbRow) = CoinAccount(r.getStr("account_id"), r.getLong("balance"), r.getLong("version"), r.getInstant("created_at"))
+    static CoinEntry entry(r: DbRow) = CoinEntry(r.getStr("id"), r.getStr("account_id"), r.getLong("amount"), r.getStr("kind"), r.getStr("ref_id"), r.getStrOrNull("message"), r.getStr("idempotency_key"), r.getStr("prev_hash"), r.getStr("hash"), r.getInstant("created_at"))
+    CoinAccount? findAccount(accountId: String) {
+        var row = store.queryOptional("select account_id, balance, version, created_at from coin_accounts where account_id = ?", DbParams().bindStr(accountId))
+        if (row == null) {
+            return null
+        }
+        return CoinStore.account(row)
+    }
+    insertAccount(a: CoinAccount) {
+        store.execute("insert into coin_accounts (account_id, balance, version, created_at) values (?, ?, ?, ?)", DbParams().bindStr(a.accountId()).bindLong(a.balance()).bindLong(a.version()).bindInstant(a.createdAt()))
+    }
+    // Optimistic update: nobody writes when another transaction moved the snapshot between read and write; the
+    // caller answers 409 COIN_CONCURRENCY (which by contract means "try again").
+    Bool updateBalanceIfVersion(accountId: String, newBalance: Long, expectedVersion: Long) = store.execute("update coin_accounts set balance = ?, version = version + 1 where account_id = ? and version = ?", DbParams().bindLong(newBalance).bindStr(accountId).bindLong(expectedVersion)) == 1
+    // Hash of the latest line of the account (the chain head), or null.
+    String? lastHash(accountId: String) {
+        var rows = store.queryList("select hash from coin_entries where account_id = ? order by created_at desc, id desc limit 1", DbParams().bindStr(accountId))
+        if (rows.size() == 0) {
+            return null
+        }
+        return rows.get(0).getStr("hash")
+    }
+    // A duplicate (account, idempotency_key) is a unique violation: the database answers 409 CONFLICT and the
+    // surrounding transaction rolls back, so the same operation never lands twice.
+    insertEntry(e: CoinEntry) {
+        store.execute("insert into coin_entries (" + CoinStore.entryColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(e.id()).bindStr(e.accountId()).bindLong(e.amount()).bindStr(e.kind()).bindStr(e.refId()).bindStrOrNull(e.message()).bindStr(e.idempotencyKey()).bindStr(e.prevHash()).bindStr(e.hash()).bindInstant(e.createdAt()))
+    }
+    Bool existsByKindAndRefId(kind: String, refId: String) = store.queryLong("select count(*) from coin_entries where kind = ? and ref_id = ?", DbParams().bindStr(kind).bindStr(refId)) > 0L
+    List<String> refIdsOf(accountId: String, kind: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select ref_id from coin_entries where account_id = ? and kind = ?", DbParams().bindStr(accountId).bindStr(kind))) {
+            out.add(r.getStr("ref_id"))
+        }
+        return out
+    }
+    List<CoinEntry> recentEntries(accountId: String, limit: Int) {
+        var size = limit
+        if (size < 1) {
+            size = 1
+        }
+        return this.entries("select " + CoinStore.entryColumns() + " from coin_entries where account_id = ? order by created_at desc, id desc limit ?", DbParams().bindStr(accountId).bindInt(size))
+    }
+    // One page of the extract, newest first, with an optional [from, to) window. Reads size + 1 rows to know hasNext.
+    CoinEntryPage entryPage(accountId: String, page: Int, size: Int, from: String?, to: String?) {
+        var sql = "select " + CoinStore.entryColumns() + " from coin_entries where account_id = ?"
+        var params = DbParams().bindStr(accountId)
+        if (from != null) {
+            sql = sql + " and created_at >= ?"
+            params.bindInstant(from)
+        }
+        if (to != null) {
+            sql = sql + " and created_at < ?"
+            params.bindInstant(to)
+        }
+        sql = sql + " order by created_at desc, id desc limit ? offset ?"
+        var skipped = page as Long
+        skipped = skipped * (size as Long)
+        params.bindInt(size + 1).bindLong(skipped)
+        var rows = this.entries(sql, params)
+        var hasNext = rows.size() > size
+        var out = listOf<CoinEntry>()
+        var i = 0
+        while (i < size && i < rows.size()) {
+            out.add(rows.get(i))
+            i = i + 1
+        }
+        return CoinEntryPage(out, hasNext)
+    }
+    // What the account debited in [start, end): the new-account daily ceiling counts every debit.
+    Long debitedBetween(accountId: String, start: String, end: String) = store.queryLong("select coalesce(sum(-amount), 0) from coin_entries where account_id = ? and amount < 0 and created_at >= ? and created_at < ?", DbParams().bindStr(accountId).bindInstant(start).bindInstant(end))
+    CoinEntry? findByAccountAndRef(accountId: String, refId: String) {
+        var rows = this.entries("select " + CoinStore.entryColumns() + " from coin_entries where account_id = ? and ref_id = ? order by created_at, id limit 1", DbParams().bindStr(accountId).bindStr(refId))
+        if (rows.size() == 0) {
+            return null
+        }
+        return rows.get(0)
+    }
+    CoinEntry? findByRefAndKind(refId: String, kind: String) {
+        var rows = this.entries("select " + CoinStore.entryColumns() + " from coin_entries where ref_id = ? and kind = ? order by id limit 1", DbParams().bindStr(refId).bindStr(kind))
+        if (rows.size() == 0) {
+            return null
+        }
+        return rows.get(0)
+    }
+    List<CoinAccount> allAccounts() {
+        var out = listOf<CoinAccount>()
+        for (var r in store.queryList("select account_id, balance, version, created_at from coin_accounts", DbParams())) {
+            out.add(CoinStore.account(r))
+        }
+        return out
+    }
+    // The ledger is the truth: the sum of the lines rebuilds the balance.
+    Long balanceFromLedger(accountId: String) = store.queryLong("select coalesce(sum(amount), 0) from coin_entries where account_id = ?", DbParams().bindStr(accountId))
+    Long totalBalance() = store.queryLong("select coalesce(sum(balance), 0) from coin_accounts", DbParams())
+    Long countRewardsByRefPrefix(prefix: String) = store.queryLong("select count(*) from coin_entries where kind = 'REWARD' and ref_id like ? escape '!'", DbParams().bindStr(LikePattern.escape(prefix) + "%"))
+    // Use or emission of the coin in a window: the sum of the lines of one kind.
+    Long sumAmountByKindBetween(kind: String, from: String, to: String) = store.queryLong("select coalesce(sum(amount), 0) from coin_entries where kind = ? and created_at >= ? and created_at < ?", DbParams().bindStr(kind).bindInstant(from).bindInstant(to))
+    List<CoinEntry> entries(sql: String, p: DbParams) {
+        var out = listOf<CoinEntry>()
+        for (var r in store.queryList(sql, p)) {
+            out.add(CoinStore.entry(r))
+        }
+        return out
+    }
+    // ---- reference quote
+    static CoinRate rate(r: DbRow) {
+        var micros = 0L
+        var storedMicros = r.getLongOrNull("brl_micros")
+        if (storedMicros != null) {
+            micros = storedMicros
+        }
+        if (micros <= 0L) {
+            micros = r.getLong("brl_cents") * CoinRates.microsPerCent()
+        }
+        return CoinRate(r.getStr("id"), CoinRates.toCents(micros), micros, r.getStrOrNull("note"), r.getInstant("effective_at"))
+    }
+    CoinRate? findLatestRate() {
+        var rows = store.queryList("select id, brl_cents, brl_micros, note, effective_at from coin_rate_history order by effective_at desc limit 1", DbParams())
+        if (rows.size() == 0) {
+            return null
+        }
+        return CoinStore.rate(rows.get(0))
+    }
+    List<CoinRate> rateHistory(limit: Int) {
+        var out = listOf<CoinRate>()
+        for (var r in store.queryList("select id, brl_cents, brl_micros, note, effective_at from coin_rate_history order by effective_at desc limit ?", DbParams().bindInt(limit))) {
+            out.add(CoinStore.rate(r))
+        }
+        return out
+    }
+    saveRate(rate: CoinRate) {
+        store.execute("insert into coin_rate_history (id, brl_cents, brl_micros, note, effective_at) values (?, ?, ?, ?, ?)", DbParams().bindStr(rate.id()).bindLong(rate.brlCents()).bindLong(rate.brlMicros()).bindStrOrNull(rate.note()).bindInstant(rate.effectiveAt()))
+    }
+    // ---- streak
+    CoinStreak? findStreak(userId: String) {
+        var row = store.queryOptional("select current_days, longest_days, last_day, last_frozen_day from user_streaks where user_id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return CoinStreak(userId, row.getInt("current_days"), row.getInt("longest_days"), row.getDateOrNull("last_day"), row.getDateOrNull("last_frozen_day"))
+    }
+    // Update, else insert. Two actions creating the row at once computed the same day: the stored one wins.
+    saveStreak(s: CoinStreak, now: String) {
+        var updated = store.execute("update user_streaks set current_days = ?, longest_days = ?, last_day = ?, last_frozen_day = ?, updated_at = ? where user_id = ?", DbParams().bindInt(s.currentDays()).bindInt(s.longestDays()).bindDateOrNull(s.lastDay()).bindDateOrNull(s.lastFrozenDay()).bindInstant(now).bindStr(s.userId()))
+        if (updated > 0) {
+            return
+        }
+        try {
+            store.execute("insert into user_streaks (user_id, current_days, longest_days, last_day, last_frozen_day, updated_at) values (?, ?, ?, ?, ?, ?)", DbParams().bindStr(s.userId()).bindInt(s.currentDays()).bindInt(s.longestDays()).bindDateOrNull(s.lastDay()).bindDateOrNull(s.lastFrozenDay()).bindInstant(now))
+        } catch (String e) {
+            if (!Errors.hasCode(e, "CONFLICT")) {
+                throw e
+            }
+        }
+    }
+    // ---- disputes
+    static CoinDispute dispute(r: DbRow) = CoinDispute(r.getStr("id"), r.getStr("entry_ref"), r.getStr("sender_id"), r.getStr("receiver_id"), r.getLong("amount"), r.getStr("reason"), r.getStr("description"), r.getStr("state"), r.getStrOrNull("report_id"), r.getStrOrNull("review_note"), r.getStrOrNull("reviewed_by"), r.getInstantOrNull("reviewed_at"), r.getInstant("created_at"))
+    static String disputeColumns() = "id, entry_ref, sender_id, receiver_id, amount, reason, description, state, report_id, review_note, reviewed_by, reviewed_at, created_at"
+    insertDispute(d: CoinDispute) {
+        store.execute("insert into coin_disputes (" + CoinStore.disputeColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(d.id()).bindStr(d.entryRef()).bindStr(d.senderId()).bindStr(d.receiverId()).bindLong(d.amount()).bindStr(d.reason()).bindStr(d.description()).bindStr(d.state()).bindStrOrNull(d.reportId()).bindStrOrNull(d.reviewNote()).bindStrOrNull(d.reviewedBy()).bindInstantOrNull(d.reviewedAt()).bindInstant(d.createdAt()))
+    }
+    // The decision is an atomic claim of the OPEN dispute: a second decision finds nothing to claim.
+    Bool decideDispute(id: String, state: String, note: String?, reviewerId: String, at: String) = store.execute("update coin_disputes set state = ?, review_note = ?, reviewed_by = ?, reviewed_at = ? where id = ? and state = 'OPEN'", DbParams().bindStr(state).bindStrOrNull(note).bindStr(reviewerId).bindInstant(at).bindStr(id)) == 1
+    CoinDispute? findDispute(id: String) {
+        var row = store.queryOptional("select " + CoinStore.disputeColumns() + " from coin_disputes where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return CoinStore.dispute(row)
+    }
+    Bool disputeExistsForEntry(entryRef: String) = store.queryLong("select count(*) from coin_disputes where entry_ref = ?", DbParams().bindStr(entryRef)) > 0L
+    List<CoinDispute> pendingDisputes(limit: Int) {
+        var size = limit
+        if (size > 200) {
+            size = 200
+        }
+        return this.disputes("select " + CoinStore.disputeColumns() + " from coin_disputes where state = 'OPEN' order by created_at asc limit ?", DbParams().bindInt(size))
+    }
+    List<CoinDispute> disputesBySender(senderId: String) = this.disputes("select " + CoinStore.disputeColumns() + " from coin_disputes where sender_id = ? order by created_at desc", DbParams().bindStr(senderId))
+    List<CoinDispute> disputes(sql: String, p: DbParams) {
+        var out = listOf<CoinDispute>()
+        for (var r in store.queryList(sql, p)) {
+            out.add(CoinStore.dispute(r))
+        }
+        return out
+    }
+}

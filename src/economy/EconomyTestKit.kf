@@ -1,0 +1,85 @@
+package economy
+
+import coin.*
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import notifications.*
+import profile.*
+
+// What a test of the economy domains reads from the booted app (one app per test file: Security.install sets
+// process-wide statics).
+class EconomyStack {
+    ProfileModule profiles
+    NotificationsModule notifications
+    CoinModule coin
+    SharedServices shared
+    public constructor(profiles: ProfileModule, notifications: NotificationsModule, coin: CoinModule, shared: SharedServices) {
+        this.profiles = profiles
+        this.notifications = notifications
+        this.coin = coin
+        this.shared = shared
+    }
+}
+
+// Test support of the economy domains. The wiring mirrors Main.kf for profile, notifications and the economy
+// modules, over the same request pipeline.
+//
+//   var app = EconomyTestKit.boot("walletflow", mapOf<String, String>())
+//   var me = EconomyTestKit.login(app, "coin_sender")          // verified account + live session: a ProfileCaller
+//   Check.status(me.get("/carteira"), 200)
+class EconomyTestKit {
+    static EconomyStack? stackHandle = null
+    static TestApp boot(name: String, overrides: Map<String,String>) {
+        var created = DomainTestKit.boot(name, overrides, (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+    EconomyTestKit.wire(p, s, parts)
+})
+        EconomyTestKit.pinned = created
+        return created
+    }
+    static TestApp? pinned = null
+    // One app per test file: the first call boots, later calls reuse it.
+    static TestApp app(name: String, overrides: Map<String,String>) {
+        var cur = EconomyTestKit.pinned
+        if (cur != null) {
+            return cur
+        }
+        return EconomyTestKit.boot(name, overrides)
+    }
+    // Last test of a file: stops the background jobs (the outbox worker keeps the test process alive).
+    static finish() {
+        EconomyTestKit.stack().shared.stop()
+    }
+    static wire(p: Platform, shared: SharedServices, parts: SecurityParts) {
+        var hooks = SecurityHooks.defaults(p.db)
+        var profiles = ProfileModule.install(p, shared, hooks)
+        var core = CoinCore.create(p, shared, parts)
+        var seams = NotificationsSeams(p)
+        seams.coins = CoinNotificationCoins(core.service)
+        var notifications = NotificationsModule.installWith(p, shared, seams)
+        var coin = CoinModule.install(p, shared, parts, core, profiles, notifications)
+        EconomyTestKit.stackHandle = EconomyStack(profiles, notifications, coin, shared)
+    }
+    static EconomyStack stack() {
+        var s = EconomyTestKit.stackHandle
+        if (s == null) {
+            throw "EconomyTestKit: boot the app first"
+        }
+        return s
+    }
+    // A verified account (id = username = name) with a live session; returns its caller.
+    static ProfileCaller login(app: TestApp, id: String) = ProfileTestApp.login(app, id)
+    // An admin account (users.is_admin).
+    static ProfileCaller loginAdmin(app: TestApp, id: String) {
+        var caller = ProfileTestApp.login(app, id)
+        app.db().execute("update users set is_admin = ? where id = ?", DbParams().bindBool(true).bindStr(id))
+        return caller
+    }
+    // An adult account (the age gate of the write paths needs a birth date).
+    static ProfileCaller loginAdult(app: TestApp, id: String) {
+        var caller = ProfileTestApp.login(app, id)
+        app.db().execute("update users set birth_date = '1990-01-01' where id = ?", DbParams().bindStr(id))
+        return caller
+    }
+}

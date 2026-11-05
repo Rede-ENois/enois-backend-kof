@@ -1,0 +1,68 @@
+package coin
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.security.*
+import kernel.time.*
+import notifications.*
+
+// Cross-domain seam of the coin domain: what a transfer dispute asks of moderation (a report, the sanction that
+// follows a decision). pending-port: moderation (ModerationService.report, SanctionService.applyForReport and
+// restrictUser). The default writes the rows the Java services write for a USER report, so the dispute flow is real
+// before the moderation domain exists; moderation extends the class and Main passes its subclass in.
+class CoinDisputeModeration {
+    Db database
+    ActionThrottle throttle
+    Notifications notifications
+    Int reportsPerHour
+    public constructor(database: Db, throttle: ActionThrottle, notifications: Notifications, reportsPerHour: Int) {
+        this.database = database
+        this.throttle = throttle
+        this.notifications = notifications
+        this.reportsPerHour = reportsPerHour
+    }
+    // ModerationService.report(reporter, USER, target, SCAM, description): the id of the new report.
+    String report(reporterId: String, targetUserId: String, description: String) {
+        // Ceiling per account: mass reporting (coordination) stops being cheap.
+        throttle.requireAllowed("report", reporterId, reportsPerHour, 3600000L)
+        if (database.queryLong("select count(*) from reports where reporter_id = ? and target_type = 'USER' and target_id = ?", DbParams().bindStr(reporterId).bindStr(targetUserId)) > 0L) {
+            throw Errors.api(409, "ALREADY_REPORTED", "Voce ja denunciou este conteudo.")
+        }
+        var id = Ids.prefixed("report_")
+        database.execute("insert into reports (id, reporter_id, target_type, target_id, reason, description, status, created_at) values (?, ?, 'USER', ?, 'SCAM', ?, 'PENDING', ?)", DbParams().bindStr(id).bindStr(reporterId).bindStr(targetUserId).bindStr(description).bindInstant(EconomyClock.nowIso()))
+        return id
+    }
+    // SanctionService.applyForReport for a USER report (the author of a profile is the person): restricts the reported
+    // person, marks the report AUTO_PENALIZED and tells them how to appeal. False when the report is not pending.
+    Bool applyForReport(reportId: String, motive: String) {
+        var row = database.queryOptional("select status, target_id from reports where id = ?", DbParams().bindStr(reportId))
+        if (row == null) {
+            return false
+        }
+        if (row.getStr("status") != "PENDING") {
+            return false
+        }
+        var authorId = row.getStr("target_id")
+        this.restrictIfFree(authorId, reportId, motive)
+        database.execute("update reports set status = 'AUTO_PENALIZED', resolution_note = ? where id = ?", DbParams().bindStr(motive).bindStr(reportId))
+        notifications.create(authorId, "SANCAO", "sistema", "Conta restrita", "Sua conta foi restringida apos analise automatica de uma denuncia: " + motive + ". Se foi um erro, voce pode recorrer e uma pessoa do time vai revisar.", "/api/penalidades", "Recorrer")
+        return true
+    }
+    // SanctionService.restrictUser: a direct restriction by a human decision; the reference is the id of the decision
+    // record (dispute/appeal), so the person's appeal works. One active sanction per person.
+    restrictUser(userId: String, referenceId: String, motive: String) {
+        if (this.hasActiveSanction(userId)) {
+            return
+        }
+        this.restrictIfFree(userId, referenceId, motive)
+        notifications.create(userId, "SANCAO", "sistema", "Conta restrita", "Sua conta foi restrita: " + motive + ". Se foi um erro, você pode recorrer.", "/api/penalidades", "Recorrer")
+    }
+    Bool hasActiveSanction(userId: String) = database.queryLong("select count(*) from user_sanctions where user_id = ? and status = 'ACTIVE'", DbParams().bindStr(userId)) > 0L
+    restrictIfFree(userId: String, referenceId: String, motive: String) {
+        if (this.hasActiveSanction(userId)) {
+            return
+        }
+        database.execute("insert into user_sanctions (id, user_id, report_id, type, reason, status, created_at) values (?, ?, ?, 'RESTRICTION', ?, 'ACTIVE', ?)", DbParams().bindStr(Ids.prefixed("sanc_")).bindStr(userId).bindStr(referenceId).bindStr(motive).bindInstant(EconomyClock.nowIso()))
+    }
+}

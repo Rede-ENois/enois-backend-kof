@@ -1,0 +1,262 @@
+package coin
+
+import kernel.config.*
+import kernel.jobs.*
+import kernel.log.*
+import kernel.text.*
+import kernel.time.*
+
+// Reassesses the REFERENCE quote of the spark from the real use.
+//
+// Sources (configurable window, 30 days by default): marketplace/services escrow (ESCROW_HOLD), P2P transfers
+// (TRANSFER_IN), the return to the vault (store purchases and marketplace fees) and the automatic issuance (REWARD).
+// The formula lives in the CoinEconomyCalculator; here the metrics are read from the ledger and the result is
+// published in the quote history.
+//
+// Safeguards: a maximum step per run, price floor/ceiling, a smaller weight for P2P and a use ceiling per window
+// (ping-pong between accounts does not inflate the price). With no circulation nothing changes. Once a month the FULL
+// round recalculates the price from zero (anchor x index, without the last value and without the step limit). The base
+// value of the automatic issuance is still the initial quote; the conversion is CoinService.scaledReward.
+//
+// One publication per period: the cron and the admin button obey the same rule, so clicking again inside the period
+// publishes nothing (it only returns the calculation of the moment and when the next evaluation is).
+class CoinEconomyService {
+    CoinStore ledger
+    CoinRateService rates
+    CoinService coins
+    Bool enabled
+    Long periodMs
+    Long anchorMicros
+    CoinEconomyParams params
+    ProcessLock gate = ProcessLock()
+    Log log = Log("coin.economy")
+    public constructor(ledger: CoinStore, rates: CoinRateService, coins: CoinService, enabled: Bool, periodHours: Int, anchorMicros: Long, params: CoinEconomyParams) {
+        this.ledger = ledger
+        this.rates = rates
+        this.coins = coins
+        this.enabled = enabled
+        var hours = periodHours
+        if (hours < 1) {
+            hours = 1
+        }
+        var hoursLong = hours as Long
+        this.periodMs = hoursLong * 3600000L
+        var anchor = anchorMicros
+        if (anchor < 1L) {
+            anchor = 1L
+        }
+        this.anchorMicros = anchor
+        this.params = params
+    }
+    // Reads the COIN_ECONOMY_* variables (the Java `rede.coin.economy.*` properties).
+    static CoinEconomyService fromConfig(cfg: Config, ledger: CoinStore, rates: CoinRateService, coins: CoinService) {
+        var p = CoinEconomyCalculator.params(cfg.getInt("COIN_ECONOMY_WINDOW_DAYS", 30), CoinEconomyService.number(cfg, "COIN_ECONOMY_TARGET_TURNOVER", 0.05), CoinEconomyService.number(cfg, "COIN_ECONOMY_P2P_WEIGHT", 0.5), CoinEconomyService.number(cfg, "COIN_ECONOMY_MAX_USAGE_RATIO", 1.0), CoinEconomyService.number(cfg, "COIN_ECONOMY_SCARCITY_WEIGHT", 0.5), CoinEconomyService.number(cfg, "COIN_ECONOMY_SENSITIVITY", 0.25), CoinEconomyService.number(cfg, "COIN_ECONOMY_MAX_STEP", 0.01), cfg.getLong("COIN_ECONOMY_MIN_MICROS", 1000L), cfg.getLong("COIN_ECONOMY_MAX_MICROS", 1000000L))
+        return CoinEconomyService(ledger, rates, coins, cfg.getBool("COIN_ECONOMY_ENABLED", true), cfg.getInt("COIN_ECONOMY_PERIOD_HOURS", 3), cfg.getLong("COIN_ECONOMY_ANCHOR_MICROS", 10000L), p)
+    }
+    static Double number(cfg: Config, key: String, fallback: Double) {
+        var raw = cfg.lookup(key)
+        if (raw == null) {
+            return fallback
+        }
+        try {
+            return raw.trim().toDouble()
+        } catch (String e) {
+            throw "CONFIG_INVALID: " + key + " must be a number"
+        }
+    }
+    // The two crons: every 3 hours (publishes the step) and the 1st of each month 03:40 (the full round), both in the
+    // zone of COIN_ECONOMY_ZONE (America/Sao_Paulo). "-" turns a cron off.
+    schedule(jobs: Scheduler, cfg: Config) {
+        var self = this
+        var zone = cfg.getStr("COIN_ECONOMY_ZONE", "America/Sao_Paulo")
+        jobs.cron("coin-economy", cfg.getStr("COIN_ECONOMY_CRON", "0 10 */3 * * *"), zone, () -> {
+            self.scheduledRecalculate()
+        })
+        jobs.cron("coin-economy-monthly", cfg.getStr("COIN_ECONOMY_MONTHLY_CRON", "0 40 3 1 * *"), zone, () -> {
+            self.scheduledMonthlyRecalculate()
+        })
+    }
+    // Periodic run: publishes the new quote when it changed.
+    scheduledRecalculate() {
+        if (!enabled) {
+            return
+        }
+        try {
+            var summary = this.recalculate()
+            if (summary.published()) {
+                log.info("coin_economy quote_micros=" + summary.result().suggestedMicros() + " previous=" + summary.previousMicros() + " usage=" + (summary.metrics().escrowUsage() + summary.metrics().p2pUsage()) + " issuance=" + summary.metrics().issuance() + " circulation=" + summary.metrics().circulation())
+            }
+        } catch (String failure) {
+            log.warn("coin_economy_failed error=" + failure)
+        }
+    }
+    // The FULL monthly round: recalculates the price FROM ZERO (anchor x window index) without starting from the last
+    // published value and without the step limit. It publishes even when the 3 hour period has not closed.
+    scheduledMonthlyRecalculate() {
+        if (!enabled) {
+            return
+        }
+        try {
+            var summary = this.monthlyRecalculate()
+            if (summary.published()) {
+                log.info("coin_economy_monthly quote_micros=" + summary.result().suggestedMicros() + " previous=" + summary.previousMicros() + " index=" + summary.result().index())
+            }
+        } catch (String failure) {
+            log.warn("coin_economy_monthly_failed error=" + failure)
+        }
+    }
+    // The same calculation of the monthly round, called by hand (tests and administration).
+    CoinEconomySummary monthlyRecalculate() {
+        var out = listOf<CoinEconomySummary>()
+        var failure = ""
+        gate.enter()
+        try {
+            out.add(this.monthlyNow())
+        } catch (String e) {
+            failure = e
+        }
+        gate.leave()
+        if (failure.length() > 0) {
+            throw failure
+        }
+        return out.get(0)
+    }
+    CoinEconomySummary monthlyNow() {
+        var latest = rates.latest()
+        var current = latest.brlMicros()
+        var m = this.metrics()
+        var result = CoinEconomyCalculator.absoluteEvaluate(anchorMicros, m, params)
+        var published = false
+        if (enabled && result.suggestedMicros() != current) {
+            rates.publish(result.suggestedMicros(), this.monthlyNote(m, result))
+            published = true
+        }
+        var now = EconomyClock.nowIso()
+        var next = this.nextEvaluationAt(latest.effectiveAt(), now)
+        var shown = current
+        if (published) {
+            shown = result.suggestedMicros()
+        }
+        return CoinEconomySummary(params.windowDays(), m, result, current, shown, published, this.elapsedFraction(latest.effectiveAt(), now), this.isOpen(next, now), next)
+    }
+    String monthlyNote(m: CoinMetrics, result: CoinEconomyResult) = "Cotação completa do mês (referência, calculada do zero): giro " + CoinEconomyService.faiscas(m.escrowUsage() + m.p2pUsage() + m.treasuryInflow()) + ", retorno ao cofre " + CoinEconomyService.faiscas(m.treasuryInflow()) + ", emissão " + CoinEconomyService.faiscas(m.issuance()) + ", cofre " + CoinEconomyService.faiscas(m.treasuryBalance()) + ", índice " + CoinEconomyService.twoDecimals(result.index())
+    String periodNote(m: CoinMetrics, result: CoinEconomyResult) = "Reavaliação automática por uso: giro " + CoinEconomyService.faiscas(m.escrowUsage() + m.p2pUsage() + m.treasuryInflow()) + ", retorno ao cofre " + CoinEconomyService.faiscas(m.treasuryInflow()) + ", emissão " + CoinEconomyService.faiscas(m.issuance()) + ", cofre " + CoinEconomyService.faiscas(m.treasuryBalance()) + ", índice " + CoinEconomyService.twoDecimals(result.index())
+    // Publishes the quote of the period, if the period has closed. The cadence is the same for the cron and for the
+    // button: AT MOST ONE publication per period. The lock is held until the publication commits, so whoever enters
+    // right after reads the new quote and does not publish again.
+    CoinEconomySummary recalculate() {
+        var out = listOf<CoinEconomySummary>()
+        var failure = ""
+        gate.enter()
+        try {
+            out.add(this.recalculateNow())
+        } catch (String e) {
+            failure = e
+        }
+        gate.leave()
+        if (failure.length() > 0) {
+            throw failure
+        }
+        return out.get(0)
+    }
+    CoinEconomySummary recalculateNow() {
+        var latest = rates.latest()
+        var previous = latest.brlMicros()
+        var lastAt = latest.effectiveAt()
+        var now = EconomyClock.nowIso()
+        var next = this.nextEvaluationAt(lastAt, now)
+        var m = this.metrics()
+        var result = CoinEconomyCalculator.evaluate(previous, m, params)
+        var elapsed = this.elapsedFraction(lastAt, now)
+        var published = false
+        if (this.isOpen(next, now) && enabled && result.suggestedMicros() != previous) {
+            rates.publish(result.suggestedMicros(), this.periodNote(m, result))
+            published = true
+            next = Time.fromMillis(Time.toMillis(now) + periodMs)
+        }
+        var shown = previous
+        if (published) {
+            shown = result.suggestedMicros()
+        }
+        return CoinEconomySummary(params.windowDays(), m, result, previous, shown, published, elapsed, this.isOpen(next, now), next)
+    }
+    // Reading for the panel: the same metrics, publishing nothing. The suggestion is the step the next publication
+    // will apply.
+    CoinEconomySummary snapshot() {
+        var latest = rates.latest()
+        var previous = latest.brlMicros()
+        var now = EconomyClock.nowIso()
+        var lastAt = latest.effectiveAt()
+        var elapsed = this.elapsedFraction(lastAt, now)
+        var m = this.metrics()
+        var next = this.nextEvaluationAt(lastAt, now)
+        return CoinEconomySummary(params.windowDays(), m, CoinEconomyCalculator.evaluate(previous, m, params), previous, previous, false, elapsed, this.isOpen(next, now), next)
+    }
+    // The period has closed: an evaluation right now may publish.
+    Bool isOpen(nextEvaluation: String, now: String) = Time.toMillis(now) >= Time.toMillis(nextEvaluation)
+    // When the period closes: last publication + period.
+    String nextEvaluationAt(lastPublishedAt: String, now: String) = Time.fromMillis(Time.toMillis(lastPublishedAt) + periodMs)
+    // The fraction of the period elapsed since the last publication, limited to [0, 1].
+    Double elapsedFraction(lastPublishedAt: String, now: String) {
+        var seconds = (Time.toMillis(now) - Time.toMillis(lastPublishedAt)) / 1000L
+        if (seconds <= 0L) {
+            return 0.0
+        }
+        var fraction = seconds.toDouble() / (periodMs / 1000L).toDouble()
+        if (fraction > 1.0) {
+            return 1.0
+        }
+        return fraction
+    }
+    CoinMetrics metrics() {
+        var to = EconomyClock.nowIso()
+        var windowDaysLong = params.windowDays() as Long
+        var from = Time.fromMillis(Time.toMillis(to) - windowDaysLong * 24L * 3600000L)
+        var escrow = ledger.sumAmountByKindBetween("ESCROW_HOLD", from, to)
+        var p2p = ledger.sumAmountByKindBetween("TRANSFER_IN", from, to)
+        var issuance = ledger.sumAmountByKindBetween("REWARD", from, to)
+        // Return to the vault: store purchases (PURCHASE leaves the buyer and goes back to the treasury) and marketplace
+        // fees (FEE_IN). Without this return the treasury runs dry and the economy stalls.
+        var store = CoinEconomyCalculator.atLeastZero(0L - ledger.sumAmountByKindBetween("PURCHASE", from, to))
+        var fees = CoinEconomyCalculator.atLeastZero(ledger.sumAmountByKindBetween("FEE_IN", from, to))
+        var inflow = CoinEconomyCalculator.saturatingAdd(store, fees)
+        var supply = coins.supply()
+        return CoinMetrics(escrow, p2p, inflow, issuance, supply.circulacao(), supply.cofre())
+    }
+    // Thousandths to sparks, the way BigDecimal.valueOf(mf, 3).stripTrailingZeros().toPlainString() prints it.
+    static String faiscas(mf: Long) {
+        var negative = mf < 0L
+        var abs = mf
+        if (negative) {
+            abs = 0L - mf
+        }
+        var whole = abs / 1000L
+        var frac = abs % 1000L
+        var out = "" + whole
+        if (frac > 0L) {
+            var digits = "" + frac
+            while (digits.length() < 3) {
+                digits = "0" + digits
+            }
+            while (digits.endsWith("0")) {
+                digits = digits.substring(0, digits.length() - 1)
+            }
+            out = out + "." + digits
+        }
+        if (negative) {
+            return "-" + out
+        }
+        return out
+    }
+    // `%.2f` with the ROOT locale.
+    static String twoDecimals(value: Double) {
+        var hundredths = Numbers.round(value * 100.0)
+        var whole = hundredths / 100L
+        var cents = hundredths % 100L
+        var tail = "" + cents
+        if (cents < 10L) {
+            tail = "0" + tail
+        }
+        return whole + "." + tail
+    }
+}

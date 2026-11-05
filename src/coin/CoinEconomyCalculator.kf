@@ -1,0 +1,143 @@
+package coin
+
+import kernel.text.*
+
+// The math of the automatic quote: pure, no state, tested alone.
+//
+// The quote is a CONTROLLER with three signals:
+//   - Turnover: real use of the coin (marketplace/services escrow, P2P with a smaller weight) and the return to the
+//     vault (store purchases and fees) against a turnover target.
+//   - Scarcity: the fewer sparks left in the vault compared to the total, the more each spark is worth (a multiplier
+//     from 1x to 1x + weight).
+//   - Issuance: dilution, more sparks issued for the same use, less value per spark.
+// If the turnover stops (nobody uses it and nothing returns to the vault) the index falls and the price goes down:
+// the treasury needs a return not to run dry. Everything is limited by a maximum step per run and by a price floor and
+// ceiling.
+record CoinEconomyCore(Long usage, Long circulation, Long effective, Double scarcity, Double index)
+
+class CoinEconomyCalculator {
+    static Double clampDouble(value: Double, low: Double, high: Double) {
+        var out = value
+        if (out > high) {
+            out = high
+        }
+        if (out < low) {
+            out = low
+        }
+        return out
+    }
+    static Long clampLong(value: Long, low: Long, high: Long) {
+        var out = value
+        if (out > high) {
+            out = high
+        }
+        if (out < low) {
+            out = low
+        }
+        return out
+    }
+    static Long saturatingAdd(a: Long, b: Long) {
+        var sum = a + b
+        if (sum < 0L) {
+            return 9223372036854775807L
+        }
+        return sum
+    }
+    static Long atLeastZero(v: Long) {
+        if (v < 0L) {
+            return 0L
+        }
+        return v
+    }
+    // The parameters come from env: normalised so the math never runs without limits.
+    static CoinEconomyParams params(windowDays: Int, targetTurnover: Double, p2pWeight: Double, maxUsageRatio: Double, scarcityWeight: Double, sensitivity: Double, maxStep: Double, minMicros: Long, maxMicros: Long) {
+        var days = windowDays
+        if (days > 365) {
+            days = 365
+        }
+        if (days < 1) {
+            days = 1
+        }
+        var floor = minMicros
+        if (floor < 1L) {
+            floor = 1L
+        }
+        var ceiling = maxMicros
+        if (ceiling < floor) {
+            ceiling = floor
+        }
+        return CoinEconomyParams(days, CoinEconomyCalculator.clampDouble(targetTurnover, 0.0001, 10.0), CoinEconomyCalculator.clampDouble(p2pWeight, 0.0, 1.0), CoinEconomyCalculator.clampDouble(maxUsageRatio, 0.01, 100.0), CoinEconomyCalculator.clampDouble(scarcityWeight, 0.0, 2.0), CoinEconomyCalculator.clampDouble(sensitivity, 0.01, 5.0), CoinEconomyCalculator.clampDouble(maxStep, 0.001, 0.5), floor, ceiling)
+    }
+    // Floor of 0,1 cent a spark: lets the price fall when the economy stalls; ceiling R$ 1,00.
+    static CoinEconomyParams defaults() = CoinEconomyCalculator.params(30, 0.05, 0.5, 1.0, 0.5, 0.25, 0.01, CoinRates.microsPerCent() / 10L, CoinRates.microsPerCent() * 100L)
+    static Long clampPrice(value: Long, p: CoinEconomyParams) = CoinEconomyCalculator.clampLong(value, p.minMicros(), p.maxMicros())
+    // The heart of the calculation, shared by the step and the full monthly round.
+    static CoinEconomyCore core(m: CoinMetrics, p: CoinEconomyParams) {
+        var circulation = CoinEconomyCalculator.atLeastZero(m.circulation())
+        var treasury = CoinEconomyCalculator.atLeastZero(m.treasuryBalance())
+        var escrow = CoinEconomyCalculator.atLeastZero(m.escrowUsage())
+        var p2p = CoinEconomyCalculator.atLeastZero(m.p2pUsage())
+        var inflow = CoinEconomyCalculator.atLeastZero(m.treasuryInflow())
+        var issuance = CoinEconomyCalculator.atLeastZero(m.issuance())
+        var usage = CoinEconomyCalculator.saturatingAdd(CoinEconomyCalculator.saturatingAdd(escrow, p2p), inflow)
+        if (circulation == 0L) {
+            return CoinEconomyCore(usage, 0L, 0L, 1.0, 1.0)
+        }
+        // Fewer sparks in the vault (compared to the total) = more scarcity = more value per spark.
+        var total = CoinEconomyCalculator.saturatingAdd(treasury, circulation)
+        var treasuryRatio = 0.0
+        if (total > 0L) {
+            treasuryRatio = treasury.toDouble() / total.toDouble()
+        }
+        var scarcity = 1.0 + p.scarcityWeight() * (1.0 - treasuryRatio)
+        // P2P is circulation, not consumption: it enters with a smaller weight. The total turnover is capped at one
+        // turn of the stock per window: ping-pong between accounts cannot inflate the quote alone.
+        var weighted = escrow.toDouble() + p2p.toDouble() * p.p2pWeight() + inflow.toDouble()
+        var cap = circulation.toDouble() * p.maxUsageRatio()
+        var effective = weighted
+        if (cap < effective) {
+            effective = cap
+        }
+        var target = circulation.toDouble() * p.targetTurnover()
+        var ratio = scarcity
+        if (target > 0.0) {
+            ratio = effective / target * scarcity
+        }
+        var dilution = 1.0 + issuance.toDouble() / circulation.toDouble()
+        return CoinEconomyCore(usage, circulation, Numbers.round(effective), scarcity, ratio / dilution)
+    }
+    // The FULL monthly calculation: the price comes straight from the window metrics multiplying the anchor by the
+    // index: it does NOT start from the last published value and does NOT go through the step limit (the step exists
+    // to smooth the 3 hour control; the monthly round is the reference validation and fixes the whole price at once,
+    // with floor and ceiling as the only limits).
+    static CoinEconomyResult absoluteEvaluate(anchorMicros: Long, m: CoinMetrics, p: CoinEconomyParams) {
+        var core = CoinEconomyCalculator.core(m, p)
+        var anchor = anchorMicros
+        if (anchor < 1L) {
+            anchor = 1L
+        }
+        var next = anchor
+        if (core.circulation() != 0L) {
+            next = Numbers.round(anchor.toDouble() * core.index())
+        }
+        return CoinEconomyResult(core.usage(), core.effective(), Numbers.round2(core.scarcity()), core.index(), CoinEconomyCalculator.clampPrice(next, p))
+    }
+    // One step of the quote: always the step of ONE PERIOD (3 h by default). The CoinEconomyService decides whether it
+    // is time to publish: the math does not look at the clock nor at how many times the button was clicked, only at
+    // the movement measured on the ledger.
+    static CoinEconomyResult evaluate(previousMicros: Long, m: CoinMetrics, p: CoinEconomyParams) {
+        var previous = previousMicros
+        if (previous < 1L) {
+            previous = 1L
+        }
+        var core = CoinEconomyCalculator.core(m, p)
+        // Without stock in circulation there is nothing to reassess: the price stays where it is.
+        if (core.circulation() == 0L) {
+            return CoinEconomyResult(core.usage(), 0L, 1.0, 1.0, CoinEconomyCalculator.clampPrice(previous, p))
+        }
+        var step = p.maxStep()
+        var delta = CoinEconomyCalculator.clampDouble((core.index() - 1.0) * p.sensitivity(), 0.0 - step, step)
+        var next = Numbers.round(previous.toDouble() * (1.0 + delta))
+        return CoinEconomyResult(core.usage(), core.effective(), Numbers.round2(core.scarcity()), core.index(), CoinEconomyCalculator.clampPrice(next, p))
+    }
+}

@@ -1,0 +1,55 @@
+package coin
+
+import kernel.error.*
+import kernel.id.*
+import kernel.text.*
+
+// The REFERENCE quote of the spark (CoinRateService): a published price in BRL that pays the creators and feeds
+// the mini exchange. Administration may publish by hand; the automatic calculation is the CoinEconomyService.
+// It is NOT an exchange rate: it does not buy sparks.
+class CoinRateService {
+    CoinStore ledger
+    public constructor(ledger: CoinStore) {
+        this.ledger = ledger
+    }
+    // The current quote: the last one published; the first time, seeds the initial one (R$ 0,01 a spark).
+    CoinRate latest() {
+        var found = ledger.findLatestRate()
+        if (found != null) {
+            return found
+        }
+        var seeded = this.build(CoinRates.initialMicros(), "Cotação inicial de referência")
+        ledger.saveRate(seeded)
+        return seeded
+    }
+    Long currentBrlCents() = this.latest().brlCents()
+    Long currentBrlMicros() = this.latest().brlMicros()
+    List<CoinRate> history(limit: Int) {
+        var size = limit
+        if (size < 2) {
+            size = 2
+        }
+        if (size > 365) {
+            size = 365
+        }
+        return ledger.rateHistory(size)
+    }
+    // Publishes a new reference quote in micro-reais (the new line becomes the current one).
+    CoinRate publish(brlMicros: Long, note: String?) {
+        var rate = this.build(brlMicros, note)
+        ledger.saveRate(rate)
+        return rate
+    }
+    // Legacy manual publication: the panel always spoke in cents.
+    CoinRate publishCents(brlCents: Long, note: String?) = this.publish(brlCents * CoinRates.microsPerCent(), note)
+    CoinRate build(brlMicros: Long, note: String?) {
+        if (brlMicros <= 0L) {
+            throw Errors.api(400, "INVALID_RATE", "A cotação precisa ser positiva.")
+        }
+        var clean = Nulls.str()
+        if (Texts.hasText(note)) {
+            clean = Texts.trimIfText(note)
+        }
+        return CoinRate(Ids.prefixed("rate_"), CoinRates.toCents(brlMicros), brlMicros, clean, EconomyClock.nowIso())
+    }
+}

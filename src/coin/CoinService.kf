@@ -1,0 +1,560 @@
+package coin
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.log.*
+import kernel.security.*
+import kernel.time.*
+
+// The spark: the internal coin of Enois.
+//
+// FIXED supply set at the genesis (there is never a later emission): the treasury is born with a fixed volume and
+// the airdrop (100 per account) and the earnings come out of it. P2P transfers move sparks between accounts without
+// creating or burning any. Pix style: instant, by key (username), irreversible; moderation reverts with a mirror
+// entry, never DELETE.
+//
+// Integrity: append-only ledger with a hash chained per account + optimistic snapshot (the `version` column,
+// `UPDATE .. WHERE version = ?`, 409 COIN_CONCURRENCY for the loser) + idempotency per (account, key), which is the
+// unique index of coin_entries. Everything that writes more than one line runs in ONE transaction.
+class CoinService {
+    Db database
+    CoinStore ledger
+    CoinRateService rates
+    SecretCipher cipher
+    ActionThrottle throttle
+    TransferDedupe dedupe
+    Int transfersPerMinute
+    Int transfersPerHour
+    Log log = Log("coin.service")
+    public constructor(database: Db, ledger: CoinStore, rates: CoinRateService, cipher: SecretCipher, throttle: ActionThrottle, dedupe: TransferDedupe, transfersPerMinute: Int, transfersPerHour: Int) {
+        this.database = database
+        this.ledger = ledger
+        this.rates = rates
+        this.cipher = cipher
+        this.throttle = throttle
+        this.dedupe = dedupe
+        var perMinute = transfersPerMinute
+        if (perMinute > 1000) {
+            perMinute = 1000
+        }
+        if (perMinute < 1) {
+            perMinute = 1
+        }
+        var perHour = transfersPerHour
+        if (perHour > 10000) {
+            perHour = 10000
+        }
+        if (perHour < perMinute) {
+            perHour = perMinute
+        }
+        this.transfersPerMinute = perMinute
+        this.transfersPerHour = perHour
+    }
+    static String treasuryAccount() = "coin_tesouraria"
+    // The escrow RETENTION account: it belongs to nobody; the sparks sit here.
+    static String escrowAccount() = "coin_escrow"
+    // Platform fee on sales: 10% of the price, back to the treasury.
+    static Long marketplaceFeePercent() = 10L
+    // The spark is FRACTIONAL: the whole ledger counts THOUSANDTHS (1 spark = 1.000 mf), like cents of the real.
+    static Long scale() = 1000L
+    static Long fais(sparks: Long) = sparks * 1000L
+    // The fixed volume of the genesis. Not public, never changes.
+    static Long treasuryGenesis() = 2000000L * 1000L
+    static Long airdropPerUser() = 100L * 1000L
+    // Daily presence: 5 a day, a bonus of 25 every 7 days in a row (day 7, 14, 21...).
+    static Long dailyPresence() = 5L * 1000L
+    static Long streakBonus() = 25L * 1000L
+    static Int streakBonusEveryDays() = 7
+    // Ceiling for accounts younger than 7 days: 500 sparks a day.
+    static Long newAccountDailyCap() = 500L * 1000L
+    static Long newAccountWindowMs() = 7L * 24L * 3600000L
+    static Int streakBootstrapDays() = 60
+    static String encPrefix() = "enc:v1:"
+    static String zeroHash() = "0000000000000000000000000000000000000000000000000000000000000000"
+    // ---- wallet
+    // The coin account: creates the account, runs the genesis airdrop and marks the presence of the day.
+    CoinWallet wallet(accountId: String, username: String) {
+        var self = this
+        var box = listOf<CoinWallet>()
+        database.transaction(() -> {
+            box.add(self.openWallet(accountId, username))
+        })
+        return box.get(0)
+    }
+    CoinWallet openWallet(accountId: String, username: String) {
+        this.ensureAccount(accountId)
+        this.ensureGenesis(accountId)
+        this.ensureDailyPresence(accountId)
+        var extract = this.decrypted(ledger.recentEntries(accountId, 50))
+        return CoinWallet(this.ensureAccount(accountId).balance(), username, CoinService.scale(), rates.currentBrlCents(), rates.currentBrlMicros(), extract, this.streak(accountId))
+    }
+    // The extract for AUDIT (incident/panel): reads what exists and credits NOTHING. The normal wallet guarantees
+    // genesis and presence (a side effect of opening it): in an audit that would create an account and an airdrop
+    // for whoever is being investigated.
+    CoinWallet walletSnapshot(accountId: String, username: String, limit: Int) {
+        var account = ledger.findAccount(accountId)
+        var balance = 0L
+        var extract = listOf<CoinEntry>()
+        if (account != null) {
+            balance = account.balance()
+            var size = limit
+            if (size > 200) {
+                size = 200
+            }
+            if (size < 1) {
+                size = 1
+            }
+            extract = this.decrypted(ledger.recentEntries(accountId, size))
+        }
+        return CoinWallet(balance, username, CoinService.scale(), rates.currentBrlCents(), rates.currentBrlMicros(), extract, null)
+    }
+    List<CoinEntry> decrypted(rows: List<CoinEntry>) {
+        var out = listOf<CoinEntry>()
+        for (var e in rows) {
+            out.add(e.withMessage(this.decipher(e.message())))
+        }
+        return out
+    }
+    // Converts a base value (set at the initial quote: 100 sparks = R$ 1,00) to the current quote, preserving the
+    // VALUE in reais. If the spark went up the person gets fewer sparks for the same value; if it went down, more.
+    // Never zero (at least one thousandth), with a floor of 0,1 cent a spark in the conversion.
+    Long scaledReward(baseMf: Long) = CoinService.scaleReward(baseMf, rates.currentBrlMicros())
+    static Long scaleReward(baseMf: Long, brlMicros: Long) {
+        var safe = brlMicros
+        var floor = CoinRates.microsPerCent() / 10L
+        if (safe < floor) {
+            safe = floor
+        }
+        var scaled = (baseMf * CoinRates.initialMicros() + safe / 2L) / safe
+        if (scaled < 1L) {
+            return 1L
+        }
+        return scaled
+    }
+    // ---- presence and streak
+    // A meaningful action happened (post, comment, reaction, daily game, message, joining a community or group): it
+    // counts as today's presence. Called by the application services AFTER the action; runs after the caller's
+    // commit, in its own transaction, and never throws. The presence is a side effect, never a reason for the
+    // action to fail (or to wait on the treasury row the caller's transaction may be holding).
+    recordPresence(userId: String) {
+        if (userId.trim().length() == 0) {
+            return
+        }
+        var self = this
+        database.afterCommit(() -> {
+            self.recordPresenceNow(userId)
+        })
+    }
+    recordPresenceNow(userId: String) {
+        try {
+            // Fast path: already counted today is one primary-key read, no transaction, no ledger.
+            var known = ledger.findStreak(userId)
+            if (known != null) {
+                if (known.doneOn(EconomyClock.brazilDay())) {
+                    return
+                }
+            }
+            var self = this
+            database.transaction(() -> {
+                self.ensureDailyPresence(userId)
+            })
+        } catch (String e) {
+            log.warn("presence_record_failed error=" + Errors.parse(e).code())
+        }
+    }
+    // The current streak as of today (pending freeze or break applied, nothing written).
+    CoinStreakView streak(userId: String) {
+        var today = EconomyClock.brazilDay()
+        var s = this.streakOf(userId, today).settle(today)
+        return CoinStreakView(s.currentDays(), s.longestDays(), s.doneOn(today), s.freezesAvailable(today), s.lastFrozenDay())
+    }
+    CoinStreak streakOf(userId: String, today: String) {
+        var stored = ledger.findStreak(userId)
+        if (stored != null) {
+            return stored
+        }
+        return this.bootstrapStreak(userId, today)
+    }
+    // Daily presence: +5 a day; +25 of bonus every 7 days of streak (day 7, 14, 21...), counted on the stored streak:
+    // the frozen day does not add, so it neither anticipates nor skips the bonus. Idempotent per account + day (Sao
+    // Paulo). The streak lives in `user_streaks` (with the weekly freeze); values are converted by the current quote.
+    ensureDailyPresence(accountId: String) {
+        var today = EconomyClock.brazilDay()
+        var before = this.streakOf(accountId, today)
+        if (before.doneOn(today)) {
+            return
+        }
+        var after = before.touch(today)
+        ledger.saveStreak(after, EconomyClock.nowIso())
+        var ref = "presenca:" + accountId + ":" + today
+        if (ledger.existsByKindAndRefId("REWARD", ref)) {
+            return
+        }
+        var now = EconomyClock.nowIso()
+        var amount = this.scaledReward(CoinService.dailyPresence())
+        var message = "Presença diária"
+        if (after.currentDays() % CoinService.streakBonusEveryDays() == 0) {
+            amount = amount + this.scaledReward(CoinService.streakBonus())
+            message = "Presença diária (bônus de " + after.currentDays() + " dias seguidos)"
+        }
+        this.ensureTreasury()
+        this.grant(CoinService.treasuryAccount(), 0L - amount, "GENESIS_TREASURY", "presenca-tesouraria:" + ref, message, now)
+        this.grant(accountId, amount, "REWARD", ref, message, now)
+    }
+    // Streak of someone without a `user_streaks` row yet: rebuilt from recent presence rewards.
+    CoinStreak bootstrapStreak(accountId: String, today: String) {
+        var prefix = "presenca:" + accountId + ":"
+        var oldest = ZoneDates.plusDays(today, 0 - CoinService.streakBootstrapDays())
+        var days = listOf<String>()
+        for (var ref in ledger.refIdsOf(accountId, "REWARD")) {
+            if (ref.startsWith(prefix)) {
+                var day = ref.substring(prefix.length())
+                if (day.compareTo(oldest) >= 0 && day.compareTo(today) <= 0) {
+                    days.add(day)
+                }
+            }
+        }
+        return CoinStreak.fromPresenceDays(accountId, days)
+    }
+    // ---- accounts
+    // Guarantees account and airdrop for whoever never opened the wallet: a payment (an escrow, for instance) cannot
+    // fail only because the person has not visited the coin screen yet.
+    ensureGenesisFor(accountId: String) {
+        var self = this
+        database.transaction(() -> {
+            self.ensureGenesis(accountId)
+        })
+    }
+    // Idempotent airdrop: 100 sparks from the treasury, once per account. No exception per username.
+    ensureGenesis(accountId: String) {
+        if (ledger.existsByKindAndRefId("AIRDROP", "airdrop:" + accountId)) {
+            return
+        }
+        this.ensureTreasury()
+        var amount = CoinService.airdropPerUser()
+        this.grant(CoinService.treasuryAccount(), 0L - amount, "GENESIS_TREASURY", "airdrop-tesouraria:" + accountId, "Distribuição inicial", EconomyClock.nowIso())
+        this.grant(accountId, amount, "AIRDROP", "airdrop:" + accountId, "Distribuição inicial", EconomyClock.nowIso())
+    }
+    // The treasury account: born with the fixed genesis volume the first time it is touched.
+    CoinAccount ensureTreasury() {
+        var found = ledger.findAccount(CoinService.treasuryAccount())
+        if (found != null) {
+            return found
+        }
+        var created = CoinAccount(CoinService.treasuryAccount(), 0L, 0L, EconomyClock.nowIso())
+        ledger.insertAccount(created)
+        this.grant(CoinService.treasuryAccount(), CoinService.treasuryGenesis(), "GENESIS_TREASURY", "genesis:tesouraria", "Gênese da faísca (supply fixo)", EconomyClock.nowIso())
+        var again = ledger.findAccount(CoinService.treasuryAccount())
+        if (again == null) {
+            return created
+        }
+        return again
+    }
+    CoinAccount ensureAccount(accountId: String) {
+        var found = ledger.findAccount(accountId)
+        if (found != null) {
+            return found
+        }
+        var created = CoinAccount(accountId, 0L, 0L, EconomyClock.nowIso())
+        ledger.insertAccount(created)
+        return created
+    }
+    // Posts a line on the account (a debit when amount < 0) updating the snapshot with the chained hash.
+    CoinEntry grant(accountId: String, amount: Long, kind: String, refId: String, message: String?, now: String) {
+        this.ensureAccount(accountId)
+        var account = ledger.findAccount(accountId)
+        if (account == null) {
+            throw Errors.api(500, "COIN_ACCOUNT_MISSING", "Conta da moeda nao encontrada.")
+        }
+        if (amount < 0L && account.balance() + amount < 0L) {
+            throw Errors.api(400, "INSUFFICIENT_SPARKS", "Faíscas insuficientes.")
+        }
+        var prevHash = CoinService.zeroHash()
+        var head = ledger.lastHash(accountId)
+        if (head != null) {
+            prevHash = head
+        }
+        var idem = kind.toLowerCase() + ":" + refId
+        var hash = CoinService.hashOf(prevHash, accountId, amount, kind, refId, idem)
+        var entry = CoinEntry(Ids.prefixed("cent_"), accountId, amount, kind, refId, this.encrypt(message), idem, prevHash, hash, now)
+        ledger.insertEntry(entry)
+        if (!ledger.updateBalanceIfVersion(accountId, account.balance() + amount, account.version())) {
+            throw Errors.api(409, "COIN_CONCURRENCY", "Movimentação concorrente; tente de novo.")
+        }
+        return entry
+    }
+    // The transfer message is PERSONAL DATA: encrypted at rest (AES-GCM) when the key exists.
+    String? encrypt(message: String?) {
+        if (message == null) {
+            return null
+        }
+        if (message.trim().length() == 0 || !cipher.isEnabled()) {
+            return message
+        }
+        return CoinService.encPrefix() + cipher.encrypt(message)
+    }
+    String? decipher(message: String?) {
+        if (message == null) {
+            return null
+        }
+        if (!message.startsWith(CoinService.encPrefix())) {
+            return message
+        }
+        if (!cipher.isEnabled()) {
+            return "[mensagem protegida]"
+        }
+        var plain = "[mensagem protegida]"
+        try {
+            plain = cipher.decrypt(message.substring(CoinService.encPrefix().length()))
+        } catch (String e) {
+            plain = "[mensagem protegida]"
+        }
+        return plain
+    }
+    static String hashOf(prevHash: String, accountId: String, amount: Long, kind: String, refId: String, idem: String) = Hashes.sha256Hex(prevHash + "|" + accountId + "|" + amount + "|" + kind + "|" + refId + "|" + idem)
+    // ---- movements
+    // Pix style P2P transfer: by username, instant, irreversible.
+    CoinEntry transfer(fromAccountId: String, toUsername: String, amount: Long, message: String?, toUserId: String, toUsernameResolved: String) {
+        var self = this
+        var box = listOf<CoinEntry>()
+        database.transaction(() -> {
+            box.add(self.sendTransfer(fromAccountId, amount, message, toUserId))
+        })
+        return box.get(0)
+    }
+    CoinEntry sendTransfer(fromAccountId: String, amount: Long, message: String?, toUserId: String) {
+        if (amount <= 0L) {
+            throw Errors.api(400, "INVALID_AMOUNT", "O valor precisa ser maior que zero.")
+        }
+        if (fromAccountId == toUserId) {
+            throw Errors.api(400, "SELF_TRANSFER", "Não dá para transferir para você mesmo.")
+        }
+        this.ensureGenesis(fromAccountId)
+        var from = this.ensureAccount(fromAccountId)
+        this.ensureAccount(toUserId)
+        // Ceiling for new accounts: the first 7 days send up to 500 a day (the UTC day, like the Java clock).
+        if (this.isNewAccount(from)) {
+            var start = EconomyClock.utcDay() + "T00:00:00Z"
+            var end = ZoneDates.plusDays(EconomyClock.utcDay(), 1) + "T00:00:00Z"
+            var sentToday = ledger.debitedBetween(fromAccountId, start, end)
+            if (sentToday + amount > CoinService.newAccountDailyCap()) {
+                throw Errors.api(403, "NEW_ACCOUNT_LIMIT", "Contas novas enviam até " + CoinService.newAccountDailyCap() / CoinService.scale() + " faíscas por dia nos primeiros 7 dias.")
+            }
+        }
+        if (from.balance() < amount) {
+            throw Errors.api(400, "INSUFFICIENT_SPARKS", "Faíscas insuficientes.")
+        }
+        // The SAME Pix repeated in seconds (double click/retry) returns the entry of the first time.
+        var repeated = dedupe.recent(fromAccountId, toUserId, amount, message)
+        if (repeated != null) {
+            log.info("faisca: transferencia repetida ignorada de " + fromAccountId + " para " + toUserId + " de " + amount + " mf (ref " + repeated.refId() + ")")
+            return repeated
+        }
+        // Ceiling per account: 141 POSTs in a burst (incident of 22/10) stop here, before the ledger.
+        throttle.requireAllowed("transferencia-minuto", fromAccountId, transfersPerMinute, 60000L)
+        throttle.requireAllowed("transferencia-hora", fromAccountId, transfersPerHour, 3600000L)
+        var transferRef = Ids.prefixed("p2p_")
+        var now = EconomyClock.nowIso()
+        var note = ""
+        if (message != null) {
+            note = message
+        }
+        var out = this.grant(fromAccountId, 0L - amount, "TRANSFER_OUT", transferRef, note, now)
+        this.grant(toUserId, amount, "TRANSFER_IN", transferRef, note, now)
+        dedupe.remember(fromAccountId, toUserId, amount, message, out)
+        // Money audit: without the message (personal data), with enough to rebuild what happened.
+        log.info("faisca: transferencia de " + fromAccountId + " para " + toUserId + " de " + amount + " mf (ref " + transferRef + ")")
+        return out
+    }
+    Bool isNewAccount(account: CoinAccount) = EconomyClock.nowMillis() - Time.toMillis(account.createdAt()) < CoinService.newAccountWindowMs()
+    // Escrow (marketplace/services): the sparks LEAVE the buyer and stay RETAINED in the escrow account, not spent and
+    // not withdrawable by anyone until the decision (release or refund).
+    CoinEntry escrowHold(buyerAccountId: String, amount: Long, purchaseRef: String, message: String?) {
+        var self = this
+        var box = listOf<CoinEntry>()
+        database.transaction(() -> {
+            box.add(self.holdInEscrow(buyerAccountId, amount, purchaseRef, message))
+        })
+        return box.get(0)
+    }
+    CoinEntry holdInEscrow(buyerAccountId: String, amount: Long, purchaseRef: String, message: String?) {
+        if (amount <= 0L) {
+            throw Errors.api(400, "INVALID_AMOUNT", "O preço precisa ser positivo.")
+        }
+        var now = EconomyClock.nowIso()
+        var note = CoinService.noteOf(message)
+        var out = this.grant(buyerAccountId, 0L - amount, "ESCROW_OUT", purchaseRef, note, now)
+        this.grant(CoinService.escrowAccount(), amount, "ESCROW_HOLD", purchaseRef, note, now)
+        return out
+    }
+    static String noteOf(message: String?) {
+        if (message == null) {
+            return ""
+        }
+        return message
+    }
+    // Escrow release: the seller gets price - 10% fee; the fee goes back to the treasury (the supply does not change:
+    // the sparks only change account).
+    escrowRelease(sellerAccountId: String, amount: Long, purchaseRef: String, message: String?) {
+        var self = this
+        database.transaction(() -> {
+            self.releaseEscrow(sellerAccountId, amount, purchaseRef, message)
+        })
+    }
+    releaseEscrow(sellerAccountId: String, amount: Long, purchaseRef: String, message: String?) {
+        if (amount <= 0L) {
+            throw Errors.api(400, "INVALID_AMOUNT", "O preço precisa ser positivo.")
+        }
+        var now = EconomyClock.nowIso()
+        var fee = amount * CoinService.marketplaceFeePercent() / 100L
+        var net = amount - fee
+        var note = CoinService.noteOf(message)
+        this.grant(CoinService.escrowAccount(), 0L - amount, "ESCROW_RELEASE", purchaseRef, note, now)
+        this.grant(sellerAccountId, net, "ESCROW_IN", purchaseRef, note, now)
+        if (fee > 0L) {
+            this.ensureTreasury()
+            this.grant(CoinService.treasuryAccount(), fee, "FEE_IN", purchaseRef, "Taxa de marketplace", now)
+        }
+    }
+    // Escrow refund: it goes back IN FULL to the buyer. The exit from the escrow uses the SAME ref as the release: the
+    // idempotency key (kind:ref, unique per account) is the same on both paths and the database refuses the second one.
+    // With different refs, releasing and refunding the same purchase at once (the buyer asking for a refund while the
+    // job releases, or accepting and refusing on two tabs) paid the seller AND returned to the buyer, taking from the
+    // escrow the money of other purchases.
+    escrowRefund(buyerAccountId: String, amount: Long, purchaseRef: String, message: String?) {
+        var self = this
+        database.transaction(() -> {
+            self.refundEscrow(buyerAccountId, amount, purchaseRef, message)
+        })
+    }
+    refundEscrow(buyerAccountId: String, amount: Long, purchaseRef: String, message: String?) {
+        if (amount <= 0L) {
+            throw Errors.api(400, "INVALID_AMOUNT", "O preço precisa ser positivo.")
+        }
+        var now = EconomyClock.nowIso()
+        var note = CoinService.noteOf(message)
+        this.grant(CoinService.escrowAccount(), 0L - amount, "ESCROW_RELEASE", purchaseRef, note, now)
+        this.grant(buyerAccountId, amount, "REFUND_IN", purchaseRef + ":refund", note, now)
+    }
+    // Purchase in the platform STORE (plan C3): the value leaves the buyer and GOES BACK to the treasury: the supply
+    // does not change. Idempotent per ref (the same purchase never duplicates; who already owns the item pays once).
+    purchase(accountId: String, amount: Long, ref: String, message: String?) {
+        var self = this
+        database.transaction(() -> {
+            self.buyFromStore(accountId, amount, ref, message)
+        })
+    }
+    buyFromStore(accountId: String, amount: Long, ref: String, message: String?) {
+        if (amount <= 0L) {
+            throw Errors.api(400, "INVALID_AMOUNT", "O preço precisa ser positivo.")
+        }
+        if (ledger.existsByKindAndRefId("PURCHASE", ref)) {
+            return
+        }
+        this.ensureTreasury()
+        var now = EconomyClock.nowIso()
+        this.grant(accountId, 0L - amount, "PURCHASE", ref, message, now)
+        this.grant(CoinService.treasuryAccount(), amount, "GENESIS_TREASURY", "loja-tesouraria:" + ref, message, now)
+    }
+    // Rewards of the month by prefix (the monthly ceiling of what is earned, e.g. micro-projects 3 a month).
+    Long rewardCountByPrefix(prefix: String) = ledger.countRewardsByRefPrefix(prefix)
+    // Prize granted by a role with permission (plan C2: event/community prizes; audited: every grant is a ledger line
+    // with the reason). It comes out of the treasury; the fixed supply is preserved.
+    grantPrize(accountId: String, amount: Long, ref: String, message: String?) {
+        var self = this
+        database.transaction(() -> {
+            self.payPrize(accountId, amount, ref, message)
+        })
+    }
+    payPrize(accountId: String, amount: Long, ref: String, message: String?) {
+        if (amount <= 0L) {
+            throw Errors.api(400, "INVALID_AMOUNT", "O valor precisa ser positivo.")
+        }
+        if (ledger.existsByKindAndRefId("REWARD", ref)) {
+            return
+        }
+        this.ensureTreasury()
+        var now = EconomyClock.nowIso()
+        this.grant(CoinService.treasuryAccount(), 0L - amount, "GENESIS_TREASURY", "premio-tesouraria:" + ref, message, now)
+        this.grant(accountId, amount, "REWARD", ref, message, now)
+    }
+    // Has this reward been earned already? (readable idempotency for the earned hooks)
+    Bool hasReward(ref: String) = ledger.existsByKindAndRefId("REWARD", ref)
+    // Reward of the earned kind (plan C2): out of the treasury into the account; the fixed supply is preserved.
+    // Idempotent per ref (the same reward never duplicates).
+    reward(accountId: String, amount: Long, ref: String, message: String?) {
+        var self = this
+        database.transaction(() -> {
+            self.payReward(accountId, amount, ref, message)
+        })
+    }
+    payReward(accountId: String, amount: Long, ref: String, message: String?) {
+        if (amount <= 0L) {
+            throw Errors.api(400, "INVALID_AMOUNT", "O valor precisa ser positivo.")
+        }
+        if (ledger.existsByKindAndRefId("REWARD", ref)) {
+            return
+        }
+        this.ensureTreasury()
+        var now = EconomyClock.nowIso()
+        this.grant(CoinService.treasuryAccount(), 0L - amount, "GENESIS_TREASURY", "reward-tesouraria:" + ref, message, now)
+        this.grant(accountId, amount, "REWARD", ref, message, now)
+    }
+    // REVERSAL of a transfer (contested scam, moderation decision): a mirror in the ledger, the receiver gives back and
+    // the sender gets it again. Append-only: no UPDATE/DELETE; the mirror lines carry the reason.
+    reverseTransfer(receiverId: String, senderId: String, amount: Long, originalRef: String, reason: String) {
+        var self = this
+        database.transaction(() -> {
+            self.mirrorTransfer(receiverId, senderId, amount, originalRef, reason)
+        })
+    }
+    mirrorTransfer(receiverId: String, senderId: String, amount: Long, originalRef: String, reason: String) {
+        if (amount <= 0L) {
+            throw Errors.api(400, "INVALID_AMOUNT", "O valor da reversão precisa ser positivo.")
+        }
+        var now = EconomyClock.nowIso()
+        this.grant(receiverId, 0L - amount, "REVERSAL_OUT", originalRef + ":reversao", reason, now)
+        this.grant(senderId, amount, "REVERSAL_IN", originalRef + ":reversao", reason, now)
+    }
+    // ---- supply and reconciliation
+    // The sum of every balance HAS to equal the genesis total: nothing creates sparks, everything circulates from the
+    // value that already exists. A divergence is a bug or fraud: the panel shows it and the investigation follows.
+    CoinSupply supply() {
+        var total = CoinService.treasuryGenesis()
+        var treasury = ledger.findAccount(CoinService.treasuryAccount())
+        var vault = 0L
+        var sum = ledger.totalBalance()
+        // Pre-genesis (no wallet opened yet) is not a divergence: it is an alarm only when the treasury exists and the
+        // sum of the balances does not close with the total.
+        var coherent = sum == 0L
+        if (treasury != null) {
+            vault = treasury.balance()
+            coherent = sum == total
+        }
+        return CoinSupply(total, vault, total - vault, sum, coherent)
+    }
+    // Reconciliation (plan C4): the LEDGER is the truth: rebuilds the balance of each account by adding its lines and
+    // compares it to the snapshot. A divergence LOGS AN ALERT (no silent auto-correction: the investigation comes
+    // first). Runs at night (04:17 UTC, the JVM zone of the Java service).
+    reconcile() {
+        for (var account in ledger.allAccounts()) {
+            var rebuilt = ledger.balanceFromLedger(account.accountId())
+            if (rebuilt != account.balance()) {
+                log.error("coin_reconciliation_divergence accountId=" + account.accountId() + " snapshot=" + account.balance() + " ledger=" + rebuilt)
+            }
+        }
+    }
+    schedule(jobs: Scheduler) {
+        var self = this
+        jobs.cron("coin-reconcile", "0 17 4 * * *", "UTC", () -> {
+            self.reconcile()
+        })
+    }
+    Long balance(accountId: String) = this.ensureAccount(accountId).balance()
+    List<CoinEntry> entries(accountId: String, limit: Int) = ledger.recentEntries(accountId, limit)
+    CoinEntryPage extract(accountId: String, page: Int, size: Int, from: String?, to: String?) {
+        var result = ledger.entryPage(accountId, page, size, from, to)
+        return CoinEntryPage(this.decrypted(result.entries()), result.hasNext())
+    }
+}

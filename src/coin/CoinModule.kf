@@ -1,0 +1,61 @@
+package coin
+
+import kernel.*
+import kernel.security.*
+import notifications.*
+import profile.*
+
+// Composition of the coin domain, in two steps because the domains that were ported first need the coin SERVICE
+// before the notifications module (which the disputes use) exists:
+//
+//   var coinCore = CoinCore.create(platform, shared, parts)          // ledger, quote, economy: no routes yet
+//   ... NotificationsSeams.coins = CoinNotificationCoins(coinCore.service), the other *Coins bridges ...
+//   var coin = CoinModule.install(platform, shared, parts, coinCore, profileModule, notificationsModule)
+//
+// What the other modules read: `coin.service` (CoinService: reward, purchase, escrow*, recordPresence, hasReward...),
+// `coin.rates`, `coin.economy`, `coin.disputes`.
+class CoinCore {
+    CoinStore store
+    CoinRateService rates
+    CoinService service
+    CoinEconomyService economy
+    public constructor(store: CoinStore, rates: CoinRateService, service: CoinService, economy: CoinEconomyService) {
+        this.store = store
+        this.rates = rates
+        this.service = service
+        this.economy = economy
+    }
+    static CoinCore create(platform: Platform, shared: SharedServices, parts: SecurityParts) {
+        var cfg = platform.cfg
+        var store = CoinStore(platform.db)
+        var rates = CoinRateService(store)
+        var dedupe = TransferDedupe(cfg.getLong("REDE_COIN_TRANSFER_DEDUPE_SECONDS", 10L))
+        var service = CoinService(platform.db, store, rates, shared.cipher, parts.actionThrottle, dedupe, cfg.getInt("REDE_COIN_TRANSFER_PER_MINUTE", 10), cfg.getInt("REDE_COIN_TRANSFER_PER_HOUR", 60))
+        var economy = CoinEconomyService.fromConfig(cfg, store, rates, service)
+        return CoinCore(store, rates, service, economy)
+    }
+}
+
+class CoinModule {
+    CoinCore core
+    CoinService service
+    CoinRateService rates
+    CoinEconomyService economy
+    CoinDisputeService disputes
+    public constructor(core: CoinCore, disputes: CoinDisputeService) {
+        this.core = core
+        this.service = core.service
+        this.rates = core.rates
+        this.economy = core.economy
+        this.disputes = disputes
+    }
+    static CoinModule install(platform: Platform, shared: SharedServices, parts: SecurityParts, core: CoinCore, profiles: ProfileModule, notifications: NotificationsModule) = CoinModule.installWith(platform, shared, core, profiles, notifications, CoinDisputeModeration(platform.db, parts.actionThrottle, notifications.notifications, platform.cfg.getInt("REDE_MODERATION_REPORTS_PER_HOUR", 10)))
+    // The moderation domain passes its own CoinDisputeModeration subclass here.
+    static CoinModule installWith(platform: Platform, shared: SharedServices, core: CoinCore, profiles: ProfileModule, notifications: NotificationsModule, moderation: CoinDisputeModeration) {
+        var disputes = CoinDisputeService(platform.db, core.store, core.service, moderation, notifications.notifications)
+        CoinRoutes.register(platform.server, core.service, core.rates, core.economy, disputes, profiles.directory, shared.idempotency)
+        core.economy.schedule(shared.jobs, platform.cfg)
+        core.service.schedule(shared.jobs)
+        return CoinModule(core, disputes)
+    }
+}
