@@ -1,0 +1,465 @@
+package support
+
+import identity.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.log.*
+import kernel.time.*
+import notifications.*
+import ops.*
+import profile.*
+
+// Who answers on GitHub: the login of the person and the token they linked with write permission. The contributions
+// port subclasses it (pending-port: contributions); the default has no GitHub identity, so the service token is used.
+class SupportGithubPeople {
+    ProfileDirectory directory
+    public constructor(directory: ProfileDirectory) {
+        this.directory = directory
+    }
+    String? login(userId: String) = null
+    String? userToken(userId: String) = null
+    String? displayName(userId: String, fallback: String?) {
+        var p = directory.findById(userId)
+        if (p == null) {
+            return fallback
+        }
+        return p.displayWithNickname()
+    }
+}
+
+// Tells who opened a ticket that it was closed or reopened, by e-mail and in the app.
+class SupportStatusNotifier {
+    MailService mail
+    Notifications notifications
+    public constructor(mail: MailService, notifications: Notifications) {
+        this.mail = mail
+        this.notifications = notifications
+    }
+    closed(r: SupportRequestRecord) {
+        if (r.contactEmail().trim().length() > 0) {
+            var html = "<p>Olá,</p>" + "<p>Seu pedido <b>" + IdentityMailer.escapeHtml(r.subject()) + "</b> foi concluído pelo time do Énóis.</p>" + "<p>Se o problema continuar, é só abrir um novo pedido em " + "<a href=\"https://enois.ia.br/suporte\">enois.ia.br/suporte</a>.</p>" + "<p>— Equipe Énóis</p>"
+            mail.sendBulk(r.contactEmail(), "Pedido de suporte concluído — " + r.subject(), html, "Suporte Énóis", "", "", "SUPPORT_CLOSED")
+        }
+        if (r.userId().trim().length() > 0) {
+            notifications.create(r.userId(), "SUPORTE", "sistema", "Pedido de suporte concluído", "Seu pedido \"" + r.subject() + "\" foi concluído. Se precisar, abra um novo pedido.", "/suporte", "Ver pedidos")
+        }
+    }
+    reopened(r: SupportRequestRecord) {
+        if (r.userId().trim().length() > 0) {
+            notifications.create(r.userId(), "SUPORTE", "sistema", "Pedido de suporte reaberto", "Seu pedido \"" + r.subject() + "\" voltou a ser acompanhado pelo time.", "/suporte", "Ver pedidos")
+        }
+    }
+}
+
+// The conversation of a ticket: panel replies and GitHub comments. The comment id is the dedup key: the webhook
+// echo of a comment the app itself published never enters twice.
+class SupportThread {
+    SupportStore store
+    public constructor(store: SupportStore) {
+        this.store = store
+    }
+    static Int maxBody() = 4000
+    static String clip(body: String?) {
+        if (body == null) {
+            return ""
+        }
+        var clean = body.trim()
+        if (clean.length() > SupportThread.maxBody()) {
+            return clean.substring(0, SupportThread.maxBody())
+        }
+        return clean
+    }
+    List<SupportMessageRecord> thread(requestId: String) = store.thread(requestId)
+    SupportMessageRecord addFromPanel(requestId: String, body: String?) {
+        var m = SupportMessageRecord(Ids.prefixed("support_msg_"), requestId, "ENOIS", null, null, SupportThread.clip(body), 0L, Time.nowIso())
+        store.insertMessage(m)
+        return m
+    }
+    // False when the comment is already registered (the echo of the app's own comment).
+    Bool addFromGithub(requestId: String, commentId: Long, authorLogin: String?, body: String?) {
+        if (store.commentKnown(commentId)) {
+            return false
+        }
+        var login = SupportText.none()
+        if (authorLogin != null) {
+            if (authorLogin.trim().length() > 0) {
+                login = authorLogin.trim()
+            }
+        }
+        store.insertMessage(SupportMessageRecord(Ids.prefixed("support_msg_"), requestId, "GITHUB", login, login, SupportThread.clip(body), commentId, Time.nowIso()))
+        return true
+    }
+    // If the webhook came first the comment is already a GITHUB message: the unique key is not violated.
+    markGithubComment(messageId: String, commentId: Long, authorName: String?, login: String?) {
+        if (store.commentOwnedByOther(commentId, messageId)) {
+            return
+        }
+        store.markComment(messageId, commentId, authorName, login)
+    }
+}
+
+// Mirrors the ticket in an issue of the private repository after the commit, so a GitHub failure never undoes
+// the ticket. The way back (GitHub -> panel) is the webhook.
+class SupportGithubSync {
+    SupportStore store
+    SupportGithubGateway gateway
+    SupportThread thread
+    SupportGithubPeople people
+    Log log = Log("support.sync")
+    public constructor(store: SupportStore, gateway: SupportGithubGateway, thread: SupportThread, people: SupportGithubPeople) {
+        this.store = store
+        this.gateway = gateway
+        this.thread = thread
+        this.people = people
+    }
+    onOpened(requestId: String) {
+        if (!gateway.enabled()) {
+            return
+        }
+        try {
+            var r = store.findById(requestId)
+            if (r == null) {
+                return
+            }
+            if (r.githubIssueNumber() != null) {
+                return
+            }
+            var issue = gateway.createIssue(SupportGithubSync.issueTitle(r), SupportGithubSync.issueBody(r))
+            if (issue != null) {
+                store.attachIssue(r.id(), issue.number(), issue.url())
+            }
+        } catch (String failure) {
+            log.warn("Falha ao espelhar o pedido " + requestId + " no GitHub.")
+        }
+    }
+    // The reply becomes a comment: with the write token of the person when they linked GitHub with it (it shows
+    // under their profile), else with the service token and the text names who answered. Best effort.
+    onReply(requestId: String, messageId: String, adminId: String, text: String) {
+        if (!gateway.enabled()) {
+            return
+        }
+        try {
+            var r = store.findById(requestId)
+            if (r == null) {
+                return
+            }
+            var number = r.githubIssueNumber()
+            if (number == null) {
+                return
+            }
+            var login = people.login(adminId)
+            var authorName = people.displayName(adminId, login)
+            var body = SupportGithubSync.attribution(login) + "\n\n" + text
+            var userToken = people.userToken(adminId)
+            var commentId = gateway.comment(number, body, userToken)
+            if (commentId == 0L && userToken != null) {
+                // The person's token has no permission on the repository: falls back to the service token.
+                commentId = gateway.comment(number, body, null)
+            }
+            if (commentId > 0L) {
+                thread.markGithubComment(messageId, commentId, authorName, login)
+            }
+        } catch (String failure) {
+            log.warn("Falha ao espelhar a resposta do ticket " + requestId + " no GitHub.")
+        }
+    }
+    onStatusChanged(requestId: String, previous: String, current: String) {
+        if (!gateway.enabled() || previous == current) {
+            return
+        }
+        try {
+            var r = store.findById(requestId)
+            if (r == null) {
+                return
+            }
+            var number = r.githubIssueNumber()
+            if (number == null) {
+                return
+            }
+            if (current == "CLOSED") {
+                gateway.closeIssue(number)
+            }
+            else 
+                if (previous == "CLOSED") {
+                    gateway.reopenIssue(number)
+                }
+        } catch (String failure) {
+            log.warn("Falha ao sincronizar o status do pedido " + requestId + " no GitHub.")
+        }
+    }
+    static String attribution(login: String?) {
+        if (login != null) {
+            if (login.trim().length() > 0) {
+                return "**@" + login + "** (pelo Énóis):"
+            }
+        }
+        return "**Equipe Énois** (pelo Énóis):"
+    }
+    static String issueTitle(r: SupportRequestRecord) {
+        var title = "[Suporte] " + r.subject().trim()
+        if (title.length() <= 200) {
+            return title
+        }
+        return title.substring(0, 199) + "…"
+    }
+    // Markdown for the team; the repository is private, so the contact may appear.
+    static String issueBody(r: SupportRequestRecord) {
+        var body = "**Ticket:** `" + r.id() + "`\n" + "**Categoria:** " + r.category() + "\n" + "**Solicitante:** `" + r.userId() + "`\n"
+        if (r.contactEmail().trim().length() > 0) {
+            body = body + "**Contato:** " + r.contactEmail() + "\n"
+        }
+        body = body + "**Aberto em:** " + ZoneDates.formatLocal(r.createdAt(), "America/Sao_Paulo", "dd/MM/yyyy HH:mm") + " (America/Sao_Paulo)\n"
+        var image = r.imageUrl()
+        if (image != null) {
+            if (image.trim().length() > 0) {
+                body = body + "**Print:** " + image + "\n"
+            }
+        }
+        body = body + "\n---\n\n" + r.message() + "\n" + "\n---\n" + "Fechar ou reabrir esta issue atualiza o pedido no painel do Énóis (e avisa quem abriu).\n"
+        return body
+    }
+}
+
+class SupportService {
+    SupportStore store
+    Db database
+    MailService mail
+    Notifications notifications
+    SupportStatusNotifier notifier
+    SupportThread thread
+    SupportGithubSync sync
+    String supportEmail
+    public constructor(database: Db, store: SupportStore, mail: MailService, notifications: Notifications, notifier: SupportStatusNotifier, thread: SupportThread, sync: SupportGithubSync, supportEmail: String) {
+        this.database = database
+        this.store = store
+        this.mail = mail
+        this.notifications = notifications
+        this.notifier = notifier
+        this.thread = thread
+        this.sync = sync
+        this.supportEmail = supportEmail.trim()
+    }
+    static Int maxSubject() = 160
+    static Int maxMessage() = 4000
+    static Int minMessage() = 10
+    static Int maxPerDay() = 5
+    static String invalid(message: String) = Errors.api(400, "INVALID_SUPPORT_REQUEST", message)
+    static String notFound() = Errors.api(404, "SUPPORT_REQUEST_NOT_FOUND", "Pedido de suporte não encontrado.")
+    SupportRequestRecord open(userId: String, subject: String?, message: String?, contactEmail: String?, imageUrl: String?, category: String?) {
+        var cleanSubject = ""
+        if (subject != null) {
+            cleanSubject = subject.trim()
+        }
+        var cleanMessage = ""
+        if (message != null) {
+            cleanMessage = message.trim()
+        }
+        var cleanEmail = ""
+        if (contactEmail != null) {
+            cleanEmail = contactEmail.trim().toLowerCase()
+        }
+        if (cleanSubject.length() == 0) {
+            throw SupportService.invalid("Informe o assunto do pedido.")
+        }
+        if (cleanSubject.length() > SupportService.maxSubject()) {
+            throw SupportService.invalid("Assunto deve ter no maximo 160 caracteres.")
+        }
+        if (cleanMessage.length() < SupportService.minMessage()) {
+            throw SupportService.invalid("Descreva o pedido com pelo menos 10 caracteres.")
+        }
+        if (cleanMessage.length() > SupportService.maxMessage()) {
+            throw SupportService.invalid("Mensagem deve ter no maximo 4000 caracteres.")
+        }
+        if (cleanEmail.length() == 0 || !cleanEmail.contains("@")) {
+            throw SupportService.invalid("Informe um e-mail de contato valido.")
+        }
+        var now = Time.nowIso()
+        if (store.countByUserSince(userId, Time.plusSeconds(now, 0L - 86400L)) >= SupportService.maxPerDay() as Long) {
+            throw Errors.api(429, "TOO_MANY_SUPPORT_REQUESTS", "Voce ja abriu varios pedidos nas ultimas 24h. Aguarde o retorno do time.")
+        }
+        var cleanImage = SupportText.none()
+        if (imageUrl != null) {
+            if (imageUrl.trim().length() > 0) {
+                cleanImage = imageUrl.trim()
+            }
+        }
+        if (cleanImage != null) {
+            if (!cleanImage.startsWith("https://")) {
+                throw SupportService.invalid("O anexo deve ser um link https do CDN.")
+            }
+            if (cleanImage.length() > 500) {
+                throw SupportService.invalid("O anexo de imagem deve ter no maximo 500 caracteres.")
+            }
+        }
+        var chosen = "OTHER"
+        if (category != null) {
+            chosen = category
+        }
+        var created = SupportRequestRecord(Ids.prefixed("support_"), userId, cleanSubject, cleanMessage, cleanEmail, cleanImage, chosen, "OPEN", null, null, null, now, null, null)
+        database.transaction(() -> {
+    store.insert(created)
+    this.mailTeam(created)
+    database.afterCommit(() -> sync.onOpened(created.id()))
+})
+        // The mirror in GitHub is born after the commit (SupportGithubSync).
+        return created
+    }
+    // The contact of the requester is the Reply-To of the team mail (only an address that has an @).
+    static String replyTo(contact: String) {
+        if (contact.contains("@")) {
+            return contact
+        }
+        return ""
+    }
+    mailTeam(r: SupportRequestRecord) {
+        if (supportEmail.length() == 0) {
+            return
+        }
+        var html = "<p>Novo pedido de suporte enviado pelo app.</p>" + "<ul>" + "<li><b>Usuario:</b> " + IdentityMailer.escapeHtml(r.contactEmail()) + "</li>" + "<li><b>Assunto:</b> " + IdentityMailer.escapeHtml(r.subject()) + "</li>" + "</ul>" + "<p><b>Mensagem:</b></p><pre style=\"white-space:pre-wrap\">" + IdentityMailer.escapeHtml(r.message()) + "</pre>"
+        mail.sendBulk(supportEmail, "[Suporte] " + r.subject(), html, "Suporte Énóis", SupportService.replyTo(r.contactEmail()), "", "SUPPORT")
+    }
+    static Int sized(limit: Int, fallback: Int) {
+        if (limit < 1) {
+            return fallback
+        }
+        if (limit > 100) {
+            return 100
+        }
+        return limit
+    }
+    List<SupportRequestRecord> list(category: String?, status: String?, limit: Int) = store.findFiltered(category, status, SupportService.sized(limit, 30))
+    List<SupportRequestRecord> mine(userId: String, limit: Int) = store.findByUser(userId, SupportService.sized(limit, 20))
+    SupportRequestRecord find(id: String) {
+        var found = store.findById(id)
+        if (found == null) {
+            throw SupportService.notFound()
+        }
+        return found
+    }
+    // Triage: moves the ticket between statuses and/or recategorises it. Closing or reopening tells the author
+    // and, after the commit, syncs the GitHub issue.
+    SupportRequestRecord update(id: String, status: String?, category: String?) {
+        var request = this.find(id)
+        var previous = request.status()
+        var nextStatus = previous
+        if (status != null) {
+            nextStatus = status
+        }
+        var nextCategory = request.category()
+        if (category != null) {
+            nextCategory = category
+        }
+        database.transaction(() -> {
+    store.updateStatusCategory(id, nextStatus, nextCategory)
+    var saved = this.find(id)
+    if (status != null && status != previous) {
+        if (status == "CLOSED") {
+            notifier.closed(saved)
+        }
+        else 
+            if (previous == "CLOSED") {
+                notifier.reopened(saved)
+            }
+        database.afterCommit(() -> sync.onStatusChanged(id, previous, status))
+    }
+})
+        return this.find(id)
+    }
+    // Official reply: stored, e-mailed to the contact and left as an in-app notice. OPEN becomes IN_PROGRESS;
+    // closing is a separate action.
+    SupportRequestRecord reply(id: String, adminId: String, message: String?) {
+        var clean = ""
+        if (message != null) {
+            clean = message.trim()
+        }
+        if (clean.length() < 5) {
+            throw Errors.api(400, "INVALID_SUPPORT_REPLY", "Escreva uma resposta com pelo menos 5 caracteres.")
+        }
+        if (clean.length() > SupportService.maxMessage()) {
+            throw Errors.api(400, "INVALID_SUPPORT_REPLY", "A resposta deve ter no máximo 4000 caracteres.")
+        }
+        var request = this.find(id)
+        var nextStatus = request.status()
+        if (nextStatus == "OPEN") {
+            nextStatus = "IN_PROGRESS"
+        }
+        database.transaction(() -> {
+    store.saveReply(id, nextStatus, clean, adminId, Time.nowIso())
+    var saved = this.find(id)
+    var threadMessage = thread.addFromPanel(id, clean)
+    var html = "<p>Olá,</p>" + "<p>Sobre o seu pedido <b>" + IdentityMailer.escapeHtml(saved.subject()) + "</b>:</p>" + "<blockquote style=\"margin:8px 0;padding:8px 12px;border-left:3px solid #ccc;" + "white-space:pre-wrap\">" + IdentityMailer.escapeHtml(clean) + "</blockquote>" + "<p>— Equipe Énóis</p>"
+    mail.sendBulk(saved.contactEmail(), "Resposta do suporte do Énóis — " + saved.subject(), html, "Suporte Énóis", "", "", "SUPPORT_REPLY")
+    if (saved.userId().trim().length() > 0) {
+        notifications.create(saved.userId(), "SUPORTE", adminId, "Resposta do suporte", clean, "/suporte", "Ver")
+    }
+    database.afterCommit(() -> sync.onReply(id, threadMessage.id(), adminId, clean))
+})
+        return this.find(id)
+    }
+}
+
+// GitHub -> panel: the webhook closes or reopens the local ticket and tells the author. It never calls GitHub
+// back (the state came from there), so there is no event loop.
+class SupportWebhook {
+    SupportStore store
+    Db database
+    SupportThread thread
+    SupportStatusNotifier notifier
+    SupportGithubConfig settings
+    Log log = Log("support.webhook")
+    public constructor(database: Db, store: SupportStore, thread: SupportThread, notifier: SupportStatusNotifier, settings: SupportGithubConfig) {
+        this.database = database
+        this.store = store
+        this.thread = thread
+        this.notifier = notifier
+        this.settings = settings
+    }
+    // An event from another repository must not touch the support (when the repository is configured).
+    Bool acceptsRepository(fullName: String) {
+        var expected = settings.repository()
+        return expected.trim().length() == 0 || expected.toLowerCase() == fullName.toLowerCase()
+    }
+    Bool applyIssueComment(issueNumber: Int, commentId: Long, authorLogin: String, body: String) {
+        var request = store.findByIssue(issueNumber)
+        if (request == null) {
+            log.warn("Comentário do GitHub na issue #" + issueNumber + " sem ticket de suporte correspondente")
+            return false
+        }
+        thread.addFromGithub(request.id(), commentId, authorLogin, body)
+        return true
+    }
+    // false only when no ticket matches the number.
+    Bool applyIssueState(issueNumber: Int, state: String) {
+        var request = store.findByIssue(issueNumber)
+        if (request == null) {
+            log.warn("Webhook do GitHub para a issue #" + issueNumber + " sem ticket de suporte correspondente")
+            return false
+        }
+        var lower = state.toLowerCase()
+        if (lower == "closed") {
+            if (request.status() != "CLOSED") {
+                database.transaction(() -> {
+    store.updateStatus(request.id(), "CLOSED")
+    var saved = store.findById(request.id())
+    if (saved != null) {
+        notifier.closed(saved)
+    }
+})
+            }
+            return true
+        }
+        if (lower == "open") {
+            if (request.status() == "CLOSED") {
+                database.transaction(() -> {
+    store.updateStatus(request.id(), "OPEN")
+    var saved = store.findById(request.id())
+    if (saved != null) {
+        notifier.reopened(saved)
+    }
+})
+            }
+        }
+        return true
+    }
+}

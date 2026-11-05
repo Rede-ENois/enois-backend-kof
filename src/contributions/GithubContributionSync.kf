@@ -1,0 +1,503 @@
+package contributions
+
+import kernel.log.*
+import kernel.text.*
+import kernel.time.*
+import kernel.error.*
+import kernel.id.*
+
+// Counters and state of one sync run.
+class SyncRun {
+    Bool dryRun
+    Bool full
+    List<String> authors
+    Bool targeted
+    String started
+    Int fetched = 0
+    Int created = 0
+    Int updated = 0
+    Int skipped = 0
+    Int detailsFetched = 0
+    Int revertedFlagged = 0
+    Int issuesFetched = 0
+    Int issuesCreated = 0
+    Int issuesUpdated = 0
+    Int sealsRecalculated = 0
+    Int detailBudget
+    Bool rateLimited = false
+    List<String> names = listOf<String>()
+    List<String> errors = listOf<String>()
+    List<String> affectedUsers = listOf<String>()
+    public constructor(dryRun: Bool, full: Bool, authors: List<String>, started: String, detailBudget: Int) {
+        this.dryRun = dryRun
+        this.full = full
+        this.authors = authors
+        this.targeted = authors.size() > 0
+        this.started = started
+        this.detailBudget = detailBudget
+    }
+    addError(message: String) {
+        if (errors.size() < 20) {
+            errors.add(message)
+        }
+    }
+    touch(userId: String?) {
+        if (userId != null) {
+            if (!affectedUsers.contains(userId)) {
+                affectedUsers.add(userId)
+            }
+        }
+    }
+}
+
+// Imports merged pull requests and issues of the eligible repositories and recalculates the seals. The count derives
+// from persisted evidence: a merged PR becomes validated evidence on its own (GitHub is the source); an issue only
+// counts with a qualifying label or when a maintainer validates it. Idempotent by (repository, kind, number) and
+// bounded by a detail budget so the API limit is not blown.
+class GithubContributionSync {
+    GithubGateway gateway
+    ContributionsStore store
+    ContributorSealService seals
+    Int maxPages
+    Int maxDetails
+    List<String> qualifiedLabels
+    String organization
+    Log log = Log("contributions.sync")
+    public constructor(gateway: GithubGateway, store: ContributionsStore, seals: ContributorSealService, maxPages: Int, maxDetails: Int, qualifiedLabels: String, organization: String) {
+        this.gateway = gateway
+        this.store = store
+        this.seals = seals
+        this.maxPages = GithubContributionSync.clamp(maxPages, 1, 20)
+        this.maxDetails = GithubContributionSync.clamp(maxDetails, 1, 200)
+        this.qualifiedLabels = GithubContributionSync.parseLabels(qualifiedLabels)
+        this.organization = organization.trim()
+    }
+    static Int clamp(v: Int, low: Int, high: Int) {
+        var out = v
+        if (out > high) {
+            out = high
+        }
+        if (out < low) {
+            out = low
+        }
+        return out
+    }
+    static List<String> parseLabels(csv: String) {
+        var out = listOf<String>()
+        for (var part in csv.split(",")) {
+            var label = part.trim().toLowerCase()
+            if (label.length() > 0) {
+                out.add(label)
+            }
+        }
+        return out
+    }
+    SyncReport sync(dryRun: Bool, full: Bool, requested: List<String>) = this.execute(dryRun, full, requested, listOf<String>())
+    // Only the contributions of one GitHub link: what runs when a person connects the account (or asks to verify
+    // again). The cut avoids spending the detail budget on other people's pull requests.
+    SyncReport syncForGithubUser(githubUserId: String) {
+        if (githubUserId.trim().length() == 0) {
+            throw Errors.api(400, "INVALID_GITHUB_IDENTITY", "Vínculo do GitHub inválido.")
+        }
+        return this.execute(false, false, listOf<String>(), listOf(githubUserId))
+    }
+    SyncReport execute(dryRun: Bool, full: Bool, requested: List<String>, authors: List<String>) {
+        var started = Time.nowIso()
+        var run = SyncRun(dryRun, full, authors, started, maxDetails)
+        if (!dryRun) {
+            this.discoverOrganization(run)
+        }
+        var selected = this.select(store.repositories(), requested)
+        var stopped = false
+        for (var repository in selected) {
+            if (!stopped) {
+                run.names.add(repository.repository())
+                var failure = this.processRepository(run, repository)
+                if (failure.length() > 0) {
+                    stopped = true
+                }
+            }
+        }
+        if (!dryRun) {
+            for (var userId in run.affectedUsers) {
+                seals.recalculate(userId)
+                run.sealsRecalculated = run.sealsRecalculated + 1
+            }
+        }
+        return SyncReport(dryRun, full, run.names, run.fetched, run.created, run.updated, run.skipped, run.detailsFetched, run.revertedFlagged, run.issuesFetched, run.issuesCreated, run.issuesUpdated, run.sealsRecalculated, run.rateLimited, run.errors, started, Time.nowIso())
+    }
+    // Every public repository of the organization is eligible, including the ones that appear later: it is born
+    // enabled. An existing row is never changed, so what the administration switched off stays off. A GitHub
+    // failure does not stop the cycle: the list that already exists is what counts.
+    discoverOrganization(run: SyncRun) {
+        if (organization.length() == 0) {
+            return
+        }
+        try {
+            var known = listOf<String>()
+            for (var r in store.repositories()) {
+                known.add(r.repository().toLowerCase())
+            }
+            var prefix = organization.toLowerCase() + "/"
+            for (var name in gateway.organizationRepositories(organization, maxPages)) {
+                var lower = name.toLowerCase()
+                if (lower.startsWith(prefix) && !known.contains(lower)) {
+                    store.saveRepository(GhRepository(name, true, run.started, null))
+                }
+            }
+        } catch (String e) {
+            run.errors.add("organization-discovery: GITHUB_ERROR")
+        }
+    }
+    List<GhRepository> select(all: List<GhRepository>, requested: List<String>) {
+        var out = listOf<GhRepository>()
+        if (requested.size() == 0) {
+            for (var r in all) {
+                if (r.enabled()) {
+                    out.add(r)
+                }
+            }
+            return out
+        }
+        for (var name in requested) {
+            var found = ContribText.noRepo()
+            for (var r in all) {
+                if (r.repository() == name) {
+                    found = r
+                }
+            }
+            if (found == null) {
+                throw Errors.api(400, "GITHUB_REPOSITORY_NOT_ELIGIBLE", "Repositório não está na lista elegível: " + name)
+            }
+            if (!found.enabled()) {
+                throw Errors.api(400, "GITHUB_REPOSITORY_DISABLED", "Repositório desabilitado para selos: " + name)
+            }
+            out.add(found)
+        }
+        return out
+    }
+    // "" when the repository went fine, else the failure (which stops the cycle). The identities seen are marked ERROR
+    // on a failure and OK on success, like the Java try/catch/finally.
+    String processRepository(run: SyncRun, repository: GhRepository) {
+        var seen = listOf<String>()
+        var failure = ""
+        try {
+            this.importRepository(run, repository, seen)
+        } catch (String e) {
+            failure = e
+            if (e.startsWith(GithubGateway.rateLimitTag())) {
+                run.rateLimited = true
+            }
+            else {
+                log.warn("github_sync_failed repository=" + repository.repository())
+            }
+            run.addError(repository.repository() + ": " + e)
+        }
+        if (failure.length() > 0 && !run.dryRun) {
+            var ids = seen
+            if (run.targeted) {
+                ids = run.authors
+            }
+            for (var githubId in ids) {
+                if (githubId.trim().length() > 0) {
+                    store.markSynced(githubId, "ERROR", failure, run.started)
+                }
+            }
+        }
+        return failure
+    }
+    importRepository(run: SyncRun, repository: GhRepository, seen: List<String>) {
+        var since = ContribText.none()
+        var last = repository.lastSyncedAt()
+        if (!run.full && last != null) {
+            since = Time.plusSeconds(last, 0L - 86400L)
+        }
+        var pulls = gateway.mergedPullRequests(repository.repository(), since, maxPages)
+        run.fetched = run.fetched + pulls.size()
+        for (var pull in pulls) {
+            seen.add(pull.authorId())
+            if (!run.targeted || run.authors.contains(pull.authorId())) {
+                this.importPull(run, repository, pull)
+            }
+        }
+        // A "Revert ..." PR that mentions #N marks evidence N. A single-link sync leaves other people's evidence alone.
+        if (!run.targeted) {
+            for (var pull in pulls) {
+                this.flagRevert(run, repository, pull)
+            }
+        }
+        var issues = gateway.issues(repository.repository(), since, maxPages)
+        run.issuesFetched = run.issuesFetched + issues.size()
+        for (var issue in issues) {
+            seen.add(issue.authorId())
+            if (!run.targeted || run.authors.contains(issue.authorId())) {
+                this.importIssue(run, repository, issue)
+            }
+        }
+        if (!run.dryRun) {
+            if (run.targeted) {
+                for (var githubId in run.authors) {
+                    store.markSynced(githubId, "OK", null, run.started)
+                }
+            }
+            else {
+                store.saveRepository(GhRepository(repository.repository(), repository.enabled(), repository.addedAt(), run.started))
+                for (var githubId in seen) {
+                    if (githubId.trim().length() > 0) {
+                        store.markSynced(githubId, "OK", null, run.started)
+                    }
+                }
+            }
+        }
+    }
+    String? userIdOf(githubUserId: String) {
+        if (githubUserId.trim().length() == 0) {
+            return null
+        }
+        var identity = store.identityByGithub(githubUserId)
+        if (identity == null) {
+            return null
+        }
+        return identity.userId()
+    }
+    static Bool sameInstant(a: String?, b: String?) {
+        if (a == null) {
+            return b == null
+        }
+        if (b == null) {
+            return false
+        }
+        return Time.toMillis(a) == Time.toMillis(b)
+    }
+    importPull(run: SyncRun, repository: GhRepository, pull: GhPullRequest) {
+        var userId = this.userIdOf(pull.authorId())
+        var number = pull.number() as Int
+        var existing = store.findByObject(repository.repository(), "PULL_REQUEST", number)
+        var needsDetails = existing == null
+        if (existing != null) {
+            needsDetails = !existing.detailsFetched || !GithubContributionSync.sameInstant(existing.githubUpdatedAt, pull.updatedAt())
+        }
+        var gotDetails = false
+        var detail = pull
+        if (needsDetails && run.detailBudget > 0) {
+            detail = gateway.withDetails(repository.repository(), pull)
+            run.detailBudget = run.detailBudget - 1
+            run.detailsFetched = run.detailsFetched + 1
+            gotDetails = true
+        }
+        else 
+            if (needsDetails) {
+                run.skipped = run.skipped + 1
+            }
+        // A merged PR is accepted work: the evidence is born validated. Human review can still contest or revoke it.
+        var status = "VALIDATED"
+        var hasTests = false
+        var score = 0
+        var signals = ContribText.none()
+        var files = ContribText.none()
+        if (existing != null) {
+            if (existing.reviewedBy != null) {
+                status = existing.status
+            }
+            hasTests = existing.hasTests
+            score = existing.score
+            signals = existing.signalsJson
+            files = existing.filesJson
+        }
+        if (gotDetails) {
+            hasTests = GithubContributionSync.hasTests(detail.files())
+            score = GithubContributionSync.score(hasTests, detail.approvalsCount(), detail.changedFiles())
+            signals = GithubContributionSync.signalsJson(hasTests, detail)
+            files = GithubContributionSync.truncate(json.encode(detail.files()), 20000)
+        }
+        var title = GithubContributionSync.safe(detail.title(), 500)
+        var url = GithubContributionSync.safe(detail.url(), 500)
+        if (existing != null) {
+            existing.userId = userId
+            existing.title = title
+            existing.url = url
+            existing.state = detail.state()
+            existing.openedAt = detail.openedAt()
+            existing.mergedAt = detail.mergedAt()
+            if (gotDetails) {
+                existing.githubUpdatedAt = detail.updatedAt()
+                existing.reviewsCount = detail.reviewsCount()
+                existing.approvalsCount = detail.approvalsCount()
+                existing.changesRequestedCount = detail.changesRequestedCount()
+            }
+            existing.detailsFetched = gotDetails || existing.detailsFetched
+            existing.additions = detail.additions()
+            existing.deletions = detail.deletions()
+            existing.changedFiles = detail.changedFiles()
+            existing.filesJson = files
+            existing.hasTests = hasTests
+            existing.score = score
+            existing.signalsJson = signals
+            existing.status = status
+            existing.updatedAt = run.started
+            if (!run.dryRun) {
+                store.save(existing)
+            }
+            run.updated = run.updated + 1
+        }
+        else {
+            var c = GhContribution(Ids.prefixed("ghc_"), detail.authorId(), detail.authorLogin(), repository.repository(), "PULL_REQUEST", number, "CODE", status, run.started)
+            c.userId = userId
+            c.objectId = detail.nodeId()
+            c.title = title
+            c.url = url
+            c.state = detail.state()
+            c.openedAt = detail.openedAt()
+            c.mergedAt = detail.mergedAt()
+            if (gotDetails) {
+                c.githubUpdatedAt = detail.updatedAt()
+            }
+            c.detailsFetched = gotDetails
+            c.additions = detail.additions()
+            c.deletions = detail.deletions()
+            c.changedFiles = detail.changedFiles()
+            c.filesJson = files
+            c.reviewsCount = detail.reviewsCount()
+            c.approvalsCount = detail.approvalsCount()
+            c.changesRequestedCount = detail.changesRequestedCount()
+            c.hasTests = hasTests
+            c.score = score
+            c.signalsJson = signals
+            if (!run.dryRun) {
+                store.save(c)
+                store.appendAudit(c.id, null, "IMPORTED", null, status, "PR #" + detail.number() + " importado de " + repository.repository(), run.started)
+            }
+            run.created = run.created + 1
+        }
+        run.touch(userId)
+    }
+    flagRevert(run: SyncRun, repository: GhRepository, pull: GhPullRequest) {
+        var target = GithubContributionSync.revertTarget(pull.title(), pull.body())
+        if (target == 0) {
+            return
+        }
+        var contribution = store.findByObject(repository.repository(), "PULL_REQUEST", target)
+        if (contribution != null) {
+            if (!contribution.reverted) {
+                if (!run.dryRun) {
+                    contribution.reverted = true
+                    contribution.updatedAt = run.started
+                    store.save(contribution)
+                    store.appendAudit(contribution.id, null, "REVERT_DETECTED", contribution.status, contribution.status, "Revertido pelo PR #" + pull.number(), run.started)
+                }
+                run.revertedFlagged = run.revertedFlagged + 1
+            }
+        }
+    }
+    importIssue(run: SyncRun, repository: GhRepository, issue: GhIssue) {
+        var userId = this.userIdOf(issue.authorId())
+        var number = issue.number() as Int
+        var existing = store.findByObject(repository.repository(), "ISSUE", number)
+        var manual = false
+        if (existing != null) {
+            manual = existing.reviewedBy != null
+        }
+        var status = "PENDING"
+        if (this.qualified(issue.labels())) {
+            status = "VALIDATED"
+        }
+        if (manual && existing != null) {
+            status = existing.status
+        }
+        // The column keeps the labels as short JSON; truncating avoids blowing the varchar.
+        var labels = GithubContributionSync.truncate(json.encode(issue.labels()), 1000)
+        var title = GithubContributionSync.safe(issue.title(), 500)
+        var url = GithubContributionSync.safe(issue.url(), 500)
+        if (existing != null) {
+            existing.userId = userId
+            existing.title = title
+            existing.url = url
+            existing.state = issue.state()
+            existing.openedAt = issue.openedAt()
+            existing.closedAt = issue.closedAt()
+            existing.githubUpdatedAt = issue.updatedAt()
+            existing.labels = labels
+            existing.status = status
+            existing.updatedAt = run.started
+            if (!run.dryRun) {
+                store.save(existing)
+            }
+            run.issuesUpdated = run.issuesUpdated + 1
+        }
+        else {
+            var c = GhContribution(Ids.prefixed("ghc_"), issue.authorId(), issue.authorLogin(), repository.repository(), "ISSUE", number, "ISSUES", status, run.started)
+            c.userId = userId
+            c.objectId = issue.nodeId()
+            c.title = title
+            c.url = url
+            c.state = issue.state()
+            c.openedAt = issue.openedAt()
+            c.closedAt = issue.closedAt()
+            c.githubUpdatedAt = issue.updatedAt()
+            c.labels = labels
+            c.signalsJson = labels
+            if (!run.dryRun) {
+                store.save(c)
+                store.appendAudit(c.id, null, "IMPORTED", null, status, "Issue #" + issue.number() + " importada de " + repository.repository(), run.started)
+            }
+            run.issuesCreated = run.issuesCreated + 1
+        }
+        run.touch(userId)
+    }
+    Bool qualified(labels: List<String>) {
+        if (qualifiedLabels.size() == 0) {
+            return false
+        }
+        for (var label in labels) {
+            if (label.trim().length() > 0 && qualifiedLabels.contains(label.trim().toLowerCase())) {
+                return true
+            }
+        }
+        return false
+    }
+    static Bool hasTests(files: List<String>) {
+        for (var path in files) {
+            if (Regexes.first("(?i)(^|/)(test|tests|__tests__|spec)(/|$)|(\\.test\\.|\\.spec\\.)", path) != null) {
+                return true
+            }
+        }
+        return false
+    }
+    static Int score(hasTests: Bool, approvals: Int, changedFiles: Int) {
+        var score = 0
+        if (hasTests) {
+            score = score + 2
+        }
+        if (approvals > 0) {
+            score = score + 1
+        }
+        if (changedFiles >= 2) {
+            score = score + 1
+        }
+        return score
+    }
+    static String signalsJson(hasTests: Bool, pr: GhPullRequest) {
+        var lines = pr.additions() + pr.deletions()
+        var trivial = pr.changedFiles() <= 1 && lines < 5
+        return "{\"tests\":" + hasTests + ",\"approvals\":" + pr.approvalsCount() + ",\"changesRequested\":" + pr.changesRequestedCount() + ",\"changedFiles\":" + pr.changedFiles() + ",\"lines\":" + lines + ",\"trivial\":" + trivial + "}"
+    }
+    static String truncate(v: String, max: Int) {
+        if (v.length() <= max) {
+            return v
+        }
+        return v.substring(0, max)
+    }
+    static String safe(v: String, max: Int) = GithubContributionSync.truncate(v.replaceAll("\\p{Cntrl}", "").trim(), max)
+    // The number a "revert" title/body points at, 0 when it is not a revert.
+    static Int revertTarget(title: String, body: String) {
+        var text = title + " " + body.toLowerCase()
+        if (!text.contains("revert")) {
+            return 0
+        }
+        var m = Regexes.first("#(\\d+)", text)
+        if (m == null) {
+            return 0
+        }
+        return m.groups().get(1).toInt()
+    }
+}

@@ -1,0 +1,90 @@
+package contributions
+
+import kernel.time.*
+import profile.*
+
+record VerifiedContributor(String userId, String? username, String displayName, String githubLogin, String sealName, Int evidenceCount, String grantedAt)
+
+// Who already has verified contributions (an active seal) and a linked GitHub account. The contributors panel lists
+// the person from this read; the name shown comes from the profile and the handle from the link, never from a form.
+class VerifiedContributors {
+    ContributionsStore store
+    ProfileDirectory directory
+    public constructor(store: ContributionsStore, directory: ProfileDirectory) {
+        this.store = store
+        this.directory = directory
+    }
+    VerifiedContributor? find(userId: String) {
+        var active = store.activeSeals(userId)
+        if (active.size() == 0) {
+            return null
+        }
+        var identity = store.identityByUser(userId)
+        if (identity == null) {
+            return null
+        }
+        return this.view(userId, active, identity)
+    }
+    List<VerifiedContributor> list() {
+        var users = listOf<String>()
+        var all = store.allActiveSeals()
+        for (var seal in all) {
+            if (!users.contains(seal.userId())) {
+                users.add(seal.userId())
+            }
+        }
+        var result = listOf<VerifiedContributor>()
+        for (var userId in users) {
+            var mine = listOf<UserSealRecord>()
+            for (var seal in all) {
+                if (seal.userId() == userId) {
+                    mine.add(seal)
+                }
+            }
+            var identity = store.identityByUser(userId)
+            if (identity != null) {
+                result.add(this.view(userId, mine, identity))
+            }
+        }
+        return result
+    }
+    VerifiedContributor view(userId: String, active: List<UserSealRecord>, identity: GhIdentity) {
+        // By category order (stable inside it).
+        var ordered = listOf<UserSealRecord>()
+        for (var category in ContribEnums.categories()) {
+            for (var seal in active) {
+                if (seal.category() == category) {
+                    ordered.add(seal)
+                }
+            }
+        }
+        var names = listOf<String>()
+        var evidence = 0
+        var grantedAt = ""
+        for (var seal in ordered) {
+            var tier = SealTypes.find(seal.sealType())
+            if (tier != null) {
+                if (!names.contains(tier.displayName())) {
+                    names.add(tier.displayName())
+                }
+            }
+            evidence = evidence + seal.evidenceCount()
+            if (grantedAt.length() == 0 || Time.toMillis(seal.grantedAt()) > Time.toMillis(grantedAt)) {
+                grantedAt = seal.grantedAt()
+            }
+        }
+        var profile = directory.findById(userId)
+        var displayName = identity.githubLogin()
+        var username = ContribText.none()
+        if (profile != null) {
+            username = profile.username
+            if (profile.name.trim().length() > 0) {
+                displayName = profile.name
+            }
+            else {
+                displayName = profile.username
+            }
+        }
+        return VerifiedContributor(userId, username, displayName, identity.githubLogin(), String.join(" · ", names), evidence, grantedAt)
+    }
+}

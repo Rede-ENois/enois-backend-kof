@@ -1,0 +1,89 @@
+package support
+
+import kernel.config.*
+import kernel.error.*
+import kernel.log.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+
+// Configuration of the GitHub mirror of the support tickets. The token, the repository and the webhook secret
+// are stored ENCRYPTED in support_settings (same key as the app) and can change without a restart; the
+// environment (GITHUB_ISSUES_TOKEN, GITHUB_ISSUES_REPO, GITHUB_ISSUES_WEBHOOK_SECRET) is the fallback of a
+// fresh install. Nothing here hands a secret out: the panel only sees "configured" or not. Read on every use.
+class SupportGithubConfig {
+    SupportStore store
+    SecretCipher cipher
+    String envToken
+    String envRepo
+    String envSecret
+    Log log = Log("support.github.config")
+    public constructor(store: SupportStore, cipher: SecretCipher, envToken: String, envRepo: String, envSecret: String) {
+        this.store = store
+        this.cipher = cipher
+        this.envToken = envToken.trim()
+        this.envRepo = envRepo.trim()
+        this.envSecret = envSecret.trim()
+    }
+    static SupportGithubConfig fromConfig(cfg: Config, store: SupportStore, cipher: SecretCipher) = SupportGithubConfig(store, cipher, cfg.getStr("GITHUB_ISSUES_TOKEN", ""), cfg.getStr("GITHUB_ISSUES_REPO", ""), cfg.getStr("GITHUB_ISSUES_WEBHOOK_SECRET", ""))
+    static String tokenName() = "github_token"
+    static String repoName() = "github_repo"
+    static String secretName() = "github_webhook_secret"
+    String token() = this.value(SupportGithubConfig.tokenName(), envToken)
+    String repository() = this.value(SupportGithubConfig.repoName(), envRepo)
+    String webhookSecret() = this.value(SupportGithubConfig.secretName(), envSecret)
+    Bool tokenConfigured() = this.token().trim().length() > 0
+    Bool webhookSecretConfigured() = this.webhookSecret().trim().length() > 0
+    Bool enabled() = this.token().trim().length() > 0 && this.repository().trim().length() > 0
+    // A null field keeps the current value; an empty string removes it. Secrets need the cipher key.
+    update(token: String?, repository: String?, webhookSecret: String?) {
+        if (SupportGithubConfig.filled(token) || SupportGithubConfig.filled(webhookSecret)) {
+            cipher.requireEnabled()
+        }
+        if (repository != null) {
+            if (repository.trim().length() == 0) {
+                throw Errors.api(400, "INVALID_GITHUB_CONFIG", "Informe o repositório no formato dono/nome.")
+            }
+            if (!Regexes.matches("[\\w.-]+/[\\w.-]+", repository.trim())) {
+                throw Errors.api(400, "INVALID_GITHUB_CONFIG", "Repositório deve ser dono/nome.")
+            }
+        }
+        this.apply(SupportGithubConfig.tokenName(), token)
+        this.apply(SupportGithubConfig.repoName(), repository)
+        this.apply(SupportGithubConfig.secretName(), webhookSecret)
+    }
+    static Bool filled(v: String?) {
+        if (v == null) {
+            return false
+        }
+        return v.trim().length() > 0
+    }
+    apply(name: String, v: String?) {
+        if (v == null) {
+            return
+        }
+        var clean = v.trim()
+        if (clean.length() == 0) {
+            store.deleteSetting(name)
+            return
+        }
+        store.saveSetting(name, cipher.encrypt(clean), Time.nowIso())
+    }
+    String value(name: String, fallback: String) {
+        var plain = ""
+        try {
+            var stored = store.settingCipher(name)
+            if (stored != null) {
+                plain = cipher.decrypt(stored).trim()
+            }
+        } catch (String e) {
+            // key missing or changed: it does not take support down, it only turns the mirror off
+            log.warn("Configuração " + name + " do GitHub indisponível.")
+            plain = ""
+        }
+        if (plain.length() > 0) {
+            return plain
+        }
+        return fallback
+    }
+}

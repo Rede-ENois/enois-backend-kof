@@ -1,0 +1,145 @@
+package support
+
+import kernel.db.*
+
+// support_requests, support_messages and support_settings (the encrypted GitHub mirror settings).
+class SupportStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, user_id, subject, message, contact_email, image_url, category, status, admin_reply, replied_by, replied_at, created_at, github_issue_number, github_issue_url"
+    static SupportRequestRecord mapRow(r: DbRow) = SupportRequestRecord(r.getStr("id"), r.getStr("user_id"), r.getStr("subject"), r.getStr("message"), r.getStr("contact_email"), r.getStrOrNull("image_url"), r.getStr("category"), r.getStr("status"), r.getStrOrNull("admin_reply"), r.getStrOrNull("replied_by"), r.getInstantOrNull("replied_at"), r.getInstant("created_at"), r.getIntOrNull("github_issue_number"), r.getStrOrNull("github_issue_url"))
+    static List<SupportRequestRecord> mapped(rows: List<DbRow>) {
+        var out = listOf<SupportRequestRecord>()
+        for (var r in rows) {
+            out.add(SupportStore.mapRow(r))
+        }
+        return out
+    }
+    static Int cap(limit: Int) {
+        if (limit > 100) {
+            return 100
+        }
+        if (limit < 1) {
+            return 1
+        }
+        return limit
+    }
+    insert(s: SupportRequestRecord) {
+        var p = DbParams()
+        p.bindStr(s.id())
+        p.bindStr(s.userId())
+        p.bindStr(s.subject())
+        p.bindStr(s.message())
+        p.bindStr(s.contactEmail())
+        p.bindStrOrNull(s.imageUrl())
+        p.bindStr(s.category())
+        p.bindStr(s.status())
+        p.bindStrOrNull(s.adminReply())
+        p.bindStrOrNull(s.repliedBy())
+        p.bindInstantOrNull(s.repliedAt())
+        p.bindInstant(s.createdAt())
+        p.bindIntOrNull(s.githubIssueNumber())
+        p.bindStrOrNull(s.githubIssueUrl())
+        store.execute("insert into support_requests (" + SupportStore.columns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", p)
+    }
+    SupportRequestRecord? findById(id: String) {
+        var row = store.queryOptional("select " + SupportStore.columns() + " from support_requests where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return SupportStore.mapRow(row)
+    }
+    SupportRequestRecord? findByIssue(number: Int) {
+        var row = store.queryOptional("select " + SupportStore.columns() + " from support_requests where github_issue_number = ? order by created_at desc limit 1", DbParams().bindInt(number))
+        if (row == null) {
+            return null
+        }
+        return SupportStore.mapRow(row)
+    }
+    // Newest first; a null filter means any.
+    List<SupportRequestRecord> findFiltered(category: String?, status: String?, limit: Int) {
+        var sql = "select " + SupportStore.columns() + " from support_requests where 1 = 1"
+        var p = DbParams()
+        if (category != null) {
+            sql = sql + " and category = ?"
+            p.bindStr(category)
+        }
+        if (status != null) {
+            sql = sql + " and status = ?"
+            p.bindStr(status)
+        }
+        p.bindInt(SupportStore.cap(limit))
+        return SupportStore.mapped(store.queryList(sql + " order by created_at desc limit ?", p))
+    }
+    List<SupportRequestRecord> findByUser(userId: String, limit: Int) = SupportStore.mapped(store.queryList("select " + SupportStore.columns() + " from support_requests where user_id = ? order by created_at desc limit ?", DbParams().bindStr(userId).bindInt(SupportStore.cap(limit))))
+    Long countByUserSince(userId: String, since: String) = store.queryLong("select count(*) from support_requests where user_id = ? and created_at > ?", DbParams().bindStr(userId).bindInstant(since))
+    updateStatusCategory(id: String, status: String, category: String) {
+        store.execute("update support_requests set status = ?, category = ? where id = ?", DbParams().bindStr(status).bindStr(category).bindStr(id))
+    }
+    updateStatus(id: String, status: String) {
+        store.execute("update support_requests set status = ? where id = ?", DbParams().bindStr(status).bindStr(id))
+    }
+    saveReply(id: String, status: String, reply: String, adminId: String, at: String) {
+        store.execute("update support_requests set status = ?, admin_reply = ?, replied_by = ?, replied_at = ? where id = ?", DbParams().bindStr(status).bindStr(reply).bindStr(adminId).bindInstant(at).bindStr(id))
+    }
+    attachIssue(id: String, number: Int, url: String?) {
+        store.execute("update support_requests set github_issue_number = ?, github_issue_url = ? where id = ?", DbParams().bindInt(number).bindStrOrNull(url).bindStr(id))
+    }
+    // Thread.
+    static String messageColumns() = "id, request_id, direction, author_name, author_github_login, body, github_comment_id, created_at"
+    static SupportMessageRecord mapMessage(r: DbRow) = SupportMessageRecord(r.getStr("id"), r.getStr("request_id"), r.getStr("direction"), r.getStrOrNull("author_name"), r.getStrOrNull("author_github_login"), r.getStr("body"), SupportStore.commentOf(r), r.getInstant("created_at"))
+    static Long commentOf(r: DbRow) {
+        if (r.isNull("github_comment_id")) {
+            return 0L
+        }
+        return r.getLong("github_comment_id")
+    }
+    insertMessage(m: SupportMessageRecord) {
+        var p = DbParams()
+        p.bindStr(m.id())
+        p.bindStr(m.requestId())
+        p.bindStr(m.direction())
+        p.bindStrOrNull(m.authorName())
+        p.bindStrOrNull(m.authorGithubLogin())
+        p.bindStr(m.body())
+        if (m.githubCommentId() == 0L) {
+            p.bindLongOrNull(null)
+        }
+        else {
+            p.bindLong(m.githubCommentId())
+        }
+        p.bindInstant(m.createdAt())
+        store.execute("insert into support_messages (" + SupportStore.messageColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?)", p)
+    }
+    List<SupportMessageRecord> thread(requestId: String) {
+        var out = listOf<SupportMessageRecord>()
+        for (var r in store.queryList("select " + SupportStore.messageColumns() + " from support_messages where request_id = ? order by created_at asc, id asc", DbParams().bindStr(requestId))) {
+            out.add(SupportStore.mapMessage(r))
+        }
+        return out
+    }
+    Bool commentKnown(commentId: Long) = store.queryLong("select count(*) from support_messages where github_comment_id = ?", DbParams().bindLong(commentId)) > 0L
+    Bool commentOwnedByOther(commentId: Long, messageId: String) = store.queryLong("select count(*) from support_messages where github_comment_id = ? and id <> ?", DbParams().bindLong(commentId).bindStr(messageId)) > 0L
+    markComment(messageId: String, commentId: Long, authorName: String?, login: String?) {
+        store.execute("update support_messages set github_comment_id = ?, author_name = ?, author_github_login = ? where id = ?", DbParams().bindLong(commentId).bindStrOrNull(authorName).bindStrOrNull(login).bindStr(messageId))
+    }
+    // Settings.
+    String? settingCipher(name: String) {
+        var row = store.queryOptional("select value_cipher from support_settings where name = ?", DbParams().bindStr(name))
+        if (row == null) {
+            return null
+        }
+        return row.getStr("value_cipher")
+    }
+    saveSetting(name: String, cipher: String, at: String) {
+        var changed = store.execute("update support_settings set value_cipher = ?, updated_at = ? where name = ?", DbParams().bindStr(cipher).bindInstant(at).bindStr(name))
+        if (changed == 0) {
+            store.execute("insert into support_settings (name, value_cipher, updated_at) values (?, ?, ?)", DbParams().bindStr(name).bindStr(cipher).bindInstant(at))
+        }
+    }
+    deleteSetting(name: String) {
+        store.execute("delete from support_settings where name = ?", DbParams().bindStr(name))
+    }
+}

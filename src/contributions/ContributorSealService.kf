@@ -1,0 +1,337 @@
+package contributions
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.time.*
+import profile.*
+
+// The recognition rules: the level is derived from the count of verified evidence; human review exists to contest,
+// correct and qualify issues, never for the front end to grant. Each category shows only the highest tier reached.
+// When the count changes (promotion, revert, invalidated issue) the previous tier is revoked and the new one granted,
+// always with an audit event. A manual revocation is not undone by the sync: the admin has to grant again.
+class ContributorSealService {
+    ContributionsStore store
+    ProfileDirectory directory
+    Db database
+    public constructor(database: Db, store: ContributionsStore, directory: ProfileDirectory) {
+        this.database = database
+        this.store = store
+        this.directory = directory
+    }
+    GhContribution required(contributionId: String) {
+        var found = store.findById(contributionId)
+        if (found == null) {
+            throw ContributorSealService.notFound()
+        }
+        return found
+    }
+    // The tier named by the request: an unknown name is a body Jackson cannot read, a plain 400.
+    static SealTier tierOf(type: String) {
+        var tier = SealTypes.find(type)
+        if (tier == null) {
+            throw Errors.badRequest()
+        }
+        return tier
+    }
+    UserSealRecord activeSeal(userId: String, sealType: String) {
+        var found = store.findSeal(userId, sealType)
+        if (found == null) {
+            throw Errors.api(404, "SEAL_NOT_ACTIVE", "Este selo não está ativo.")
+        }
+        if (found.status() != "ACTIVE") {
+            throw Errors.api(404, "SEAL_NOT_ACTIVE", "Este selo não está ativo.")
+        }
+        return found
+    }
+    static String notFound() = Errors.api(404, "CONTRIBUTION_NOT_FOUND", "Evidência de contribuição não encontrada.")
+    static String userNotFound() = Errors.api(404, "USER_NOT_FOUND", "Usuário não encontrado.")
+    static Bool allowed(from: String, to: String) {
+        if (from == to) {
+            return true
+        }
+        if (from == "PENDING") {
+            return to == "VALIDATED" || to == "REJECTED" || to == "CONTESTED"
+        }
+        if (from == "VALIDATED") {
+            return to == "REVOKED" || to == "CONTESTED"
+        }
+        if (from == "CONTESTED") {
+            return to == "VALIDATED" || to == "REJECTED" || to == "REVOKED"
+        }
+        return to == "CONTESTED" || to == "VALIDATED"
+    }
+    static String? cleanNote(note: String?) {
+        if (note == null) {
+            return null
+        }
+        if (note.trim().length() == 0) {
+            return null
+        }
+        return note.trim()
+    }
+    AdminContributionView review(contributionId: String, target: String?, note: String?, adminId: String) {
+        if (target == null) {
+            throw Errors.api(400, "INVALID_REVIEW_STATUS", "Informe um estado de revisão válido.")
+        }
+        if (target == "PENDING") {
+            throw Errors.api(400, "INVALID_REVIEW_STATUS", "Informe um estado de revisão válido.")
+        }
+        var contribution = this.required(contributionId)
+        var previous = contribution.status
+        if (!ContributorSealService.allowed(previous, target)) {
+            throw Errors.api(409, "INVALID_STATUS_TRANSITION", "Esta evidência não pode passar de " + previous + " para " + target + ".")
+        }
+        var now = Time.nowIso()
+        var clean = ContributorSealService.cleanNote(note)
+        contribution.status = target
+        contribution.reviewNote = clean
+        contribution.reviewedBy = adminId
+        contribution.reviewedAt = now
+        contribution.updatedAt = now
+        database.transaction(() -> {
+    store.save(contribution)
+    store.appendAudit(contribution.id, adminId, target, previous, target, clean, now)
+    var owner = contribution.userId
+    if (owner != null) {
+        this.recalculate(owner)
+    }
+})
+        return this.adminView(contribution)
+    }
+    // Recomputes the tiers of the implemented categories from the stored evidence. Idempotent.
+    recalculate(userId: String) {
+        database.transaction(() -> {
+    this.recalculateCategory(userId, "CODE")
+    this.recalculateCategory(userId, "ISSUES")
+})
+    }
+    Int recalculateAll() {
+        var total = 0
+        for (var identity in store.identities()) {
+            this.recalculate(identity.userId())
+            total = total + 1
+        }
+        return total
+    }
+    recalculateCategory(userId: String, category: String) {
+        var count = store.countCountable(userId, category)
+        var target = SealTypes.forCount(category, count)
+        var targetName = ""
+        if (target != null) {
+            targetName = target.name()
+        }
+        var now = Time.nowIso()
+        for (var tier in SealTypes.of(category)) {
+            var existing = store.findSeal(userId, tier.name())
+            if (tier.name() == targetName) {
+                this.activate(userId, tier, count, existing, now)
+            }
+            else 
+                if (existing != null) {
+                    if (existing.status() == "ACTIVE") {
+                        var reason = "Nível atualizado: agora " + count + " contribuições verificadas."
+                        if (count == 0) {
+                            reason = "Sem evidências válidas no momento."
+                        }
+                        store.saveSeal(ContributorSealService.revoked(existing, now, null, reason))
+                        store.appendSealEvent(userId, tier.name(), "REVOKED", null, reason, now)
+                    }
+                }
+        }
+    }
+    static UserSealRecord revoked(s: UserSealRecord, at: String, by: String?, reason: String) = UserSealRecord(s.id(), s.userId(), s.sealType(), s.category(), "REVOKED", s.grantedAt(), s.grantedBy(), at, by, reason, s.evidenceCount())
+    static UserSealRecord regranted(s: UserSealRecord, at: String, by: String?, evidence: Int) = UserSealRecord(s.id(), s.userId(), s.sealType(), s.category(), "ACTIVE", at, by, null, null, null, evidence)
+    activate(userId: String, tier: SealTier, count: Int, existing: UserSealRecord?, now: String) {
+        var note = "Nível alcançado: " + count + " contribuições verificadas."
+        if (existing != null) {
+            if (existing.status() == "ACTIVE") {
+                if (existing.evidenceCount() != count) {
+                    store.saveSeal(UserSealRecord(existing.id(), existing.userId(), existing.sealType(), existing.category(), "ACTIVE", existing.grantedAt(), existing.grantedBy(), null, null, null, count))
+                }
+                return
+            }
+            // A manual revocation stays until an explicit grant by the administration.
+            if (existing.revokedBy() != null) {
+                return
+            }
+            store.saveSeal(ContributorSealService.regranted(existing, now, null, count))
+            store.appendSealEvent(userId, tier.name(), "GRANTED", null, note, now)
+            return
+        }
+        store.saveSeal(UserSealRecord(Ids.prefixed("seal_"), userId, tier.name(), tier.category(), "ACTIVE", now, null, null, null, null, count))
+        store.appendSealEvent(userId, tier.name(), "GRANTED", null, note, now)
+    }
+    grantSeal(userId: String, type: String?, reason: String?, adminId: String) {
+        if (type == null) {
+            throw Errors.api(400, "SEAL_TYPE_REQUIRED", "Informe o tipo de selo.")
+        }
+        var tier = ContributorSealService.tierOf(type)
+        var now = Time.nowIso()
+        var cleanReason = "Concessão manual da administração."
+        var given = ContributorSealService.cleanNote(reason)
+        if (given != null) {
+            cleanReason = given
+        }
+        var count = store.countCountable(userId, tier.category())
+        var existing = store.findSeal(userId, tier.name())
+        if (existing != null) {
+            if (existing.status() == "ACTIVE") {
+                return
+            }
+        }
+        var granted = UserSealRecord(Ids.prefixed("seal_"), userId, tier.name(), tier.category(), "ACTIVE", now, adminId, null, null, null, count)
+        if (existing != null) {
+            granted = ContributorSealService.regranted(existing, now, adminId, count)
+        }
+        database.transaction(() -> {
+    store.saveSeal(granted)
+    store.appendSealEvent(userId, tier.name(), "GRANTED", adminId, cleanReason, now)
+})
+    }
+    revokeSeal(userId: String, type: String?, reason: String?, adminId: String) {
+        if (type == null) {
+            throw Errors.api(400, "SEAL_TYPE_REQUIRED", "Informe o tipo de selo.")
+        }
+        var tier = ContributorSealService.tierOf(type)
+        var seal = this.activeSeal(userId, tier.name())
+        var now = Time.nowIso()
+        var cleanReason = "Revogação manual pela administração."
+        var given = ContributorSealService.cleanNote(reason)
+        if (given != null) {
+            cleanReason = given
+        }
+        database.transaction(() -> {
+    store.saveSeal(ContributorSealService.revoked(seal, now, adminId, cleanReason))
+    store.appendSealEvent(userId, tier.name(), "REVOKED", adminId, cleanReason, now)
+})
+    }
+    List<AdminContributionView> adminList(status: String?, kind: String?, limit: Int) {
+        var size = limit
+        if (size > 200) {
+            size = 200
+        }
+        if (size < 1) {
+            size = 1
+        }
+        var out = listOf<AdminContributionView>()
+        for (var c in store.list(status, kind, size)) {
+            out.add(this.adminView(c))
+        }
+        return out
+    }
+    AdminContributionDetail adminDetail(contributionId: String) {
+        var contribution = store.findById(contributionId)
+        if (contribution == null) {
+            throw ContributorSealService.notFound()
+        }
+        return AdminContributionDetail(this.adminView(contribution), store.audit(contributionId, 100))
+    }
+    String profileId(username: String) {
+        var profile = directory.findByUsername(username)
+        if (profile == null) {
+            throw ContributorSealService.userNotFound()
+        }
+        return profile.id
+    }
+    List<PublicSealView> publicSeals(username: String) {
+        var userId = this.profileId(username)
+        var active = store.activeSeals(userId)
+        var out = listOf<PublicSealView>()
+        // Ordered by the category (stable inside it, by the tier order).
+        for (var category in ContribEnums.categories()) {
+            for (var tier in SealTypes.of(category)) {
+                for (var seal in active) {
+                    if (seal.sealType() == tier.name()) {
+                        out.add(PublicSealView(tier.name(), tier.displayName(), tier.description(), seal.category(), ContribEnums.categoryName(seal.category()), seal.grantedAt(), seal.evidenceCount(), tier.minCount(), ContributorSealService.maxOf(tier), tier.emblem()))
+                    }
+                }
+            }
+        }
+        return out
+    }
+    static Int? maxOf(tier: SealTier) {
+        if (tier.maxCount() == SealTypes.unbounded()) {
+            return ContribText.noInt()
+        }
+        return tier.maxCount()
+    }
+    // Public evidence, paginated; the profile has no fixed ceiling of items.
+    EvidencePage publicEvidence(username: String, category: String, page: Int, size: Int) {
+        var userId = this.profileId(username)
+        var safeSize = size
+        if (safeSize > 100) {
+            safeSize = 100
+        }
+        if (safeSize < 1) {
+            safeSize = 1
+        }
+        var safePage = page
+        if (safePage < 0) {
+            safePage = 0
+        }
+        var total = store.countCountable(userId, category)
+        var items = listOf<EvidenceView>()
+        for (var c in store.countablePage(userId, category, safePage, safeSize)) {
+            var happened = c.mergedAt
+            if (happened == null) {
+                happened = c.closedAt
+            }
+            items.add(EvidenceView(c.kind, c.repository, c.number, c.title, c.url, happened, c.category))
+        }
+        var seen = safePage + 1 as Long
+        seen = seen * safeSize
+        var more = seen < total
+        return EvidencePage(items, total, safePage, safeSize, more)
+    }
+    CriteriaView criteria() {
+        var repos = listOf<String>()
+        for (var r in store.enabledRepositories()) {
+            repos.add(r.repository())
+        }
+        var categories = listOf<CategoryCriteria>()
+        for (var category in ContribEnums.categories()) {
+            var tiers = SealTypes.of(category)
+            if (tiers.size() > 0) {
+                var rows = listOf<TierCriteria>()
+                for (var t in tiers) {
+                    rows.add(TierCriteria(t.name(), t.displayName(), t.description(), t.minCount(), ContributorSealService.maxOf(t), t.emblem()))
+                }
+                categories.add(CategoryCriteria(category, ContribEnums.categoryName(category), ContribEnums.categoryDescription(category), rows))
+            }
+        }
+        var policies = listOf("PR integrado em repositório elegível conta automaticamente; PR revertido não conta.", "Issue conta quando tem label de qualificação ou é validada por um mantenedor.", "Cada categoria exibe apenas o nível mais alto alcançado.", "A pessoa precisa manter o GitHub vinculado à própria conta do Énóis.", "Sincronização é periódica: os números podem levar alguns minutos para refletir.", "Selo é reconhecimento de trabalho, não privilégio de moderação.")
+        return CriteriaView(repos, categories, policies, ContribEnums.statuses())
+    }
+    List<RepositoryView> adminRepositories() {
+        var out = listOf<RepositoryView>()
+        for (var r in store.repositories()) {
+            out.add(RepositoryView(r.repository(), r.enabled(), r.lastSyncedAt()))
+        }
+        return out
+    }
+    RepositoryView setRepositoryEnabled(repository: String?, enabled: Bool) {
+        var name = ""
+        if (repository != null) {
+            name = repository
+        }
+        for (var r in store.repositories()) {
+            if (r.repository() == name) {
+                store.saveRepository(GhRepository(r.repository(), enabled, r.addedAt(), r.lastSyncedAt()))
+                return RepositoryView(r.repository(), enabled, r.lastSyncedAt())
+            }
+        }
+        throw Errors.api(404, "GITHUB_REPOSITORY_NOT_FOUND", "Repositório não cadastrado.")
+    }
+    AdminContributionView adminView(c: GhContribution) {
+        var username = ContribText.none()
+        var owner = c.userId
+        if (owner != null) {
+            var profile = directory.findById(owner)
+            if (profile != null) {
+                username = profile.username
+            }
+        }
+        return AdminContributionView(c.id, c.userId, username, c.githubLogin, c.repository, c.kind, c.number, c.title, c.url, c.labels, c.mergedAt, c.closedAt, c.changedFiles, c.additions, c.deletions, c.hasTests, c.reverted, c.status, c.score, c.reviewNote, c.reviewedBy, c.reviewedAt, c.createdAt)
+    }
+}

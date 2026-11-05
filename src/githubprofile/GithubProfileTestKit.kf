@@ -1,0 +1,124 @@
+package githubprofile
+
+import contributions.*
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import profile.*
+import projects.*
+
+// A public GitHub reader the tests feed, counting the trips per login.
+class GithubProfileFakeGateway extends GithubProfileGateway {
+    List<GithubUserRepository> repos = listOf<GithubUserRepository>()
+    String readmeMarkdown = ""
+    String readmeRepoUrl = ""
+    Bool hasReadme = false
+    Map<String,Int> listCalls = mapOf<String, Int>()
+    Map<String,Int> readmeCalls = mapOf<String, Int>()
+    public constructor() {
+        super()
+    }
+    List<GithubUserRepository> listUserRepositories(login: String, maxPages: Int) {
+        listCalls.put(login, GithubProfileFakeGateway.next(listCalls, login))
+        return repos
+    }
+    GithubProfileReadme? profileReadme(login: String) {
+        readmeCalls.put(login, GithubProfileFakeGateway.next(readmeCalls, login))
+        if (!hasReadme) {
+            return null
+        }
+        return GithubProfileReadme(readmeMarkdown, readmeRepoUrl, "main")
+    }
+    static Int next(m: Map<String,Int>, login: String) {
+        var cur = m.get(login)
+        if (cur == null) {
+            return 1
+        }
+        return cur + 1
+    }
+    Int listTrips(login: String) {
+        var cur = listCalls.get(login)
+        if (cur == null) {
+            return 0
+        }
+        return cur
+    }
+    Int readmeTrips(login: String) {
+        var cur = readmeCalls.get(login)
+        if (cur == null) {
+            return 0
+        }
+        return cur
+    }
+}
+
+class GithubProfileTestKit {
+    static TestApp? cachedApp = null
+    static ContributionsModule? cachedContributions = null
+    static ProjectsModule? cachedProjects = null
+    static GithubProfileFakeGateway? cachedGateway = null
+    static SharedServices? cachedShared = null
+    static TestApp app() {
+        var cur = GithubProfileTestKit.cachedApp
+        if (cur != null) {
+            return cur
+        }
+        var created = DomainTestKit.boot("githubprofile", mapOf(), (p: Platform, s: SharedServices, parts: SecurityParts) -> GithubProfileTestKit.wire(p, s, parts))
+        GithubProfileTestKit.cachedApp = created
+        return created
+    }
+    static wire(p: Platform, shared: SharedServices, parts: SecurityParts) {
+        var hooks = SecurityHooks.defaults(p.db)
+        var profiles = ProfileModule.install(p, shared, hooks)
+        var projects = ProjectsModule.install(p, shared, hooks)
+        var contributions = ContributionsModule.installWith(p, shared, parts, profiles.directory, GithubGateway(), true)
+        var gateway = GithubProfileFakeGateway()
+        GithubProfileTestKit.cachedContributions = contributions
+        GithubProfileTestKit.cachedProjects = projects
+        GithubProfileTestKit.cachedGateway = gateway
+        GithubProfileTestKit.cachedShared = shared
+        GithubProfileModule.installWith(p, shared, contributions, profiles, projects, gateway)
+    }
+    static ContributionsModule contributions() {
+        GithubProfileTestKit.app()
+        var cur = GithubProfileTestKit.cachedContributions
+        if (cur == null) {
+            throw "GithubProfileTestKit: contributions not wired"
+        }
+        return cur
+    }
+    static ProjectsModule projects() {
+        GithubProfileTestKit.app()
+        var cur = GithubProfileTestKit.cachedProjects
+        if (cur == null) {
+            throw "GithubProfileTestKit: projects not wired"
+        }
+        return cur
+    }
+    static GithubProfileFakeGateway gateway() {
+        GithubProfileTestKit.app()
+        var cur = GithubProfileTestKit.cachedGateway
+        if (cur == null) {
+            throw "GithubProfileTestKit: gateway not wired"
+        }
+        return cur
+    }
+    static Db db() = GithubProfileTestKit.app().db()
+    static String login(userId: String) {
+        var token = "tok-" + userId + "-1234567890"
+        if (GithubProfileTestKit.db().queryLong("select count(*) from users where id = ?", DbParams().bindStr(userId)) == 0L) {
+            SecurityFixtures.login(GithubProfileTestKit.db(), userId, token)
+        }
+        return token
+    }
+    static List<String> auth(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+    static TestResponse send(method: String, path: String, token: String, body: String) = GithubProfileTestKit.app().client.send(method, path, GithubProfileTestKit.auth(token), "", body)
+    static GithubUserRepository repo(login: String, name: String, description: String, url: String, language: String, topics: List<String>, stars: Int, forks: Int) = GithubUserRepository(login + "/" + name, name, description, url, "https://" + name + ".example.com", language, topics, stars, forks, false, false, "2026-10-27T12:00:00Z", "main")
+    static finish() {
+        var shared = GithubProfileTestKit.cachedShared
+        if (shared != null) {
+            shared.stop()
+        }
+    }
+}

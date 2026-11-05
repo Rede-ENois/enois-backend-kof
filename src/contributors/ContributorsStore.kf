@@ -1,0 +1,55 @@
+package contributors
+
+import kernel.db.*
+
+// contributor_applications.
+class ContributorsStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, user_id, name, github, email, area, experience, message, accepted_terms_at, status, source, created_at"
+    static ContributorApplicationRecord mapRow(r: DbRow) = ContributorApplicationRecord(r.getStr("id"), r.getStrOrNull("user_id"), r.getStr("name"), r.getStr("github"), r.getStr("email"), r.getStrOrNull("area"), r.getStrOrNull("experience"), r.getStrOrNull("message"), r.getInstant("accepted_terms_at"), r.getStr("status"), r.getStr("source"), r.getInstant("created_at"))
+    save(a: ContributorApplicationRecord) {
+        var changed = store.execute("update contributor_applications set user_id = ?, name = ?, github = ?, email = ?, area = ?, experience = ?, message = ?, accepted_terms_at = ?, status = ?, source = ?, created_at = ? where id = ?", DbParams().bindStrOrNull(a.userId()).bindStr(a.name()).bindStr(a.github()).bindStr(a.email()).bindStrOrNull(a.area()).bindStrOrNull(a.experience()).bindStrOrNull(a.message()).bindInstant(a.acceptedTermsAt()).bindStr(a.status()).bindStr(a.source()).bindInstant(a.createdAt()).bindStr(a.id()))
+        if (changed == 0) {
+            store.execute("insert into contributor_applications (" + ContributorsStore.columns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(a.id()).bindStrOrNull(a.userId()).bindStr(a.name()).bindStr(a.github()).bindStr(a.email()).bindStrOrNull(a.area()).bindStrOrNull(a.experience()).bindStrOrNull(a.message()).bindInstant(a.acceptedTermsAt()).bindStr(a.status()).bindStr(a.source()).bindInstant(a.createdAt()))
+        }
+    }
+    ContributorApplicationRecord? findById(id: String) {
+        var row = store.queryOptional("select " + ContributorsStore.columns() + " from contributor_applications where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return ContributorsStore.mapRow(row)
+    }
+    ContributorApplicationRecord? findByUser(userId: String) {
+        var row = store.queryOptional("select " + ContributorsStore.columns() + " from contributor_applications where user_id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return ContributorsStore.mapRow(row)
+    }
+    // The newest public (accountless) application of a GitHub handle.
+    ContributorApplicationRecord? findLandingByGithub(github: String) {
+        var row = store.queryOptional("select " + ContributorsStore.columns() + " from contributor_applications where github = ? and user_id is null order by created_at desc limit 1", DbParams().bindStr(github))
+        if (row == null) {
+            return null
+        }
+        return ContributorsStore.mapRow(row)
+    }
+    List<ContributorApplicationRecord> list(status: String?, limit: Int) {
+        var sql = "select " + ContributorsStore.columns() + " from contributor_applications"
+        var p = DbParams()
+        if (status != null) {
+            sql = sql + " where status = ?"
+            p.bindStr(status)
+        }
+        p.bindInt(limit)
+        var out = listOf<ContributorApplicationRecord>()
+        for (var r in store.queryList(sql + " order by created_at desc limit ?", p)) {
+            out.add(ContributorsStore.mapRow(r))
+        }
+        return out
+    }
+}

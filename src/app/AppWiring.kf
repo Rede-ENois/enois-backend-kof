@@ -38,6 +38,10 @@ import games.*
 import dailygames.*
 import coin.*
 import cosmetics.*
+import contributions.*
+import contributors.*
+import githubprofile.*
+import support.*
 import marketplace.*
 import services.*
 
@@ -67,8 +71,12 @@ class AppWiring {
         // The cosmetics core (catalog + badge ownership) comes first: profile asks it who owns an emblem.
         var cosmeticsCore = CosmeticsCore.create(platform)
         var profiles = ProfileModule.installWith(platform, shared, ProfileNotifier(platform.db), cosmeticsCore.badges, ProfileParentalLinks(platform.db), ProfileForeignCounts(platform.db), PreferencesThemeGallery(platform.db))
+        // contributions: evidence, seals and the GitHub link. It comes before identity: the OAuth link of GitHub is
+        // remembered by it (ContributionsOAuthLinks) and a verified contributor owns the cosmetic tag.
+        var contributions = ContributionsModule.install(platform, shared, parts, profiles)
         var jobSeams = JobSeamSet(platform, profiles)
         var identitySeams = IdentitySeams.defaults(platform, mail)
+        identitySeams.oauthLinks = ContributionsOAuthLinks(platform.db, contributions.identities, contributions.tokens, contributions.linkSync)
         identitySeams.reputations = JobsIdentityReputation(jobSeams.reputation)
         var identity = IdentityModule.installWith(platform, shared, hooks, parts, identitySeams)
         var age = AgeModule.install(platform, identity.mailer)
@@ -82,7 +90,7 @@ class AppWiring {
         notificationSeams.coins = CoinNotificationCoins(coinCore.service)
         var notificationsModule = NotificationsModule.installWith(platform, shared, notificationSeams)
         var coinModule = CoinModule.install(platform, shared, parts, coinCore, profiles, notificationsModule)
-        CosmeticsModule.install(platform, cosmeticsCore, coinModule, profiles)
+        CosmeticsModule.installWith(platform, cosmeticsCore, coinModule, profiles, ContributionsCosmeticsContributors(platform.db, VerifiedContributors(contributions.store, profiles.directory)))
         PushModule.install(platform, shared, hooks, parts, notificationsModule)
         var messagingSeams = MessagingSeamSet(platform)
         messagingSeams.coins = CoinMessagingCoins(coinCore.service)
@@ -114,8 +122,13 @@ class AppWiring {
         ReleaseNoteModule.install(platform, shared, hooks)
         SearchModule.install(platform, shared, hooks)
         var themeModule = ThemeModule.install(platform, shared, hooks)
-        ProjectsModule.install(platform, shared, hooks)
-        SuggestionsModule.install(platform, shared, hooks)
+        var projectsModule = ProjectsModule.install(platform, shared, hooks)
+        // support (tickets, the GitHub mirror, the webhook): the person who answers comments with their own GitHub
+        // identity (contributions). The suggestions reuse its GitHub token, so they come after it.
+        var supportModule = SupportModule.install(platform, shared, profiles, notificationsModule, mail, SupportLinkedPeople(profiles.directory, contributions.identities, contributions.tokens))
+        SuggestionsModule.withGateway(platform, SuggestionIssueClient.fromConfig(platform.cfg, SuggestionsSupportToken(platform.db, shared.cipher, supportModule.settings)))
+        ContributorsModule.install(platform, parts, contributions, profiles)
+        GithubProfileModule.install(platform, shared, contributions, profiles, projectsModule)
         BlogModule.withSeams(platform, shared, BlogProfiles(platform.db), BlogFeedPointers(), BlogNotifier(), CoinBlogCoins(coinCore.service), BlogEmailSender(mail))
         // economy: the marketplace (escrow, workers) and the services directory/contracts sit on the coin service.
         MarketplaceModule.install(platform, shared, coinModule, profiles, themeModule)
