@@ -1,0 +1,186 @@
+package moderation
+
+import feed.*
+import kernel.log.*
+import kernel.time.*
+
+record ModerationLinkOutcome(String status, String verdict, Double confidence, Int removedPosts, String? sanction)
+
+// LinkSafetyService: the automatic barrier of the DESTINATION of published links. The text of a post may be innocent and the link
+// lead to pornography: the domain may be a known platform and the title a joke, none of which the text triage sees.
+// First what can be known without visiting (an adult platform host is conclusive; a sexual word in the path is only a suspicion),
+// then the destination is read (title and description the page publishes) and the model classifies. Only a violation above the
+// floor triggers the automation; the rest is recorded in the ledger and goes to a person.
+// What a violation costs: the post leaves the air, together with any other post of the author that points to the same destination,
+// and the account is sanctioned (EXPLICIT: permanent ban; scam or phishing: restriction with appeal). The model never deletes nor
+// bans: this service does, and the account can always appeal through the normal flow.
+class ModerationLinkSafety {
+    Log log = Log("moderation.links")
+    ModerationSafetyStore ledger
+    ModerationLinkedPageReader pages
+    ModerationLinkAnalyzer analyzer
+    ModerationPosts posts
+    FeedModeration feed
+    ModerationPanel panel
+    Bool enabled
+    Int retryHours
+    public constructor(ledger: ModerationSafetyStore, pages: ModerationLinkedPageReader, analyzer: ModerationLinkAnalyzer, posts: ModerationPosts, feed: FeedModeration, panel: ModerationPanel, enabled: Bool, retryHours: Int) {
+        this.ledger = ledger
+        this.pages = pages
+        this.analyzer = analyzer
+        this.posts = posts
+        this.feed = feed
+        this.panel = panel
+        this.enabled = enabled
+        this.retryHours = ModerationContentTargets.clampInt(retryHours, 1, 100000)
+    }
+    // The actor of the trail: the automation, not a person.
+    static String actor() = "automod:link"
+    // Checks the links of ONE post. Idempotent by destination: a judged URL is not visited again, and a destination that was
+    // blocked takes down at once any new post pointing to it.
+    ModerationLinkOutcome check(postId: String) {
+        if (!enabled) {
+            return ModerationLinkOutcome("DISABLED", "UNSURE", 0.0, 0, null)
+        }
+        var post = posts.byId(postId)
+        if (post == null) {
+            return ModerationLinkOutcome("UNKNOWN_POST", "UNSURE", 0.0, 0, null)
+        }
+        var links = ModerationPostLinks.extract(ModerationLinkSafety.textOf(post))
+        if (links.size() == 0) {
+            return ModerationLinkOutcome("NO_LINKS", "UNSURE", 0.0, 0, null)
+        }
+        var anyJudged = false
+        for (var link in links) {
+            var decision = this.judge(link, post.authorId())
+            if (decision == null) {
+                continue
+            }
+            anyJudged = true
+            if (ModerationLinkAnalyzer.isViolation(decision.verdict) && ModerationLinkAnalyzer.canActAlone(decision)) {
+                return this.enforce(link, post, decision)
+            }
+        }
+        if (anyJudged) {
+            return ModerationLinkOutcome("RECORDED", "UNSURE", 0.0, 0, null)
+        }
+        return ModerationLinkOutcome("NO_VERDICT", "UNSURE", 0.0, 0, null)
+    }
+    // The verdict of a destination: ledger first (never visits twice), then the policy without a visit, then the page read.
+    // Nothing here throws: a link that does not answer becomes UNSURE.
+    ModerationLinkVerdict? judge(link: String, ownerId: String) {
+        var previous = ledger.findLink(link)
+        if (previous != null) {
+            // A definitive verdict holds forever; UNSURE is "could not see it now": it retries after the rest, or a destination
+            // that was down would stay unjudged forever.
+            var definitive = previous.verdict != "UNSURE"
+            var resting = Time.toMillis(previous.checkedAt) > Time.toMillis(Time.nowIso()) - (retryHours as Long) * 3600000L
+            if (definitive || resting) {
+                return ModerationLinkVerdict(previous.verdict, previous.severity, previous.confidence, previous.reason)
+            }
+        }
+        // An adult platform host is conclusive and needs neither a visit nor the model.
+        if (ModerationLinkPolicy.isKnownAdultHost(link)) {
+            var verdict = ModerationLinkVerdict("EXPLICIT", "HIGH", 0.99, "destino de plataforma de conteudo adulto")
+            this.remember(link, ownerId, verdict)
+            log.info("link_safety adult_host")
+            return verdict
+        }
+        var page = this.read(link)
+        if (page == null) {
+            // Nothing to judge: recorded so it is not visited again every round.
+            this.remember(link, ownerId, ModerationLinkVerdict("UNSURE", "LOW", 0.0, "destino sem descricao legivel"))
+            return null
+        }
+        var guess = analyzer.analyze(page)
+        if (guess == null) {
+            this.remember(link, ownerId, ModerationLinkVerdict("UNSURE", "LOW", 0.0, "sem palpite automatico"))
+            return null
+        }
+        this.remember(link, ownerId, guess)
+        log.info("link_safety verdict=" + guess.verdict + " confidence=" + guess.confidence + " path_suspicion=" + ModerationLinkPolicy.hasSexualToken(link))
+        return guess
+    }
+    ModerationPageSummary? read(link: String) {
+        try {
+            var page = pages.summaryOf(link)
+            if (page == null) {
+                return null
+            }
+            if (!ModerationPages.hasAnything(page)) {
+                return null
+            }
+            return page
+        } catch (String e) {
+            return null
+        }
+    }
+    // Takes down every post of the author that points to the destination and punishes the account. The removal comes BEFORE the
+    // sanction: even if the sanction fails, the link cannot stay within reach of readers.
+    ModerationLinkOutcome enforce(link: String, origin: FeedPostRow, verdict: ModerationLinkVerdict) {
+        var authorId = origin.authorId()
+        var motive = "Automod de link: " + verdict.reason
+        // The post that triggered always enters; the author's others enter if they point to the same destination.
+        var targets = listOf(origin.id())
+        for (var other in posts.allByAuthor(authorId)) {
+            if (!targets.contains(other.id()) && ModerationLinkSafety.pointsTo(other, link)) {
+                targets.add(other.id())
+            }
+        }
+        var removed = 0
+        for (var id in targets) {
+            try {
+                feed.removeAsModerator(ModerationLinkSafety.actor(), id, motive)
+                removed = removed + 1
+            } catch (String e) {
+                log.warn("link_safety_remove_failed post=" + id)
+            }
+        }
+        var sanction = "NONE"
+        var author = panel.profiles.findById(authorId)
+        if (author != null) {
+            try {
+                // Explicit destination does not come back with a warning: the house rule for that content is expulsion, the same as
+                // for the image. Scam/phishing stays a restriction with appeal.
+                var type = "RESTRICTION"
+                if (verdict.verdict == "EXPLICIT") {
+                    type = "PERMABAN"
+                }
+                var result = panel.sanctionUser(ModerationLinkSafety.actor(), author.username, type, motive)
+                sanction = result.status
+                if (type == "PERMABAN" && result.status != "ALREADY_BANNED") {
+                    panel.sanitizeUser(ModerationLinkSafety.actor(), author.username, motive)
+                }
+                log.warn("link_safety_sanction type=" + type + " verdict=" + verdict.verdict + " posts=" + removed)
+            } catch (String e) {
+                sanction = "FAILED"
+                log.error("link_safety_sanction_failed")
+            }
+        }
+        return ModerationLinkOutcome("ENFORCED", verdict.verdict, verdict.confidence, removed, sanction)
+    }
+    remember(link: String, ownerId: String, verdict: ModerationLinkVerdict) {
+        try {
+            ledger.saveLink(ModerationSafetyRules.link(link, ownerId, verdict.verdict, verdict.severity, verdict.confidence, verdict.reason, analyzer.modelName(), Time.nowIso()))
+        } catch (String e) {
+            // An unavailable ledger cannot stop the barrier from acting.
+            log.warn("link_safety_ledger_failed")
+        }
+    }
+    // The text of the post that may carry a link: the body and, on the mini page, the already sanitised HTML.
+    static String textOf(post: FeedPostRow) {
+        var page = post.pageHtml()
+        if (page == null) {
+            return post.content()
+        }
+        return post.content() + " " + page
+    }
+    static Bool pointsTo(post: FeedPostRow, link: String) {
+        for (var other in ModerationPostLinks.extract(ModerationLinkSafety.textOf(post))) {
+            if (other == link) {
+                return true
+            }
+        }
+        return false
+    }
+}

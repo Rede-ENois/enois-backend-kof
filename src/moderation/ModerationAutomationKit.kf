@@ -1,0 +1,152 @@
+package moderation
+
+import kernel.db.*
+import kernel.time.*
+import media.*
+
+// A model that answers what the test says (the chat-completions envelope around `content`); `down` answers like an unreachable
+// provider. Every request body is recorded.
+class ModerationScriptedModel extends ModerationLlmTransport {
+    String content = ""
+    Bool down = false
+    List<String> bodies = listOf<String>()
+    public constructor() {
+        super()
+    }
+    String? complete(baseUrl: String, apiKey: String, body: String) {
+        bodies.add(body)
+        if (down) {
+            return null
+        }
+        return "{\"choices\":[{\"message\":{\"content\":" + json.encode(content) + "}}]}"
+    }
+    Int calls() = bodies.size()
+}
+
+// Pages by address; records what was "visited".
+class ModerationScriptedPages extends ModerationLinkedPageReader {
+    Map<String,ModerationPageSummary> pages = mapOf<String, ModerationPageSummary>()
+    List<String> visited = listOf<String>()
+    public constructor() {
+        super()
+    }
+    ModerationPageSummary? summaryOf(url: String) {
+        visited.add(url)
+        return pages.get(url)
+    }
+}
+
+// Images by "TYPE:id" (base64 strings); records the reads.
+class ModerationScriptedImages extends ModerationImages {
+    Map<String,List<String>> images = mapOf<String, List<String>>()
+    List<String> reads = listOf<String>()
+    Bool fail = false
+    public constructor() {
+        super()
+    }
+    List<String> imagesOf(targetType: String, targetId: String, max: Int) {
+        reads.add(targetType + ":" + targetId)
+        if (fail) {
+            throw "storage fora do ar"
+        }
+        var found = images.get(targetType + ":" + targetId)
+        if (found == null) {
+            return listOf<String>()
+        }
+        return found
+    }
+}
+
+// Fixtures of the automation suites on top of ModerationTestKit. The suites call `setup()` first: it gives the model an API key,
+// installs the scripted model, pages and images in the booted module and runs the barrier executor inline.
+class ModerationAutomationKit {
+    static ModerationScriptedModel? modelSlot = null
+    static ModerationScriptedPages? pagesSlot = null
+    static ModerationScriptedImages? imagesSlot = null
+    static ModerationScriptedModel model() {
+        var cur = ModerationAutomationKit.modelSlot
+        if (cur == null) {
+            throw "ModerationAutomationKit: call setup() first"
+        }
+        return cur
+    }
+    static ModerationScriptedPages pages() {
+        var cur = ModerationAutomationKit.pagesSlot
+        if (cur == null) {
+            throw "ModerationAutomationKit: call setup() first"
+        }
+        return cur
+    }
+    static ModerationScriptedImages images() {
+        var cur = ModerationAutomationKit.imagesSlot
+        if (cur == null) {
+            throw "ModerationAutomationKit: call setup() first"
+        }
+        return cur
+    }
+    static setup() {
+        var module = ModerationTestKit.module()
+        var model = ModerationScriptedModel()
+        var pages = ModerationScriptedPages()
+        var images = ModerationScriptedImages()
+        ModerationAutomationKit.modelSlot = model
+        ModerationAutomationKit.pagesSlot = pages
+        ModerationAutomationKit.imagesSlot = images
+        module.ai.apiKey = "test-key"
+        module.ai.transport = model
+        module.ai.images = images
+        module.barriers.links.pages = pages
+        module.barriers.media.images = images
+        module.barriers.sexual.images = images
+        module.barriers.executor.inline = true
+    }
+    // The model says `content` from now on (and is up).
+    static says(content: String) {
+        var model = ModerationAutomationKit.model()
+        model.content = content
+        model.down = false
+    }
+    static String contentVerdict(verdict: String, confidence: String) = "{\"veredito\":\"" + verdict + "\",\"confianca\":" + confidence + ",\"motivo\":\"postura de assistente\"}"
+    static String safetyVerdict(verdict: String, severity: String, confidence: String, reason: String) = "{\"veredito\":\"" + verdict + "\",\"gravidade\":\"" + severity + "\",\"confianca\":" + confidence + ",\"motivo\":\"" + reason + "\"}"
+    static String triageVerdict(action: String, ambiguous: String, confidence: String) = "{\"categoria\":\"SEXUAL\",\"gravidade\":\"HIGH\",\"confianca\":" + confidence + ",\"ambiguo\":" + ambiguous + ",\"acao\":\"" + action + "\",\"justificativa\":\"conteudo explicito\"}"
+    // An image media of the user (media_assets), READY and not deleted.
+    static String media(mediaId: String, ownerId: String, mime: String) {
+        var now = Time.nowIso()
+        ModerationTestKit.db().execute("insert into media_assets (id, owner_id, file_name, mime_type, size_bytes, purpose, object_key, cdn_url, status, delete_status, created_at, expires_at) values (?, ?, \'file\', ?, 10, \'POST_IMAGE\', ?, ?, \'READY\', \'NONE\', ?, ?)", DbParams().bindStr(mediaId).bindStr(ownerId).bindStr(mime).bindStr("uploads/" + mediaId + "/file").bindStr("https://enois.exemplo.com/api/storage/uploads/" + mediaId + "/file").bindInstant(now).bindInstant(Time.plusSeconds(now, 3600L)))
+        return mediaId
+    }
+    static attach(postId: String, mediaId: String) {
+        ModerationTestKit.db().execute("insert into post_media (post_id, media_id) values (?, ?)", DbParams().bindStr(postId).bindStr(mediaId))
+    }
+    // A post row written straight into the table (a given text and time, active), as the barriers read it.
+    static String postAt(postId: String, authorId: String, content: String, createdAt: String) {
+        ModerationTestKit.db().execute("insert into posts (id, author_id, type, content, created_at, visibility, reactions, comments, saves, shares, reposts, status, author_identity, media_spoiler) values (?, ?, \'INSIGHT\', ?, ?, \'PUBLIC\', 0, 0, 0, 0, 0, \'ACTIVE\', \'SOCIAL\', false)", DbParams().bindStr(postId).bindStr(authorId).bindStr(content).bindInstant(createdAt))
+        return postId
+    }
+    static String postStatus(postId: String) {
+        var row = ModerationTestKit.db().queryOptional("select status from posts where id = ?", DbParams().bindStr(postId))
+        if (row == null) {
+            return "MISSING"
+        }
+        return row.getStr("status")
+    }
+    static Long count(sql: String, key: String) = ModerationTestKit.db().queryLong(sql, DbParams().bindStr(key))
+    static Long notices(userId: String) = ModerationAutomationKit.count("select count(*) from notifications where user_id = ?", userId)
+    static String contentStatus(postId: String) {
+        var row = ModerationTestKit.db().queryOptional("select review_status from content_automation_checks where post_id = ?", DbParams().bindStr(postId))
+        if (row == null) {
+            return "NONE_ROW"
+        }
+        return row.getStr("review_status")
+    }
+    static Bool banned(userId: String) = ModerationTestKit.module().sanctionStore.findActiveByUser(userId) != null
+    static String sanctionType(userId: String) {
+        var s = ModerationTestKit.module().sanctionStore.findActiveByUser(userId)
+        if (s == null) {
+            return "NONE"
+        }
+        return s.type
+    }
+    // Drains the outbox by hand (the worker is parked in the kit): `PostPublished` reaches the barriers.
+    static Int drainOutbox() = ModerationTestKit.shared().outbox.processPending()
+}

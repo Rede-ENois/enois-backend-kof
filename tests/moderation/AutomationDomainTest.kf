@@ -1,0 +1,292 @@
+import kernel.testkit.*
+import moderation.*
+
+// Ports of the pure Java tests of the barriers: AutomationSignalsTests, LinkPolicyTest, PostLinksTest, HttpLinkedPageReaderTest
+// (the parts that do not touch the network) and the three analyzer suites (ContentAutomationAnalyzerTests, LinkSafetyAnalyzerTest,
+// MediaSafetyAnalyzerTests). The model is the scripted transport of ModerationAutomationKit: no network.
+
+// "verdict|confidence|reason" of a parsed guess, "" when the answer was discarded.
+String contentOf(raw: String?) {
+    var v = ModerationTestKit.module().barriers.contentAnalyzer.parse(raw)
+    if (v == null) {
+        return ""
+    }
+    return v.verdict + "|" + v.confidence + "|" + v.reason
+}
+
+String linkOf(raw: String?) {
+    var v = ModerationTestKit.module().barriers.linkAnalyzer.parse(raw)
+    if (v == null) {
+        return ""
+    }
+    return v.verdict + "|" + v.severity + "|" + v.confidence
+}
+
+String mediaOf(raw: String?) {
+    var v = ModerationTestKit.module().barriers.mediaAnalyzer.parse(raw)
+    if (v == null) {
+        return ""
+    }
+    return v.verdict + "|" + v.severity + "|" + v.confidence
+}
+
+Bool alone(raw: String) {
+    var v = ModerationTestKit.module().barriers.mediaAnalyzer.parse(raw)
+    return ModerationMediaAnalyzer.canActAlone(v)
+}
+
+test "a text that declares itself machine-written is a signal" {
+    Check.isTrue("pt", ModerationAutomationSignals.suspect("Como um modelo de linguagem, não tenho opiniões pessoais."))
+    Check.isTrue("en", ModerationAutomationSignals.suspect("I'm an AI, so I can't have preferences."))
+}
+
+test "assistant posture is a signal" {
+    Check.isTrue("claro", ModerationAutomationSignals.suspect("Claro! Aqui está o texto que você pediu."))
+    Check.isTrue("espero", ModerationAutomationSignals.suspect("Espero ter ajudado. Se precisar de mais alguma coisa..."))
+    Check.isTrue("hope", ModerationAutomationSignals.suspect("Hope this helps! Let me know if you need anything else."))
+}
+
+test "accents and case do not hide the marker" {
+    Check.isTrue("caps", ModerationAutomationSignals.suspect("CLARO! AQUI ESTÁ a versão revisada"))
+    Check.isTrue("resumo", ModerationAutomationSignals.suspect("Em resumo, os pontos principais são estes."))
+}
+
+test "generator formatting on a long post is a signal" {
+    var text = "## Introdução\n\n**Primeiro ponto**\n- item um, com a descrição completa do que ele significa na prática\n- item dois, igualmente detalhado e sem voz pessoal nenhuma\n- item três, fechando a lista no mesmo tom impessoal de manual\n\n## Conclusão\n\nO texto acima cobre o assunto com a profundidade necessária para o leitor entender o contexto\ngeral e os detalhes práticos de cada etapa mencionada anteriormente, sem nenhuma marca de quem\nescreveu: nem opinião, nem exemplo próprio, nem informalidade de conversa."
+    Check.isTrue("long enough", text.length() > 420)
+    Check.isTrue("structured", ModerationAutomationSignals.suspect(text))
+}
+
+test "a short post with one bullet is not structure" {
+    Check.isTrue("short list is how people write", !ModerationAutomationSignals.suspect("**hoje**\n- café\n- praia"))
+}
+
+test "ordinary human text and a mention of AI in an opinion are not a signal" {
+    Check.isTrue("late", !ModerationAutomationSignals.suspect("acordei tarde hoje, perdi o ônibus e cheguei atrasado de novo"))
+    Check.isTrue("question", !ModerationAutomationSignals.suspect("Alguém sabe se o evento de sábado vai ter transmissão?"))
+    Check.isTrue("opinion", !ModerationAutomationSignals.suspect("usei o chatgpt pra revisar o texto e achei o resultado morno"))
+}
+
+test "empty content is never a signal" {
+    Check.isTrue("null", !ModerationAutomationSignals.suspect(null))
+    Check.isTrue("blank", !ModerationAutomationSignals.suspect("   "))
+}
+
+test "adult platform hosts are recognised and look-alikes are not" {
+    Check.isTrue("www", ModerationLinkPolicy.isKnownAdultHost("https://www.pornhub.com/view_video.php?id=1"))
+    Check.isTrue("bare", ModerationLinkPolicy.isKnownAdultHost("https://xvideos.com/video123"))
+    Check.isTrue("subdomain", ModerationLinkPolicy.isKnownAdultHost("https://pt.xvideos.com/video123"))
+    Check.isTrue("onlyfans", ModerationLinkPolicy.isKnownAdultHost("https://onlyfans.com/algum_perfil"))
+    Check.isTrue("naopornhub is not pornhub", !ModerationLinkPolicy.isKnownAdultHost("https://naopornhub.com/x"))
+    Check.isTrue("youtube", !ModerationLinkPolicy.isKnownAdultHost("https://youtube.com/watch?v=abc"))
+    Check.isTrue("enois", !ModerationLinkPolicy.isKnownAdultHost("https://enois.ia.br/blog"))
+}
+
+test "a sexual word in the path is only a flag and an innocent path does not flag" {
+    Check.isTrue("porno", ModerationLinkPolicy.hasSexualToken("https://exemplo.com/porno-caseiro"))
+    Check.isTrue("xxx", ModerationLinkPolicy.hasSexualToken("https://exemplo.com/video/xxx"))
+    Check.isTrue("onlyfans", ModerationLinkPolicy.hasSexualToken("https://exemplo.com/onlyfans-da-beltrana"))
+    Check.isTrue("education matches too, so it is only a suspicion", ModerationLinkPolicy.hasSexualToken("https://jornal.com/educacao-sexual-nas-escolas"))
+    Check.isTrue("youtube", !ModerationLinkPolicy.hasSexualToken("https://youtube.com/watch?v=abc123"))
+    Check.isTrue("github", !ModerationLinkPolicy.hasSexualToken("https://github.com/melmonfre/rede"))
+}
+
+test "shorteners are recognised" {
+    Check.isTrue("bit.ly", ModerationLinkPolicy.isShortener("https://bit.ly/abc"))
+    Check.isTrue("youtube", !ModerationLinkPolicy.isShortener("https://youtube.com/watch?v=abc"))
+}
+
+test "the addresses of a text are extracted and normalised" {
+    var links = ModerationPostLinks.extract("olha esse video https://www.youtube.com/watch?v=abc123 e depois https://enois.ia.br/blog")
+    Check.eqInt("two", 2, links.size())
+    Check.eqStr("first", "https://youtube.com/watch?v=abc123", links.get(0))
+    Check.eqStr("second", "https://enois.ia.br/blog", links.get(1))
+}
+
+test "a scheme that is not a destination is ignored" {
+    Check.eqInt("javascript and data", 0, ModerationPostLinks.extract("javascript:alert(1) e data:text/html,oi").size())
+    Check.eqInt("file", 0, ModerationPostLinks.extract("file:///etc/passwd").size())
+    Check.eqInt("ftp", 0, ModerationPostLinks.extract("ftp://exemplo.com/arquivo").size())
+}
+
+test "normalisation makes the same destination comparable" {
+    var expected = "https://youtube.com/watch?v=abc123"
+    Check.eqStr("www, case and tracker", expected, ModerationTestKit.str2(ModerationPostLinks.normalize("https://www.YouTube.com/watch?v=abc123&utm_source=x")))
+    Check.eqStr("trailing slash", expected, ModerationTestKit.str2(ModerationPostLinks.normalize("https://youtube.com/watch/?v=abc123")))
+    Check.eqStr("trailing dot", expected, ModerationTestKit.str2(ModerationPostLinks.normalize("https://youtube.com/watch?v=abc123.")))
+    Check.isTrue("a parameter that changes the content stays", ModerationTestKit.str2(ModerationPostLinks.normalize("https://youtube.com/watch?v=abc")) != ModerationTestKit.str2(ModerationPostLinks.normalize("https://youtube.com/watch?v=xyz")))
+}
+
+test "the extraction stops at the link ceiling" {
+    var text = ""
+    var i = 0
+    while (i < 12) {
+        text = text + "https://exemplo" + i + ".com/a "
+        i = i + 1
+    }
+    Check.eqInt("capped", ModerationPostLinks.maxLinks(), ModerationPostLinks.extract(text).size())
+}
+
+test "empty or null text has no link and an invalid host is refused" {
+    Check.eqInt("null", 0, ModerationPostLinks.extract(null).size())
+    Check.eqInt("blank", 0, ModerationPostLinks.extract("   ").size())
+    Check.eqInt("no link", 0, ModerationPostLinks.extract("sem link nenhum aqui").size())
+    Check.isTrue("localhost", ModerationPostLinks.normalize("https://localhost:8080/admin") == null)
+    Check.isTrue("no host", ModerationPostLinks.normalize("https:///sem-host") == null)
+}
+
+test "the reader refuses to visit the own network" {
+    var reader = ModerationLinkedPageReader()
+    Check.isTrue("localhost", !reader.isPublicDestination("http://localhost:8080/admin"))
+    Check.isTrue("loopback", !reader.isPublicDestination("http://127.0.0.1/x"))
+    Check.isTrue("10/8", !reader.isPublicDestination("http://10.0.0.5/x"))
+    Check.isTrue("192.168/16", !reader.isPublicDestination("http://192.168.1.1/x"))
+    Check.isTrue("172.16/12", !reader.isPublicDestination("http://172.16.0.1/x"))
+    Check.isTrue("ipv6 loopback", !reader.isPublicDestination("http://[::1]/x"))
+}
+
+test "the reader refuses the cloud metadata path, other schemes and ports" {
+    var reader = ModerationLinkedPageReader()
+    Check.isTrue("metadata", !reader.isPublicDestination("http://169.254.169.254/latest/meta-data/"))
+    Check.isTrue("file", !reader.isPublicDestination("file:///etc/passwd"))
+    Check.isTrue("ftp", !reader.isPublicDestination("ftp://exemplo.com/a"))
+    Check.isTrue("gopher", !reader.isPublicDestination("gopher://exemplo.com/a"))
+    Check.isTrue("ssh port", !reader.isPublicDestination("http://93.184.216.34:22/x"))
+    Check.isTrue("redis port", !reader.isPublicDestination("http://93.184.216.34:6379/x"))
+}
+
+test "the reader accepts a really public destination" {
+    // Public IP literals: the guard resolves a literal without DNS, so the case does not depend on the network.
+    var reader = ModerationLinkedPageReader()
+    Check.isTrue("https", reader.isPublicDestination("https://93.184.216.34/artigo"))
+    Check.isTrue("query", reader.isPublicDestination("https://8.8.8.8/watch?v=abc"))
+}
+
+test "the Open Graph title and description win over the HTML ones" {
+    var html = "<html><head>\n<title>Titulo do HTML</title>\n<meta property=\"og:title\" content=\"Titulo do video\">\n<meta property=\"og:description\" content=\"A descricao publica\">\n<meta name=\"description\" content=\"descricao comum\">\n</head><body>corpo</body></html>\n"
+    var page = ModerationLinkedPageReader.summaryOfHtml("https://exemplo.com/v", html)
+    Check.eqStr("title", "Titulo do video", ModerationTestKit.str2(page.title))
+    Check.eqStr("description", "A descricao publica", ModerationTestKit.str2(page.description))
+}
+
+test "without Open Graph the HTML title and description are used" {
+    var html = "<html><head><title>  Um   artigo  </title><meta name=\"description\" content=\"resumo do artigo\"></head></html>"
+    var page = ModerationLinkedPageReader.summaryOfHtml("https://exemplo.com/a", html)
+    Check.eqStr("title", "Um artigo", ModerationTestKit.str2(page.title))
+    Check.eqStr("description", "resumo do artigo", ModerationTestKit.str2(page.description))
+}
+
+test "a page with no title or description has no summary and HTML entities are decoded" {
+    Check.isTrue("nothing", !ModerationPages.hasAnything(ModerationLinkedPageReader.summaryOfHtml("https://exemplo.com/x", "<html><body>nada</body></html>")))
+    Check.eqStr("entities", "A & B <teste>", ModerationTestKit.str2(ModerationLinkedPageReader.summaryOfHtml("https://exemplo.com/x", "<title>A &amp; B &lt;teste&gt;</title>").title))
+}
+
+test "content analyzer: a well formed answer is parsed and one outside the contract is discarded" {
+    Check.eqStr("parsed", "AUTOMATED|0.93|postura de assistente", contentOf("{\"veredito\":\"AUTOMATED\",\"confianca\":0.93,\"motivo\":\"postura de assistente\"}"))
+    Check.eqStr("unknown verdict", "", contentOf("{\"veredito\":\"TALVEZ\",\"confianca\":0.9}"))
+    Check.eqStr("confidence above 1", "", contentOf("{\"veredito\":\"HUMAN\",\"confianca\":7}"))
+    Check.eqStr("negative confidence", "", contentOf("{\"veredito\":\"HUMAN\",\"confianca\":-1}"))
+    Check.eqStr("no verdict", "", contentOf("{\"motivo\":\"sem veredito\"}"))
+    Check.eqStr("not json", "", contentOf("nao e json"))
+    Check.eqStr("null", "", contentOf(null))
+}
+
+test "content analyzer: only a confirmed automated verdict above the floor can hide a post" {
+    Check.isTrue("automated 0.9", ModerationContentAnalyzer.canQuarantine(ModerationContentVerdict("AUTOMATED", 0.9, "x")))
+    Check.isTrue("automated 0.79", !ModerationContentAnalyzer.canQuarantine(ModerationContentVerdict("AUTOMATED", 0.79, "x")))
+    Check.isTrue("unsure", !ModerationContentAnalyzer.canQuarantine(ModerationContentVerdict("UNSURE", 0.99, "x")))
+    Check.isTrue("human", !ModerationContentAnalyzer.canQuarantine(ModerationContentVerdict("HUMAN", 0.99, "x")))
+    Check.isTrue("null", !ModerationContentAnalyzer.canQuarantine(null))
+}
+
+test "content analyzer: without the model there is no verdict and with it the post goes as untrusted data" {
+    ModerationAutomationKit.setup()
+    var module = ModerationTestKit.module()
+    var model = ModerationAutomationKit.model()
+    module.ai.apiKey = ""
+    Check.isTrue("no key, no verdict", module.barriers.contentAnalyzer.analyze("Claro! Aqui está o texto que você pediu.") == null)
+    Check.eqInt("no call", 0, model.calls())
+    module.ai.apiKey = "test-key"
+    ModerationAutomationKit.says("{\"veredito\":\"AUTOMATED\",\"confianca\":0.91,\"motivo\":\"postura de assistente\"}")
+    var guess = module.barriers.contentAnalyzer.analyze("Claro! Aqui está o texto que você pediu.")
+    Check.isTrue("a verdict", guess != null)
+    Check.eqInt("one call", 1, model.calls())
+    var body = model.bodies.get(0)
+    Check.isTrue("its own instruction", body.contains("HUMAN|AUTOMATED|UNSURE"))
+    Check.isTrue("the post is data", body.contains("dado nao confiavel"))
+    Check.isTrue("no image part", !body.contains("image_url"))
+}
+
+test "link analyzer: explicit and suspicious destinations are read and the rest is discarded" {
+    Check.eqStr("explicit", "EXPLICIT|HIGH|0.93", linkOf("{\"veredito\":\"EXPLICIT\",\"gravidade\":\"HIGH\",\"confianca\":0.93,\"motivo\":\"video adulto\"}"))
+    Check.eqStr("suspicious", "SUSPICIOUS|MEDIUM|0.8", linkOf("{\"veredito\":\"SUSPICIOUS\",\"gravidade\":\"MEDIUM\",\"confianca\":0.8,\"motivo\":\"phishing\"}"))
+    Check.eqStr("unknown verdict", "", linkOf("{\"veredito\":\"TALVEZ\",\"confianca\":0.9}"))
+    Check.eqStr("confidence 2.0", "", linkOf("{\"veredito\":\"SAFE\",\"confianca\":2.0}"))
+    Check.eqStr("not json", "", linkOf("nao e json"))
+    Check.eqStr("empty", "", linkOf(""))
+    Check.eqStr("null", "", linkOf(null))
+}
+
+test "link analyzer: without a key or a summary there is no guess and no call" {
+    ModerationAutomationKit.setup()
+    var module = ModerationTestKit.module()
+    var model = ModerationAutomationKit.model()
+    module.ai.apiKey = ""
+    var page = ModerationPages.of("https://exemplo.com/x", "Titulo", "Descricao")
+    Check.isTrue("no key", module.barriers.linkAnalyzer.analyze(page) == null)
+    module.ai.apiKey = "test-key"
+    Check.isTrue("null page", module.barriers.linkAnalyzer.analyze(null) == null)
+    Check.isTrue("blank page", module.barriers.linkAnalyzer.analyze(ModerationPages.of("https://exemplo.com/x", " ", "")) == null)
+    Check.eqInt("never called", 0, model.calls())
+}
+
+test "link analyzer: it acts alone only on a confirmed violation above the floor" {
+    Check.isTrue("explicit 0.9", ModerationLinkAnalyzer.canActAlone(ModerationLinkVerdict("EXPLICIT", "HIGH", 0.9, "")))
+    Check.isTrue("suspicious 0.75", ModerationLinkAnalyzer.canActAlone(ModerationLinkVerdict("SUSPICIOUS", "HIGH", 0.75, "")))
+    Check.isTrue("explicit 0.5", !ModerationLinkAnalyzer.canActAlone(ModerationLinkVerdict("EXPLICIT", "HIGH", 0.5, "")))
+    Check.isTrue("safe", !ModerationLinkAnalyzer.canActAlone(ModerationLinkVerdict("SAFE", "LOW", 0.99, "")))
+    Check.isTrue("unsure", !ModerationLinkAnalyzer.canActAlone(ModerationLinkVerdict("UNSURE", "LOW", 0.99, "")))
+    Check.isTrue("null", !ModerationLinkAnalyzer.canActAlone(null))
+}
+
+test "link analyzer: the page summary enters as untrusted data" {
+    var prompt = ModerationLinkAnalyzer.userPrompt(ModerationPages.of("https://exemplo.com/x", "Meu video", "descricao qualquer"))
+    Check.isTrue("untrusted", prompt.contains("dado nao confiavel"))
+    Check.isTrue("title", prompt.contains("Meu video"))
+    Check.isTrue("url", prompt.contains("https://exemplo.com/x"))
+}
+
+test "media analyzer: explicit with confidence acts alone, below the floor goes to a person, a minor skips the floor" {
+    Check.eqStr("explicit", "EXPLICIT|CRITICAL|0.93", mediaOf("{\"veredito\":\"EXPLICIT\",\"gravidade\":\"CRITICAL\",\"confianca\":0.93,\"motivo\":\"nudez visivel\"}"))
+    Check.isTrue("explicit alone", alone("{\"veredito\":\"EXPLICIT\",\"gravidade\":\"CRITICAL\",\"confianca\":0.93,\"motivo\":\"nudez visivel\"}"))
+    Check.isTrue("below the floor", !alone("{\"veredito\":\"EXPLICIT\",\"gravidade\":\"HIGH\",\"confianca\":0.55,\"motivo\":\"talvez\"}"))
+    Check.isTrue("minor skips the floor", alone("{\"veredito\":\"SEXUAL_MINOR\",\"gravidade\":\"CRITICAL\",\"confianca\":0.4,\"motivo\":\"aparencia\"}"))
+}
+
+test "media analyzer: safe and unsure never act alone and a verdict outside the contract is discarded" {
+    Check.isTrue("safe", !alone("{\"veredito\":\"SAFE\",\"gravidade\":\"LOW\",\"confianca\":0.99,\"motivo\":\"praia\"}"))
+    Check.isTrue("unsure", !alone("{\"veredito\":\"UNSURE\",\"gravidade\":\"LOW\",\"confianca\":0.99,\"motivo\":\"desfocada\"}"))
+    Check.eqStr("invented", "", mediaOf("{\"veredito\":\"GORE\",\"confianca\":0.9}"))
+    Check.eqStr("confidence 7", "", mediaOf("{\"veredito\":\"EXPLICIT\",\"confianca\":7}"))
+    Check.eqStr("broken json", "", mediaOf("{\"veredito\":\"EXPLICIT\""))
+    Check.eqStr("empty", "", mediaOf(""))
+    Check.eqStr("null", "", mediaOf(null))
+}
+
+test "media analyzer: the JSON is found inside a markdown fence or prose and braces in the reason do not end it" {
+    Check.eqStr("fence", "SAFE|LOW|0.95", mediaOf("```json\n{\"veredito\":\"SAFE\",\"gravidade\":\"LOW\",\"confianca\":0.95,\"motivo\":\"praia\"}\n```"))
+    Check.eqStr("prose", "EXPLICIT|HIGH|0.91", mediaOf("Analisei a imagem.\n{\"veredito\":\"EXPLICIT\",\"gravidade\":\"HIGH\",\"confianca\":0.91,\"motivo\":\"nudez\"}\nFim."))
+    Check.eqStr("braces", "SAFE|LOW|0.9", mediaOf("{\"veredito\":\"SAFE\",\"gravidade\":\"LOW\",\"confianca\":0.9,\"motivo\":\"texto com } e { no meio\"}"))
+}
+
+test "media analyzer: without an image there is no guess even with a key, and the instruction forbids guessing" {
+    ModerationAutomationKit.setup()
+    var analyzer = ModerationTestKit.module().barriers.mediaAnalyzer
+    Check.isTrue("empty", analyzer.analyze("") == null)
+    Check.isTrue("null", analyzer.analyze(null) == null)
+    Check.eqInt("never called", 0, ModerationAutomationKit.model().calls())
+    var prompt = ModerationMediaAnalyzer.systemPrompt()
+    Check.isTrue("names the verdicts", prompt.contains("EXPLICIT") && prompt.contains("SEXUAL_MINOR") && prompt.contains("nudez"))
+    Check.isTrue("no guessing", prompt.contains("nunca EXPLICIT por suposicao"))
+    ModerationTestKit.finish()
+}

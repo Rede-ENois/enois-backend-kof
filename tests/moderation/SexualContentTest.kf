@@ -1,0 +1,218 @@
+import kernel.db.*
+import kernel.testkit.*
+import moderation.*
+
+// Port of SexualContentReportTests and SexualContentReportWiringTests: a report for SEXUAL content on a post takes it off the air
+// at once and the bot decides first. Three exits and only them (confirmed NSFW deletes, safe gives back, doubt stays with a
+// person); none punishes the account. Posts, ledger, audit trail and the report route are real; the model is scripted.
+// A model that looks at the world at the moment it is asked: what the post and the ledger looked like BEFORE the bot decided.
+class ProbingModel extends ModerationScriptedModel {
+    String watch = ""
+    String postAtCall = ""
+    String ledgerAtCall = ""
+    public constructor() {
+        super()
+    }
+    String? complete(baseUrl: String, apiKey: String, body: String) {
+        postAtCall = ModerationAutomationKit.postStatus(watch)
+        ledgerAtCall = ModerationAutomationKit.contentStatus(watch)
+        return super.complete(baseUrl, apiKey, body)
+    }
+}
+
+String handle(postId: String) = ModerationTestKit.module().barriers.sexual.handle(postId, "foto explicita").status
+
+ModerationSexualOutcome outcomeOf(postId: String) = ModerationTestKit.module().barriers.sexual.handle(postId, "foto explicita")
+
+String triage(action: String, ambiguous: String, confidence: String) = ModerationAutomationKit.triageVerdict(action, ambiguous, confidence)
+
+Long audits(action: String, target: String) = ModerationTestKit.db().queryLong("select count(*) from audit_logs where action = ? and target_id = ?", DbParams().bindStr(action).bindStr(target))
+
+String auditReason(action: String, target: String) {
+    var row = ModerationTestKit.db().queryOptional("select actor_id, metadata from audit_logs where action = ? and target_id = ?", DbParams().bindStr(action).bindStr(target))
+    if (row == null) {
+        return ""
+    }
+    return row.getStr("actor_id") + "|" + ModerationTestKit.str2(row.getStrOrNull("metadata"))
+}
+
+String withImages(authorId: String) {
+    var postId = ModerationTestKit.publish(authorId, "olha isso")
+    ModerationAutomationKit.images().images.put("POST:" + postId, listOf("AQID"))
+    return postId
+}
+
+test "confirmed NSFW deletes the post for good and does not punish the account" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sx_nsfw")
+    var postId = withImages(author)
+    ModerationAutomationKit.says(triage("PENALIZAR", "false", "0.95"))
+    var outcome = outcomeOf(postId)
+    Check.eqStr("status", "REMOVED", outcome.status)
+    Check.isTrue("removed", outcome.removed)
+    Check.isTrue("not released", !outcome.released)
+    var removal = auditReason("POST_DELETED_BY_MODERATION", postId)
+    Check.isTrue("by the automation", removal.startsWith("automod:sexual|"))
+    Check.isTrue("with the justification of the model", removal.contains("conteudo explicito"))
+    Check.eqStr("the review is closed as removed", "REMOVED", ModerationAutomationKit.contentStatus(postId))
+    Check.eqStr("the post is deleted", "DELETED", ModerationAutomationKit.postStatus(postId))
+    Check.eqStr("the account is not punished", "NONE", ModerationAutomationKit.sanctionType(author))
+    Check.isTrue("the images of the post went to the model", ModerationAutomationKit.images().reads.contains("POST:" + postId))
+    Check.isTrue("as an image part", ModerationAutomationKit.model().bodies.get(ModerationAutomationKit.model().calls() - 1).contains("image_url"))
+}
+
+test "the post leaves the air and the case is in the human queue BEFORE the bot decides" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sx_order")
+    var postId = withImages(author)
+    var module = ModerationTestKit.module()
+    var probe = ProbingModel()
+    probe.watch = postId
+    probe.content = triage("PENALIZAR", "false", "0.95")
+    module.ai.transport = probe
+    handle(postId)
+    module.ai.transport = ModerationAutomationKit.model()
+    Check.eqInt("the model was asked once", 1, probe.calls())
+    Check.eqStr("hiding comes before any model call", "QUARANTINED", probe.postAtCall)
+    Check.eqStr("the case is already pending for a person", "PENDING", probe.ledgerAtCall)
+}
+
+test "safe content goes back to the feed" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sx_safe")
+    var postId = withImages(author)
+    ModerationAutomationKit.says(triage("NENHUMA", "false", "0.9"))
+    var outcome = outcomeOf(postId)
+    Check.eqStr("status", "RELEASED", outcome.status)
+    Check.isTrue("released", outcome.released)
+    Check.eqStr("back on the air", "ACTIVE", ModerationAutomationKit.postStatus(postId))
+    Check.eqInt("the quarantine was lifted by the automation", 1, audits("POST_QUARANTINE_RELEASED", postId) as Int)
+    Check.eqStr("review closed as released", "RELEASED", ModerationAutomationKit.contentStatus(postId))
+    Check.eqInt("never removed", 0, audits("POST_DELETED_BY_MODERATION", postId) as Int)
+}
+
+test "the doubt of the bot stays with a person" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sx_doubt")
+    var postId = withImages(author)
+    ModerationAutomationKit.says(triage("HUMAN_REVIEW", "true", "0.55"))
+    var outcome = outcomeOf(postId)
+    Check.eqStr("status", "HUMAN_REVIEW", outcome.status)
+    Check.isTrue("hidden", outcome.quarantined)
+    Check.eqStr("still hidden", "QUARANTINED", ModerationAutomationKit.postStatus(postId))
+    Check.eqStr("still in the queue", "PENDING", ModerationAutomationKit.contentStatus(postId))
+    Check.eqInt("neither released", 0, audits("POST_QUARANTINE_RELEASED", postId) as Int)
+    Check.eqInt("nor removed", 0, audits("POST_DELETED_BY_MODERATION", postId) as Int)
+}
+
+test "an ambiguous or low confidence PENALIZAR does not delete" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sx_gate")
+    var ambiguous = withImages(author)
+    ModerationAutomationKit.says(triage("PENALIZAR", "true", "0.95"))
+    Check.eqStr("ambiguous", "HUMAN_REVIEW", handle(ambiguous))
+    Check.eqInt("not removed", 0, audits("POST_DELETED_BY_MODERATION", ambiguous) as Int)
+    var low = withImages(author)
+    ModerationAutomationKit.says(triage("PENALIZAR", "false", "0.5"))
+    Check.eqStr("low confidence", "HUMAN_REVIEW", handle(low))
+    Check.eqInt("not removed", 0, audits("POST_DELETED_BY_MODERATION", low) as Int)
+}
+
+test "without the model the post stays hidden and goes to a person" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sx_nomodel")
+    var postId = withImages(author)
+    var module = ModerationTestKit.module()
+    var calls = ModerationAutomationKit.model().calls()
+    module.ai.apiKey = ""
+    var outcome = outcomeOf(postId)
+    module.ai.apiKey = "test-key"
+    Check.eqStr("status", "HUMAN_REVIEW", outcome.status)
+    Check.isTrue("hidden", outcome.quarantined)
+    Check.eqInt("the model was not asked", calls, ModerationAutomationKit.model().calls())
+    Check.eqInt("not removed", 0, audits("POST_DELETED_BY_MODERATION", postId) as Int)
+}
+
+test "an invalid verdict neither deletes nor gives back" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sx_invalid")
+    var postId = withImages(author)
+    ModerationAutomationKit.says("nao e json")
+    Check.eqStr("status", "HUMAN_REVIEW", handle(postId))
+    Check.eqStr("still hidden", "QUARANTINED", ModerationAutomationKit.postStatus(postId))
+    Check.eqInt("not removed", 0, audits("POST_DELETED_BY_MODERATION", postId) as Int)
+    Check.eqInt("not released", 0, audits("POST_QUARANTINE_RELEASED", postId) as Int)
+}
+
+test "a model failure does not take the precaution down" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sx_failure")
+    var postId = withImages(author)
+    ModerationAutomationKit.model().down = true
+    var outcome = outcomeOf(postId)
+    ModerationAutomationKit.model().down = false
+    Check.eqStr("status", "HUMAN_REVIEW", outcome.status)
+    Check.isTrue("quarantined", outcome.quarantined)
+    var broken = withImages(author)
+    ModerationAutomationKit.images().fail = true
+    var failed = outcomeOf(broken)
+    ModerationAutomationKit.images().fail = false
+    Check.eqStr("an image read that throws too", "HUMAN_REVIEW", failed.status)
+    Check.isTrue("still hidden", failed.quarantined)
+}
+
+test "a repeated report does not evaluate again" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sx_twice")
+    var postId = withImages(author)
+    ModerationAutomationKit.says(triage("HUMAN_REVIEW", "true", "0.55"))
+    handle(postId)
+    var calls = ModerationAutomationKit.model().calls()
+    var again = outcomeOf(postId)
+    Check.eqStr("status", "ALREADY_CHECKED", again.status)
+    Check.isTrue("still quarantined", again.quarantined)
+    Check.eqInt("no model call", calls, ModerationAutomationKit.model().calls())
+}
+
+test "a post that is off the air has nothing to hide and a disabled switch does nothing" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sx_off")
+    var calls = ModerationAutomationKit.model().calls()
+    Check.eqStr("unknown post", "SKIP", handle("post_fora_do_ar_sx"))
+    Check.eqInt("no model call", calls, ModerationAutomationKit.model().calls())
+    var postId = withImages(author)
+    var sexual = ModerationTestKit.module().barriers.sexual
+    sexual.enabled = false
+    Check.eqStr("disabled", "DISABLED", handle(postId))
+    sexual.enabled = true
+    Check.eqStr("still on the air", "ACTIVE", ModerationAutomationKit.postStatus(postId))
+    Check.eqInt("nobody is told", 0, ModerationAutomationKit.notices(author) as Int)
+}
+
+test "a sexual report on a post starts the immediate path through the report route" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sx_route_author")
+    var reporter = ModerationTestKit.login("sx_route_reporter")
+    var postId = withImages(author)
+    ModerationAutomationKit.says(triage("PENALIZAR", "false", "0.95"))
+    var res = ModerationTestKit.report(reporter, "POST", postId, "SEXUAL_CONTENT", "a foto e explicita")
+    Check.status(res, 201)
+    Check.eqStr("the bot decided right away", "DELETED", ModerationAutomationKit.postStatus(postId))
+    Check.eqStr("by the sexual path", "REMOVED", ModerationAutomationKit.contentStatus(postId))
+    Check.isTrue("with the description of the reporter in the prompt", ModerationAutomationKit.model().bodies.get(ModerationAutomationKit.model().calls() - 1).contains("a foto e explicita"))
+}
+
+test "a sexual report on a comment or another reason on a post does not trigger it" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sx_other_author")
+    var reporter = ModerationTestKit.login("sx_other_reporter")
+    var postId = withImages(author)
+    var commentId = ModerationTestKit.comment(author, postId, "um comentario", null)
+    var calls = ModerationAutomationKit.model().calls()
+    Check.status(ModerationTestKit.report(reporter, "COMMENT", commentId, "SEXUAL_CONTENT", "a foto e explicita"), 201)
+    Check.status(ModerationTestKit.report(reporter, "POST", postId, "SPAM", "spam"), 201)
+    Check.eqStr("the post is untouched", "ACTIVE", ModerationAutomationKit.postStatus(postId))
+    Check.eqInt("no ledger row", 0, ModerationAutomationKit.count("select count(*) from content_automation_checks where post_id = ?", postId) as Int)
+    Check.eqInt("the model is not asked", calls, ModerationAutomationKit.model().calls())
+    ModerationTestKit.finish()
+}

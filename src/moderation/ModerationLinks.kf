@@ -1,0 +1,150 @@
+package moderation
+
+import kernel.url.*
+
+// LinkPolicy: what can be known about a link WITHOUT visiting it. A host of a platform dedicated to adult content is conclusive;
+// a sexual word in the path or the parameters is only a suspicion (it also appears in sex education, band names, research), so
+// it sends the destination to the model, never punishes alone. Addresses are normalised strings (ModerationPostLinks.normalize).
+class ModerationLinkPolicy {
+    static List<String> adultHosts() = listOf("pornhub.com", "xvideos.com", "xnxx.com", "redtube.com", "youporn.com", "xhamster.com", "spankbang.com", "brazzers.com", "onlyfans.com", "fansly.com", "chaturbate.com", "cam4.com", "livejasmin.com", "erome.com", "motherless.com", "literotica.com", "nhentai.net", "e-hentai.org", "hentaihaven.xxx", "rule34.xxx", "sankakucomplex.com", "privacy.com.br", "cameraprive.com", "buceteiro.com", "xvideos-br.com", "pornobr.com", "sexlog.com")
+    static List<String> suspiciousTerms() = listOf("porn", "porno", "pornografia", "xxx", "nsfw", "nude", "nudes", "naked", "pelada", "pelado", "hentai", "onlyfans", "sexcam", "sexo", "sexvideo", "sex-video", "sex-tape", "sextape", "18mais", "18+", "adulto", "adult", "erotic", "erotico", "putaria", "buceta", "pau-grande", "boquete", "gozar", "orgia", "suruba", "camsex", "liveporn", "sexual")
+    static List<String> shorteners() = listOf("bit.ly", "tinyurl.com", "goo.gl", "t.co", "ow.ly", "is.gd", "buff.ly", "cutt.ly", "shorturl.at", "encurtador.com.br", "encurtador.com", "linktr.ee")
+    static Bool isKnownAdultHost(url: String) = ModerationLinkPolicy.hostIn(url, ModerationLinkPolicy.adultHosts())
+    static Bool isShortener(url: String) = ModerationLinkPolicy.hostIn(url, ModerationLinkPolicy.shorteners())
+    static Bool hostIn(url: String, hosts: List<String>) {
+        var host = ModerationLinkPolicy.hostOf(url)
+        if (host.length() == 0) {
+            return false
+        }
+        for (var known in hosts) {
+            if (host == known || host.endsWith("." + known)) {
+                return true
+            }
+        }
+        return false
+    }
+    // A sexual word in the path or the parameters of the address?
+    static Bool hasSexualToken(url: String) {
+        var target = (Uris.path(url) + " " + Uris.query(url)).toLowerCase().replace("-", " ").replace("_", " ")
+        for (var term in ModerationLinkPolicy.suspiciousTerms()) {
+            if (target.contains(term.replace("-", " "))) {
+                return true
+            }
+        }
+        return false
+    }
+    static String hostOf(url: String) {
+        var host = Uris.host(url)
+        if (host.startsWith("www.")) {
+            return host.substring(4)
+        }
+        return host
+    }
+}
+
+// PostLinks: the addresses the text publishes, normalised so a destination already judged is recognised.
+class ModerationPostLinks {
+    // A text with 200 links is spam, not content.
+    static Int maxLinks() = 5
+    static List<String> extract(text: String?) {
+        var links = listOf<String>()
+        if (text == null) {
+            return links
+        }
+        String body = text
+        if (body.trim().length() == 0) {
+            return links
+        }
+        var seen = listOf<String>()
+        var i = 0
+        while (i < body.length() && links.size() < ModerationPostLinks.maxLinks()) {
+            var start = ModerationPostLinks.indexOfScheme(body, i)
+            if (start < 0) {
+                break
+            }
+            var end = start
+            while (end < body.length() && !ModerationPostLinks.isBoundary(body.substring(end, end + 1))) {
+                end = end + 1
+            }
+            var normalized = ModerationPostLinks.normalize(body.substring(start, end))
+            if (normalized != null) {
+                String address = normalized
+                if (!seen.contains(address)) {
+                    seen.add(address)
+                    links.add(address)
+                }
+            }
+            i = end
+            if (start + 1 > i) {
+                i = start + 1
+            }
+        }
+        return links
+    }
+    // The address ready to compare and visit, or null when it is not a valid destination (http/https with a host only).
+    static String? normalize(raw: String?) = LinkTargets.normalize(raw)
+    static Int indexOfScheme(text: String, from: Int) {
+        var http = text.indexOf("http://", from)
+        var https = text.indexOf("https://", from)
+        if (http < 0) {
+            return https
+        }
+        if (https < 0) {
+            return http
+        }
+        if (http < https) {
+            return http
+        }
+        return https
+    }
+    // What ends an address in a text: whitespace and the separators that usually follow it.
+    static Bool isBoundary(c: String) = c.trim().length() == 0 || "<>\"'()[]{},;".contains(c)
+}
+
+// PageSummary: what an external page says about itself, title and description, nothing else. Enough to judge the DESTINATION
+// without keeping third-party content.
+record ModerationPageSummary(String url, String? title, String? description)
+
+class ModerationPages {
+    static Int maxTitle() = 200
+    static Int maxDescription() = 400
+    static ModerationPageSummary of(url: String, title: String?, description: String?) = ModerationPageSummary(url, ModerationPages.truncate(title, ModerationPages.maxTitle()), ModerationPages.truncate(description, ModerationPages.maxDescription()))
+    static String? truncate(value: String?, max: Int) {
+        if (value == null) {
+            return null
+        }
+        String text = value
+        var clean = text.replaceAll("\\s+", " ").trim()
+        if (clean.length() <= max) {
+            return clean
+        }
+        return clean.substring(0, max)
+    }
+    static Bool filled(v: String?) {
+        if (v == null) {
+            return false
+        }
+        String text = v
+        return text.trim().length() > 0
+    }
+    static Bool hasAnything(page: ModerationPageSummary) = ModerationPages.filled(page.title) || ModerationPages.filled(page.description)
+    // The line that goes to the triage.
+    static String promptLine(page: ModerationPageSummary) {
+        var line = "- " + page.url
+        var title = ModerationPages.orEmpty(page.title)
+        if (title.trim().length() > 0) {
+            line = line + " | titulo: " + title
+        }
+        var description = ModerationPages.orEmpty(page.description)
+        if (description.trim().length() > 0) {
+            line = line + " | descricao: " + description
+        }
+        return line
+    }
+    static String orEmpty(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+}

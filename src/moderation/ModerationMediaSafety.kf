@@ -1,0 +1,118 @@
+package moderation
+
+import feed.*
+import kernel.log.*
+import kernel.time.*
+
+record ModerationMediaOutcome(String status, String verdict, Double confidence, Int removedPosts, String? sanction)
+
+// The owner and type of a stored media, read from media_assets.
+record ModerationMediaRef(String ownerId, String mimeType)
+
+// MediaSafetyService: the automatic safety barrier of uploaded media. Moderation was reactive, it only looked at what somebody
+// reported, and the triage received only the TEXT of the target: a publication whose content is in the image had no signal at
+// all. The upload does not pass through the backend either (the browser sends it straight to storage), so nothing on the way
+// looked at the file. This barrier closes that hole.
+// How it decides: the analyzer looks at the image and returns a structured verdict. Only EXPLICIT and SEXUAL_MINOR with enough
+// confidence trigger the automation; the rest is recorded and goes to a person. The model never deletes nor bans, this service does.
+// What a violation costs: the media leaves the air in every post that uses it and the account is banned at once. Not a timed
+// restriction: the content is unrecoverable in practice and the house rule for it is expulsion; the appeal still exists.
+class ModerationMediaSafety {
+    Log log = Log("moderation.media")
+    ModerationSafetyStore ledger
+    ModerationImages images
+    ModerationMediaAnalyzer analyzer
+    ModerationPosts posts
+    FeedModeration feed
+    ModerationPanel panel
+    Bool enabled
+    public constructor(ledger: ModerationSafetyStore, images: ModerationImages, analyzer: ModerationMediaAnalyzer, posts: ModerationPosts, feed: FeedModeration, panel: ModerationPanel, enabled: Bool) {
+        this.ledger = ledger
+        this.images = images
+        this.analyzer = analyzer
+        this.posts = posts
+        this.feed = feed
+        this.panel = panel
+        this.enabled = enabled
+    }
+    // The actor of the trail: the automation, not a person.
+    static String actor() = "automod:midia"
+    // Checks ONE media. Idempotent: a checked one answers the previous row without calling the model. Not transactional on
+    // purpose: the download and the model call take seconds; each effect (record, removal, sanction) has its own transaction.
+    ModerationMediaOutcome check(mediaId: String) {
+        if (!enabled) {
+            return ModerationMediaOutcome("DISABLED", "UNSURE", 0.0, 0, null)
+        }
+        var previous = ledger.findMedia(mediaId)
+        if (previous != null) {
+            return ModerationMediaOutcome("ALREADY_CHECKED", previous.verdict, previous.confidence, 0, null)
+        }
+        var asset = ledger.mediaRef(mediaId)
+        if (asset == null) {
+            return ModerationMediaOutcome("UNKNOWN_MEDIA", "UNSURE", 0.0, 0, null)
+        }
+        var ownerId = asset.ownerId
+        if (!asset.mimeType.toLowerCase().startsWith("image/")) {
+            this.remember(mediaId, ownerId, "UNSURE", "LOW", 0.0, "tipo de mídia fora da classificação de imagem")
+            return ModerationMediaOutcome("UNSUPPORTED_MEDIA", "UNSURE", 0.0, 0, null)
+        }
+        var read = images.imagesOf("MEDIA", mediaId, 1)
+        var guess = ModerationMediaSafety.noGuess()
+        if (read.size() > 0) {
+            guess = analyzer.analyze(read.get(0))
+        }
+        if (guess == null) {
+            // No guess (model down, unreadable image): recorded as UNSURE so the sweep does not repeat the cost, and left to a person.
+            this.remember(mediaId, ownerId, "UNSURE", "LOW", 0.0, "sem palpite automatico")
+            return ModerationMediaOutcome("NO_VERDICT", "UNSURE", 0.0, 0, null)
+        }
+        this.remember(mediaId, ownerId, guess.verdict, guess.severity, guess.confidence, guess.reason)
+        log.info("media_safety mediaId=" + mediaId + " verdict=" + guess.verdict + " confidence=" + guess.confidence + " severity=" + guess.severity)
+        if (!ModerationMediaAnalyzer.canActAlone(guess)) {
+            return ModerationMediaOutcome("RECORDED", guess.verdict, guess.confidence, 0, null)
+        }
+        return this.enforce(mediaId, ownerId, guess)
+    }
+    static ModerationMediaVerdict? noGuess() = null
+    // Takes the media off the air in every post that uses it and bans the account. The removal comes BEFORE the sanction: even if
+    // the sanction fails (already banned, profile gone) the image cannot stay on the timeline.
+    ModerationMediaOutcome enforce(mediaId: String, ownerId: String, decision: ModerationMediaVerdict) {
+        var reason = "Automod de midia: " + decision.reason
+        var removed = 0
+        for (var post in posts.byMedia(mediaId)) {
+            try {
+                feed.removeAsModerator(ModerationMediaSafety.actor(), post.id(), reason)
+                removed = removed + 1
+            } catch (String e) {
+                log.warn("media_safety_remove_failed post=" + post.id())
+            }
+        }
+        var sanction = "NONE"
+        var author = panel.profiles.findById(ownerId)
+        if (author != null) {
+            try {
+                // PERMABAN: explicit sexual content does not come back with a warning; the appeal still exists for a model error.
+                var result = panel.sanctionUser(ModerationMediaSafety.actor(), author.username, "PERMABAN", reason)
+                sanction = result.status
+                if (result.status != "ALREADY_BANNED") {
+                    panel.sanitizeUser(ModerationMediaSafety.actor(), author.username, reason)
+                }
+                log.warn("media_safety_ban mediaId=" + mediaId + " verdict=" + decision.verdict + " posts=" + removed)
+            } catch (String e) {
+                sanction = "FAILED"
+                log.error("media_safety_ban_failed mediaId=" + mediaId)
+            }
+        }
+        return ModerationMediaOutcome("ENFORCED", decision.verdict, decision.confidence, removed, sanction)
+    }
+    remember(mediaId: String, ownerId: String, verdict: String, severity: String, confidence: Double, reason: String) {
+        try {
+            ledger.saveMedia(ModerationSafetyRules.media(mediaId, ownerId, verdict, severity, confidence, reason, analyzer.modelName(), Time.nowIso()))
+        } catch (String e) {
+            // An unavailable ledger cannot stop the barrier from acting.
+            log.warn("media_safety_ledger_failed mediaId=" + mediaId)
+        }
+    }
+    // Ids of recent media not checked yet (the sweep uses this).
+    List<String> pending(since: String, limit: Int) = ledger.uncheckedMediaIdsSince(since, limit)
+}

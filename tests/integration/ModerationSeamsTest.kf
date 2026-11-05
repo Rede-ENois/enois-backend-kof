@@ -1,5 +1,6 @@
 import app.*
 import kernel.db.*
+import kernel.image.*
 import kernel.sanctions.*
 import kernel.security.*
 import kernel.testkit.*
@@ -76,6 +77,27 @@ test "a company page removed by moderation is closed by the companies service an
     Check.eqStr("closed", "CLOSED", db.queryOne("select status from companies where id = \'comp_ms\'", DbParams()).getStr("status"))
     Check.isTrue("owner told", log.has("MODERACAO", "ms_owner"))
     Check.eqInt("exactly one notice", 1, db.queryLong("select count(*) from notifications where user_id = \'ms_owner\' and kind = \'MODERACAO\'", DbParams()) as Int)
+}
+
+test "the upload gate reviewer is the media-safety analyzer of moderation" {
+    var wired = WiredApp.wired()
+    var model = ModerationScriptedModel()
+    model.content = ModerationAutomationKit.safetyVerdict("EXPLICIT", "HIGH", "0.9", "nudez")
+    wired.moderation.ai.apiKey = "test-key"
+    wired.moderation.ai.transport = model
+    var photo = Images.sample("png", 200, 200)
+    Check.eqStr("an explicit verdict refuses the upload", "PROHIBITED", wired.media.moderation.reviewer.review(photo))
+    model.content = ModerationAutomationKit.safetyVerdict("SAFE", "LOW", "0.95", "paisagem")
+    Check.eqStr("a safe one lets it through", "SAFE", wired.media.moderation.reviewer.review(photo))
+    Check.eqInt("the model was asked with the image", 2, model.calls())
+    Check.isTrue("as a vision part", model.bodies.get(0).contains("image_url"))
+}
+
+test "the report triage reads media through the media domain" {
+    var wired = WiredApp.wired()
+    var images = wired.moderation.ai.images
+    Check.eqInt("a media target is the media itself", 1, images.mediaIdsOf("MEDIA", "media_x").size())
+    Check.eqInt("a user target has none", 0, images.mediaIdsOf("USER", "someone").size())
 }
 
 test "game and service review queues belong to the moderation team and stop self approval" {

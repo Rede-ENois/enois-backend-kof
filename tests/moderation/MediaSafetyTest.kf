@@ -1,0 +1,216 @@
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import moderation.*
+
+// Ports of MediaSafetyServiceTests (the barrier itself: explicit content published, image taken down, account banned; the rest
+// proves it does NOT act when unsure), MediaSafetyListenerTests (the hook survives a full queue and one failing media) and the
+// sweep. Media rows, posts, removals and sanctions are real; the model and the image reader are scripted.
+class RejectingExecutor extends ModerationExecutor {
+    public constructor() {
+        super()
+    }
+    execute(task: () -> void) {
+        throw "queue full"
+    }
+}
+
+class FlakyMediaSafety extends ModerationMediaSafety {
+    List<String> seen = listOf<String>()
+    public constructor(base: ModerationMediaSafety) {
+        super(base.ledger, base.images, base.analyzer, base.posts, base.feed, base.panel, base.enabled)
+    }
+    ModerationMediaOutcome check(mediaId: String) {
+        seen.add(mediaId)
+        if (mediaId == "media_flaky_1") {
+            throw "review unavailable"
+        }
+        return super.check(mediaId)
+    }
+}
+
+String check(mediaId: String) = ModerationTestKit.module().barriers.media.check(mediaId).status
+
+Long audits(action: String, target: String) = ModerationTestKit.db().queryLong("select count(*) from audit_logs where action = ? and target_id = ?", DbParams().bindStr(action).bindStr(target))
+
+String removal(postId: String) {
+    var row = ModerationTestKit.db().queryOptional("select actor_id from audit_logs where action = \'POST_DELETED_BY_MODERATION\' and target_id = ?", DbParams().bindStr(postId))
+    if (row == null) {
+        return ""
+    }
+    return row.getStr("actor_id")
+}
+
+String ledger(mediaId: String) {
+    var row = ModerationTestKit.db().queryOptional("select verdict, severity, confidence, owner_id, model from media_safety_checks where media_id = ?", DbParams().bindStr(mediaId))
+    if (row == null) {
+        return "none"
+    }
+    return row.getStr("verdict") + "|" + row.getStr("severity") + "|" + row.getDouble("confidence") + "|" + row.getStr("owner_id") + "|" + row.getStr("model")
+}
+
+image(mediaId: String) {
+    ModerationAutomationKit.images().images.put("MEDIA:" + mediaId, listOf("AQID"))
+}
+
+test "an explicit image is removed from every post and the account is banned" {
+    ModerationAutomationKit.setup()
+    var owner = ModerationTestKit.login("ms_owner")
+    var first = ModerationTestKit.publish(owner, "primeiro post com a foto")
+    var second = ModerationTestKit.publish(owner, "segundo post com a mesma foto")
+    var mediaId = ModerationAutomationKit.media("media_ms_1", owner, "image/jpeg")
+    ModerationAutomationKit.attach(first, mediaId)
+    ModerationAutomationKit.attach(second, mediaId)
+    image(mediaId)
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("EXPLICIT", "CRITICAL", "0.95", "nudez visivel"))
+    var result = ModerationTestKit.module().barriers.media.check(mediaId)
+    Check.eqStr("status", "ENFORCED", result.status)
+    Check.eqInt("the image leaves EVERY post that uses it", 2, result.removedPosts)
+    Check.eqStr("first removed by the automation", "automod:midia", removal(first))
+    Check.eqStr("second removed by the automation", "automod:midia", removal(second))
+    Check.isTrue("the account is banned", ModerationAutomationKit.banned(owner))
+    Check.eqStr("permanent ban", "PERMABAN", ModerationAutomationKit.sanctionType(owner))
+    Check.eqInt("the content was sanitised", 1, audits("USER_CONTENT_PURGED", owner) as Int)
+}
+
+test "the ledger records the verdict for audit" {
+    ModerationAutomationKit.setup()
+    var owner = ModerationTestKit.login("ms_ledger")
+    var mediaId = ModerationAutomationKit.media("media_ms_2", owner, "image/png")
+    image(mediaId)
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("EXPLICIT", "HIGH", "0.9", "nudez"))
+    check(mediaId)
+    Check.eqStr("row", "EXPLICIT|HIGH|0.9|" + owner + "|qwen3.8-27b", ledger(mediaId))
+}
+
+test "an uncertain verdict records but does not punish" {
+    ModerationAutomationKit.setup()
+    var owner = ModerationTestKit.login("ms_unsure")
+    var postId = ModerationTestKit.publish(owner, "foto talvez problematica")
+    var mediaId = ModerationAutomationKit.media("media_ms_3", owner, "image/jpeg")
+    ModerationAutomationKit.attach(postId, mediaId)
+    image(mediaId)
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("EXPLICIT", "HIGH", "0.4", "talvez"))
+    Check.eqStr("status", "RECORDED", check(mediaId))
+    Check.eqStr("still on the air", "ACTIVE", ModerationAutomationKit.postStatus(postId))
+    Check.isTrue("not banned", !ModerationAutomationKit.banned(owner))
+    Check.eqStr("removal", "", removal(postId))
+}
+
+test "a safe image costs nothing" {
+    ModerationAutomationKit.setup()
+    var owner = ModerationTestKit.login("ms_safe")
+    var postId = ModerationTestKit.publish(owner, "foto de praia")
+    var mediaId = ModerationAutomationKit.media("media_ms_4", owner, "image/jpeg")
+    ModerationAutomationKit.attach(postId, mediaId)
+    image(mediaId)
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("SAFE", "LOW", "0.99", "pessoa vestida"))
+    Check.eqStr("status", "RECORDED", check(mediaId))
+    Check.eqStr("still on the air", "ACTIVE", ModerationAutomationKit.postStatus(postId))
+    Check.isTrue("not banned", !ModerationAutomationKit.banned(owner))
+}
+
+test "media without a verdict is not downloaded again every round" {
+    ModerationAutomationKit.setup()
+    var owner = ModerationTestKit.login("ms_noverdict")
+    var mediaId = ModerationAutomationKit.media("media_ms_5", owner, "image/jpeg")
+    image(mediaId)
+    ModerationAutomationKit.model().down = true
+    Check.eqStr("status", "NO_VERDICT", check(mediaId))
+    Check.eqStr("recorded as unsure", "UNSURE|LOW|0.0|" + owner + "|qwen3.8-27b", ledger(mediaId))
+    ModerationAutomationKit.model().down = false
+    var reads = ModerationAutomationKit.images().reads.size()
+    Check.eqStr("second round", "ALREADY_CHECKED", check(mediaId))
+    Check.eqInt("no new read", reads, ModerationAutomationKit.images().reads.size())
+    Check.isTrue("not banned", !ModerationAutomationKit.banned(owner))
+}
+
+test "an already checked media is not analysed again" {
+    ModerationAutomationKit.setup()
+    var owner = ModerationTestKit.login("ms_twice")
+    var mediaId = ModerationAutomationKit.media("media_ms_6", owner, "image/jpeg")
+    image(mediaId)
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("SAFE", "LOW", "0.99", "ok"))
+    check(mediaId)
+    var calls = ModerationAutomationKit.model().calls()
+    var reads = ModerationAutomationKit.images().reads.size()
+    Check.eqStr("status", "ALREADY_CHECKED", check(mediaId))
+    Check.eqInt("no model call", calls, ModerationAutomationKit.model().calls())
+    Check.eqInt("no image read", reads, ModerationAutomationKit.images().reads.size())
+}
+
+test "a video is recorded as unsupported without reading the image or calling the model" {
+    ModerationAutomationKit.setup()
+    var owner = ModerationTestKit.login("ms_video")
+    var mediaId = ModerationAutomationKit.media("media_ms_7", owner, "video/mp4")
+    var calls = ModerationAutomationKit.model().calls()
+    var reads = ModerationAutomationKit.images().reads.size()
+    Check.eqStr("status", "UNSUPPORTED_MEDIA", check(mediaId))
+    Check.eqInt("no model call", calls, ModerationAutomationKit.model().calls())
+    Check.eqInt("no image read", reads, ModerationAutomationKit.images().reads.size())
+    Check.eqStr("recorded", "UNSURE|LOW|0.0|" + owner + "|qwen3.8-27b", ledger(mediaId))
+    Check.eqStr("unknown media", "UNKNOWN_MEDIA", check("media_missing_ms"))
+}
+
+test "a disabled switch checks nothing" {
+    ModerationAutomationKit.setup()
+    var owner = ModerationTestKit.login("ms_off")
+    var mediaId = ModerationAutomationKit.media("media_ms_8", owner, "image/jpeg")
+    var media = ModerationTestKit.module().barriers.media
+    media.enabled = false
+    var calls = ModerationAutomationKit.model().calls()
+    Check.eqStr("status", "DISABLED", check(mediaId))
+    Check.eqInt("no model call", calls, ModerationAutomationKit.model().calls())
+    Check.eqInt("the sweep too", 0, ModerationTestKit.module().barriers.sweeps.mediaSweep())
+    media.enabled = true
+}
+
+test "a queue rejection does not escape after the post has committed" {
+    ModerationAutomationKit.setup()
+    var owner = ModerationTestKit.login("ms_queue")
+    var postId = ModerationTestKit.publish(owner, "post publicado com a fila cheia")
+    var handler = ModerationTestKit.module().barriers.published
+    var normal = handler.executor
+    handler.executor = RejectingExecutor()
+    handler.handle("PostPublished", postId, "{\"postId\":\"" + postId + "\"}")
+    handler.executor = normal
+    Check.eqStr("the post is untouched", "ACTIVE", ModerationAutomationKit.postStatus(postId))
+}
+
+test "one failed media does not prevent checking the others" {
+    ModerationAutomationKit.setup()
+    var owner = ModerationTestKit.login("ms_flaky")
+    var postId = ModerationTestKit.publish(owner, "post com duas fotos")
+    ModerationAutomationKit.attach(postId, ModerationAutomationKit.media("media_flaky_1", owner, "image/jpeg"))
+    ModerationAutomationKit.attach(postId, ModerationAutomationKit.media("media_flaky_2", owner, "image/jpeg"))
+    var handler = ModerationTestKit.module().barriers.published
+    var original = handler.media
+    var flaky = FlakyMediaSafety(original)
+    handler.media = flaky
+    handler.mediaOf(postId)
+    handler.media = original
+    Check.eqInt("both were attempted", 2, flaky.seen.size())
+    Check.isTrue("the failing one", flaky.seen.contains("media_flaky_1"))
+    Check.isTrue("and the other", flaky.seen.contains("media_flaky_2"))
+}
+
+test "the sweep blocks what the hook missed once and the outbox event checks the media of a new post" {
+    ModerationAutomationKit.setup()
+    var owner = ModerationTestKit.login("ms_sweep")
+    var mediaId = ModerationAutomationKit.media("media_ms_sweep", owner, "image/png")
+    image(mediaId)
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("EXPLICIT", "HIGH", "0.9", "nudez"))
+    var sweeps = ModerationTestKit.module().barriers.sweeps
+    Check.isTrue("enforced", sweeps.mediaSweep() >= 1)
+    Check.isTrue("banned", ModerationAutomationKit.banned(owner))
+    Check.eqInt("nothing left", 0, sweeps.mediaSweep())
+    var other = ModerationTestKit.login("ms_hook")
+    var postId = ModerationTestKit.publish(other, "post publicado com foto")
+    var hookMedia = ModerationAutomationKit.media("media_ms_hook", other, "image/jpeg")
+    ModerationAutomationKit.attach(postId, hookMedia)
+    image(hookMedia)
+    ModerationAutomationKit.drainOutbox()
+    Check.eqStr("the PostPublished event checked the media", "EXPLICIT", ledger(hookMedia).substring(0, 8))
+    Check.isTrue("and banned the account", ModerationAutomationKit.banned(other))
+    ModerationTestKit.finish()
+}

@@ -744,6 +744,8 @@ Syntax: loose terms (AND), `AND/E`, `OR/OU`, `NOT/NAO/NÃO`, `-term`, `+term`, `
 import kernel.url.*
 import kernel.security.*
 
+LinkTargets.normalize(raw): String?                    // http(s) destination normalised for comparison (no www, tracker params, fragment, default port; same URI quoting as Java), null when invalid
+Uris.query(url)  Uris.resolve(base, reference)         // decoded query; a Location header resolved against its request URL
 SafeUrl.requireHttpUrl(raw, "site")                    // 400 INVALID_URL; blank passes; max 500 chars, host, no credentials
 SafeUrl.requireHttpUrlList(list, field)  SafeUrl.requireHttpUrlsJoined(text, separatorRegex, field)
 SafeUrl.requireSafeMarkdownLinks(text, field)          // 400 UNSAFE_LINK: markdown/reference/html link schemes
@@ -833,8 +835,9 @@ Bytes.hex("89504e47"): Byte[]   Bytes.toHex(data)                           // f
 discarded: exit code, `-1` when missing or timed out (and killed).
 
 `Images` (kernel.image): `dimensions(data, exifOrientation): ImageSize?` reads the header only, `rotateJpeg(data,
-orientation)` applies EXIF orientations 2 to 8 to the pixels (16 megapixel cap), `sample/halves` build test
-fixtures. `PageCards.render(html, author, fontPath): Byte[]` (kernel.image) draws the 1200x630 share card of a page with
+orientation)` applies EXIF orientations 2 to 8 to the pixels (16 megapixel cap), `shrinkJpeg(data, maxSide)` re-encodes a
+new JPEG with the longest side capped (no EXIF, never enlarges) and `toBase64(data)` is the image part of a vision
+request, `sample/halves` build test fixtures. `PageCards.render(html, author, fontPath): Byte[]` (kernel.image) draws the 1200x630 share card of a page with
 Java2D (text from jsoup, the bundled `resources/fonts/LiberationSans-Bold.ttf`, headless, a font-less fallback);
 the feed caches it as base64 in the `pagePreviewCards` TtlCache and streams it through the lane. `Gate` is a lock (`enter()` / `leave()`), `Permits(max)` a non-waiting semaphore (`tryAcquire`, `release`).
 
@@ -951,7 +954,7 @@ var reply = Outbound.request("POST", url, listOf("Content-Type: application/json
 var patched = Outbound.patch(url, headers, "{}", 15000)            // PATCH (java.net.http cannot PATCH: Apache HttpPatch, G321)
 var posted = Outbound.attempt("POST", url, headers, "{}", 15000)    // same, but unreachable = status 0 and empty body instead of a throw
 var res = Outbound.getBytes(url, listOf("Accept: image/*"), 4000, 6000, 1048576)   // connect ms, read ms, max bytes
-res.status   res.contentType   res.body: Byte[]   res.size()   res.text()
+res.status   res.contentType   res.location   res.body: Byte[]   res.size()   res.text()   res.textAs("ISO-8859-1")
 var probe = Outbound.probe(url, 10000)             // HEAD (ranged GET on 405), follows redirects: probe.status (0 = unreachable), probe.contentType
 var path = Outbound.download(url, maxBytes)        // temp file path, 200 only, no redirects, throws "download falhou: ..."
 ```

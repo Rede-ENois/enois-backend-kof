@@ -64,12 +64,14 @@ class AppWired {
     FeedModule feed
     ModerationModule moderation
     MediaFeedBridge mediaFeed
-    public constructor(shared: SharedServices, notifications: NotificationsModule, feed: FeedModule, moderation: ModerationModule, mediaFeed: MediaFeedBridge) {
+    MediaModule media
+    public constructor(shared: SharedServices, notifications: NotificationsModule, feed: FeedModule, moderation: ModerationModule, mediaFeed: MediaFeedBridge, media: MediaModule) {
         this.mediaFeed = mediaFeed
         this.shared = shared
         this.notifications = notifications
         this.feed = feed
         this.moderation = moderation
+        this.media = media
     }
 }
 
@@ -226,9 +228,13 @@ class AppWiring {
         // moderation (reports, sanctions, moderators, IP blocks, automations): last, it acts on the content of every domain above.
         // Seams it owns: hooks.moderators / hooks.reports and the risk escalation (set before the pipeline), the feed honeypot,
         // the coin dispute, the community project moderators, the profile report facts and caches, the company page closing.
-        var moderationModule = ModerationModule.installWith(platform, shared, parts, feedModule, groupsModule, profiles, mail, notificationsModule.notifications, ModerationReportEvents(), ModerationCompaniesBridge(platform.db, companyService), ModerationProfileCaches(platform.db, shared.caches), ModerationLlmTransport(), ModerationImages(), honeypot, early)
+        var moderationImages = ModerationMediaImages(media.store, feedModule.store, ModerationMediaStorageBytes(media))
+        var moderationModule = ModerationModule.installWith(platform, shared, parts, feedModule, groupsModule, profiles, mail, notificationsModule.notifications, ModerationReportEvents(), ModerationCompaniesBridge(platform.db, companyService), ModerationProfileCaches(platform.db, shared.caches), ModerationLlmTransport(), moderationImages, honeypot, early, ModerationLinkedPageReader())
+        // media <- moderation: the semantic second opinion of the upload gate is the media-safety analyzer, and the reported-image
+        // reader (above) is what the triage, the sexual-content flow and the media barrier look at.
+        media.moderation.reviewer = ModerationMediaReviewer(moderationModule.barriers.mediaAnalyzer)
         coinDispute.bind(moderationModule.service, moderationModule.sanctions)
         ModerationReviewRoutes.register(platform.server, gamesModule.games, servicesModule.offers, profiles.directory)
-        return AppWired(shared, notificationsModule, feedModule, moderationModule, mediaFeed)
+        return AppWired(shared, notificationsModule, feedModule, moderationModule, mediaFeed, media)
     }
 }

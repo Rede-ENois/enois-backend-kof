@@ -1,0 +1,55 @@
+import kernel.db.*
+import kernel.testkit.*
+import moderation.*
+
+// Port of MediaSafetyWiringTests: the application boots with the media, link and automated-content barriers, the ledgers exist
+// with their upsert keys and the sweeps run without blowing anything up; the review queue is open only to moderators and the
+// new report reason crosses the HTTP contract.
+Long columns(table: String) = ModerationTestKit.db().queryLong("select count(*) from information_schema.columns where table_name = ?", DbParams().bindStr(table))
+
+test "the media barrier is wired into the application" {
+    var barriers = ModerationTestKit.module().barriers
+    Check.isTrue("enabled", barriers.media.enabled)
+    Check.eqInt("the sweep runs", 0, barriers.sweeps.mediaSweep())
+}
+
+test "the media ledger table exists with its upsert key" {
+    Check.isTrue("columns", columns("MEDIA_SAFETY_CHECKS") >= 8L)
+}
+
+test "the link barrier is wired and its ledger table exists" {
+    var barriers = ModerationTestKit.module().barriers
+    Check.isTrue("enabled", barriers.links.enabled)
+    Check.isTrue("ledger columns", columns("LINK_SAFETY_CHECKS") >= 9L)
+    Check.isTrue("the sweep runs", barriers.sweeps.linkSweep() >= 0)
+}
+
+test "the automation barrier is wired and its ledger carries the review queue index" {
+    var barriers = ModerationTestKit.module().barriers
+    Check.isTrue("enabled", barriers.content.enabled)
+    Check.isTrue("ledger columns", columns("CONTENT_AUTOMATION_CHECKS") >= 8L)
+    Check.isTrue("the sweep runs", barriers.sweeps.contentSweep() >= 0)
+    Check.isTrue("the quarantine review is wired", ModerationTestKit.module().quarantine.pending(5).size() >= 0)
+}
+
+test "the PostPublished event has the barrier handler registered and spam, sexual and sweeps are on" {
+    var module = ModerationTestKit.module()
+    Check.isTrue("a handler on the outbox", ModerationTestKit.shared().outbox.handlerCount("PostPublished") >= 1)
+    Check.isTrue("spam", module.barriers.spam.enabled)
+    Check.isTrue("sexual", module.barriers.sexual.enabled)
+}
+
+test "the review queue is open only to moderators" {
+    Check.status(ModerationTestKit.get("", "/moderation/quarantine"), 401)
+    var member = ModerationTestKit.login("bw_member")
+    Check.status(ModerationTestKit.get(member, "/moderation/quarantine"), 403)
+    var admin = ModerationTestKit.loginAdmin("bw_admin")
+    Check.status(ModerationTestKit.get(admin, "/moderation/quarantine"), 200)
+}
+
+test "a report of sexual content is accepted by the API" {
+    var reporter = ModerationTestKit.login("bw_reporter")
+    var res = ModerationTestKit.report(reporter, "POST", "post_inexistente", "SEXUAL_CONTENT", "conteudo explicito na imagem")
+    Check.status(res, 201)
+    ModerationTestKit.finish()
+}

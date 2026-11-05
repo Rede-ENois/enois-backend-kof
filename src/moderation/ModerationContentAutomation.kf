@@ -1,0 +1,127 @@
+package moderation
+
+import feed.*
+import kernel.log.*
+import kernel.security.*
+import kernel.time.*
+import notifications.*
+
+// What happened to a post (for the log and the tests).
+record ModerationContentOutcome(String status, String verdict, Double confidence, Bool quarantined)
+
+// ContentAutomationService: the barrier of automated content. The network is for people, and this layer protects that WITHOUT a
+// report. A cheap deterministic marker (the generator's literal trace in the text) decides whether the classifier is worth calling;
+// the model judges with a structured verdict, and only "automated" above the floor triggers the automation.
+// What the automation does, and what it NEVER does: the post goes to QUARANTINE (gone from the feed, the profile and the detail,
+// still in the database), becomes a system case in the review queue and the author is told. Nothing is deleted and nobody is
+// punished this way: releasing or removing, and whether to punish the account, is always a person, through the review flows.
+class ModerationContentAutomation {
+    Log log = Log("moderation.automation")
+    ModerationSafetyStore ledger
+    ModerationPosts posts
+    ModerationContentAnalyzer analyzer
+    FeedModeration feed
+    Notifications notifications
+    AdminGuard admins
+    ModerationModeratorStore moderators
+    Bool enabled
+    public constructor(ledger: ModerationSafetyStore, posts: ModerationPosts, analyzer: ModerationContentAnalyzer, feed: FeedModeration, notifications: Notifications, admins: AdminGuard, moderators: ModerationModeratorStore, enabled: Bool) {
+        this.ledger = ledger
+        this.posts = posts
+        this.analyzer = analyzer
+        this.feed = feed
+        this.notifications = notifications
+        this.admins = admins
+        this.moderators = moderators
+        this.enabled = enabled
+    }
+    // The actor of the trail: the automation, not a person.
+    static String actor() = "automod:conteudo"
+    Bool isStaff(userId: String) {
+        if (admins.isAdmin(userId)) {
+            return true
+        }
+        return moderators.findApprovedByUser(userId) != null
+    }
+    // Evaluates ONE post. Idempotent: an evaluated post answers the previous row without calling the model. Never throws to the
+    // caller (it runs after the publication commit; a failure here cannot touch the post on the air).
+    ModerationContentOutcome evaluate(postId: String) {
+        if (!enabled) {
+            return ModerationContentOutcome("DISABLED", "UNSURE", 0.0, false)
+        }
+        var previous = ledger.findContent(postId)
+        if (previous != null) {
+            return ModerationContentOutcome("ALREADY_CHECKED", previous.verdict, previous.confidence, previous.status == "PENDING")
+        }
+        var post = posts.byId(postId)
+        if (post == null) {
+            return ModerationContentOutcome("SKIP", "UNSURE", 0.0, false)
+        }
+        if (post.status() != "ACTIVE") {
+            return ModerationContentOutcome("SKIP", "UNSURE", 0.0, false)
+        }
+        // Staff stays out: a false positive hiding the content of those who take care of the network would be worse than any bot.
+        if (this.isStaff(post.authorId())) {
+            return ModerationContentOutcome("STAFF_SKIPPED", "UNSURE", 0.0, false)
+        }
+        var content = post.content()
+        if (!ModerationAutomationSignals.suspect(content)) {
+            // Recorded at no model cost: this is what keeps the sweep from reading the post forever.
+            this.remember(post, "HUMAN", 0.0, "sem rastro de gerador no texto", "NONE")
+            return ModerationContentOutcome("CLEAN_DETERMINISTIC", "HUMAN", 0.0, false)
+        }
+        var guess = analyzer.analyze(content)
+        if (guess == null) {
+            this.remember(post, "UNSURE", 0.0, "sem palpite automatico", "NONE")
+            return ModerationContentOutcome("NO_VERDICT", "UNSURE", 0.0, false)
+        }
+        this.remember(post, guess.verdict, guess.confidence, guess.reason, "NONE")
+        log.info("content_automation post=" + postId + " verdict=" + guess.verdict + " confidence=" + guess.confidence)
+        if (!ModerationContentAnalyzer.canQuarantine(guess)) {
+            return ModerationContentOutcome("RECORDED", guess.verdict, guess.confidence, false)
+        }
+        return this.quarantine(post, guess)
+    }
+    // Precaution, not punishment: the post leaves the air, the review queue gets the case and the author knows. No path here
+    // applies a sanction.
+    ModerationContentOutcome quarantine(post: FeedPostRow, guess: ModerationContentVerdict) {
+        var motive = "Automod de conteudo automatizado: " + guess.reason
+        // Before hiding: the case exists in the review queue. If the quarantine fails right below, the post stays up but a person
+        // already has the case.
+        this.remember(post, guess.verdict, guess.confidence, guess.reason, "PENDING")
+        var hidden = false
+        try {
+            hidden = feed.quarantine(ModerationContentAutomation.actor(), post.id(), motive)
+        } catch (String e) {
+            log.warn("content_automation_quarantine_failed post=" + post.id())
+        }
+        if (!hidden) {
+            log.warn("content_automation_quarantine_missed post=" + post.id())
+        }
+        try {
+            notifications.create(post.authorId(), "MODERACAO", ModerationContentAutomation.actor(), "Post em análise", "Um post seu entrou em revisão automática e está temporariamente fora do ar. Uma pessoa do time de moderação vai revisar e você é avisado do resultado; se estiver tudo certo, ele volta ao ar.", "/api/diretrizes", "Ver diretrizes")
+        } catch (String e) {
+            log.warn("content_automation_notice_failed post=" + post.id())
+        }
+        log.warn("content_automation_quarantined post=" + post.id() + " confidence=" + guess.confidence)
+        return ModerationContentOutcome("QUARANTINED", guess.verdict, guess.confidence, true)
+    }
+    remember(post: FeedPostRow, verdict: String, confidence: Double, reason: String?, status: String) {
+        try {
+            ledger.saveContent(ModerationSafetyRules.content(post.id(), post.authorId(), verdict, confidence, reason, analyzer.modelName(), Time.nowIso(), status))
+        } catch (String e) {
+            // An unavailable ledger cannot stop the barrier from acting (the check may repeat).
+            log.warn("content_automation_ledger_failed post=" + post.id())
+        }
+    }
+    // Ids of recent posts not evaluated yet (the sweep uses this).
+    List<String> pending(since: String, limit: Int) = ledger.uncheckedPostIdsSince(since, limit)
+    // Empty once the post left the air.
+    Bool isActive(postId: String) {
+        var post = posts.byId(postId)
+        if (post == null) {
+            return false
+        }
+        return post.status() == "ACTIVE" && post.content().trim().length() > 0
+    }
+}

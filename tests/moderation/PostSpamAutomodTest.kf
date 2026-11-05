@@ -1,0 +1,166 @@
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import moderation.*
+
+// Port of PostSpamAutomodTests: the spam/flood automod WITHOUT a report. The deterministic part raises the suspicion (flood,
+// repetition, a run of practically empty posts) and the AI decides with the same gate as the report triage; nothing is deleted
+// nor applied without a confirmed PENALIZAR. Posts are real rows at given times; the model is scripted.
+// A service with the Java test constants (min length 3, window 10 min, flood 8, repeat 3, short flood 8, lookback 168 h,
+// sanitize limit 50, auto-ban 20) and NO per-author interval, so each case evaluates at once.
+ModerationSpamAutomod spam() {
+    var base = ModerationTestKit.module().barriers.spam
+    return ModerationSpamAutomod(base.posts, base.ai, base.feed, base.sanctions, base.admins, base.moderators, true, 3, 10, 8, 3, 8, 168, 50, 20, 0)
+}
+
+String verdict(action: String, ambiguous: String, confidence: String) = "{\"categoria\":\"SPAM\",\"gravidade\":\"MEDIUM\",\"confianca\":" + confidence + ",\"ambiguo\":" + ambiguous + ",\"acao\":\"" + action + "\",\"justificativa\":\"flood de posts\"}"
+
+// `count` distinct posts of the author, one second apart, the first one `minutesAgo` minutes ago.
+List<String> flood(author: String, prefix: String, count: Int, minutesAgo: Int) {
+    var ids = listOf<String>()
+    var start = Time.nowMillis() - (minutesAgo as Long) * 60000L
+    var i = 0
+    while (i < count) {
+        ids.add(ModerationAutomationKit.postAt(prefix + i, author, "Post de teste numero " + i, Time.fromMillis(start - (i as Long) * 1000L)))
+        i = i + 1
+    }
+    return ids
+}
+
+Long removedBy(ids: List<String>) {
+    var total = 0L
+    for (var id in ids) {
+        total = total + ModerationTestKit.db().queryLong("select count(*) from audit_logs where action = \'POST_DELETED_BY_MODERATION\' and actor_id = \'automod-spam\' and target_id = ?", DbParams().bindStr(id))
+    }
+    return total
+}
+
+test "a flood confirmed by the AI is removed and restricted" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sp_flood")
+    var ids = flood(author, "post_sp_flood_", 8, 1)
+    ModerationAutomationKit.says(verdict("PENALIZAR", "false", "0.95"))
+    var outcome = spam().evaluate(author)
+    Check.eqStr("status", "PENALIZED", outcome.status)
+    Check.eqInt("removed", 8, outcome.removed)
+    Check.eqStr("restriction", "RESTRICTION", ModerationTestKit.str2(outcome.sanction))
+    Check.eqInt("by the synthetic moderator", 8, removedBy(ids) as Int)
+    Check.eqStr("an active restriction, not a ban", "RESTRICTION", ModerationAutomationKit.sanctionType(author))
+}
+
+test "without the AI confirmation nothing is removed" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sp_review")
+    var ids = flood(author, "post_sp_review_", 8, 1)
+    ModerationAutomationKit.says(verdict("NENHUMA", "true", "0.2"))
+    var outcome = spam().evaluate(author)
+    Check.eqStr("status", "NEEDS_REVIEW", outcome.status)
+    Check.eqInt("removed", 0, outcome.removed)
+    Check.eqInt("nothing removed", 0, removedBy(ids) as Int)
+    Check.eqStr("no sanction", "NONE", ModerationAutomationKit.sanctionType(author))
+    ModerationAutomationKit.model().down = true
+    Check.eqStr("model down: nothing either", "NEEDS_REVIEW", spam().evaluate(author).status)
+    ModerationAutomationKit.model().down = false
+}
+
+test "a couple of posts in the window is not a signal" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sp_few")
+    flood(author, "post_sp_few_", 3, 1)
+    var calls = ModerationAutomationKit.model().calls()
+    Check.eqStr("status", "NO_SIGNAL", spam().evaluate(author).status)
+    Check.eqInt("the model is not asked", calls, ModerationAutomationKit.model().calls())
+}
+
+test "a massive flood confirmed by the AI bans the account" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sp_massive")
+    flood(author, "post_sp_massive_", 20, 1)
+    ModerationAutomationKit.says(verdict("PENALIZAR", "false", "0.97"))
+    var outcome = spam().evaluate(author)
+    Check.eqStr("status", "PENALIZED", outcome.status)
+    Check.eqStr("ban", "BAN", ModerationTestKit.str2(outcome.sanction))
+    Check.isTrue("banned", ModerationAutomationKit.banned(author))
+    Check.eqStr("escalated to a ban", "BAN", ModerationAutomationKit.sanctionType(author))
+}
+
+test "repeated text is a signal even without a flood" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sp_repeat")
+    var ids = listOf<String>()
+    var i = 0
+    var now = Time.nowMillis()
+    while (i < 3) {
+        ids.add(ModerationAutomationKit.postAt("post_sp_rep_" + i, author, "  Ganhe dinheiro fácil, clique aqui  ", Time.fromMillis(now - (120L + (i as Long)) * 1000L)))
+        i = i + 1
+    }
+    ModerationAutomationKit.says(verdict("PENALIZAR", "false", "0.9"))
+    var outcome = spam().evaluate(author)
+    Check.eqStr("status", "PENALIZED", outcome.status)
+    Check.eqInt("removed", 3, outcome.removed)
+    Check.eqInt("by the synthetic moderator", 3, removedBy(ids) as Int)
+}
+
+test "a run of practically empty posts is a signal" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sp_empty")
+    var ids = listOf<String>()
+    var i = 0
+    var now = Time.nowMillis()
+    while (i < 8) {
+        var text = "oi"
+        if (i % 2 == 0) {
+            text = "."
+        }
+        ids.add(ModerationAutomationKit.postAt("post_sp_curto_" + i, author, text, Time.fromMillis(now - (60L + (i as Long)) * 1000L)))
+        i = i + 1
+    }
+    ModerationAutomationKit.says(verdict("PENALIZAR", "false", "0.92"))
+    var outcome = spam().evaluate(author)
+    Check.eqStr("status", "PENALIZED", outcome.status)
+    Check.eqInt("removed", 8, outcome.removed)
+}
+
+test "staff is out of the automod" {
+    ModerationAutomationKit.setup()
+    var staff = ModerationTestKit.loginAdmin("sp_staff")
+    flood(staff, "post_sp_staff_", 8, 1)
+    var calls = ModerationAutomationKit.model().calls()
+    Check.eqStr("status", "STAFF_SKIPPED", spam().evaluate(staff).status)
+    Check.eqInt("the model is not asked", calls, ModerationAutomationKit.model().calls())
+}
+
+test "one evaluation per author per interval, a sanctioned account is not reanalysed and a disabled switch does nothing" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sp_throttle")
+    flood(author, "post_sp_thr_", 8, 1)
+    ModerationAutomationKit.says(verdict("NENHUMA", "true", "0.2"))
+    var service = ModerationTestKit.module().barriers.spam
+    Check.eqStr("first", "NEEDS_REVIEW", service.evaluate(author).status)
+    var calls = ModerationAutomationKit.model().calls()
+    Check.eqStr("second inside the interval", "THROTTLED", service.evaluate(author).status)
+    Check.eqInt("no new call", calls, ModerationAutomationKit.model().calls())
+    var sanctioned = ModerationTestKit.login("sp_sanctioned")
+    flood(sanctioned, "post_sp_sanc_", 8, 1)
+    ModerationTestKit.module().sanctions.restrictUser(sanctioned, "ref_sp_sanc", "teste")
+    Check.eqStr("already sanctioned", "ALREADY_SANCTIONED", spam().evaluate(sanctioned).status)
+    var off = spam()
+    off.enabled = false
+    Check.eqStr("disabled", "DISABLED", off.evaluate(author).status)
+}
+
+test "publishing a flood reaches the automod through the outbox event" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("sp_hook")
+    var ids = listOf<String>()
+    var i = 0
+    while (i < 8) {
+        ids.add(ModerationTestKit.publish(author, "mensagem repetitiva numero " + i))
+        i = i + 1
+    }
+    ModerationAutomationKit.says(verdict("PENALIZAR", "false", "0.96"))
+    ModerationAutomationKit.drainOutbox()
+    Check.eqStr("restricted by the hook", "RESTRICTION", ModerationAutomationKit.sanctionType(author))
+    Check.eqInt("the flood was removed", 8, removedBy(ids) as Int)
+    ModerationTestKit.finish()
+}

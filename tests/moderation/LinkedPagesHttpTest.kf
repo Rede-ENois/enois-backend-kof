@@ -1,0 +1,84 @@
+import kernel.*
+import kernel.http.*
+import kernel.testkit.*
+import moderation.*
+
+// The real page read of HttpLinkedPageReader through kernel.http.Outbound, against a local stand-in server (the only address the
+// test visits). The stand-in subclass accepts the loopback address the default reader refuses; the hop itself is the production one.
+class LocalReader extends ModerationLinkedPageReader {
+    public constructor() {
+        super()
+    }
+    Bool isPublicDestination(url: String) = url.startsWith("http://127.0.0.1:")
+}
+
+class StandIn {
+    static TestApp? cached = null
+    static Int hits = 0
+    static TestApp app() {
+        var cur = StandIn.cached
+        if (cur != null) {
+            return cur
+        }
+        var created = TestApp.bootWire("linkedpages", (p: Platform) -> {
+    p.server.get("/og", () -> {
+    StandIn.hits = StandIn.hits + 1
+    ResponseHeaders.set("Content-Type", "text/html; charset=utf-8")
+    return status(200, "<html><head><title>Titulo do HTML</title><meta property=\"og:title\" content=\"Video &amp; cia\"><meta property=\"og:description\" content=\"A descricao publica\"></head><body>corpo</body></html>")
+})
+    p.server.get("/moved", () -> {
+    ResponseHeaders.set("Location", "/og")
+    return status(302, "")
+})
+    p.server.get("/loop", () -> {
+    ResponseHeaders.set("Location", "/loop")
+    return status(302, "")
+})
+    p.server.get("/plain", () -> {
+    ResponseHeaders.set("Content-Type", "text/plain")
+    return status(200, "<title>nao e html</title>")
+})
+    p.server.get("/gone", () -> status(404, "nope"))
+})
+        StandIn.cached = created
+        return created
+    }
+    static String url(path: String) = "http://127.0.0.1:" + StandIn.app().port + path
+}
+
+test "the title and the description are read from the page over HTTP" {
+    var page = LocalReader().summaryOf(StandIn.url("/og"))
+    Check.isTrue("a summary", page != null)
+    Check.eqStr("title decoded", "Video & cia", ModerationTestKit.str2(ModerationLinkedPageReader.summaryOfHtml("x", "<meta property=\"og:title\" content=\"Video &amp; cia\">").title))
+    Check.eqInt("one request", 1, StandIn.hits)
+    Check.eqStr("the summary", "Video & cia|A descricao publica", LinkedPagesHttpHelper.titleAndDescription(page))
+}
+
+test "a redirect is followed by hand to a relative address" {
+    Check.eqStr("followed", "Video & cia|A descricao publica", LinkedPagesHttpHelper.titleAndDescription(LocalReader().summaryOf(StandIn.url("/moved"))))
+}
+
+test "a redirect loop stops at the cap, a non HTML page and an error status have no summary" {
+    Check.isTrue("loop", LocalReader().summaryOf(StandIn.url("/loop")) == null)
+    Check.isTrue("text/plain", LocalReader().summaryOf(StandIn.url("/plain")) == null)
+    Check.isTrue("404", LocalReader().summaryOf(StandIn.url("/gone")) == null)
+}
+
+test "the default reader never visits the loopback address and an unreachable host is no summary" {
+    var before = StandIn.hits
+    Check.isTrue("refused", ModerationLinkedPageReader().summaryOf(StandIn.url("/og")) == null)
+    Check.eqInt("no request was made", before, StandIn.hits)
+    Check.isTrue("connection refused", LocalReader().summaryOf("http://127.0.0.1:1/x") == null)
+    Check.eqStr("charset of a header", "iso-8859-1", ModerationLinkedPageReader.charsetOf("text/html; charset=\"ISO-8859-1\""))
+    Check.eqStr("no charset", "UTF-8", ModerationLinkedPageReader.charsetOf("text/html"))
+    StandIn.app().platform.stop()
+}
+
+class LinkedPagesHttpHelper {
+    static String titleAndDescription(page: ModerationPageSummary?) {
+        if (page == null) {
+            return "none"
+        }
+        return ModerationTestKit.str2(page.title) + "|" + ModerationTestKit.str2(page.description)
+    }
+}

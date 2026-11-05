@@ -1045,7 +1045,7 @@ review routes in `src/app`). Wired last in `AppWiring`; the seams it owns are in
 
 - Endpoints: 56 of 56 (ModeratorController 35, ReportController 13, SanctionController 8). The handoff inventory said 58;
   the Java mappings count 56.
-- Kof tests: 62 in `tests/moderation` (reports, decisions, sanctions, suspensions, moderator panel and appointment,
+- Kof tests: 166 in `tests/moderation` (62 before the barriers, 104 for them: see below; reports, decisions, sanctions, suspensions, moderator panel and appointment,
   eligibility, pre-triage, AI triage, bulk ban and IP blocks, honeypot and signup guard bounds, automations, content sweep,
   insight reads, e-mail escaping, reputation fairness) and 5 wiring tests in `tests/integration/ModerationSeamsTest.kf`.
 - Java tests ported: MyReportsTests, SanctionFlowTests, SuspensionFlowTests, AdminSanctionManualTests, ApprovedCommentReportTests,
@@ -1060,19 +1060,41 @@ review routes in `src/app`). Wired last in `AppWiring`; the seams it owns are in
   the revoked session and the wired `IP_BLOCKED` test (the moderation kit does not boot identity); decisions answer the
   `ReportView` JSON (Java answered the record text); `GET /admin/users/{u}/age` omits `ageBand` while the birth date is missing
   (a Java `Map`).
-- NOT ported (no code, no tests): `ContentAutomationService` and analyzer, `LinkSafetyService`, `LinkSafetyAnalyzer`,
-  `HttpLinkedPageReader`, `MediaSafetyService`, `MediaSafetyAnalyzer`, `PostSpamAutomodService`, `SexualContentReportService`
-  and their listeners and sweep workers, with their Java tests (ContentAutomationServiceTests, ContentAutomationAnalyzerTests,
-  LinkSafety*, MediaSafety*, PostSpamAutomodTests, SexualContentReport*, AutomationSignalsTests, LinkPolicyTest, PostLinksTest,
-  HttpLinkedPageReaderTest, ModerationImageContentReviewerTests, ContentQuarantineReviewServiceTests are covered by the
-  quarantine port but its own test is not). Consequences: the media upload image reviewer (`MediaImageReviewer`) and the
-  reported-image reader for the AI triage (`ModerationImages`) stay at their defaults (no second opinion, no images in the
-  LLM call).
+- Barriers (branch `port/moderation-automations`): `ContentAutomationService` + analyzer, `LinkSafetyService` + analyzer +
+  `HttpLinkedPageReader`, `MediaSafetyService` + analyzer, `PostSpamAutomodService`, `SexualContentReportService`, with their
+  listeners (the `PostPublished` outbox event of the feed, `ModerationReportEvents.reportCreated` for the sexual flow, both
+  after the commit and on a bounded one-lane executor, `ModerationExecutor`) and their sweep workers. Files:
+  `ModerationAutomationSignals`, `ModerationLinks` (LinkPolicy, PostLinks, PageSummary), `ModerationAnalyzers`,
+  `ModerationAutomationPrompts` (text blocks extracted by script), `ModerationSafetyStore` (the three ledgers and the post
+  readers), `ModerationLinkedPages`, `ModerationContentAutomation`, `ModerationLinkSafety`, `ModerationMediaSafety`,
+  `ModerationSpamAutomod`, `ModerationSexualReport`, `ModerationBarriers` (executor, hook handler, sweeps),
+  `ModerationBarrierSet`, `ModerationMediaBridge` (reported image reader and upload-gate reviewer).
+  Config keys keep the Java env names and defaults (`MODERATION_MEDIA_*`, `MODERATION_LINKS_*`, `MODERATION_AUTOMATION_*`,
+  `MODERATION_SEXUAL_ENABLED`, `MODERATION_SPAM_*`).
+- Barrier tests: 104 Kof tests in `tests/moderation` (AutomationDomainTest 32, ContentAutomationTest 13, LinkSafetyTest 12,
+  MediaSafetyTest 11, PostSpamAutomodTest 9, SexualContentTest 12, LinkedPagesHttpTest 4, BarrierWiringTest 7,
+  MediaBridgeTest 4), 2 wiring tests in `tests/integration/ModerationSeamsTest.kf`, 5 kernel tests
+  (`tests/kernel/LinkTargetsTest.kf`). Java tests ported 120 of 120: ContentAutomationServiceTests, ContentAutomationAnalyzerTests,
+  LinkSafetyServiceTest, LinkSafetyAnalyzerTest, MediaSafetyServiceTests, MediaSafetyListenerTests, MediaSafetyAnalyzerTests,
+  MediaSafetyWiringTests, PostSpamAutomodTests, SexualContentReportTests, SexualContentReportWiringTests,
+  AutomationSignalsTests, LinkPolicyTest, PostLinksTest, HttpLinkedPageReaderTest, ModerationImageContentReviewerTests.
+  Mockito interaction checks became assertions on the real rows (post status, audit trail, ledger, sanctions, notifications)
+  and on the scripted model (calls, request bodies); a probing model proves the order "hidden and pending BEFORE the bot".
+- Barrier differences kept on purpose: `HttpLinkedPageReaderTest.aceitaDestinoPublicoDeVerdade` uses public IP literals
+  (`93.184.216.34`, `8.8.8.8`) instead of `example.com` and `youtube.com`: the guard resolves a literal without DNS, so the test
+  needs no network (the assertion, "a really public destination is accepted", is the same). The Spring-context checks of
+  MediaSafetyWiringTests (bean present, tables exist, sweeps run, queue 401, SEXUAL_CONTENT accepted) are asserted on the booted
+  module and over HTTP. The reported-image reader downloads from the bucket when the media module has one and otherwise through
+  the guarded downloader of the public address; Java only had images when the migration downloader bean existed.
+  A sweep or a hook reads the post through the feed store row mapping (`FeedStore.postOf`).
+- Kernel changes of the barrier work: `kernel.url.LinkTargets` (address normalisation, same `java.net.URI` quoting as Java),
+  `Uris.query` and `Uris.resolve`, `Images.shrinkJpeg` and `Images.toBase64`, `OutboundResponse.location` and `textAs(charset)`.
 - Scheduled jobs on `kernel.jobs`: report AI triage (60 s), learning weights (10 min), suspension expiry (30 min), content sweep
-  (2 min), automatic ban (3 min), report cleanup (30 min).
+  (2 min), automatic ban (3 min), report cleanup (30 min), media sweep (5 min, first run 45 s), link sweep (5 min, 60 s),
+  automated-content sweep (10 min, 90 s).
 - Kernel changes: `DbParams.bindIntOrNull/bindLongOrNull` (G370, same fix as main), `SharedServices.createWith(platform,
   escalation)`.
-- Gaps found: G370 to G377 in `docs/KOF_GAPS.md`.
+- Gaps found: G370 to G379 in `docs/KOF_GAPS.md`.
 
 ## Route parity (final tidy)
 
@@ -1089,15 +1111,15 @@ of `src/**/*.kf`, and diffs the (method, path) sets.
 - Cosmetics moderation: the Java service has no cosmetics moderation or admin endpoint (`CommunityCosmeticsController` is
   `/cosmetics/catalog|{id}|drafts|mine|{id}/submit|{id}/report|profile/*`; a submitted cosmetic stays `PENDING_MODERATION`
   and no Java code approves or rejects it). Nothing to port, nothing to add to `BootRoutesTest`.
-- Deliberate exceptions: the moderation automation classes (`ContentAutomationService`, `LinkSafety*`, `MediaSafety*`,
-  `PostSpamAutomod`, `SexualContentReport*`) have no routes of their own in the list above; their ports belong to another branch.
+- The moderation automation classes (`ContentAutomationService`, `LinkSafety*`, `MediaSafety*`, `PostSpamAutomod`,
+  `SexualContentReport*`) have no HTTP routes; they are ported (see "moderation").
 
 ## Totals (final tidy)
 
-Kof side, counted from the tree: 322 test files with 2186 `test "..."` blocks, 665 route registrations of which 640 match a Java mapping one to one (the rest are
+Kof side, counted from the tree before the moderation automations merge (they added 8 files and 111 tests): 322 test files with 2186 `test "..."` blocks, 665 route registrations of which 640 match a Java mapping one to one (the rest are
 the client and filter patterns above). Per domain, tests in `tests/<domain>` (HTTP-level and unit):
 feed 167, identity 138, jobs 108, media 104 (all media suites), profile 93, messaging 69, cosmetics 67, emotes 68, coin 63,
-moderation 62, groups 57, events 53, mentoring 43, notifications 37, ops 37, corporate 33, studypairs 31, importlinkedin 29,
+moderation 166, groups 57, events 53, mentoring 43, notifications 37, ops 37, corporate 33, studypairs 31, importlinkedin 29,
 games 29, support 28, network 25, preferences 25, contributions 24, communities 22, linkedin 20, dailygames 19, gifs 18,
 freelances 18, blog 16, companies 16, marketplace 16, push 16, importresume 16, calls 15, suggestions 15, projects 10,
 contributors 9, apiv1 9, themes 9, notices 8, githubprofile 7, search 7, releasenotes 6, presence 5, communityprojects 3,

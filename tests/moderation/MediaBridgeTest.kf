@@ -1,0 +1,92 @@
+import kernel.db.*
+import kernel.image.*
+import kernel.testkit.*
+import media.*
+import moderation.*
+
+// The reported-image reader (ReportedMediaAdapter) and the upload-gate reviewer (ModerationImageContentReviewer) built on the
+// media-safety analyzer. Storage answers fixture bytes (a 1600x800 PNG), the model is scripted: no network, no bucket.
+class FixtureBytes extends ModerationMediaBytes {
+    Byte[] data
+    Bool fail = false
+    List<String> asked = listOf<String>()
+    public constructor(data: Byte[]) {
+        super()
+        this.data = data
+    }
+    Byte[]? bytesOf(asset: MediaAsset) {
+        asked.add(asset.id)
+        if (fail) {
+            return null
+        }
+        return data
+    }
+}
+
+ModerationMediaImages reader(bytes: ModerationMediaBytes) {
+    var module = ModerationTestKit.module()
+    return ModerationMediaImages(MediaStore(ModerationTestKit.db()), module.barriers.posts.feed, bytes)
+}
+
+test "the images of a post come back reduced to JPEG, only images, capped by the limit" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("mb_author")
+    var postId = ModerationTestKit.publish(author, "post com midia")
+    ModerationAutomationKit.attach(postId, ModerationAutomationKit.media("media_mb_1", author, "image/png"))
+    ModerationAutomationKit.attach(postId, ModerationAutomationKit.media("media_mb_2", author, "video/mp4"))
+    ModerationAutomationKit.attach(postId, ModerationAutomationKit.media("media_mb_3", author, "image/jpeg"))
+    var bytes = FixtureBytes(Images.sample("png", 1600, 800))
+    var images = reader(bytes)
+    var all = images.imagesOf("POST", postId, 3)
+    Check.eqInt("the video is left out", 2, all.size())
+    Check.isTrue("a JPEG without metadata", all.get(0).startsWith("/9j/"))
+    Check.eqInt("the video was never read", 0, bytes.asked.indexOf("media_mb_2") + 1)
+    Check.eqInt("capped by the limit", 1, images.imagesOf("POST", postId, 1).size())
+    Check.eqInt("a zero limit reads nothing", 0, images.imagesOf("POST", postId, 0).size())
+}
+
+test "the target can be a media, a comment or something without images" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("mb_other")
+    var postId = ModerationTestKit.publish(author, "post com comentario com foto")
+    var commentId = ModerationTestKit.comment(author, postId, "comentario com foto", null)
+    var mediaId = ModerationAutomationKit.media("media_mb_4", author, "image/png")
+    ModerationTestKit.db().execute("insert into comment_media (comment_id, media_id) values (?, ?)", DbParams().bindStr(commentId).bindStr(mediaId))
+    var images = reader(FixtureBytes(Images.sample("png", 300, 300)))
+    Check.eqInt("a media target is the media itself", 1, images.imagesOf("MEDIA", mediaId, 2).size())
+    Check.eqInt("a comment target reads the comment media", 1, images.imagesOf("COMMENT", commentId, 2).size())
+    Check.eqInt("a post without media", 0, images.imagesOf("POST", postId, 2).size())
+    Check.eqInt("a user target has no images", 0, images.imagesOf("USER", author, 2).size())
+}
+
+test "an image that cannot be read is ignored and never throws" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("mb_broken")
+    var mediaId = ModerationAutomationKit.media("media_mb_5", author, "image/png")
+    var bytes = FixtureBytes(Images.sample("png", 100, 100))
+    bytes.fail = true
+    Check.eqInt("storage down", 0, reader(bytes).imagesOf("MEDIA", mediaId, 1).size())
+    Check.eqInt("not an image", 0, reader(FixtureBytes("isto nao e uma imagem".getBytes() as Byte[])).imagesOf("MEDIA", mediaId, 1).size())
+    Check.eqInt("the default seam has no source", 0, reader(ModerationMediaBytes()).imagesOf("MEDIA", mediaId, 1).size())
+}
+
+test "the upload-gate reviewer maps the media verdict to SAFE, PROHIBITED, UNSURE or nothing" {
+    ModerationAutomationKit.setup()
+    var reviewer = ModerationMediaReviewer(ModerationTestKit.module().barriers.mediaAnalyzer)
+    var photo = Images.sample("png", 800, 600)
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("SAFE", "LOW", "0.9", "praia"))
+    Check.eqStr("safe above the floor", "SAFE", reviewer.review(photo))
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("SAFE", "LOW", "0.5", "praia"))
+    Check.eqStr("safe below the floor is not safe", "UNSURE", reviewer.review(photo))
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("EXPLICIT", "HIGH", "0.9", "nudez"))
+    Check.eqStr("explicit", "PROHIBITED", reviewer.review(photo))
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("SEXUAL_MINOR", "CRITICAL", "0.3", "aparencia"))
+    Check.eqStr("a minor skips the floor", "PROHIBITED", reviewer.review(photo))
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("EXPLICIT", "HIGH", "0.5", "talvez"))
+    Check.eqStr("explicit below the floor goes to a person", "UNSURE", reviewer.review(photo))
+    ModerationAutomationKit.model().down = true
+    Check.eqStr("the model returned nothing", "", reviewer.review(photo))
+    ModerationAutomationKit.model().down = false
+    Check.eqStr("an unreadable image", "", reviewer.review("nao e imagem".getBytes() as Byte[]))
+    ModerationTestKit.finish()
+}

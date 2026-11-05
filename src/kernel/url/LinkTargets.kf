@@ -1,0 +1,96 @@
+package kernel.url
+
+import java.net.URI
+import kernel.text.*
+
+// The addresses a text publishes, normalised for comparison (the link rules of the moderation domain): host in lower case
+// without `www.`, no trailing slash, no fragment, no default port and none of the tracking parameters the site itself adds
+// (the rest of the query stays, it changes the video or the article). Same rules and same output as the Java `PostLinks.normalize`,
+// including how `java.net.URI` quotes the path and the query, so a stored hash of an address stays comparable.
+class LinkTargets {
+    static List<String> trackers() = listOf("utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id", "fbclid", "gclid", "mc_cid", "mc_eid", "igshid", "si", "ref_src", "ref_url")
+    // The normalised address, or null when the text is not a valid http(s) destination with a dotted host.
+    static String? normalize(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        var candidate = raw.trim()
+        while (candidate.length() > 0 && ").,;:!?\"'>]}".indexOf(candidate.substring(candidate.length() - 1)) >= 0) {
+            candidate = candidate.substring(0, candidate.length() - 1)
+        }
+        try {
+            var uri = URI.create(candidate)
+            var schemeRaw = uri.getScheme()
+            if (schemeRaw == null) {
+                return null
+            }
+            var scheme = schemeRaw.toLowerCase()
+            if (scheme != "http" && scheme != "https") {
+                return null
+            }
+            var hostRaw = uri.getHost()
+            if (hostRaw == null) {
+                return null
+            }
+            var host = hostRaw.trim()
+            if (host.length() == 0 || host.indexOf(".") < 0) {
+                return null
+            }
+            host = host.toLowerCase()
+            if (host.startsWith("www.")) {
+                host = host.substring(4)
+            }
+            var path = LinkTargets.orRoot(uri.getRawPath())
+            if (path.length() > 1 && path.endsWith("/")) {
+                path = path.substring(0, path.length() - 1)
+            }
+            var query = LinkTargets.withoutTrackers(uri.getRawQuery())
+            var port = uri.getPort()
+            if (port < 0 || (port == 80 && scheme == "http") || (port == 443 && scheme == "https")) {
+                port = -1
+            }
+            // A `null` literal compiles to an Object parameter and misses the constructor (NoSuchMethodError): typed nulls.
+            var noUser = Nulls.str()
+            var noFragment = Nulls.str()
+            return new URI(scheme, noUser, host, port, path, query, noFragment).toString()
+        } catch (String e) {
+            return null
+        }
+    }
+    static String orRoot(rawPath: String?) {
+        if (rawPath == null) {
+            return "/"
+        }
+        if (rawPath.length() == 0) {
+            return "/"
+        }
+        return rawPath
+    }
+    static String? withoutTrackers(rawQuery: String?) {
+        if (rawQuery == null) {
+            return null
+        }
+        if (rawQuery.trim().length() == 0) {
+            return null
+        }
+        var kept = listOf<String>()
+        for (var pair in rawQuery.split("&")) {
+            if (pair.trim().length() == 0) {
+                continue
+            }
+            var equals = pair.indexOf("=")
+            var key = pair
+            if (equals >= 0) {
+                key = pair.substring(0, equals)
+            }
+            if (LinkTargets.trackers().contains(key.toLowerCase())) {
+                continue
+            }
+            kept.add(pair)
+        }
+        if (kept.size() == 0) {
+            return null
+        }
+        return String.join("&", kept)
+    }
+}

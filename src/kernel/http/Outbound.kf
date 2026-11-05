@@ -19,19 +19,32 @@ import org.apache.http.util.EntityUtils
 
 record OutboundReply(Int status, String body)
 
-// A finished outbound GET: status, lower-cased Content-Type ("" when absent) and the body bytes
-// (at most `maxBytes + 1` of them, so a caller detects "too large" without reading the rest).
+// A finished outbound GET: status, lower-cased Content-Type ("" when absent), the Location header ("" when absent: a caller
+// that follows redirects by hand re-checks every hop) and the body bytes (at most `maxBytes + 1` of them, so a caller
+// detects "too large" without reading the rest).
 class OutboundResponse {
     Int status
     String contentType
+    String location
     Byte[] body
-    public constructor(status: Int, contentType: String, body: Byte[]) {
+    public constructor(status: Int, contentType: String, location: String, body: Byte[]) {
         this.status = status
         this.contentType = contentType
+        this.location = location
         this.body = body
     }
     Int size() = body.length
     String text() = new String(body, "UTF-8")
+    // The body decoded in the named charset; an unknown charset name falls back to UTF-8.
+    String textAs(charset: String) {
+        try {
+            return new String(body, charset)
+        } catch (IOException e) {
+            return new String(body, "UTF-8")
+        } catch (String e) {
+            return new String(body, "UTF-8")
+        }
+    }
 }
 
 // Result of a HEAD/GET probe: status (0 = unreachable) and the Content-Type header ("" when absent).
@@ -162,7 +175,7 @@ class Outbound {
     //   var res = Outbound.getBytes("https://cdn.example/x.png", listOf("Accept: image/*"), 4000, 6000, 1048576)
     static OutboundResponse getBytes(url: String, headers: List<String>, connectTimeoutMs: Int, readTimeoutMs: Int, maxBytes: Int) {
         var failure = ""
-        var out = OutboundResponse(0, "", new Byte[0])
+        var out = OutboundResponse(0, "", "", new Byte[0])
         try {
             var conn = new URL(url).openConnection() as HttpURLConnection
             conn.setRequestMethod("GET")
@@ -181,6 +194,11 @@ class Outbound {
             if (type != null) {
                 kind = type.toLowerCase()
             }
+            var place = conn.getHeaderField("Location")
+            var where = ""
+            if (place != null) {
+                where = place
+            }
             var bytes = new Byte[0]
             if (status >= 400) {
                 var errors = conn.getErrorStream()
@@ -195,7 +213,7 @@ class Outbound {
                 stream.close()
             }
             conn.disconnect()
-            out = OutboundResponse(status, kind, bytes)
+            out = OutboundResponse(status, kind, where, bytes)
         } catch (IOException e) {
             failure = "OUTBOUND_FAILED"
         } catch (String e) {
