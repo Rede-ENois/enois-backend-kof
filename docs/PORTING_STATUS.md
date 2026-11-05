@@ -860,3 +860,25 @@ Slug `orgs`, branch `port/orgs`, gap range G340 to G359. Test fixtures: `app.Org
 | `JobCorporate` (jobs) | `CorporateJobsBridge` in `JobSeamSet.corporate` |
 
 `NotificationActors` and `FeedAuthors.corporateByIds` still read `corporate_profiles` read-only with the same columns (same answers; not swapped).
+
+### freelances
+
+Branch `port/orgs-freelances`, package `freelances` (`src/freelances`), module `FreelancesModule.install(platform, shared, profiles, age.gate, corporate, messagingModule)` in `AppWiring`.
+
+| Item | Result |
+|---|---|
+| Endpoints ported/total | 7/7: `GET /freelances` (public, offset cursor, `q`), `GET /me/freelances`, `POST /freelances`, `PATCH /freelances/{id}`, `DELETE /freelances/{id}`, `POST /freelances/{id}/close`, `POST /freelances/{id}/proposals` |
+| Java tests ported/total | 7/7: `FreelanceFlowTests` (4), `FreelanceEditDeleteTests` (2), the freelance case of `TextFieldLimitTests` (1). `SuspiciousContentTargetsTests` and `ServicesFlowTests` only mention the table name or the word and belong to moderation and services |
+| Kof tests | `tests/freelances/*`: 7 ported plus 11 added in `FreelanceRulesTest` (session guard, view and owned flag, every validation code, lifecycle errors, cursor, search escaping, creation throttle, age gate, link check, proposal guards with the block list) |
+
+Seams: none owned. Every collaborator is the real module API from `AppWiring`: `ProfileDirectory` (usernames), `AgeGate.requireCanWrite`, `CorporateService.requireActive`, `MessagingService.freelanceConversationBetween/sendMessage`, `SharedServices.blockedUsers`; the creation throttle (10 per hour per account) is an own `ActionThrottle`, like the other modules. Test fixtures: `app.FreelanceTestKit` (src/app).
+
+Deliberate differences from the Java service:
+
+- The list cursor is a plain SQL `limit/offset`. The Java adapter paged by `offset / size` and skipped `offset % size` rows of that page, so an offset that is not a multiple of the page size returned a short page and no `nextCursor` (cursors issued by the service are always aligned, so the contract the app sees is the same).
+- Edit and close are atomic claims on the status (`update ... where status = 'OPEN'`): two racing requests cannot both win, the loser gets the same 409 the sequential case gets.
+- `POST .../proposals`: the conversation and the message run in one transaction, as in Java; a missing body is `400 BAD_REQUEST` and a JSON `null` body is `400 EMPTY_PROPOSAL`.
+- The body is checked by `SafeLinks.checkRequest()` (the Java `SafeLinkRequestBodyAdvice`), so a scope or a proposal with an unsafe Markdown link is `400 UNSAFE_LINK`. The domain has no URL field of its own.
+- The Java `countOpen` repository method had no caller and is not ported. `freelances` is also named in the Java attack-purge and content-sweep targets: those jobs belong to security and moderation.
+
+No kernel change, no new compiler gap.
