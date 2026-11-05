@@ -966,3 +966,20 @@ Java interop for the identity flows lives here; domain code only sees Strings.
 - `Time.sleep(millis)`: blocks the thread (tests that wait for a background job).
 - Test fixtures (`kernel.testkit`): `ZipFixtures.start()` then `.text/.zeros/.noise/.finish()` builds ZIPs on disk (a 60 MB bomb is under 100 KB), `PdfFixtures.write(lines)` writes a one-page PDF by hand (no lines: a page with no text, the shape of a scanned PDF; PDFBox rebuilds the xref of a hand-made file).
 - `ProfileDirectory.findByEmail(email)`: the account of an e-mail (lower case), used by the LinkedIn contact match.
+## kernel additions of the games port
+
+```kotlin
+import kernel.text.*   import kernel.time.*   import kernel.url.*
+
+var rng = JavaRandom(seed)        // java.util.Random: the same sequence the Java service draws
+rng.nextInt(bound)                // Random.nextInt(int); shuffles are written by the caller
+JavaRandom.secureLong()           // SecureRandom.nextLong, an unguessable challenge seed
+
+IsoWeeks.key("2026-11-04")        // "2026-W45": ISO week, no zero padding (weekBasedYear + "-W" + week)
+
+HostAddresses.classify(host)      // "OK" | "INTERNAL" (loopback, any-local, link-local, site-local, multicast, fc00::/7) | "UNRESOLVED"
+UrlParser.parse(value)            // UrlParts(scheme, userInfo, host, text) or null; tolerates a space or a brace in the path
+```
+
+`HostAddresses.classify` resolves names through DNS; games inject it as the `GamesHosts` seam so tests never
+touch the network. All four are covered by `tests/kernel/GamesAdaptersTest.kf`.

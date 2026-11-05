@@ -1,0 +1,212 @@
+import games.*
+import kernel.testkit.*
+
+// Port of GamesPlatformTests: the catalogue with discovery, the creator page, the library, the devlog and the
+// guarantees the request asks for. Game addresses use a literal public IP (https://8.8.8.8/...) like the Java
+// suite: the guard resolves the host, and a literal never depends on DNS.
+String gplatJson(title: String, url: String, description: String, genres: String) = "{\"title\":\"" + title + "\",\"url\":\"" + url + "\",\"description\":\"" + description + "\",\"tags\":\"" + genres + "\"}"
+
+// Sends with the full sheet through the edit, then moderation approves: the real way to the catalogue.
+String gplatPublish(creator: String, admin: String, title: String, url: String, description: String, genres: String, stage: String, distribution: String) {
+    var created = GamesTestKit.send("POST", "/games", GamesTestKit.auth(creator), gplatJson(title, url, description, genres))
+    Check.status(created, 200)
+    var id = created.json("id")
+    Check.status(GamesTestKit.send("PATCH", "/games/" + id, GamesTestKit.auth(creator), "{\"title\":\"" + title + "\",\"url\":\"" + url + "\",\"description\":\"" + description + "\",\"tags\":\"" + genres + "\",\"genres\":\"" + genres + "\",\"stage\":\"" + stage + "\",\"distribution\":\"" + distribution + "\"}"), 200)
+    Check.status(GamesTestKit.send("POST", "/admin/games/" + id + "/approve", GamesTestKit.auth(admin), ""), 200)
+    return id
+}
+
+// The slugs of a catalogue query, in order.
+List<String> gplatSlugs(query: String) {
+    var res = GamesTestKit.get("/games" + query, listOf<String>())
+    Check.status(res, 200)
+    var out = listOf<String>()
+    var n = res.jsonSize("items")
+    var i = 0
+    while (i < n) {
+        out.add(res.json("items." + i + ".slug"))
+        i = i + 1
+    }
+    return out
+}
+
+Bool gplatSame(expected: List<String>, actual: List<String>) {
+    if (expected.size() != actual.size()) {
+        return false
+    }
+    var i = 0
+    while (i < expected.size()) {
+        if (expected.get(i) != actual.get(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+gplatExpect(label: String, expected: List<String>, actual: List<String>) {
+    if (!gplatSame(expected, actual)) {
+        throw "FAIL " + label + ": expected " + expected.size() + " items, first=" + expected + " but got " + actual
+    }
+}
+
+test "the catalogue searches, filters, orders and paginates" {
+    var creator = GamesTestKit.login("gplat-creator1")
+    var admin = GamesTestKit.loginAdmin("gplat-admin")
+    // The tag `catalogo1` is this test's own: the database is shared by the whole file.
+    gplatPublish(creator, admin, "Neon Drift", "https://8.8.8.8/neon", "Corrida neon de arcade", "ARCADE,RETRO,catalogo1", "RELEASED", "FREE")
+    gplatPublish(creator, admin, "Padaria do Zé", "https://8.8.8.8/padaria", "Simulador de padaria", "SIMULACAO,catalogo1", "EARLY_ACCESS", "FREE")
+    gplatPublish(creator, admin, "Cave Story BR", "https://8.8.8.8/cave", "Plataforma de caverna", "PLATAFORMA,catalogo1", "DEMO", "PAID")
+    // Text search finds by title, description and tag.
+    gplatExpect("query neon", listOf("neon-drift"), gplatSlugs("?tag=catalogo1&query=neon"))
+    gplatExpect("query padaria", listOf("padaria-do-ze"), gplatSlugs("?tag=catalogo1&query=padaria"))
+    gplatExpect("query arcade", listOf("neon-drift"), gplatSlugs("?tag=catalogo1&query=arcade"))
+    // Filters.
+    gplatExpect("genre", listOf("cave-story-br"), gplatSlugs("?tag=catalogo1&genre=PLATAFORMA"))
+    gplatExpect("stage", listOf("padaria-do-ze"), gplatSlugs("?tag=catalogo1&stage=EARLY_ACCESS"))
+    gplatExpect("distribution", listOf("cave-story-br"), gplatSlugs("?tag=catalogo1&distribution=PAID"))
+    var retro = gplatSlugs("?tag=retro")
+    Check.isTrue("retro finds the neon game", retro.contains("neon-drift"))
+    Check.isTrue("retro does not find the others", !retro.contains("padaria-do-ze") && !retro.contains("cave-story-br"))
+    // Order by title is alphabetical and stable.
+    gplatExpect("order title", listOf("cave-story-br", "neon-drift", "padaria-do-ze"), gplatSlugs("?tag=catalogo1&order=title"))
+    // Pagination: two per page, with a cursor until it ends.
+    var first = GamesTestKit.get("/games?tag=catalogo1&limit=2&order=title", listOf<String>())
+    Check.status(first, 200)
+    Check.eqInt("first page", 2, first.jsonSize("items"))
+    var cursor = first.json("nextCursor")
+    Check.eqStr("cursor", "2", cursor)
+    var second = GamesTestKit.get("/games?tag=catalogo1&limit=2&order=title&cursor=" + cursor, listOf<String>())
+    Check.status(second, 200)
+    Check.eqInt("second page", 1, second.jsonSize("items"))
+    Check.isTrue("the cursor ends", second.jsonIsNull("nextCursor"))
+    // A closed order list, a clamped limit and closed stage/distribution values.
+    Check.apiError(GamesTestKit.get("/games?stage=NOPE", listOf<String>()), 400, "INVALID_STAGE")
+    Check.apiError(GamesTestKit.get("/games?distribution=NOPE", listOf<String>()), 400, "INVALID_DISTRIBUTION")
+    Check.status(GamesTestKit.get("/games?order=comment%3Bdrop&limit=9999", listOf<String>()), 200)
+}
+
+test "the address guard rejects unsafe targets" {
+    var creator = GamesTestKit.login("gplat-creator2")
+    var bad = listOf("http://8.8.8.8/jogo", "javascript:alert(1)", "data:text/html,<h1>oi</h1>", "https://127.0.0.1/jogo", "https://localhost/jogo", "https://10.1.2.3/jogo", "https://192.168.0.10/jogo", "https://169.254.169.254/latest", "https://[::1]/jogo", "https://usuario:senha@8.8.8.8/jogo", "https:///sem-host", "https://8.8.8.8/jogo com espaço")
+    for (var url in bad) {
+        var res = GamesTestKit.send("POST", "/games", GamesTestKit.auth(creator), "{\"title\":\"Jogo Ruim\",\"url\":\"" + url + "\"}")
+        Check.apiError(res, 400, "INVALID_GAME_URL")
+    }
+    // And the legitimate public address passes.
+    Check.status(GamesTestKit.send("POST", "/games", GamesTestKit.auth(creator), "{\"title\":\"Jogo Bom\",\"url\":\"https://8.8.8.8/bom\"}"), 200)
+    // Field ceilings are 400 with the column size, not a database failure.
+    var tooLong = GamesTestKit.send("POST", "/games", GamesTestKit.auth(creator), "{\"title\":\"" + strings.repeat("t", 201) + "\",\"url\":\"https://8.8.8.8/x\"}")
+    Check.apiError(tooLong, 400, "GAME_FIELD_TOO_LONG")
+    Check.eqStr("message", "O campo titulo aceita no máximo 200 caracteres.", tooLong.json("message"))
+    Check.apiError(GamesTestKit.send("POST", "/games", GamesTestKit.auth(creator), "{\"title\":\"ab\",\"url\":\"https://8.8.8.8/x\"}"), 400, "INVALID_TITLE")
+}
+
+test "an unpublished game stays out of the catalogue and owner actions are guarded" {
+    var creator = GamesTestKit.login("gplat-creator3")
+    var other = GamesTestKit.login("gplat-other3")
+    var gameId = GamesTestKit.submit(creator, "Rascunho Secreto", "https://8.8.8.8/secreto")
+    // Not published: out of the catalogue and 404 for whoever is not the owner.
+    gplatExpect("not listed", listOf<String>(), gplatSlugs("?query=secreto"))
+    Check.apiError(GamesTestKit.get("/games/gplat-creator3/rascunho-secreto", listOf<String>()), 404, "GAME_NOT_FOUND")
+    var own = GamesTestKit.get("/games/gplat-creator3/rascunho-secreto", GamesTestKit.auth(creator))
+    Check.status(own, 200)
+    Check.jsonEq(own, "status", "SUBMITTED")
+    // Who is not the owner neither edits nor publishes an update.
+    Check.apiError(GamesTestKit.send("PATCH", "/games/" + gameId, GamesTestKit.auth(other), "{\"title\":\"Invadido\",\"url\":\"https://8.8.8.8/x\"}"), 403, "NOT_AUTHORIZED")
+    Check.apiError(GamesTestKit.send("POST", "/games/" + gameId + "/updates", GamesTestKit.auth(other), "{\"title\":\"Novidade alheia\"}"), 403, "NOT_AUTHORIZED")
+    // Keeping an unpublished game is refused (nothing to keep).
+    Check.apiError(GamesTestKit.send("POST", "/games/" + gameId + "/favorite", GamesTestKit.auth(other), ""), 409, "GAME_NOT_PUBLISHED")
+    // A bad stage in the edit is 400 even before the ownership check (the details are built first).
+    Check.apiError(GamesTestKit.send("PATCH", "/games/" + gameId, GamesTestKit.auth(other), "{\"title\":\"Invadido\",\"url\":\"https://8.8.8.8/x\",\"stage\":\"NOPE\"}"), 400, "INVALID_STAGE")
+}
+
+test "creator page, follow, favorites and the devlog" {
+    var creator = GamesTestKit.login("gplat-creator4")
+    var player = GamesTestKit.login("gplat-player4")
+    var admin = GamesTestKit.loginAdmin("gplat-admin")
+    var gameId = gplatPublish(creator, admin, "Café com Código", "https://8.8.8.8/cafe", "Jogo sobre café", "SIMULACAO,devpage1", "RELEASED", "FREE")
+    // Creator page: the Énóis identity + what they filled.
+    var saved = GamesTestKit.send("PUT", "/games/profile", GamesTestKit.auth(creator), "{\"displayName\":\"Estúdio Café\",\"headline\":\"jogos pequenos e honestos\",\"bio\":\"Fazemos jogos de navegador.\",\"links\":\"https://exemplo.com,https://github.com/cafe\"}")
+    Check.status(saved, 200)
+    Check.jsonEq(saved, "displayName", "Estúdio Café")
+    Check.jsonEq(saved, "games.0.slug", "cafe-com-codigo")
+    Check.jsonEq(saved, "links.1", "https://github.com/cafe")
+    Check.apiError(GamesTestKit.send("PUT", "/games/profile", GamesTestKit.auth(creator), "{\"links\":\"javascript:alert(1)\"}"), 400, "INVALID_URL")
+    Check.apiError(GamesTestKit.send("PUT", "/games/profile", GamesTestKit.auth(creator), "{\"headline\":\"" + strings.repeat("h", 201) + "\"}"), 400, "FIELD_TOO_LONG")
+    // Following is one-way and idempotent.
+    var follow = GamesTestKit.send("POST", "/games/gplat-creator4/follow", GamesTestKit.auth(player), "")
+    Check.status(follow, 200)
+    Check.jsonEq(follow, "following", "true")
+    var page = GamesTestKit.get("/games/gplat-creator4/profile", GamesTestKit.auth(player))
+    Check.status(page, 200)
+    Check.jsonEq(page, "following", "true")
+    Check.jsonEq(page, "followers", "1")
+    var unfollow = GamesTestKit.send("DELETE", "/games/gplat-creator4/follow", GamesTestKit.auth(player), "")
+    Check.status(unfollow, 200)
+    Check.jsonEq(unfollow, "following", "false")
+    // Nobody follows themselves.
+    Check.apiError(GamesTestKit.send("POST", "/games/gplat-creator4/follow", GamesTestKit.auth(creator), ""), 400, "CANNOT_FOLLOW_SELF")
+    // Library: keep, list and unkeep.
+    var kept = GamesTestKit.send("POST", "/games/" + gameId + "/favorite", GamesTestKit.auth(player), "")
+    Check.status(kept, 200)
+    Check.jsonEq(kept, "favorited", "true")
+    var library = GamesTestKit.get("/games/library", GamesTestKit.auth(player))
+    Check.status(library, 200)
+    Check.jsonEq(library, "0.slug", "cafe-com-codigo")
+    Check.jsonEq(library, "0.favorited", "true")
+    Check.jsonEq(library, "0.favorites", "1")
+    var gone = GamesTestKit.send("DELETE", "/games/" + gameId + "/favorite", GamesTestKit.auth(player), "")
+    Check.status(gone, 200)
+    Check.jsonEq(gone, "favorited", "false")
+    Check.eqInt("empty library", 0, GamesTestKit.get("/games/library", GamesTestKit.auth(player)).jsonSize(""))
+    // Devlog: the owner publishes, everybody reads, and the count shows in the game numbers.
+    var update = GamesTestKit.send("POST", "/games/" + gameId + "/updates", GamesTestKit.auth(creator), "{\"title\":\"Versão 1.2\",\"body\":\"Corrigi o bug do café frio.\",\"version\":\"1.2\"}")
+    Check.status(update, 200)
+    Check.jsonEq(update, "version", "1.2")
+    var updates = GamesTestKit.get("/games/" + gameId + "/updates", listOf<String>())
+    Check.status(updates, 200)
+    Check.jsonEq(updates, "0.title", "Versão 1.2")
+    Check.apiError(GamesTestKit.send("POST", "/games/" + gameId + "/updates", GamesTestKit.auth(creator), "{\"body\":\"sem titulo\"}"), 400, "INVALID_TITLE")
+    // "Play" counts the session on the server (this is where the order by plays comes from).
+    var play = GamesTestKit.send("POST", "/games/" + gameId + "/play", GamesTestKit.auth(player), "")
+    Check.status(play, 200)
+    Check.jsonEq(play, "plays", "1")
+    var stats = GamesTestKit.get("/games/" + gameId + "/stats", listOf<String>())
+    Check.status(stats, 200)
+    Check.jsonEq(stats, "plays", "1")
+    Check.jsonEq(stats, "players", "1")
+    Check.jsonEq(stats, "updates", "1")
+    // The most played leads the order by plays, scoped to this test's own tag.
+    var ordered = gplatSlugs("?tag=devpage1&order=plays")
+    Check.eqStr("most played first", "cafe-com-codigo", ordered.get(0))
+}
+
+test "suspension takes the game off the air without deleting it" {
+    var creator = GamesTestKit.login("gplat-creator5")
+    var admin = GamesTestKit.loginAdmin("gplat-admin")
+    var player = GamesTestKit.login("gplat-player5")
+    var gameId = gplatPublish(creator, admin, "Jogo Suspeito", "https://8.8.8.8/suspeito", "Para suspender", "SUSPEITO", "RELEASED", "FREE")
+    // Somebody keeps the game before the suspension.
+    Check.status(GamesTestKit.send("POST", "/games/" + gameId + "/favorite", GamesTestKit.auth(player), ""), 200)
+    // Who is not an admin does not suspend.
+    Check.apiError(GamesTestKit.send("POST", "/admin/games/" + gameId + "/suspend", GamesTestKit.auth(creator), "{\"note\":\"quero tirar\"}"), 403, "FORBIDDEN")
+    var suspended = GamesTestKit.send("POST", "/admin/games/" + gameId + "/suspend", GamesTestKit.auth(admin), "{\"note\":\"violação de direitos\"}")
+    Check.status(suspended, 200)
+    Check.jsonEq(suspended, "status", "SUSPENDED")
+    Check.apiError(GamesTestKit.send("POST", "/admin/games/" + gameId + "/suspend", GamesTestKit.auth(admin), "{}"), 409, "ALREADY_SUSPENDED")
+    // Out of the catalogue, gone for the others and out of the library of who kept it, but the record stays:
+    // the owner still sees it and moderation can put it back.
+    gplatExpect("not listed", listOf<String>(), gplatSlugs("?query=suspeito"))
+    Check.apiError(GamesTestKit.get("/games/gplat-creator5/jogo-suspeito", listOf<String>()), 404, "GAME_NOT_FOUND")
+    Check.eqInt("library is empty", 0, GamesTestKit.get("/games/library", GamesTestKit.auth(player)).jsonSize(""))
+    var own = GamesTestKit.get("/games/gplat-creator5/jogo-suspeito", GamesTestKit.auth(creator))
+    Check.status(own, 200)
+    Check.jsonEq(own, "status", "SUSPENDED")
+    var restored = GamesTestKit.send("POST", "/admin/games/" + gameId + "/unsuspend", GamesTestKit.auth(admin), "")
+    Check.status(restored, 200)
+    Check.jsonEq(restored, "status", "PUBLISHED")
+    Check.apiError(GamesTestKit.send("POST", "/admin/games/" + gameId + "/unsuspend", GamesTestKit.auth(admin), ""), 409, "NOT_SUSPENDED")
+    gplatExpect("listed again", listOf("jogo-suspeito"), gplatSlugs("?query=suspeito"))
+    GamesTestKit.finish()
+}

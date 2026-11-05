@@ -1,0 +1,74 @@
+import dailygames.*
+import games.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Blocks over HTTP: the replay runs against the server clock, so the anti-cheat is tested by pinning it.
+// Port of the blocks half of DailyGamePayoutTest plus the endpoint contract (the Java suite only covered the
+// engine, the HTTP flow had no test).
+String blocksBody(action: String, requestId: String) = "{\"action\":\"" + action + "\",\"requestId\":\"" + requestId + "\"}"
+
+test "start, state and the validation of an action" {
+    GamesTestClock.pin("2026-10-18T12:00:00.000Z")
+    var token = GamesTestKit.login("dbk-ana")
+    var state = GamesTestKit.get("/daily-games/blocks/today", GamesTestKit.auth(token))
+    Check.jsonEq(state, "status", "NOT_STARTED")
+    Check.apiError(GamesTestKit.send("POST", "/daily-games/blocks/today/actions", GamesTestKit.auth(token), blocksBody("LEFT", "request_0001")), 409, "GAME_NOT_STARTED")
+    var started = GamesTestKit.send("POST", "/daily-games/blocks/today/start", GamesTestKit.auth(token), "")
+    Check.status(started, 200)
+    Check.jsonEq(started, "status", "PLAYING")
+    Check.jsonEq(started, "rulesVersion", "2")
+    Check.eqInt("20 rows", 20, started.jsonSize("board"))
+    Check.eqInt("4 active cells", 4, started.jsonSize("activeCells"))
+    Check.eqInt("4 next cells", 4, started.jsonSize("nextCells"))
+    Check.apiError(GamesTestKit.send("POST", "/daily-games/blocks/today/actions", GamesTestKit.auth(token), blocksBody("JUMP", "request_0001")), 400, "INVALID_ACTION")
+    Check.apiError(GamesTestKit.send("POST", "/daily-games/blocks/today/actions", GamesTestKit.auth(token), blocksBody("LEFT", "x")), 400, "INVALID_REQUEST_ID")
+    Check.status(GamesTestKit.anonymous("POST", "/daily-games/blocks/today/actions", blocksBody("LEFT", "request_0001")), 401)
+    GamesTestClock.unpin()
+}
+
+test "anti-cheat: idempotency, 80 ms between actions and the ten minute window" {
+    GamesTestClock.pin("2026-10-18T12:00:00.000Z")
+    var token = GamesTestKit.login("dbk-bia")
+    Check.status(GamesTestKit.send("POST", "/daily-games/blocks/today/start", GamesTestKit.auth(token), ""), 200)
+    var first = GamesTestKit.send("POST", "/daily-games/blocks/today/actions", GamesTestKit.auth(token), blocksBody("LEFT", "request_0001"))
+    Check.status(first, 200)
+    Check.jsonEq(first, "actions", "1")
+    // Same instant: too fast. The very same request id is an idempotent replay and is not an action.
+    Check.apiError(GamesTestKit.send("POST", "/daily-games/blocks/today/actions", GamesTestKit.auth(token), blocksBody("RIGHT", "request_0002")), 429, "ACTION_TOO_FAST")
+    var replay = GamesTestKit.send("POST", "/daily-games/blocks/today/actions", GamesTestKit.auth(token), blocksBody("LEFT", "request_0001"))
+    Check.jsonEq(replay, "actions", "1")
+    Check.apiError(GamesTestKit.send("POST", "/daily-games/blocks/today/actions", GamesTestKit.auth(token), blocksBody("RIGHT", "request_0001")), 409, "IDEMPOTENCY_CONFLICT")
+    GamesTestClock.pin("2026-10-18T12:00:01.000Z")
+    var second = GamesTestKit.send("POST", "/daily-games/blocks/today/actions", GamesTestKit.auth(token), blocksBody("RIGHT", "request_0002"))
+    Check.status(second, 200)
+    Check.jsonEq(second, "actions", "2")
+    // Past the 600 s window the match is closed.
+    GamesTestClock.pin("2026-10-18T12:10:01.000Z")
+    Check.apiError(GamesTestKit.send("POST", "/daily-games/blocks/today/actions", GamesTestKit.auth(token), blocksBody("LEFT", "request_0003")), 409, "GAME_FINISHED")
+    GamesTestClock.unpin()
+}
+
+test "blocks payout ranks by score then time and excludes non winners" {
+    var db = GamesTestKit.db()
+    GamesTestKit.login("dbq-u1")
+    GamesTestKit.login("dbq-u2")
+    GamesTestKit.login("dbq-u3")
+    GamesTestKit.login("dbq-u4")
+    db.execute("insert into daily_blocks_challenges values (?, 12345, 3, 1)", DbParams().bindDate("2026-10-16"))
+    var start = "2026-10-16T12:01:30Z"
+    var day = "2026-10-16"
+    db.execute("insert into daily_blocks_sessions values (?, ?, ?, null, ?, \'WON\', 400, 3)", DbParams().bindDate(day).bindStr("dbq-u1").bindInstant(start).bindInstant("2026-10-16T12:05:00Z"))
+    db.execute("insert into daily_blocks_sessions values (?, ?, ?, null, ?, \'WON\', 400, 3)", DbParams().bindDate(day).bindStr("dbq-u2").bindInstant(start).bindInstant("2026-10-16T12:03:20Z"))
+    db.execute("insert into daily_blocks_sessions values (?, ?, ?, null, ?, \'WON\', 900, 3)", DbParams().bindDate(day).bindStr("dbq-u3").bindInstant(start).bindInstant("2026-10-16T12:08:20Z"))
+    db.execute("insert into daily_blocks_sessions values (?, ?, ?, null, ?, \'LOST\', 999, 2)", DbParams().bindDate(day).bindStr("dbq-u4").bindInstant(start).bindInstant("2026-10-16T12:10:00Z"))
+    var order = GamesTestKit.daily().blocks.payoutOrder(day)
+    Check.eqInt("three paid", 3, order.size())
+    Check.eqStr("first", "dbq-u3", order.get(0))
+    Check.eqStr("second", "dbq-u2", order.get(1))
+    Check.eqStr("third", "dbq-u1", order.get(2))
+    // The public board shows today's winners only.
+    var board = GamesTestKit.get("/daily-games/blocks/leaderboard", GamesTestKit.auth(GamesTestKit.login("dbq-u1")))
+    Check.status(board, 200)
+    Check.eqInt("nobody today", 0, board.jsonSize("items"))
+}

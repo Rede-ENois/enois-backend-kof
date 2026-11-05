@@ -1,0 +1,101 @@
+import dailygames.*
+import games.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Port of DailyWordServiceTest and the word half of DailyGamePayoutTest, over HTTP (the Java ones called the
+// service with a fixed Clock; here GamesTestClock pins the instant of the booted app).
+String wordBody(guess: String, requestId: String) = "{\"guess\":\"" + guess + "\",\"requestId\":\"" + requestId + "\"}"
+
+String wordJoin(marks: List<String>) {
+    var out = ""
+    for (var m in marks) {
+        out = out + m + ","
+    }
+    return out
+}
+
+test "repeated letters only consume available occurrences" {
+    assert(wordJoin(WordRules.evaluate("AMORA", "AAAAA")) == "CORRECT,ABSENT,ABSENT,ABSENT,CORRECT,")
+    assert(wordJoin(WordRules.evaluate("AMORA", "MORAA")) == "PRESENT,PRESENT,PRESENT,PRESENT,CORRECT,")
+    assert(WordRules.normalize("maçãs") == "MACAS")
+}
+
+test "the daily challenge is shared, private and idempotent" {
+    GamesTestClock.pin("2026-10-18T12:00:00Z")
+    var ana = GamesTestKit.login("dwf-ana")
+    var bia = GamesTestKit.login("dwf-bia")
+    var state = GamesTestKit.get("/daily-games/words/today", GamesTestKit.auth(ana))
+    Check.status(state, 200)
+    Check.jsonEq(state, "status", "NOT_STARTED")
+    Check.jsonEq(state, "date", "2026-10-18")
+    // Without a session the guess is refused; anonymous callers do not even get to the state.
+    Check.apiError(GamesTestKit.send("POST", "/daily-games/words/today/guesses", GamesTestKit.auth(ana), wordBody("AMIGO", "request_0000")), 409, "GAME_NOT_STARTED")
+    Check.status(GamesTestKit.anonymous("GET", "/daily-games/words/today", ""), 401)
+    Check.status(GamesTestKit.send("POST", "/daily-games/words/today/start", GamesTestKit.auth(ana), ""), 200)
+    Check.status(GamesTestKit.send("POST", "/daily-games/words/today/start", GamesTestKit.auth(bia), ""), 200)
+    var answer = GamesTestKit.db().queryOne("select answer from daily_word_challenges where challenge_date = ?", DbParams().bindDate("2026-10-18")).getStr("answer")
+    var wrong = "AMIGO"
+    if (answer == "AMIGO") {
+        wrong = "AMORA"
+    }
+    var first = GamesTestKit.send("POST", "/daily-games/words/today/guesses", GamesTestKit.auth(ana), wordBody(wrong, "request_0001"))
+    Check.status(first, 200)
+    Check.jsonEq(first, "status", "IN_PROGRESS")
+    Check.eqInt("one guess", 1, first.jsonSize("guesses"))
+    // The answer never leaves the server while the match is on.
+    assert(!first.body.contains(answer + "\""))
+    assert(!GamesRecordingCoins.presenceSlot.contains("dwf-ana"))
+    // The same request id with the same word answers the same; with another word it is a conflict.
+    var again = GamesTestKit.send("POST", "/daily-games/words/today/guesses", GamesTestKit.auth(ana), wordBody(wrong, "request_0001"))
+    Check.eqStr("idempotent body", first.body, again.body)
+    Check.apiError(GamesTestKit.send("POST", "/daily-games/words/today/guesses", GamesTestKit.auth(ana), wordBody(answer, "request_0001")), 409, "IDEMPOTENCY_CONFLICT")
+    var second = GamesTestKit.send("POST", "/daily-games/words/today/guesses", GamesTestKit.auth(bia), wordBody(answer, "request_0002"))
+    Check.status(second, 200)
+    Check.jsonEq(second, "status", "WON")
+    Check.jsonEq(second, "streak", "1")
+    // Finishing counts as the day's presence.
+    assert(GamesRecordingCoins.presenceSlot.contains("dwf-bia"))
+    var won = GamesTestKit.send("POST", "/daily-games/words/today/guesses", GamesTestKit.auth(ana), wordBody(answer, "request_0003"))
+    Check.jsonEq(won, "status", "WON")
+    Check.eqInt("one challenge", 1, GamesTestKit.db().queryLong("select count(*) from daily_word_challenges where challenge_date = ?", DbParams().bindDate("2026-10-18")).toInt())
+    // Bia solved it in one try: she leads the board.
+    var board = GamesTestKit.get("/daily-games/words/leaderboard", GamesTestKit.auth(ana))
+    Check.status(board, 200)
+    Check.jsonEq(board, "items.0.username", "dwf-bia")
+    // A word outside the dictionary, a bad request id and a finished match.
+    Check.apiError(GamesTestKit.send("POST", "/daily-games/words/today/guesses", GamesTestKit.auth(bia), wordBody("ZZZZZ", "request_0004")), 400, "INVALID_GUESS")
+    Check.apiError(GamesTestKit.send("POST", "/daily-games/words/today/guesses", GamesTestKit.auth(bia), wordBody(wrong, "x")), 400, "INVALID_REQUEST_ID")
+    Check.apiError(GamesTestKit.send("POST", "/daily-games/words/today/guesses", GamesTestKit.auth(bia), wordBody(wrong, "request_0005")), 409, "GAME_FINISHED")
+    // ?date= is limited to today and yesterday.
+    Check.status(GamesTestKit.get("/daily-games/words/today?date=2026-10-17", GamesTestKit.auth(ana)), 200)
+    Check.apiError(GamesTestKit.get("/daily-games/words/today?date=2026-10-16", GamesTestKit.auth(ana)), 400, "INVALID_CHALLENGE_DATE")
+    Check.apiError(GamesTestKit.get("/daily-games/words/today?date=2026-10-19", GamesTestKit.auth(ana)), 400, "INVALID_CHALLENGE_DATE")
+    GamesTestClock.unpin()
+}
+
+test "word payout ranks by attempts and excludes those who missed" {
+    GamesTestClock.pin("2026-10-16T12:00:00Z")
+    var u1 = GamesTestKit.login("dwp-ana")
+    var u2 = GamesTestKit.login("dwp-bia")
+    var u3 = GamesTestKit.login("dwp-caio")
+    GamesTestKit.db().execute("insert into daily_word_challenges (challenge_date, answer) values (?, ?)", DbParams().bindDate("2026-10-16").bindStr("AMORA"))
+    for (var token in listOf(u1, u2, u3)) {
+        Check.status(GamesTestKit.send("POST", "/daily-games/words/today/start", GamesTestKit.auth(token), ""), 200)
+    }
+    Check.status(GamesTestKit.send("POST", "/daily-games/words/today/guesses", GamesTestKit.auth(u1), wordBody("AMIGO", "request_0001")), 200)
+    Check.status(GamesTestKit.send("POST", "/daily-games/words/today/guesses", GamesTestKit.auth(u1), wordBody("AMORA", "request_0002")), 200)
+    Check.status(GamesTestKit.send("POST", "/daily-games/words/today/guesses", GamesTestKit.auth(u2), wordBody("AMORA", "request_0003")), 200)
+    var n = 0
+    for (var guess in listOf("AMIGO", "BARCO", "CAMPO", "CANTO", "CARRO", "CASAS")) {
+        n = n + 1
+        Check.status(GamesTestKit.send("POST", "/daily-games/words/today/guesses", GamesTestKit.auth(u3), wordBody(guess, "request_u3_" + n)), 200)
+    }
+    var lost = GamesTestKit.get("/daily-games/words/today", GamesTestKit.auth(u3))
+    Check.jsonEq(lost, "status", "LOST")
+    var order = GamesTestKit.daily().word.payoutOrder("2026-10-16")
+    Check.eqInt("two paid", 2, order.size())
+    Check.eqStr("first", "dwp-bia", order.get(0))
+    Check.eqStr("second", "dwp-ana", order.get(1))
+    GamesTestClock.unpin()
+}

@@ -1,0 +1,95 @@
+import games.*
+import kernel.testkit.*
+
+// Port of GameStoreCustomizationTests: the store as the CREATOR runs it: edit the sheet and the visual identity
+// (icon / banner by photo or HTML), choose the game address (slug), delete the game and read the usage numbers.
+String gstorePublish(creator: String, admin: String, title: String, url: String) = GamesTestKit.publish(creator, admin, title, url)
+
+test "the owner edits the identity and the slug and deletes the game" {
+    var creator = GamesTestKit.login("gstore-creator1")
+    var other = GamesTestKit.login("gstore-other1")
+    var admin = GamesTestKit.loginAdmin("gstore-admin")
+    var gameId = gstorePublish(creator, admin, "Jogo Editável", "https://8.8.8.8/editavel")
+    // Full edit: sheet, new address and visual identity (icon + HTML banner).
+    var edited = GamesTestKit.send("PATCH", "/games/" + gameId, GamesTestKit.auth(creator), "{\"title\":\"Jogo Editado\",\"url\":\"https://8.8.8.8/editado\",\"tags\":\"ARCADE\",\"slug\":\"Endereço Novo\",\"icon\":\"/uploads/jogos/icone.png\",\"banner\":\"/uploads/jogos/banner.png\",\"bannerHtml\":\"<div class=\\\"banner\\\">bem-vindo</div>\"}")
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "slug", "endereco-novo")
+    // The new address opens with the identity; the old one stops existing.
+    var page = GamesTestKit.get("/games/gstore-creator1/endereco-novo", GamesTestKit.auth(creator))
+    Check.status(page, 200)
+    Check.jsonEq(page, "slug", "endereco-novo")
+    Check.jsonEq(page, "icon", "/uploads/jogos/icone.png")
+    Check.jsonEq(page, "banner", "/uploads/jogos/banner.png")
+    Check.jsonEq(page, "bannerHtml", "<div class=\"banner\">bem-vindo</div>")
+    Check.apiError(GamesTestKit.get("/games/gstore-creator1/jogo-editavel", listOf<String>()), 404, "GAME_NOT_FOUND")
+    // The address of another game of the SAME creator is a collision: refused, not overwritten.
+    var second = gstorePublish(creator, admin, "Segundo Jogo", "https://8.8.8.8/segundo")
+    Check.apiError(GamesTestKit.send("PATCH", "/games/" + second, GamesTestKit.auth(creator), "{\"title\":\"Segundo Jogo\",\"url\":\"https://8.8.8.8/segundo\",\"slug\":\"endereco-novo\"}"), 409, "SLUG_IN_USE")
+    Check.apiError(GamesTestKit.send("PATCH", "/games/" + second, GamesTestKit.auth(creator), "{\"title\":\"Segundo Jogo\",\"url\":\"https://8.8.8.8/segundo\",\"slug\":\"!!\"}"), 400, "INVALID_SLUG")
+    // Deleting is the owner's. Who is not the owner gets 403.
+    Check.apiError(GamesTestKit.send("DELETE", "/games/" + gameId, GamesTestKit.auth(other), ""), 403, "NOT_AUTHORIZED")
+    var deleted = GamesTestKit.send("DELETE", "/games/" + gameId, GamesTestKit.auth(creator), "")
+    Check.status(deleted, 200)
+    Check.jsonEq(deleted, "status", "DELETED")
+    // It leaves the store, the public address, the panel and the numbers.
+    Check.apiError(GamesTestKit.get("/games/gstore-creator1/endereco-novo", listOf<String>()), 404, "GAME_NOT_FOUND")
+    var mine = GamesTestKit.get("/me/games", GamesTestKit.auth(creator))
+    Check.eqInt("not in the panel", -1, GamesTestKit.indexOf(mine, "", "id", gameId))
+    Check.apiError(GamesTestKit.get("/games/" + gameId + "/analytics", GamesTestKit.auth(creator)), 404, "GAME_NOT_FOUND")
+}
+
+test "analytics count public views and are owner only" {
+    var creator = GamesTestKit.login("gstore-creator2")
+    var player = GamesTestKit.login("gstore-player2")
+    var admin = GamesTestKit.loginAdmin("gstore-admin")
+    var gameId = gstorePublish(creator, admin, "Jogo com Números", "https://8.8.8.8/numeros")
+    // Two public openings (anonymous + player) and ONE by the owner: the owner's does not count.
+    Check.status(GamesTestKit.get("/games/gstore-creator2/jogo-com-numeros", listOf<String>()), 200)
+    Check.status(GamesTestKit.get("/games/gstore-creator2/jogo-com-numeros", GamesTestKit.auth(player)), 200)
+    Check.status(GamesTestKit.get("/games/gstore-creator2/jogo-com-numeros", GamesTestKit.auth(creator)), 200)
+    Check.status(GamesTestKit.send("POST", "/games/" + gameId + "/play", GamesTestKit.auth(player), ""), 200)
+    // The chart: a fixed 7-day window, totals and the series (only the creator sees it).
+    var analytics = GamesTestKit.get("/games/" + gameId + "/analytics?days=7", GamesTestKit.auth(creator))
+    Check.status(analytics, 200)
+    Check.jsonEq(analytics, "plays", "1")
+    Check.jsonEq(analytics, "players", "1")
+    Check.jsonEq(analytics, "days", "7")
+    Check.eqInt("series", 7, analytics.jsonSize("series"))
+    Check.jsonEq(analytics, "series.6.pageViews", "2")
+    Check.jsonEq(analytics, "series.6.plays", "1")
+    Check.jsonEq(analytics, "series.6.players", "1")
+    Check.jsonEq(analytics, "series.6.shares", "0")
+    Check.eqInt("days is clamped", 90, GamesTestKit.get("/games/" + gameId + "/analytics?days=500", GamesTestKit.auth(creator)).jsonSize("series"))
+    // The numbers of the game are not public.
+    Check.apiError(GamesTestKit.get("/games/" + gameId + "/analytics", GamesTestKit.auth(player)), 403, "NOT_AUTHORIZED")
+    Check.apiError(GamesTestKit.get("/games/" + gameId + "/analytics", listOf<String>()), 401, "UNAUTHENTICATED")
+}
+
+// The STORE knows what is mine: with a session the catalogue marks `owned` on my game, which makes the card
+// offer "Edit" to whoever published. Without a session (or for somebody else) nothing is mine.
+test "the catalogue marks my own game so the store can offer edit" {
+    var creator = GamesTestKit.login("gstore-creator4")
+    var other = GamesTestKit.login("gstore-other4")
+    var admin = GamesTestKit.loginAdmin("gstore-admin")
+    var title = "Jogo do Catalogo Proprio"
+    var gameId = gstorePublish(creator, admin, title, "https://8.8.8.8/catalogo")
+    Check.jsonEq(GamesTestKit.get("/games?query=proprio", listOf<String>()), "items.0.owned", "false")
+    Check.jsonEq(GamesTestKit.get("/games?query=proprio", GamesTestKit.auth(other)), "items.0.owned", "false")
+    Check.jsonEq(GamesTestKit.get("/games?query=proprio", GamesTestKit.auth(creator)), "items.0.owned", "true")
+    // "My submissions" (the owner's list): all of them are mine.
+    var mine = GamesTestKit.get("/me/games", GamesTestKit.auth(creator))
+    var at = GamesTestKit.indexOf(mine, "", "id", gameId)
+    Check.isTrue("the game is in /me/games", at >= 0)
+    Check.jsonEq(mine, at + ".owned", "true")
+}
+
+test "the creator panel prefills without knowing the username" {
+    var creator = GamesTestKit.login("gstore-creator3")
+    Check.status(GamesTestKit.send("PUT", "/games/profile", GamesTestKit.auth(creator), "{\"displayName\":\"Estúdio Teste\"}"), 200)
+    var mine = GamesTestKit.get("/games/profile/mine", GamesTestKit.auth(creator))
+    Check.status(mine, 200)
+    Check.jsonEq(mine, "displayName", "Estúdio Teste")
+    Check.jsonEq(mine, "username", "gstore-creator3")
+    Check.apiError(GamesTestKit.get("/games/profile/mine", listOf<String>()), 401, "UNAUTHENTICATED")
+    GamesTestKit.finish()
+}

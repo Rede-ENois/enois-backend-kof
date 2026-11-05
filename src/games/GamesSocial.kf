@@ -1,0 +1,176 @@
+package games
+
+import kernel.error.*
+import kernel.id.*
+import kernel.text.*
+import kernel.time.*
+import profile.*
+
+// Reviews (1-5 stars + text) and comments of the games. The OWNER does not review their own game (it would
+// inflate the rating); each person has ONE review per game (sending again updates it); comments are free, but
+// the owner of the game and the author can delete them. Port of GameSocialService.
+class GamesSocial {
+    GamesStore games
+    ProfileDirectory profiles
+    public constructor(games: GamesStore, profiles: ProfileDirectory) {
+        this.games = games
+        this.profiles = profiles
+    }
+    GameReviewsView reviews(gameId: String, limit: Int) {
+        var found = this.game(gameId)
+        var items = listOf<GameReviewView>()
+        for (var review in games.reviewsOf(found.id(), limit)) {
+            items.add(this.reviewView(review))
+        }
+        return GameReviewsView(games.averageRating(found.id()), games.countReviews(found.id()), items)
+    }
+    // Batch summary of the cards: id -> {average, reviews, comments}, in the order of the ids.
+    List<GameRatingEntry> ratings(gameIds: List<String>) {
+        var averages = mapOf<String, Double>()
+        var counts = mapOf<String, Long>()
+        for (var row in games.reviewStats(gameIds)) {
+            var average = 0.0
+            var text = row.getStrOrNull("average")
+            if (text != null) {
+                average = text.trim().toDouble()
+            }
+            averages.put(row.getStr("game_id"), average)
+            counts.put(row.getStr("game_id"), row.getLong("total"))
+        }
+        var commentCounts = mapOf<String, Long>()
+        for (var row in games.commentCounts(gameIds)) {
+            commentCounts.put(row.getStr("game_id"), row.getLong("total"))
+        }
+        var out = listOf<GameRatingEntry>()
+        for (var id in gameIds) {
+            var average = 0.0
+            var knownAverage = averages.get(id)
+            if (knownAverage != null) {
+                average = knownAverage
+            }
+            var reviewCount = 0L
+            var knownCount = counts.get(id)
+            if (knownCount != null) {
+                reviewCount = knownCount
+            }
+            var commentCount = 0L
+            var knownComments = commentCounts.get(id)
+            if (knownComments != null) {
+                commentCount = knownComments
+            }
+            out.add(GameRatingEntry(id, GameRatingSummary(average, reviewCount, commentCount)))
+        }
+        return out
+    }
+    GameReviewView review(gameId: String, userId: String, rating: Int, text: String?) {
+        var found = this.game(gameId)
+        if (found.userId() == userId) {
+            throw Errors.api(403, "OWNER_CANNOT_REVIEW", "Você não pode avaliar o próprio jogo.")
+        }
+        if (rating < 1 || rating > 5) {
+            throw Errors.api(400, "INVALID_RATING", "A nota vai de 1 a 5 estrelas.")
+        }
+        var clean = GamesSocial.trimOrNull(text, 2000, "O texto da avaliação é longo demais.")
+        var now = Time.nowIso()
+        var existing = games.findReview(gameId, userId)
+        if (existing == null) {
+            games.insertReview(GameReviewRecord(Ids.prefixed("grev_"), gameId, userId, rating, clean, now, now))
+        }
+        else {
+            games.updateReview(existing.id(), rating, clean, now)
+        }
+        var saved = games.findReview(gameId, userId)
+        if (saved == null) {
+            throw Errors.api(404, "REVIEW_NOT_FOUND", "Você ainda não avaliou este jogo.")
+        }
+        return this.reviewView(saved)
+    }
+    deleteReview(gameId: String, userId: String) {
+        this.game(gameId)
+        var existing = games.findReview(gameId, userId)
+        if (existing == null) {
+            throw Errors.api(404, "REVIEW_NOT_FOUND", "Você ainda não avaliou este jogo.")
+        }
+        games.deleteReview(existing.id())
+    }
+    GameCommentsView comments(gameId: String, limit: Int) {
+        var found = this.game(gameId)
+        var items = listOf<GameCommentView>()
+        for (var comment in games.commentsOf(found.id(), limit)) {
+            items.add(this.commentView(comment))
+        }
+        return GameCommentsView(games.countComments(found.id()), items)
+    }
+    GameCommentView comment(gameId: String, userId: String, text: String?) {
+        this.game(gameId)
+        var clean = GamesSocial.trimOrNull(text, 2000, "O comentário é longo demais.")
+        if (clean == null) {
+            throw Errors.api(400, "COMMENT_REQUIRED", "Escreva um comentário.")
+        }
+        if (clean.length() < 2) {
+            throw Errors.api(400, "COMMENT_REQUIRED", "Escreva um comentário.")
+        }
+        var saved = GameCommentRecord(Ids.prefixed("gcm_"), gameId, userId, clean, Time.nowIso())
+        games.insertComment(saved)
+        return this.commentView(saved)
+    }
+    deleteComment(gameId: String, commentId: String, userId: String) {
+        var found = this.game(gameId)
+        var comment = games.findComment(commentId)
+        if (comment == null) {
+            throw Errors.api(404, "COMMENT_NOT_FOUND", "Comentário não encontrado.")
+        }
+        if (comment.gameId() != gameId) {
+            throw Errors.api(404, "COMMENT_NOT_FOUND", "Comentário não encontrado.")
+        }
+        if (comment.userId() != userId && found.userId() != userId) {
+            throw Errors.api(403, "FORBIDDEN", "Só o autor ou o dono do jogo pode apagar.")
+        }
+        games.deleteComment(commentId)
+    }
+    GameRecord game(gameId: String) {
+        var found = games.findById(gameId)
+        if (found == null) {
+            throw Errors.api(404, "GAME_NOT_FOUND", "Jogo não encontrado.")
+        }
+        return found
+    }
+    GameReviewView reviewView(review: GameReviewRecord) {
+        var profile = profiles.findById(review.userId())
+        var username = Nulls.str()
+        var name = Nulls.str()
+        var avatar = Nulls.str()
+        if (profile != null) {
+            username = profile.username()
+            name = profile.displayName()
+            avatar = profile.avatar()
+        }
+        return GameReviewView(review.id(), review.userId(), username, name, avatar, review.rating(), review.body(), review.createdAt(), review.updatedAt())
+    }
+    GameCommentView commentView(comment: GameCommentRecord) {
+        var profile = profiles.findById(comment.userId())
+        var username = Nulls.str()
+        var name = Nulls.str()
+        var avatar = Nulls.str()
+        if (profile != null) {
+            username = profile.username()
+            name = profile.displayName()
+            avatar = profile.avatar()
+        }
+        return GameCommentView(comment.id(), comment.userId(), username, name, avatar, comment.body(), comment.createdAt())
+    }
+    // Blank is null; trimmed; over `max` is 400 TEXT_TOO_LONG.
+    static String? trimOrNull(value: String?, max: Int, tooLong: String) {
+        if (!GameRules.hasText(value)) {
+            return null
+        }
+        var clean = GameRules.trimText(value)
+        if (clean.length() > max) {
+            throw Errors.api(400, "TEXT_TOO_LONG", tooLong)
+        }
+        return clean
+    }
+}
+
+// One entry of the ratings batch (the JSON is an object keyed by game id, in this order).
+record GameRatingEntry(String id, GameRatingSummary summary)

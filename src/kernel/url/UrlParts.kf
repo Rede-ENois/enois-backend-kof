@@ -1,0 +1,85 @@
+package kernel.url
+
+import java.net.URI
+import java.util.regex.Pattern
+
+// The pieces of a user-supplied link that the games guard judges, and the text to store.
+record UrlParts(String scheme, String? userInfo, String? host, String text)
+
+// Parses a pasted link the way the browser does: java.net.URI first, and when its RFC 2396 grammar
+// refuses it (a space, a brace), the illegal characters are percent-encoded and the link is judged
+// normally. Returns null for what cannot be read as an http(s) address at all.
+class UrlParser {
+    static UrlParts? parse(value: String) {
+        var uri = UrlParser.strict(value)
+        if (uri == null) {
+            uri = UrlParser.tolerant(value)
+        }
+        if (uri == null) {
+            return null
+        }
+        var scheme = uri.getScheme()
+        var lower = ""
+        if (scheme != null) {
+            lower = scheme.toLowerCase()
+        }
+        return UrlParts(lower, uri.getUserInfo(), uri.getHost(), uri.toString())
+    }
+    static URI? strict(value: String) {
+        try {
+            return URI.create(value)
+        } catch (String e) {
+            return null
+        }
+    }
+    // `new URI(scheme, authority, path, query, fragment)` quotes what java.net.URI.create refuses (a space in a
+    // path, a quote, a brace); the 5-argument constructor cannot be called from Kof (the overload is picked with
+    // Object parameters, NoSuchMethodError), so the same characters are percent-encoded here and the string is
+    // parsed with URI.create. Only http(s) URLs with a non-empty authority get this far.
+    static URI? tolerant(value: String) {
+        var matcher = Pattern.compile("^(https?)://([^/?#]+)([^?#]*)(\\?[^#]*)?(#.*)?$").matcher(value)
+        if (!matcher.matches()) {
+            return null
+        }
+        var quoted = ""
+        var i = 0
+        while (i < value.length()) {
+            quoted = quoted + UrlParser.quote(value.substring(i, i + 1))
+            i = i + 1
+        }
+        return UrlParser.strict(quoted)
+    }
+    static String quote(c: String) {
+        if (c == " ") {
+            return "%20"
+        }
+        if (c == "\"") {
+            return "%22"
+        }
+        if (c == "<") {
+            return "%3C"
+        }
+        if (c == ">") {
+            return "%3E"
+        }
+        if (c == "\\") {
+            return "%5C"
+        }
+        if (c == "^") {
+            return "%5E"
+        }
+        if (c == "`") {
+            return "%60"
+        }
+        if (c == "{") {
+            return "%7B"
+        }
+        if (c == "|") {
+            return "%7C"
+        }
+        if (c == "}") {
+            return "%7D"
+        }
+        return c
+    }
+}

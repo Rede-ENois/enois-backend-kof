@@ -1,0 +1,283 @@
+package games
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.text.*
+import kernel.time.*
+
+// What the person asked for in the catalogue search. Empty fields filter nothing. `order` is a CLOSED list
+// (`recent`, `plays`, `title`): sorting by a column that came from the URL would be free SQL injection.
+record GameSearchCriteria(String? queryPattern, String? genrePattern, String? tagPattern, String? stage, String? distribution, String order)
+
+class GameCriteria {
+    static Int maxTerm() = 80
+    static GameSearchCriteria of(query: String?, genre: String?, tag: String?, stage: String?, distribution: String?, order: String?) = GameSearchCriteria(GameCriteria.pattern(GameCriteria.clean(query)), GameCriteria.pattern(GameCriteria.clean(genre)), GameCriteria.pattern(GameCriteria.clean(tag)), stage, distribution, GameCriteria.normalizeOrder(order))
+    static String? clean(value: String?) {
+        if (value == null) {
+            return null
+        }
+        if (value.trim().length() == 0) {
+            return null
+        }
+        var trimmed = value.trim()
+        if (trimmed.length() > GameCriteria.maxTerm()) {
+            return trimmed.substring(0, GameCriteria.maxTerm())
+        }
+        return trimmed
+    }
+    // The term becomes a lower-case LIKE pattern with `%` and `_` escaped (the user is not a wildcard).
+    static String? pattern(term: String?) {
+        if (term == null) {
+            return null
+        }
+        return "%" + LikePattern.escape(term.toLowerCase()) + "%"
+    }
+    // A stage from the URL: empty means no filter, an unknown value is 400.
+    static String? stageOrNull(value: String?) {
+        if (value == null) {
+            return null
+        }
+        if (value.trim().length() == 0) {
+            return null
+        }
+        return GameCriteria.stage(value.trim())
+    }
+    static String? distributionOrNull(value: String?) {
+        if (value == null) {
+            return null
+        }
+        if (value.trim().length() == 0) {
+            return null
+        }
+        return GameCriteria.distribution(value.trim())
+    }
+    static String stage(value: String) {
+        var upper = value.toUpperCase()
+        if (upper == "IN_DEVELOPMENT" || upper == "DEMO" || upper == "EARLY_ACCESS" || upper == "RELEASED" || upper == "PAUSED") {
+            return upper
+        }
+        throw Errors.api(400, "INVALID_STAGE", "Estágio inválido.")
+    }
+    static String distribution(value: String) {
+        var upper = value.toUpperCase()
+        if (upper == "FREE" || upper == "PAID") {
+            return upper
+        }
+        throw Errors.api(400, "INVALID_DISTRIBUTION", "Modelo de distribuição inválido.")
+    }
+    static String aspect(value: String) {
+        var upper = value.toUpperCase()
+        if (upper == "WIDESCREEN" || upper == "CLASSIC" || upper == "SQUARE" || upper == "PORTRAIT") {
+            return upper
+        }
+        throw Errors.api(400, "INVALID_ASPECT", "Proporção inválida.")
+    }
+    static String normalizeOrder(order: String?) {
+        if (order == null) {
+            return "recent"
+        }
+        var value = order.trim().toLowerCase()
+        if (value == "plays" || value == "title") {
+            return value
+        }
+        return "recent"
+    }
+}
+
+// One page of the catalogue and the cursor of the next (null when it ended).
+record GameCatalogPage(List<GameRecord> items, String? nextCursor)
+
+// The catalogue: find a game, open a game and count what happened. Two rules worth knowing:
+// only PUBLISHED appears (draft, submitted, rejected and suspended stay out of the catalogue and the public
+// page: the owner sees theirs in `/me/games`, moderation in its queue); and the SERVER counts: `plays` goes up
+// when somebody starts playing, and a page view is NOT part of that number (the easiest counter to inflate
+// and the least useful to decide what to play).
+class GamesCatalog {
+    GamesStore games
+    public constructor(games: GamesStore) {
+        this.games = games
+    }
+    static Int maxPage() = 48
+    static Int defaultPage() = 24
+    static Int maxTrending() = 12
+    static Int maxSeriesEvents() = 50000
+    static Int maxDays() = 90
+    GameCatalogPage search(criteria: GameSearchCriteria, limit: Int?, cursor: String?) {
+        var size = GamesCatalog.defaultPage()
+        if (limit != null) {
+            size = GameRules.clamp(limit, 1, GamesCatalog.maxPage())
+        }
+        var offset = GamesCatalog.parseCursor(cursor)
+        // The page is the one that CONTAINS the offset (Spring's PageRequest.of(offset / size, size)).
+        var start = offset / size * size
+        var found = games.search(criteria.queryPattern(), criteria.genrePattern(), criteria.tagPattern(), criteria.stage(), criteria.distribution(), criteria.order(), size, start)
+        var next = Nulls.str()
+        if (found.hasMore()) {
+            next = "" + (offset + size)
+        }
+        return GameCatalogPage(found.items(), next)
+    }
+    // A blank or malformed cursor means the first page; a negative one too.
+    static Int parseCursor(cursor: String?) {
+        if (cursor == null) {
+            return 0
+        }
+        if (cursor.trim().length() == 0) {
+            return 0
+        }
+        try {
+            return GameRules.clamp(Integer.parseInt(cursor.trim()), 0, 2147483647)
+        } catch (String e) {
+            return 0
+        }
+    }
+    // Somebody started playing: counts the session and records the event. The number is the server's.
+    Int startPlay(gameId: String, viewerId: String?) {
+        var found = games.findById(gameId)
+        if (found == null) {
+            throw Errors.api(404, "GAME_NOT_FOUND", "Jogo não encontrado.")
+        }
+        if (found.status() != GameStatus.published()) {
+            throw Errors.api(409, "GAME_NOT_PUBLISHED", "Este jogo não está publicado.")
+        }
+        games.recordEvent(Ids.prefixed("gevt_"), gameId, GameEventKind.playStart(), viewerId, Time.nowIso())
+        return games.countPlay(gameId)
+    }
+    // The numbers of the page: sessions, estimated distinct players, favorites and updates.
+    GameStats stats(gameId: String) {
+        var plays = 0
+        var found = games.findById(gameId)
+        if (found != null) {
+            plays = found.plays()
+        }
+        return GameStats(plays, games.distinctPlayers(gameId), games.countFavorites(gameId), games.countUpdates(gameId))
+    }
+    // "Played today": the last 24 hours, most played first. The window is rolling, not the calendar day:
+    // "today" depends on the viewer's zone and the server knows nobody's zone. Only PUBLISHED enters; twice
+    // the candidates are read because a suspended game at the top must not shrink the card.
+    List<GameTrending> trendingToday(limit: Int) {
+        var size = GameRules.clamp(limit, 1, GamesCatalog.maxTrending())
+        var since = Time.fromMillis(Time.nowMillis() - 86400000L)
+        var ranked = listOf<GameTrending>()
+        for (var tally in games.mostPlayedSince(GameEventKind.playStart(), since, size * 2)) {
+            var found = games.findById(tally.gameId())
+            if (found != null) {
+                if (found.status() == GameStatus.published() && ranked.size() < size) {
+                    ranked.add(GameTrending(found, tally.plays(), tally.players()))
+                }
+            }
+        }
+        return ranked
+    }
+    // The usage chart (creator only): totals and a daily series. EVERY day of the window appears, even with
+    // no events: the chart needs a fixed axis (an empty day is information, a missing day is not).
+    GameAnalytics analytics(gameId: String, viewerId: String?, requestedDays: Int) {
+        var found = games.findById(gameId)
+        if (found == null) {
+            throw Errors.api(404, "GAME_NOT_FOUND", "Jogo não encontrado.")
+        }
+        var owner = false
+        if (viewerId != null) {
+            owner = found.userId() == viewerId
+        }
+        if (!owner) {
+            throw Errors.api(403, "NOT_AUTHORIZED", "Os números do jogo são só do criador.")
+        }
+        var days = GameRules.clamp(requestedDays, 1, GamesCatalog.maxDays())
+        var today = Time.nowIso().substring(0, 10)
+        var start = ZoneDates.plusDays(today, 1 - days)
+        var counters = mapOf<String, Long>()
+        var seen = mapOf<String, Long>()
+        for (var row in games.eventsSince(gameId, start + "T00:00:00Z", GamesCatalog.maxSeriesEvents())) {
+            var day = row.getInstant("created_at").substring(0, 10)
+            if (day.compareTo(start) >= 0 && day.compareTo(today) <= 0) {
+                var kind = row.getStr("kind")
+                if (kind == GameEventKind.pageView()) {
+                    GamesCatalog.bump(counters, day + "|view")
+                }
+                if (kind == GameEventKind.share()) {
+                    GamesCatalog.bump(counters, day + "|share")
+                }
+                if (kind == GameEventKind.playStart()) {
+                    GamesCatalog.bump(counters, day + "|play")
+                    // Distinct player PER DAY: who plays on two days counts on both (usage, not a total).
+                    var who = row.getStrOrNull("user_id")
+                    if (who == null) {
+                        who = row.getStr("id")
+                    }
+                    var key = day + "|who|" + who
+                    if (!seen.containsKey(key)) {
+                        seen.put(key, 1L)
+                        GamesCatalog.bump(counters, day + "|player")
+                    }
+                }
+            }
+        }
+        var series = listOf<GameDayUsage>()
+        var i = 0
+        while (i < days) {
+            var day = ZoneDates.plusDays(start, i)
+            series.add(GameDayUsage(day, GamesCatalog.read(counters, day + "|view"), GamesCatalog.read(counters, day + "|play"), GamesCatalog.read(counters, day + "|share"), GamesCatalog.read(counters, day + "|player")))
+            i = i + 1
+        }
+        return GameAnalytics(start, today, days, found.plays(), games.distinctPlayers(gameId), games.countFavorites(gameId), games.countUpdates(gameId), series)
+    }
+    static bump(counters: Map<String,Long>, key: String) {
+        counters.put(key, GamesCatalog.read(counters, key) + 1L)
+    }
+    static Long read(counters: Map<String,Long>, key: String) {
+        var value = counters.get(key)
+        if (value == null) {
+            return 0L
+        }
+        return value
+    }
+}
+
+// A game of the "played today" ranking and what it did in the window.
+record GameTrending(GameRecord game, Long plays, Long players)
+
+// The library of whoever plays: what the person kept. Keeping is idempotent and so is unkeeping. Only a
+// PUBLISHED game enters: keeping somebody else's draft makes no sense.
+class GamesLibrary {
+    GamesStore games
+    public constructor(games: GamesStore) {
+        this.games = games
+    }
+    static Int maxLibrary() = 200
+    Bool toggle(userId: String, gameId: String) {
+        var found = games.findById(gameId)
+        if (found == null) {
+            throw Errors.api(404, "GAME_NOT_FOUND", "Jogo não encontrado.")
+        }
+        if (found.status() != GameStatus.published()) {
+            throw Errors.api(409, "GAME_NOT_PUBLISHED", "Este jogo não está publicado.")
+        }
+        if (games.favoriteExists(userId, gameId)) {
+            games.deleteFavorite(userId, gameId)
+            return false
+        }
+        games.insertFavorite(Ids.prefixed("gfav_"), userId, gameId, Time.nowIso())
+        return true
+    }
+    Bool has(userId: String?, gameId: String) {
+        if (userId == null) {
+            return false
+        }
+        return games.favoriteExists(userId, gameId)
+    }
+    // The favorites with the game of each (what left the air leaves the list).
+    List<GameRecord> library(userId: String) {
+        var items = listOf<GameRecord>()
+        for (var gameId in games.favoriteGameIds(userId, GamesLibrary.maxLibrary())) {
+            var found = games.findById(gameId)
+            if (found != null) {
+                if (found.status() == GameStatus.published()) {
+                    items.add(found)
+                }
+            }
+        }
+        return items
+    }
+}

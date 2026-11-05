@@ -1,0 +1,42 @@
+import games.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Port of GameBoostTests (G2): the paid boost: the creator boosts their OWN game (5 faiscas / 7 days, one per
+// week); the catalogue lifts the boosted game; a non-creator does not boost. The wallet is a ledger row (see
+// GameIdentityTest).
+test "boost puts the game first and allows one per week" {
+    var admin = GamesTestKit.loginAdmin("gboost-admin")
+    var creator = GamesTestKit.login("gboost-creator")
+    var other = GamesTestKit.login("gboost-outro")
+    GamesTestKit.fund("gboost-creator", 105000L)
+    GamesTestKit.fund("gboost-outro", 105000L)
+    var gameId = GamesTestKit.publish(creator, admin, "Jogo Impulsionado", "https://creator.itch.io/impulsionado")
+    var rival = GamesTestKit.publish(creator, admin, "Jogo Sem Impulso", "https://creator.itch.io/semimpulso")
+    // A non-creator does not boost; a game that is not published cannot be boosted.
+    Check.apiError(GamesTestKit.send("POST", "/games/" + gameId + "/boost", GamesTestKit.auth(other), ""), 403, "NOT_THE_CREATOR")
+    var draft = GamesTestKit.submit(creator, "Rascunho Sem Impulso", "https://creator.itch.io/draft")
+    Check.apiError(GamesTestKit.send("POST", "/games/" + draft + "/boost", GamesTestKit.auth(creator), ""), 409, "GAME_NOT_PUBLISHED")
+    // The creator boosts: 5.000 mf leave (105.000 -> 100.000) and the game is highlighted.
+    var boosted = GamesTestKit.send("POST", "/games/" + gameId + "/boost", GamesTestKit.auth(creator), "")
+    Check.status(boosted, 200)
+    Check.jsonEq(boosted, "boosted", "true")
+    Check.jsonEq(boosted, "id", gameId)
+    Check.eqStr("balance after the boost", "100000", "" + GamesTestKit.balance("gboost-creator"))
+    // The second boost in the same week is refused (one per week per game) and costs nothing.
+    Check.apiError(GamesTestKit.send("POST", "/games/" + gameId + "/boost", GamesTestKit.auth(creator), ""), 409, "ALREADY_BOOSTED")
+    Check.eqStr("balance unchanged", "100000", "" + GamesTestKit.balance("gboost-creator"))
+    // The catalogue lifts the boosted one first (order=recent is the default), even though the other was published later.
+    var catalogue = GamesTestKit.get("/games?limit=48", listOf<String>())
+    var atBoosted = GamesTestKit.indexOf(catalogue, "items", "id", gameId)
+    var atRival = GamesTestKit.indexOf(catalogue, "items", "id", rival)
+    Check.isTrue("both listed", atBoosted >= 0 && atRival >= 0)
+    Check.isTrue("the boosted game comes first", atBoosted < atRival)
+    Check.eqInt("first of the items", 0, atBoosted)
+    // The boost lasts 7 days from now.
+    var row = GamesTestKit.db().queryOne("select boost_until from games where id = ?", DbParams().bindStr(gameId))
+    Check.isTrue("boost stamp set", row.getInstantOrNull("boost_until") != null)
+    var game = GamesTestKit.get("/games/gboost-creator/jogo-impulsionado", GamesTestKit.auth(creator))
+    Check.jsonEq(game, "boosted", "true")
+    GamesTestKit.finish()
+}

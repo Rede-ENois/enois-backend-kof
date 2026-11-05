@@ -1,0 +1,212 @@
+package dailygames
+
+import games.*
+import kernel.db.*
+import kernel.error.*
+import kernel.text.*
+import kernel.time.*
+
+// Match state. `score`, `lines` and `actions` come from replaying the stored actions; the pieces are the
+// official upcoming sequence (the client plays the real one, the server still validates by replay).
+record DailyBlocksState(String date, String status, Int score, Int lines, Int actions, List<String> board, List<BlocksCell> activeCells, List<BlocksCell> nextCells, Int rulesVersion, List<Int> pieces)
+
+record DailyBlocksEntry(String username, String name, Int score, Int lines, Long elapsedMillis)
+
+record DailyBlocksRanking(List<DailyBlocksEntry> items)
+
+record DailyBlocksActionBody(String? action, String? requestId)
+
+// The daily falling-blocks game: every action is stored and the whole match is rebuilt by replaying them
+// against the SERVER clock (1 tick = 100 ms since the start), so a client cannot claim a score it did not play.
+// Anti-cheat as in Java: ids are idempotent, 80 ms between actions, 6000 actions and 600 s per match.
+// Port of DailyBlocksService.
+class DailyBlocksService {
+    Db database
+    DailyGamesClock clock
+    GamesCoins coins
+    public constructor(database: Db, clock: DailyGamesClock, coins: GamesCoins) {
+        this.database = database
+        this.clock = clock
+        this.coins = coins
+    }
+    static Long windowMillis() = 6000L * 100L
+    DailyBlocksState state(userId: String, date: String?) = this.stateFor(DailyRules.requestedDay(clock, date), userId)
+    Bool hasSession(day: String, userId: String) = database.queryLong("select count(*) from daily_blocks_sessions where challenge_date = ? and user_id = ?", DbParams().bindDate(day).bindStr(userId)) > 0L
+    static Int clampTicks(millis: Long) {
+        var ticks = millis / 100L
+        if (ticks < 0L) {
+            return 0
+        }
+        if (ticks > 6000L) {
+            return 6000
+        }
+        return ticks.toInt()
+    }
+    static Int ticksBetween(from: String, to: String) = DailyBlocksService.clampTicks(Time.toMillis(to) - Time.toMillis(from))
+    // The server clock rules the tick: 1 tick = 100 ms since the start. Each action enters at the tick of its
+    // timestamp; gravity runs in real time, like the client.
+    BlocksResult replay(day: String, userId: String) {
+        var challenge = database.queryOne("select seed, target_lines from daily_blocks_challenges where challenge_date = ?", DbParams().bindDate(day))
+        var seed = challenge.getLong("seed")
+        var target = challenge.getInt("target_lines")
+        var started = database.queryOne("select started_at from daily_blocks_sessions where challenge_date = ? and user_id = ?", DbParams().bindDate(day).bindStr(userId)).getInstant("started_at")
+        var events = listOf<BlocksEvent>()
+        // Actions past the 6000-tick window no longer belong to the match (TIMED_OUT): ignored in the replay.
+        var previousTick = 0
+        for (var row in database.queryList("select action, created_at from daily_blocks_actions where challenge_date = ? and user_id = ? order by action_no", DbParams().bindDate(day).bindStr(userId))) {
+            var tick = DailyBlocksService.ticksBetween(started, row.getInstant("created_at"))
+            if (tick < 1) {
+                tick = 1
+            }
+            if (tick > previousTick && tick < BlocksEngine.maxTicks()) {
+                events.add(BlocksEvent(tick, row.getStr("action")))
+                previousTick = tick
+            }
+        }
+        var elapsed = DailyBlocksService.ticksBetween(started, clock.nowIso())
+        if (events.size() > 0) {
+            var last = events.get(events.size() - 1).tick()
+            if (last > elapsed) {
+                elapsed = last
+            }
+        }
+        return BlocksEngine.replay(seed, target, events, elapsed)
+    }
+    DailyBlocksState stateFor(day: String, userId: String) {
+        if (!this.hasSession(day, userId)) {
+            return DailyBlocksState(day, "NOT_STARTED", 0, 0, 0, listOf<String>(), listOf<BlocksCell>(), listOf<BlocksCell>(), BlocksEngine.rulesVersion(), listOf<Int>())
+        }
+        var r = this.replay(day, userId)
+        var pieces = listOf<Int>()
+        if (r.status() == BlocksEngine.playing()) {
+            var seed = database.queryOne("select seed from daily_blocks_challenges where challenge_date = ?", DbParams().bindDate(day)).getLong("seed")
+            pieces = BlocksEngine.pieceSequence(seed, 100, r.piecesSpawned())
+        }
+        return DailyBlocksState(day, r.status(), r.score(), r.lines(), r.actions(), r.board(), r.activeCells(), r.nextCells(), r.rulesVersion(), pieces)
+    }
+    DailyBlocksState start(userId: String) {
+        var day = clock.today()
+        var self = this
+        database.transaction(() -> {
+    self.database.execute("insert into daily_blocks_challenges (challenge_date, seed, target_lines, rules_version) values (?, ?, 3, ?) on duplicate key update challenge_date = challenge_date", DbParams().bindDate(day).bindLong(JavaRandom.secureLong()).bindInt(BlocksEngine.rulesVersion()))
+    self.database.execute("insert into daily_blocks_sessions (challenge_date, user_id, started_at, status, score, `lines`) values (?, ?, ?, \'PLAYING\', 0, 0) on duplicate key update user_id = user_id", DbParams().bindDate(day).bindStr(userId).bindInstant(self.clock.nowIso()))
+})
+        return this.stateFor(day, userId)
+    }
+    DailyBlocksState action(userId: String, action: String?, requestId: String?, requestedDate: String?) {
+        if (!DailyRules.validRequestId(requestId)) {
+            throw Errors.api(400, "INVALID_REQUEST_ID", "Identificador invalido.")
+        }
+        if (!DailyBlocksService.knownAction(action)) {
+            throw Errors.api(400, "INVALID_ACTION", "Acao invalida.")
+        }
+        var day = DailyRules.requestedDay(clock, requestedDate)
+        var self = this
+        var finished = false
+        database.transaction(() -> {
+    finished = self.actionInTransaction(userId, action as String, requestId as String, day)
+})
+        if (finished) {
+            coins.recordPresence(userId)
+        }
+        return this.stateFor(day, userId)
+    }
+    static Bool knownAction(action: String?) {
+        if (action == null) {
+            return false
+        }
+        return action == "LEFT" || action == "RIGHT" || action == "ROTATE" || action == "SOFT_DROP" || action == "HARD_DROP" || action == "WAIT"
+    }
+    // The action under the row lock; true when it ended the match.
+    Bool actionInTransaction(userId: String, action: String, requestId: String, day: String) {
+        var sessions = database.queryList("select started_at, last_action_at, completed_at, status, score, `lines` from daily_blocks_sessions where challenge_date = ? and user_id = ? for update", DbParams().bindDate(day).bindStr(userId))
+        if (sessions.size() == 0) {
+            throw Errors.api(409, "GAME_NOT_STARTED", "Inicie o desafio primeiro.")
+        }
+        var session = sessions.get(0)
+        var prior = database.queryList("select action from daily_blocks_actions where challenge_date = ? and user_id = ? and request_id = ?", DbParams().bindDate(day).bindStr(userId).bindStr(requestId))
+        if (prior.size() > 0) {
+            if (prior.get(0).getStr("action") != action) {
+                throw Errors.api(409, "IDEMPOTENCY_CONFLICT", "Identificador ja usado.")
+            }
+            return false
+        }
+        if (session.getStr("status") != BlocksEngine.playing()) {
+            throw Errors.api(409, "GAME_FINISHED", "Desafio encerrado.")
+        }
+        var now = clock.nowIso()
+        if (Time.toMillis(now) - Time.toMillis(session.getInstant("started_at")) >= DailyBlocksService.windowMillis()) {
+            // Like the Java service, the answer is a 409 inside the transaction: the TIMED_OUT mark it tried to write
+            // is rolled back, and the state keeps being derived from the replay (which reports TIMED_OUT itself).
+            throw Errors.api(409, "GAME_FINISHED", "Janela de tempo do desafio encerrada.")
+        }
+        var lastAction = session.getInstantOrNull("last_action_at")
+        if (lastAction != null) {
+            if (Time.toMillis(now) - Time.toMillis(lastAction) < 80L) {
+                throw Errors.api(429, "ACTION_TOO_FAST", "Aguarde antes da proxima acao.")
+            }
+        }
+        var count = database.queryLong("select count(*) from daily_blocks_actions where challenge_date = ? and user_id = ?", DbParams().bindDate(day).bindStr(userId)).toInt()
+        if (count >= BlocksEngine.maxActions()) {
+            throw Errors.api(409, "ACTION_LIMIT", "Limite de acoes atingido.")
+        }
+        database.execute("insert into daily_blocks_actions (challenge_date, user_id, action_no, request_id, action, created_at) values (?, ?, ?, ?, ?, ?)", DbParams().bindDate(day).bindStr(userId).bindInt(count + 1).bindStr(requestId).bindStr(action).bindInstant(now))
+        var result = this.replay(day, userId)
+        var stamp = Nulls.str()
+        if (result.status() != BlocksEngine.playing()) {
+            stamp = now
+        }
+        database.execute("update daily_blocks_sessions set last_action_at = ?, completed_at = ?, status = ?, score = ?, `lines` = ? where challenge_date = ? and user_id = ?", DbParams().bindInstant(now).bindInstantOrNull(stamp).bindStr(result.status()).bindInt(result.score()).bindInt(result.lines()).bindDate(day).bindStr(userId))
+        return result.status() != BlocksEngine.playing()
+    }
+    // Today's winners: highest score, then least time, then username (top 100).
+    DailyBlocksRanking leaderboard() {
+        var entries = this.winners(clock.today())
+        var items = listOf<DailyBlocksEntry>()
+        var i = 0
+        while (i < entries.size() && i < 100) {
+            items.add(entries.get(i))
+            i = i + 1
+        }
+        return DailyBlocksRanking(items)
+    }
+    // Everybody who won that day, in scoreboard order: score descending, time, username.
+    List<DailyBlocksEntry> winners(day: String) {
+        var keys = listOf<String>()
+        var byKey = mapOf<String, DailyBlocksEntry>()
+        for (var row in database.queryList("select u.username, u.name, s.user_id, s.score, s.`lines`, s.started_at, s.completed_at from daily_blocks_sessions s join users u on u.id = s.user_id where s.challenge_date = ? and s.status = \'WON\'", DbParams().bindDate(day))) {
+            var elapsed = DailyRules.elapsedMillis(row.getInstant("started_at"), row.getInstant("completed_at"))
+            var entry = DailyBlocksEntry(row.getStr("username"), row.getStr("name"), row.getInt("score"), row.getInt("lines"), elapsed)
+            var key = DailyRules.pad(2000000000L - row.getLong("score"), 10) + "|" + DailyRules.pad(elapsed, 15) + "|" + row.getStr("username") + "|" + row.getStr("user_id")
+            keys.add(key)
+            byKey.put(key, entry)
+        }
+        var out = listOf<DailyBlocksEntry>()
+        for (var key in keys.sorted()) {
+            var entry = byKey.get(key)
+            if (entry != null) {
+                out.add(entry)
+            }
+        }
+        return out
+    }
+    // Accounts in the order of the day's scoreboard, without the cap of 100 and without who did not win: the prize queue.
+    List<String> payoutOrder(day: String) {
+        var keys = listOf<String>()
+        var owners = mapOf<String, String>()
+        for (var row in database.queryList("select u.username, s.user_id, s.score, s.started_at, s.completed_at from daily_blocks_sessions s join users u on u.id = s.user_id where s.challenge_date = ? and s.status = \'WON\'", DbParams().bindDate(day))) {
+            var elapsed = DailyRules.elapsedMillis(row.getInstant("started_at"), row.getInstant("completed_at"))
+            var key = DailyRules.pad(2000000000L - row.getLong("score"), 10) + "|" + DailyRules.pad(elapsed, 15) + "|" + row.getStr("username") + "|" + row.getStr("user_id")
+            keys.add(key)
+            owners.put(key, row.getStr("user_id"))
+        }
+        var out = listOf<String>()
+        for (var key in keys.sorted()) {
+            var owner = owners.get(key)
+            if (owner != null) {
+                out.add(owner)
+            }
+        }
+        return out
+    }
+}

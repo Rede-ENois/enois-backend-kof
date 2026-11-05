@@ -1,0 +1,44 @@
+import games.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Port of GameShareTests (G-share): the achievement shared by the game becomes a post with the game tag
+// (the text and media come from the game by postMessage; the APP publishes with the player's session).
+// The 12 per day cap is asserted too. The post is read from `posts` (the feed endpoints belong to the feed port).
+test "share publishes a post with the game tags and a daily cap" {
+    var admin = GamesTestKit.loginAdmin("gshare-admin")
+    var player = GamesTestKit.login("gshare-player")
+    var intruder = GamesTestKit.login("gshare-intruder")
+    var gameId = GamesTestKit.publish(player, admin, "Fazendinha Alegre", "https://player.itch.io/fazendinha")
+    // The player shares the achievement: the post is born with the tags "game" and the game's slug.
+    var shared = GamesTestKit.send("POST", "/games/" + gameId + "/compartilhar", GamesTestKit.auth(player), "{\"texto\":\"Peguei nível 10 na fazendinha!\"}")
+    Check.status(shared, 200)
+    Check.jsonEq(shared, "status", "SHARED")
+    var postId = shared.json("postId")
+    var db = GamesTestKit.db()
+    var post = db.queryOne("select author_id, type, content, visibility, status from posts where id = ?", DbParams().bindStr(postId))
+    Check.eqStr("author", "gshare-player", post.getStr("author_id"))
+    Check.eqStr("content", "Peguei nível 10 na fazendinha!", post.getStr("content"))
+    Check.eqStr("visibility", "PUBLIC", post.getStr("visibility"))
+    var tags = db.queryList("select tag from post_tags where post_id = ? order by tag", DbParams().bindStr(postId))
+    Check.eqInt("two tags", 2, tags.size())
+    Check.eqStr("tag game", "fazendinha-alegre", tags.get(0).getStr("tag"))
+    Check.eqStr("tag slug", "game", tags.get(1).getStr("tag"))
+    // No text, no share. A game that is not published does not share either.
+    Check.apiError(GamesTestKit.send("POST", "/games/" + gameId + "/compartilhar", GamesTestKit.auth(player), "{\"texto\":\"\"}"), 400, "TEXT_REQUIRED")
+    var tooLong = GamesTestKit.send("POST", "/games/" + gameId + "/compartilhar", GamesTestKit.auth(player), "{\"texto\":\"" + strings.repeat("a", 601) + "\"}")
+    Check.apiError(tooLong, 400, "TEXT_TOO_LONG")
+    var draft = GamesTestKit.submit(player, "Rascunho de Compartilhar", "https://player.itch.io/rascunho")
+    Check.apiError(GamesTestKit.send("POST", "/games/" + draft + "/compartilhar", GamesTestKit.auth(player), "{\"texto\":\"oi\"}"), 409, "GAME_NOT_PUBLISHED")
+    Check.apiError(GamesTestKit.send("POST", "/games/nao-existe/compartilhar", GamesTestKit.auth(player), "{\"texto\":\"oi\"}"), 404, "GAME_NOT_FOUND")
+    // The daily cap: 11 more shares, and the 13th is refused (429 SHARE_LIMIT).
+    var n = 2
+    while (n <= 12) {
+        Check.status(GamesTestKit.send("POST", "/games/" + gameId + "/compartilhar", GamesTestKit.auth(player), "{\"texto\":\"Conquista " + n + " da fazendinha!\"}"), 200)
+        n = n + 1
+    }
+    Check.apiError(GamesTestKit.send("POST", "/games/" + gameId + "/compartilhar", GamesTestKit.auth(player), "{\"texto\":\"A décima terceira conquista!\"}"), 429, "SHARE_LIMIT")
+    // The cap is per person: somebody else still shares.
+    Check.status(GamesTestKit.send("POST", "/games/" + gameId + "/compartilhar", GamesTestKit.auth(intruder), "{\"texto\":\"Também joguei!\"}"), 200)
+    GamesTestKit.finish()
+}
