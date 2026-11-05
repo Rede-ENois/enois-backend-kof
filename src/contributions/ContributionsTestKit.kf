@@ -1,0 +1,177 @@
+package contributions
+
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import notifications.*
+import profile.*
+
+// A deterministic GitHub reader the tests feed with the lists they want.
+class ContributionsFakeGateway extends GithubGateway {
+    List<GhPullRequest> pulls = listOf<GhPullRequest>()
+    List<GhIssue> issueList = listOf<GhIssue>()
+    List<String> orgRepos = listOf<String>()
+    List<GhPullRequest> open = listOf<GhPullRequest>()
+    List<String> reviews = listOf<String>()
+    Bool acceptUserToken = true
+    Bool acceptServiceToken = true
+    String failWith = ""
+    public constructor() {
+        super()
+    }
+    List<String> organizationRepositories(organization: String, maxPages: Int) = orgRepos
+    List<GhPullRequest> mergedPullRequests(repository: String, since: String?, maxPages: Int) {
+        if (failWith.length() > 0) {
+            throw failWith
+        }
+        return pulls
+    }
+    List<GhIssue> issues(repository: String, since: String?, maxPages: Int) = issueList
+    List<GhPullRequest> openPullRequests(repository: String, maxPages: Int) = open
+    Bool submitReview(repository: String, number: Long, decision: String, body: String?, tokenOverride: String?) {
+        var comment = ""
+        if (body != null) {
+            comment = body
+        }
+        var who = "service"
+        if (tokenOverride != null) {
+            who = tokenOverride
+        }
+        reviews.add(repository + "|" + number + "|" + decision + "|" + comment + "|" + who)
+        if (who == "service") {
+            return acceptServiceToken
+        }
+        return acceptUserToken
+    }
+}
+
+// Fixtures of the contributions suites. One booted app per test file.
+class ContributionsTestKit {
+    static TestApp? cachedApp = null
+    static ContributionsModule? cachedModule = null
+    static ContributionsFakeGateway? cachedGateway = null
+    static ProfileModule? cachedProfiles = null
+    static SharedServices? cachedShared = null
+    static Map<String,String> extra = mapOf<String, String>()
+    static configure(overrides: Map<String,String>) {
+        ContributionsTestKit.extra = overrides
+    }
+    static TestApp app() {
+        var cur = ContributionsTestKit.cachedApp
+        if (cur != null) {
+            return cur
+        }
+        var created = DomainTestKit.boot("contributions", ContributionsTestKit.extra, (p: Platform, s: SharedServices, parts: SecurityParts) -> ContributionsTestKit.wire(p, s, parts))
+        ContributionsTestKit.cachedApp = created
+        return created
+    }
+    static wire(p: Platform, shared: SharedServices, parts: SecurityParts) {
+        var hooks = SecurityHooks.defaults(p.db)
+        var profiles = ProfileModule.install(p, shared, hooks)
+        NotificationsModule.install(p, shared, hooks, parts)
+        var gateway = ContributionsFakeGateway()
+        ContributionsTestKit.cachedProfiles = profiles
+        ContributionsTestKit.cachedGateway = gateway
+        ContributionsTestKit.cachedShared = shared
+        ContributionsTestKit.cachedModule = ContributionsModule.installWith(p, shared, parts, profiles.directory, gateway, true)
+    }
+    static ContributionsModule module() {
+        ContributionsTestKit.app()
+        var cur = ContributionsTestKit.cachedModule
+        if (cur == null) {
+            throw "ContributionsTestKit: module not wired"
+        }
+        return cur
+    }
+    static ContributionsFakeGateway gateway() {
+        ContributionsTestKit.app()
+        var cur = ContributionsTestKit.cachedGateway
+        if (cur == null) {
+            throw "ContributionsTestKit: gateway not wired"
+        }
+        return cur
+    }
+    static ProfileModule profiles() {
+        ContributionsTestKit.app()
+        var cur = ContributionsTestKit.cachedProfiles
+        if (cur == null) {
+            throw "ContributionsTestKit: profiles not wired"
+        }
+        return cur
+    }
+    static Db db() = ContributionsTestKit.app().db()
+    static String tokenOf(userId: String) = "tok-" + userId + "-1234567890"
+    static String login(userId: String) {
+        var store = ContributionsTestKit.db()
+        if (store.queryLong("select count(*) from users where id = ?", DbParams().bindStr(userId)) == 0L) {
+            SecurityFixtures.login(store, userId, ContributionsTestKit.tokenOf(userId))
+        }
+        return ContributionsTestKit.tokenOf(userId)
+    }
+    static String loginAdmin(userId: String) {
+        var token = ContributionsTestKit.login(userId)
+        ContributionsTestKit.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr(userId))
+        return token
+    }
+    static List<String> auth(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+    static TestResponse send(method: String, path: String, token: String, body: String) = ContributionsTestKit.app().client.send(method, path, ContributionsTestKit.auth(token), "", body)
+    static TestResponse anonymous(method: String, path: String, body: String) = ContributionsTestKit.app().client.send(method, path, listOf("Content-Type: application/json"), "", body)
+    // A validated PR evidence of the user (what the sync would have persisted).
+    static GhContribution savePr(userId: String, githubId: String, repo: String, number: Int) {
+        var now = Time.nowIso()
+        var c = GhContribution("ghc_" + repo.replace("/", "_") + "_" + number, githubId, "seal-dev", repo, "PULL_REQUEST", number, "CODE", "VALIDATED", now)
+        c.userId = userId
+        c.objectId = "node-" + number
+        c.title = "Corrige cálculo " + number
+        c.url = "https://github.com/Rede-ENois/x/pull/" + number
+        c.openedAt = now
+        c.mergedAt = now
+        c.githubUpdatedAt = now
+        c.detailsFetched = true
+        c.additions = 40
+        c.deletions = 4
+        c.changedFiles = 2
+        c.filesJson = "[\"src/test/BalanceTest.java\"]"
+        c.reviewsCount = 2
+        c.approvalsCount = 1
+        c.hasTests = true
+        c.score = 3
+        c.signalsJson = "{\"tests\":true}"
+        ContributionsTestKit.module().store.save(c)
+        return c
+    }
+    static GhContribution saveIssue(userId: String, githubId: String, repo: String, number: Int, status: String) {
+        var now = Time.nowIso()
+        var c = GhContribution("ghc_" + repo.replace("/", "_") + "_i" + number, githubId, "issue-dev", repo, "ISSUE", number, "ISSUES", status, now)
+        c.userId = userId
+        c.objectId = "node-issue-" + number
+        c.title = "Falha no login com 2FA"
+        c.url = "https://github.com/Rede-ENois/x/issues/" + number
+        c.state = "open"
+        c.openedAt = now
+        c.githubUpdatedAt = now
+        c.labels = "[\"bug\"]"
+        c.signalsJson = "[\"bug\"]"
+        ContributionsTestKit.module().store.save(c)
+        return c
+    }
+    static Bool active(userId: String, sealType: String) {
+        var seal = ContributionsTestKit.module().store.findSeal(userId, sealType)
+        if (seal == null) {
+            return false
+        }
+        return seal.status() == "ACTIVE"
+    }
+    static GhPullRequest pull(number: Long, authorId: String, login: String, title: String, files: List<String>, additions: Int, deletions: Int, reviews: Int, approvals: Int, now: String) = GhPullRequest(number, "node-" + number, title, "https://github.com/Rede-ENois/x/pull/" + number, "", authorId, login, "closed", Time.plusSeconds(now, 0L - 3600L), now, now, additions, deletions, files.size(), files, reviews, approvals, 0)
+    static GhPullRequest revert(number: Long, authorId: String, login: String, target: Long, now: String) = GhPullRequest(number, "node-" + number, "Revert \"PR #" + target + "\"", "https://github.com/Rede-ENois/x/pull/" + number, "Reverts #" + target, authorId, login, "closed", Time.plusSeconds(now, 0L - 300L), now, now, 2, 1, 1, listOf("src/main/Foo.java"), 0, 0, 0)
+    static GhIssue issue(number: Long, authorId: String, login: String, title: String, labels: List<String>, now: String) = GhIssue(number, "node-issue-" + number, title, "https://github.com/Rede-ENois/x/issues/" + number, authorId, login, "open", Time.plusSeconds(now, 0L - 3600L), null, now, labels)
+    static String suffix() = "" + Time.nowMillis()
+    static finish() {
+        var shared = ContributionsTestKit.cachedShared
+        if (shared != null) {
+            shared.stop()
+        }
+    }
+}

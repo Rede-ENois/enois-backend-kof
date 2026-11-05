@@ -1,0 +1,122 @@
+package contributions
+
+import kernel.error.*
+import kernel.log.*
+import kernel.time.*
+
+// The review queue of open pull requests of the eligible repositories. The review leaves in the name of whoever linked
+// GitHub with write; without it the service token is used (when it has permission) and, if neither can, the answer is
+// an explicit error: never pretend it approved.
+class PullRequestReview {
+    GithubGateway gateway
+    ContributionsStore store
+    GithubUserTokens tokens
+    Log log = Log("contributions.review")
+    public constructor(gateway: GithubGateway, store: ContributionsStore, tokens: GithubUserTokens) {
+        this.gateway = gateway
+        this.store = store
+        this.tokens = tokens
+    }
+    static Int maxComment() = 2000
+    List<OpenPullRequestView> open(limit: Int) {
+        var capped = limit
+        if (capped > 200) {
+            capped = 200
+        }
+        if (capped < 1) {
+            capped = 1
+        }
+        var all = listOf<OpenPullRequestView>()
+        for (var repository in store.repositories()) {
+            if (repository.enabled()) {
+                try {
+                    for (var pull in gateway.openPullRequests(repository.repository(), 2)) {
+                        all.add(PullRequestReview.view(repository.repository(), pull))
+                    }
+                } catch (String failure) {
+                    log.warn("Falha ao listar PRs abertos de " + repository.repository())
+                }
+            }
+        }
+        // Newest update first, the ones without a date last (selection: the list is short).
+        var out = listOf<OpenPullRequestView>()
+        while (all.size() > 0 && out.size() < capped) {
+            var best = 0
+            var at = 1
+            while (at < all.size()) {
+                if (PullRequestReview.millis(all.get(at).updatedAt()) > PullRequestReview.millis(all.get(best).updatedAt())) {
+                    best = at
+                }
+                at = at + 1
+            }
+            out.add(all.get(best))
+            all.remove(best)
+        }
+        return out
+    }
+    static Long millis(at: String?) {
+        if (at == null) {
+            return 0L - 1L
+        }
+        return Time.toMillis(at)
+    }
+    static OpenPullRequestView view(repository: String, pull: GhPullRequest) {
+        var avatar = ContribText.none()
+        if (pull.authorLogin().trim().length() > 0) {
+            avatar = "https://github.com/" + pull.authorLogin() + ".png?size=80"
+        }
+        return OpenPullRequestView(repository, pull.number(), pull.title(), pull.url(), pull.authorLogin(), avatar, pull.openedAt(), pull.updatedAt())
+    }
+    review(userId: String, repository: String?, number: Long, decision: String?, comment: String?) {
+        var name = ""
+        if (repository != null) {
+            name = repository
+        }
+        var known = false
+        for (var item in store.repositories()) {
+            if (item.enabled() && item.repository() == name) {
+                known = true
+            }
+        }
+        if (!known) {
+            throw Errors.api(400, "UNKNOWN_REPOSITORY", "Repositório não está na lista elegível.")
+        }
+        var event = ""
+        if (decision != null) {
+            event = decision.trim().toUpperCase()
+        }
+        if (event != "APPROVE" && event != "REQUEST_CHANGES") {
+            throw Errors.api(400, "INVALID_REVIEW_DECISION", "Decisão inválida: use APPROVE ou REQUEST_CHANGES.")
+        }
+        var clean = ContribText.none()
+        if (comment != null) {
+            clean = comment.trim()
+        }
+        if (event == "REQUEST_CHANGES") {
+            var empty = clean == null
+            if (clean != null) {
+                empty = clean.length() == 0
+            }
+            if (empty) {
+                throw Errors.api(400, "REVIEW_COMMENT_REQUIRED", "Explique o que precisa mudar antes de pedir alterações.")
+            }
+        }
+        if (clean != null) {
+            if (clean.length() > PullRequestReview.maxComment()) {
+                throw Errors.api(400, "REVIEW_COMMENT_TOO_LONG", "O comentário da revisão deve ter no máximo 2000 caracteres.")
+            }
+        }
+        var userToken = ContribText.none()
+        var stored = tokens.accessToken(userId)
+        if (stored.length() > 0) {
+            userToken = stored
+        }
+        var done = gateway.submitReview(name, number, event, clean, userToken)
+        if (!done && userToken != null) {
+            done = gateway.submitReview(name, number, event, clean, null)
+        }
+        if (!done) {
+            throw Errors.api(502, "GITHUB_REVIEW_FAILED", "O GitHub não aceitou a revisão. Vincule seu GitHub com permissão de escrita e tente de novo.")
+        }
+    }
+}

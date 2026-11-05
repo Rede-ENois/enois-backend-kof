@@ -1,0 +1,102 @@
+import contributions.*
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+
+// The seams the contributions domain fills in AppWiring: the GitHub side of the identity OAuth links and the
+// cosmetics "verified contributor" rule.
+TestApp seamApp() {
+    ContributionsTestKit.configure(mapOf("REDE_SECURITY_ENCRYPTION_KEY", SecretCipher.generateKeyBase64()))
+    return ContributionsTestKit.app()
+}
+
+ContributionsOAuthLinks links() {
+    var module = ContributionsTestKit.module()
+    return ContributionsOAuthLinks(ContributionsTestKit.db(), module.identities, module.tokens, module.linkSync)
+}
+
+String failure(userId: String, githubId: String) {
+    var failed = ""
+    try {
+        links().rememberGithub(userId, githubId, "Other", null, null)
+    } catch (String e) {
+        failed = e
+    }
+    return failed
+}
+
+test "linking GitHub remembers the identity, keeps a write token only with the right scope and verifies on its own" {
+    var app = seamApp()
+    var module = ContributionsTestKit.module()
+    var gateway = ContributionsTestKit.gateway()
+    var sfx = ContributionsTestKit.suffix()
+    var repo = "Rede-ENois/link-" + sfx
+    module.store.saveRepository(GhRepository(repo, true, Time.nowIso(), null))
+    var userId = "link_" + sfx
+    var token = ContributionsTestKit.login(userId)
+    var now = Time.nowIso()
+    gateway.issueList = listOf<GhIssue>()
+    gateway.pulls = listOf(ContributionsTestKit.pull(5L, "gh-link-" + sfx, "link-dev", "Corrige o vínculo", listOf("src/main/A.java"), 5, 1, 0, 0, now))
+    // Read-only scope: the identity is kept (the login is cleaned), the token is not.
+    links().rememberGithub(userId, "gh-link-" + sfx, "Link Dev!", "gho_read", "read:user")
+    var status = ContributionsTestKit.send("GET", "/me/github", token, "")
+    Check.jsonEq(status, "linked", "true")
+    Check.jsonEq(status, "login", "LinkDev")
+    Check.jsonEq(status, "writeAccess", "false")
+    assert(!module.tokens.hasWriteToken(userId))
+    // The contributions of the link were verified right after the link (the listener runs inline in the suites).
+    assert(module.store.findByObject(repo, "PULL_REQUEST", 5) != null)
+    assert(ContributionsTestKit.active(userId, "AJUDANTE"))
+    assert(module.identities.status(userId).syncState() == "OK")
+    // The same account again with a write scope: the token is stored ciphered and shows as write access.
+    links().rememberGithub(userId, "gh-link-" + sfx, "Link Dev", "gho_write", "read:user,repo")
+    Check.jsonEq(ContributionsTestKit.send("GET", "/me/github", token, ""), "writeAccess", "true")
+    assert(module.tokens.accessToken(userId) == "gho_write")
+    var stored = ContributionsTestKit.db().queryOne("select token_cipher from github_user_tokens where user_id = ?", DbParams().bindStr(userId))
+    assert(!stored.getStr("token_cipher").contains("gho_write"))
+    // One GitHub account per Énóis account and the other way around.
+    var other = "link_other_" + sfx
+    ContributionsTestKit.login(other)
+    assert(Errors.hasCode(failure(other, "gh-link-" + sfx), "GITHUB_ACCOUNT_IN_USE"))
+    assert(Errors.hasCode(failure(userId, "gh-different-" + sfx), "GITHUB_ALREADY_LINKED"))
+    // A public_repo scope also counts; unlinking removes the identity.
+    links().unlinkGithub(userId)
+    Check.jsonEq(ContributionsTestKit.send("GET", "/me/github", token, ""), "linked", "false")
+    links().rememberGithub(other, "gh-other-" + sfx, "Other Dev", "gho_public", "public_repo")
+    assert(module.tokens.hasWriteToken(other))
+}
+
+test "the contributor tag belongs to whoever has an active seal and a GitHub identity" {
+    var app = seamApp()
+    var module = ContributionsTestKit.module()
+    var sfx = ContributionsTestKit.suffix()
+    var seam = ContributionsCosmeticsContributors(ContributionsTestKit.db(), VerifiedContributors(module.store, ContributionsTestKit.profiles().directory))
+    var userId = "tag_" + sfx
+    ContributionsTestKit.login(userId)
+    assert(!seam.isVerified(userId))
+    // A seal without the identity is not enough, nor an identity without a seal.
+    module.identities.remember(userId, "gh-tag-" + sfx, "tag-dev")
+    assert(!seam.isVerified(userId))
+    ContributionsTestKit.savePr(userId, "gh-tag-" + sfx, "Rede-ENois/tag-" + sfx, 1)
+    module.seals.recalculate(userId)
+    assert(seam.isVerified(userId))
+    module.identities.unlink(userId)
+    assert(!seam.isVerified(userId))
+    module.identities.remember(userId, "gh-tag-" + sfx, "tag-dev")
+    assert(seam.isVerified(userId))
+    // The seam and the verified read agree on the name, handle and seal shown in the panel.
+    var verified = VerifiedContributors(module.store, ContributionsTestKit.profiles().directory).find(userId)
+    assert(verified != null)
+    if (verified != null) {
+        assert(verified.githubLogin() == "tag-dev")
+        assert(verified.sealName() == "Ajudante")
+        Check.eqInt("evidence", 1, verified.evidenceCount())
+        assert(verified.username() == userId)
+    }
+}
+
+test "finish" {
+    ContributionsTestKit.finish()
+}

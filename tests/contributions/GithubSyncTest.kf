@@ -1,0 +1,362 @@
+import contributions.*
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of GitHubContributionSyncTests (idempotent sync of PRs and issues, mapping by the immutable id, qualification,
+// revert, dry run), GitHubIdentityServiceTests, GitHubSyncEndpointTests and the status half of GitHubOAuthLinkTests.
+TestApp sapp() {
+    ContributionsTestKit.configure(mapOf("GITHUB_QUALIFIED_ISSUE_LABELS", "qualificado"))
+    return ContributionsTestKit.app()
+}
+
+Bool repoKnown(name: String) {
+    for (var r in ContributionsTestKit.module().store.repositories()) {
+        if (r.repository() == name) {
+            return true
+        }
+    }
+    return false
+}
+
+Bool repoEnabled(name: String) {
+    for (var r in ContributionsTestKit.module().store.repositories()) {
+        if (r.repository() == name) {
+            return r.enabled()
+        }
+    }
+    return false
+}
+
+test "new organization repositories become eligible but switched off ones stay off" {
+    var app = sapp()
+    var module = ContributionsTestKit.module()
+    var gateway = ContributionsTestKit.gateway()
+    var sfx = ContributionsTestKit.suffix()
+    var fresh = "Rede-ENois/novo-" + sfx
+    var switchedOff = "Rede-ENois/desligado-" + sfx
+    var foreign = "Outra-Org/estranho-" + sfx
+    module.store.saveRepository(GhRepository(switchedOff, false, Time.nowIso(), null))
+    gateway.orgRepos = listOf(fresh, switchedOff, foreign)
+    gateway.pulls = listOf<GhPullRequest>()
+    gateway.issueList = listOf<GhIssue>()
+    module.sync.sync(true, false, listOf<String>())
+    assert(!repoKnown(fresh))
+    module.sync.sync(false, false, listOf<String>())
+    assert(repoKnown(fresh))
+    assert(repoEnabled(fresh))
+    assert(!repoEnabled(switchedOff))
+    assert(!repoKnown(foreign))
+    gateway.orgRepos = listOf<String>()
+}
+
+test "the sync is idempotent, maps the identity and flags reverts" {
+    var app = sapp()
+    var module = ContributionsTestKit.module()
+    var gateway = ContributionsTestKit.gateway()
+    var sfx = ContributionsTestKit.suffix()
+    var repo = "Rede-ENois/sync-test-" + sfx
+    module.store.saveRepository(GhRepository(repo, true, Time.nowIso(), null))
+    var userId = "gh_sync_" + sfx
+    ContributionsTestKit.login(userId)
+    module.identities.remember(userId, "gh-103-" + sfx, "dev-103")
+    var now = Time.nowIso()
+    gateway.issueList = listOf<GhIssue>()
+    gateway.pulls = listOf(ContributionsTestKit.pull(103L, "gh-103-" + sfx, "dev-103", "Corrige cálculo de saldo", listOf("src/main/Balance.java", "src/test/BalanceTest.java"), 40, 4, 2, 1, now), ContributionsTestKit.pull(101L, "gh-101", "dev-101", "Adiciona teste de integração", listOf("src/main/Foo.java", "src/test/FooTest.java"), 50, 5, 2, 1, now), ContributionsTestKit.revert(102L, "gh-102", "dev-102", 101L, now))
+    var first = module.sync.sync(false, true, listOf(repo))
+    Check.eqInt("created", 3, first.created())
+    Check.eqInt("reverts", 1, first.revertedFlagged())
+    Check.eqInt("recalculated", 1, first.sealsRecalculated())
+    var head = module.store.findByObject(repo, "PULL_REQUEST", 103)
+    assert(head != null)
+    if (head != null) {
+        assert(head.userId == userId)
+        assert(head.detailsFetched)
+        assert(head.hasTests)
+        // A merged PR is accepted work: it enters validated, with no manual review.
+        assert(head.status == "VALIDATED")
+        Check.eqInt("score", 4, head.score)
+    }
+    var reverted = module.store.findByObject(repo, "PULL_REQUEST", 101)
+    assert(reverted != null)
+    if (reverted != null) {
+        assert(reverted.reverted)
+    }
+    // The link has 1 countable PR: the matching tier is granted on its own.
+    var seal = module.store.findSeal(userId, "AJUDANTE")
+    assert(seal != null)
+    if (seal != null) {
+        assert(seal.status() == "ACTIVE")
+        Check.eqInt("evidence", 1, seal.evidenceCount())
+    }
+    var second = module.sync.sync(false, true, listOf(repo))
+    Check.eqInt("created again", 0, second.created())
+    Check.eqInt("updated", 3, second.updated())
+    assert(module.store.findByObject(repo, "PULL_REQUEST", 103) != null)
+    assert(module.store.audit(head_id(module, repo), 10).size() >= 1)
+    // The repository window advanced (a full sweep).
+    var window = ContributionsTestKit.db().queryOne("select last_synced_at from github_repositories where repository = ?", DbParams().bindStr(repo))
+    assert(!window.isNull("last_synced_at"))
+    var link = module.identities.status(userId)
+    assert(link.syncState() == "OK")
+}
+
+String head_id(module: ContributionsModule, repo: String) {
+    var c = module.store.findByObject(repo, "PULL_REQUEST", 103)
+    if (c == null) {
+        return ""
+    }
+    return c.id
+}
+
+test "a sync for one GitHub user only imports that author's contributions" {
+    var app = sapp()
+    var module = ContributionsTestKit.module()
+    var gateway = ContributionsTestKit.gateway()
+    var sfx = ContributionsTestKit.suffix()
+    var repo = "Rede-ENois/targeted-test-" + sfx
+    module.store.saveRepository(GhRepository(repo, true, Time.nowIso(), null))
+    var target = "gh_target_" + sfx
+    var other = "gh_other_" + sfx
+    ContributionsTestKit.login(target)
+    ContributionsTestKit.login(other)
+    var targetGithub = "gh-target-" + sfx
+    var otherGithub = "gh-other-" + sfx
+    module.identities.remember(target, targetGithub, "target-dev")
+    module.identities.remember(other, otherGithub, "other-dev")
+    var now = Time.nowIso()
+    gateway.pulls = listOf(ContributionsTestKit.pull(700L, targetGithub, "target-dev", "Corrige o alvo", listOf("src/main/Target.java"), 20, 2, 1, 1, now), ContributionsTestKit.pull(701L, otherGithub, "other-dev", "Outra pessoa", listOf("src/main/Other.java"), 10, 1, 0, 0, now), ContributionsTestKit.revert(702L, targetGithub, "target-dev", 701L, now))
+    gateway.issueList = listOf(ContributionsTestKit.issue(800L, targetGithub, "target-dev", "Issue do alvo", listOf("qualificado"), now), ContributionsTestKit.issue(801L, otherGithub, "other-dev", "Issue de outra pessoa", listOf("qualificado"), now))
+    var report = module.sync.syncForGithubUser(targetGithub)
+    assert(report.created() >= 1)
+    var targetPr = module.store.findByObject(repo, "PULL_REQUEST", 700)
+    assert(targetPr != null)
+    if (targetPr != null) {
+        assert(targetPr.userId == target)
+    }
+    assert(report.sealsRecalculated() >= 1)
+    assert(module.store.findByObject(repo, "PULL_REQUEST", 701) == null)
+    assert(module.store.findByObject(repo, "ISSUE", 800) != null)
+    assert(module.store.findByObject(repo, "ISSUE", 801) == null)
+    // The link is swept in EVERY registered repository, so the tier depends on the real count.
+    var prs = module.store.countCountable(target, "CODE")
+    var issues = module.store.countCountable(target, "ISSUES")
+    assert(prs > 0)
+    assert(issues > 0)
+    var codeTier = SealTypes.forCount("CODE", prs)
+    var issueTier = SealTypes.forCount("ISSUES", issues)
+    assert(codeTier != null && issueTier != null)
+    if (codeTier != null) {
+        assert(module.store.findSeal(target, codeTier.name()) != null)
+    }
+    if (issueTier != null) {
+        assert(module.store.findSeal(target, issueTier.name()) != null)
+    }
+    for (var s in module.store.allActiveSeals()) {
+        assert(s.userId() != other)
+    }
+    assert(module.identities.status(target).syncState() == "OK")
+    assert(module.identities.status(other).syncState() == "STALE")
+    // The sweep was only the link's: the repository window of the others does not move.
+    var window = ContributionsTestKit.db().queryOne("select last_synced_at from github_repositories where repository = ?", DbParams().bindStr(repo))
+    assert(window.isNull("last_synced_at"))
+    Check.apiError(app.client.send("POST", "/me/github/sync", listOf("X-Session-Token: x"), "", ""), 401, "UNAUTHENTICATED")
+}
+
+test "a dry run does not persist" {
+    var app = sapp()
+    var module = ContributionsTestKit.module()
+    var gateway = ContributionsTestKit.gateway()
+    var sfx = ContributionsTestKit.suffix()
+    var repo = "Rede-ENois/dry-test-" + sfx
+    module.store.saveRepository(GhRepository(repo, true, Time.nowIso(), null))
+    gateway.issueList = listOf<GhIssue>()
+    gateway.pulls = listOf(ContributionsTestKit.pull(201L, "gh-201", "dev-201", "PR de teste seco", listOf("src/main/X.java"), 10, 1, 1, 0, Time.nowIso()))
+    var report = module.sync.sync(true, true, listOf(repo))
+    Check.eqInt("counted", 1, report.created())
+    assert(module.store.findByObject(repo, "PULL_REQUEST", 201) == null)
+}
+
+test "the issue sync is idempotent and only qualified issues count" {
+    var app = sapp()
+    var module = ContributionsTestKit.module()
+    var gateway = ContributionsTestKit.gateway()
+    var sfx = ContributionsTestKit.suffix()
+    var repo = "Rede-ENois/issues-test-" + sfx
+    module.store.saveRepository(GhRepository(repo, true, Time.nowIso(), null))
+    var userId = "gh_issue_" + sfx
+    ContributionsTestKit.login(userId)
+    module.identities.remember(userId, "gh-issue-" + sfx, "issue-dev")
+    var now = Time.nowIso()
+    gateway.pulls = listOf<GhPullRequest>()
+    gateway.issueList = listOf(ContributionsTestKit.issue(500L, "gh-issue-" + sfx, "issue-dev", "Falha no login com 2FA", listOf("qualificado"), now), ContributionsTestKit.issue(501L, "gh-issue-" + sfx, "issue-dev", "Sugestão de texto", listOf<String>(), now))
+    var first = module.sync.sync(false, true, listOf(repo))
+    Check.eqInt("created", 2, first.issuesCreated())
+    var qualified = module.store.findByObject(repo, "ISSUE", 500)
+    var pending = module.store.findByObject(repo, "ISSUE", 501)
+    assert(qualified != null && pending != null)
+    if (qualified != null) {
+        assert(qualified.status == "VALIDATED")
+        assert(qualified.category == "ISSUES")
+        assert(qualified.labels == "[\"qualificado\"]")
+    }
+    if (pending != null) {
+        assert(pending.status == "PENDING")
+    }
+    assert(ContributionsTestKit.active(userId, "BETA_TESTER"))
+    var second = module.sync.sync(false, true, listOf(repo))
+    Check.eqInt("created again", 0, second.issuesCreated())
+    Check.eqInt("updated", 2, second.issuesUpdated())
+}
+
+test "an issue that loses its qualification stops counting" {
+    var app = sapp()
+    var module = ContributionsTestKit.module()
+    var gateway = ContributionsTestKit.gateway()
+    var sfx = ContributionsTestKit.suffix()
+    var repo = "Rede-ENois/issues-drop-" + sfx
+    module.store.saveRepository(GhRepository(repo, true, Time.nowIso(), null))
+    var userId = "gh_issue_drop_" + sfx
+    ContributionsTestKit.login(userId)
+    module.identities.remember(userId, "gh-issue-drop-" + sfx, "issue-dev-drop")
+    var now = Time.nowIso()
+    gateway.pulls = listOf<GhPullRequest>()
+    gateway.issueList = listOf(ContributionsTestKit.issue(600L, "gh-issue-drop-" + sfx, "issue-dev-drop", "Problema real", listOf("qualificado"), now))
+    module.sync.sync(false, true, listOf(repo))
+    assert(ContributionsTestKit.active(userId, "BETA_TESTER"))
+    gateway.issueList = listOf(ContributionsTestKit.issue(600L, "gh-issue-drop-" + sfx, "issue-dev-drop", "Problema real", listOf<String>(), Time.plusSeconds(now, 30L)))
+    module.sync.sync(false, true, listOf(repo))
+    var dropped = module.store.findByObject(repo, "ISSUE", 600)
+    assert(dropped != null)
+    if (dropped != null) {
+        assert(dropped.status == "PENDING")
+    }
+    var seal = module.store.findSeal(userId, "BETA_TESTER")
+    assert(seal != null)
+    if (seal != null) {
+        assert(seal.status() == "REVOKED")
+    }
+}
+
+test "a human review is kept by the next sync and a failing GitHub stops the cycle with the link in ERROR" {
+    var app = sapp()
+    var module = ContributionsTestKit.module()
+    var gateway = ContributionsTestKit.gateway()
+    var sfx = ContributionsTestKit.suffix()
+    var repo = "Rede-ENois/review-kept-" + sfx
+    module.store.saveRepository(GhRepository(repo, true, Time.nowIso(), null))
+    var userId = "gh_keep_" + sfx
+    ContributionsTestKit.login(userId)
+    var admin = ContributionsTestKit.loginAdmin("keep-admin")
+    module.identities.remember(userId, "gh-keep-" + sfx, "keep-dev")
+    var now = Time.nowIso()
+    gateway.pulls = listOf<GhPullRequest>()
+    gateway.issueList = listOf(ContributionsTestKit.issue(610L, "gh-keep-" + sfx, "keep-dev", "Sugestão", listOf<String>(), now))
+    module.sync.sync(false, true, listOf(repo))
+    var kept = module.store.findByObject(repo, "ISSUE", 610)
+    assert(kept != null)
+    if (kept != null) {
+        Check.status(ContributionsTestKit.send("POST", "/admin/contributors/contributions/" + kept.id + "/review", admin, "{\"status\":\"REJECTED\"}"), 200)
+    }
+    module.sync.sync(false, true, listOf(repo))
+    var again = module.store.findByObject(repo, "ISSUE", 610)
+    assert(again != null)
+    if (again != null) {
+        assert(again.status == "REJECTED")
+    }
+    // A failing GitHub: the cycle stops, the error is reported and the link is marked ERROR; a rate limit says so.
+    gateway.failWith = "GITHUB_RATE_LIMITED: GitHub recusou a chamada (status=403, remaining=?)"
+    var limited = module.sync.syncForGithubUser("gh-keep-" + sfx)
+    gateway.failWith = ""
+    assert(limited.rateLimited())
+    assert(limited.errors().size() >= 1)
+    assert(module.identities.status(userId).syncState() == "ERROR")
+    gateway.failWith = "GITHUB_ERROR: GitHub respondeu 500"
+    var broken = module.sync.syncForGithubUser("gh-keep-" + sfx)
+    gateway.failWith = ""
+    assert(!broken.rateLimited())
+    assert(broken.errors().size() >= 1)
+    Check.apiError(app.client.send("POST", "/admin/contributors/sync", ContributionsTestKit.auth(admin), "", "{\"repositories\":[\"Nope/nope\"]}"), 400, "GITHUB_REPOSITORY_NOT_ELIGIBLE")
+    module.store.saveRepository(GhRepository("Rede-ENois/off-" + sfx, false, now, null))
+    Check.apiError(ContributionsTestKit.send("POST", "/admin/contributors/sync", admin, "{\"repositories\":[\"Rede-ENois/off-" + sfx + "\"]}"), 400, "GITHUB_REPOSITORY_DISABLED")
+    gateway.pulls = listOf<GhPullRequest>()
+    gateway.issueList = listOf<GhIssue>()
+    var viaHttp = ContributionsTestKit.send("POST", "/admin/contributors/sync", admin, "{\"dryRun\":true,\"full\":true,\"repositories\":[\"" + repo + "\"]}")
+    Check.status(viaHttp, 200)
+    Check.jsonEq(viaHttp, "dryRun", "true")
+    Check.jsonEq(viaHttp, "full", "true")
+    Check.jsonEq(viaHttp, "repositories.0", repo)
+}
+
+test "the GitHub identity is idempotent and exclusive" {
+    var app = sapp()
+    var module = ContributionsTestKit.module()
+    var sfx = ContributionsTestKit.suffix()
+    var first = "ghid_first_" + sfx
+    var second = "ghid_second_" + sfx
+    ContributionsTestKit.login(first)
+    ContributionsTestKit.login(second)
+    module.identities.remember(first, "ghid-" + sfx, "first-login")
+    module.identities.remember(first, "ghid-" + sfx, "first-login-renamed")
+    var status = module.identities.status(first)
+    assert(status.login() == "first-login-renamed")
+    var inUse = ""
+    try {
+        module.identities.remember(second, "ghid-" + sfx, "other")
+    } catch (String e) {
+        inUse = e
+    }
+    assert(Errors.hasCode(inUse, "GITHUB_ACCOUNT_IN_USE"))
+    assert(Errors.parse(inUse).message().contains("outro perfil"))
+    var other = ""
+    try {
+        module.identities.remember(first, "ghid-other-" + sfx, "other")
+    } catch (String e) {
+        other = e
+    }
+    assert(Errors.hasCode(other, "GITHUB_ALREADY_LINKED"))
+    assert(Errors.parse(other).message().contains("outro GitHub"))
+    var bad = ""
+    try {
+        module.identities.remember(second, "ghid-bad-" + sfx, "!!!")
+    } catch (String e) {
+        bad = e
+    }
+    assert(Errors.hasCode(bad, "INVALID_GITHUB_LOGIN"))
+    module.identities.unlink(first)
+    assert(!module.identities.status(first).linked())
+}
+
+test "the verify button needs the link and answers counts" {
+    var app = sapp()
+    var module = ContributionsTestKit.module()
+    var sfx = ContributionsTestKit.suffix()
+    var userId = "gh_sync_endpoint_" + sfx
+    var token = ContributionsTestKit.login(userId)
+    Check.apiError(ContributionsTestKit.send("POST", "/me/github/sync", token, ""), 409, "GITHUB_NOT_LINKED")
+    Check.apiError(ContributionsTestKit.anonymous("POST", "/me/github/sync", ""), 401, "UNAUTHENTICATED")
+    var unlinked = ContributionsTestKit.send("GET", "/me/github", token, "")
+    Check.status(unlinked, 200)
+    Check.jsonEq(unlinked, "linked", "false")
+    Check.jsonEq(unlinked, "writeAccess", "false")
+    module.identities.remember(userId, "gh-endpoint-" + sfx, "endpoint-dev")
+    var linked = ContributionsTestKit.send("GET", "/me/github", token, "")
+    Check.jsonEq(linked, "linked", "true")
+    Check.jsonEq(linked, "login", "endpoint-dev")
+    Check.jsonEq(linked, "syncState", "STALE")
+    var gateway = ContributionsTestKit.gateway()
+    var now = Time.nowIso()
+    gateway.issueList = listOf<GhIssue>()
+    gateway.pulls = listOf(ContributionsTestKit.pull(990L, "gh-endpoint-" + sfx, "endpoint-dev", "Corrige", listOf("src/main/A.java"), 5, 1, 0, 0, now))
+    var res = ContributionsTestKit.send("POST", "/me/github/sync", token, "")
+    Check.status(res, 200)
+    assert(res.json("contributions") != "0")
+    Check.jsonEq(res, "rateLimited", "false")
+    assert(res.jsonHas("seals"))
+    assert(res.jsonHas("issues"))
+}
+
+test "finish" {
+    ContributionsTestKit.finish()
+}

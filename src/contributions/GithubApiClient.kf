@@ -1,0 +1,286 @@
+package contributions
+
+import kernel.config.*
+import kernel.time.*
+import kernel.url.*
+
+// GitHub's answers, only the members the evidence reads. Everything optional: a missing member is a default.
+record GhApiUser(Long? id, String? login)
+record GhApiPull(Long? number, String? node_id, String? title, String? html_url, String? body, GhApiUser? user, String? state, String? created_at, String? merged_at, String? updated_at, Int? additions, Int? deletions, Int? changed_files)
+record GhApiLabel(String? name)
+record GhApiMarker(String? url)
+record GhApiIssue(Long? number, String? node_id, String? title, String? html_url, GhApiUser? user, String? state, String? created_at, String? closed_at, String? updated_at, List<GhApiLabel>? labels, GhApiMarker? pull_request)
+record GhApiFile(String? filename)
+record GhApiReview(String? state)
+// `private` is a Kof keyword (it cannot be a record member): the request already asks for type=public, so the redundant check of Java is dropped.
+record GhApiOrgRepo(String? full_name, Troolean fork, Troolean archived, Troolean disabled)
+
+// The real GitHub reader: public repositories of the organization. The token is optional (the public API has a
+// low limit); when present it is a read-only fine-grained one. It never receives user content: only merged pull
+// requests, files and reviews.
+class GithubApiClient extends GithubGateway {
+    GithubHttp github
+    public constructor(github: GithubHttp) {
+        super()
+        this.github = github
+    }
+    static GithubApiClient fromConfig(cfg: Config) = GithubApiClient(GithubHttp(cfg.getStr("GITHUB_API_BASE", "https://api.github.com"), cfg.getStr("GITHUB_CONTRIBUTIONS_TOKEN", ""), cfg.getStr("GITHUB_USER_AGENT", "EnoisBot/1.0 (+https://enois.ia.br)")))
+    static Int pages(maxPages: Int, ceiling: Int) {
+        if (maxPages < 1) {
+            return 1
+        }
+        if (maxPages > ceiling) {
+            return ceiling
+        }
+        return maxPages
+    }
+    static String str(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    static Long lng(v: Long?) {
+        if (v == null) {
+            return 0L
+        }
+        return v
+    }
+    static Int num(v: Int?) {
+        if (v == null) {
+            return 0
+        }
+        return v
+    }
+    static Bool flag(v: Troolean) = v == true
+    static String? instant(v: String?) {
+        if (v == null) {
+            return null
+        }
+        if (v.trim().length() == 0) {
+            return null
+        }
+        return v
+    }
+    static Bool before(updated: String?, since: String?) {
+        if (updated == null) {
+            return false
+        }
+        if (since == null) {
+            return false
+        }
+        return Time.toMillis(updated) < Time.toMillis(since)
+    }
+    List<GhApiPull> pullPage(path: String) = json.decode<List<GhApiPull>>(github.get(path))
+    List<GhPullRequest> mergedPullRequests(repository: String, since: String?, maxPages: Int) {
+        var result = listOf<GhPullRequest>()
+        var limit = GithubApiClient.pages(maxPages, 20)
+        var page = 1
+        while (page <= limit) {
+            var array = this.pullPage("/repos/" + repository + "/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=" + page)
+            if (array.size() == 0) {
+                return result
+            }
+            var reached = false
+            for (var pr in array) {
+                if (GithubApiClient.before(pr.updated_at(), since)) {
+                    reached = true
+                }
+                else 
+                    if (GithubApiClient.instant(pr.merged_at()) != null) {
+                        result.add(GithubApiClient.fromPull(pr))
+                    }
+            }
+            if (reached || array.size() < 100) {
+                return result
+            }
+            page = page + 1
+        }
+        return result
+    }
+    List<String> organizationRepositories(organization: String, maxPages: Int) {
+        var result = listOf<String>()
+        var limit = GithubApiClient.pages(maxPages, 10)
+        var page = 1
+        while (page <= limit) {
+            var array = json.decode<List<GhApiOrgRepo>>(github.get("/orgs/" + UrlCodec.encode(organization) + "/repos?type=public&per_page=100&page=" + page))
+            if (array.size() == 0) {
+                return result
+            }
+            for (var repo in array) {
+                var name = GithubApiClient.str(repo.full_name())
+                if (name.trim().length() > 0 && !GithubApiClient.flag(repo.fork) && !GithubApiClient.flag(repo.archived) && !GithubApiClient.flag(repo.disabled)) {
+                    result.add(name)
+                }
+            }
+            if (array.size() < 100) {
+                return result
+            }
+            page = page + 1
+        }
+        return result
+    }
+    List<GhIssue> issues(repository: String, since: String?, maxPages: Int) {
+        var result = listOf<GhIssue>()
+        var limit = GithubApiClient.pages(maxPages, 20)
+        var sinceParam = ""
+        if (since != null) {
+            sinceParam = "&since=" + UrlCodec.encode(since)
+        }
+        var page = 1
+        while (page <= limit) {
+            var array = json.decode<List<GhApiIssue>>(github.get("/repos/" + repository + "/issues?state=all&sort=updated&direction=desc&per_page=100&page=" + page + sinceParam))
+            if (array.size() == 0) {
+                return result
+            }
+            var reached = false
+            for (var issue in array) {
+                // The API mixes pull requests into the issues endpoint; they count through the pulls endpoint.
+                if (issue.pull_request() == null) {
+                    if (GithubApiClient.before(issue.updated_at(), since)) {
+                        reached = true
+                    }
+                    else {
+                        result.add(GithubApiClient.fromIssue(issue))
+                    }
+                }
+            }
+            if (reached || array.size() < 100) {
+                return result
+            }
+            page = page + 1
+        }
+        return result
+    }
+    List<GhPullRequest> openPullRequests(repository: String, maxPages: Int) {
+        var result = listOf<GhPullRequest>()
+        var limit = GithubApiClient.pages(maxPages, 10)
+        var page = 1
+        while (page <= limit) {
+            var array = this.pullPage("/repos/" + repository + "/pulls?state=open&sort=created&direction=desc&per_page=100&page=" + page)
+            if (array.size() == 0) {
+                return result
+            }
+            for (var pr in array) {
+                result.add(GithubApiClient.fromPull(pr))
+            }
+            if (array.size() < 100) {
+                return result
+            }
+            page = page + 1
+        }
+        return result
+    }
+    Bool submitReview(repository: String, number: Long, decision: String, body: String?, tokenOverride: String?) {
+        var payload = "{\"event\":" + json.encode(decision)
+        if (body != null) {
+            if (body.trim().length() > 0) {
+                payload = payload + ",\"body\":" + json.encode(body)
+            }
+        }
+        payload = payload + "}"
+        var status = this.reviewStatus(github.apiBase + "/repos/" + repository + "/pulls/" + number + "/reviews", payload, tokenOverride)
+        return status / 100 == 2
+    }
+    // The HTTP status of the review call, 0 when GitHub could not be reached.
+    Int reviewStatus(url: String, payload: String, tokenOverride: String?) {
+        var status = 0
+        try {
+            var reply = github.send(url, "application/vnd.github+json", "POST", payload, tokenOverride)
+            status = reply.status()
+        } catch (String e) {
+            status = 0
+        }
+        return status
+    }
+    GhPullRequest withDetails(repository: String, pr: GhPullRequest) {
+        var files = listOf<String>()
+        var page = 1
+        while (page <= 3 && files.size() < 500) {
+            var array = json.decode<List<GhApiFile>>(github.get("/repos/" + repository + "/pulls/" + pr.number() + "/files?per_page=100&page=" + page))
+            if (array.size() == 0) {
+                page = 99
+            }
+            else {
+                for (var file in array) {
+                    var name = GithubApiClient.str(file.filename())
+                    if (files.size() < 500 && name.trim().length() > 0) {
+                        files.add(name)
+                    }
+                }
+                if (array.size() < 100) {
+                    page = 99
+                }
+                page = page + 1
+            }
+        }
+        var reviews = 0
+        var approvals = 0
+        var changes = 0
+        var reviewPage = 1
+        while (reviewPage <= 2) {
+            var array = json.decode<List<GhApiReview>>(github.get("/repos/" + repository + "/pulls/" + pr.number() + "/reviews?per_page=100&page=" + reviewPage))
+            if (array.size() == 0) {
+                reviewPage = 99
+            }
+            else {
+                for (var review in array) {
+                    reviews = reviews + 1
+                    var state = GithubApiClient.str(review.state())
+                    if (state == "APPROVED") {
+                        approvals = approvals + 1
+                    }
+                    else 
+                        if (state == "CHANGES_REQUESTED") {
+                            changes = changes + 1
+                        }
+                }
+                if (array.size() < 100) {
+                    reviewPage = 99
+                }
+                reviewPage = reviewPage + 1
+            }
+        }
+        return GhPullRequest(pr.number(), pr.nodeId(), pr.title(), pr.url(), pr.body(), pr.authorId(), pr.authorLogin(), pr.state(), pr.openedAt(), pr.mergedAt(), pr.updatedAt(), pr.additions(), pr.deletions(), pr.changedFiles(), files, reviews, approvals, changes)
+    }
+    static String userId(u: GhApiUser?) {
+        if (u == null) {
+            return ""
+        }
+        var id = u.id()
+        if (id == null) {
+            return ""
+        }
+        return "" + id
+    }
+    static String userLogin(u: GhApiUser?) {
+        if (u == null) {
+            return ""
+        }
+        return GithubApiClient.str(u.login())
+    }
+    static GhPullRequest fromPull(pr: GhApiPull) {
+        var state = GithubApiClient.str(pr.state())
+        if (state.length() == 0) {
+            state = "closed"
+        }
+        return GhPullRequest(GithubApiClient.lng(pr.number()), GithubApiClient.str(pr.node_id()), GithubApiClient.str(pr.title()), GithubApiClient.str(pr.html_url()), GithubApiClient.str(pr.body()), GithubApiClient.userId(pr.user()), GithubApiClient.userLogin(pr.user()), state, GithubApiClient.instant(pr.created_at()), GithubApiClient.instant(pr.merged_at()), GithubApiClient.instant(pr.updated_at()), GithubApiClient.num(pr.additions()), GithubApiClient.num(pr.deletions()), GithubApiClient.num(pr.changed_files()), listOf<String>(), 0, 0, 0)
+    }
+    static GhIssue fromIssue(issue: GhApiIssue) {
+        var labels = listOf<String>()
+        var nodes = issue.labels()
+        if (nodes != null) {
+            for (var label in nodes) {
+                var name = GithubApiClient.str(label.name())
+                if (name.trim().length() > 0) {
+                    labels.add(name)
+                }
+            }
+        }
+        var state = GithubApiClient.str(issue.state())
+        if (state.length() == 0) {
+            state = "open"
+        }
+        return GhIssue(GithubApiClient.lng(issue.number()), GithubApiClient.str(issue.node_id()), GithubApiClient.str(issue.title()), GithubApiClient.str(issue.html_url()), GithubApiClient.userId(issue.user()), GithubApiClient.userLogin(issue.user()), state, GithubApiClient.instant(issue.created_at()), GithubApiClient.instant(issue.closed_at()), GithubApiClient.instant(issue.updated_at()), labels)
+    }
+}
