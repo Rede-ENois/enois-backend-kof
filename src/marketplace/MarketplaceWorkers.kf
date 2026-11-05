@@ -1,0 +1,162 @@
+package marketplace
+
+import kernel.log.*
+import kernel.sanctions.*
+import profile.*
+import themes.*
+
+// What the workers read about a theme author: the profile and the sanction gate. Names and patterns decide who
+// is a leftover of the attack.
+class MarketplaceSuspicion {
+    List<String> patterns = listOf<String>()
+    public constructor(raw: String) {
+        for (var part in raw.split(",")) {
+            var p = part.trim().toLowerCase()
+            if (p.length() > 0) {
+                patterns.add(p)
+            }
+        }
+    }
+    Bool anyIn(text: String) {
+        var lower = text.toLowerCase()
+        for (var p in patterns) {
+            if (lower.contains(p)) {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// Migration of the community themes to the marketplace: every theme published in the gallery becomes a listing at
+// the price floor (50 sparks) with the author as seller. Idempotent (it only creates when no listing is active),
+// so it runs at boot and every hour without duplicating anything.
+class MarketplaceGalleryImport {
+    ThemeStore themes
+    MarketplaceService marketplace
+    SanctionGateReader sanctionGate
+    ProfileDirectory profiles
+    MarketplaceSuspicion suspicion
+    Log log = Log("marketplace.import")
+    public constructor(themes: ThemeStore, marketplace: MarketplaceService, sanctionGate: SanctionGateReader, profiles: ProfileDirectory, suspicion: MarketplaceSuspicion) {
+        this.themes = themes
+        this.marketplace = marketplace
+        this.sanctionGate = sanctionGate
+        this.profiles = profiles
+        this.suspicion = suspicion
+    }
+    Int importPublishedThemes() {
+        var created = 0
+        for (var theme in themes.findPublished(500)) {
+            // A theme of a banned, deleted or test account is not listed again: the cleanup removes it and this
+            // import would recreate it in the same round.
+            if (this.shouldSkip(theme)) {
+                continue
+            }
+            try {
+                var listed = marketplace.ensureListed(theme.authorId(), "THEME", theme.id(), theme.name(), theme.description(), MarketplaceService.minPrice())
+                if (listed != null) {
+                    created = created + 1
+                }
+            } catch (String e) {
+                // One problematic package never stops the migration of the others.
+                log.warn("marketplace_theme_import_failed theme=" + theme.id() + " error=" + e)
+            }
+        }
+        if (created > 0) {
+            log.info("marketplace_themes_imported count=" + created)
+        }
+        return created
+    }
+    Bool shouldSkip(theme: ThemePackage) {
+        if (sanctionGate.banned(theme.authorId())) {
+            return true
+        }
+        var profile = profiles.findById(theme.authorId())
+        if (profile == null) {
+            return true
+        }
+        if (suspicion.anyIn(profile.name + " " + profile.username)) {
+            return true
+        }
+        return suspicion.anyIn(theme.name())
+    }
+}
+
+// One-off cleanup of the attack leftovers: listings whose item no longer exists, whose seller is not the theme
+// author, or whose seller is banned or looks like a probe are removed, refunding what sits in the escrow. Then every
+// published theme goes on sale. Idempotent: it runs at boot and every hour. Each listing in its own transaction.
+class MarketplaceSanitizer {
+    MarketplaceService marketplace
+    ThemeStore themes
+    MarketplaceStore store
+    SanctionGateReader sanctionGate
+    ProfileDirectory profiles
+    MarketplaceSuspicion suspicion
+    MarketplaceGalleryImport galleryImport
+    Log log = Log("marketplace.sanitize")
+    public constructor(marketplace: MarketplaceService, themes: ThemeStore, store: MarketplaceStore, sanctionGate: SanctionGateReader, profiles: ProfileDirectory, suspicion: MarketplaceSuspicion, galleryImport: MarketplaceGalleryImport) {
+        this.marketplace = marketplace
+        this.themes = themes
+        this.store = store
+        this.sanctionGate = sanctionGate
+        this.profiles = profiles
+        this.suspicion = suspicion
+        this.galleryImport = galleryImport
+    }
+    // Also called by the admin endpoint (diagnosis and cleanup on demand).
+    Int sanitizeNow() {
+        var removed = 0
+        for (var listing in marketplace.allListings(500)) {
+            if (listing.status() != "ACTIVE") {
+                continue
+            }
+            try {
+                if (this.isOrphan(listing)) {
+                    if (marketplace.sanitizeListing(listing)) {
+                        removed = removed + 1
+                    }
+                }
+            } catch (String e) {
+                log.warn("marketplace_sanitize_failed listing=" + listing.id() + " error=" + e)
+            }
+        }
+        // Everything published in the gallery goes back on sale at the price floor.
+        galleryImport.importPublishedThemes()
+        if (removed > 0) {
+            log.info("marketplace_leftovers_removed count=" + removed)
+        }
+        return removed
+    }
+    Bool hasSuspiciousName(sellerId: String) {
+        var profile = profiles.findById(sellerId)
+        if (profile == null) {
+            return false
+        }
+        return suspicion.anyIn(profile.name + " " + profile.username)
+    }
+    Bool isOrphan(listing: MarketplaceListing) {
+        // Banned seller (attack accounts): the listing falls, refunding the escrow.
+        if (sanctionGate.banned(listing.sellerId())) {
+            return true
+        }
+        if (this.hasSuspiciousName(listing.sellerId())) {
+            return true
+        }
+        if (suspicion.anyIn(listing.title())) {
+            return true
+        }
+        // Deleted seller: the account is gone, so the listing cannot stay.
+        if (profiles.findById(listing.sellerId()) == null) {
+            return true
+        }
+        if (listing.itemKind() == "THEME") {
+            var theme = themes.findById(listing.itemId())
+            if (theme == null) {
+                return true
+            }
+            return theme.authorId() != listing.sellerId()
+        }
+        return store.findItem(listing.itemId()) == null
+    }
+}

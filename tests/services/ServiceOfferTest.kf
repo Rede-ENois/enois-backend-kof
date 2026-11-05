@@ -1,0 +1,155 @@
+import economy.*
+import kernel.*
+import kernel.testkit.*
+import profile.*
+import services.*
+
+// Port of ServiceOfferTests: submit, moderation, public catalog, owner pages and link validation. The moderation
+// endpoints (/moderation/services/*) belong to the moderation domain, which is not ported: the same transitions are
+// driven through ServiceOfferService.approve/reject/suspend, the methods that domain will call. The link guard is the
+// StubLinkGuard of the kit (no DNS in a suite), https only and no internal names as in the real one.
+TestApp soApp() = ServicesTestKit.app("serviceoffers")
+
+ServiceOfferService soOffers() = ServicesTestKit.stack().services.offers
+
+String soBody(title: String, description: String, link: String, category: String) = json.encode(ServiceOfferBody(title, description, link, category))
+
+String soSubmit(who: ProfileCaller, title: String, description: String, link: String, category: String) {
+    var res = who.post("/services", soBody(title, description, link, category))
+    Check.status(res, 200)
+    return ServicesTestKit.str(res, "id")
+}
+
+String soSlugOf(who: ProfileCaller, serviceId: String) {
+    var mine = who.get("/services/mine")
+    Check.status(mine, 200)
+    var i = 0
+    while (i < 20) {
+        if (ServicesTestKit.str(mine, i + ".id") == serviceId) {
+            return ServicesTestKit.str(mine, i + ".slug")
+        }
+        i = i + 1
+    }
+    throw "service not found in /mine: " + serviceId
+}
+
+String soStatusIn(who: ProfileCaller, path: String, serviceId: String) {
+    var res = who.get(path)
+    Check.status(res, 200)
+    var i = 0
+    while (i < 20) {
+        var id = res.jsonStr(i + ".id")
+        if (id == null) {
+            return "ABSENT"
+        }
+        if (id == serviceId) {
+            return ServicesTestKit.str(res, i + ".status")
+        }
+        i = i + 1
+    }
+    return "ABSENT"
+}
+
+test "submit, approve, catalog and the guest reads" {
+    var app = soApp()
+    var author = ServicesTestKit.login(app, "svc-author1")
+    var guest = ServicesTestKit.anonymous(app)
+    var serviceId = soSubmit(author, "Site institucional", "Crio sites institucionais completos...", "https://creator.itch.io/servico-dev", "DESENVOLVIMENTO")
+    var slug = soSlugOf(author, serviceId)
+    // before the moderation: out of the catalog
+    Check.isTrue("not in the catalog yet", !guest.get("/services?q=Site%20institucional").body.contains(serviceId))
+    Check.eqStr("the owner sees it in /mine", "SUBMITTED", soStatusIn(author, "/services/mine", serviceId))
+    var approved = soOffers().approve(serviceId, "reviewer", "bom material")
+    Check.eqStr("published", "PUBLISHED", approved.status())
+    var catalog = guest.get("/services?category=DESENVOLVIMENTO&q=Site%20institucional")
+    Check.status(catalog, 200)
+    Check.isTrue("in the catalog with the username", catalog.body.contains(serviceId) && catalog.body.contains("\"username\":\"svc-author1\""))
+    // public page: the guest reads and is not the owner
+    var page = guest.get("/services/svc-author1/" + slug)
+    Check.status(page, 200)
+    Check.eqStr("not owned by the guest", "false", ServicesTestKit.str(page, "owned"))
+    Check.eqStr("owned by the author", "true", ServicesTestKit.str(author.get("/services/svc-author1/" + slug), "owned"))
+}
+
+test "submitting without a session is rejected" {
+    var app = soApp()
+    var res = ServicesTestKit.anonymous(app).post("/services", soBody("Consultoria", "Ajudo com consultorias...", "", "OUTROS"))
+    Check.apiError(res, 401, "UNAUTHENTICATED")
+}
+
+test "link validation blocks insecure and private targets" {
+    var app = soApp()
+    var author = ServicesTestKit.login(app, "svc-author2")
+    Check.apiError(author.post("/services", soBody("Design de produto", "Faço design de produto digital...", "javascript:alert(1)", "DESIGN")), 400, "INVALID_GAME_URL")
+    Check.apiError(author.post("/services", soBody("Design de produto", "Faço design de produto digital...", "http://localhost:8080", "DESIGN")), 400, "INVALID_GAME_URL")
+    Check.apiError(author.post("/services", soBody("Design de produto", "Faço design de produto digital...", "https://user:pass@creator.itch.io/x", "DESIGN")), 400, "INVALID_GAME_URL")
+    Check.apiError(author.post("/services", soBody("Design de produto", "Faço design de produto digital...", "https://intranet.private.example/x", "DESIGN")), 400, "INVALID_GAME_URL")
+    var withLink = soSubmit(author, "Design de produto", "Faço design de produto digital...", "https://creator.itch.io/servico-portfolio", "DESIGN")
+    var withoutLink = soSubmit(author, "Design sem portfolio", "Faço design sem portfolio público...", "", "DESIGN")
+    var mine = author.get("/services/mine")
+    Check.status(mine, 200)
+    var i = 0
+    var checkedLink = false
+    var checkedNone = false
+    while (i < 5) {
+        var id = mine.jsonStr(i + ".id")
+        if (id == withLink) {
+            Check.jsonEq(mine, i + ".link", "https://creator.itch.io/servico-portfolio")
+            checkedLink = true
+        }
+        if (id == withoutLink) {
+            Check.isTrue("no link stays null", mine.jsonStr(i + ".link") == null)
+            checkedNone = true
+        }
+        i = i + 1
+    }
+    Check.isTrue("both found", checkedLink && checkedNone)
+}
+
+test "the owner edits and an outsider cannot" {
+    var app = soApp()
+    var author = ServicesTestKit.login(app, "svc-author3")
+    var outsider = ServicesTestKit.login(app, "svc-outsider2")
+    var serviceId = soSubmit(author, "Copywriting de vendas", "Escrevo textos de vendas que convertem...", "", "COPYWRITING")
+    Check.status(outsider.patch("/services/" + serviceId, soBody("Texto alheio", "Tentativa de editar texto alheio...", "", "COPYWRITING")), 403)
+    soOffers().approve(serviceId, "reviewer", null)
+    var slugBefore = soSlugOf(author, serviceId)
+    Check.status(author.patch("/services/" + serviceId, soBody("Copywriting que converte", "Escrevo textos de vendas que convertem...", "", "COPYWRITING")), 200)
+    Check.isTrue("the title changed", author.get("/services/mine").body.contains("Copywriting que converte"))
+    Check.eqStr("the slug stays", slugBefore, soSlugOf(author, serviceId))
+    var outsider2 = ServicesTestKit.login(app, "svc-outsider3")
+    Check.status(outsider2.delete("/services/" + serviceId), 403)
+    Check.status(author.delete("/services/" + serviceId), 200)
+}
+
+test "reject requires a reason and resubmit returns to moderation" {
+    var app = soApp()
+    var author = ServicesTestKit.login(app, "svc-author4")
+    var serviceId = soSubmit(author, "SEO para pequenas", "Faço SEO para pequenas empresas...", "", "SEO")
+    var failed = false
+    try {
+        soOffers().reject(serviceId, "reviewer", null)
+    } catch (String e) {
+        failed = Errors.hasCode(e, "REASON_REQUIRED")
+    }
+    Check.isTrue("a rejection without a reason is refused", failed)
+    var rejected = soOffers().reject(serviceId, "reviewer", "descreva o público alvo")
+    Check.eqStr("rejected", "REJECTED", rejected.status())
+    Check.eqStr("the review note", "descreva o público alvo", ServicesTestKit.str(author.get("/services/mine"), "0.reviewNote"))
+    var again = author.post("/services/" + serviceId + "/resubmit", "")
+    Check.status(again, 200)
+    Check.jsonEq(again, "status", "SUBMITTED")
+}
+
+test "a suspended service leaves the catalog" {
+    var app = soApp()
+    var author = ServicesTestKit.login(app, "svc-author5")
+    var guest = ServicesTestKit.anonymous(app)
+    var serviceId = soSubmit(author, "Marketing de conteudo", "Crio marketing de conteúdo...", "", "MARKETING")
+    soOffers().approve(serviceId, "reviewer", null)
+    Check.isTrue("in the catalog", guest.get("/services?q=Marketing%20de%20conteudo").body.contains(serviceId))
+    soOffers().suspend(serviceId, "reviewer", "descreva preço")
+    Check.isTrue("out of the catalog", !guest.get("/services?q=Marketing%20de%20conteudo").body.contains(serviceId))
+    Check.eqStr("the record stays in /mine", "SUSPENDED", soStatusIn(author, "/services/mine", serviceId))
+    ServicesTestKit.finish()
+}
