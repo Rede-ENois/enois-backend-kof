@@ -38,8 +38,8 @@ or needs several owners. Tests that prove the wiring boot `AppWiring.installAll`
 | `FeedGraph` | feed | network | SWITCHED `NetworkFeedGraph` |
 | `FeedBlogs` | feed | blog | SWITCHED `BlogFeedBlogs` (blog store) |
 | `FeedReaderPrefs` | feed | preferences | SWITCHED `PreferencesFeedReader` |
-| `FeedHoneypot` | feed | moderation | KEPT: moderation owns it (port/moderation) |
-| `FeedModeration` GROUP_POST / GROUP_COMMENT removal | feed | groups | KEPT: part of the moderation actions, left to port/moderation |
+| `FeedHoneypot` | feed | moderation | SWITCHED `ModerationHoneypot` (built before the feed, bound to the sanction service when moderation is installed; the hidden field bans through `banAuthor`) |
+| `FeedModeration` GROUP_POST / GROUP_COMMENT removal | feed | groups | N/A: the Java `ReportedContentRemover` only removes POST and COMMENT; group reports are read (`GroupReportReader`) and decided without removal |
 | `GamesFeed` | games | feed | SWITCHED `FeedGamesFeed` (a share is `FeedService.publish`: gates, limiters, mentions, counters, `PostPublished`) |
 | `GamesCoins` | games, dailygames | coin | SWITCHED `CoinGamesCoins` (reward, purchase, scaled reward, rate, presence streak) |
 | `BlogFeedPointers` | blog | feed | SWITCHED `FeedBlogPointers` (BLOG pointer post with tag `blog`; delete is the feed soft delete) |
@@ -53,10 +53,10 @@ or needs several owners. Tests that prove the wiring boot `AppWiring.installAll`
 | `GroupAgeGate` | groups | age | SWITCHED `AgeGroupGate` |
 | `GroupMediaLookup` | groups | media | SWITCHED `MediaGroupLookup` |
 | `GroupCoins` | groups | coin | WIRED `CoinGroupCoins` |
-| `GroupReportReader` | groups | moderation | KEPT: moderation |
+| `GroupReportReader` | groups | moderation | WIRED: moderation reads GROUP_POST / GROUP_COMMENT reports through `GroupsModule.reports` (`ModerationTargets`) |
 | `ProjectsProfiles` | projects | profile | SWITCHED `ProfileProjectsLookup` |
 | `CommunityProjectProfiles` | communityprojects | profile | SWITCHED `ProfileCommunityProjectLookup` |
-| `CommunityProjectModerators` | communityprojects | moderation | KEPT: moderation |
+| `CommunityProjectModerators` | communityprojects | moderation | SWITCHED `ModerationProjectModerators` (`src/app/ModerationBridges.kf`, approved application through `ModerationModeratorStore`) |
 | `StudyPairProfiles` | studypairs | profile | SWITCHED `ProfileStudyPairLookup` |
 | `StudyPairAgePolicy` | studypairs | age | SWITCHED `AgeStudyPairPolicy` |
 | `StudyPairPreferences` | studypairs | preferences | SWITCHED `PreferencesStudyPairs` |
@@ -70,12 +70,12 @@ or needs several owners. Tests that prove the wiring boot `AppWiring.installAll`
 | `PreferencesThemeGallery` | preferences | themes | SWITCHED `ThemesPreferencesGallery` (`ThemeModule.withService`) |
 | `ProfileBadgeOwnership` | profile | cosmetics | WIRED `cosmeticsCore.badges` |
 | `ProfileForeignCounts`: events, mentoring | profile | events, mentoring | WIRED `OrgsForeignCounts` |
-| `ProfileForeignCounts`: confirmedReportFacts | profile | moderation | KEPT: moderation |
+| `ProfileForeignCounts`: confirmedReportFacts | profile | moderation | SWITCHED `ModerationForeignCounts` (`ModerationStore.confirmedFactsAbout`); a sanction also clears `publicRanking` and `publicProfiles` through `ModerationProfileCaches` |
 | `ProfileForeignCounts`: socialPosts, uniqueEngagers, deniedNotes, approvedNotes, communitiesJoined, jobAbandons | profile | feed, communities, jobs | OPEN: the Java profile adapter ran these as native queries too (no owner API with the same shape); only worth switching with owner methods |
 | `OnboardingActions` | onboarding | preferences, profile, communities, groups, network | SWITCHED `AppOnboardingActions` (`src/app/OnboardingBridges.kf`; joins, connection requests, liked topics and skills now run the owners' rules, counters, notices and presence) |
 | `OnboardingStore` reads (starter pack) | onboarding | communities, groups, network, preferences | OPEN: read-only candidate queries, no owner API for them |
 | `IdentityUsers` | identity | profile | KEPT: the profile domain has no account creation API; the writes (signup, anonymise, verify, 2FA flags) are the repository saves identity does in Java |
-| `IdentityIpBlocks`, `IdentitySignupGuard` | identity | moderation | KEPT: moderation |
+| `IdentityIpBlocks`, `IdentitySignupGuard` | identity | moderation | WIRED: the defaults already are the moderation rules (`blocked_ips` lookup with the Java 5 s cache; the per-pod signup strike guard of `SuspiciousSignupGuard`); moderation writes the table through `ModerationIpBlocks`, proved in `ModerationSeamsTest` |
 | `IdentityOAuthLinks` | identity | contributions | WIRED `ContributionsOAuthLinks` |
 | `IdentityReputation` | identity | jobs/profile | WIRED `JobsIdentityReputation` |
 | `AgeStore` birth date read | age | profile | KEPT: age owns the policy; Java `AgePolicyAdapter` reads the same column |
@@ -84,14 +84,18 @@ or needs several owners. Tests that prove the wiring boot `AppWiring.installAll`
 | `CosmeticsContributors` | cosmetics | contributions | WIRED `ContributionsCosmeticsContributors` |
 | `SupportService` GitHub identity | support | contributions | WIRED `SupportLinkedPeople` |
 | `SuggestionsGithubToken` | suggestions | support | WIRED `SuggestionsSupportToken` |
-| `CoinDisputeModeration` | coin | moderation | KEPT: moderation |
+| `CoinDisputeModeration` | coin | moderation | SWITCHED `ModerationCoinDispute` (report, `applyForReport` and `restrictUser` are the moderation services; bound after the moderation install) |
+| `SecurityModerators`, `SecurityAutoReports`, `RiskEscalation` | kernel security and risk | moderation | SWITCHED `ModerationEarly` (hooks set before `Security.install`; `SharedServices.createWith` takes the escalation; all three bound to `ModerationService` at the end) |
+| `ModerationCompanies` | moderation | companies | SWITCHED `ModerationCompaniesBridge` (`CompanyService.contentOf` / `ownerOf` / `closeByModeration`, which also tells the owner) |
+| `/moderation/games`, `/moderation/services` | moderation | games, services | SWITCHED `ModerationReviewRoutes` (the owners' use cases behind the team guard and the own-submission rule) |
+| `MediaImageReviewer`, `ModerationImages` | media, moderation | moderation (MediaSafetyAnalyzer) | OPEN: needs the MediaSafety analyzer (area 6, not ported) |
 | `GifCommunityReader` | gifs | feed | KEPT: dead in Java (`CommunityGifProvider` is never registered as a bean), nothing reads it |
 | `MediaPdfCleaner` | media | pdf library | OPEN: PDFBox needs the `loadPDF(byte[])` workaround of G281 and the save path of G164; not attempted in this round |
 | `CallClock`, `PushSender`, `DigestMailer` | calls, push, notifications | none | KEPT: test seams or infrastructure, no owner |
 
 ## Tests proving the wiring
 
-`tests/integration/NotificationSeamsTest.kf`, `FeedSeamsTest.kf`, `CommunitySeamsTest.kf` boot the production wiring:
+`tests/integration/NotificationSeamsTest.kf`, `FeedSeamsTest.kf`, `CommunitySeamsTest.kf`, `ModerationSeamsTest.kf` boot the production wiring:
 connection request and mention go through the Notifications API (a listener on the API sees the event), a game share is
 a feed post with `PostPublished`, a blog post is a BLOG pointer post and raises NEW_BLOG_POST, the community and channel
 feeds are the real feed (channel rules ported from `CommunityChannelTests.channelRulesAreEnforcedByTheBackend`, pin),
@@ -102,5 +106,5 @@ and onboarding joins a community, asks for a connection and saves a skill throug
 - OPEN rows above.
 - Feed and coins tests still waiting for a wired suite (PORTING_STATUS): the coin-ledger reaction test, the identity
   presentation tests (profile cosmetics frame and name style on a post) and the Mockito media-embedding test.
-- When moderation lands, switch `FeedHoneypot`, `IdentityIpBlocks`/`IdentitySignupGuard`, `CommunityProjectModerators`,
-  `CoinDisputeModeration`, `GroupReportReader` and `ProfileForeignCounts.confirmedReportFacts`.
+- Moderation seams are switched except `MediaImageReviewer` and the reported-image reader (they need the MediaSafety
+  analyzer, see PORTING_STATUS "moderation").
