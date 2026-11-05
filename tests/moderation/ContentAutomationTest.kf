@@ -1,0 +1,178 @@
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import moderation.*
+
+// Port of ContentAutomationServiceTests (the rule asked for: nothing bans on its own; a suspicious post goes to QUARANTINE, is
+// marked and enters the human review queue, and no path here applies a sanction) over real posts and ledger rows, plus the sweep
+// and the outbox hook that start it. The model is the scripted transport (no network).
+String suspicious() = "Claro! Aqui está o texto que você pediu. Espero ter ajudado."
+
+String evaluate(postId: String) = ModerationTestKit.module().barriers.content.evaluate(postId).status
+
+String ledgerRow(postId: String) {
+    var row = ModerationTestKit.db().queryOptional("select verdict, confidence, review_status, model from content_automation_checks where post_id = ?", DbParams().bindStr(postId))
+    if (row == null) {
+        return "none"
+    }
+    return row.getStr("verdict") + "|" + row.getDouble("confidence") + "|" + row.getStr("review_status") + "|" + row.getStr("model")
+}
+
+test "automated with confidence goes to quarantine and to review without punishing" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ca_bot1")
+    var admin = ModerationTestKit.loginAdmin("ca_admin")
+    var postId = ModerationTestKit.publish(author, suspicious())
+    ModerationAutomationKit.says(ModerationAutomationKit.contentVerdict("AUTOMATED", "0.93"))
+    var outcome = ModerationTestKit.module().barriers.content.evaluate(postId)
+    Check.eqStr("status", "QUARANTINED", outcome.status)
+    Check.isTrue("quarantined", outcome.quarantined)
+    Check.eqStr("the post left the air", "QUARANTINED", ModerationAutomationKit.postStatus(postId))
+    Check.status(ModerationTestKit.get("", "/feed/posts/" + postId), 404)
+    Check.eqStr("ledger, pending review, the model of the config", "AUTOMATED|0.93|PENDING|qwen3.8-27b", ledgerRow(postId))
+    Check.eqInt("the author is told", 1, ModerationAutomationKit.notices(author) as Int)
+    Check.eqStr("by the automation", "automod:conteudo", ModerationTestKit.db().queryOne("select actor_id from notifications where user_id = ?", DbParams().bindStr(author)).getStr("actor_id"))
+    Check.isTrue("no sanction", !ModerationAutomationKit.banned(author))
+    var queue = ModerationTestKit.get(admin, "/moderation/quarantine")
+    Check.status(queue, 200)
+    Check.isTrue("the human queue has the case", queue.jsonStr("0.postId") == postId)
+    Check.eqStr("with the verdict", "AUTOMATED", ModerationTestKit.str(queue, "0.verdict"))
+}
+
+test "the author is told it is temporary and nothing else" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ca_bot2")
+    var postId = ModerationTestKit.publish(author, suspicious())
+    ModerationAutomationKit.says(ModerationAutomationKit.contentVerdict("AUTOMATED", "0.95"))
+    evaluate(postId)
+    var body = ModerationTestKit.db().queryOne("select body from notifications where user_id = ?", DbParams().bindStr(author)).getStr("body")
+    Check.isTrue("it talks about review", body.contains("revis"))
+    Check.isTrue("never about a ban", !body.toLowerCase().contains("banid"))
+}
+
+test "a human verdict is only recorded" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ca_human")
+    var postId = ModerationTestKit.publish(author, suspicious())
+    ModerationAutomationKit.says(ModerationAutomationKit.contentVerdict("HUMAN", "0.95"))
+    Check.eqStr("status", "RECORDED", evaluate(postId))
+    Check.eqStr("still on the air", "ACTIVE", ModerationAutomationKit.postStatus(postId))
+    Check.eqStr("ledger", "HUMAN|0.95|NONE|qwen3.8-27b", ledgerRow(postId))
+    Check.eqInt("nobody is told", 0, ModerationAutomationKit.notices(author) as Int)
+}
+
+test "suspicion below the confidence floor does not hide anything" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ca_low")
+    var postId = ModerationTestKit.publish(author, suspicious())
+    ModerationAutomationKit.says(ModerationAutomationKit.contentVerdict("AUTOMATED", "0.61"))
+    Check.eqStr("status", "RECORDED", evaluate(postId))
+    Check.eqStr("still on the air", "ACTIVE", ModerationAutomationKit.postStatus(postId))
+    Check.eqStr("ledger", "AUTOMATED|0.61|NONE|qwen3.8-27b", ledgerRow(postId))
+    Check.eqInt("nobody is told", 0, ModerationAutomationKit.notices(author) as Int)
+}
+
+test "text without any machine trace never reaches the model" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ca_clean")
+    var postId = ModerationTestKit.publish(author, "acordei tarde, perdi o onibus e cheguei atrasado de novo")
+    var before = ModerationAutomationKit.model().calls()
+    Check.eqStr("status", "CLEAN_DETERMINISTIC", evaluate(postId))
+    Check.eqInt("no model call", before, ModerationAutomationKit.model().calls())
+    Check.eqStr("recorded as human at no cost", "HUMAN|0.0|NONE|qwen3.8-27b", ledgerRow(postId))
+}
+
+test "without a verdict nothing happens" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ca_noverdict")
+    var postId = ModerationTestKit.publish(author, suspicious())
+    ModerationAutomationKit.model().down = true
+    Check.eqStr("status", "NO_VERDICT", evaluate(postId))
+    Check.eqStr("still on the air", "ACTIVE", ModerationAutomationKit.postStatus(postId))
+    Check.eqStr("recorded as unsure so it is not retried every round", "UNSURE|0.0|NONE|qwen3.8-27b", ledgerRow(postId))
+    ModerationAutomationKit.model().down = false
+}
+
+test "an already checked post is not sent to the model again" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ca_twice")
+    var postId = ModerationTestKit.publish(author, suspicious())
+    ModerationAutomationKit.says(ModerationAutomationKit.contentVerdict("AUTOMATED", "0.9"))
+    Check.eqStr("first", "QUARANTINED", evaluate(postId))
+    var calls = ModerationAutomationKit.model().calls()
+    var again = ModerationTestKit.module().barriers.content.evaluate(postId)
+    Check.eqStr("status", "ALREADY_CHECKED", again.status)
+    Check.isTrue("still quarantined", again.quarantined)
+    Check.eqInt("no new call", calls, ModerationAutomationKit.model().calls())
+}
+
+test "a post that is not active is skipped" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ca_gone")
+    var postId = ModerationTestKit.publish(author, suspicious())
+    ModerationTestKit.db().execute("update posts set status = \'DELETED\' where id = ?", DbParams().bindStr(postId))
+    var calls = ModerationAutomationKit.model().calls()
+    Check.eqStr("status", "SKIP", evaluate(postId))
+    Check.eqInt("no call", calls, ModerationAutomationKit.model().calls())
+    Check.eqStr("an unknown post too", "SKIP", evaluate("post_missing_ca"))
+}
+
+test "staff is out of the barrier" {
+    ModerationAutomationKit.setup()
+    var staff = ModerationTestKit.loginAdmin("ca_staff")
+    var postId = ModerationTestKit.publish(staff, suspicious())
+    var calls = ModerationAutomationKit.model().calls()
+    Check.eqStr("admin", "STAFF_SKIPPED", evaluate(postId))
+    Check.eqInt("no call", calls, ModerationAutomationKit.model().calls())
+    var moderator = ModerationTestKit.login("ca_mod")
+    ModerationTestKit.db().execute("insert into moderator_applications (id, user_id, motivation, status, created_at) values (\'app_ca_mod\', ?, \'quero ajudar\', \'APPROVED\', ?)", DbParams().bindStr(moderator).bindInstant(Time.nowIso()))
+    var modPost = ModerationTestKit.publish(moderator, suspicious())
+    Check.eqStr("moderator", "STAFF_SKIPPED", evaluate(modPost))
+}
+
+test "the sweep helper does not offer posts that left the air" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ca_helper")
+    var postId = ModerationTestKit.publish(author, suspicious())
+    var content = ModerationTestKit.module().barriers.content
+    Check.isTrue("active post", content.isActive(postId))
+    ModerationAutomationKit.says(ModerationAutomationKit.contentVerdict("AUTOMATED", "0.9"))
+    evaluate(postId)
+    Check.isTrue("quarantined post", !content.isActive(postId))
+}
+
+test "the sweep evaluates what the hook missed once and never again" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ca_sweep")
+    var postId = ModerationAutomationKit.postAt("post_ca_sweep_1", author, suspicious(), Time.nowIso())
+    ModerationAutomationKit.says(ModerationAutomationKit.contentVerdict("AUTOMATED", "0.9"))
+    var sweeps = ModerationTestKit.module().barriers.sweeps
+    Check.eqInt("one quarantined", 1, sweeps.contentSweep())
+    Check.eqStr("quarantined", "QUARANTINED", ModerationAutomationKit.postStatus(postId))
+    var calls = ModerationAutomationKit.model().calls()
+    Check.eqInt("nothing left", 0, sweeps.contentSweep())
+    Check.eqInt("the ledger keeps the model from a second reading", calls, ModerationAutomationKit.model().calls())
+}
+
+test "a disabled switch evaluates nothing" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ca_off")
+    var postId = ModerationTestKit.publish(author, suspicious())
+    var content = ModerationTestKit.module().barriers.content
+    content.enabled = false
+    Check.eqStr("status", "DISABLED", evaluate(postId))
+    Check.eqInt("the sweep too", 0, ModerationTestKit.module().barriers.sweeps.contentSweep())
+    content.enabled = true
+}
+
+test "publishing reaches the barrier through the outbox event" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ca_hook")
+    ModerationAutomationKit.says(ModerationAutomationKit.contentVerdict("AUTOMATED", "0.97"))
+    var postId = ModerationTestKit.publish(author, suspicious())
+    Check.eqStr("on the air until the event is handled", "ACTIVE", ModerationAutomationKit.postStatus(postId))
+    ModerationAutomationKit.drainOutbox()
+    Check.eqStr("hidden after the PostPublished event", "QUARANTINED", ModerationAutomationKit.postStatus(postId))
+    Check.eqStr("ledger", "AUTOMATED|0.97|PENDING|qwen3.8-27b", ledgerRow(postId))
+    ModerationTestKit.finish()
+}

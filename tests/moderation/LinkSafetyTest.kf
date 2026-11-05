@@ -1,0 +1,183 @@
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import moderation.*
+
+// Port of LinkSafetyServiceTest: what the link barrier blocks alone, what it sends to a person and what it leaves in peace. The
+// page reader and the model are scripted (the thing proved is the DECISION of the service); posts, ledger, removals and sanctions
+// are real rows.
+String check(postId: String) = ModerationTestKit.module().barriers.links.check(postId).status
+
+// "actor|reason" of the moderation removal of a post, "" when it was not removed by moderation.
+String removal(postId: String) {
+    var row = ModerationTestKit.db().queryOptional("select actor_id, metadata from audit_logs where action = \'POST_DELETED_BY_MODERATION\' and target_id = ?", DbParams().bindStr(postId))
+    if (row == null) {
+        return ""
+    }
+    return row.getStr("actor_id") + "|" + ModerationTestKit.str2(row.getStrOrNull("metadata"))
+}
+
+Long ledgerRows(url: String) = ModerationTestKit.db().queryLong("select count(*) from link_safety_checks where url = ?", DbParams().bindStr(url))
+
+String ledgerVerdict(url: String) {
+    var row = ModerationTestKit.db().queryOptional("select verdict from link_safety_checks where url = ?", DbParams().bindStr(url))
+    if (row == null) {
+        return "none"
+    }
+    return row.getStr("verdict")
+}
+
+page(url: String, title: String, description: String) {
+    ModerationAutomationKit.pages().pages.put(url, ModerationPages.of(url, title, description))
+}
+
+test "an adult platform host is taken down without visiting it or calling the model" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ls_adult")
+    var postId = ModerationTestKit.publish(author, "olha isso https://www.pornhub.com/view_video.php?id=1")
+    var result = ModerationTestKit.module().barriers.links.check(postId)
+    Check.eqStr("status", "ENFORCED", result.status)
+    Check.eqStr("verdict", "EXPLICIT", result.verdict)
+    Check.eqStr("removed by the automation with the reason", "automod:link|Automod de link: destino de plataforma de conteudo adulto", removal(postId))
+    Check.eqStr("the sanction applied", "ACTIVE", ModerationTestKit.str2(result.sanction))
+    Check.isTrue("banned", ModerationAutomationKit.banned(author))
+    Check.eqStr("permanent ban", "PERMABAN", ModerationAutomationKit.sanctionType(author))
+    Check.eqInt("never visited", 0, ModerationAutomationKit.pages().visited.size())
+    Check.eqInt("no model call", 0, ModerationAutomationKit.model().calls())
+}
+
+test "an innocent link takes nothing down" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ls_inno")
+    var postId = ModerationTestKit.publish(author, "meu repositorio https://github.com/melmonfre/rede")
+    page("https://github.com/melmonfre/rede", "melmonfre/rede", "codigo da rede")
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("SAFE", "LOW", "0.95", "repo"))
+    Check.eqStr("status", "RECORDED", check(postId))
+    Check.eqStr("still on the air", "ACTIVE", ModerationAutomationKit.postStatus(postId))
+    Check.isTrue("no sanction", !ModerationAutomationKit.banned(author))
+    Check.eqStr("ledger", "SAFE", ledgerVerdict("https://github.com/melmonfre/rede"))
+}
+
+test "an adult video on a legitimate site is blocked by its destination" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ls_video")
+    var postId = ModerationTestKit.publish(author, "assiste ai https://youtube.com/watch?v=abc123")
+    page("https://youtube.com/watch?v=abc123", "Video completo - cena adulta explicita", "conteudo adulto")
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("EXPLICIT", "HIGH", "0.92", "video adulto"))
+    var result = ModerationTestKit.module().barriers.links.check(postId)
+    Check.eqStr("status", "ENFORCED", result.status)
+    Check.eqInt("one post removed", 1, result.removedPosts)
+    Check.eqStr("the sanction applied", "ACTIVE", ModerationTestKit.str2(result.sanction))
+    Check.isTrue("the account is banned", ModerationAutomationKit.banned(author))
+    Check.eqStr("permanent ban", "PERMABAN", ModerationAutomationKit.sanctionType(author))
+    Check.eqStr("the destination was read once", "https://youtube.com/watch?v=abc123", String.join(",", ModerationAutomationKit.pages().visited))
+}
+
+test "a suspicious destination restricts without a permanent ban" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ls_scam")
+    var postId = ModerationTestKit.publish(author, "ganhe seguidores https://exemplo.com/seguidores")
+    page("https://exemplo.com/seguidores", "Ganhe 10k seguidores", "promocao")
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("SUSPICIOUS", "MEDIUM", "0.85", "venda de seguidores"))
+    Check.eqStr("status", "ENFORCED", check(postId))
+    Check.eqStr("restriction with appeal", "RESTRICTION", ModerationAutomationKit.sanctionType(author))
+    Check.eqStr("the post left the air", "DELETED", ModerationAutomationKit.postStatus(postId))
+}
+
+test "below the floor it only records for human review" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ls_low")
+    var postId = ModerationTestKit.publish(author, "veja https://youtube.com/watch?v=xyz")
+    page("https://youtube.com/watch?v=xyz", "talvez algo", "talvez")
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("EXPLICIT", "HIGH", "0.45", "nao tenho certeza"))
+    Check.eqStr("status", "RECORDED", check(postId))
+    Check.eqStr("still on the air", "ACTIVE", ModerationAutomationKit.postStatus(postId))
+    Check.eqInt("one ledger row", 1, ledgerRows("https://youtube.com/watch?v=xyz") as Int)
+    Check.isTrue("nobody is punished", !ModerationAutomationKit.banned(author))
+}
+
+test "a destination without a description never becomes an accusation" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ls_empty")
+    var postId = ModerationTestKit.publish(author, "veja https://exemplo.com/fora-do-ar")
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("EXPLICIT", "HIGH", "0.99", "x"))
+    Check.eqStr("status", "NO_VERDICT", check(postId))
+    Check.eqStr("still on the air", "ACTIVE", ModerationAutomationKit.postStatus(postId))
+    Check.eqInt("one ledger row", 1, ledgerRows("https://exemplo.com/fora-do-ar") as Int)
+    Check.eqStr("recorded as unsure", "UNSURE", ledgerVerdict("https://exemplo.com/fora-do-ar"))
+}
+
+test "a destination already judged is not visited again" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ls_judged")
+    var postId = ModerationTestKit.publish(author, "veja https://youtube.com/watch?v=ja-julgado")
+    var url = "https://youtube.com/watch?v=ja-julgado"
+    ModerationTestKit.module().barriers.ledger.saveLink(ModerationSafetyRules.link(url, author, "SAFE", "LOW", 0.9, "ok", "modelo", Time.nowIso()))
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("EXPLICIT", "HIGH", "0.99", "x"))
+    var visits = ModerationAutomationKit.pages().visited.size()
+    Check.eqStr("status", "RECORDED", check(postId))
+    Check.eqStr("still on the air", "ACTIVE", ModerationAutomationKit.postStatus(postId))
+    Check.eqInt("not visited", visits, ModerationAutomationKit.pages().visited.size())
+}
+
+test "an unsure verdict is retried after the rest and a blocked destination takes down a new post at once" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ls_retry")
+    var url = "https://exemplo.com/voltou"
+    var old = Time.plusSeconds(Time.nowIso(), 0L - 48L * 3600L)
+    ModerationTestKit.module().barriers.ledger.saveLink(ModerationSafetyRules.link(url, author, "UNSURE", "LOW", 0.0, "destino sem descricao legivel", "modelo", old))
+    var postId = ModerationTestKit.publish(author, "veja " + url)
+    page(url, "Venda de conteudo adulto", "perfil adulto")
+    ModerationAutomationKit.says(ModerationAutomationKit.safetyVerdict("EXPLICIT", "HIGH", "0.9", "perfil adulto"))
+    Check.eqStr("an old UNSURE is judged again", "ENFORCED", check(postId))
+    var other = ModerationTestKit.login("ls_after")
+    var later = ModerationTestKit.publish(other, "olha " + url)
+    var visits = ModerationAutomationKit.pages().visited.size()
+    Check.eqStr("the blocked destination needs no visit", "ENFORCED", check(later))
+    Check.eqInt("not visited again", visits, ModerationAutomationKit.pages().visited.size())
+}
+
+test "a post without a link spends nothing" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ls_nolink")
+    var postId = ModerationTestKit.publish(author, "post sem endereco nenhum")
+    var rows = ModerationTestKit.db().queryLong("select count(*) from link_safety_checks", DbParams())
+    Check.eqStr("status", "NO_LINKS", check(postId))
+    Check.eqInt("no ledger row", rows as Int, ModerationTestKit.db().queryLong("select count(*) from link_safety_checks", DbParams()) as Int)
+}
+
+test "a disabled switch and an unknown post do nothing" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ls_off")
+    var postId = ModerationTestKit.publish(author, "https://www.pornhub.com/x")
+    var links = ModerationTestKit.module().barriers.links
+    links.enabled = false
+    Check.eqStr("disabled", "DISABLED", check(postId))
+    Check.eqStr("still on the air", "ACTIVE", ModerationAutomationKit.postStatus(postId))
+    Check.eqInt("the sweep too", 0, ModerationTestKit.module().barriers.sweeps.linkSweep())
+    links.enabled = true
+    Check.eqStr("unknown post", "UNKNOWN_POST", check("post_sumiu_ls"))
+}
+
+test "it also takes down the other posts of the author that point to the same destination" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ls_many")
+    var first = ModerationTestKit.publish(author, "veja https://www.pornhub.com/x")
+    var second = ModerationTestKit.publish(author, "de novo https://pornhub.com/x")
+    var unrelated = ModerationTestKit.publish(author, "outra coisa https://github.com/melmonfre/rede")
+    var result = ModerationTestKit.module().barriers.links.check(first)
+    Check.eqInt("the trigger and the one pointing to the same destination", 2, result.removedPosts)
+    Check.eqStr("first", "automod:link|Automod de link: destino de plataforma de conteudo adulto", removal(first))
+    Check.eqStr("second", "automod:link|Automod de link: destino de plataforma de conteudo adulto", removal(second))
+    Check.isTrue("the unrelated one was not removed by this barrier (the ban cleanup took it later)", !removal(unrelated).startsWith("automod:link"))
+}
+
+test "the sweep checks the posts with links of the window" {
+    ModerationAutomationKit.setup()
+    var author = ModerationTestKit.login("ls_sweep")
+    var postId = ModerationAutomationKit.postAt("post_ls_sweep_1", author, "olha https://xvideos.com/video777", Time.nowIso())
+    var sweeps = ModerationTestKit.module().barriers.sweeps
+    Check.isTrue("at least this post was checked", sweeps.linkSweep() >= 1)
+    Check.eqStr("removed", "automod:link|Automod de link: destino de plataforma de conteudo adulto", removal(postId))
+    ModerationTestKit.finish()
+}
