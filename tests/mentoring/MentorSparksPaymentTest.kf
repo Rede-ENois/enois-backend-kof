@@ -1,0 +1,140 @@
+import app.*
+import coin.*
+import kernel.testkit.*
+import mentoring.*
+import profile.*
+
+// Port of MentorSparksPaymentTests: a paid session holds the price in the escrow at booking, completion pays the
+// mentor minus the platform fee and cancellation returns it whole to who paid.
+Long sparks(n: Long) = n * CoinService.scale()
+
+test "a paid booking goes to the escrow and completion pays the mentor minus the fee" {
+    var owner = MentoringTestKit.login("mentor-sparks-owner")
+    var mentee = MentoringTestKit.login("mentor-sparks-mentee")
+    var price = sparks(200L)
+    var mentorId = MentoringTestKit.createPricedMentor(owner, price)
+    var slotId = MentoringTestKit.futureSlot(owner, mentorId)
+    MentoringTestKit.fund("mentor-sparks-mentee", sparks(500L), "test-mentoria-fundo-owner")
+    var menteeBefore = MentoringTestKit.balance("mentor-sparks-mentee")
+    var ownerBefore = MentoringTestKit.balance("mentor-sparks-owner")
+    var sessionId = MentoringTestKit.bookOk(mentee, mentorId, slotId)
+    // At booking the sparks leave the mentee and are held; the mentor sees nothing yet.
+    Check.eqStr("mentee paid", "" + (menteeBefore - price), "" + MentoringTestKit.balance("mentor-sparks-mentee"))
+    Check.eqStr("mentor waits", "" + ownerBefore, "" + MentoringTestKit.balance("mentor-sparks-owner"))
+    var inbox = owner.get("/mentors/" + mentorId + "/sessions")
+    Check.status(inbox, 200)
+    Check.eqStr("inbox price", "" + price, MentoringTestKit.fieldOf(inbox, "", sessionId, "priceSparks"))
+    var mine = mentee.get("/mentors/sessions/mine")
+    Check.status(mine, 200)
+    Check.jsonEq(mine, "0.mentorUsername", "mentor-sparks-owner")
+    Check.jsonEq(mine, "0.priceSparks", "" + price)
+    var done = MentoringTestKit.complete(owner, mentorId, sessionId)
+    Check.status(done, 200)
+    Check.jsonEq(done, "status", "COMPLETED")
+    // The mentor gets the price minus the 10% of the platform.
+    var net = price - price / 10L
+    Check.eqStr("mentor paid", "" + (ownerBefore + net), "" + MentoringTestKit.balance("mentor-sparks-owner"))
+    Check.eqStr("mentee stays charged", "" + (menteeBefore - price), "" + MentoringTestKit.balance("mentor-sparks-mentee"))
+    // Confirming again does not pay twice.
+    Check.apiError(MentoringTestKit.complete(owner, mentorId, sessionId), 409, "SESSION_NOT_SCHEDULED")
+    Check.eqStr("not paid twice", "" + (ownerBefore + net), "" + MentoringTestKit.balance("mentor-sparks-owner"))
+}
+
+test "booking without sparks fails and leaves the slot free" {
+    var owner = MentoringTestKit.login("mentor-no-funds-owner")
+    var mentee = MentoringTestKit.login("mentor-no-funds-mentee")
+    var mentorId = MentoringTestKit.createPricedMentor(owner, sparks(200L))
+    var slotId = MentoringTestKit.createSlot(owner, mentorId, MentoringTestKit.after(90000L))
+    // The airdrop covers 100 sparks: a 200 session does not fit the balance of who never got more.
+    Check.apiError(MentoringTestKit.book(mentee, mentorId, slotId, "oi"), 400, "INSUFFICIENT_SPARKS")
+    // No orphan session and the slot stays free for someone else.
+    var slots = OrgsTestKit.anonymous().get("/mentors/" + mentorId + "/slots")
+    Check.status(slots, 200)
+    Check.eqStr("slot is free", "true", MentoringTestKit.fieldOf(slots, "items", slotId, "available"))
+    var mine = mentee.get("/mentors/sessions/mine")
+    Check.status(mine, 200)
+    Check.eqInt("no session", 0, mine.jsonSize(""))
+}
+
+test "cancelling before the session refunds and frees the slot" {
+    var owner = MentoringTestKit.login("mentor-cancel-owner")
+    var mentee = MentoringTestKit.login("mentor-cancel-mentee")
+    var mentorId = MentoringTestKit.createPricedMentor(owner, sparks(80L))
+    var slotId = MentoringTestKit.futureSlot(owner, mentorId)
+    MentoringTestKit.fund("mentor-cancel-mentee", sparks(200L), "test-mentoria-fundo-cancel")
+    var menteeBefore = MentoringTestKit.balance("mentor-cancel-mentee")
+    var sessionId = MentoringTestKit.bookOk(mentee, mentorId, slotId)
+    Check.eqStr("held", "" + (menteeBefore - sparks(80L)), "" + MentoringTestKit.balance("mentor-cancel-mentee"))
+    var cancelled = MentoringTestKit.cancel(mentee, mentorId, sessionId)
+    Check.status(cancelled, 200)
+    Check.jsonEq(cancelled, "status", "CANCELLED")
+    // FULL refund: the cancellation charges nobody.
+    Check.eqStr("refunded", "" + menteeBefore, "" + MentoringTestKit.balance("mentor-cancel-mentee"))
+    var slots = OrgsTestKit.anonymous().get("/mentors/" + mentorId + "/slots")
+    Check.eqStr("slot is free again", "true", MentoringTestKit.fieldOf(slots, "items", slotId, "available"))
+    // A closed session pays nobody anymore.
+    Check.status(MentoringTestKit.complete(owner, mentorId, sessionId), 409)
+    Check.status(MentoringTestKit.cancel(mentee, mentorId, sessionId), 409)
+}
+
+test "only participants act and the mentee cannot cancel after the start" {
+    var owner = MentoringTestKit.login("mentor-rules-owner")
+    var mentee = MentoringTestKit.login("mentor-rules-mentee")
+    var stranger = MentoringTestKit.login("mentor-rules-stranger")
+    var mentorId = MentoringTestKit.createPricedMentor(owner, sparks(60L))
+    // A slot that already started: who decides the cancellation is who attends.
+    var slotId = MentoringTestKit.createSlot(owner, mentorId, MentoringTestKit.after(-7200L))
+    MentoringTestKit.fund("mentor-rules-mentee", sparks(200L), "test-mentoria-fundo-rules")
+    var sessionId = MentoringTestKit.bookOk(mentee, mentorId, slotId)
+    Check.status(MentoringTestKit.complete(stranger, mentorId, sessionId), 403)
+    Check.status(MentoringTestKit.complete(mentee, mentorId, sessionId), 403)
+    Check.status(MentoringTestKit.cancel(stranger, mentorId, sessionId), 403)
+    Check.apiError(MentoringTestKit.cancel(mentee, mentorId, sessionId), 409, "SESSION_ALREADY_STARTED")
+    // The mentor cancels and returns the value: they decide after the time.
+    var menteeBefore = MentoringTestKit.balance("mentor-rules-mentee")
+    Check.status(MentoringTestKit.cancel(owner, mentorId, sessionId), 200)
+    Check.eqStr("returned", "" + (menteeBefore + sparks(60L)), "" + MentoringTestKit.balance("mentor-rules-mentee"))
+    // A past slot does not come back to the agenda.
+    var slots = OrgsTestKit.anonymous().get("/mentors/" + mentorId + "/slots")
+    Check.eqStr("past slot stays booked", "false", MentoringTestKit.fieldOf(slots, "items", slotId, "available"))
+    Check.apiError(MentoringTestKit.complete(owner, mentorId, "mentor_session_nope"), 404, "SESSION_NOT_FOUND")
+}
+
+test "the sparks price respects floor and ceiling and can be removed" {
+    var owner = MentoringTestKit.login("mentor-price-owner")
+    Check.apiError(MentoringTestKit.postMentor(owner, "" + sparks(10L)), 400, "SPARKS_PRICE_TOO_LOW")
+    Check.apiError(MentoringTestKit.postMentor(owner, "" + sparks(20000L)), 400, "SPARKS_PRICE_TOO_HIGH")
+    var low = MentoringTestKit.postMentor(owner, "" + sparks(10L))
+    Check.jsonEq(low, "message", "O preço mínimo de uma sessão é 50 faíscas.")
+    Check.jsonEq(MentoringTestKit.postMentor(owner, "" + sparks(20000L)), "message", "O preço máximo de uma sessão é 10000 faíscas.")
+    var created = MentoringTestKit.postMentor(owner, "" + sparks(150L))
+    Check.status(created, 201)
+    Check.jsonEq(created, "sparksPrice", "" + sparks(150L))
+    var mentorId = OrgsTestKit.str(created, "id")
+    // Going back is allowed: without a price the mentoring is free again.
+    var cleared = owner.patch("/mentors/" + mentorId, "{\"expertise\":[\"Java\"],\"price\":\"Gratuito\"}")
+    Check.status(cleared, 200)
+    Check.isTrue("no sparksPrice", cleared.jsonIsNull("sparksPrice"))
+}
+
+test "the worker releases the escrow after the grace window" {
+    var owner = MentoringTestKit.login("mentor-settle-owner")
+    var mentee = MentoringTestKit.login("mentor-settle-mentee")
+    var mentorId = MentoringTestKit.createPricedMentor(owner, sparks(100L))
+    // A session of eight days ago: past the contest window the money cannot stay stuck.
+    var slotId = MentoringTestKit.createSlot(owner, mentorId, MentoringTestKit.after(-8L * 86400L))
+    MentoringTestKit.fund("mentor-settle-mentee", sparks(200L), "test-mentoria-fundo-settle")
+    var ownerBefore = MentoringTestKit.balance("mentor-settle-owner")
+    var menteeBefore = MentoringTestKit.balance("mentor-settle-mentee")
+    MentoringTestKit.bookOk(mentee, mentorId, slotId)
+    MentoringTestKit.service().settleExpiredSessions()
+    Check.eqStr("owner paid", "" + (ownerBefore + sparks(90L)), "" + MentoringTestKit.balance("mentor-settle-owner"))
+    Check.eqStr("mentee charged", "" + (menteeBefore - sparks(100L)), "" + MentoringTestKit.balance("mentor-settle-mentee"))
+    var inbox = owner.get("/mentors/" + mentorId + "/sessions")
+    Check.status(inbox, 200)
+    Check.jsonEq(inbox, "0.status", "COMPLETED")
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}
