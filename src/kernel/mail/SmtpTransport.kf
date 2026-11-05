@@ -1,0 +1,90 @@
+package kernel.mail
+
+import java.util.Properties
+import jakarta.mail.Multipart
+import jakarta.mail.Session
+import jakarta.mail.Transport
+import jakarta.mail.internet.InternetAddress
+import jakarta.mail.internet.MimeBodyPart
+import jakarta.mail.internet.MimeMessage
+import jakarta.mail.internet.MimeMultipart
+import kernel.config.*
+
+// The only file that touches jakarta.mail / angus-mail (the family spring-boot-starter-mail pulls in the Java
+// service). Settings are the Java `spring.mail.*` ones: MAIL_HOST (localhost), MAIL_PORT (587), MAIL_USERNAME,
+// MAIL_PASSWORD, STARTTLS enabled and required, auth on, 5 s connect/read/write timeouts. A failure is thrown
+// as a String with the cause, never with the password.
+class SmtpTransport extends MailTransport {
+    String host
+    Int port
+    String username
+    String password
+    Properties props = new Properties()
+    public constructor(cfg: Config) {
+        this.host = cfg.getStr("MAIL_HOST", "localhost")
+        this.port = cfg.getInt("MAIL_PORT", 587)
+        this.username = cfg.getStr("MAIL_USERNAME", "suporte@enois.ia.br")
+        this.password = cfg.getStr("MAIL_PASSWORD", "")
+        var timeout = cfg.getStr("MAIL_SMTP_TIMEOUT_MS", "5000")
+        props.setProperty("mail.smtp.auth", "true")
+        props.setProperty("mail.smtp.starttls.enable", cfg.getStr("MAIL_SMTP_STARTTLS_ENABLE", "true"))
+        props.setProperty("mail.smtp.starttls.required", cfg.getStr("MAIL_SMTP_STARTTLS_REQUIRED", "true"))
+        props.setProperty("mail.smtp.connectiontimeout", timeout)
+        props.setProperty("mail.smtp.timeout", timeout)
+        props.setProperty("mail.smtp.writetimeout", timeout)
+    }
+    send(message: MailMessage) {
+        var failure = ""
+        try {
+            var session = Session.getInstance(props)
+            var mime = new MimeMessage(session)
+            this.fill(mime, message)
+            var transport = session.getTransport("smtp")
+            try {
+                transport.connect(host, port, username, password)
+                var recipients = new InternetAddress[1]
+                recipients[0] = new InternetAddress(message.to)
+                transport.sendMessage(mime, recipients)
+            } catch (Exception inner) {
+                failure = inner.getMessage()
+            }
+            transport.close()
+        } catch (Exception e) {
+            failure = e.getMessage()
+        }
+        if (failure.length() > 0) {
+            throw failure
+        }
+    }
+    fill(mime: MimeMessage, message: MailMessage) {
+        if (message.fromName.length() > 0) {
+            mime.setFrom(new InternetAddress(message.from, message.fromName, "UTF-8"))
+        }
+        else {
+            mime.setFrom(new InternetAddress(message.from))
+        }
+        // Kof cannot name the nested Message.RecipientType (KOF_GAPS G310): the To header is set raw and the
+        // envelope recipient is passed to sendMessage.
+        mime.setHeader("To", new InternetAddress(message.to).toString())
+        if (message.replyTo.length() > 0) {
+            var reply = new InternetAddress[1]
+            reply[0] = new InternetAddress(message.replyTo)
+            mime.setReplyTo(reply)
+        }
+        if (message.listUnsubscribe.length() > 0) {
+            mime.setHeader("List-Unsubscribe", "<" + message.listUnsubscribe + ">")
+            // RFC 8058 one-click: the client POSTs to the same URL.
+            mime.setHeader("List-Unsubscribe-Post", "List-Unsubscribe=One-Click")
+        }
+        mime.setSubject(message.subject, "UTF-8")
+        var body = new MimeMultipart("alternative")
+        var plain = new MimeBodyPart()
+        plain.setText(message.text, "UTF-8", "plain")
+        body.addBodyPart(plain)
+        var html = new MimeBodyPart()
+        html.setText(message.html, "UTF-8", "html")
+        body.addBodyPart(html)
+        mime.setContent(body)
+        mime.saveChanges()
+    }
+}

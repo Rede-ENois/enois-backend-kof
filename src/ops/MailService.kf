@@ -1,0 +1,51 @@
+package ops
+
+import kernel.config.*
+import kernel.log.*
+import kernel.mail.*
+import kernel.text.*
+
+// The one mail service every sender uses (EmailService.sendHtml of the Java service): builds the message,
+// hands it to the transport and records the metadata in `email_log` (SENT, or FAILED with the cause, cut at
+// 500 characters). It never throws: a failed send answers false, a failed log write is swallowed by the store.
+// From is MAIL_USERNAME (default suporte@enois.ia.br), like `spring.mail.username`.
+class MailService {
+    Log log = Log("ops.mail")
+    MailTransport transport
+    EmailLogStore emailLog
+    String fromEmail
+    public constructor(cfg: Config, transport: MailTransport, emailLog: EmailLogStore) {
+        this.transport = transport
+        this.emailLog = emailLog
+        this.fromEmail = cfg.getStr("MAIL_USERNAME", "suporte@enois.ia.br")
+    }
+    // Production: SMTP from MAIL_HOST / MAIL_PORT / MAIL_USERNAME / MAIL_PASSWORD.
+    static MailService fromConfig(cfg: Config, emailLog: EmailLogStore) = MailService(cfg, SmtpTransport(cfg), emailLog)
+    // The simple overload: sender and headers by default.
+    Bool sendHtml(toEmail: String, subject: String, html: String, kind: String) = this.sendBulk(toEmail, subject, html, "", "", "", kind)
+    // Named sender, optional Reply-To and RFC 2369 / RFC 8058 List-Unsubscribe (an empty string means absent).
+    Bool sendBulk(toEmail: String, subject: String, html: String, fromName: String, replyTo: String, listUnsubscribeUrl: String, kind: String) {
+        var failure = ""
+        try {
+            transport.send(MailMessage(fromEmail, fromName, toEmail, replyTo, subject, html, MailText.fromHtml(html), listUnsubscribeUrl))
+        } catch (String e) {
+            failure = e
+            if (failure.length() == 0) {
+                failure = "delivery failed"
+            }
+        }
+        var sent = failure.length() == 0
+        if (sent) {
+            log.info("email_sent kind=" + kind)
+        }
+        else {
+            log.warn("email_delivery_failed kind=" + kind)
+        }
+        var cause = Nulls.str()
+        if (!sent) {
+            cause = failure
+        }
+        emailLog.append(toEmail, subject, kind, sent, cause)
+        return sent
+    }
+}
