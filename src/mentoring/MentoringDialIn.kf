@@ -1,0 +1,118 @@
+package mentoring
+
+import kernel.http.*
+
+// The part of the public Jitsi API the mentoring room uses: dial-in numbers and the PIN of the conference
+// (JitsiDialInGateway). The base class answers nothing (the room still works in the browser); JitsiDialInClient
+// asks api.jitsi.net. A failure never propagates: dial-in is an extra.
+class MentoringDialInGateway {
+    List<String> phoneNumbers(conference: String) = listOf<String>()
+    String? conferencePin(conference: String) = null
+}
+
+class JitsiDialInClient extends MentoringDialInGateway {
+    String apiBase
+    public constructor(rawBase: String) {
+        var trimmed = rawBase.trim()
+        while (trimmed.endsWith("/")) {
+            trimmed = trimmed.substring(0, trimmed.length() - 1)
+        }
+        this.apiBase = trimmed
+    }
+    static String defaultApiBase() = "https://api.jitsi.net"
+    List<String> phoneNumbers(conference: String) {
+        var text = this.fetch("/phoneNumberList?conference=" + encoding.urlEncode(conference))
+        return JitsiDialInClient.parseNumbers(text)
+    }
+    String? conferencePin(conference: String) {
+        var text = this.fetch("/conferenceMapper?conference=" + encoding.urlEncode(conference))
+        return JitsiDialInClient.parsePin(text)
+    }
+    // "" when the API is off, unreachable or answers a non-2xx status.
+    String fetch(path: String) {
+        if (apiBase.length() == 0) {
+            return ""
+        }
+        var out = ""
+        try {
+            var reply = Outbound.request("GET", apiBase + path, listOf("Accept: application/json"), "", 4000)
+            if (reply.status() / 100 == 2) {
+                out = reply.body()
+            }
+        } catch (String e) {
+            out = ""
+        }
+        return out
+    }
+    // {"numbers": {"Brazil": ["+55..."], "Other": [...]}}: Brazil first, the rest in the order of the answer.
+    static List<String> parseNumbers(text: String) {
+        var out = listOf<String>()
+        if (text.length() == 0) {
+            return out
+        }
+        try {
+            var doc = json.decode<Map<String,Object>>(text)
+            var numbers = doc.get("numbers") as Map<String,Object>
+            var brazil = numbers.get("Brazil")
+            if (brazil != null) {
+                JitsiDialInClient.appendNumbers(out, brazil)
+            }
+            for (var key in numbers.keys()) {
+                if (key != "Brazil") {
+                    var entries = numbers.get(key)
+                    if (entries != null) {
+                        JitsiDialInClient.appendNumbers(out, entries)
+                    }
+                }
+            }
+        } catch (String e) {
+            return listOf<String>()
+        }
+        return out
+    }
+    static appendNumbers(out: List<String>, entries: Object) {
+        try {
+            var list = entries as List<Object>
+            for (var entry in list) {
+                var number = "" + entry
+                if (number.trim().length() > 0) {
+                    out.add(number)
+                }
+            }
+        } catch (String e) {
+            return
+        }
+    }
+    // {"id": 123456}: a positive id is the PIN.
+    static String? parsePin(text: String) {
+        if (text.length() == 0) {
+            return null
+        }
+        var pin = JitsiDialInClient.pinOf(text)
+        if (pin.length() == 0) {
+            return null
+        }
+        return pin
+    }
+    static String pinOf(text: String) {
+        var out = ""
+        try {
+            var doc = json.decode<Map<String,Object>>(text)
+            var raw = doc.get("id")
+            if (raw != null) {
+                var asText = "" + raw
+                var dot = asText.indexOf(".")
+                if (dot >= 0) {
+                    asText = asText.substring(0, dot)
+                }
+                var id = asText.toLong()
+                if (id > 0L) {
+                    out = "" + id
+                }
+            }
+        } catch (String e) {
+            out = ""
+        }
+        return out
+    }
+}

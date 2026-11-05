@@ -1,0 +1,120 @@
+package mentoring
+
+import kernel.error.*
+
+// Where the room of a mentoring session comes from (MentoringRooms). Jitsi has no "create room": any name becomes
+// a room when the first person joins, so the room is a link built here, named after the session or fixed per
+// mentor. The base is configurable (REDE_MENTORING_JITSI_BASE_URL). The room is an open link without token.
+class MentoringRooms {
+    String baseUrl
+    String conferenceHost
+    public constructor(rawBase: String) {
+        var trimmed = rawBase.trim()
+        while (trimmed.endsWith("/")) {
+            trimmed = trimmed.substring(0, trimmed.length() - 1)
+        }
+        if (trimmed.length() == 0) {
+            trimmed = MentoringRooms.defaultBaseUrl()
+        }
+        this.baseUrl = trimmed
+        this.conferenceHost = MentoringRooms.hostOf(trimmed)
+    }
+    static String defaultBaseUrl() = "https://meet.jit.si"
+    // Host of an absolute URL (URI.getHost); the Jitsi default when there is none.
+    static String hostOf(url: String) {
+        var rest = url
+        var scheme = rest.indexOf("://")
+        if (scheme >= 0) {
+            rest = rest.substring(scheme + 3)
+        }
+        var end = rest.length()
+        for (var stop in listOf("/", "?", "#")) {
+            var at = rest.indexOf(stop)
+            if (at >= 0 && at < end) {
+                end = at
+            }
+        }
+        var authority = rest.substring(0, end)
+        var at = authority.lastIndexOf("@")
+        if (at >= 0) {
+            authority = authority.substring(at + 1)
+        }
+        var colon = authority.indexOf(":")
+        if (colon >= 0) {
+            authority = authority.substring(0, colon)
+        }
+        if (authority.trim().length() == 0 || authority.contains(" ")) {
+            return "meet.jit.si"
+        }
+        return authority
+    }
+    // The link of a session room, from the mode the mentor chose.
+    String sessionRoom(mentor: MentoringMentor, sessionId: String) {
+        if (mentor.roomMode == MentoringRoomMode.custom()) {
+            var url = mentor.meetingUrl
+            if (url == null) {
+                throw Errors.api(400, "MENTOR_ROOM_REQUIRED", "O mentor nao tem sala configurada; escolha outra modalidade antes de receber inscricoes.")
+            }
+            if (url.trim().length() == 0) {
+                throw Errors.api(400, "MENTOR_ROOM_REQUIRED", "O mentor nao tem sala configurada; escolha outra modalidade antes de receber inscricoes.")
+            }
+            return url.trim()
+        }
+        if (mentor.roomMode == MentoringRoomMode.jitsiPermanent()) {
+            return this.jitsiUrl(this.permanentRoom(mentor))
+        }
+        return this.jitsiUrl(this.ephemeralRoom(sessionId))
+    }
+    // The permanent room of the mentor: the one they created, or one derived from the id (stable forever).
+    String permanentRoom(mentor: MentoringMentor) {
+        var existing = this.sanitizeRoom(mentor.jitsiRoom)
+        if (existing != null) {
+            return existing
+        }
+        return "rede-mentor-" + MentoringRooms.compact(mentor.id)
+    }
+    String ephemeralRoom(sessionId: String) = "rede-mentoria-" + MentoringRooms.compact(sessionId)
+    String jitsiUrl(room: String) = baseUrl + "/" + room
+    // True when the room runs on Jitsi (it has dial-in through the public API); false for the mentor's own room.
+    Bool isJitsi(mode: String) = mode == MentoringRoomMode.jitsiSession() || mode == MentoringRoomMode.jitsiPermanent()
+    // Conference name for the public Jitsi API: room@conference.<host>.
+    String conferenceName(roomUrl: String) {
+        var room = roomUrl
+        var slash = roomUrl.lastIndexOf("/")
+        if (slash >= 0 && slash < roomUrl.length() - 1) {
+            room = roomUrl.substring(slash + 1)
+        }
+        return room + "@conference." + conferenceHost
+    }
+    // A room typed by the mentor: only letters, digits and dashes. Blank is "no room".
+    String? sanitizeRoom(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        var room = raw.trim().toLowerCase().replaceAll("[^a-z0-9-]", "-").replaceAll("-{2,}", "-")
+        while (room.startsWith("-")) {
+            room = room.substring(1)
+        }
+        while (room.endsWith("-")) {
+            room = room.substring(0, room.length() - 1)
+        }
+        if (room.length() < 3) {
+            throw Errors.api(400, "INVALID_ROOM_NAME", "O nome da sala precisa ter pelo menos 3 caracteres (letras, numeros ou traco).")
+        }
+        if (room.length() > 100) {
+            throw Errors.api(400, "INVALID_ROOM_NAME", "O nome da sala aceita ate 100 caracteres.")
+        }
+        return room
+    }
+    // A room name derived from an internal id: safe characters only, lower case, at most 64.
+    static String compact(id: String) {
+        var cleaned = id.toLowerCase().replaceAll("[^a-z0-9]", "")
+        if (cleaned.length() > 64) {
+            return cleaned.substring(0, 64)
+        }
+        return cleaned
+    }
+}

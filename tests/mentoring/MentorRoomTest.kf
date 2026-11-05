@@ -1,0 +1,166 @@
+import app.*
+import kernel.testkit.*
+import mentoring.*
+import profile.*
+
+// Port of MentorRoomTests: the room of a session is a Jitsi room per session by default, a permanent Jitsi room or the
+// mentor's own room; the link is frozen at booking and only the people involved see it.
+TestResponse roomMine(mentee: ProfileCaller) {
+    var res = mentee.get("/mentors/sessions/mine")
+    Check.status(res, 200)
+    return res
+}
+
+test "default is a Jitsi room created per session" {
+    var owner = MentoringTestKit.login("mentor-room-default-owner")
+    var mentorId = MentoringTestKit.createPlainMentor(owner)
+    var firstSlot = MentoringTestKit.futureSlot(owner, mentorId)
+    var secondSlot = MentoringTestKit.futureSlot(owner, mentorId)
+    var menteeA = MentoringTestKit.login("mentor-room-default-a")
+    var menteeB = MentoringTestKit.login("mentor-room-default-b")
+    Check.status(MentoringTestKit.book(menteeA, mentorId, firstSlot, "oi"), 201)
+    Check.status(MentoringTestKit.book(menteeB, mentorId, secondSlot, "oi"), 201)
+    var mineA = roomMine(menteeA)
+    var mineB = roomMine(menteeB)
+    var roomA = mineA.json("0.roomUrl")
+    var roomB = mineB.json("0.roomUrl")
+    Check.isTrue("room A is a Jitsi session room", roomA.startsWith("https://meet.jit.si/rede-mentoria-"))
+    Check.isTrue("room B is a Jitsi session room", roomB.startsWith("https://meet.jit.si/rede-mentoria-"))
+    // A room of its own per session: two mentees never land in the same room.
+    Check.isTrue("different rooms", roomA != roomB)
+    Check.eqStr("mode", "JITSI_SESSION", mineA.json("0.roomMode"))
+    // The mentor sees the same link as the mentee.
+    var inbox = owner.get("/mentors/" + mentorId + "/sessions")
+    Check.status(inbox, 200)
+    Check.eqStr("mentor sees the same room", roomA, MentoringTestKit.fieldOf(inbox, "", mineA.json("0.id"), "roomUrl"))
+}
+
+test "mentor can use their own room and it is required for that mode" {
+    var owner = MentoringTestKit.login("mentor-room-custom-owner")
+    // An own room without a link is refused.
+    var refused = owner.post("/mentors", "{\"expertise\":[\"Java\"],\"price\":\"Gratuito\",\"roomMode\":\"CUSTOM\"}")
+    Check.apiError(refused, 400, "MEETING_URL_REQUIRED")
+    var mentorId = MentoringTestKit.createMentor(owner, "{\"expertise\":[\"Java\"],\"price\":\"Gratuito\",\"roomMode\":\"CUSTOM\",\"meetingUrl\":\"https://meet.google.com/abc-defg-hij\"}")
+    var slotId = MentoringTestKit.futureSlot(owner, mentorId)
+    var mentee = MentoringTestKit.login("mentor-room-custom-mentee")
+    Check.status(MentoringTestKit.book(mentee, mentorId, slotId, "oi"), 201)
+    var mine = roomMine(mentee)
+    Check.eqStr("own room", "https://meet.google.com/abc-defg-hij", mine.json("0.roomUrl"))
+    Check.eqStr("mode", "CUSTOM", mine.json("0.roomMode"))
+    // An own room has no Jitsi dial-in.
+    var dial = mentee.get("/mentors/" + mentorId + "/sessions/" + mine.json("0.id") + "/dial-in")
+    Check.apiError(dial, 400, "NOT_A_JITSI_ROOM")
+}
+
+test "permanent Jitsi room is stable and only the owner sees it" {
+    var owner = MentoringTestKit.login("mentor-room-perm-owner")
+    var mentorId = MentoringTestKit.createMentor(owner, "{\"expertise\":[\"Java\"],\"price\":\"Gratuito\",\"roomMode\":\"JITSI_PERMANENT\"}")
+    var room = owner.get("/mentors/" + mentorId + "/room")
+    Check.status(room, 200)
+    Check.jsonEq(room, "roomMode", "JITSI_PERMANENT")
+    var permanentUrl = room.json("roomUrl")
+    Check.isTrue("permanent room url", permanentUrl.startsWith("https://meet.jit.si/rede-mentor-"))
+    // Two different sessions use the same permanent room.
+    var menteeA = MentoringTestKit.login("mentor-room-perm-a")
+    var menteeB = MentoringTestKit.login("mentor-room-perm-b")
+    Check.status(MentoringTestKit.book(menteeA, mentorId, MentoringTestKit.futureSlot(owner, mentorId), "oi"), 201)
+    Check.status(MentoringTestKit.book(menteeB, mentorId, MentoringTestKit.futureSlot(owner, mentorId), "oi"), 201)
+    Check.eqStr("room of A", permanentUrl, roomMine(menteeA).json("0.roomUrl"))
+    Check.eqStr("room of B", permanentUrl, roomMine(menteeB).json("0.roomUrl"))
+    // The permanent link does not reach the public showcase nor who is not the owner.
+    var shown = OrgsTestKit.anonymous().get("/mentors/" + mentorId)
+    Check.status(shown, 200)
+    Check.jsonEq(shown, "roomMode", "JITSI_PERMANENT")
+    Check.isTrue("no meetingUrl in the showcase", !shown.jsonHas("meetingUrl"))
+    Check.isTrue("no roomUrl in the showcase", !shown.jsonHas("roomUrl"))
+    Check.status(menteeA.get("/mentors/" + mentorId + "/room"), 403)
+    Check.status(OrgsTestKit.anonymous().get("/mentors/" + mentorId + "/room"), 401)
+}
+
+test "a booked session keeps the room it was booked with" {
+    var owner = MentoringTestKit.login("mentor-room-freeze-owner")
+    var mentorId = MentoringTestKit.createPlainMentor(owner)
+    var slotId = MentoringTestKit.futureSlot(owner, mentorId)
+    var mentee = MentoringTestKit.login("mentor-room-freeze-mentee")
+    Check.status(MentoringTestKit.book(mentee, mentorId, slotId, "oi"), 201)
+    var bookedRoom = roomMine(mentee).json("0.roomUrl")
+    // The mentor changes the room of the profile after the booking.
+    var patched = owner.patch("/mentors/" + mentorId, "{\"expertise\":[\"Java\"],\"price\":\"Gratuito\",\"roomMode\":\"CUSTOM\",\"meetingUrl\":\"https://meet.google.com/nova-sala\"}")
+    Check.status(patched, 200)
+    // The session already booked stays in the old room; the next one is born in the new one.
+    Check.eqStr("frozen room", bookedRoom, roomMine(mentee).json("0.roomUrl"))
+    var other = MentoringTestKit.login("mentor-room-freeze-other")
+    Check.status(MentoringTestKit.book(other, mentorId, MentoringTestKit.futureSlot(owner, mentorId), "oi"), 201)
+    Check.eqStr("new room", "https://meet.google.com/nova-sala", roomMine(other).json("0.roomUrl"))
+}
+
+test "switching back to Jitsi drops the external link" {
+    var owner = MentoringTestKit.login("mentor-room-switch-owner")
+    var mentorId = MentoringTestKit.createMentor(owner, "{\"expertise\":[\"Java\"],\"price\":\"Gratuito\",\"roomMode\":\"CUSTOM\",\"meetingUrl\":\"https://meet.google.com/velha-sala\"}")
+    // The showcase does not announce the link; the owner gets it on the private room route.
+    Check.isTrue("no link in the showcase", !OrgsTestKit.anonymous().get("/mentors/" + mentorId).jsonHas("meetingUrl"))
+    var room = owner.get("/mentors/" + mentorId + "/room")
+    Check.status(room, 200)
+    Check.jsonEq(room, "meetingUrl", "https://meet.google.com/velha-sala")
+    // Back to Jitsi without sending a link: the old Meet cannot stay announced on the profile.
+    var patched = owner.patch("/mentors/" + mentorId, "{\"expertise\":[\"Java\"],\"price\":\"Gratuito\",\"roomMode\":\"JITSI_PERMANENT\",\"jitsiRoom\":\"Sala Da Mel\"}")
+    Check.status(patched, 200)
+    var shown = OrgsTestKit.anonymous().get("/mentors/" + mentorId)
+    Check.jsonEq(shown, "roomMode", "JITSI_PERMANENT")
+    Check.isTrue("no link in the showcase", !shown.jsonHas("meetingUrl"))
+    var view = owner.get("/mentors/" + mentorId + "/room")
+    Check.status(view, 200)
+    // The requested name is normalised to the format Jitsi accepts.
+    Check.jsonEq(view, "jitsiRoom", "sala-da-mel")
+    Check.jsonEq(view, "roomUrl", "https://meet.jit.si/sala-da-mel")
+    Check.isTrue("the stored link is gone", view.jsonIsNull("meetingUrl"))
+}
+
+test "dial-in is only for participants and answers for Jitsi rooms" {
+    var owner = MentoringTestKit.login("mentor-room-dial-owner")
+    var mentorId = MentoringTestKit.createPlainMentor(owner)
+    var mentee = MentoringTestKit.login("mentor-room-dial-mentee")
+    Check.status(MentoringTestKit.book(mentee, mentorId, MentoringTestKit.futureSlot(owner, mentorId), "oi"), 201)
+    var sessionId = roomMine(mentee).json("0.id")
+    var stranger = MentoringTestKit.login("mentor-room-dial-stranger")
+    var path = "/mentors/" + mentorId + "/sessions/" + sessionId + "/dial-in"
+    Check.status(stranger.get(path), 403)
+    Check.status(OrgsTestKit.anonymous().get(path), 401)
+    // The Jitsi API may not answer (no network here): the link still holds and the list comes back empty.
+    var ok = mentee.get(path)
+    Check.status(ok, 200)
+    Check.isTrue("conference", ok.json("conference").contains("@conference."))
+    Check.isTrue("numbers is an array", ok.jsonHas("numbers"))
+    Check.eqInt("no numbers without the API", 0, ok.jsonSize("numbers"))
+    Check.status(owner.get(path), 200)
+    Check.apiError(owner.get("/mentors/" + mentorId + "/sessions/mentor_session_nope/dial-in"), 404, "SESSION_NOT_FOUND")
+}
+
+test "room names are sanitised and bounded" {
+    var owner = MentoringTestKit.login("mentor-room-name-owner")
+    var tooShort = owner.post("/mentors", "{\"expertise\":[\"Java\"],\"roomMode\":\"JITSI_PERMANENT\",\"jitsiRoom\":\"a!\"}")
+    Check.apiError(tooShort, 400, "INVALID_ROOM_NAME")
+    var tooLong = owner.post("/mentors", "{\"expertise\":[\"Java\"],\"roomMode\":\"JITSI_PERMANENT\",\"jitsiRoom\":\"" + strings.repeat("a", 101) + "\"}")
+    Check.apiError(tooLong, 400, "INVALID_ROOM_NAME")
+    var rooms = MentoringRooms("https://jitsi.example.org:8443/base/")
+    Check.eqStr("collapses dashes", "minha-sala-1", rooms.sanitizeRoom("  --Minha   Sala__1-- ") as String)
+    Check.eqStr("url keeps the base without the trailing slash", "https://jitsi.example.org:8443/base/sala", rooms.jitsiUrl("sala"))
+    Check.eqStr("conference host", "sala@conference.jitsi.example.org", rooms.conferenceName("https://jitsi.example.org:8443/base/sala"))
+    Check.eqStr("default host", "meet.jit.si", MentoringRooms.hostOf("not a url"))
+}
+
+test "the dial-in answer of the Jitsi API puts Brazil first and reads the PIN" {
+    var numbers = JitsiDialInClient.parseNumbers("{\"numbers\":{\"USA\":[\"+1 111\"],\"Brazil\":[\"+55 31 1\",\"+55 11 2\"],\"Chile\":[\"+56 3\"]}}")
+    Check.eqInt("count", 4, numbers.size())
+    Check.eqStr("brazil first", "+55 31 1", numbers.get(0))
+    Check.eqStr("brazil second", "+55 11 2", numbers.get(1))
+    Check.eqInt("garbage", 0, JitsiDialInClient.parseNumbers("<html>").size())
+    Check.eqInt("empty", 0, JitsiDialInClient.parseNumbers("").size())
+    Check.eqStr("pin", "123456", JitsiDialInClient.parsePin("{\"id\":123456,\"message\":\"ok\"}") as String)
+    Check.isTrue("no pin for zero", JitsiDialInClient.parsePin("{\"id\":0}") == null)
+    Check.isTrue("no pin for garbage", JitsiDialInClient.parsePin("nope") == null)
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}
