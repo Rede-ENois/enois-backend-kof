@@ -1,0 +1,33 @@
+package kernel.files
+
+import java.io.IOException
+import org.apache.pdfbox.Loader
+import org.apache.pdfbox.pdmodel.PDDocument
+import org.apache.pdfbox.pdmodel.PDDocumentInformation
+
+// The other PDFBox user of the kernel (PdfText reads, this one cleans): the Java MediaMetadataSanitizer.pdf, which
+// replaces the document information (author, title, producer...) by an empty one, drops the XMP metadata of the
+// catalog and saves. The bytes go in as an array (Loader.loadPDF(File) picks the wrong overload, G281) and come
+// out through a temp file: `save(OutputStream)` is not picked, the compiler offers only `save(String)` (G400).
+class PdfCleaner {
+    // The cleaned bytes. An unreadable or encrypted file throws, the caller keeps the original.
+    static Byte[] clean(data: Byte[]) {
+        var path = UploadFiles.create("pdf-clean-", ".pdf")
+        try {
+            var document = Loader.loadPDF(data)
+            PdfCleaner.strip(document)
+            document.save(path)
+            document.close()
+        } catch (IOException e) {
+            UploadFiles.discard(path)
+            throw "pdf_unreadable"
+        }
+        var cleaned = UploadFiles.readBytes(path)
+        UploadFiles.discard(path)
+        return cleaned
+    }
+    static strip(document: PDDocument) {
+        document.setDocumentInformation(new PDDocumentInformation())
+        document.getDocumentCatalog().setMetadata(null)
+    }
+}

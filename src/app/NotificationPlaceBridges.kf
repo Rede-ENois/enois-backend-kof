@@ -1,0 +1,71 @@
+package app
+
+import communities.*
+import events.*
+import feed.*
+import groups.*
+import java.util.HashMap
+import kernel.db.*
+import notifications.*
+
+// notifications: the places a notice points at, asked to their owners instead of read from the tables. Communities
+// and groups answer through their directories, the post's community through the feed store; the event lookups stay
+// the ones of EventsNotificationPlaces.
+class OwnersNotificationPlaces extends EventsNotificationPlaces {
+    CommunityDirectory communities
+    GroupDirectory groups
+    FeedStore posts
+    public constructor(database: Db, eventsStore: EventsStore, communities: CommunityDirectory, groups: GroupDirectory, posts: FeedStore) {
+        super(database, eventsStore)
+        this.communities = communities
+        this.groups = groups
+        this.posts = posts
+    }
+    Map<String,NotificationPlaceView> communitiesByIds(ids: List<String>) {
+        var out = new HashMap<String, NotificationPlaceView>()
+        var names = communities.namesByIds(ids)
+        for (var id in names.keys()) {
+            var name = names.get(id)
+            if (name != null) {
+                out.put(id, NotificationPlaceView("COMMUNITY", id, name, null))
+            }
+        }
+        return out
+    }
+    Map<String,NotificationPlaceView> communitiesOfPosts(postIds: List<String>) {
+        var out = new HashMap<String, NotificationPlaceView>()
+        var communityOf = new HashMap<String, String>()
+        var communityIds = listOf<String>()
+        for (var post in posts.posts(postIds)) {
+            var communityId = post.communityId()
+            if (communityId != null) {
+                communityOf.put(post.id(), communityId)
+                if (!communityIds.contains(communityId)) {
+                    communityIds.add(communityId)
+                }
+            }
+        }
+        var names = communities.namesByIds(communityIds)
+        for (var postId in communityOf.keys()) {
+            var communityId = communityOf.get(postId)
+            if (communityId != null) {
+                var name = names.get(communityId)
+                if (name != null) {
+                    out.put(postId, NotificationPlaceView("COMMUNITY", communityId, name, null))
+                }
+            }
+        }
+        return out
+    }
+    Map<String,NotificationPlaceView> groupsBySlugs(slugs: List<String>) {
+        var out = new HashMap<String, NotificationPlaceView>()
+        var found = groups.notClosedBySlugs(slugs)
+        for (var slug in found.keys()) {
+            var g = found.get(slug)
+            if (g != null) {
+                out.put(slug, NotificationPlaceView("GROUP", g.id(), g.name(), null))
+            }
+        }
+        return out
+    }
+}

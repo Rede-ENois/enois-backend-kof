@@ -27,7 +27,7 @@ or needs several owners. Tests that prove the wiring boot `AppWiring.installAll`
 | `DigestPersonalization` | notifications | preferences | SWITCHED `PreferencesDigestPersonalization` |
 | `NotificationSources` | notifications | feed | SWITCHED `FeedNotificationSources` (feed store) |
 | `NotificationCoins` | notifications | coin | WIRED `CoinNotificationCoins` |
-| `NotificationPlaceReader` | notifications | communities, groups, events | PARTLY: events WIRED (`EventsNotificationPlaces`); communities and groups lookups OPEN (`communitiesByIds`, `communitiesOfPosts`, `groupsBySlugs` still read the tables) |
+| `NotificationPlaceReader` | notifications | communities, groups, feed, events | SWITCHED `OwnersNotificationPlaces` (`src/app/NotificationPlaceBridges.kf`: `CommunityDirectory.namesByIds`, `GroupDirectory.notClosedBySlugs`, the feed store for the community of a post; events stay on `EventsNotificationPlaces`); proved by `tests/integration/NotificationPlacesTest.kf` |
 | `PushPresence` | push | presence | SWITCHED `PresencePushBridge` (`PushModule.withPresence`) |
 | `FeedAuthors` | feed | profile, corporate, contributions | SWITCHED `ProfileFeedAuthors` (`src/app/FeedBridges.kf`; new `ContributionsStore.activeSealUserIds`, `CorporateService.byUserIds`) |
 | `FeedMedia` | feed | media | SWITCHED `MediaFeedBridge` (ownership, visible cards, `requestPostMediaDeletion` now feeds the deletion jobs) |
@@ -71,9 +71,9 @@ or needs several owners. Tests that prove the wiring boot `AppWiring.installAll`
 | `ProfileBadgeOwnership` | profile | cosmetics | WIRED `cosmeticsCore.badges` |
 | `ProfileForeignCounts`: events, mentoring | profile | events, mentoring | WIRED `OrgsForeignCounts` |
 | `ProfileForeignCounts`: confirmedReportFacts | profile | moderation | SWITCHED `ModerationForeignCounts` (`ModerationStore.confirmedFactsAbout`); a sanction also clears `publicRanking` and `publicProfiles` through `ModerationProfileCaches` |
-| `ProfileForeignCounts`: socialPosts, uniqueEngagers, deniedNotes, approvedNotes, communitiesJoined, jobAbandons | profile | feed, communities, jobs | OPEN: the Java profile adapter ran these as native queries too (no owner API with the same shape); only worth switching with owner methods |
+| `ProfileForeignCounts`: socialPosts, uniqueEngagers, deniedNotes, approvedNotes, communitiesJoined, jobAbandons | profile | feed, communities, jobs | KEPT: the Java profile adapter ran these as native queries too, and no owner API has the same shape (aggregates over posts, notes, memberships and abandons); switching would add owner methods that only this reader calls |
 | `OnboardingActions` | onboarding | preferences, profile, communities, groups, network | SWITCHED `AppOnboardingActions` (`src/app/OnboardingBridges.kf`; joins, connection requests, liked topics and skills now run the owners' rules, counters, notices and presence) |
-| `OnboardingStore` reads (starter pack) | onboarding | communities, groups, network, preferences | OPEN: read-only candidate queries, no owner API for them |
+| `OnboardingStore` reads (starter pack) | onboarding | communities, groups, network, preferences | KEPT: the Java onboarding adapter ran these candidate queries as native queries (joined with member counts, exclusions of what the person already joined or asked); no owner API has that shape |
 | `IdentityUsers` | identity | profile | KEPT: the profile domain has no account creation API; the writes (signup, anonymise, verify, 2FA flags) are the repository saves identity does in Java |
 | `IdentityIpBlocks`, `IdentitySignupGuard` | identity | moderation | WIRED: the defaults already are the moderation rules (`blocked_ips` lookup with the Java 5 s cache; the per-pod signup strike guard of `SuspiciousSignupGuard`); moderation writes the table through `ModerationIpBlocks`, proved in `ModerationSeamsTest` |
 | `IdentityOAuthLinks` | identity | contributions | WIRED `ContributionsOAuthLinks` |
@@ -90,7 +90,7 @@ or needs several owners. Tests that prove the wiring boot `AppWiring.installAll`
 | `/moderation/games`, `/moderation/services` | moderation | games, services | SWITCHED `ModerationReviewRoutes` (the owners' use cases behind the team guard and the own-submission rule) |
 | `MediaImageReviewer`, `ModerationImages` | media, moderation | moderation (MediaSafetyAnalyzer) | OPEN: needs the MediaSafety analyzer (area 6, not ported) |
 | `GifCommunityReader` | gifs | feed | KEPT: dead in Java (`CommunityGifProvider` is never registered as a bean), nothing reads it |
-| `MediaPdfCleaner` | media | pdf library | OPEN: PDFBox needs the `loadPDF(byte[])` workaround of G281 and the save path of G164; not attempted in this round |
+| `MediaPdfCleaner` | media | pdf library | SWITCHED: implemented with PDFBox in `kernel.files.PdfCleaner` (document information replaced, XMP metadata dropped, saved through a temp file because of G400); tests in `tests/media/MediaSanitizerTest.kf` |
 | `CallClock`, `PushSender`, `DigestMailer` | calls, push, notifications | none | KEPT: test seams or infrastructure, no owner |
 
 ## Tests proving the wiring
@@ -103,8 +103,7 @@ and onboarding joins a community, asks for a connection and saves a skill throug
 
 ## Handoff: what is left
 
-- OPEN rows above.
-- Feed and coins tests still waiting for a wired suite (PORTING_STATUS): the coin-ledger reaction test, the identity
-  presentation tests (profile cosmetics frame and name style on a post) and the Mockito media-embedding test.
+- OPEN rows above: only `MediaImageReviewer` / `ModerationImages` remain (owned by the moderation automation branch).
+- The feed tests that waited for a wired suite are ported in `tests/integration/FeedWiredPresentationTest.kf`.
 - Moderation seams are switched except `MediaImageReviewer` and the reported-image reader (they need the MediaSafety
   analyzer, see PORTING_STATUS "moderation").

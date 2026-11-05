@@ -1,0 +1,168 @@
+import app.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Feed behaviours that need several real domains, on the production wiring (AppWiring.installAll): the coin ledger,
+// the profile and cosmetics owners behind the author presentation, the notifications API and the media owner.
+// Ports of PostReactionsAndReplyTests.reactionsReceivedDoNotCreateCoinEntriesForTheAuthor, BadgesEverywhereTests,
+// NameStyleEverywhereTests (post, comment, read and notification) and PostMediaEmbeddingTests.
+String wiredPost(token: String, key: String, content: String, mediaIds: String) {
+    var res = WiredApp.send("POST", "/feed/posts", token, key, "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"" + content + "\",\"tags\":[],\"mediaIds\":[" + mediaIds + "]}")
+    Check.status(res, 201)
+    var id = res.jsonStr("id")
+    if (id == null) {
+        throw "FAIL no post id"
+    }
+    return id
+}
+
+Long coinEntries(accountId: String) = WiredApp.app().db().queryLong("select count(*) from coin_entries where account_id = ?", DbParams().bindStr(accountId))
+
+test "reactions received do not create coin entries for the author" {
+    var author = WiredApp.adult("wired_react_author")
+    var postId = wiredPost(author, "wired-react-pub", "Reacao nao rende faisca para quem publicou.", "")
+    var before = coinEntries("wired_react_author")
+    var i = 0
+    while (i < 10) {
+        var reactor = WiredApp.adult("wired_react_r" + i)
+        var res = WiredApp.send("POST", "/feed/posts/" + postId + "/reactions", reactor, "wired-like-" + i, "{\"type\":\"LIKE\"}")
+        Check.status(res, 200)
+        Check.jsonEq(res, "counters.reactions", "" + (i + 1))
+        i = i + 1
+    }
+    Check.isTrue("no coin entry for received reactions", coinEntries("wired_react_author") == before)
+}
+
+test "a post and a comment carry the five badges set through the profile" {
+    var autor = WiredApp.adult("wired_badges_autor")
+    var badges = "[\"https://cdn.test/emblema-1.png\",\"https://cdn.test/emblema-2.png\",\"https://cdn.test/emblema-3.png\",\"https://cdn.test/emblema-4.png\",\"https://cdn.test/emblema-5.png\"]"
+    Check.status(WiredApp.send("PUT", "/me/badges", autor, "wired-badges-put", "{\"badges\":" + badges + "}"), 200)
+    var published = WiredApp.send("POST", "/feed/posts", autor, "wired-badges-pub-1", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Post com cinco emblemas.\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(published, 201)
+    Check.eqInt("five badges", 5, published.jsonSize("authorBadges"))
+    Check.jsonEq(published, "authorBadges.0", "https://cdn.test/emblema-1.png")
+    Check.jsonEq(published, "authorBadges.4", "https://cdn.test/emblema-5.png")
+    Check.jsonEq(published, "authorBadge", "https://cdn.test/emblema-1.png")
+    var postId = published.jsonStr("id")
+    if (postId == null) {
+        throw "FAIL no post id"
+    }
+    var comment = WiredApp.send("POST", "/feed/posts/" + postId + "/comments", autor, "wired-badges-comment-1", "{\"content\":\"Comentario com os mesmos emblemas.\",\"mediaIds\":[],\"mentionedUserIds\":[]}")
+    Check.status(comment, 201)
+    Check.eqInt("five badges on the comment", 5, comment.jsonSize("authorBadges"))
+    var sem = WiredApp.adult("wired_badges_sem")
+    var plain = WiredApp.send("POST", "/feed/posts", sem, "wired-badges-pub-2", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Sem emblema nenhum.\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(plain, 201)
+    Check.eqInt("no badges", 0, plain.jsonSize("authorBadges"))
+    Check.isTrue("no legacy badge", plain.jsonIsNull("authorBadge"))
+}
+
+String personalize(token: String, key: String) {
+    var res = WiredApp.send("PUT", "/cosmetics/profile/name-style", token, key, "{\"theme\":\"NEON\",\"font\":\"DISPLAY\",\"color\":\"#FF4FA3\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "theme", "NEON")
+    return token
+}
+
+test "post, comment and read carry the name style set through the cosmetics owner" {
+    var autor = personalize(WiredApp.adult("wired_style_autor"), "wired-style-put-1")
+    var published = WiredApp.send("POST", "/feed/posts", autor, "wired-style-pub-1", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Post com nome personalizado.\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(published, 201)
+    Check.jsonEq(published, "authorStyle.theme", "NEON")
+    Check.jsonEq(published, "authorStyle.font", "DISPLAY")
+    Check.jsonEq(published, "authorStyle.color", "#ff4fa3")
+    var postId = published.jsonStr("id")
+    if (postId == null) {
+        throw "FAIL no post id"
+    }
+    var read = WiredApp.get("/feed/posts/" + postId, autor)
+    Check.jsonEq(read, "authorStyle.theme", "NEON")
+    Check.jsonEq(read, "authorStyle.color", "#ff4fa3")
+    var comment = WiredApp.send("POST", "/feed/posts/" + postId + "/comments", autor, "wired-style-comment-1", "{\"content\":\"Comentario com o mesmo estilo.\",\"mediaIds\":[],\"mentionedUserIds\":[]}")
+    Check.status(comment, 201)
+    Check.jsonEq(comment, "authorStyle.theme", "NEON")
+    Check.jsonEq(comment, "authorStyle.font", "DISPLAY")
+    var sem = WiredApp.adult("wired_style_sem")
+    var plain = WiredApp.send("POST", "/feed/posts", sem, "wired-style-pub-2", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Post sem personalizacao.\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(plain, 201)
+    Check.isTrue("no style", plain.jsonIsNull("authorStyle"))
+}
+
+test "the notification of a styled commenter carries the style" {
+    var dono = WiredApp.adult("wired_style_dono")
+    var comentarista = personalize(WiredApp.adult("wired_style_comentarista"), "wired-style-put-2")
+    var postId = wiredPost(dono, "wired-style-notif-pub", "Post do dono sem estilo.", "")
+    var comment = WiredApp.send("POST", "/feed/posts/" + postId + "/comments", comentarista, "wired-style-notif-comment", "{\"content\":\"Comentei marcando o dono para gerar a notificacao.\",\"mediaIds\":[],\"mentionedUserIds\":[\"wired_style_dono\"]}")
+    Check.status(comment, 201)
+    var list = WiredApp.get("/notifications", dono)
+    Check.status(list, 200)
+    var found = -1
+    var i = 0
+    while (i < list.jsonSize("items")) {
+        if (list.jsonStr("items." + i + ".actorId") == "wired_style_comentarista") {
+            found = i
+        }
+        i = i + 1
+    }
+    Check.isTrue("notification of the commenter", found >= 0)
+    Check.jsonEq(list, "items." + found + ".actorStyle.theme", "NEON")
+    Check.jsonEq(list, "items." + found + ".actorStyle.color", "#ff4fa3")
+}
+
+String mediaIdsOfWired(res: TestResponse, path: String) {
+    var out = listOf<String>()
+    var i = 0
+    while (i < res.jsonSize(path)) {
+        out.add("" + res.jsonStr(path + "." + i + ".id"))
+        i = i + 1
+    }
+    return String.join(",", out)
+}
+
+wiredMedia(id: String, ownerId: String, mime: String, width: Int, height: Int) {
+    var now = Time.nowIso()
+    var db = WiredApp.app().db()
+    db.execute("insert into media_assets (id, owner_id, file_name, mime_type, size_bytes, purpose, object_key, cdn_url, status, delete_status, created_at, expires_at) values (?, ?, \'file\', ?, 10, \'POST_IMAGE\', ?, ?, \'READY\', \'NONE\', ?, ?)", DbParams().bindStr(id).bindStr(ownerId).bindStr(mime).bindStr("uploads/" + id + "/file").bindStr("https://enois.exemplo.com/api/storage/uploads/" + id + "/file").bindInstant(now).bindInstant(Time.plusSeconds(now, 3600L)))
+    if (width > 0) {
+        db.execute("update media_assets set width = ?, height = ? where id = ?", DbParams().bindInt(width).bindInt(height).bindStr(id))
+    }
+}
+
+test "posts carry the visible media in order, resolved once per page" {
+    var author = WiredApp.adult("wired_media_embed")
+    wiredMedia("wired_media_sized", "wired_media_embed", "image/png", 1200, 800)
+    wiredMedia("wired_media_unsized", "wired_media_embed", "video/mp4", 0, 0)
+    wiredMedia("wired_media_removed", "wired_media_embed", "image/jpeg", 0, 0)
+    var first = WiredApp.send("POST", "/feed/posts", author, "wired-media-pub-1", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Post com anexos um\",\"tags\":[],\"mediaIds\":[\"wired_media_unsized\",\"wired_media_sized\",\"wired_media_removed\"]}")
+    Check.status(first, 201)
+    Check.eqStr("media in order", "wired_media_unsized,wired_media_sized,wired_media_removed", mediaIdsOfWired(first, "media"))
+    wiredPost(author, "wired-media-pub-2", "Post com anexos dois", "\"wired_media_sized\"")
+    Check.status(WiredApp.send("DELETE", "/media/wired_media_removed", author, "wired-media-delete", ""), 200)
+    var firstId = first.jsonStr("id")
+    if (firstId == null) {
+        throw "FAIL no post id"
+    }
+    var single = WiredApp.get("/feed/posts/" + firstId, author)
+    Check.status(single, 200)
+    Check.eqInt("media ids kept", 3, single.jsonSize("mediaIds"))
+    Check.eqStr("only the visible ones", "wired_media_unsized,wired_media_sized", mediaIdsOfWired(single, "media"))
+    Check.jsonEq(single, "media.0.mimeType", "video/mp4")
+    Check.isTrue("unsized width", single.jsonIsNull("media.0.width"))
+    Check.jsonEq(single, "media.1.width", "1200")
+    Check.jsonEq(single, "media.1.height", "800")
+    var address = "" + single.jsonStr("media.1.cdnUrl")
+    Check.isTrue("address", address.endsWith("/wired_media_sized/file"))
+    var lookups = WiredApp.wired().mediaFeed
+    var before = lookups.cardLookups
+    var page = WiredApp.get("/users/wired_media_embed/posts", author)
+    Check.status(page, 200)
+    Check.eqInt("two posts", 2, page.jsonSize("items"))
+    Check.eqStr("newest", "wired_media_sized", mediaIdsOfWired(page, "items.0.media"))
+    Check.eqStr("oldest", "wired_media_unsized,wired_media_sized", mediaIdsOfWired(page, "items.1.media"))
+    Check.eqInt("one media lookup for the page", 1, lookups.cardLookups - before)
+}
+
+test "the stack is stopped at the end" {
+    WiredApp.finish()
+}

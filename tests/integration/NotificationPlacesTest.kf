@@ -1,0 +1,64 @@
+import app.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import notifications.*
+
+// Production wiring (AppWiring): the place a notification points at (community, post of a community, group) is asked to
+// the communities and groups owners and the feed store; the community and the group are created through their routes.
+String placeId(res: TestResponse, what: String) {
+    var id = res.jsonStr("id")
+    if (id == null) {
+        throw "FAIL no " + what + " id"
+    }
+    return id
+}
+
+seedNotification(id: String, userId: String, kind: String, href: String) {
+    WiredApp.app().db().execute("insert into notifications (id, user_id, kind, actor_id, title, body, href, is_read, created_at) values (?, ?, ?, \'sistema\', \'Aviso\', \'corpo\', ?, false, ?)", DbParams().bindStr(id).bindStr(userId).bindStr(kind).bindStr(href).bindInstant(Time.nowIso()))
+}
+
+test "places of community, community post and group come from their owners" {
+    var owner = WiredApp.adult("places_owner")
+    var community = WiredApp.send("POST", "/communities", owner, "places-c1", "{\"name\":\"Mesa de BH\",\"description\":\"Comunidade de teste.\",\"topic\":\"TECNOLOGIA\"}")
+    Check.status(community, 201)
+    var communityId = placeId(community, "community")
+    var post = WiredApp.send("POST", "/feed/posts", owner, "places-p1", "{\"type\":\"INSIGHT\",\"content\":\"Post dentro da comunidade.\",\"communityId\":\"" + communityId + "\"}")
+    Check.status(post, 201)
+    var postId = placeId(post, "post")
+    var group = WiredApp.send("POST", "/groups", owner, "places-g1", "{\"name\":\"Grupo da Roda\",\"description\":\"grupo de teste\",\"joinMode\":\"OPEN\"}")
+    Check.status(group, 201)
+    var groupId = placeId(group, "group")
+    var slug = group.jsonStr("slug")
+    if (slug == null) {
+        throw "FAIL no group slug"
+    }
+    var closed = WiredApp.send("POST", "/groups", owner, "places-g2", "{\"name\":\"Grupo Fechado\",\"description\":\"grupo de teste\",\"joinMode\":\"OPEN\"}")
+    Check.status(closed, 201)
+    var closedSlug = closed.jsonStr("slug")
+    if (closedSlug == null) {
+        throw "FAIL no closed slug"
+    }
+    WiredApp.app().db().execute("update groups set status = \'CLOSED\' where slug = ?", DbParams().bindStr(closedSlug))
+    seedNotification("places_n_community", "places_owner", "MENTION", "/comunidades/" + communityId)
+    seedNotification("places_n_post", "places_owner", "NEW_REACTION", "/api/feed/posts/" + postId + "?reacoes=1")
+    seedNotification("places_n_group", "places_owner", "GROUP_NEW_POST", "/grupos/" + slug)
+    seedNotification("places_n_closed", "places_owner", "GROUP_NEW_POST", "/grupos/" + closedSlug)
+    seedNotification("places_n_gone", "places_owner", "MENTION", "/comunidades/gone-community")
+    var list = WiredApp.get("/notifications", owner)
+    Check.status(list, 200)
+    var k = "items"
+    Check.eqStr("community type", "COMMUNITY", "" + DomainTestKit.itemStr(list, k, "places_n_community", "place.type"))
+    Check.eqStr("community id", communityId, "" + DomainTestKit.itemStr(list, k, "places_n_community", "place.id"))
+    Check.eqStr("community name", "Mesa de BH", "" + DomainTestKit.itemStr(list, k, "places_n_community", "place.name"))
+    Check.eqStr("post community", communityId, "" + DomainTestKit.itemStr(list, k, "places_n_post", "place.id"))
+    Check.eqStr("group type", "GROUP", "" + DomainTestKit.itemStr(list, k, "places_n_group", "place.type"))
+    Check.eqStr("group id", groupId, "" + DomainTestKit.itemStr(list, k, "places_n_group", "place.id"))
+    Check.eqStr("group name", "Grupo da Roda", "" + DomainTestKit.itemStr(list, k, "places_n_group", "place.name"))
+    Check.isTrue("closed group has no place", DomainTestKit.itemIsNull(list, k, "places_n_closed", "place"))
+    Check.isTrue("unknown community has no place", DomainTestKit.itemIsNull(list, k, "places_n_gone", "place"))
+}
+
+test "the stack is stopped at the end" {
+    WiredApp.finish()
+}
