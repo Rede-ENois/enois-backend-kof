@@ -1,0 +1,86 @@
+import app.*
+import events.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.text.*
+import kernel.time.*
+
+// Port of EventSanitizationTests: events that passed leave the showcase and refuse attendance; after the grace the
+// attendances (personal data) disappear and only the total stays.
+test "expiresAtComesFromTheEventDate" {
+    var now = Time.nowMillis()
+    var past = EventsTestKit.day(-2)
+    Check.isTrue("an iso date has an end", EventRules.expiresAt(past, "19:30") != null)
+    Check.isTrue("two days ago is over", EventRules.isExpired(past, "19:30", now, 0L))
+    Check.isTrue("the dd/MM/yyyy format is read", EventRules.parseDate("01/01/2020") == "2020-01-01")
+    Check.isTrue("a Brazilian date in the past is over", EventRules.isExpired("01/01/2020", Nulls.str(), now, 0L))
+    // Without a usable date there is no expiry: it never sanitises on a guess.
+    Check.isTrue("no date, no end", EventRules.expiresAt("amanha", "") == null)
+    Check.isTrue("no date, never over", !EventRules.isExpired("amanha", "", now, 0L))
+    Check.isTrue("31/02 is not a date", EventRules.parseDate("31/02/2030") == null)
+}
+
+test "pastEventsLeaveTheListingAndRefuseNewAttendance" {
+    var host = OrgsTestKit.login("evt_host")
+    var pastId = EventsTestKit.create(host, "Evento que ja passou", EventsTestKit.day(-3))
+    var futureId = EventsTestKit.create(host, "Evento futuro", EventsTestKit.day(5))
+    // The showcase has only the future.
+    var listing = OrgsTestKit.anonymous().get("/events?limit=50")
+    Check.status(listing, 200)
+    Check.isTrue("future listed", EventsTestKit.listed(listing, futureId))
+    Check.isTrue("past hidden", !EventsTestKit.listed(listing, pastId))
+    // History stays reachable (marked) when asked for on purpose.
+    var history = OrgsTestKit.anonymous().get("/events?limit=50&includePast=true")
+    Check.status(history, 200)
+    var at = EventsTestKit.indexOf(history, pastId)
+    Check.isTrue("past listed with includePast", at >= 0)
+    Check.jsonEq(history, "items." + at + ".expired", "true")
+    // And it takes no more attendance.
+    var late = host.post("/events/" + pastId + "/attendees", "")
+    Check.apiError(late, 400, "EVENT_FINISHED")
+    Check.jsonEq(late, "message", "Este evento ja aconteceu.")
+    // The future event takes it normally.
+    Check.status(host.post("/events/" + futureId + "/attendees", ""), 200)
+}
+
+test "sanitizationDropsAttendanceDataAndKeepsTheTotal" {
+    var host = OrgsTestKit.login("evt_sanitize_host")
+    var guest = OrgsTestKit.login("evt_sanitize_guest")
+    var service = EventsTestKit.service(EventsClock())
+    // A future event with a confirmed attendance...
+    var eventId = EventsTestKit.create(host, "Evento para sanitizar", EventsTestKit.day(2))
+    Check.status(guest.post("/events/" + eventId + "/attendees", ""), 200)
+    Check.eqInt("one attendance", 1, EventsTestKit.attendeeRows(eventId))
+    // ...that ended an hour ago (the instant comes from the UTC clock NOW, never a fixed hour of the day): it left the
+    // showcase, but the 24h grace still protects the data.
+    var hourAgo = Time.plusSeconds(Time.nowIso(), -3600L)
+    EventsTestKit.setEventDate(eventId, hourAgo.substring(0, 10), hourAgo.substring(11, 16))
+    service.sanitizeExpired()
+    Check.eqInt("grace keeps the attendance", 1, EventsTestKit.attendeeRows(eventId))
+    // Past the grace, the sanitisation erases the link to each person.
+    EventsTestKit.setEventDate(eventId, EventsTestKit.day(-3), "10:00")
+    var first = service.sanitizeExpired()
+    Check.isTrue("at least this event was sanitised", first.sanitized() >= 1)
+    Check.eqInt("attendance erased", 0, EventsTestKit.attendeeRows(eventId))
+    // The total survives without the identities.
+    var detail = OrgsTestKit.anonymous().get("/events/" + eventId)
+    Check.status(detail, 200)
+    Check.jsonEq(detail, "attendees", "1")
+    Check.jsonEq(detail, "expired", "true")
+    // The person's contribution survives too: the per-user count feeds the reputation of the profile.
+    Check.eqInt("attended total of the guest", 1, EventsTestKit.store().attendedTotal("evt_sanitize_guest"))
+    // Idempotent: running again changes nothing for this event.
+    service.sanitizeExpired()
+    Check.eqInt("still erased", 0, EventsTestKit.attendeeRows(eventId))
+    Check.jsonEq(OrgsTestKit.anonymous().get("/events/" + eventId), "attendees", "1")
+    Check.eqInt("the total is not counted twice", 1, EventsTestKit.store().attendedTotal("evt_sanitize_guest"))
+    // After the retention the event leaves for good.
+    OrgsTestKit.db().execute("update events set sanitized_at = ? where id = ?", DbParams().bindInstant(Time.plusSeconds(Time.nowIso(), -34560000L)).bindStr(eventId))
+    Check.isTrue("purged by retention", service.sanitizeExpired().purged() >= 1)
+    Check.apiError(OrgsTestKit.anonymous().get("/events/" + eventId), 404, "EVENT_NOT_FOUND")
+    Check.eqInt("no attendance left", 0, EventsTestKit.attendeeRows(eventId))
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}

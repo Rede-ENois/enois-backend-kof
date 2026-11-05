@@ -1,0 +1,116 @@
+package companies
+
+import jobs.*
+import kernel.text.*
+
+// The companies directory: real pages first-class, plus the names that only exist on jobs. PAGE = an active page
+// (its counts come from grouped reads, never one query per page); JOBS = open internal jobs not linked to any page,
+// under a name no page has; EXTERNAL = external job names no page and no internal job name has.
+class CompanyDirectoryService {
+    CompanyService companies
+    MicroProjectService microProjects
+    JobCompanyDirectory jobsDirectory
+    // How many pages are read before ranking: ranking needs the counts, so it happens in memory.
+    static Int pageCandidates() = 500
+    public constructor(companies: CompanyService, microProjects: MicroProjectService, jobsDirectory: JobCompanyDirectory) {
+        this.companies = companies
+        this.microProjects = microProjects
+        this.jobsDirectory = jobsDirectory
+    }
+    static String key(name: String?) {
+        if (name == null) {
+            return ""
+        }
+        return name.trim().toLowerCase()
+    }
+    static Bool matches(needle: String, name: String) = needle.length() == 0 || CompanyDirectoryService.key(name).contains(needle)
+    static String pad(n: Long, width: Int) {
+        var text = "" + n
+        while (text.length() < width) {
+            text = "0" + text
+        }
+        return text
+    }
+    List<DirectoryEntryView> directory(query: String?, sector: String?, limit: Int) {
+        var needle = CompanyDirectoryService.key(query)
+        var bySector = Texts.hasText(sector)
+        var pages = companies.active(query, sector, CompanyDirectoryService.pageCandidates())
+        var ids = listOf<String>()
+        for (var p in pages) {
+            ids.add(p.id)
+        }
+        var jobs = jobsDirectory.openJobsByCompanyIds(ids)
+        var projects = microProjects.openCountsByCompany(ids)
+        var followers = companies.followerCounts(ids)
+        var entries = listOf<DirectoryEntryView>()
+        for (var page in pages) {
+            entries.add(DirectoryEntryView("PAGE", page.slug, page.name, page.logo, page.sector, page.location, jobs.getOrDefault(page.id, 0L), projects.getOrDefault(page.id, 0L), followers.getOrDefault(page.id, 0L)))
+        }
+        // Names without a page have no sector: a sector filter shows pages only.
+        if (!bySector) {
+            entries.addAll(this.namesWithoutPage(needle))
+        }
+        // Pages first, then names from jobs; each by activity, then by name.
+        var keys = listOf<String>()
+        var i = 0
+        while (i < entries.size()) {
+            var e = entries.get(i)
+            var kind = "1"
+            if (e.kind() == "PAGE") {
+                kind = "0"
+            }
+            keys.add(kind + CompanyDirectoryService.pad(999999999999L - (e.openJobs() + e.openProjects()), 13) + e.name().toLowerCase() + "\0" + CompanyDirectoryService.pad(i as Long, 8))
+            i = i + 1
+        }
+        Texts.sortInPlace(keys)
+        var out = listOf<DirectoryEntryView>()
+        for (var k in keys) {
+            if (out.size() >= limit) {
+                break
+            }
+            var at = k.substring(k.length() - 8).toInt()
+            out.add(entries.get(at))
+        }
+        return out
+    }
+    List<DirectoryEntryView> namesWithoutPage(needle: String) {
+        var pageNames = listOf<String>()
+        for (var n in companies.activeNames()) {
+            pageNames.add(CompanyDirectoryService.key(n))
+        }
+        var order = listOf<String>()
+        Map<String,DirectoryEntryView> byName = mapOf()
+        for (var job in jobsDirectory.openUnlinkedJobsByName()) {
+            var k = CompanyDirectoryService.key(job.name)
+            if (!pageNames.contains(k) && CompanyDirectoryService.matches(needle, job.name)) {
+                if (byName.get(k) == null) {
+                    order.add(k)
+                }
+                byName.put(k, DirectoryEntryView("JOBS", null, job.name, job.logo, null, null, job.count, 0L, 0L))
+            }
+        }
+        for (var external in jobsDirectory.externalJobsByName()) {
+            var k = CompanyDirectoryService.key(external.name)
+            if (pageNames.contains(k) || !CompanyDirectoryService.matches(needle, external.name)) {
+                continue
+            }
+            var internal = byName.get(k)
+            // The same name on internal and external jobs is one company: the counts add up.
+            if (internal != null) {
+                byName.put(k, DirectoryEntryView("JOBS", null, internal.name(), internal.logo(), null, null, internal.openJobs() + external.count, 0L, 0L))
+            }
+            else {
+                order.add(k)
+                byName.put(k, DirectoryEntryView("EXTERNAL", null, external.name, external.logo, null, null, external.count, 0L, 0L))
+            }
+        }
+        var out = listOf<DirectoryEntryView>()
+        for (var k in order) {
+            var e = byName.get(k)
+            if (e != null) {
+                out.add(e)
+            }
+        }
+        return out
+    }
+}

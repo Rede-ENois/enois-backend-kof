@@ -1,0 +1,74 @@
+import app.*
+import kernel.testkit.*
+import profile.*
+
+// Port of CorporateNametagTests: the nametag of the professional profile is the `@` and the end of the public
+// URL, independent from the social one.
+cnCreate(who: ProfileCaller, username: String) {
+    var res = who.post("/me/business-profile", "{\"username\":\"" + username + "\",\"name\":\"Nome Profissional\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "username", username)
+}
+
+cnActivate(who: ProfileCaller) {
+    Check.status(who.patch("/me/business-profile", "{\"headline\":\"Desenvolvedora\"}"), 200)
+    var res = who.post("/me/business-profile/activate", "")
+    Check.status(res, 200)
+    Check.jsonEq(res, "status", "ACTIVE")
+}
+
+cnChange(who: ProfileCaller, username: String) {
+    Check.status(who.post("/me/business-profile/username", "{\"username\":\"" + username + "\"}"), 200)
+}
+
+test "newNametagChangesThePublicUrlAndNotTheSocialHandle" {
+    var who = OrgsTestKit.login("nametag_success")
+    var guest = OrgsTestKit.anonymous()
+    Check.status(who.patch("/me/profile", "{\"username\":\"social.da.mel\",\"name\":\"Mel\"}"), 200)
+    cnCreate(who, "corp.antigo")
+    cnActivate(who)
+    var me = who.get("/me")
+    Check.status(me, 200)
+    var socialHandle = OrgsTestKit.str(me, "username")
+    Check.isTrue("social handle " + socialHandle, socialHandle.startsWith("social-da-mel"))
+    Check.jsonEq(guest.get("/corporate/corp.antigo"), "username", "corp.antigo")
+    cnChange(who, "melsantos")
+    Check.jsonEq(who.get("/me/business-profile"), "username", "melsantos")
+    Check.jsonEq(guest.get("/corporate/melsantos"), "username", "melsantos")
+    Check.status(guest.get("/corporate/corp.antigo"), 404)
+    var social = guest.get("/users/" + socialHandle)
+    Check.status(social, 200)
+    Check.jsonEq(social, "username", socialHandle)
+}
+
+test "takenNametagIsRefused" {
+    var owner = OrgsTestKit.login("nametag_dona")
+    cnCreate(owner, "nametag.dona")
+    var other = OrgsTestKit.login("nametag_outra")
+    cnCreate(other, "nametag.outra")
+    Check.apiError(other.post("/me/business-profile/username", "{\"username\":\"nametag.dona\"}"), 409, "USERNAME_TAKEN")
+    Check.jsonEq(other.get("/me/business-profile"), "username", "nametag.outra")
+}
+
+test "emptyNametagIsRefused" {
+    var who = OrgsTestKit.login("nametag_empty")
+    cnCreate(who, "nametag.vazio")
+    Check.apiError(who.post("/me/business-profile/username", "{\"username\":\"  \"}"), 400, "INVALID_USERNAME")
+}
+
+test "malformedNametagIsRefused" {
+    var who = OrgsTestKit.login("nametag_invalido")
+    cnCreate(who, "nametag.valido")
+    // Too short, with a space and starting or ending with a separator: none becomes a profile URL.
+    for (var bad in listOf("ab", "mel santos", ".melsantos", "melsantos.", "melsantos_")) {
+        Check.apiError(who.post("/me/business-profile/username", "{\"username\":\"" + bad + "\"}"), 400, "INVALID_USERNAME")
+    }
+}
+
+test "sendingTheSameNametagIsAccepted" {
+    var who = OrgsTestKit.login("nametag_mesmo")
+    cnCreate(who, "nametag.mesmo")
+    cnChange(who, "nametag.mesmo")
+    Check.jsonEq(who.get("/me/business-profile"), "username", "nametag.mesmo")
+    OrgsTestKit.finish()
+}

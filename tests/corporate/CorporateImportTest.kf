@@ -1,0 +1,86 @@
+import app.*
+import kernel.testkit.*
+import profile.*
+
+// Port of CorporateImportConsentTests and CorporateImportPersistenceTests: the professional profile is NOT an
+// automatic copy of the social one. The preview shows what would come and only the explicitly chosen fields apply.
+ciCreate(who: ProfileCaller, username: String, name: String) {
+    Check.status(who.post("/me/business-profile", "{\"username\":\"" + username + "\",\"name\":\"" + name + "\"}"), 200)
+}
+
+test "bannerHtmlRoundTripsThroughTheProfessionalProfile" {
+    var who = OrgsTestKit.login("corporate_banner_html")
+    ciCreate(who, "capa.html", "Nome Profissional")
+    var html = "<div style=\\\"color:red\\\">capa</div>"
+    var res = who.patch("/me/business-profile", "{\"headline\":\"Headline\",\"bannerHtml\":\"" + html + "\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "bannerHtml", "<div style=\"color:red\">capa</div>")
+    Check.jsonEq(who.get("/me/business-profile"), "bannerHtml", "<div style=\"color:red\">capa</div>")
+}
+
+test "previewShowsSocialFieldsWithoutWritingAnything" {
+    var who = OrgsTestKit.login("import_preview")
+    Check.status(who.patch("/me/profile", "{\"headline\":\"Headline do social\",\"bio\":\"Bio do social\",\"name\":\"Nome Social\"}"), 200)
+    ciCreate(who, "import.preview", "Nome Profissional")
+    Check.jsonEq(who.get("/me/business-profile"), "headline", "")
+    var preview = who.get("/me/business-profile/import-preview")
+    Check.status(preview, 200)
+    Check.jsonEq(preview, "headline", "Headline do social")
+    Check.jsonEq(preview, "bio", "Bio do social")
+    var after = who.get("/me/business-profile")
+    Check.jsonEq(after, "headline", "")
+    Check.jsonEq(after, "bio", "")
+}
+
+test "onlyTheChosenFieldsAreApplied" {
+    var who = OrgsTestKit.login("import_consent")
+    Check.status(who.patch("/me/profile", "{\"headline\":\"Headline do social\",\"bio\":\"Bio do social\",\"name\":\"Nome Social\"}"), 200)
+    ciCreate(who, "import.consent", "Nome Profissional")
+    var res = who.post("/me/business-profile/import", "{\"fields\":[\"headline\"]}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "headline", "Headline do social")
+    Check.jsonEq(res, "bio", "")
+    Check.jsonEq(res, "name", "Nome Profissional")
+}
+
+test "bannerHtmlIsImportedWhenChosen" {
+    var who = OrgsTestKit.login("import_banner_html")
+    Check.status(who.patch("/me/profile", "{\"username\":\"capa.social\",\"headline\":\"Headline do social\",\"bannerHtml\":\"<section class=\\\"capa\\\">capa do social</section>\"}"), 200)
+    ciCreate(who, "import.banner", "Nome Profissional")
+    var preview = who.get("/me/business-profile/import-preview")
+    Check.status(preview, 200)
+    Check.jsonEq(preview, "bannerHtml", "<section class=\"capa\">capa do social</section>")
+    var res = who.post("/me/business-profile/import", "{\"fields\":[\"bannerHtml\"]}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "bannerHtml", "<section class=\"capa\">capa do social</section>")
+    Check.jsonEq(res, "headline", "")
+}
+
+test "emptySelectionIsRefused" {
+    var who = OrgsTestKit.login("import_empty")
+    ciCreate(who, "import.empty", "Nome Profissional")
+    Check.apiError(who.post("/me/business-profile/import", "{\"fields\":[]}"), 400, "NO_FIELDS_SELECTED")
+}
+
+test "unknownFieldIsRefused" {
+    var who = OrgsTestKit.login("import_unknown")
+    ciCreate(who, "import.unknown", "Nome Profissional")
+    Check.apiError(who.post("/me/business-profile/import", "{\"fields\":[\"senha\"]}"), 400, "INVALID_IMPORT_FIELD")
+}
+
+test "importingAllFieldsPersistsAndReadsBack" {
+    var who = OrgsTestKit.login("import_persist_user")
+    Check.status(who.patch("/me/profile", "{\"name\":\"Maria Social\",\"headline\":\"Engenheira de dados\",\"bio\":\"Bio social completa.\",\"location\":\"Recife, PE\"}"), 200)
+    Check.status(who.post("/me/business-profile", "{\"username\":\"import.persist\",\"name\":\"Nome Profissional Inicial\"}"), 200)
+    // Every field the preview offers (a null field counts: Jackson's asText of a null node is "null", length 4).
+    var preview = who.get("/me/business-profile/import-preview")
+    Check.status(preview, 200)
+    Check.status(who.post("/me/business-profile/import", "{\"fields\":[\"name\",\"headline\",\"bio\",\"avatar\",\"banner\",\"bannerHtml\",\"location\"]}"), 200)
+    var after = who.get("/me/business-profile")
+    Check.status(after, 200)
+    Check.jsonEq(after, "name", "Maria Social")
+    Check.jsonEq(after, "headline", "Engenheira de dados")
+    Check.jsonEq(after, "bio", "Bio social completa.")
+    Check.jsonEq(after, "location", "Recife, PE")
+    OrgsTestKit.finish()
+}

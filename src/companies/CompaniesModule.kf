@@ -1,0 +1,56 @@
+package companies
+
+import coin.*
+import corporate.*
+import jobs.*
+import kernel.*
+import messaging.*
+import notifications.*
+import profile.*
+
+// Composition of the companies domain (company pages, directory, microprojects). AppWiring installs it after
+// corporate, profile, notifications, messaging, coin and jobs; the jobs domain takes `jobsBridge` as its
+// `JobCompanies` seam, so it is built first (`CompaniesModule.core`) and the routes come after the jobs.
+class CompaniesModule {
+    CompanyService companies
+    MicroProjectService microProjects
+    CompanyDirectoryService directory
+    public constructor(companies: CompanyService, microProjects: MicroProjectService, directory: CompanyDirectoryService) {
+        this.companies = companies
+        this.microProjects = microProjects
+        this.directory = directory
+    }
+    // The company service alone (no routes): the jobs domain needs it before the jobs module exists.
+    static CompanyService core(platform: Platform, notificationsModule: NotificationsModule) = CompanyService(platform.db, CompanyStore(platform.db), notificationsModule.notifications)
+    static CompaniesModule install(platform: Platform, shared: SharedServices, companies: CompanyService, profiles: ProfileModule, corporateModule: CorporateModule, notificationsModule: NotificationsModule, messagingModule: MessagingModule, coinModule: CoinModule, jobsModule: JobsModule) {
+        var projects = MicroProjectService(platform.db, MicroProjectStore(platform.db), companies, notificationsModule.notifications, coinModule.service, corporateModule.service, messagingModule.service, shared.blockedUsers)
+        var directory = CompanyDirectoryService(companies, projects, jobsModule.directory)
+        CompanyRoutes(companies, projects, directory, jobsModule.directory, corporateModule.service, profiles.directory).register(platform.server)
+        return CompaniesModule(companies, projects, directory)
+    }
+}
+
+// jobs: the page of a company, the role of a member and the followers, now backed by CompanyService.
+class CompanyJobsBridge extends JobCompanies {
+    CompanyService companies
+    public constructor(store: kernel.db.Db, companies: CompanyService) {
+        super(store)
+        this.companies = companies
+    }
+    JobCompanyPage company(companyId: String) {
+        var c = companies.company(companyId)
+        return JobCompanyPage(c.id, c.slug, c.name, c.logo, c.ownerUserId, c.status)
+    }
+    String? roleOf(companyId: String, userId: String) = companies.roleOf(companyId, userId)
+    requireRecruiter(page: JobCompanyPage, userId: String) {
+        companies.requireRole(companies.company(page.id), userId, "RECRUITER")
+    }
+    Map<String,String> slugsOf(ids: List<String>) {
+        Map<String,String> out = mapOf()
+        for (var c in companies.byIds(ids)) {
+            out.put(c.id, c.slug)
+        }
+        return out
+    }
+    List<String> followerIds(companyId: String) = companies.followerIdsOf(companyId)
+}

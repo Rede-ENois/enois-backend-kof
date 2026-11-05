@@ -1,0 +1,154 @@
+import app.*
+import kernel.time.*
+import kernel.testkit.*
+import mentoring.*
+import profile.*
+
+// Port of MentorAgendaTests: the weekly availability generates slots, the owner sees who booked, nobody else sees the
+// inbox, and the mentor publishes an external room for the mentees.
+TestResponse agendaPut(owner: ProfileCaller, mentorId: String, itemsJson: String) = owner.put("/mentors/" + mentorId + "/availability", "{\"items\":" + itemsJson + "}")
+
+TestResponse agendaSlots(mentorId: String) {
+    var res = OrgsTestKit.anonymous().get("/mentors/" + mentorId + "/slots")
+    Check.status(res, 200)
+    return res
+}
+
+String monWedFri() = "[{\"dayOfWeek\":1,\"times\":[\"19:00\",\"20:00\"]},{\"dayOfWeek\":3,\"times\":[\"19:00\"]},{\"dayOfWeek\":5,\"times\":[\"19:00\"]}]"
+
+test "weekly availability generates slots and keeps the booked ones" {
+    var owner = MentoringTestKit.login("mentor-agenda-owner")
+    var mentorId = MentoringTestKit.createPlainMentor(owner)
+    // Monday, Wednesday and Friday at 19:00, and Monday at 20:00 too.
+    var saved = agendaPut(owner, mentorId, monWedFri())
+    Check.status(saved, 200)
+    Check.jsonEq(saved, "0.dayOfWeek", "1")
+    Check.eqInt("two times on monday", 2, saved.jsonSize("0.times"))
+    Check.jsonEq(saved, "0.times.0", "19:00")
+    var slots = agendaSlots(mentorId)
+    var count = slots.jsonSize("items")
+    Check.isTrue("more than eight slots", count > 8)
+    var bookedSlot = slots.json("items.0.id")
+    var mentee = MentoringTestKit.login("mentor-agenda-mentee")
+    Check.status(MentoringTestKit.book(mentee, mentorId, bookedSlot, "Quero aprender Spring"), 201)
+    // Saving the same rules again neither duplicates slots nor erases the booked one.
+    Check.status(agendaPut(owner, mentorId, monWedFri()), 200)
+    var afterSame = agendaSlots(mentorId)
+    Check.eqInt("same count", count, afterSame.jsonSize("items"))
+    Check.isTrue("booked slot stays", MentoringTestKit.contains(afterSame, "items", bookedSlot))
+    // Taking Friday out withdraws only the free slots of that day; the booked one stays.
+    Check.status(agendaPut(owner, mentorId, "[{\"dayOfWeek\":1,\"times\":[\"19:00\",\"20:00\"]},{\"dayOfWeek\":3,\"times\":[\"19:00\"]}]"), 200)
+    var afterRemoval = agendaSlots(mentorId)
+    Check.isTrue("fewer slots", afterRemoval.jsonSize("items") < afterSame.jsonSize("items"))
+    Check.isTrue("booked slot stays after removal", MentoringTestKit.contains(afterRemoval, "items", bookedSlot))
+    // The owner reads the rules back grouped by day; nobody else does.
+    var rules = owner.get("/mentors/" + mentorId + "/availability")
+    Check.status(rules, 200)
+    Check.eqInt("two days", 2, rules.jsonSize(""))
+    Check.jsonEq(rules, "1.dayOfWeek", "3")
+    // An empty save clears the rules and withdraws every free future slot.
+    Check.status(agendaPut(owner, mentorId, "[]"), 200)
+    Check.eqInt("only the booked slot", 1, agendaSlots(mentorId).jsonSize("items"))
+}
+
+test "slots of a day are the rule times in Sao Paulo, an hour long, never in the past" {
+    var owner = MentoringTestKit.login("mentor-agenda-zone")
+    var mentorId = MentoringTestKit.createPlainMentor(owner)
+    Check.status(agendaPut(owner, mentorId, "[{\"dayOfWeek\":1,\"times\":[\"19:00\"]}]"), 200)
+    var slots = agendaSlots(mentorId)
+    Check.isTrue("at least three mondays", slots.jsonSize("items") >= 3)
+    var starts = slots.json("items.0.startsAt")
+    // 19:00 in Sao Paulo (UTC-3) is 22:00Z.
+    Check.isTrue("22:00Z", starts.endsWith("T22:00:00Z"))
+    Check.eqStr("one hour", Time.plusSeconds(starts, 3600L), slots.json("items.0.endsAt"))
+    Check.eqStr("slots are available", "true", slots.json("items.0.available"))
+}
+
+test "owner sees who booked and the message" {
+    var owner = MentoringTestKit.login("mentor-inbox-owner")
+    var mentorId = MentoringTestKit.createPlainMentor(owner)
+    Check.status(agendaPut(owner, mentorId, "[{\"dayOfWeek\":2,\"times\":[\"18:30\"]}]"), 200)
+    var slotId = agendaSlots(mentorId).json("items.0.id")
+    var mentee = MentoringTestKit.login("mentor-inbox-mentee")
+    Check.status(MentoringTestKit.book(mentee, mentorId, slotId, "Preciso de ajuda com entrevista"), 201)
+    var inbox = owner.get("/mentors/" + mentorId + "/sessions")
+    Check.status(inbox, 200)
+    Check.jsonEq(inbox, "0.menteeId", "mentor-inbox-mentee")
+    Check.isTrue("mentee username", inbox.json("0.menteeUsername").length() > 0)
+    Check.jsonEq(inbox, "0.menteeName", "mentor-inbox-mentee")
+    Check.jsonEq(inbox, "0.message", "Preciso de ajuda com entrevista")
+    Check.jsonEq(inbox, "0.status", "SCHEDULED")
+    Check.isTrue("starts at", inbox.json("0.startsAt").length() > 0)
+    Check.jsonEq(inbox, "0.slotId", slotId)
+    // The mentee and a third party do not see the inbox of the mentor.
+    Check.status(mentee.get("/mentors/" + mentorId + "/sessions"), 403)
+    Check.status(OrgsTestKit.anonymous().get("/mentors/" + mentorId + "/sessions"), 401)
+    // Neither is the availability public.
+    Check.status(mentee.get("/mentors/" + mentorId + "/availability"), 403)
+}
+
+test "the inbox lists the newest slot first and the sessions without a slot last" {
+    var owner = MentoringTestKit.login("mentor-order-owner")
+    var mentorId = MentoringTestKit.createPlainMentor(owner)
+    var mentee = MentoringTestKit.login("mentor-order-mentee")
+    var near = MentoringTestKit.createSlot(owner, mentorId, MentoringTestKit.after(3600L))
+    var far = MentoringTestKit.createSlot(owner, mentorId, MentoringTestKit.after(7L * 86400L))
+    var nearSession = MentoringTestKit.bookOk(mentee, mentorId, near)
+    var farSession = MentoringTestKit.bookOk(mentee, mentorId, far)
+    var inbox = owner.get("/mentors/" + mentorId + "/sessions")
+    Check.status(inbox, 200)
+    Check.jsonEq(inbox, "0.id", farSession)
+    Check.jsonEq(inbox, "1.id", nearSession)
+}
+
+test "availability validates day and time" {
+    var owner = MentoringTestKit.login("mentor-agenda-invalid")
+    var mentorId = MentoringTestKit.createPlainMentor(owner)
+    Check.apiError(agendaPut(owner, mentorId, "[{\"dayOfWeek\":8,\"times\":[\"19:00\"]}]"), 400, "INVALID_DAY_OF_WEEK")
+    Check.apiError(agendaPut(owner, mentorId, "[{\"dayOfWeek\":1,\"times\":[\"25:00\"]}]"), 400, "INVALID_TIME")
+    Check.apiError(agendaPut(owner, mentorId, "[{\"dayOfWeek\":1,\"times\":[\"9:00\"]}]"), 400, "INVALID_TIME")
+    Check.apiError(agendaPut(owner, mentorId, "[{\"dayOfWeek\":1,\"times\":[\"12:60\"]}]"), 400, "INVALID_TIME")
+    Check.apiError(agendaPut(owner, mentorId, "[{\"times\":[\"10:00\"]}]"), 400, "INVALID_DAY_OF_WEEK")
+    Check.apiError(agendaPut(owner, mentorId, "[{\"dayOfWeek\":1,\"times\":[\"01:00\",\"02:00\",\"03:00\",\"04:00\",\"05:00\",\"06:00\",\"07:00\",\"08:00\",\"09:00\",\"10:00\",\"11:00\",\"12:00\",\"13:00\"]}]"), 400, "TOO_MANY_TIMES")
+    // Duplicates collapse and a body without items clears the rules.
+    var dup = agendaPut(owner, mentorId, "[{\"dayOfWeek\":4,\"times\":[\"10:00\",\"10:00\",\" 09:30 \"]}]")
+    Check.status(dup, 200)
+    Check.eqInt("two times", 2, dup.jsonSize("0.times"))
+    Check.jsonEq(dup, "0.times.0", "09:30")
+    var empty = owner.put("/mentors/" + mentorId + "/availability", "{}")
+    Check.status(empty, 200)
+    Check.eqInt("cleared", 0, empty.jsonSize(""))
+    var stranger = MentoringTestKit.login("mentor-agenda-invalid-stranger")
+    Check.apiError(agendaPut(stranger, mentorId, "[]"), 403, "FORBIDDEN")
+    Check.apiError(agendaPut(stranger, "mentor_nope", "[]"), 404, "MENTOR_NOT_FOUND")
+}
+
+test "mentor publishes an external meeting room for mentees" {
+    var owner = MentoringTestKit.login("mentor-meeting-owner")
+    // An https link at registration.
+    var created = owner.post("/mentors", "{\"expertise\":[\"Java\"],\"price\":\"Gratuito\",\"meetingUrl\":\"https://meet.google.com/abc-defg-hij\"}")
+    Check.status(created, 201)
+    var mentorId = OrgsTestKit.str(created, "id")
+    // The public showcase does not announce the room; only the owner gets it on /room. Who books gets the link in
+    // the session. A non-https link is refused.
+    var shown = OrgsTestKit.anonymous().get("/mentors/" + mentorId)
+    Check.status(shown, 200)
+    Check.isTrue("no meetingUrl", !shown.jsonHas("meetingUrl"))
+    Check.eqStr("mode deduced from the link", "CUSTOM", shown.json("roomMode"))
+    var room = owner.get("/mentors/" + mentorId + "/room")
+    Check.status(room, 200)
+    Check.jsonEq(room, "meetingUrl", "https://meet.google.com/abc-defg-hij")
+    var insecure = owner.patch("/mentors/" + mentorId, "{\"expertise\":[\"Java\"],\"price\":\"Gratuito\",\"meetingUrl\":\"http://sala.insegura.example/x\"}")
+    Check.apiError(insecure, 400, "INVALID_MEETING_URL")
+    // Removing the link is allowed too (empty string).
+    var cleared = owner.patch("/mentors/" + mentorId, "{\"expertise\":[\"Java\"],\"price\":\"Gratuito\",\"meetingUrl\":\"\"}")
+    Check.status(cleared, 200)
+    Check.isTrue("no meetingUrl", !cleared.jsonHas("meetingUrl"))
+    Check.eqStr("back to Jitsi", "JITSI_SESSION", cleared.json("roomMode"))
+    var longUrl = "https://meet.example.org/" + strings.repeat("a", 480)
+    Check.apiError(owner.patch("/mentors/" + mentorId, "{\"expertise\":[\"Java\"],\"meetingUrl\":\"" + longUrl + "\"}"), 400, "INVALID_MEETING_URL")
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}

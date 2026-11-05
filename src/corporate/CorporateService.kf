@@ -1,0 +1,253 @@
+package corporate
+
+import kernel.error.*
+import kernel.text.*
+import kernel.time.*
+import kernel.url.*
+import profile.*
+
+// CorporateProfileService: the professional identity of the account. Born by the person's initiative, always as a
+// draft and with nothing copied from the social profile (the import is a separate flow with consent field by
+// field); activating needs a headline; deactivating deletes nothing.
+class CorporateService {
+    CorporateStore store
+    ProfileDirectory profiles
+    // Fields the social profile can offer, by name, never in bulk.
+    static List<String> importableFields() = listOf("name", "headline", "bio", "avatar", "banner", "bannerHtml", "location")
+    public constructor(store: CorporateStore, profiles: ProfileDirectory) {
+        this.store = store
+        this.profiles = profiles
+    }
+    // 1:1 per account: a second profile is refused.
+    CorporateProfile create(userId: String, username: String?, name: String?) {
+        if (store.findByUserId(userId) != null) {
+            throw Errors.api(409, "CORPORATE_PROFILE_EXISTS", "Você já tem um perfil profissional. Edite-o em vez de criar outro.")
+        }
+        if (store.existsByUsername(CorporateRules.normalize(username))) {
+            throw Errors.api(409, "USERNAME_TAKEN", "Esse usuário profissional já está em uso. Escolha outro.")
+        }
+        var created = this.draft(userId, username, name)
+        return store.save(created)
+    }
+    // The format rules of the domain threw IllegalArgumentException (400 BAD_REQUEST at the edge).
+    CorporateProfile draft(userId: String, username: String?, name: String?) {
+        try {
+            return CorporateRules.create(userId, username, name, Time.nowIso())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    CorporateProfile? byUser(userId: String) = store.findByUserId(userId)
+    CorporateProfile? byUsername(username: String) = store.findByUsername(CorporateRules.normalize(username))
+    // The ACTIVE identities of these accounts keyed by account id (draft or disabled never represent anyone).
+    Map<String,CorporateProfile> activeByUserIds(userIds: List<String>) {
+        Map<String,CorporateProfile> out = mapOf()
+        for (var p in store.findByUserIds(userIds)) {
+            if (p.active()) {
+                out.put(p.userId, p)
+            }
+        }
+        return out
+    }
+    // The account's ACTIVE identity, or 403: every professional operation goes through here.
+    CorporateProfile requireActive(userId: String) {
+        var p = store.findByUserId(userId)
+        if (p == null) {
+            throw Errors.api(403, "NO_ACTIVE_CORPORATE_PROFILE", "Ative o seu perfil profissional para usar os recursos de trabalho.")
+        }
+        if (!p.active()) {
+            throw Errors.api(403, "NO_ACTIVE_CORPORATE_PROFILE", "Ative o seu perfil profissional para usar os recursos de trabalho.")
+        }
+        return p
+    }
+    CorporateProfile updateDetails(userId: String, b: CorporateDetailsBody) {
+        var current = this.byUserIdOrThrow(userId)
+        var headline = CorporateService.trimOrNull(b.headline(), 200)
+        var bio = CorporateService.trimOrNull(b.bio(), 2000)
+        var avatar = CorporateService.trimOrNull(b.avatar(), 500)
+        var banner = CorporateService.trimOrNull(b.banner(), 500)
+        var bannerHtml = CorporateService.trimOrNull(b.bannerHtml(), 20000)
+        var location = CorporateService.trimOrNull(b.location(), 200)
+        var industry = CorporateService.trimOrNull(b.industry(), 200)
+        var links = SafeUrl.requireHttpUrlsJoined(CorporateService.trimOrNull(b.externalLinks(), 1000), "[,\\s]+", "links externos")
+        return store.save(current.withDetails(headline, bio, avatar, banner, bannerHtml, location, industry, links, Time.nowIso()))
+    }
+    // What the social profile offers, fitted to the professional limits. Nothing is written.
+    CorporateImportPreview importPreview(userId: String) {
+        var social = this.social(userId)
+        return CorporateImportPreview(CorporateService.fit(social.name, 160), CorporateService.fit(social.headline, 200), CorporateService.fit(social.bio, 2000), CorporateService.fit(social.avatar, 500), CorporateService.fit(social.banner, 500), CorporateService.fitHtml(social.bannerHtml, 20000), CorporateService.fit(social.location, 200))
+    }
+    ProfileRecord social(userId: String) {
+        var p = profiles.findById(userId)
+        if (p == null) {
+            throw Errors.api(404, "PROFILE_NOT_FOUND", "Perfil social não encontrado.")
+        }
+        return p
+    }
+    // Only the explicitly chosen fields come over (an empty list is refused; the rest stays as it was).
+    CorporateProfile importFromSocial(userId: String, fields: List<String>?) {
+        if (fields == null) {
+            throw Errors.api(400, "NO_FIELDS_SELECTED", "Escolha pelo menos um campo para trazer do perfil social.")
+        }
+        if (fields.size() == 0) {
+            throw Errors.api(400, "NO_FIELDS_SELECTED", "Escolha pelo menos um campo para trazer do perfil social.")
+        }
+        var current = this.byUserIdOrThrow(userId)
+        var social = this.social(userId)
+        var selected = listOf<String>()
+        for (var field in fields) {
+            var key = CorporateService.fieldKey(field)
+            if (!CorporateService.importable(key)) {
+                throw Errors.api(400, "INVALID_IMPORT_FIELD", "Campo desconhecido para importação: " + key)
+            }
+            selected.add(key)
+        }
+        var headline = current.headline
+        var bio = current.bio
+        var avatar = current.avatar
+        var banner = current.banner
+        var bannerHtml = current.bannerHtml
+        var location = current.location
+        if (selected.contains("headline")) {
+            headline = CorporateService.fit(social.headline, 200)
+        }
+        if (selected.contains("bio")) {
+            bio = CorporateService.fit(social.bio, 2000)
+        }
+        if (selected.contains("avatar")) {
+            avatar = CorporateService.fit(social.avatar, 500)
+        }
+        if (selected.contains("banner")) {
+            banner = CorporateService.fit(social.banner, 500)
+        }
+        if (selected.contains("bannerhtml")) {
+            bannerHtml = CorporateService.fitHtml(social.bannerHtml, 20000)
+        }
+        if (selected.contains("location")) {
+            location = CorporateService.fit(social.location, 200)
+        }
+        var now = Time.nowIso()
+        var updated = current.withDetails(headline, bio, avatar, banner, bannerHtml, location, current.industry, current.externalLinks, now)
+        if (selected.contains("name") && Texts.hasText(social.name)) {
+            updated = this.renamed(updated, social.name, now)
+        }
+        return store.save(updated)
+    }
+    CorporateProfile renamed(p: CorporateProfile, name: String?, now: String) {
+        try {
+            return p.withName(name as String, now)
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String fieldKey(field: String?) {
+        if (field == null) {
+            return ""
+        }
+        return field.trim().toLowerCase()
+    }
+    static Bool importable(key: String) {
+        for (var f in CorporateService.importableFields()) {
+            if (f.toLowerCase() == key) {
+                return true
+            }
+        }
+        return false
+    }
+    // Fits the field limit without breaking the text (the preview shows the result).
+    static String? fit(value: String?, max: Int) {
+        if (value == null) {
+            return null
+        }
+        if (!Texts.hasText(value)) {
+            return null
+        }
+        var trimmed = value.trim()
+        if (trimmed.length() <= max) {
+            return trimmed
+        }
+        var cut = max - 1
+        if (cut < 0) {
+            cut = 0
+        }
+        return trimmed.substring(0, cut).trim() + "…"
+    }
+    // Markup is cut at the last `>` that fits: a half tag would turn the rest of the cover into visible text.
+    // When not even that fits the field stays empty.
+    static String? fitHtml(value: String?, max: Int) {
+        if (value == null) {
+            return null
+        }
+        if (!Texts.hasText(value)) {
+            return null
+        }
+        var trimmed = value.trim()
+        if (trimmed.length() <= max) {
+            return trimmed
+        }
+        var cut = trimmed.lastIndexOf(">", max - 1)
+        if (cut <= 0) {
+            return null
+        }
+        return trimmed.substring(0, cut + 1)
+    }
+    CorporateProfile rename(userId: String, name: String?) {
+        var current = this.byUserIdOrThrow(userId)
+        try {
+            return store.save(current.withName(name as String, Time.nowIso()))
+        } catch (String e) {
+            if (Errors.hasCode(e, "USERNAME_TAKEN")) {
+                throw e
+            }
+            throw Errors.badRequest()
+        }
+    }
+    // The nametag is the `@` and the end of the public URL; independent of the social @. Sending the current
+    // value is not an error and writes nothing; another person's nametag is 409.
+    CorporateProfile changeUsername(userId: String, username: String?) {
+        var current = this.byUserIdOrThrow(userId)
+        var desired = CorporateRules.normalize(username)
+        if (desired.length() == 0) {
+            throw Errors.api(400, "INVALID_USERNAME", "Escolha o nametag do perfil profissional: é ele que aparece como @ e no fim da URL.")
+        }
+        if (desired == current.username) {
+            return current
+        }
+        if (store.existsByUsername(desired)) {
+            throw Errors.api(409, "USERNAME_TAKEN", "Esse usuário profissional já está em uso. Escolha outro.")
+        }
+        if (!CorporateRules.usernameOk(desired)) {
+            throw Errors.api(400, "INVALID_USERNAME", "Usuário profissional inválido: use 3 a 30 caracteres entre letras, números, ponto, hífen ou underline.")
+        }
+        return store.save(current.withUsername(desired, Time.nowIso()))
+    }
+    // Activation needs a headline: an incomplete profile never shows as ready.
+    CorporateProfile activate(userId: String) {
+        var current = this.byUserIdOrThrow(userId)
+        if (!Texts.hasText(current.headline)) {
+            throw Errors.api(409, "PROFILE_INCOMPLETE", "Preencha a headline do perfil profissional antes de ativá-lo.")
+        }
+        return store.save(current.withStatus("ACTIVE", Time.nowIso()))
+    }
+    CorporateProfile deactivate(userId: String) = store.save(this.byUserIdOrThrow(userId).withStatus("DISABLED", Time.nowIso()))
+    CorporateProfile byUserIdOrThrow(userId: String) {
+        var p = store.findByUserId(userId)
+        if (p == null) {
+            throw Errors.api(404, "NO_BUSINESS_PROFILE", "Você ainda não tem um perfil profissional. Crie um para usar os recursos de trabalho.")
+        }
+        return p
+    }
+    static String? trimOrNull(value: String?, max: Int) {
+        if (value == null) {
+            return null
+        }
+        if (!Texts.hasText(value)) {
+            return null
+        }
+        var trimmed = value.trim()
+        if (trimmed.length() > max) {
+            throw Errors.api(400, "FIELD_TOO_LONG", "Um dos campos passou do limite de " + max + " caracteres.")
+        }
+        return trimmed
+    }
+}

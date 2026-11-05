@@ -1,0 +1,255 @@
+package mentoring
+
+import kernel.db.*
+import kernel.text.*
+
+// SQL of `mentors`, `mentor_slots`, `mentor_sessions` and `mentor_availabilities` (the JPA adapter of the Java
+// domain). State changes that two requests could race on (booking a slot, completing, cancelling and settling a
+// session, the completed-sessions counter) are atomic `update ... where` claims.
+class MentoringStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String mentorColumns() = "id, user_id, expertise, rating, sessions_count, price, banner, meeting_url, sparks_price, room_mode, jitsi_room, created_at, updated_at"
+    static String slotColumns() = "id, mentor_id, starts_at, ends_at, available"
+    static String sessionColumns() = "id, mentor_id, mentee_id, slot_id, message, status, price_sparks, room_mode, room_url, settled_at, created_at"
+    // The expertise is stored comma-joined (String.split drops trailing empty parts).
+    static List<String> splitExpertise(raw: String?) {
+        var out = listOf<String>()
+        if (raw == null) {
+            return out
+        }
+        if (raw.trim().length() == 0) {
+            return out
+        }
+        var parts = raw.split(",")
+        var last = parts.length
+        while (last > 0 && parts[last - 1].length() == 0) {
+            last = last - 1
+        }
+        var i = 0
+        while (i < last) {
+            out.add(parts[i])
+            i = i + 1
+        }
+        return out
+    }
+    static MentoringMentor mentor(r: DbRow) = MentoringMentor(r.getStr("id"), r.getStr("user_id"), MentoringStore.splitExpertise(r.getStrOrNull("expertise")), r.getDouble("rating"), r.getInt("sessions_count"), r.getStrOrNull("price"), r.getStrOrNull("banner"), r.getStrOrNull("meeting_url"), r.getLongOrNull("sparks_price"), MentoringRoomMode.fromStored(r.getStrOrNull("room_mode")), r.getStrOrNull("jitsi_room"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    static MentoringSlot slot(r: DbRow) = MentoringSlot(r.getStr("id"), r.getStr("mentor_id"), r.getInstant("starts_at"), r.getInstant("ends_at"), r.getBool("available"))
+    static MentoringSession session(r: DbRow) = MentoringSession(r.getStr("id"), r.getStr("mentor_id"), r.getStr("mentee_id"), r.getStrOrNull("slot_id"), r.getStrOrNull("message"), r.getStr("status"), r.getLongOrNull("price_sparks"), MentoringRoomMode.fromStored(r.getStrOrNull("room_mode")), r.getStrOrNull("room_url"), r.getInstantOrNull("settled_at"), r.getInstant("created_at"))
+    static List<MentoringMentor> mentors(rows: List<DbRow>) {
+        var out = listOf<MentoringMentor>()
+        for (var r in rows) {
+            out.add(MentoringStore.mentor(r))
+        }
+        return out
+    }
+    static List<MentoringSlot> slots(rows: List<DbRow>) {
+        var out = listOf<MentoringSlot>()
+        for (var r in rows) {
+            out.add(MentoringStore.slot(r))
+        }
+        return out
+    }
+    static List<MentoringSession> sessions(rows: List<DbRow>) {
+        var out = listOf<MentoringSession>()
+        for (var r in rows) {
+            out.add(MentoringStore.session(r))
+        }
+        return out
+    }
+    // ---- mentors
+    insertMentor(m: MentoringMentor) {
+        var p = DbParams()
+        p.bindStr(m.id)
+        p.bindStr(m.userId)
+        p.bindStr(String.join(",", m.expertise))
+        p.bindDouble(m.rating)
+        p.bindInt(m.sessionsCount)
+        p.bindStrOrNull(m.price)
+        p.bindStrOrNull(m.banner)
+        p.bindStrOrNull(m.meetingUrl)
+        p.bindLongOrNull(m.sparksPrice)
+        p.bindStr(m.roomMode)
+        p.bindStrOrNull(m.jitsiRoom)
+        p.bindInstant(m.createdAt)
+        p.bindInstant(m.updatedAt)
+        store.execute("insert into mentors (" + MentoringStore.mentorColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", p)
+    }
+    // The owner's edit: identity, rating, the completed counter and the creation date stay.
+    updateMentor(m: MentoringMentor) {
+        var p = DbParams()
+        p.bindStr(String.join(",", m.expertise))
+        p.bindStrOrNull(m.price)
+        p.bindStrOrNull(m.banner)
+        p.bindStrOrNull(m.meetingUrl)
+        p.bindLongOrNull(m.sparksPrice)
+        p.bindStr(m.roomMode)
+        p.bindStrOrNull(m.jitsiRoom)
+        p.bindInstant(m.updatedAt)
+        p.bindStr(m.id)
+        store.execute("update mentors set expertise = ?, price = ?, banner = ?, meeting_url = ?, sparks_price = ?, room_mode = ?, jitsi_room = ?, updated_at = ? where id = ?", p)
+    }
+    MentoringMentor? findMentor(id: String) {
+        var row = store.queryOptional("select " + MentoringStore.mentorColumns() + " from mentors where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return MentoringStore.mentor(row)
+    }
+    MentoringMentor? findMentorByUser(userId: String) {
+        var row = store.queryOptional("select " + MentoringStore.mentorColumns() + " from mentors where user_id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return MentoringStore.mentor(row)
+    }
+    deleteMentor(id: String) {
+        store.execute("delete from mentors where id = ?", DbParams().bindStr(id))
+    }
+    // The catalogue. With a query: newest first, matching the expertise or the name/@ of the owner. With only an
+    // expertise: best rated first. Every pattern is a literal `like ... escape '!'`.
+    List<MentoringMentor> findMentors(expertise: String?, query: String?, before: String?, limit: Int) {
+        var p = DbParams()
+        var sql = "select " + MentoringStore.mentorColumns() + " from mentors m where 1 = 1"
+        if (before != null) {
+            sql = sql + " and m.created_at < ?"
+            p.bindInstant(before)
+        }
+        var queryPattern = LikePattern.contains(query)
+        var expertisePattern = LikePattern.contains(expertise)
+        var order = " order by m.created_at desc"
+        if (queryPattern != null) {
+            if (expertisePattern != null) {
+                sql = sql + " and lower(m.expertise) like ? escape \'!\'"
+                p.bindStr(expertisePattern)
+            }
+            sql = sql + " and (lower(m.expertise) like ? escape \'!\' or exists (select p.id from users p where p.id = m.user_id and (lower(p.name) like ? escape \'!\' or lower(p.username) like ? escape \'!\')))"
+            p.bindStr(queryPattern)
+            p.bindStr(queryPattern)
+            p.bindStr(queryPattern)
+        }
+        else {
+            if (expertisePattern != null) {
+                sql = sql + " and lower(m.expertise) like ? escape \'!\'"
+                p.bindStr(expertisePattern)
+                order = " order by m.rating desc, m.created_at desc"
+            }
+        }
+        sql = sql + order + " limit ?"
+        p.bindInt(limit)
+        return MentoringStore.mentors(store.queryList(sql, p))
+    }
+    // Completed sessions of a mentee: the reputation component of the profile.
+    Long countCompletedAsMentee(userId: String) = store.queryLong("select count(*) from mentor_sessions where mentee_id = ? and status = \'COMPLETED\'", DbParams().bindStr(userId))
+    // A completed session counts for the mentor: the number the showcase shows.
+    countSessionCompleted(mentorId: String, now: String) {
+        store.execute("update mentors set sessions_count = sessions_count + 1, updated_at = ? where id = ?", DbParams().bindInstant(now).bindStr(mentorId))
+    }
+    // ---- slots
+    insertSlot(s: MentoringSlot) {
+        store.execute("insert into mentor_slots (" + MentoringStore.slotColumns() + ") values (?, ?, ?, ?, ?)", DbParams().bindStr(s.id).bindStr(s.mentorId).bindInstant(s.startsAt).bindInstant(s.endsAt).bindBool(s.available))
+    }
+    List<MentoringSlot> findSlotsByMentor(mentorId: String) = MentoringStore.slots(store.queryList("select " + MentoringStore.slotColumns() + " from mentor_slots where mentor_id = ? order by starts_at asc", DbParams().bindStr(mentorId)))
+    MentoringSlot? findSlot(slotId: String) {
+        var row = store.queryOptional("select " + MentoringStore.slotColumns() + " from mentor_slots where id = ?", DbParams().bindStr(slotId))
+        if (row == null) {
+            return null
+        }
+        return MentoringStore.slot(row)
+    }
+    // The slots of many sessions in one query, by id.
+    Map<String,MentoringSlot> findSlotsByIds(ids: List<String>) {
+        Map<String,MentoringSlot> out = mapOf()
+        if (ids.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        var marks = listOf<String>()
+        for (var id in ids) {
+            p.bindStr(id)
+            marks.add("?")
+        }
+        for (var r in store.queryList("select " + MentoringStore.slotColumns() + " from mentor_slots where id in (" + String.join(",", marks) + ")", p)) {
+            var s = MentoringStore.slot(r)
+            out.put(s.id, s)
+        }
+        return out
+    }
+    deleteSlot(slotId: String) {
+        store.execute("delete from mentor_slots where id = ?", DbParams().bindStr(slotId))
+    }
+    // Atomic booking: true only for the request that took the free slot.
+    Bool bookSlot(slotId: String) = store.execute("update mentor_slots set available = false where id = ? and available = true", DbParams().bindStr(slotId)) > 0
+    releaseSlot(slotId: String) {
+        store.execute("update mentor_slots set available = true where id = ?", DbParams().bindStr(slotId))
+    }
+    // The next free future slot of each mentor, one query: mentor id -> ISO instant.
+    Map<String,String> nextSlots(mentorIds: List<String>, now: String) {
+        Map<String,String> out = mapOf()
+        if (mentorIds.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        p.bindInstant(now)
+        var marks = listOf<String>()
+        for (var id in mentorIds) {
+            p.bindStr(id)
+            marks.add("?")
+        }
+        for (var r in store.queryList("select mentor_id, min(starts_at) as next_start from mentor_slots where available = true and starts_at > ? and mentor_id in (" + String.join(",", marks) + ") group by mentor_id", p)) {
+            out.put(r.getStr("mentor_id"), r.getInstant("next_start"))
+        }
+        return out
+    }
+    // ---- sessions
+    insertSession(s: MentoringSession) {
+        var p = DbParams()
+        p.bindStr(s.id)
+        p.bindStr(s.mentorId)
+        p.bindStr(s.menteeId)
+        p.bindStrOrNull(s.slotId)
+        p.bindStrOrNull(s.message)
+        p.bindStr(s.status)
+        p.bindLongOrNull(s.priceSparks)
+        p.bindStr(s.roomMode)
+        p.bindStrOrNull(s.roomUrl)
+        p.bindInstantOrNull(s.settledAt)
+        p.bindInstant(s.createdAt)
+        store.execute("insert into mentor_sessions (" + MentoringStore.sessionColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", p)
+    }
+    MentoringSession? findSession(sessionId: String) {
+        var row = store.queryOptional("select " + MentoringStore.sessionColumns() + " from mentor_sessions where id = ?", DbParams().bindStr(sessionId))
+        if (row == null) {
+            return null
+        }
+        return MentoringStore.session(row)
+    }
+    List<MentoringSession> findSessionsByMentor(mentorId: String) = MentoringStore.sessions(store.queryList("select " + MentoringStore.sessionColumns() + " from mentor_sessions where mentor_id = ? order by created_at desc", DbParams().bindStr(mentorId)))
+    List<MentoringSession> findSessionsByMentee(menteeId: String) = MentoringStore.sessions(store.queryList("select " + MentoringStore.sessionColumns() + " from mentor_sessions where mentee_id = ? order by created_at desc", DbParams().bindStr(menteeId)))
+    List<MentoringSession> findScheduledSessions() = MentoringStore.sessions(store.queryList("select " + MentoringStore.sessionColumns() + " from mentor_sessions where status = \'SCHEDULED\'", DbParams()))
+    // Paid sessions whose money is still in the escrow.
+    List<MentoringSession> findUnsettledPaidSessions() = MentoringStore.sessions(store.queryList("select " + MentoringStore.sessionColumns() + " from mentor_sessions where price_sparks is not null and settled_at is null", DbParams()))
+    // Clock completion: only the request that finds the session SCHEDULED completes it (no money moves).
+    Bool completeByClock(sessionId: String) = store.execute("update mentor_sessions set status = \'COMPLETED\' where id = ? and status = \'SCHEDULED\'", DbParams().bindStr(sessionId)) > 0
+    // The mentor's confirmation: COMPLETED and settled in one claim.
+    Bool completeAndSettle(sessionId: String, now: String) = store.execute("update mentor_sessions set status = \'COMPLETED\', settled_at = ? where id = ? and status = \'SCHEDULED\'", DbParams().bindInstant(now).bindStr(sessionId)) > 0
+    Bool cancelAndSettle(sessionId: String, now: String) = store.execute("update mentor_sessions set status = \'CANCELLED\', settled_at = ? where id = ? and status = \'SCHEDULED\'", DbParams().bindInstant(now).bindStr(sessionId)) > 0
+    // The automatic release: claims a session whose money is still held (never a cancelled one, never twice).
+    Bool settleHeld(sessionId: String, now: String) = store.execute("update mentor_sessions set status = \'COMPLETED\', settled_at = ? where id = ? and settled_at is null and status <> \'CANCELLED\'", DbParams().bindInstant(now).bindStr(sessionId)) > 0
+    // ---- availability
+    List<MentoringAvailability> findAvailabilities(mentorId: String) {
+        var out = listOf<MentoringAvailability>()
+        for (var r in store.queryList("select id, mentor_id, day_of_week, time_of_day from mentor_availabilities where mentor_id = ? order by day_of_week asc, time_of_day asc", DbParams().bindStr(mentorId))) {
+            out.add(MentoringAvailability(r.getStr("id"), r.getStr("mentor_id"), r.getInt("day_of_week"), r.getStr("time_of_day")))
+        }
+        return out
+    }
+    insertAvailability(a: MentoringAvailability) {
+        store.execute("insert into mentor_availabilities (id, mentor_id, day_of_week, time_of_day) values (?, ?, ?, ?)", DbParams().bindStr(a.id).bindStr(a.mentorId).bindInt(a.dayOfWeek).bindStr(a.timeOfDay))
+    }
+    deleteAvailabilities(mentorId: String) {
+        store.execute("delete from mentor_availabilities where mentor_id = ?", DbParams().bindStr(mentorId))
+    }
+}

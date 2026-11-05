@@ -1,0 +1,122 @@
+import app.*
+import kernel.testkit.*
+import mentoring.*
+import profile.*
+
+// Port of MentorProfileTests: banner, agenda management by the owner, and the booking guard on slot ownership.
+test "mentor has a banner and can manage the agenda" {
+    var mentor = MentoringTestKit.login("mentor-profile-owner")
+    var created = mentor.post("/mentors", "{\"expertise\":[\"Java\",\"Spring\"],\"price\":\"Gratuito\",\"banner\":\"https://cdn.enois.test/banner.jpg\"}")
+    Check.status(created, 201)
+    Check.jsonEq(created, "banner", "https://cdn.enois.test/banner.jpg")
+    var mentorId = OrgsTestKit.str(created, "id")
+    var startsAt = MentoringTestKit.after(86400L)
+    var endsAt = MentoringTestKit.after(90000L)
+    var slot = mentor.post("/mentors/" + mentorId + "/slots", "{\"startsAt\":\"" + startsAt + "\",\"endsAt\":\"" + endsAt + "\"}")
+    Check.status(slot, 201)
+    var slotId = OrgsTestKit.str(slot, "id")
+    var listed = OrgsTestKit.anonymous().get("/mentors/" + mentorId + "/slots")
+    Check.status(listed, 200)
+    Check.isTrue("the slot is listed", MentoringTestKit.contains(listed, "items", slotId))
+    Check.status(mentor.delete("/mentors/" + mentorId + "/slots/" + slotId), 204)
+    var after = OrgsTestKit.anonymous().get("/mentors/" + mentorId + "/slots")
+    Check.status(after, 200)
+    Check.eqInt("no slot left", 0, after.jsonSize("items"))
+}
+
+test "booking requires the slot to belong to the mentor" {
+    var mentorA = MentoringTestKit.createPlainMentor(MentoringTestKit.login("mentor-slot-a"))
+    var ownerB = MentoringTestKit.login("mentor-slot-b")
+    var mentorB = MentoringTestKit.createPlainMentor(ownerB)
+    var mentee = MentoringTestKit.login("mentor-slot-mentee")
+    var slotOfB = MentoringTestKit.futureSlot(ownerB, mentorB)
+    var res = MentoringTestKit.book(mentee, mentorA, slotOfB, "oi")
+    Check.apiError(res, 404, "SLOT_NOT_FOUND")
+}
+
+test "the owner of one mentor cannot delete the slot of another through their own mentor id" {
+    var ownerA = MentoringTestKit.login("mentor-delslot-a")
+    var mentorA = MentoringTestKit.createPlainMentor(ownerA)
+    var ownerB = MentoringTestKit.login("mentor-delslot-b")
+    var mentorB = MentoringTestKit.createPlainMentor(ownerB)
+    var slotOfB = MentoringTestKit.futureSlot(ownerB, mentorB)
+    Check.apiError(ownerA.delete("/mentors/" + mentorA + "/slots/" + slotOfB), 404, "SLOT_NOT_FOUND")
+    Check.apiError(ownerA.delete("/mentors/" + mentorB + "/slots/" + slotOfB), 403, "FORBIDDEN")
+    Check.apiError(ownerB.delete("/mentors/" + mentorB + "/slots/slot_nope"), 404, "SLOT_NOT_FOUND")
+}
+
+test "a booked slot cannot be deleted and the owner cannot book their own hour" {
+    var owner = MentoringTestKit.login("mentor-booked-owner")
+    var mentorId = MentoringTestKit.createPlainMentor(owner)
+    var mentee = MentoringTestKit.login("mentor-booked-mentee")
+    var slotId = MentoringTestKit.futureSlot(owner, mentorId)
+    Check.apiError(MentoringTestKit.book(owner, mentorId, slotId, "eu"), 400, "CANNOT_BOOK_OWN")
+    MentoringTestKit.bookOk(mentee, mentorId, slotId)
+    Check.apiError(owner.delete("/mentors/" + mentorId + "/slots/" + slotId), 409, "SLOT_BOOKED")
+    var other = MentoringTestKit.login("mentor-booked-other")
+    Check.apiError(MentoringTestKit.book(other, mentorId, slotId, "tarde"), 409, "SLOT_UNAVAILABLE")
+}
+
+test "a second mentor profile for the same account is refused and the profile can be deleted" {
+    var owner = MentoringTestKit.login("mentor-dup-owner")
+    var mentorId = MentoringTestKit.createPlainMentor(owner)
+    Check.apiError(owner.post("/mentors", "{\"expertise\":[\"Go\"]}"), 409, "ALREADY_MENTOR")
+    var stranger = MentoringTestKit.login("mentor-dup-stranger")
+    Check.apiError(stranger.delete("/mentors/" + mentorId), 403, "FORBIDDEN")
+    Check.apiError(stranger.patch("/mentors/" + mentorId, "{\"expertise\":[\"Go\"]}"), 403, "FORBIDDEN")
+    var gone = owner.delete("/mentors/" + mentorId)
+    Check.status(gone, 200)
+    Check.jsonEq(gone, "status", "DELETED")
+    Check.jsonEq(gone, "id", mentorId)
+    Check.apiError(OrgsTestKit.anonymous().get("/mentors/" + mentorId), 404, "MENTOR_NOT_FOUND")
+}
+
+test "a mentor that already has an agenda cannot be deleted (the foreign keys of the Java schema, 409)" {
+    var owner = MentoringTestKit.login("mentor-fk-owner")
+    var mentorId = MentoringTestKit.createPlainMentor(owner)
+    MentoringTestKit.futureSlot(owner, mentorId)
+    Check.apiError(owner.delete("/mentors/" + mentorId), 409, "CONFLICT")
+}
+
+test "malformed bodies and missing tokens" {
+    var owner = MentoringTestKit.login("mentor-bad-owner")
+    Check.apiError(owner.post("/mentors", "{\"price\":\"Gratuito\"}"), 400, "BAD_REQUEST")
+    Check.apiError(owner.post("/mentors", "not json"), 400, "BAD_REQUEST")
+    var mentorId = MentoringTestKit.createPlainMentor(owner)
+    Check.apiError(owner.post("/mentors/" + mentorId + "/slots", "{\"startsAt\":\"ontem\",\"endsAt\":\"hoje\"}"), 400, "BAD_REQUEST")
+    var anon = OrgsTestKit.anonymous()
+    Check.status(anon.post("/mentors", "{\"expertise\":[\"Go\"]}"), 401)
+    Check.apiError(owner.get("/mentors?limit=0"), 400, "BAD_REQUEST")
+    Check.apiError(owner.get("/mentors?cursor=ontem"), 400, "INVALID_CURSOR")
+}
+
+test "a write without Idempotency-Key is refused and a replay answers the stored response" {
+    var owner = MentoringTestKit.login("mentor-idem-owner")
+    var none = owner.callKey("POST", "/mentors", "", "{\"expertise\":[\"Java\"]}")
+    Check.apiError(none, 400, "IDEMPOTENCY_KEY_REQUIRED")
+    var first = owner.callKey("POST", "/mentors", "mentor-idem-key-1", "{\"expertise\":[\"Java\"]}")
+    Check.status(first, 201)
+    var again = owner.callKey("POST", "/mentors", "mentor-idem-key-1", "{\"expertise\":[\"Java\"]}")
+    Check.status(again, 201)
+    Check.eqStr("same mentor", OrgsTestKit.str(first, "id"), OrgsTestKit.str(again, "id"))
+    var changed = owner.callKey("POST", "/mentors", "mentor-idem-key-1", "{\"expertise\":[\"Go\"]}")
+    Check.apiError(changed, 409, "IDEMPOTENCY_PAYLOAD_CONFLICT")
+}
+
+test "the mentoring profile counts completed sessions as a mentee (profile seam replaced)" {
+    var owner = MentoringTestKit.login("mentor-seam-owner")
+    var mentee = MentoringTestKit.login("mentor-seam-mentee")
+    var mentorId = MentoringTestKit.createPlainMentor(owner)
+    var slotId = MentoringTestKit.createSlot(owner, mentorId, MentoringTestKit.after(-7200L))
+    var sessionId = MentoringTestKit.bookOk(mentee, mentorId, slotId)
+    var counts = MentoringProfileCounts(MentoringTestKit.database())
+    Check.eqInt("not completed yet", 0, counts.mentoringAsMentee("mentor-seam-mentee"))
+    Check.status(MentoringTestKit.complete(owner, mentorId, sessionId), 200)
+    Check.eqInt("one completed", 1, counts.mentoringAsMentee("mentor-seam-mentee"))
+    Check.eqInt("the mentor is not a mentee", 0, counts.mentoringAsMentee("mentor-seam-owner"))
+    Check.eqInt("other counts keep reading as before", 0, counts.communitiesJoined("mentor-seam-mentee"))
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}

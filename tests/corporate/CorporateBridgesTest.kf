@@ -1,0 +1,71 @@
+import app.*
+import corporate.*
+import kernel.*
+import kernel.testkit.*
+import profile.*
+
+// The seams feed, messaging and jobs held for the corporate domain, now backed by CorporateService: draft and
+// disabled identities represent nobody, the ACTIVE one answers with its professional name and @.
+CorporateService cbService() = CorporateService(CorporateStore(OrgsTestKit.db()), ProfileDirectory(OrgsTestKit.db()))
+
+cbActivate(who: ProfileCaller, username: String) {
+    Check.status(who.post("/me/business-profile", "{\"username\":\"" + username + "\",\"name\":\"Perfil " + username + "\"}"), 200)
+    Check.status(who.patch("/me/business-profile", "{\"headline\":\"Cargo\",\"avatar\":\"https://img.example.com/a.png\"}"), 200)
+    Check.status(who.post("/me/business-profile/activate", ""), 200)
+}
+
+test "the feed bridge sees only ACTIVE identities, by address and by account" {
+    var a = OrgsTestKit.login("cb_feed_a")
+    var b = OrgsTestKit.login("cb_feed_b")
+    cbActivate(a, "cb.feed.a")
+    Check.status(b.post("/me/business-profile", "{\"username\":\"cb.feed.b\",\"name\":\"Perfil B\"}"), 200)
+    var bridge = CorporateFeedBridge(OrgsTestKit.db(), cbService())
+    Check.eqStr("active by @", "cb_feed_a", bridge.activeUserIdOf(" CB.feed.A ") as String)
+    Check.isTrue("draft has no page", bridge.activeUserIdOf("cb.feed.b") == null)
+    Check.isTrue("unknown", bridge.activeUserIdOf("cb.feed.zzz") == null)
+    Check.isTrue("active account", bridge.hasActiveProfile("cb_feed_a"))
+    Check.isTrue("draft account", !bridge.hasActiveProfile("cb_feed_b"))
+    Check.status(b.post("/me/business-profile/activate", ""), 409)
+}
+
+test "the messaging bridge answers the professional identity of active accounts" {
+    var a = OrgsTestKit.login("cb_msg_a")
+    var b = OrgsTestKit.login("cb_msg_b")
+    cbActivate(a, "cb.msg.a")
+    var bridge = CorporateMessagingBridge(OrgsTestKit.db(), cbService())
+    var found = bridge.activeByUserIds(listOf("cb_msg_a", "cb_msg_b"))
+    Check.eqInt("only the active one", 1, found.size())
+    var ident = found.get("cb_msg_a")
+    if (ident == null) {
+        throw "identity missing"
+    }
+    Check.eqStr("identity", "CORPORATE", ident.identity())
+    Check.eqStr("username", "cb.msg.a", ident.username())
+    Check.eqStr("avatar", "https://img.example.com/a.png", ident.avatar())
+    bridge.requireActive("cb_msg_a")
+    var refused = ""
+    try {
+        bridge.requireActive("cb_msg_b")
+    } catch (String e) {
+        refused = e
+    }
+    Check.isTrue("403 without identity", Errors.hasCode(refused, "NO_ACTIVE_CORPORATE_PROFILE"))
+}
+
+test "the jobs bridge hands the professional identity of an application" {
+    var a = OrgsTestKit.login("cb_job_a")
+    cbActivate(a, "cb.job.a")
+    var bridge = CorporateJobsBridge(OrgsTestKit.db(), cbService())
+    var pro = bridge.requireActive("cb_job_a")
+    Check.eqStr("username", "cb.job.a", pro.username())
+    Check.eqStr("name", "Perfil cb.job.a", pro.name())
+    Check.eqStr("headline", "Cargo", pro.headline() as String)
+    var refused = ""
+    try {
+        bridge.requireActive("nobody_here")
+    } catch (String e) {
+        refused = e
+    }
+    Check.isTrue("403", Errors.hasCode(refused, "NO_ACTIVE_CORPORATE_PROFILE"))
+    OrgsTestKit.finish()
+}

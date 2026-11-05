@@ -1,0 +1,198 @@
+package events
+
+import identity.*
+import kernel.config.*
+import kernel.id.*
+import kernel.jobs.*
+import kernel.log.*
+import kernel.sanctions.*
+import kernel.text.*
+import kernel.security.*
+import kernel.time.*
+import notifications.*
+
+// Recurring events ("rituais"): once an occurrence is over, the next one in the series is scheduled and the people
+// who confirmed the previous one are told, so they can confirm again. Attendance is never copied: showing up is
+// always a fresh choice.
+//
+// Only the latest occurrence of a series spawns, and (series_id, date) is unique, so running twice (or on two
+// instances) never creates the same occurrence twice. The series stops (recurrence goes back to NONE) when the
+// host's account is no longer active or the event is flagged by moderation.
+//
+// Env: REDE_EVENTS_RECURRENCE_ENABLED (true), REDE_EVENTS_RECURRENCE_CRON ("0 20 * * * *"), REDE_EVENTS_RECURRENCE_ZONE
+// ("America/Sao_Paulo").
+class EventsRecurrenceService {
+    EventsStore store
+    Notifications notifications
+    IdentityStore credentials
+    SanctionGateReader sanctions
+    SuspiciousText suspicious
+    EventsClock clock
+    Bool enabled
+    Log log = Log("events.recurrence")
+    public constructor(store: EventsStore, notifications: Notifications, credentials: IdentityStore, sanctions: SanctionGateReader, suspicious: SuspiciousText, clock: EventsClock, enabled: Bool) {
+        this.store = store
+        this.notifications = notifications
+        this.credentials = credentials
+        this.sanctions = sanctions
+        this.suspicious = suspicious
+        this.clock = clock
+        this.enabled = enabled
+    }
+    schedule(jobs: Scheduler, cfg: Config) {
+        var self = this
+        jobs.cron("event-recurrence", cfg.getStr("REDE_EVENTS_RECURRENCE_CRON", "0 20 * * * *"), cfg.getStr("REDE_EVENTS_RECURRENCE_ZONE", "America/Sao_Paulo"), () -> {
+    self.scheduledSpawn()
+})
+    }
+    scheduledSpawn() {
+        if (!enabled) {
+            return
+        }
+        var created = this.spawnNextOccurrences()
+        if (created > 0) {
+            log.info("event_recurrence spawned=" + created)
+        }
+    }
+    // Creates the next occurrence of every series whose latest occurrence is over. No transaction around the loop on
+    // purpose: each series is saved on its own, so one failure (a unique-key race with another instance, for
+    // example) does not roll back the others. Returns how many occurrences were created.
+    Int spawnNextOccurrences() {
+        var created = 0
+        for (var e in store.findRecurring()) {
+            try {
+                if (this.spawnNext(e)) {
+                    created = created + 1
+                }
+            } catch (String failure) {
+                log.warn("event_recurrence_failed eventId=" + e.id + " error=" + failure)
+            }
+        }
+        return created
+    }
+    Bool spawnNext(e: EventRecord) {
+        var now = clock.millis()
+        var series = e.seriesId
+        if (series == null) {
+            return false
+        }
+        if (!EventRules.isExpired(e.date, e.time, now, 0L)) {
+            return false
+        }
+        var latest = store.findLatestInSeries(series)
+        if (latest == null) {
+            return false
+        }
+        if (latest.id != e.id) {
+            return false
+        }
+        if (!this.hostIsActive(e.createdBy) || suspicious.matchesAny(listOf(e.title, e.host))) {
+            store.updateSeriesRecurrence(series, "NONE")
+            log.info("event_recurrence_stopped seriesId=" + series)
+            return false
+        }
+        var current = EventRules.parseDate(e.date)
+        if (current == null) {
+            return false
+        }
+        var anchor = this.anchorOf(e)
+        // Catch-up: if the scheduler was off for a while, skip to the first date still ahead.
+        var nextDate = current
+        var behind = true
+        while (behind) {
+            nextDate = EventRules.nextDate(e.recurrence, anchor, nextDate)
+            behind = EventRules.isExpired(nextDate, e.time, now, 0L)
+        }
+        if (store.existsInSeries(series, nextDate)) {
+            return false
+        }
+        var stamp = clock.iso()
+        // The next occurrence happens in the same place: without it, it would vanish from the city filter.
+        var next = EventRecord(Ids.prefixed("event_"), e.title, nextDate, e.time, e.format, e.host, e.cover, e.streamUrl, e.location, e.city, e.state, e.cityKey, e.createdBy, stamp, stamp, Nulls.str(), Nulls.integer(), e.recurrence, series)
+        store.save(next)
+        this.notifyAttendees(e, next, nextDate)
+        return true
+    }
+    // Date of the occurrence after this one, or null for a one-off event (shown in the event view).
+    String? nextOccurrenceDate(e: EventRecord) {
+        if (e.recurrence == "NONE") {
+            return null
+        }
+        var own = EventRules.parseDate(e.date)
+        if (own == null) {
+            return null
+        }
+        var anchor = this.anchorOf(e)
+        return EventRules.nextDate(e.recurrence, anchor, own)
+    }
+    // The series' first occurrence date (monthly math counts from it). Falls back to the event itself when the first
+    // one is gone (deleted or purged by retention). Only called for an event with a readable date.
+    String anchorOf(e: EventRecord) {
+        var own = EventRules.parseDate(e.date)
+        var ownDay = ""
+        if (own != null) {
+            ownDay = own
+        }
+        var series = e.seriesId
+        if (e.recurrence != "MONTHLY") {
+            return ownDay
+        }
+        if (series == null) {
+            return ownDay
+        }
+        if (series == e.id) {
+            return ownDay
+        }
+        var first = store.findById(series)
+        if (first == null) {
+            return ownDay
+        }
+        var firstDay = EventRules.parseDate(first.date)
+        if (firstDay == null) {
+            return ownDay
+        }
+        return firstDay
+    }
+    // Deleted account (credentials removed) or active sanction: the ritual does not go on without its host.
+    Bool hostIsActive(userId: String) {
+        if (sanctions.restricted(userId)) {
+            return false
+        }
+        return credentials.credentialByUser(userId) != null
+    }
+    notifyAttendees(previous: EventRecord, next: EventRecord, nextDate: String) {
+        var shown = nextDate.substring(8, 10) + "/" + nextDate.substring(5, 7) + "/" + nextDate.substring(0, 4)
+        var body = previous.title + " volta em " + shown + " às " + next.time + ". Se quiser ir, confirme presença de novo."
+        for (var userId in store.findAttendeeIds(previous.id)) {
+            if (userId != previous.createdBy) {
+                notifications.create(userId, "EVENT_NEXT_OCCURRENCE", previous.createdBy, "Próximo encontro marcado", body, "/eventos?evento=" + next.id, "Ver evento")
+            }
+        }
+    }
+}
+
+// Periodic sanitisation of past events. Runs at boot (no initial delay) and then every REDE_EVENTS_SANITIZE_DELAY_MS
+// (default one hour): once the event is over, the attendance (personal data) disappears and only the total stays.
+class EventSanitizationWorker {
+    EventsService service
+    Log log = Log("events.sanitization")
+    public constructor(service: EventsService) {
+        this.service = service
+    }
+    schedule(jobs: Scheduler, cfg: Config) {
+        var self = this
+        jobs.fixedDelay("event-sanitization", 0L, cfg.getLong("REDE_EVENTS_SANITIZE_DELAY_MS", 3600000L), () -> {
+    self.sanitize()
+})
+    }
+    sanitize() {
+        try {
+            var result = service.sanitizeExpired()
+            if (result.sanitized() > 0 || result.purged() > 0) {
+                log.info("Eventos sanitizados: " + result.sanitized() + " (presencas apagadas); expurgados por retencao: " + result.purged())
+            }
+        } catch (String failure) {
+            log.warn("Falha na sanitizacao de eventos: " + failure)
+        }
+    }
+}

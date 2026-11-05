@@ -1,0 +1,319 @@
+package companies
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.text.*
+import kernel.time.*
+import kernel.url.*
+import notifications.*
+
+// CompanyService: company pages. Authorisation by role happens HERE (never in the front); the owner is unique and
+// the transfer is explicit. The slug is born from the name and is unique (a collision gets a numeric suffix).
+class CompanyService {
+    Db store
+    CompanyStore companies
+    Notifications notifications
+    public constructor(store: Db, companies: CompanyStore, notifications: Notifications) {
+        this.store = store
+        this.companies = companies
+        this.notifications = notifications
+    }
+    Company create(userId: String, b: CompanyCreateBody) {
+        var name = b.name()
+        if (name == null) {
+            throw Errors.api(400, "INVALID_COMPANY_NAME", "Nome da empresa e obrigatorio.")
+        }
+        if (name.trim().length() < 2) {
+            throw Errors.api(400, "INVALID_COMPANY_NAME", "Nome da empresa e obrigatorio.")
+        }
+        this.checkFields(b.name(), b.description(), b.sector(), b.size(), b.location(), b.website())
+        var slug = this.uniqueSlug(CompanyService.slugFrom(name))
+        var website = Nulls.str()
+        if (Texts.hasText(b.website())) {
+            website = SafeUrl.requireHttpUrl(CompanyService.trimmed(b.website()), "website")
+        }
+        var now = Time.nowIso()
+        var id = "comp_" + Ids.uuid().replace("-", "")
+        var company = Company(id, slug, name.trim(), CompanyService.trimText(b.description()), CompanyService.trimText(b.sector()), CompanyService.trimText(b.size()), CompanyService.trimText(b.location()), website, null, null, userId, "ACTIVE", now, now)
+        store.transaction(() -> {
+    companies.save(company)
+    companies.saveMember(CompanyMember("cmemb_" + Ids.uuid().replace("-", ""), id, userId, "OWNER", now))
+})
+        return this.company(id)
+    }
+    // The trimmed text, "" for null (callers check hasText first; a cast would be reformatted into `x as String.trim()`).
+    static String trimmed(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v.trim()
+    }
+    static String? trimText(v: String?) {
+        if (!Texts.hasText(v)) {
+            return null
+        }
+        return CompanyService.trimmed(v)
+    }
+    // Fields that are null keep their value; a blank text stays as sent.
+    Company update(companyId: String, userId: String, b: CompanyUpdateBody) {
+        var company = this.company(companyId)
+        this.requireRole(company, userId, "EDITOR")
+        this.checkFields(b.name(), b.description(), b.sector(), b.size(), b.location(), b.website())
+        var name = company.name
+        if (Texts.hasText(b.name())) {
+            name = CompanyService.trimmed(b.name())
+        }
+        var description = CompanyService.keepOr(company.description, CompanyService.trimKeep(b.description()))
+        var sector = CompanyService.keepOr(company.sector, b.sector())
+        var size = CompanyService.keepOr(company.size, b.size())
+        var location = CompanyService.keepOr(company.location, b.location())
+        var website = b.website()
+        if (Texts.hasText(website)) {
+            website = SafeUrl.requireHttpUrl(CompanyService.trimmed(website), "website")
+        }
+        var logo = CompanyService.keepOr(company.logo, CompanyService.trimKeep(b.logo()))
+        var cover = CompanyService.keepOr(company.cover, CompanyService.trimKeep(b.cover()))
+        var updated = Company(company.id, company.slug, name, description, sector, size, location, CompanyService.keepOr(company.website, website), logo, cover, company.ownerUserId, company.status, company.createdAt, Time.nowIso())
+        companies.save(updated)
+        return this.company(companyId)
+    }
+    static String? trimKeep(v: String?) {
+        if (v == null) {
+            return null
+        }
+        if (Texts.hasText(v)) {
+            return v.trim()
+        }
+        return v
+    }
+    static String? keepOr(current: String?, incoming: String?) {
+        if (incoming != null) {
+            return incoming
+        }
+        return current
+    }
+    // The page behind a public address; a closed page does not exist for visitors.
+    Company bySlug(slug: String) {
+        var company = companies.findBySlug(slug)
+        if (company == null) {
+            throw Errors.api(404, "COMPANY_NOT_FOUND", "Pagina empresarial nao encontrada.")
+        }
+        if (!company.active()) {
+            throw Errors.api(404, "COMPANY_NOT_FOUND", "Pagina empresarial nao encontrada.")
+        }
+        return company
+    }
+    Company company(companyId: String) {
+        var company = companies.findById(companyId)
+        if (company == null) {
+            throw Errors.api(404, "COMPANY_NOT_FOUND", "Pagina empresarial nao encontrada.")
+        }
+        return company
+    }
+    List<Company> memberOf(userId: String) = companies.findByMember(userId, 50)
+    // Public directory of pages: a closed page leaves the list (the limit applies before the filter, as in Java).
+    List<Company> listAll(limit: Int) {
+        var out = listOf<Company>()
+        for (var c in companies.listAll(limit)) {
+            if (c.active()) {
+                out.add(c)
+            }
+        }
+        return out
+    }
+    // The team is internal to the page: only someone in it, in any role, lists it.
+    List<CompanyMember> members(companyId: String, viewerId: String) {
+        this.requireRole(this.company(companyId), viewerId, "RECRUITER")
+        return companies.membersOf(companyId)
+    }
+    String? roleOf(companyId: String, userId: String) {
+        var m = companies.findMember(companyId, userId)
+        if (m == null) {
+            return null
+        }
+        return m.role
+    }
+    // A closed page takes no team, job nor project; no role is 403 NOT_A_MEMBER; the owner does everything.
+    requireRole(company: Company, userId: String, minimum: String) {
+        if (!company.active()) {
+            throw Errors.api(409, "COMPANY_CLOSED", "Esta pagina empresarial foi removida.")
+        }
+        var role = this.roleOf(company.id, userId)
+        if (role == null) {
+            throw Errors.api(403, "NOT_A_MEMBER", "Voce nao faz parte desta pagina empresarial.")
+        }
+        if (company.ownedBy(userId)) {
+            return
+        }
+        if (!CompanyService.enough(role, minimum)) {
+            throw Errors.api(403, "FORBIDDEN", "Seu papel nao permite esta acao.")
+        }
+    }
+    static Bool enough(role: String, minimum: String) {
+        if (minimum == "OWNER") {
+            return false
+        }
+        if (minimum == "ADMIN") {
+            return role == "ADMIN"
+        }
+        if (minimum == "EDITOR") {
+            return role == "ADMIN" || role == "EDITOR"
+        }
+        return role == "ADMIN" || role == "EDITOR" || role == "RECRUITER"
+    }
+    CompanyMember addMember(companyId: String, userId: String, role: String) {
+        var company = this.company(companyId)
+        // OWNER is the owner of the page (owner_user_id), not a role a person can be invited to (E-57).
+        if (role == "OWNER") {
+            throw Errors.api(400, "INVALID_ROLE", "O papel de proprietario nao pode ser concedido por convite.")
+        }
+        if (companies.findMember(companyId, userId) != null) {
+            throw Errors.api(409, "ALREADY_MEMBER", "Esta pessoa ja faz parte da pagina.")
+        }
+        var member = CompanyMember("cmemb_" + Ids.uuid().replace("-", ""), company.id, userId, role, Time.nowIso())
+        companies.saveMember(member)
+        return member
+    }
+    // Closes the page by the moderation's decision: out of the directory, gone for visitors. Idempotent (closing a
+    // closed page does nothing and answers false). The owner is told.
+    Bool closeByModeration(companyId: String, reviewerId: String) {
+        var company = companies.findById(companyId)
+        if (company == null) {
+            return false
+        }
+        if (!company.active()) {
+            return false
+        }
+        store.transaction(() -> {
+    companies.save(Company(company.id, company.slug, company.name, company.description, company.sector, company.size, company.location, company.website, company.logo, company.cover, company.ownerUserId, "CLOSED", company.createdAt, Time.nowIso()))
+    notifications.create(company.ownerUserId, "MODERACAO", reviewerId, "Sua página empresarial foi removida", "Uma denúncia sobre a página \"" + company.name + "\" foi revisada pela moderação e a página foi removida do diretório. Se acredita que foi um engano, fale com o suporte pelo canal de recursos.", "/api/suporte", "Falar com o suporte")
+})
+        return true
+    }
+    // The page by id, closed ones included (the moderation reads removed pages to review).
+    Company? findById(companyId: String) = companies.findById(companyId)
+    // What the moderation judges about a page: what it says about itself, at most 4000 characters.
+    String? contentOf(companyId: String) {
+        var c = companies.findById(companyId)
+        if (c == null) {
+            return null
+        }
+        var parts = listOf<String>()
+        for (var v in listOf(c.name, c.sector, c.location, c.website, c.description)) {
+            if (Texts.hasText(v)) {
+                parts.add(v as String)
+            }
+        }
+        if (parts.size() == 0) {
+            return null
+        }
+        var joined = String.join("\n", parts).trim()
+        if (joined.length() > 4000) {
+            joined = joined.substring(0, 4000)
+        }
+        if (joined.length() == 0) {
+            return null
+        }
+        return joined
+    }
+    String? ownerOf(companyId: String) {
+        var c = companies.findById(companyId)
+        if (c == null) {
+            return null
+        }
+        if (!Texts.hasText(c.ownerUserId)) {
+            return null
+        }
+        return c.ownerUserId
+    }
+    List<Company> byIds(ids: List<String>) = companies.findByIds(ids)
+    List<Company> active(query: String?, sector: String?, limit: Int) {
+        var needle = Nulls.str()
+        if (query != null) {
+            var text = query.trim().replace("%", "").replace("_", "").toLowerCase()
+            if (text.length() > 0) {
+                needle = text
+            }
+        }
+        var key = Nulls.str()
+        if (Texts.hasText(sector)) {
+            key = CompanyService.trimmed(sector).toLowerCase()
+        }
+        return companies.findActive(needle, key, limit)
+    }
+    List<String> activeNames() = companies.activeNames()
+    // Distinct sectors of active pages, case variants merged (the first spelling wins), alphabetical.
+    List<String> sectors() {
+        var keys = listOf<String>()
+        Map<String,String> byKey = mapOf()
+        for (var s in companies.activeSectors()) {
+            if (Texts.hasText(s)) {
+                var k = s.trim().toLowerCase()
+                if (byKey.get(k) == null) {
+                    byKey.put(k, s.trim())
+                    keys.add(k)
+                }
+            }
+        }
+        Texts.sortInPlace(keys)
+        var out = listOf<String>()
+        for (var k in keys) {
+            out.add(byKey.getOrDefault(k, k))
+        }
+        return out
+    }
+    // Follow or unfollow (idempotent); the follower count after the change.
+    Long setFollowing(companyId: String, userId: String, follow: Bool) {
+        var company = this.company(companyId)
+        if (follow) {
+            companies.follow(company.id, userId, Time.nowIso())
+        }
+        else {
+            companies.unfollow(company.id, userId)
+        }
+        return companies.followerCount(company.id)
+    }
+    Bool isFollowing(companyId: String, userId: String?) {
+        if (userId == null) {
+            return false
+        }
+        return companies.isFollowing(companyId, userId)
+    }
+    List<String> followerIdsOf(companyId: String) = companies.followerIds(companyId)
+    Long followerCount(companyId: String) = companies.followerCount(companyId)
+    Map<String,Long> followerCounts(companyIds: List<String>) = companies.followerCounts(companyIds)
+    // Tells every follower (but whoever published it) that the page opened something new: one notification row per
+    // follower inside the publish transaction.
+    notifyFollowers(company: Company, publisherId: String, title: String, body: String) {
+        for (var follower in companies.followerIds(company.id)) {
+            if (follower != publisherId) {
+                notifications.create(follower, "COMPANY_NEW_OPPORTUNITY", publisherId, title, body, "/empresa/" + company.slug, "Ver")
+            }
+        }
+    }
+    // Accents become their letter ("Estúdio" -> "estudio").
+    static String slugFrom(name: String) = Texts.stripAccents(name).toLowerCase().replaceAll("[^a-z0-9]+", "-").replaceAll("(^-|-$)", "")
+    String uniqueSlug(base: String) {
+        var slug = base
+        if (!Texts.hasText(base)) {
+            slug = "empresa"
+        }
+        var candidate = slug
+        var n = 2
+        while (companies.existsBySlug(candidate)) {
+            candidate = slug + "-" + n
+            n = n + 1
+        }
+        return candidate
+    }
+    // The ceilings of the columns: past them the database refused with "Data too long" (a 409 that names no field).
+    checkFields(name: String?, description: String?, sector: String?, size: String?, location: String?, website: String?) {
+        TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "nome", name, 160)
+        TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "descricao", description, 4000)
+        TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "setor", sector, 80)
+        TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "porte", size, 40)
+        TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "localizacao", location, 160)
+        TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "site", website, 300)
+    }
+}

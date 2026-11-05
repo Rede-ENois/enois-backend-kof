@@ -1,0 +1,205 @@
+import app.*
+import kernel.db.*
+import kernel.files.*
+import kernel.testkit.*
+import kernel.time.*
+import profile.*
+
+// Port of CompanyPagesTests: the directory (pages, job names, external names), following, the professional-identity
+// gate of proposals with the review left on completion, social fallbacks, follower notices and the V219 backfill.
+String cpProject() = "{\"title\":\"Landing page da campanha de teste\",\"problem\":\"Precisamos de uma landing page simples para a campanha de fim de ano.\",\"deliverables\":\"Pagina publicada\",\"acceptanceCriteria\":\"Carrega em menos de 2s\"}"
+
+String cpProposal() = "{\"message\":\"Entrego em tres dias, ja fiz landing pages de campanha antes.\"}"
+
+TestResponse cpCreatePage(owner: ProfileCaller, name: String, sector: String?) {
+    var body = "{\"name\":\"" + name + "\",\"description\":\"Pagina de teste.\"}"
+    if (sector != null) {
+        body = "{\"name\":\"" + name + "\",\"description\":\"Pagina de teste.\",\"sector\":\"" + sector + "\"}"
+    }
+    var res = owner.post("/empresas", body)
+    Check.status(res, 200)
+    return res
+}
+
+String cpPublish(owner: ProfileCaller, companyId: String) {
+    var res = owner.post("/empresas/" + companyId + "/microprojetos", cpProject())
+    Check.status(res, 200)
+    return OrgsTestKit.str(res, "id")
+}
+
+test "directoryListsPagesJobNamesAndExternalNamesMostOpportunitiesFirst" {
+    var owner = OrgsTestKit.login("cpages_dir_owner")
+    var guest = OrgsTestKit.anonymous()
+    var uid = "d1r4a8b2"
+    var page = cpCreatePage(owner, "Dir Page " + uid, "Setor" + uid)
+    cpPublish(owner, OrgsTestKit.str(page, "id"))
+    var now = Time.nowIso()
+    OrgsTestKit.insertJob("job_dir_a_" + uid, "Vaga A", "Dir Jobs " + uid, "user_job_seed", now)
+    OrgsTestKit.insertJob("job_dir_b_" + uid, "Vaga B", "dir jobs " + uid, "user_job_seed", now)
+    // Same name as the page, posted by someone outside it: never shown as its own entry.
+    OrgsTestKit.insertJob("job_dir_c_" + uid, "Vaga C", "DIR PAGE " + uid, "user_job_seed", now)
+    OrgsTestKit.insertExternalJob("ext_dir_" + uid, "Vaga externa", "Dir Ext " + uid, "https://example.com/vaga/" + uid, now)
+    var dir = guest.get("/empresas/diretorio?query=" + uid)
+    Check.status(dir, 200)
+    Check.eqInt("three entries", 3, dir.jsonSize(""))
+    // Pages first, even with less activity than a name that only exists in jobs.
+    Check.jsonEq(dir, "0.kind", "PAGE")
+    Check.jsonEq(dir, "0.slug", OrgsTestKit.str(page, "slug"))
+    Check.jsonEq(dir, "0.openProjects", "1")
+    Check.jsonEq(dir, "0.openJobs", "0")
+    Check.jsonEq(dir, "0.followers", "0")
+    Check.jsonEq(dir, "0.sector", "Setor" + uid)
+    Check.jsonEq(dir, "1.kind", "JOBS")
+    Check.jsonEq(dir, "1.openJobs", "2")
+    Check.isTrue("no slug on a job name", dir.jsonIsNull("1.slug"))
+    Check.jsonEq(dir, "2.kind", "EXTERNAL")
+    Check.jsonEq(dir, "2.name", "Dir Ext " + uid)
+    // A sector narrows to pages (names on jobs have no sector).
+    var bySector = guest.get("/empresas/diretorio?sector=setor" + uid)
+    Check.eqInt("one page", 1, bySector.jsonSize(""))
+    Check.jsonEq(bySector, "0.kind", "PAGE")
+    var sectors = guest.get("/empresas/setores")
+    Check.status(sectors, 200)
+    Check.isTrue("sector listed", sectors.body.contains("\"Setor" + uid + "\""))
+}
+
+test "followingIsIdempotentAndShowsOnThePage" {
+    var owner = OrgsTestKit.login("cpages_follow_owner")
+    var fan = OrgsTestKit.login("cpages_follow_fan")
+    var guest = OrgsTestKit.anonymous()
+    var page = cpCreatePage(owner, "Follow Co f0110w", null)
+    var id = OrgsTestKit.str(page, "id")
+    var slug = OrgsTestKit.str(page, "slug")
+    var i = 0
+    while (i < 2) {
+        var res = fan.post("/empresas/" + id + "/follow", "")
+        Check.status(res, 200)
+        Check.jsonEq(res, "following", "true")
+        Check.jsonEq(res, "followers", "1")
+        i = i + 1
+    }
+    var seen = fan.get("/empresa/" + slug)
+    Check.jsonEq(seen, "following", "true")
+    Check.jsonEq(seen, "stats.followers", "1")
+    // The team can follow its own page too.
+    Check.jsonEq(owner.post("/empresas/" + id + "/follow", ""), "followers", "2")
+    i = 0
+    while (i < 2) {
+        var res = fan.delete("/empresas/" + id + "/follow")
+        Check.status(res, 200)
+        Check.jsonEq(res, "following", "false")
+        Check.jsonEq(res, "followers", "1")
+        i = i + 1
+    }
+    var visitor = guest.get("/empresa/" + slug)
+    Check.jsonEq(visitor, "following", "false")
+    Check.jsonEq(visitor, "canPropose", "SIGN_IN")
+    Check.status(guest.post("/empresas/" + id + "/follow", ""), 401)
+    Check.status(fan.post("/empresas/comp_missing_f0110w/follow", ""), 404)
+}
+
+test "proposalNeedsTheProfessionalIdentityAndCompletingLeavesAReview" {
+    var owner = OrgsTestKit.login("cpages_rev_owner")
+    var pro = OrgsTestKit.login("cpages_rev_pro")
+    var guest = OrgsTestKit.anonymous()
+    var page = cpCreatePage(owner, "Review Co r3v13w", null)
+    var slug = OrgsTestKit.str(page, "slug")
+    var projectId = cpPublish(owner, OrgsTestKit.str(page, "id"))
+    var asOwner = owner.get("/empresa/" + slug)
+    Check.jsonEq(asOwner, "canPropose", "TEAM")
+    Check.jsonEq(asOwner, "stats.openProjects", "1")
+    Check.eqInt("no jobs", 0, asOwner.jsonSize("jobs"))
+    Check.eqInt("no reviews", 0, asOwner.jsonSize("reviews"))
+    Check.jsonEq(pro.get("/empresa/" + slug), "canPropose", "PROFESSIONAL_REQUIRED")
+    Check.apiError(pro.post("/microprojetos/" + projectId + "/proposals", cpProposal()), 403, "NO_ACTIVE_CORPORATE_PROFILE")
+    var proActive = OrgsTestKit.activateProfessional("cpages_rev_pro")
+    Check.jsonEq(proActive.get("/empresa/" + slug), "canPropose", "OK")
+    var sent = proActive.post("/microprojetos/" + projectId + "/proposals", cpProposal())
+    Check.status(sent, 200)
+    Check.jsonEq(sent, "status", "SENT")
+    var conversationId = OrgsTestKit.str(sent, "conversationId")
+    Check.isTrue("conversation id", conversationId.length() > 0)
+    var proUsername = "pro.cpages_rev_pro"
+    var read = owner.get("/microprojetos/" + projectId)
+    Check.jsonEq(read, "proposals.0.conversationId", conversationId)
+    Check.jsonEq(read, "proposals.0.person.identity", "CORPORATE")
+    Check.jsonEq(read, "proposals.0.person.username", proUsername)
+    Check.jsonEq(read, "proposals.0.person.href", "/profissional/" + proUsername)
+    // The proposal is posted in a professional conversation with the page owner.
+    var conversation = owner.get("/conversations/" + conversationId)
+    Check.status(conversation, 200)
+    Check.jsonEq(conversation, "kind", "FREELANCE")
+    var messages = owner.get("/conversations/" + conversationId + "/messages")
+    Check.jsonEq(messages, "items.0.from", "cpages_rev_pro")
+    Check.isTrue("message text", OrgsTestKit.str(messages, "items.0.text").contains("Entrego em tres dias"))
+    Check.status(owner.post("/microprojetos/" + projectId + "/proposals/" + OrgsTestKit.str(sent, "id") + "/select", ""), 200)
+    Check.apiError(owner.post("/microprojetos/" + projectId + "/complete", "{\"rating\":7}"), 400, "INVALID_RATING")
+    Check.apiError(owner.post("/microprojetos/" + projectId + "/complete", "{\"text\":\"Sem nota\"}"), 400, "INVALID_RATING")
+    var done = owner.post("/microprojetos/" + projectId + "/complete", "{\"rating\":5,\"text\":\"Entrega impecavel e no prazo.\"}")
+    Check.status(done, 200)
+    Check.jsonEq(done, "status", "COMPLETED")
+    var after = guest.get("/empresa/" + slug)
+    Check.jsonEq(after, "stats.openProjects", "0")
+    Check.jsonEq(after, "stats.completedProjects", "1")
+    Check.jsonEq(after, "reviews.0.projectId", projectId)
+    Check.jsonEq(after, "reviews.0.projectTitle", "Landing page da campanha de teste")
+    Check.jsonEq(after, "reviews.0.rating", "5")
+    Check.jsonEq(after, "reviews.0.text", "Entrega impecavel e no prazo.")
+    Check.jsonEq(after, "reviews.0.person.identity", "CORPORATE")
+    Check.isTrue("review person href", OrgsTestKit.str(after, "reviews.0.person.href").startsWith("/profissional/"))
+}
+
+test "membersWithoutAProfessionalProfileShowTheSocialOne" {
+    var owner = OrgsTestKit.login("cpages_social_owner")
+    var page = cpCreatePage(owner, "Social Co s0c14l", null)
+    var members = owner.get("/empresas/" + OrgsTestKit.str(page, "id") + "/members")
+    Check.status(members, 200)
+    Check.jsonEq(members, "0.person.identity", "SOCIAL")
+    Check.isTrue("social href", OrgsTestKit.str(members, "0.person.href").startsWith("/perfil/"))
+}
+
+test "publishingAMicroprojectNotifiesFollowersButNotThePublisher" {
+    var owner = OrgsTestKit.login("cpages_notify_owner")
+    var fan = OrgsTestKit.login("cpages_notify_fan")
+    var page = cpCreatePage(owner, "Notify Co n0t1fy", null)
+    var id = OrgsTestKit.str(page, "id")
+    fan.post("/empresas/" + id + "/follow", "")
+    owner.post("/empresas/" + id + "/follow", "")
+    cpPublish(owner, id)
+    var href = "\"href\":\"/empresa/" + OrgsTestKit.str(page, "slug") + "\""
+    var fanFeed = fan.get("/notifications?context=PROFESSIONAL")
+    Check.status(fanFeed, 200)
+    Check.isTrue("follower told", fanFeed.body.contains("COMPANY_NEW_OPPORTUNITY") && fanFeed.body.contains(href))
+    Check.isTrue("publisher not told", !owner.get("/notifications").body.contains("COMPANY_NEW_OPPORTUNITY"))
+}
+
+// Runs the V219 backfill again over rows of this test only: a name match alone never links.
+test "backfillLinksAJobOnlyWhenItsPosterIsOnThePage" {
+    var owner = OrgsTestKit.login("cpages_backfill_owner")
+    var uid = "bf7c3a19"
+    var name = "Backfill Co " + uid
+    var companyId = OrgsTestKit.str(cpCreatePage(owner, name, null), "id")
+    var now = Time.nowIso()
+    var linked = "job_bf_member_" + uid
+    var stranger = "job_bf_stranger_" + uid
+    var otherName = "job_bf_other_" + uid
+    OrgsTestKit.insertJob(linked, "Vaga", name.toUpperCase(), "cpages_backfill_owner", now)
+    OrgsTestKit.insertJob(stranger, "Vaga", name, "user_job_seed", now)
+    OrgsTestKit.insertJob(otherName, "Vaga", "Outra " + uid, "cpages_backfill_owner", now)
+    var migration = UploadFiles.readText("resources/db/migration/V219__company_pages.sql")
+    var start = migration.indexOf("update jobs set company_id")
+    var backfill = migration.substring(start, migration.indexOf(";", start)) + " and id in (\'" + linked + "\', \'" + stranger + "\', \'" + otherName + "\')"
+    OrgsTestKit.db().execute(backfill, DbParams())
+    Check.eqStr("member\'s job linked", companyId, cpCompanyIdOf(linked))
+    Check.eqStr("stranger\'s job not linked", "", cpCompanyIdOf(stranger))
+    Check.eqStr("other name not linked", "", cpCompanyIdOf(otherName))
+    OrgsTestKit.finish()
+}
+
+String cpCompanyIdOf(jobId: String) {
+    var v = OrgsTestKit.db().queryOne("select company_id from jobs where id = ?", DbParams().bindStr(jobId)).getStrOrNull("company_id")
+    if (v == null) {
+        return ""
+    }
+    return v
+}

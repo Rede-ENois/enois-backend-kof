@@ -914,3 +914,121 @@ Seams owned by this slice: `GithubGateway` (the GitHub reader of contributions),
 
 G320 to G324 (Apache client interop) and G325: `private` is a Kof keyword and cannot be a record member; also seen again:
 G204/G304 (a field named `http` is read as the package, `VerifyError`/`COMPUTE_FRAMES` crash), G12.
+## orgs: corporate, companies, mentoring, freelances, events
+
+Slug `orgs`, branch `port/orgs`, gap range G340 to G359. Test fixtures: `app.OrgsTestKit` (src/app) boots the exact production wiring (`AppWiring.install`) once per test file, so every orgs test also proves the wiring and the seams.
+
+| Domain | Endpoints ported/total | Kof tests | Java tests ported/total |
+|---|---|---|---|
+| companies (`src/companies`, includes the microprojects) | 19/19 (`/empresas`, `/empresas/diretorio`, `/setores`, `/mine`, `PATCH /empresas/{id}`, `follow` POST/DELETE, `members` GET/POST, `POST .../microprojetos`, `GET /empresa/{slug}`, `GET /microprojetos`, `GET|PUT|DELETE /microprojetos/{id}`, `proposals`, `.../select`, `.../complete`) | `tests/companies/*` (16) | 12/12 methods + the 2 assertions `JobCompanyPageTests` left for this port + the company cases of `TextFieldLimitTests` and `LinkSchemeAllowlistTests` |
+| corporate (`src/corporate`) | 10/10 (`GET|POST|PATCH /me/business-profile`, `POST .../name`, `.../username`, `GET .../import-preview`, `POST .../import`, `.../activate`, `.../deactivate`, `GET /corporate/{username}`) | `tests/corporate/*` (33, 3 of them cover the bridges) | 31/31 methods |
+
+### corporate notes
+
+- `CorporateProfile.create/withName/withUsername` threw `IllegalArgumentException` (400 `BAD_REQUEST`, or `INVALID_USERNAME` for the nametag change): `CorporateRules` throws a marker the service maps the same way.
+- The unique `@` is the database index; a constraint violation is `USERNAME_TAKEN` only when another account holds that `@`, any other refused value stays the generic `409 CONFLICT` (the Java persistence test asserted "not an ApiException"; here it is "not USERNAME_TAKEN").
+
+### Seams replaced by the corporate port
+
+| Seam | Now |
+|---|---|
+| `FeedCorporate` (feed) | `CorporateFeedBridge` through `FeedModule.installWithCorporate` |
+| `MessagingCorporate` (messaging) | `CorporateMessagingBridge` in `MessagingSeamSet.corporate` |
+| `JobCorporate` (jobs) | `CorporateJobsBridge` in `JobSeamSet.corporate` |
+
+`NotificationActors` and `FeedAuthors.corporateByIds` still read `corporate_profiles` read-only with the same columns (same answers; not swapped).
+
+### companies notes
+
+- The Java `companies` package also holds the microprojects marketplace; both are ported (`CompanyService`, `MicroProjectService`, `CompanyDirectoryService`). The directory reads open jobs and external job names from `jobs.JobCompanyDirectory`.
+- The `COMPANY_NEW_OPPORTUNITY` follower notice, the microproject notices (`MICROPROJETO`) and the moderation notice go through `Notifications.create`; the proposal opens a `FREELANCE` conversation through `MessagingService.freelanceConversationBetween` and posts the message; the completion bonus (+200 sparks, 3 a month, per project) goes through `CoinService.reward` and never fails the acceptance.
+- Moderation is not ported: `CompanyService.closeByModeration`, `contentOf` and `ownerOf` are the three methods the Java `CompanyModerationAdapter` (`CompanyReportReader`, `CompanyRemovalPort`) calls; the moderation port subclasses its own seams over them. `CompanyReportTests` belong to moderation.
+- `MicroProjectEditTests`/`CompanyFlowTests`/`CompanyPagesTests` run over the production wiring; `JobCompanyPageTests` post their rows with the seeded table (a real `POST /jobs` needs the live reputation of the profile domain, which the production wiring computes), so `CompanyJobsTest` seeds the open job linked to the page.
+- The V180 neutralisation of `companies.website` and the V219 backfill are replayed over planted rows (`CompanyLinkSchemeTest`, `CompanyPagesTest`).
+- A `listAll` public list applies its limit before dropping closed pages (as Java); the `PATCH` keeps blank texts as sent and `null` keeps the stored value (`Company.update`).
+
+### Seams replaced by the companies port
+
+| Seam | Now |
+|---|---|
+| `JobCompanies` (jobs) | `CompanyJobsBridge` in `JobSeamSet.companies` over `CompanyService` (page, role, recruiter gate, slugs, followers) |
+
+### freelances
+
+Branch `port/orgs-freelances`, package `freelances` (`src/freelances`), module `FreelancesModule.install(platform, shared, profiles, age.gate, corporate, messagingModule)` in `AppWiring`.
+
+| Item | Result |
+|---|---|
+| Endpoints ported/total | 7/7: `GET /freelances` (public, offset cursor, `q`), `GET /me/freelances`, `POST /freelances`, `PATCH /freelances/{id}`, `DELETE /freelances/{id}`, `POST /freelances/{id}/close`, `POST /freelances/{id}/proposals` |
+| Java tests ported/total | 7/7: `FreelanceFlowTests` (4), `FreelanceEditDeleteTests` (2), the freelance case of `TextFieldLimitTests` (1). `SuspiciousContentTargetsTests` and `ServicesFlowTests` only mention the table name or the word and belong to moderation and services |
+| Kof tests | `tests/freelances/*`: 7 ported plus 11 added in `FreelanceRulesTest` (session guard, view and owned flag, every validation code, lifecycle errors, cursor, search escaping, creation throttle, age gate, link check, proposal guards with the block list) |
+
+Seams: none owned. Every collaborator is the real module API from `AppWiring`: `ProfileDirectory` (usernames), `AgeGate.requireCanWrite`, `CorporateService.requireActive`, `MessagingService.freelanceConversationBetween/sendMessage`, `SharedServices.blockedUsers`; the creation throttle (10 per hour per account) is an own `ActionThrottle`, like the other modules. Test fixtures: `app.FreelanceTestKit` (src/app).
+
+Deliberate differences from the Java service:
+
+- The list cursor is a plain SQL `limit/offset`. The Java adapter paged by `offset / size` and skipped `offset % size` rows of that page, so an offset that is not a multiple of the page size returned a short page and no `nextCursor` (cursors issued by the service are always aligned, so the contract the app sees is the same).
+- Edit and close are atomic claims on the status (`update ... where status = 'OPEN'`): two racing requests cannot both win, the loser gets the same 409 the sequential case gets.
+- `POST .../proposals`: the conversation and the message run in one transaction, as in Java; a missing body is `400 BAD_REQUEST` and a JSON `null` body is `400 EMPTY_PROPOSAL`.
+- The body is checked by `SafeLinks.checkRequest()` (the Java `SafeLinkRequestBodyAdvice`), so a scope or a proposal with an unsafe Markdown link is `400 UNSAFE_LINK`. The domain has no URL field of its own.
+- The Java `countOpen` repository method had no caller and is not ported. `freelances` is also named in the Java attack-purge and content-sweep targets: those jobs belong to security and moderation.
+
+No kernel change, no new compiler gap.
+
+### events
+
+Package `events` (`src/events`): `EventsModel` (records and the pure date rules `EventRules`), `EventsStore`, `EventsService`, `EventsRecurrenceService` (+ `EventSanitizationWorker`), `EventsRoutes`, `EventsModule`, `EventsBridges`. Fixtures: `app.EventsTestKit` (on top of `OrgsTestKit`).
+
+| | Ported/total |
+|---|---|
+| Endpoints | 8/8: `GET /events`, `GET /events/{id}`, `POST /events`, `PATCH /events/{id}`, `DELETE /events/{id}`, `PATCH /events/{id}/recurrence`, `POST /events/{id}/attendees`, `DELETE /events/{id}/attendees` |
+| Java tests of the domain (`events/**`) | 30/30 methods: viewer attendance 3, edit 4, city filter 3, sanitization 3, schedule 4, recurrence 9, sanitization window 4 |
+| Java tests elsewhere that hit events | `TextFieldLimitTests` event case 1/1 (`EventFieldLimitTest`), `IntelligentCacheTests` events cases 3/7 (`EventListCacheTest`), `LinkSchemeAllowlistTests` has no event case |
+| Kof tests | 43 in `tests/events` (10 files): the 34 ports above plus 9 extras (attendance codes and idempotent replay, response shape, edit extras, every field ceiling, stream link rules, banned host, the two seams) |
+
+- `IntelligentCacheTests` not ported (4 of 7): the TTL expiry, renewal and concurrent-load cases and the closed list of caches test `TtlCache`/`Caches`, not events; `tests/shared/TtlCacheTest.kf` covers them. The events cases (list served from cache, a write clears it, a refused write leaves it alone) run through HTTP with the cache on (60 s).
+- `NotificationContractControllerTests` event cases (place and day of an event notice, "events today") live in `tests/notifications`; they run unchanged on the events-backed reader, and `EventSeamsTest` also drives them from the events side.
+- Admin allowlist: Java `EventScheduleTests` added `rede.admin.emails`; the Kof test uses `users.is_admin` (the production rule, the allowlist is tests-only).
+
+Differences and decisions:
+
+- `Event` is an immutable `EventRecord`; recurrence is a String (NONE, WEEKLY, BIWEEKLY, MONTHLY) because enums do not cross packages. The date rules (ISO and strict dd/MM/yyyy, absurd window of 5 years ahead and 2 behind, expiry in UTC, monthly anchor math) are pure functions of ISO text and epoch millis in `EventRules`, tested with explicit instants; no Java date API is needed.
+- A missing NOT NULL column (title, date, time, format, host) is `409 CONFLICT` after every other check, as the Java database refused it.
+- The list cache (`eventsList`, `REDE_CACHE_EVENTS_LIST_TTL`) stores the JSON of an `EventListPage` (visible events, how many the database returned and the last `created_at`), so the cursor still comes from the database page; every write clears it after commit (the sanitisation job too, which Java did not).
+- Event links: `streamUrl` keeps the Java https-only rule (`INVALID_STREAM_URL`) and every JSON body goes through `SafeLinks.checkRequest` (`UNSAFE_LINK`, the Java request-body advice). `cover` is stored as sent, as in Java (V169 and V180 only rewrote old rows).
+- Jobs on `kernel.jobs`: `event-recurrence` (cron `REDE_EVENTS_RECURRENCE_CRON`, default `0 20 * * * *`, zone `REDE_EVENTS_RECURRENCE_ZONE`, switch `REDE_EVENTS_RECURRENCE_ENABLED`) and `event-sanitization` (fixed delay `REDE_EVENTS_SANITIZE_DELAY_MS`, default one hour, first run at boot).
+- The recurrence job asks identity (`IdentityStore.credentialByUser`) and the sanction reader whether the host is still active, and writes `EVENT_NEXT_OCCURRENCE` through `Notifications.create`.
+
+Seams replaced:
+
+| Seam | Now |
+|---|---|
+| `ProfileForeignCounts.eventsAttendedTotal` (profile reputation) | `EventsForeignCounts` (overrides only that method), passed in `AppWiring` instead of `ProfileForeignCounts(platform.db)`. A `TODO(orgs merge)` comment in `AppWiring` says to chain it with the mentoring subclass |
+| `NotificationPlaceReader.eventDatesByIds` / `attendingEvents` (notifications) | `EventsNotificationPlaces` in `NotificationsSeams.placeReader` |
+
+Seams owned: none. Remaining reads of `events` tables outside the domain: none (`communities`, `posts` and `groups` readers of the notification place reader stay with their owners).
+
+Kernel changes: `DbParams.bindIntOrNull` and `bindLongOrNull` bound a PRESENT value through `Integer.valueOf(Integer)` (`NoSuchMethodError`, G353); they copy the value into a plain local first, with a test in `tests/kernel/DbTest.kf`.
+
+Gaps: G353. A failing test makes the test JVM hang at exit (existing G105/G124): kill the java child to get its output.
+### mentoring
+
+`src/mentoring` (`MentoringModel`, `MentoringRooms`, `MentoringDialIn`, `MentoringStore`, `MentoringService`, `MentoringViews`, `MentoringRoutes`, `MentoringModule`, `MentoringTestKit`), installed in `AppWiring` after coin and profile; route in `BootRoutesTest` (`GET /mentors/sessions/mine`).
+
+| Item | Result |
+|---|---|
+| Endpoints ported/total | 17/17: `GET /mentors`, `GET /mentors/{id}`, `GET /mentors/{id}/slots`, `POST /mentors`, `PATCH|DELETE /mentors/{id}`, `POST|DELETE .../slots`, `POST|GET .../sessions`, `GET|PUT .../availability`, `GET /mentors/sessions/mine`, `POST .../sessions/{id}/complete`, `POST .../sessions/{id}/cancel`, `GET .../room`, `GET .../sessions/{id}/dial-in` |
+| Java tests ported/total | 24/24 methods: `MentorProfileTests` 2, `MentorRoomTests` 6, `MentorSessionCompletionTests` 4, `MentorSparksPaymentTests` 6, `MentorAgendaTests` 4 (all in `tests/mentoring`), plus the `/mentors` half of `CatalogSearchTests` (2 methods: the mentors search and the wildcard test, `MentorCatalogTest`; the `/blogs` half is in `tests/blog`). `TextFieldLimitTests` and `LinkSchemeAllowlistTests` have no mentoring case |
+| Kof tests | 43 in 6 files (24 ports, 13 extra: delete/FK parity, idempotency replay and conflict, validation, slot ownership, Sao Paulo slot generation, inbox order, orphan escrow refund, room sanitising, Jitsi API parsing, nearest-slot and rating order, profile seam; 6 `finish`) plus `tests/kernel/DbParamsNullableTest` |
+| Seams replaced | `ProfileForeignCounts.mentoringAsMentee` by `MentoringProfileCounts` (subclass, only that count; AppWiring passes it instead of `ProfileForeignCounts`). The `/mentors` search test that `tests/search` waited for |
+| Seams owned | `MentoringDialInGateway` (base class, answers nothing; `JitsiDialInClient` asks `api.jitsi.net`, `REDE_MENTORING_JITSI_API_BASE`, tests point it at a closed loopback port). Coin (`CoinService` escrow), profile (`ProfileDirectory`) are called directly |
+| Kernel changes | `DbParams.bindLongOrNull/bindIntOrNull` fixed for non-null values (G348), with `tests/kernel/DbParamsNullableTest` |
+| Gaps | G348 |
+
+Notes:
+
+- Booking a slot, completing, cancelling and settling a session, and the mentor's completed counter are atomic claims (`update ... where available = true` / `status = 'SCHEDULED'` / `settled_at is null`); Java read and wrote whole rows. The completed counter is `sessions_count + 1` in SQL, counted once whoever completes the session (read, worker or mentor).
+- Java parity kept on purpose: `DELETE /mentors/{id}` of a mentor that already has slots, availability or sessions is `409 CONFLICT` (foreign keys of V5/V203); the settlement job refunds the mentee when the profile is gone (only reachable with FKs off, covered by a test).
+- `GET /mentors` is served with one query per page for the next free slot (Java asked per mentor). `limit < 1` is `400 BAD_REQUEST` (PageRequest); the expertise-only search sorts `rating desc, created_at desc` (Java left ties undefined).
+- A missing `expertise` list, a missing or malformed `startsAt`/`endsAt` answer `400 BAD_REQUEST` (Java: a null pointer / not-null column).
+- Jobs: `mentoring-complete-finished` (`REDE_MENTORING_SESSION_COMPLETION_[INITIAL_]DELAY_MS`, 120000/300000) and `mentoring-settle-expired` (600000/3600000). Config: `REDE_MENTORING_JITSI_BASE_URL` (default `https://meet.jit.si`).

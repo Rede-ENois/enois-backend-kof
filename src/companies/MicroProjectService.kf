@@ -1,0 +1,249 @@
+package companies
+
+import coin.*
+import corporate.*
+import kernel.blocks.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.log.*
+import kernel.text.*
+import kernel.time.*
+import messaging.*
+import notifications.*
+
+// MicroProjectService: the microprojects marketplace. A company publishes a real problem with deliverables and
+// acceptance criteria; professionals apply; the company picks one (IN_PROGRESS) and closes with the acceptance.
+// Payment happens OUTSIDE the platform: what lives here is the scope contract.
+class MicroProjectService {
+    Db store
+    MicroProjectStore projects
+    CompanyService companyService
+    Notifications notifications
+    CoinService coins
+    CorporateService corporate
+    MessagingService messaging
+    BlockedUsers blockedUsers
+    public constructor(store: Db, projects: MicroProjectStore, companyService: CompanyService, notifications: Notifications, coins: CoinService, corporate: CorporateService, messaging: MessagingService, blockedUsers: BlockedUsers) {
+        this.store = store
+        this.projects = projects
+        this.companyService = companyService
+        this.notifications = notifications
+        this.coins = coins
+        this.corporate = corporate
+        this.messaging = messaging
+        this.blockedUsers = blockedUsers
+    }
+    static String newId(prefix: String) = prefix + Ids.uuid().replace("-", "")
+    // Platform bonus for the selected professional: +200 sparks per completed microproject, at most 3 a month.
+    // Idempotent per project; a failure here never undoes the acceptance.
+    rewardProfessional(professionalId: String, projectId: String) {
+        try {
+            var month = Time.nowIso().substring(0, 7)
+            var prefix = "mpbonus:" + professionalId + ":" + month + ":"
+            if (coins.rewardCountByPrefix(prefix) >= 3L) {
+                return
+            }
+            coins.reward(professionalId, coins.scaledReward(CoinService.fais(200L)), prefix + projectId, "Microprojeto concluído (bônus da plataforma)")
+        } catch (String ignored) {
+            Log("companies.microprojects").warn("microproject bonus not paid")
+        }
+    }
+    CompanyAccess companyWithRole(companyId: String, userId: String) = CompanyAccess(companyService.company(companyId), companyService.roleOf(companyId, userId))
+    MicroProject publish(companyId: String, userId: String, b: MicroProjectBody) {
+        var access = this.companyWithRole(companyId, userId)
+        // Publishing writes on the company showcase: without a role anyone signed in would publish a public
+        // project on somebody else's page.
+        if (access.role == null) {
+            throw Errors.api(403, "NOT_COMPANY_MEMBER", "Voce nao faz parte desta pagina empresarial.")
+        }
+        this.validateFields(b)
+        var id = MicroProjectService.newId("mproj_")
+        var company = access.company
+        var now = Time.nowIso()
+        var project = MicroProject(id, company.id, userId, CompanyService.trimmed(b.title()), CompanyService.trimmed(b.problem()), CompanyService.trimText(b.scope()), CompanyService.trimmed(b.deliverables()), CompanyService.trimmed(b.acceptanceCriteria()), CompanyService.trimText(b.budget()), Dates.body(b.deadline()), "OPEN", null, now, now)
+        store.transaction(() -> {
+    projects.save(project)
+    notifications.create(company.ownerUserId, "MICROPROJETO", userId, "Microprojeto publicado", "\"" + project.title + "\" esta aberto na pagina da empresa.", "/api/empresa/" + company.slug, "Ver")
+    companyService.notifyFollowers(company, userId, "Novo microprojeto", company.name + " publicou \"" + project.title + "\".")
+})
+        return this.project(id)
+    }
+    validateFields(b: MicroProjectBody) {
+        // The ceiling is the column's (`micro_projects.title varchar(200)`).
+        TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "titulo", b.title(), 200)
+        if (!Texts.hasText(b.title()) || CompanyService.trimmed(b.title()).length() < 8) {
+            throw Errors.api(400, "INVALID_TITLE", "Titulo do microprojeto precisa de pelo menos 8 caracteres.")
+        }
+        if (!Texts.hasText(b.problem()) || CompanyService.trimmed(b.problem()).length() < 30) {
+            throw Errors.api(400, "INVALID_PROBLEM", "Descreva o problema real em pelo menos 30 caracteres — e o que o piloto vai resolver.")
+        }
+        if (!Texts.hasText(b.deliverables())) {
+            throw Errors.api(400, "INVALID_DELIVERABLES", "Entregaveis sao obrigatorios.")
+        }
+        if (!Texts.hasText(b.acceptanceCriteria())) {
+            throw Errors.api(400, "INVALID_ACCEPTANCE", "Criterios de aceite sao obrigatorios.")
+        }
+        TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "problema", b.problem(), 4000)
+        TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "escopo", b.scope(), 4000)
+        TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "entregaveis", b.deliverables(), 4000)
+        TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "criterios de aceite", b.acceptanceCriteria(), 4000)
+        TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "orcamento", b.budget(), 160)
+    }
+    MicroProject lockedProject(id: String) {
+        var p = projects.findByIdForUpdate(id)
+        if (p == null) {
+            throw Errors.api(404, "PROJECT_NOT_FOUND", "Microprojeto nao encontrado.")
+        }
+        return p
+    }
+    requireEditable(project: MicroProject, userId: String) {
+        this.requireCompanyRole(project, userId)
+        if (!project.isOpen() || projects.hasProposalsForUpdate(project.id)) {
+            throw Errors.api(409, "PROJECT_NOT_EDITABLE", "Apenas microprojetos abertos sem candidaturas podem ser editados ou removidos.")
+        }
+    }
+    MicroProject edit(projectId: String, userId: String, b: MicroProjectBody) {
+        store.transaction(() -> {
+    var project = this.lockedProject(projectId)
+    this.requireEditable(project, userId)
+    this.validateFields(b)
+    projects.save(MicroProject(project.id, project.companyId, project.createdBy, CompanyService.trimmed(b.title()), CompanyService.trimmed(b.problem()), CompanyService.trimText(b.scope()), CompanyService.trimmed(b.deliverables()), CompanyService.trimmed(b.acceptanceCriteria()), CompanyService.trimText(b.budget()), Dates.body(b.deadline()), project.status, project.selectedProposalId, project.createdAt, Time.nowIso()))
+})
+        return this.project(projectId)
+    }
+    MicroProject remove(projectId: String, userId: String) {
+        store.transaction(() -> {
+    var project = this.lockedProject(projectId)
+    this.requireEditable(project, userId)
+    projects.save(MicroProject(project.id, project.companyId, project.createdBy, project.title, project.problem, project.scope, project.deliverables, project.acceptanceCriteria, project.budget, project.deadline, "CANCELLED", project.selectedProposalId, project.createdAt, Time.nowIso()))
+})
+        return this.project(projectId)
+    }
+    List<MicroProject> openProjects(limit: Int) = projects.findOpen(limit)
+    List<MicroProject> byCompany(companyId: String) = projects.findByCompany(companyId)
+    // The proposals a person sent, to tell each project card where that person stands.
+    List<MicroProjectProposal> proposalsOf(userId: String) = projects.proposalsOfUser(userId)
+    MicroProject project(projectId: String) {
+        var p = projects.findById(projectId)
+        if (p == null) {
+            throw Errors.api(404, "PROJECT_NOT_FOUND", "Microprojeto nao encontrado.")
+        }
+        return p
+    }
+    // A proposal leaves from the proposer's PROFESSIONAL identity and lands in a professional conversation with the
+    // page owner (opened or reused), where the message is posted; the conversation id is kept on the proposal.
+    MicroProjectProposal propose(projectId: String, userId: String, rawMessage: String?) {
+        if (!Texts.hasText(rawMessage) || CompanyService.trimmed(rawMessage).length() < 20) {
+            throw Errors.api(400, "INVALID_PROPOSAL", "Conte sua proposta em pelo menos 20 caracteres.")
+        }
+        var message = CompanyService.trimmed(rawMessage)
+        TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "proposta", message, 2000)
+        var proposalId = MicroProjectService.newId("mprop_")
+        store.transaction(() -> {
+    var project = this.lockedProject(projectId)
+    if (!project.isOpen()) {
+        throw Errors.api(409, "PROJECT_NOT_OPEN", "Este microprojeto nao esta mais aberto.")
+    }
+    var access = this.companyWithRole(project.companyId, userId)
+    if (access.role != null) {
+        throw Errors.api(403, "OWN_COMPANY_PROJECT", "Voce nao pode se candidatar a projeto da propria pagina.")
+    }
+    if (projects.existsProposalByUser(projectId, userId)) {
+        throw Errors.api(409, "ALREADY_PROPOSED", "Voce ja se candidatou a este microprojeto.")
+    }
+    corporate.requireActive(userId)
+    var ownerId = access.company.ownerUserId
+    if (blockedUsers.hiddenIdsFor(userId).contains(ownerId)) {
+        throw Errors.api(403, "USER_BLOCKED", "Não é possível conversar com este usuário.")
+    }
+    var conversationId = messaging.freelanceConversationBetween(userId, ownerId, "Microprojeto: " + project.title)
+    messaging.sendMessage(conversationId, userId, "Proposta para o microprojeto \"" + project.title + "\"\n\n" + message, null, false, null)
+    projects.saveProposal(MicroProjectProposal(proposalId, projectId, userId, message, "SENT", Time.nowIso(), null, conversationId))
+    notifications.create(project.createdBy, "MICROPROJETO", userId, "Nova candidatura", "Alguem se candidatou ao microprojeto \"" + project.title + "\".", "/api/empresa/" + access.company.slug, "Ver")
+})
+        var saved = projects.findProposalById(proposalId)
+        if (saved == null) {
+            throw Errors.api(404, "PROPOSAL_NOT_FOUND", "Candidatura nao encontrada.")
+        }
+        return saved
+    }
+    List<MicroProjectProposal> proposals(projectId: String, userId: String) {
+        var project = this.project(projectId)
+        this.requireCompanyRole(project, userId)
+        return projects.proposalsOfProject(projectId)
+    }
+    MicroProject selectProposal(projectId: String, proposalId: String, userId: String) {
+        store.transaction(() -> {
+    var project = this.lockedProject(projectId)
+    this.requireCompanyRole(project, userId)
+    if (!project.isOpen()) {
+        throw Errors.api(409, "PROJECT_NOT_OPEN", "Este microprojeto nao esta mais aberto.")
+    }
+    var proposal = projects.findProposalById(proposalId)
+    if (proposal == null) {
+        throw Errors.api(404, "PROPOSAL_NOT_FOUND", "Candidatura nao encontrada.")
+    }
+    if (proposal.projectId != projectId || !proposal.isSent()) {
+        throw Errors.api(409, "PROPOSAL_NOT_AVAILABLE", "Esta candidatura nao esta mais disponivel.")
+    }
+    var now = Time.nowIso()
+    projects.save(MicroProject(project.id, project.companyId, project.createdBy, project.title, project.problem, project.scope, project.deliverables, project.acceptanceCriteria, project.budget, project.deadline, "IN_PROGRESS", proposalId, project.createdAt, now))
+    projects.saveProposal(MicroProjectProposal(proposal.id, proposal.projectId, proposal.userId, proposal.message, "SELECTED", proposal.proposedAt, now, proposal.conversationId))
+    this.declineOthers(projectId, proposalId, now)
+    notifications.create(proposal.userId, "MICROPROJETO", userId, "Voce foi selecionado", "Sua candidatura ao microprojeto \"" + project.title + "\" foi escolhida. Fale com a empresa para alinhar o piloto.", "/api/empresa/" + this.companySlug(project.companyId), "Ver")
+})
+        return this.project(projectId)
+    }
+    // Completes the project. `rating` (1..5, optional) with an optional `text` (up to 500) becomes the company's one
+    // review of the selected professional.
+    MicroProject complete(projectId: String, userId: String, rating: Int?, text: String?) {
+        store.transaction(() -> {
+    var project = this.lockedProject(projectId)
+    this.requireCompanyRole(project, userId)
+    if (project.status != "IN_PROGRESS") {
+        throw Errors.api(409, "PROJECT_NOT_IN_PROGRESS", "So microprojeto em andamento pode ser concluido.")
+    }
+    var reviewText = CompanyService.trimText(text)
+    if (rating == null) {
+        if (reviewText != null) {
+            throw Errors.api(400, "INVALID_RATING", "Avalie com uma nota de 1 a 5.")
+        }
+    }
+    else {
+        if (rating < 1 || rating > 5) {
+            throw Errors.api(400, "INVALID_RATING", "Avalie com uma nota de 1 a 5.")
+        }
+    }
+    TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "avaliacao", reviewText, 500)
+    projects.save(MicroProject(project.id, project.companyId, project.createdBy, project.title, project.problem, project.scope, project.deliverables, project.acceptanceCriteria, project.budget, project.deadline, "COMPLETED", project.selectedProposalId, project.createdAt, Time.nowIso()))
+    var selected = project.selectedProposalId
+    if (selected != null) {
+        var proposal = projects.findProposalById(selected)
+        if (proposal != null) {
+            if (rating != null) {
+                projects.saveReview(MicroProjectReview(project.id, project.companyId, proposal.userId, rating, reviewText, Time.nowIso()))
+            }
+            notifications.create(proposal.userId, "MICROPROJETO", userId, "Microprojeto concluido", "A empresa confirmou o aceite dos entregaveis de \"" + project.title + "\".", "/api/empresa/" + this.companySlug(project.companyId), "Ver")
+            this.rewardProfessional(proposal.userId, project.id)
+        }
+    }
+})
+        // A text without a rating is not a review either: the client is told, never silently dropped.
+        return this.project(projectId)
+    }
+    Long countByStatus(companyId: String, status: String) = projects.countByCompanyAndStatus(companyId, status)
+    Map<String,Long> openCountsByCompany(companyIds: List<String>) = projects.openCountsByCompany(companyIds)
+    List<MicroProjectReview> latestReviews(companyId: String) = projects.latestReviews(companyId)
+    declineOthers(projectId: String, selectedProposalId: String, at: String) {
+        for (var p in projects.proposalsOfProject(projectId)) {
+            if (p.isSent() && p.id != selectedProposalId) {
+                projects.saveProposal(MicroProjectProposal(p.id, p.projectId, p.userId, p.message, "DECLINED", p.proposedAt, at, p.conversationId))
+            }
+        }
+    }
+    requireCompanyRole(project: MicroProject, userId: String) {
+        companyService.requireRole(companyService.company(project.companyId), userId, "EDITOR")
+    }
+    String companySlug(companyId: String) = companyService.company(companyId).slug
+}

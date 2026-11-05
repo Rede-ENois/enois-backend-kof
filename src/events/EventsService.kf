@@ -1,0 +1,386 @@
+package events
+
+import kernel.cache.*
+import kernel.db.*
+import kernel.error.*
+import kernel.geo.*
+import kernel.id.*
+import kernel.log.*
+import kernel.sanctions.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+
+// The clock of the events domain. Tests pass a subclass with a fixed instant (EventSanitizationWindowTests).
+class EventsClock {
+    public constructor() {}
+    Long millis() = Time.nowMillis()
+    String iso() = Time.nowIso()
+}
+
+// Use cases of EventService: create, edit, delete, recurrence, attendance, the cached list and the sanitisation
+// of past events. Every write runs in a transaction and clears the list cache after the commit.
+class EventsService {
+    Db database
+    EventsStore store
+    SanctionGateReader sanctions
+    SuspiciousText suspicious
+    EventsClock clock
+    TtlCache eventsCache
+    Log log = Log("events.service")
+    public constructor(database: Db, store: EventsStore, sanctions: SanctionGateReader, suspicious: SuspiciousText, clock: EventsClock, eventsCache: TtlCache) {
+        this.database = database
+        this.store = store
+        this.sanctions = sanctions
+        this.suspicious = suspicious
+        this.clock = clock
+        this.eventsCache = eventsCache
+    }
+    // ---------------------------------------------------------------- validation
+    // The same ceilings as the columns (`events.title varchar(255)`...): without them the database refused the
+    // write with "Data too long" and the person got a 409 that does not say which field went over.
+    checkLimits(title: String?, location: String?, host: String?, format: String?, streamUrl: String?) {
+        TextFieldLimit.check("EVENT_FIELD_TOO_LONG", "titulo", title, 255)
+        TextFieldLimit.check("EVENT_FIELD_TOO_LONG", "local", location, 255)
+        TextFieldLimit.check("EVENT_FIELD_TOO_LONG", "host", host, 255)
+        TextFieldLimit.check("EVENT_FIELD_TOO_LONG", "formato", format, 32)
+        TextFieldLimit.check("EVENT_FIELD_TOO_LONG", "transmissao", streamUrl, 500)
+    }
+    // The stream link is free text that comes back as a clickable link: only https goes in (a `javascript:` stored
+    // here would be a clickable link for whoever opens the list).
+    String? httpsOrNull(url: String?) {
+        if (!Texts.hasText(url)) {
+            return null
+        }
+        var link = url as String
+        var trimmed = link.trim()
+        if (!trimmed.toLowerCase().startsWith("https://")) {
+            throw Errors.api(400, "INVALID_STREAM_URL", "O link da transmissao precisa comecar com https://.")
+        }
+        return trimmed
+    }
+    // The date must be readable and fall in a window that exists in real life (two years back, five ahead).
+    requireRealisticSchedule(date: String?, nowMillis: Long) {
+        if (EventRules.parseDate(date) == null) {
+            throw Errors.api(400, "INVALID_EVENT_DATE", "Data do evento invalida. Use AAAA-MM-DD ou DD/MM/AAAA.")
+        }
+        if (EventRules.hasAbsurdSchedule(date, nowMillis)) {
+            throw Errors.api(400, "INVALID_EVENT_DATE", "Data fora do periodo aceito: no maximo 5 anos para frente e 2 anos para tras.")
+        }
+    }
+    // City and state only make sense for an in-person or hybrid meetup.
+    CityState? placeFor(city: String?, state: String?, format: String?) {
+        var place = CityState.of(city, state)
+        if (place == null) {
+            return null
+        }
+        var shown = ""
+        if (format != null) {
+            shown = format.trim()
+        }
+        if (shown.toUpperCase() == "ONLINE") {
+            throw Errors.api(400, "EVENT_CITY_NOT_IN_PERSON", "Cidade e estado so valem para evento presencial ou hibrido.")
+        }
+        return place
+    }
+    String parseRecurrence(raw: String?) {
+        if (!Texts.hasText(raw)) {
+            return "NONE"
+        }
+        var text = raw as String
+        var value = text.trim().toUpperCase()
+        if (!EventRules.validRecurrence(value)) {
+            throw Errors.api(400, "INVALID_RECURRENCE", "Recorrencia invalida. Use NONE, WEEKLY, BIWEEKLY ou MONTHLY.")
+        }
+        return value
+    }
+    // A ritual repeats at a fixed time: without a readable hour the next one cannot be scheduled.
+    requireScheduledTime(time: String?) {
+        if (!EventRules.hasScheduledTime(time)) {
+            throw Errors.api(400, "INVALID_EVENT_TIME", "Evento recorrente precisa de horario no formato HH:MM.")
+        }
+    }
+    // The columns title, date, time, format and host are NOT NULL: a missing one is what the database refused in the
+    // Java service (409 CONFLICT), after every other check.
+    requireColumns(title: String?, date: String?, time: String?, format: String?, host: String?) {
+        if (title == null || date == null || time == null || format == null || host == null) {
+            throw Errors.conflict()
+        }
+    }
+    static String text(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    // ---------------------------------------------------------------- writes
+    EventRecord create(title: String?, date: String?, time: String?, format: String?, host: String?, cover: String?, streamUrl: String?, location: String?, recurrence: String?, city: String?, state: String?, userId: String) {
+        this.checkLimits(title, location, host, format, streamUrl)
+        var id = Ids.prefixed("event_")
+        var now = clock.iso()
+        var stream = this.httpsOrNull(streamUrl)
+        this.requireRealisticSchedule(date, clock.millis())
+        var place = this.placeFor(city, state, format)
+        var parsed = this.parseRecurrence(recurrence)
+        String? series = Nulls.str()
+        if (parsed != "NONE") {
+            this.requireScheduledTime(time)
+            series = id
+        }
+        this.requireColumns(title, date, time, format, host)
+        String? cityName = Nulls.str()
+        String? stateName = Nulls.str()
+        String? cityKey = Nulls.str()
+        if (place != null) {
+            cityName = place.city
+            stateName = place.state
+            cityKey = place.cityKey
+        }
+        var e = EventRecord(id, EventsService.text(title), EventsService.text(date), EventsService.text(time), EventsService.text(format), EventsService.text(host), cover, stream, location, cityName, stateName, cityKey, userId, now, now, Nulls.str(), Nulls.integer(), parsed, series)
+        var self = this
+        database.transaction(() -> {
+    self.store.save(e)
+    self.eventsCache.clearAfterCommit(self.database)
+})
+        return e
+    }
+    EventRecord update(eventId: String, title: String?, date: String?, time: String?, format: String?, host: String?, cover: String?, streamUrl: String?, location: String?, city: String?, state: String?, userId: String) {
+        var self = this
+        var out = listOf<EventRecord>()
+        database.transaction(() -> {
+    out.add(self.updateInTransaction(eventId, title, date, time, format, host, cover, streamUrl, location, city, state, userId))
+})
+        return out.get(0)
+    }
+    EventRecord updateInTransaction(eventId: String, title: String?, date: String?, time: String?, format: String?, host: String?, cover: String?, streamUrl: String?, location: String?, city: String?, state: String?, userId: String) {
+        var event = this.getById(eventId)
+        if (event.createdBy != userId) {
+            throw Errors.api(403, "NOT_EVENT_OWNER", "Este evento nao e seu.")
+        }
+        this.checkLimits(title, location, host, format, streamUrl)
+        var stream = this.httpsOrNull(streamUrl)
+        this.requireRealisticSchedule(date, clock.millis())
+        var place = this.placeFor(city, state, format)
+        // A running series still needs a fixed time after the date is edited.
+        if (event.recurrence != "NONE") {
+            this.requireScheduledTime(time)
+        }
+        this.requireColumns(title, date, time, format, host)
+        String? cityName = Nulls.str()
+        String? stateName = Nulls.str()
+        String? cityKey = Nulls.str()
+        if (place != null) {
+            cityName = place.city
+            stateName = place.state
+            cityKey = place.cityKey
+        }
+        var e = EventRecord(event.id, EventsService.text(title), EventsService.text(date), EventsService.text(time), EventsService.text(format), EventsService.text(host), cover, stream, location, cityName, stateName, cityKey, event.createdBy, event.createdAt, clock.iso(), event.sanitizedAt, event.finalAttendeesCount, event.recurrence, event.seriesId)
+        store.save(e)
+        eventsCache.clearAfterCommit(database)
+        return e
+    }
+    // Turns the recurrence on, changes it or turns it off (NONE ends the series). Only the creator decides, and it
+    // applies to the whole series: switching it off on any occurrence stops the scheduler from creating the next.
+    EventRecord changeRecurrence(eventId: String, recurrence: String?, userId: String) {
+        var self = this
+        var out = listOf<EventRecord>()
+        database.transaction(() -> {
+    out.add(self.changeRecurrenceInTransaction(eventId, recurrence, userId))
+})
+        return out.get(0)
+    }
+    EventRecord changeRecurrenceInTransaction(eventId: String, recurrence: String?, userId: String) {
+        var event = this.getById(eventId)
+        if (event.createdBy != userId) {
+            throw Errors.api(403, "NOT_EVENT_OWNER", "Este evento nao e seu.")
+        }
+        var parsed = this.parseRecurrence(recurrence)
+        if (parsed != "NONE") {
+            this.requireScheduledTime(event.time)
+        }
+        var series = event.seriesId
+        if (series == null && parsed != "NONE") {
+            series = event.id
+        }
+        var e = EventRecord(event.id, event.title, event.date, event.time, event.format, event.host, event.cover, event.streamUrl, event.location, event.city, event.state, event.cityKey, event.createdBy, event.createdAt, event.updatedAt, event.sanitizedAt, event.finalAttendeesCount, parsed, series)
+        store.save(e)
+        if (series != null) {
+            store.updateSeriesRecurrence(series, parsed)
+        }
+        eventsCache.clearAfterCommit(database)
+        return e
+    }
+    // Deletes an event and its attendance: the creator deletes their own, an admin any (that is how an absurd event
+    // leaves the showcase without anyone touching the database).
+    delete(eventId: String, userId: String, admin: Bool) {
+        var self = this
+        database.transaction(() -> {
+    self.deleteInTransaction(eventId, userId, admin)
+})
+    }
+    deleteInTransaction(eventId: String, userId: String, admin: Bool) {
+        var event = store.findById(eventId)
+        if (event == null) {
+            throw Errors.api(404, "EVENT_NOT_FOUND", "Evento nao encontrado.")
+        }
+        if (!admin && event.createdBy != userId) {
+            throw Errors.api(403, "NOT_EVENT_OWNER", "Este evento nao e seu.")
+        }
+        // A removed occurrence ends the series: otherwise the previous one would become the latest again and
+        // recreate the date that just left.
+        var series = event.seriesId
+        if (series != null) {
+            store.updateSeriesRecurrence(series, "NONE")
+        }
+        store.deleteAttendees(eventId)
+        store.deleteById(eventId)
+        eventsCache.clearAfterCommit(database)
+    }
+    attend(eventId: String, userId: String) {
+        var self = this
+        database.transaction(() -> {
+    self.attendInTransaction(eventId, userId)
+})
+        log.info("event_attendance eventId=" + eventId + " action=ATTENDING")
+    }
+    attendInTransaction(eventId: String, userId: String) {
+        var event = store.findById(eventId)
+        if (event == null) {
+            throw Errors.api(404, "EVENT_NOT_FOUND", "Evento nao encontrado.")
+        }
+        if (this.hasEnded(event)) {
+            throw Errors.api(400, "EVENT_FINISHED", "Este evento ja aconteceu.")
+        }
+        if (store.isAttending(eventId, userId)) {
+            throw Errors.api(409, "ALREADY_ATTENDING", "Voce ja confirmou presenca.")
+        }
+        store.saveAttendee(eventId, userId, clock.iso())
+        // The attendance total shows on every card of the list.
+        eventsCache.clearAfterCommit(database)
+    }
+    cancelAttendance(eventId: String, userId: String) {
+        var self = this
+        database.transaction(() -> {
+    self.cancelInTransaction(eventId, userId)
+})
+        log.info("event_attendance eventId=" + eventId + " action=NOT_ATTENDING")
+    }
+    cancelInTransaction(eventId: String, userId: String) {
+        if (!store.isAttending(eventId, userId)) {
+            throw Errors.api(404, "NOT_ATTENDING", "Voce nao esta inscrito neste evento.")
+        }
+        store.removeAttendee(eventId, userId)
+        eventsCache.clearAfterCommit(database)
+    }
+    // ---------------------------------------------------------------- reads
+    // Upcoming events (or running); an expired one leaves the showcase. `includePast` is for history. The cursor
+    // comes from the page the database returned: filtering after paginating without it would make the list believe
+    // it ended. The showcase is the same for everybody, so it is cached and every write clears it.
+    EventListPage list(format: String?, city: String?, state: String?, before: String?, limit: Int, includePast: Bool, recurringOnly: Bool) {
+        var n = EventsService.clamp(limit)
+        var key = "" + format + "|" + city + "|" + state + "|" + before + "|" + n + "|" + includePast + "|" + recurringOnly
+        var self = this
+        var text = eventsCache.getOrLoad(key, () -> json.encode(self.load(format, city, state, before, n, includePast, recurringOnly)))
+        return json.decode<EventListPage>(text)
+    }
+    static Int clamp(limit: Int) {
+        if (limit < 1) {
+            return 1
+        }
+        if (limit > 100) {
+            return 100
+        }
+        return limit
+    }
+    EventListPage load(format: String?, city: String?, state: String?, before: String?, limit: Int, includePast: Bool, recurringOnly: Bool) {
+        // Place filter (in-person and hybrid only): `state` alone filters by UF; `city` needs `state`. The city
+        // compares without accents and case.
+        String? uf = Nulls.str()
+        String? cityKey = Nulls.str()
+        if (Texts.hasText(city)) {
+            var place = CityState.of(city, state)
+            if (place != null) {
+                uf = place.state
+                cityKey = place.cityKey
+            }
+        }
+        else {
+            if (Texts.hasText(state)) {
+                uf = CityState.requireState(state)
+            }
+        }
+        String? wanted = Nulls.str()
+        if (Texts.hasText(format)) {
+            wanted = format
+        }
+        var fetched = store.findAll(wanted, uf, cityKey, before, recurringOnly, limit)
+        var visible = listOf<EventRecord>()
+        for (var e in fetched) {
+            if (includePast || !this.hasEnded(e)) {
+                // An event of a banned account leaves the showcase (its content is being cleaned up).
+                if (!sanctions.banned(e.createdBy) && !suspicious.matchesAny(listOf(e.title, e.host))) {
+                    visible.add(e)
+                }
+            }
+        }
+        String? last = Nulls.str()
+        if (fetched.size() > 0) {
+            last = fetched.get(fetched.size() - 1).createdAt
+        }
+        return EventListPage(visible, fetched.size(), last)
+    }
+    EventRecord getById(id: String) {
+        var e = store.findById(id)
+        if (e == null) {
+            throw Errors.api(404, "EVENT_NOT_FOUND", "Evento nao encontrado.")
+        }
+        return e
+    }
+    Int countAttendees(eventId: String) = store.countAttendees(eventId)
+    Map<String,Int> countAttendeesByEventIds(eventIds: List<String>) = store.countAttendeesByEventIds(eventIds)
+    // Events among `eventIds` where the user confirmed attendance (one query).
+    List<String> attendingEventIds(userId: String, eventIds: List<String>) = store.findAttendingEventIds(userId, eventIds)
+    // The event is over (list and the "encerrado" badge).
+    Bool hasEnded(e: EventRecord) = EventRules.isExpired(e.date, e.time, clock.millis(), 0L)
+    // Attendance can be erased: it ended and the grace is over.
+    Bool isReadyForSanitization(e: EventRecord) = EventRules.isExpired(e.date, e.time, clock.millis(), EventRules.sanitizeGraceMillis())
+    // ---------------------------------------------------------------- sanitisation
+    // Sanitises the past events: keeps the attendance total, erases the link to each person and marks the event.
+    // Idempotent. After the retention the sanitised event is deleted whole (the history was already aggregated).
+    EventSanitizationResult sanitizeExpired() {
+        var self = this
+        var out = listOf<EventSanitizationResult>()
+        database.transaction(() -> {
+    out.add(self.sanitizeInTransaction())
+})
+        return out.get(0)
+    }
+    EventSanitizationResult sanitizeInTransaction() {
+        var now = clock.iso()
+        var sanitized = 0
+        for (var e in store.findNotSanitized()) {
+            if (this.isReadyForSanitization(e)) {
+                var attendees = store.countAttendees(e.id)
+                // What a person contributed cannot evaporate with the personal data: before the link to each
+                // person is erased, the COUNT per user is kept (it carries no personal data).
+                for (var userId in store.findAttendeeIds(e.id)) {
+                    store.addAttendanceToTotal(userId)
+                }
+                store.deleteAttendees(e.id)
+                store.save(EventRecord(e.id, e.title, e.date, e.time, e.format, e.host, e.cover, e.streamUrl, e.location, e.city, e.state, e.cityKey, e.createdBy, e.createdAt, e.updatedAt, now, attendees, e.recurrence, e.seriesId))
+                sanitized = sanitized + 1
+            }
+        }
+        var purged = 0
+        var threshold = Time.fromMillis(clock.millis() - EventRules.retentionMillis())
+        for (var e in store.findSanitizedBefore(threshold)) {
+            store.deleteAttendees(e.id)
+            store.deleteById(e.id)
+            purged = purged + 1
+        }
+        if (sanitized > 0 || purged > 0) {
+            eventsCache.clearAfterCommit(database)
+        }
+        return EventSanitizationResult(sanitized, purged)
+    }
+}

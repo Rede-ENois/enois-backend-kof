@@ -1,0 +1,66 @@
+import app.*
+import java.util.HashMap
+import kernel.testkit.*
+
+// The events-specific cases of IntelligentCacheTests, through HTTP: the showcase is the same for everybody, so it is
+// cached; a write clears it so the change shows on the next request; a refused write leaves it alone. The cache is on
+// here (60 s); the rest of the suites run it at 0 ms.
+Long ecacheMisses() = EventsTestKit.sharedOrFail().caches.get("eventsList").misses()
+
+Long ecacheHits() = EventsTestKit.sharedOrFail().caches.get("eventsList").hits()
+
+test "firstRequestQueriesTheSourceAndTheNextOnesReuseTheAnswer" {
+    var overrides = new HashMap<String, String>()
+    overrides.put("REDE_CACHE_EVENTS_LIST_TTL", "60s")
+    OrgsTestKit.bootWith(overrides)
+    var host = OrgsTestKit.login("ecache_host1")
+    EventsTestKit.create(host, "ecache first", EventsTestKit.day(30))
+    var guest = OrgsTestKit.anonymous()
+    var one = guest.get("/events?limit=7")
+    Check.status(one, 200)
+    var missesAfterFirst = ecacheMisses()
+    var hitsAfterFirst = ecacheHits()
+    guest.get("/events?limit=7")
+    guest.get("/events?limit=7")
+    Check.eqStr("no new load", "" + missesAfterFirst, "" + ecacheMisses())
+    Check.eqStr("two answers from the cache", "" + (hitsAfterFirst + 2L), "" + ecacheHits())
+    // Another key (another filter) is its own entry.
+    guest.get("/events?limit=8")
+    Check.isTrue("a new key loads", ecacheMisses() > missesAfterFirst)
+}
+
+test "aWriteClearsTheListSoTheChangeShowsUpOnTheNextRequest" {
+    var host = OrgsTestKit.login("ecache_host2")
+    var guest = OrgsTestKit.anonymous()
+    guest.get("/events?limit=50")
+    var id = EventsTestKit.create(host, "ecache appears after the write", EventsTestKit.day(31))
+    var after = guest.get("/events?limit=50")
+    Check.isTrue("the created event shows on the next request", EventsTestKit.listed(after, id))
+    var hidden = host.delete("/events/" + id)
+    Check.status(hidden, 200)
+    Check.isTrue("the deleted event is gone on the next request", !EventsTestKit.listed(guest.get("/events?limit=50"), id))
+    // Attending also clears it: the total shows in every card.
+    var other = OrgsTestKit.login("ecache_guest2")
+    var id2 = EventsTestKit.create(host, "ecache attendance total", EventsTestKit.day(32))
+    Check.status(guest.get("/events?limit=50"), 200)
+    Check.status(other.post("/events/" + id2 + "/attendees", ""), 200)
+    var counted = guest.get("/events?limit=50")
+    Check.jsonEq(counted, "items." + EventsTestKit.indexOf(counted, id2) + ".attendees", "1")
+}
+
+test "aFailedWriteLeavesTheCacheAlone" {
+    var host = OrgsTestKit.login("ecache_host3")
+    var other = OrgsTestKit.login("ecache_other3")
+    var id = EventsTestKit.create(host, "ecache refused write", EventsTestKit.day(33))
+    var guest = OrgsTestKit.anonymous()
+    guest.get("/events?limit=9")
+    var misses = ecacheMisses()
+    // Not the owner: the delete is refused before writing, and the list is still served from the cache.
+    Check.apiError(other.delete("/events/" + id), 403, "NOT_EVENT_OWNER")
+    guest.get("/events?limit=9")
+    Check.eqStr("no new load", "" + misses, "" + ecacheMisses())
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}

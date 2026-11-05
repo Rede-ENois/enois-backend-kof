@@ -1,0 +1,65 @@
+import app.*
+import events.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import profile.*
+
+// The seams other domains held for events, now backed by the events domain (EventsForeignCounts for profile,
+// EventsNotificationPlaces for notifications), through the exact production wiring.
+test "profileCountsLiveAttendancePlusTheAggregateKeptAfterThePurge" {
+    var host = OrgsTestKit.login("evseam_host1")
+    var guest = OrgsTestKit.login("evseam_guest1")
+    var counts = EventsForeignCounts(OrgsTestKit.db(), EventsTestKit.store())
+    Check.eqInt("nothing attended", 0, counts.eventsAttendedTotal("evseam_guest1"))
+    var first = EventsTestKit.create(host, "evseam first", EventsTestKit.day(3))
+    var second = EventsTestKit.create(host, "evseam second", EventsTestKit.day(4))
+    Check.status(guest.post("/events/" + first + "/attendees", ""), 200)
+    Check.status(guest.post("/events/" + second + "/attendees", ""), 200)
+    Check.eqInt("two live attendances", 2, counts.eventsAttendedTotal("evseam_guest1"))
+    // The first event passes and is sanitised: its row is erased and the aggregate keeps the count.
+    EventsTestKit.setEventDate(first, EventsTestKit.day(-3), "10:00")
+    EventsTestKit.service(EventsClock()).sanitizeExpired()
+    Check.eqInt("the first attendance left", 0, EventsTestKit.attendeeRows(first))
+    Check.eqInt("still two in total", 2, counts.eventsAttendedTotal("evseam_guest1"))
+    // Only the events count is overridden: the other counts of the profile still answer.
+    Check.eqInt("the inherited counts still work", 0, counts.communitiesJoined("evseam_guest1"))
+    // The same number feeds the production profile (the wiring passes this subclass).
+    var base = ProfileForeignCounts(OrgsTestKit.db())
+    Check.eqInt("same answer as the table reader it replaced", base.eventsAttendedTotal("evseam_guest1"), counts.eventsAttendedTotal("evseam_guest1"))
+}
+
+test "notificationsResolveTheEventDayAndTodaysConfirmedEventsFromTheEventsDomain" {
+    var host = EventsTestKit.host("evseam_host2")
+    var guest = EventsTestKit.host("evseam_guest2")
+    var yesterday = EventsTestKit.day(-1)
+    var created = host.post("/events", "{\"title\":\"evseam ritual\",\"date\":\"" + yesterday + "\",\"time\":\"19:00\",\"format\":\"Online\",\"host\":\"Enois\",\"recurrence\":\"WEEKLY\"}")
+    Check.status(created, 201)
+    var eventId = OrgsTestKit.str(created, "id")
+    EventsTestKit.store().saveAttendee(eventId, "evseam_guest2", Time.nowIso())
+    EventsTestKit.recurrence().spawnNextOccurrences()
+    // The notice points at the new occurrence: its day comes from the events reader.
+    var list = guest.get("/notifications?limit=50")
+    Check.status(list, 200)
+    var at = 0
+    while (list.jsonStr("items." + at + ".kind") != "EVENT_NEXT_OCCURRENCE") {
+        at = at + 1
+    }
+    Check.jsonEq(list, "items." + at + ".eventDate", EventsTestKit.day(6))
+    // "events today": a confirmed, not sanitised event dated today in Brazil.
+    var today = Dates.todayBrazil()
+    var todays = host.post("/events", EventsTestKit.body("evseam today", today, "23:30", "ONLINE", "Enois"))
+    Check.status(todays, 201)
+    var todayId = OrgsTestKit.str(todays, "id")
+    var tomorrow = EventsTestKit.create(host, "evseam tomorrow", EventsTestKit.day(2))
+    var notAttending = EventsTestKit.create(host, "evseam not attending", EventsTestKit.day(2))
+    EventsTestKit.store().saveAttendee(todayId, "evseam_guest2", Time.nowIso())
+    EventsTestKit.store().saveAttendee(tomorrow, "evseam_guest2", Time.nowIso())
+    var summary = guest.get("/notifications/unread-summary")
+    Check.status(summary, 200)
+    Check.jsonEq(summary, "eventsToday", "1")
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}
