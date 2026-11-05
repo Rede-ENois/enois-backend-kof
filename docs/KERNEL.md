@@ -607,6 +607,7 @@ audit.write(actorId, "USER_BANNED", targetId, "{\"reason\":\"spam\"}")      // m
 import kernel.security.*
 
 Hashes.sha256Hex(token)                       // lower-case hex of the UTF-8 bytes (only hashes are persisted)
+Hashes.hmacSha256Hex(secret, body)            // lower-case hex HMAC-SHA256 (GitHub webhook "sha256=" signature); compare with Tokens.safeEquals
 
 var cipher = SecretCipher.fromConfig(platform.cfg)   // REDE_SECURITY_ENCRYPTION_KEY (32 bytes, base64)
 cipher.encrypt(secret)  cipher.decrypt(stored)  cipher.isEnabled()  cipher.requireEnabled()
@@ -947,6 +948,7 @@ jobs keep the test process alive otherwise (G124).
 ```kotlin
 import kernel.http.*
 var reply = Outbound.request("POST", url, listOf("Content-Type: application/json"), "{}", 15000)   // reply.status, reply.body; also postJson / postForm / get
+var patched = Outbound.patch(url, headers, "{}", 15000)            // PATCH (java.net.http cannot PATCH: Apache HttpPatch, G321)
 var posted = Outbound.attempt("POST", url, headers, "{}", 15000)    // same, but unreachable = status 0 and empty body instead of a throw
 var res = Outbound.getBytes(url, listOf("Accept: image/*"), 4000, 6000, 1048576)   // connect ms, read ms, max bytes
 res.status   res.contentType   res.body: Byte[]   res.size()   res.text()
