@@ -1,0 +1,51 @@
+package cosmetics
+
+import coin.*
+import kernel.*
+import profile.*
+
+// What the profile needs BEFORE it is installed (the badge ownership seam) and the catalog, built from the file once:
+//
+//   var cosmeticsCore = CosmeticsCore.create(platform)
+//   var profiles = ProfileModule.installWith(platform, shared, ..., cosmeticsCore.badges, ...)   // the seam owner
+//   ... coin ...
+//   var cosmetics = CosmeticsModule.install(platform, cosmeticsCore, coin, profiles)
+//
+// The catalog path is COSMETICS_CATALOG (default resources/cosmetics/catalog.json, relative to the working directory).
+class CosmeticsCore {
+    CosmeticCatalog catalog
+    CosmeticsStore store
+    CosmeticsBadgeOwnership badges
+    public constructor(catalog: CosmeticCatalog, store: CosmeticsStore, badges: CosmeticsBadgeOwnership) {
+        this.catalog = catalog
+        this.store = store
+        this.badges = badges
+    }
+    static CosmeticsCore create(platform: Platform) {
+        var catalog = CosmeticCatalog.load(platform.cfg.getStr("COSMETICS_CATALOG", "resources/cosmetics/catalog.json"))
+        var store = CosmeticsStore(platform.db, CoinStore(platform.db))
+        return CosmeticsCore(catalog, store, CosmeticsBadgeOwnership(platform.db, catalog, store))
+    }
+}
+
+// The cosmetics domain: shop, free events and community cosmetics. What the other modules read: `cosmetics.shop`
+// (owns, ownedItemIds, buy, equip...), `cosmetics.events`, `cosmetics.community`.
+class CosmeticsModule {
+    CosmeticsService shop
+    CosmeticEventService events
+    CommunityCosmeticsService community
+    public constructor(shop: CosmeticsService, events: CosmeticEventService, community: CommunityCosmeticsService) {
+        this.shop = shop
+        this.events = events
+        this.community = community
+    }
+    static CosmeticsModule install(platform: Platform, core: CosmeticsCore, coin: CoinModule, profiles: ProfileModule) = CosmeticsModule.installWith(platform, core, coin, profiles, CosmeticsContributors(platform.db))
+    // The contributions domain passes its own CosmeticsContributors subclass here.
+    static CosmeticsModule installWith(platform: Platform, core: CosmeticsCore, coin: CoinModule, profiles: ProfileModule, contributors: CosmeticsContributors) {
+        var shop = CosmeticsService(platform.db, core.catalog, core.store, coin.service, profiles.directory, profiles.slots)
+        var events = CosmeticEventService(platform.db, core.store, platform.cfg)
+        var community = CommunityCosmeticsService(core.store, core.catalog, shop, profiles.directory, profiles.slots, contributors)
+        CosmeticsRoutes.register(platform.server, shop, events, community)
+        return CosmeticsModule(shop, events, community)
+    }
+}

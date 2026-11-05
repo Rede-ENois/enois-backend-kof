@@ -1,0 +1,419 @@
+package cosmetics
+
+import coin.*
+import java.util.HashSet
+import kernel.db.*
+import kernel.error.*
+import kernel.text.*
+import profile.*
+
+// The cosmetics shop (plan C3): native items with a low price in sparks. A purchase is direct (not an escrow: the item
+// belongs to the platform) and is audited in the ledger; ownership is the PURCHASE entry or, for an event reward, a row
+// in cosmetic_grants. Never reach, never boosting: only looks.
+class CosmeticsService {
+    Db database
+    CosmeticCatalog catalog
+    CosmeticsStore store
+    CoinService coins
+    ProfileDirectory directory
+    ProfileSlots slots
+    public constructor(database: Db, catalog: CosmeticCatalog, store: CosmeticsStore, coins: CoinService, directory: ProfileDirectory, slots: ProfileSlots) {
+        this.database = database
+        this.catalog = catalog
+        this.store = store
+        this.coins = coins
+        this.directory = directory
+        this.slots = slots
+    }
+    static Int maxBadges() = 5
+    static Int maxStatusChars() = 60
+    static List<String> freeStatusIcons() = listOf("cafe", "estrela", "coracao", "chip")
+    // The catalog in the asked order: "oldest" or "newest" by release order.
+    List<CosmeticItem> catalogOrdered(order: String) {
+        var base = catalog.allItems()
+        var out = listOf<CosmeticItem>()
+        if (order == "oldest") {
+            for (var i in base) {
+                out.add(i)
+            }
+            return out
+        }
+        if (order == "newest") {
+            var at = base.size() - 1
+            while (at >= 0) {
+                out.add(base.get(at))
+                at = at - 1
+            }
+            return out
+        }
+        throw Errors.api(400, "INVALID_CATALOG_ORDER", "Escolha a ordem oldest ou newest.")
+    }
+    // The shop for one viewer. Ownership and the equipped slots load once for the whole list (ledger refs, grants and
+    // the profile): never a query per item. A null viewer is a guest: owned/equipped are not sent.
+    List<ShopRow> shop(viewerId: String?, order: String) {
+        var items = this.catalogOrdered(order)
+        var now = EconomyClock.nowIso()
+        var rows = listOf<ShopRow>()
+        if (viewerId == null) {
+            for (var item in items) {
+                rows.add(ShopRow(item, catalog.available(item, now), false, false, false))
+            }
+            return rows
+        }
+        var owned = store.ownedItemIds(viewerId)
+        var profile = directory.findById(viewerId)
+        var slotsOf = this.slotsOrNull(profile)
+        for (var item in items) {
+            var isEquipped = false
+            if (slotsOf != null) {
+                isEquipped = slotsOf.equipped(item)
+            }
+            rows.add(ShopRow(item, catalog.available(item, now), owned.contains(item.id()), isEquipped, true))
+        }
+        return rows
+    }
+    CosmeticSlots? slotsOrNull(profile: ProfileRecord?) {
+        if (profile == null) {
+            return null
+        }
+        return CosmeticSlots(profile)
+    }
+    // What the shop shows today for who is looking: the collections in season and the permanent one with what is on
+    // sale in them, plus what the person already has: a piece bought stays at hand to equip after the season passes.
+    List<ShopRow> onSaleNow(viewerId: String?, order: String) {
+        var owned = new HashSet<String>()
+        if (viewerId != null) {
+            owned = store.ownedItemIds(viewerId)
+        }
+        var out = listOf<ShopRow>()
+        for (var row in this.shop(viewerId, order)) {
+            if (row.available() || owned.contains(row.item().id())) {
+                out.add(row)
+            }
+        }
+        return out
+    }
+    // Only the collections in season: the others show neither before nor after their dates. With a viewer, each look
+    // says if it is already theirs and if it is worn: the shop wears and takes off through the card itself.
+    List<CollectionRow> collectionsInSeason(viewerId: String?) {
+        var now = EconomyClock.nowIso()
+        var owned = new HashSet<String>()
+        var slotsOf = this.slotsOrNull(null)
+        if (viewerId != null) {
+            owned = store.ownedItemIds(viewerId)
+            slotsOf = this.slotsOrNull(directory.findById(viewerId))
+        }
+        var rows = listOf<CollectionRow>()
+        for (var collection in catalog.allCollections()) {
+            if (!catalog.availableCollection(collection, now)) {
+                continue
+            }
+            var looks = listOf<LookRow>()
+            for (var look in catalog.looksOf(collection.id)) {
+                if (viewerId == null) {
+                    looks.add(LookRow(look, false, false, false))
+                }
+                else {
+                    var worn = false
+                    if (slotsOf != null) {
+                        worn = this.lookWorn(slotsOf, look)
+                    }
+                    looks.add(LookRow(look, CosmeticsService.ownsAll(owned, look.items()), worn, true))
+                }
+            }
+            rows.add(CollectionRow(collection, true, looks))
+        }
+        return rows
+    }
+    static Bool ownsAll(owned: HashSet<String>, ids: List<String>) {
+        for (var id in ids) {
+            if (!owned.contains(id)) {
+                return false
+            }
+        }
+        return true
+    }
+    HashSet<String> ownedItemIds(userId: String) = store.ownedItemIds(userId)
+    Bool owns(userId: String, itemId: String) = store.owns(userId, itemId)
+    // Direct purchase: debits the buyer and credits the treasury, the fixed supply is kept.
+    CosmeticItem buy(userId: String, itemId: String) {
+        var item = this.item(itemId)
+        if (!item.purchasable()) {
+            throw Errors.api(403, "NOT_FOR_SALE", "Este item não está à venda.")
+        }
+        if (this.owns(userId, itemId)) {
+            throw Errors.api(409, "ALREADY_OWNED", "Você já tem este item.")
+        }
+        if (!catalog.available(item, EconomyClock.nowIso())) {
+            throw Errors.api(409, "OUT_OF_SEASON", "Este item está fora de temporada.")
+        }
+        coins.purchase(userId, item.priceMf(), CosmeticsStore.ownershipRef(userId, itemId), "Loja: " + item.name())
+        return item
+    }
+    // Buys every look item the person does not own, in one transaction, then equips the whole look and its status. The
+    // look costs 75% of the missing items, rounded to whole sparks (the price the shop shows). Each item is still charged
+    // under its own ownership ref (75% of its price, the rounding difference on the priciest one), so a concurrent second
+    // purchase cannot charge twice.
+    CosmeticLookPurchase buyLook(userId: String, lookId: String) {
+        var look = this.lookOrThrow(lookId)
+        var out = listOf<CosmeticLookPurchase>()
+        var self = this
+        database.transaction(() -> {
+    out.add(self.buyLookNow(userId, look))
+})
+        return out.get(0)
+    }
+    CosmeticLookPurchase buyLookNow(userId: String, look: CosmeticLook) {
+        var owned = store.ownedItemIds(userId)
+        var missing = listOf<CosmeticItem>()
+        for (var id in look.items()) {
+            if (!owned.contains(id)) {
+                missing.add(this.item(id))
+            }
+        }
+        if (missing.size() == 0) {
+            throw Errors.api(409, "ALREADY_OWNED", "Você já tem todas as peças deste look.")
+        }
+        var collection = catalog.collection(look.collection())
+        if (collection == null) {
+            throw Errors.api(404, "ITEM_NOT_FOUND", "Look não encontrado.")
+        }
+        var now = EconomyClock.nowIso()
+        if (!catalog.availableCollection(collection, now)) {
+            throw Errors.api(409, "OUT_OF_SEASON", "Este look está fora de temporada.")
+        }
+        var fullPrice = 0L
+        var discounted = 0L
+        var priciest = missing.get(0)
+        for (var item in missing) {
+            fullPrice = fullPrice + item.priceMf()
+            discounted = discounted + item.priceMf() * 3L / 4L
+            if (item.priceMf() > priciest.priceMf()) {
+                priciest = item
+            }
+        }
+        var total = Numbers.round(fullPrice.toDouble() * 3.0 / 4000.0) * 1000L
+        var rounding = total - discounted
+        var bought = listOf<String>()
+        for (var item in missing) {
+            var price = item.priceMf() * 3L / 4L
+            if (item.id() == priciest.id()) {
+                price = price + rounding
+            }
+            coins.purchase(userId, price, CosmeticsStore.ownershipRef(userId, item.id()), "Loja: " + look.title() + " - " + item.name())
+            bought.add(item.id())
+        }
+        this.wear(userId, look)
+        return CosmeticLookPurchase(look.id(), bought, total)
+    }
+    // Puts every piece of the look in its slot, the look badges (at most five) and its status.
+    wear(userId: String, look: CosmeticLook) {
+        var state = CosmeticSlots(this.profile(userId))
+        var badges = listOf<String>()
+        for (var id in look.items()) {
+            var item = this.item(id)
+            if (item.kind() == "BADGE") {
+                badges.add(id)
+            }
+            else {
+                state.applySlot(item, true)
+            }
+        }
+        state.setBadges(this.firstBadges(badges))
+        state.setStatus(look.statusText(), look.statusIcon())
+        state.write(slots, EconomyClock.nowIso())
+    }
+    List<String> firstBadges(badges: List<String>) {
+        var out = listOf<String>()
+        for (var b in badges) {
+            if (out.size() < CosmeticsService.maxBadges()) {
+                out.add(b)
+            }
+        }
+        return out
+    }
+    // Wears a whole look the person already has: each piece in its place, the look badges and its status. Buys nothing:
+    // who lacks a piece gets NOT_OWNED. Repeating the call leaves the profile as it is, so a double click changes nothing.
+    equipLook(userId: String, lookId: String) {
+        var look = this.lookOrThrow(lookId)
+        var owned = store.ownedItemIds(userId)
+        for (var id in look.items()) {
+            if (!owned.contains(id)) {
+                throw Errors.api(403, "NOT_OWNED", "Você precisa ter todas as peças do look antes de vestir.")
+            }
+        }
+        this.wear(userId, look)
+    }
+    // Takes the look off: only the slots that still hold its pieces are emptied, so a piece swapped after wearing the
+    // look stays where it is. The status only goes if it is still the look's: a note written later is not erased.
+    unequipLook(userId: String, lookId: String) {
+        var look = this.lookOrThrow(lookId)
+        var state = CosmeticSlots(this.profile(userId))
+        var badges = listOf<String>()
+        for (var b in state.badges) {
+            badges.add(b)
+        }
+        for (var id in look.items()) {
+            var item = this.item(id)
+            if (item.kind() == "BADGE") {
+                badges = CosmeticsService.without(badges, id)
+            }
+            else 
+                if (state.equipped(item)) {
+                    state.applySlot(item, false)
+                }
+        }
+        state.setBadges(badges)
+        var lookText = look.statusText()
+        if (lookText != null) {
+            if (CosmeticsService.sameText(lookText, state.statusText) && CosmeticsService.sameText(look.statusIcon(), state.statusIcon)) {
+                state.setStatus(Nulls.str(), Nulls.str())
+            }
+        }
+        state.write(slots, EconomyClock.nowIso())
+    }
+    // The list without the first occurrence of the value (List.remove(Object)).
+    static List<String> without(list: List<String>, value: String) {
+        var out = listOf<String>()
+        var removed = false
+        for (var v in list) {
+            if (!removed && v == value) {
+                removed = true
+            }
+            else {
+                out.add(v)
+            }
+        }
+        return out
+    }
+    static Bool sameText(a: String?, b: String?) {
+        if (a == null) {
+            return b == null
+        }
+        if (b == null) {
+            return false
+        }
+        return a == b
+    }
+    // Is the look worn? Every piece of it sits in its own slot.
+    Bool lookWorn(state: CosmeticSlots, look: CosmeticLook) {
+        for (var id in look.items()) {
+            var item = this.item(id)
+            if (!state.equipped(item)) {
+                return false
+            }
+        }
+        return true
+    }
+    // Equips an item the person has; "none" takes the frame off (the old contract).
+    equip(userId: String, itemId: String) {
+        if (itemId == "none") {
+            this.profile(userId)
+            slots.updateAvatarFrame(userId, null, EconomyClock.nowIso())
+            return
+        }
+        this.setSlot(userId, itemId, true)
+    }
+    unequip(userId: String, itemId: String) {
+        this.setSlot(userId, itemId, false)
+    }
+    // The status bubble: up to 60 characters (cleaned) and an optional icon, which is a free icon or the icon of an
+    // official badge the person owns. Empty text clears it.
+    ProfileRecord updateStatus(userId: String, text: String?, icon: String?) {
+        var cleanText = Nulls.str()
+        if (text != null) {
+            if (text.trim().length() > 0) {
+                cleanText = text.trim()
+            }
+        }
+        if (cleanText != null) {
+            if (cleanText.length() > CosmeticsService.maxStatusChars()) {
+                throw Errors.api(400, "FIELD_TOO_LONG", "O status pode ter no máximo 60 caracteres.")
+            }
+        }
+        var cleanIcon = Nulls.str()
+        if (icon != null) {
+            if (icon.trim().length() > 0) {
+                cleanIcon = icon.trim()
+            }
+        }
+        if (cleanIcon != null) {
+            if (!CosmeticsService.freeStatusIcons().contains(cleanIcon)) {
+                if (!this.ownsBadgeIcon(userId, cleanIcon)) {
+                    throw Errors.api(400, "INVALID_STATUS_ICON", "Ícone de status inválido.")
+                }
+            }
+        }
+        var current = this.profile(userId)
+        var state = CosmeticSlots(current)
+        state.setStatus(PlainText.defuse(cleanText), cleanIcon)
+        state.write(slots, EconomyClock.nowIso())
+        return this.profile(userId)
+    }
+    Bool ownsBadgeIcon(userId: String, icon: String) {
+        var owned = store.ownedItemIds(userId)
+        for (var item in catalog.allItems()) {
+            if (item.kind() == "BADGE" && owned.contains(item.id())) {
+                var own = item.icon()
+                if (own != null) {
+                    if (own == icon) {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+    setSlot(userId: String, itemId: String, equip: Bool) {
+        var item = this.item(itemId)
+        if (!this.owns(userId, itemId)) {
+            throw Errors.api(403, "NOT_OWNED", "Você precisa ter o item antes de equipar.")
+        }
+        var state = CosmeticSlots(this.profile(userId))
+        if (item.kind() == "BADGE") {
+            var badges = listOf<String>()
+            for (var b in state.badges) {
+                if (b != itemId) {
+                    badges.add(b)
+                }
+            }
+            if (equip) {
+                if (badges.size() >= CosmeticsService.maxBadges()) {
+                    throw Errors.api(409, "MAX_BADGES", "São no máximo 5 emblemas.")
+                }
+                var first = listOf<String>()
+                first.add(itemId)
+                for (var b in badges) {
+                    first.add(b)
+                }
+                badges = first
+            }
+            state.setBadges(badges)
+        }
+        else {
+            state.applySlot(item, equip)
+        }
+        state.write(slots, EconomyClock.nowIso())
+    }
+    CosmeticLook lookOrThrow(lookId: String) {
+        var look = catalog.look(lookId)
+        if (look == null) {
+            throw Errors.api(404, "ITEM_NOT_FOUND", "Look não encontrado.")
+        }
+        return look
+    }
+    ProfileRecord profile(userId: String) {
+        var p = directory.findById(userId)
+        if (p == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Perfil não encontrado.")
+        }
+        return p
+    }
+    CosmeticItem item(itemId: String) {
+        var item = catalog.item(itemId)
+        if (item == null) {
+            throw Errors.api(404, "ITEM_NOT_FOUND", "Item não encontrado.")
+        }
+        return item
+    }
+}

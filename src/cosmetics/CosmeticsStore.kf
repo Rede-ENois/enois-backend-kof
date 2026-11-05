@@ -1,0 +1,148 @@
+package cosmetics
+
+import coin.*
+import java.util.HashMap
+import java.util.HashSet
+import kernel.db.*
+import kernel.error.*
+
+// SQL of the cosmetics domain: ownership (cosmetic_grants + the PURCHASE entries of the coin ledger, ref
+// `cosmetico:<user>:<item>`), the event entries and the community cosmetics (profile_cosmetics).
+class CosmeticsStore {
+    Db store
+    CoinStore ledger
+    public constructor(store: Db, ledger: CoinStore) {
+        this.store = store
+        this.ledger = ledger
+    }
+    static String ownershipRef(userId: String, itemId: String) = "cosmetico:" + userId + ":" + itemId
+    // ---- ownership
+    List<String> grantedItemIds(userId: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select item_id from cosmetic_grants where user_id = ?", DbParams().bindStr(userId))) {
+            out.add(r.getStr("item_id"))
+        }
+        return out
+    }
+    Bool grantExists(userId: String, itemId: String) = store.queryLong("select count(*) from cosmetic_grants where user_id = ? and item_id = ?", DbParams().bindStr(userId).bindStr(itemId)) > 0L
+    // Everything a person owns: bought (ledger) or granted. Two queries, whatever the catalog size.
+    HashSet<String> ownedItemIds(userId: String) {
+        var prefix = CosmeticsStore.ownershipRef(userId, "")
+        var owned = new HashSet<String>()
+        for (var id in this.grantedItemIds(userId)) {
+            owned.add(id)
+        }
+        for (var ref in ledger.refIdsOf(userId, "PURCHASE")) {
+            if (ref.startsWith(prefix)) {
+                owned.add(ref.substring(prefix.length()))
+            }
+        }
+        return owned
+    }
+    Bool owns(userId: String, itemId: String) {
+        if (ledger.existsByKindAndRefId("PURCHASE", CosmeticsStore.ownershipRef(userId, itemId))) {
+            return true
+        }
+        return this.grantExists(userId, itemId)
+    }
+    // The primary key is the idempotency rule: a concurrent or repeated grant keeps the first row.
+    grant(userId: String, itemId: String, source: String, now: String) {
+        try {
+            store.execute("insert into cosmetic_grants (user_id, item_id, source, created_at) values (?, ?, ?, ?)", DbParams().bindStr(userId).bindStr(itemId).bindStr(source).bindInstant(now))
+        } catch (String e) {
+            if (!Errors.hasCode(e, "CONFLICT")) {
+                throw e
+            }
+        }
+    }
+    // The victory badge for every person that picked this team and does not have it yet.
+    grantToChoosers(eventId: String, choice: String, itemId: String, source: String, now: String) {
+        try {
+            store.execute("insert into cosmetic_grants (user_id, item_id, source, created_at) select e.user_id, ?, ?, ? from cosmetic_event_entries e where e.event_id = ? and e.choice = ? and not exists (select 1 from cosmetic_grants g where g.user_id = e.user_id and g.item_id = ?)", DbParams().bindStr(itemId).bindStr(source).bindInstant(now).bindStr(eventId).bindStr(choice).bindStr(itemId))
+        } catch (String e) {
+            // Another reader granted the same rows at the same time; every winner already has the item.
+            if (!Errors.hasCode(e, "CONFLICT")) {
+                throw e
+            }
+        }
+    }
+    // ---- event entries
+    String? choiceOf(eventId: String, userId: String) {
+        var row = store.queryOptional("select choice from cosmetic_event_entries where event_id = ? and user_id = ?", DbParams().bindStr(eventId).bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return row.getStr("choice")
+    }
+    Map<String,Long> countByChoice(eventId: String) {
+        var counts = new HashMap<String, Long>()
+        for (var r in store.queryList("select choice, count(*) as total from cosmetic_event_entries where event_id = ? group by choice", DbParams().bindStr(eventId))) {
+            counts.put(r.getStr("choice"), r.getLong("total"))
+        }
+        return counts
+    }
+    List<String> eventIdsOf(userId: String, eventIds: List<String>) {
+        var out = listOf<String>()
+        if (eventIds.size() == 0) {
+            return out
+        }
+        var marks = ""
+        var params = DbParams().bindStr(userId)
+        for (var id in eventIds) {
+            if (marks.length() > 0) {
+                marks = marks + ", "
+            }
+            marks = marks + "?"
+            params = params.bindStr(id)
+        }
+        for (var r in store.queryList("select event_id from cosmetic_event_entries where user_id = ? and event_id in (" + marks + ")", params)) {
+            out.add(r.getStr("event_id"))
+        }
+        return out
+    }
+    // The primary key (event, person) is the uniqueness rule: a duplicate is a 409 CONFLICT for the caller to map.
+    insertEntry(eventId: String, userId: String, choice: String, now: String) {
+        store.execute("insert into cosmetic_event_entries (event_id, user_id, choice, created_at) values (?, ?, ?, ?)", DbParams().bindStr(eventId).bindStr(userId).bindStr(choice).bindInstant(now))
+    }
+    // ---- community cosmetics
+    static String communityColumns() = "id, creator_id, kind, name, description, manifest_json, license, rights_confirmed, status, version, reported, created_at, updated_at"
+    static CommunityCosmetic community(r: DbRow) = CommunityCosmetic(r.getStr("id"), r.getStr("creator_id"), r.getStr("kind"), r.getStr("name"), r.getStrOrNull("description"), r.getStr("manifest_json"), r.getStr("license"), r.getBool("rights_confirmed"), r.getStr("status"), r.getInt("version"), r.getInt("reported"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    insertCommunity(c: CommunityCosmetic) {
+        store.execute("insert into profile_cosmetics (" + CosmeticsStore.communityColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(c.id()).bindStr(c.creatorId()).bindStr(c.kind()).bindStr(c.name()).bindStrOrNull(c.description()).bindStr(c.manifestJson()).bindStr(c.license()).bindBool(c.rightsConfirmed()).bindStr(c.status()).bindInt(c.version()).bindInt(c.reported()).bindInstant(c.createdAt()).bindInstant(c.updatedAt()))
+    }
+    // An edit applies only while the cosmetic is still a draft or was rejected (a submit in between wins).
+    Bool updateCommunityEdit(c: CommunityCosmetic) {
+        var changed = store.execute("update profile_cosmetics set name = ?, description = ?, manifest_json = ?, license = ?, rights_confirmed = ?, status = ?, version = ?, updated_at = ? where id = ? and status in (\'DRAFT\', \'REJECTED\')", DbParams().bindStr(c.name()).bindStrOrNull(c.description()).bindStr(c.manifestJson()).bindStr(c.license()).bindBool(c.rightsConfirmed()).bindStr(c.status()).bindInt(c.version()).bindInstant(c.updatedAt()).bindStr(c.id()))
+        return changed > 0
+    }
+    // DRAFT -> PENDING_MODERATION as one atomic claim: two submits cannot both pass.
+    Bool submitCommunity(id: String, now: String) {
+        var changed = store.execute("update profile_cosmetics set status = \'PENDING_MODERATION\', updated_at = ? where id = ? and status = \'DRAFT\'", DbParams().bindInstant(now).bindStr(id))
+        return changed > 0
+    }
+    // One more report, counted in the database (no read-modify-write).
+    reportCommunity(id: String, now: String) {
+        store.execute("update profile_cosmetics set reported = reported + 1, updated_at = ? where id = ?", DbParams().bindInstant(now).bindStr(id))
+    }
+    CommunityCosmetic? findCommunity(id: String) {
+        var row = store.queryOptional("select " + CosmeticsStore.communityColumns() + " from profile_cosmetics where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return CosmeticsStore.community(row)
+    }
+    List<CommunityCosmetic> communityByCreator(creatorId: String, limit: Int) {
+        var out = listOf<CommunityCosmetic>()
+        for (var r in store.queryList("select " + CosmeticsStore.communityColumns() + " from profile_cosmetics where creator_id = ? order by updated_at desc limit ?", DbParams().bindStr(creatorId).bindInt(limit))) {
+            out.add(CosmeticsStore.community(r))
+        }
+        return out
+    }
+    List<CommunityCosmetic> communityByStatus(status: String, limit: Int) {
+        var out = listOf<CommunityCosmetic>()
+        for (var r in store.queryList("select " + CosmeticsStore.communityColumns() + " from profile_cosmetics where status = ? order by updated_at desc limit ?", DbParams().bindStr(status).bindInt(limit))) {
+            out.add(CosmeticsStore.community(r))
+        }
+        return out
+    }
+}

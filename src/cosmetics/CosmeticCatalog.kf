@@ -1,0 +1,215 @@
+package cosmetics
+
+import java.util.HashSet
+import java.util.LinkedHashMap
+import kernel.text.*
+import kernel.time.*
+
+// The native shop catalog, loaded once from resources/cosmetics/catalog.json. The file is the single source of ids,
+// prices, collections and looks; a broken file stops the boot (a thrown String) instead of serving a half catalog.
+class CosmeticCatalog {
+    List<CosmeticItem> items = listOf<CosmeticItem>()
+    Map<String,CosmeticItem> itemsById = new LinkedHashMap<String, CosmeticItem>()
+    List<CosmeticCollection> collections = listOf<CosmeticCollection>()
+    Map<String,CosmeticCollection> collectionsById = new LinkedHashMap<String, CosmeticCollection>()
+    List<CosmeticLook> looks = listOf<CosmeticLook>()
+    Map<String,CosmeticLook> looksById = new LinkedHashMap<String, CosmeticLook>()
+    public constructor(file: CatalogFile) {
+        for (var c in file.collections()) {
+            this.addCollection(c)
+        }
+        var releaseOrders = new HashSet<String>()
+        var loaded = listOf<CosmeticItem>()
+        for (var f in file.items()) {
+            loaded.add(this.addItem(f, releaseOrders))
+        }
+        for (var l in file.looks()) {
+            this.addLook(l)
+        }
+        // oldest release first (insertion sort: the catalog is read once)
+        var sorted = listOf<CosmeticItem>()
+        for (var item in loaded) {
+            var at = sorted.size()
+            while (at > 0 && sorted.get(at - 1).releaseOrder() > item.releaseOrder()) {
+                at = at - 1
+            }
+            var tail = listOf<CosmeticItem>()
+            var i = at
+            while (i < sorted.size()) {
+                tail.add(sorted.get(i))
+                i = i + 1
+            }
+            var head = listOf<CosmeticItem>()
+            var j = 0
+            while (j < at) {
+                head.add(sorted.get(j))
+                j = j + 1
+            }
+            head.add(item)
+            for (var t in tail) {
+                head.add(t)
+            }
+            sorted = head
+        }
+        this.items = sorted
+    }
+    // Reads and validates the catalog file; a missing or unparsable file stops the boot.
+    static CosmeticCatalog load(path: String) {
+        var text = File(path).readText()
+        if (text == null) {
+            throw "Cosmetics catalog not readable: " + path
+        }
+        var file = json.decode<CatalogFile>(text)
+        return CosmeticCatalog(file)
+    }
+    addCollection(c: CatalogCollectionFile) {
+        var windows = listOf<SeasonWindow>()
+        for (var w in c.windows()) {
+            windows.add(SeasonWindow.parse(w.start(), w.end()))
+        }
+        var id = c.id()
+        var name = c.name()
+        if (id == null) {
+            throw "Invalid or duplicated collection: null"
+        }
+        if (name == null) {
+            throw "Invalid or duplicated collection: " + id
+        }
+        if (windows.size() == 0 || collectionsById.containsKey(id)) {
+            throw "Invalid or duplicated collection: " + id
+        }
+        var collection = CosmeticCollection(id, name, windows)
+        collectionsById.put(id, collection)
+        collections.add(collection)
+    }
+    static Bool knownKind(kind: String) = kind == "FRAME" || kind == "BADGE" || kind == "NAME_STYLE" || kind == "CARD_THEME" || kind == "NAMEPLATE" || kind == "BANNER" || kind == "PROFILE_EFFECT" || kind == "GARDEN"
+    CosmeticItem addItem(f: CatalogItemFile, releaseOrders: HashSet<String>) {
+        var id = f.id()
+        var kind = f.kind()
+        if (id == null) {
+            throw "Invalid or duplicated catalog id: null"
+        }
+        if (kind == null) {
+            throw "Invalid or duplicated catalog id: " + id
+        }
+        if (!CosmeticCatalog.knownKind(kind) || itemsById.containsKey(id)) {
+            throw "Invalid or duplicated catalog id: " + id
+        }
+        // The id is what the profile stores: it must fit the slot column (users.name_theme is 24).
+        var limit = 40
+        if (kind == "NAME_STYLE") {
+            limit = 24
+        }
+        if (id.length() > limit) {
+            throw "Catalog id too long for its profile slot: " + id
+        }
+        if (f.releaseOrder() <= 0 || releaseOrders.contains("" + f.releaseOrder())) {
+            throw "Invalid or duplicated release order: " + id
+        }
+        releaseOrders.add("" + f.releaseOrder())
+        var collection = f.collection()
+        if (collection != null) {
+            if (!collectionsById.containsKey(collection)) {
+                throw "Unknown collection for " + id
+            }
+        }
+        if (f.purchasable() && f.priceMf() <= 0L) {
+            throw "Item for sale without a price: " + id
+        }
+        if (kind == "BADGE" && f.icon() == null) {
+            throw "Badge without an icon: " + id
+        }
+        var ring = f.cssRing()
+        var cssRing = ""
+        if (ring != null) {
+            cssRing = ring
+        }
+        var name = f.name()
+        var shownName = ""
+        if (name != null) {
+            shownName = name
+        }
+        var description = f.description()
+        var shownDescription = ""
+        if (description != null) {
+            shownDescription = description
+        }
+        var item = CosmeticItem(f.releaseOrder(), id, kind, collection, shownName, shownDescription, f.priceMf(), cssRing, f.purchasable(), f.icon())
+        itemsById.put(id, item)
+        return item
+    }
+    // Look ids travel in the shop URL; a plain slug keeps the route and the logs boring.
+    addLook(l: CatalogLookFile) {
+        var givenId = l.id()
+        var collection = l.collection()
+        var title = l.title()
+        var named = false
+        var id = ""
+        if (givenId != null) {
+            if (givenId.trim().length() > 0) {
+                named = true
+                id = givenId
+            }
+        }
+        if (collection == null) {
+            throw "Invalid look: " + id
+        }
+        if (!named) {
+            id = "look-" + collection
+        }
+        if (title == null) {
+            throw "Invalid look: " + id
+        }
+        if (!collectionsById.containsKey(collection) || l.items().size() == 0) {
+            throw "Invalid look: " + id
+        }
+        if (named && !Regexes.matches("[a-z0-9][a-z0-9-]{2,63}", id)) {
+            throw "Invalid look id: " + id
+        }
+        for (var itemId in l.items()) {
+            var item = itemsById.get(itemId)
+            if (item == null) {
+                throw "Look " + id + " has an unknown or unsellable item: " + itemId
+            }
+            if (!item.purchasable()) {
+                throw "Look " + id + " has an unknown or unsellable item: " + itemId
+            }
+        }
+        if (looksById.containsKey(id)) {
+            throw "Duplicated look: " + id
+        }
+        var look = CosmeticLook(id, collection, title, l.items(), l.statusIcon(), l.statusText())
+        looksById.put(id, look)
+        looks.add(look)
+    }
+    // Every item, oldest release first.
+    List<CosmeticItem> allItems() = items
+    CosmeticItem? item(id: String) = itemsById.get(id)
+    List<CosmeticCollection> allCollections() = collections
+    CosmeticCollection? collection(id: String) = collectionsById.get(id)
+    CosmeticLook? look(id: String) = looksById.get(id)
+    List<CosmeticLook> looksOf(collectionId: String) {
+        var out = listOf<CosmeticLook>()
+        for (var l in looks) {
+            if (l.collection() == collectionId) {
+                out.add(l)
+            }
+        }
+        return out
+    }
+    // Seasons and events follow the Brazilian calendar, not the server zone.
+    static Int monthDayAt(nowIso: String) = SeasonWindow.ofDay(ZoneDates.dayOf(nowIso, "America/Sao_Paulo"))
+    // Original frames are always on sale; seasonal items only inside one of their windows.
+    Bool available(item: CosmeticItem, nowIso: String) {
+        var c = item.collection()
+        if (c == null) {
+            return true
+        }
+        var owner = collectionsById.get(c)
+        if (owner == null) {
+            return false
+        }
+        return owner.availableOn(CosmeticCatalog.monthDayAt(nowIso))
+    }
+    Bool availableCollection(collection: CosmeticCollection, nowIso: String) = collection.availableOn(CosmeticCatalog.monthDayAt(nowIso))
+}
