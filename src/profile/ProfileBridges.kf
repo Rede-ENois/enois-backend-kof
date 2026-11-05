@@ -1,0 +1,206 @@
+package profile
+
+import blog.*
+import calls.*
+import communities.*
+import communityprojects.*
+import groups.*
+import java.util.HashMap
+import kernel.db.*
+import kernel.geo.*
+import projects.*
+import studypairs.*
+
+// The profile lookups the other domains held while this one did not exist, now backed by ProfileDirectory (the one
+// reader of `users`). AppWiring passes these in; each keeps the contract of the seam it replaces.
+
+// groups: the author card of a post, comment or member.
+class ProfileGroupLookup extends GroupProfileLookup {
+    ProfileDirectory directory
+    public constructor(store: Db, directory: ProfileDirectory) {
+        super(store)
+        this.directory = directory
+    }
+    GroupAuthor? find(userId: String) {
+        var p = directory.findById(userId)
+        if (p == null) {
+            return null
+        }
+        return ProfileGroupLookup.author(p)
+    }
+    Map<String,GroupAuthor> findAll(userIds: List<String>) {
+        var out = mapOf<String, GroupAuthor>()
+        for (var p in directory.findAllByIds(userIds)) {
+            out.put(p.id, ProfileGroupLookup.author(p))
+        }
+        return out
+    }
+    String nameOf(userId: String) {
+        var p = directory.findById(userId)
+        if (p == null) {
+            return "Alguém"
+        }
+        return p.name
+    }
+    static GroupAuthor author(p: ProfileRecord) {
+        var style = GroupNil.style()
+        if (p.nameTheme != null || p.nameFont != null || p.nameColor != null || p.nameplate != null) {
+            style = GroupNameStyle(p.nameTheme, p.nameFont, p.nameColor, p.nameplate)
+        }
+        return GroupAuthor(p.id, p.username, p.name, p.displayWithNickname(), p.avatar, p.allBadges(), p.avatarFrame, style)
+    }
+}
+
+// communities: member cards and the viewer's own place.
+class ProfileCommunityLookup extends CommunityProfileLookup {
+    ProfileDirectory directory
+    public constructor(store: Db, directory: ProfileDirectory) {
+        super(store)
+        this.directory = directory
+    }
+    Map<String,CommunityProfileCard> cards(userIds: List<String>) {
+        var out = mapOf<String, CommunityProfileCard>()
+        for (var p in directory.findAllByIds(userIds)) {
+            out.put(p.id, CommunityProfileCard(p.id, p.username, p.displayWithNickname(), p.avatar, p.nameTheme, p.nameFont, p.nameColor, p.nameplate))
+        }
+        return out
+    }
+    CityState? placeOf(userId: String) {
+        var p = directory.findById(userId)
+        if (p == null) {
+            return null
+        }
+        var city = p.city
+        var state = p.state
+        if (city == null) {
+            return null
+        }
+        if (state == null) {
+            return null
+        }
+        var key = p.cityKey
+        if (key == null) {
+            return CityState.of(city, state)
+        }
+        return CityState(city, state, key)
+    }
+}
+
+// projects: which account owns a username.
+class ProfileProjectsLookup extends ProjectsProfiles {
+    ProfileDirectory directory
+    public constructor(store: Db, directory: ProfileDirectory) {
+        super(store)
+        this.directory = directory
+    }
+    String? idByUsername(username: String) {
+        var p = directory.findByUsername(username)
+        if (p == null) {
+            return null
+        }
+        return p.id
+    }
+}
+
+// community projects: usernames of accounts.
+class ProfileCommunityProjectLookup extends CommunityProjectProfiles {
+    ProfileDirectory directory
+    public constructor(store: Db, directory: ProfileDirectory) {
+        super(store)
+        this.directory = directory
+    }
+    String? usernameOf(userId: String) {
+        var p = directory.findById(userId)
+        if (p == null) {
+            return null
+        }
+        return p.username
+    }
+    String? idOfUsername(username: String) {
+        var p = directory.findByUsername(username)
+        if (p == null) {
+            return null
+        }
+        return p.id
+    }
+    Map<String,String> usernamesOf(userIds: List<String>) {
+        var names = new HashMap<String, String>()
+        for (var p in directory.findAllByIds(userIds)) {
+            names.put(p.id, p.username)
+        }
+        return names
+    }
+}
+
+// study pairs: who a person is.
+class ProfileStudyPairLookup extends StudyPairProfiles {
+    ProfileDirectory directory
+    public constructor(store: Db, directory: ProfileDirectory) {
+        super(store)
+        this.directory = directory
+    }
+    StudyPairPerson? find(userId: String) {
+        var p = directory.findById(userId)
+        if (p == null) {
+            return null
+        }
+        return ProfileStudyPairLookup.person(p)
+    }
+    List<StudyPairPerson> findAll(userIds: List<String>) {
+        var out = listOf<StudyPairPerson>()
+        for (var p in directory.findAllByIds(userIds)) {
+            out.add(ProfileStudyPairLookup.person(p))
+        }
+        return out
+    }
+    static StudyPairPerson person(p: ProfileRecord) = StudyPairPerson(p.id, p.username, p.name, p.avatar, p.emailVerifiedAt != null)
+}
+
+// blog: the author of a page and of the newsletter.
+class ProfileBlogLookup extends BlogProfiles {
+    ProfileDirectory directory
+    public constructor(store: Db, directory: ProfileDirectory) {
+        super(store)
+        this.directory = directory
+    }
+    BlogAuthor? findById(id: String) {
+        var p = directory.findById(id)
+        if (p == null) {
+            return null
+        }
+        return ProfileBlogLookup.author(p)
+    }
+    List<BlogAuthor> findAllByIds(ids: List<String>) {
+        var out = listOf<BlogAuthor>()
+        for (var p in directory.findAllByIds(ids)) {
+            out.add(ProfileBlogLookup.author(p))
+        }
+        return out
+    }
+    static BlogAuthor author(p: ProfileRecord) {
+        return BlogAuthor(p.id, p.username, p.name, p.avatar, p.email, p.emailVerifiedAt != null, p.allBadges(), ProfileBlogLookup.style(p))
+    }
+    static BlogNameStyle? style(p: ProfileRecord) {
+        var s = ProfileDirectory.nameStyle(p)
+        if (s == null) {
+            return null
+        }
+        return BlogNameStyle(s.theme, s.font, s.color, s.nameplate)
+    }
+}
+
+// calls: the name shown in a call and in its token.
+class ProfileCallLookup extends CallProfiles {
+    ProfileDirectory directory
+    public constructor(database: Db, directory: ProfileDirectory) {
+        super(database)
+        this.directory = directory
+    }
+    String displayName(userId: String) {
+        var p = directory.findById(userId)
+        if (p == null) {
+            return "Alguem"
+        }
+        return p.displayName()
+    }
+}

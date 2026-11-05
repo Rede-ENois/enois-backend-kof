@@ -2,7 +2,12 @@ package coin
 
 import blog.*
 import communities.*
+import feed.*
+import games.*
 import groups.*
+import kernel.db.*
+import kernel.log.*
+import kernel.security.*
 import messaging.*
 import notifications.*
 
@@ -65,5 +70,50 @@ class CoinNotificationCoins extends NotificationCoins {
     Bool hasReward(ref: String) = coins.hasReward(ref)
     reward(userId: String, amount: Long, ref: String, message: String) {
         coins.reward(userId, amount, ref, message)
+    }
+}
+
+// feed: the presence streak of an author and the reward of an accepted answer (QuestionAnswerService:
+// HELP_REWARD = 20 faiscas at the current rate, ref `resposta:{postId}` so the payment is unique for good).
+class CoinFeedCoins extends FeedCoins {
+    CoinService coins
+    Log log = Log("coin.feed")
+    public constructor(coins: CoinService) {
+        super()
+        this.coins = coins
+    }
+    recordPresence(userId: String) {
+        coins.recordPresence(userId)
+    }
+    rewardAnswer(answererId: String, askerId: String, postId: String) {
+        try {
+            coins.reward(answererId, coins.scaledReward(CoinService.fais(20L)), "resposta:" + postId, "Sua resposta resolveu uma dúvida")
+        } catch (String e) {
+            log.warn("answer_reward_failed")
+        }
+    }
+}
+
+// games: rewards, store purchases, the rate and the daily presence streak, all through the coin service.
+class CoinGamesCoins extends GamesCoins {
+    CoinService coins
+    CoinRateService rates
+    public constructor(store: Db, cipher: SecretCipher, coins: CoinService, rates: CoinRateService) {
+        super(store, cipher)
+        this.coins = coins
+        this.rates = rates
+    }
+    recordPresence(userId: String) {
+        coins.recordPresence(userId)
+    }
+    Long scaledReward(baseMf: Long) = coins.scaledReward(baseMf)
+    Long currentMicros() = rates.currentBrlMicros()
+    Bool hasReward(ref: String) = coins.hasReward(ref)
+    Bool hasPurchase(ref: String) = coins.hasPurchase(ref)
+    reward(accountId: String, amount: Long, ref: String, message: String) {
+        coins.reward(accountId, amount, ref, message)
+    }
+    purchase(accountId: String, amount: Long, ref: String, message: String) {
+        coins.purchase(accountId, amount, ref, message)
     }
 }

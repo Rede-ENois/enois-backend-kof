@@ -1,0 +1,174 @@
+package notifications
+
+import blog.*
+import corporate.*
+import feed.*
+import identity.*
+import java.util.HashMap
+import kernel.db.*
+import preferences.*
+import profile.*
+import studypairs.*
+
+// The notification seams the other domains held while this one did not exist, now backed by the Notifications
+// API (preferences, push after commit, the same row shape). AppWiring passes these in; each keeps the contract
+// of the seam it replaces.
+// profile and network: connection requests and acceptances, admin role changes.
+// Profile is installed before notifications (the notification actors read profiles), so `api` is bound right
+// after NotificationsModule.install; a notify before that is a wiring bug and fails loudly.
+class ProfileNotificationsBridge extends ProfileNotifier {
+    Notifications? api
+    public constructor(store: Db) {
+        super(store)
+    }
+    notify(userId: String, kind: String, actorId: String, title: String, body: String, href: String, ctaLabel: String) {
+        var target = api
+        if (target == null) {
+            throw "notifications API not wired"
+        }
+        target.create(userId, kind, actorId, title, body, href, ctaLabel)
+    }
+}
+
+// feed: mentions, replies and accepted answers.
+class FeedNotificationsBridge extends FeedNotifier {
+    Notifications api
+    public constructor(store: Db, api: Notifications) {
+        super(store)
+        this.api = api
+    }
+    notify(userId: String, kind: String, actorId: String, title: String, body: String, href: String, cta: String) {
+        api.create(userId, kind, actorId, title, body, href, cta)
+    }
+}
+
+// identity: NewDeviceNotifier and the TOTP reset notice (kind SEGURANCA).
+class IdentityNotificationsBridge extends IdentityNotifier {
+    Notifications api
+    public constructor(api: Notifications) {
+        super()
+        this.api = api
+    }
+    notifySecurity(userId: String, actorId: String, title: String, body: String, link: String, label: String) {
+        api.create(userId, "SEGURANCA", actorId, title, body, link, label)
+    }
+}
+
+// study pairs: invites and answers.
+class StudyPairNotificationsBridge extends StudyPairNotifier {
+    Notifications api
+    public constructor(store: Db, api: Notifications) {
+        super(store)
+        this.api = api
+    }
+    create(userId: String, kind: String, actorId: String, title: String, body: String, href: String, ctaLabel: String) {
+        api.create(userId, kind, actorId, title, body, href, ctaLabel)
+    }
+}
+
+// blog: the NEW_BLOG_POST notice of a subscriber.
+class BlogNotificationsBridge extends BlogNotifier {
+    Notifications api
+    public constructor(api: Notifications) {
+        super()
+        this.api = api
+    }
+    notifyNewPost(subscriberId: String, authorId: String, title: String, body: String, href: String) {
+        api.create(subscriberId, "NEW_BLOG_POST", authorId, title, body, href, "Ler")
+    }
+}
+
+// Who an actor is: the profile directory (name, avatar, name style) and the corporate service (ACTIVE identities).
+class ProfileNotificationActors extends NotificationActors {
+    ProfileDirectory directory
+    CorporateService corporate
+    public constructor(database: Db, directory: ProfileDirectory, corporate: CorporateService) {
+        super(database)
+        this.directory = directory
+        this.corporate = corporate
+    }
+    Map<String,NotificationActor> profilesByIds(ids: List<String>) {
+        var out = new HashMap<String, NotificationActor>()
+        for (var p in directory.findAllByIds(ids)) {
+            out.put(p.id, NotificationActor(p.id, p.name, p.username, p.avatar, NotificationActors.styleOf(p.nameTheme, p.nameFont, p.nameColor, p.nameplate)))
+        }
+        return out
+    }
+    Map<String,NotificationCorporate> activeCorporatesByIds(ids: List<String>) {
+        var out = new HashMap<String, NotificationCorporate>()
+        var active = corporate.activeByUserIds(ids)
+        for (var id in ids) {
+            var c = active.get(id)
+            if (c != null) {
+                out.put(id, NotificationCorporate(c.userId, c.name, c.username, c.avatar))
+            }
+        }
+        return out
+    }
+    String? nameOf(userId: String) {
+        var p = directory.findById(userId)
+        if (p == null) {
+            return null
+        }
+        return p.name
+    }
+}
+
+// Every account id, paged, for the community apology (the profile directory pages by id).
+class ProfileNotificationAccounts extends NotificationAccounts {
+    ProfileDirectory directory
+    public constructor(database: Db, directory: ProfileDirectory) {
+        super(database)
+        this.directory = directory
+    }
+    List<String> allIds(offset: Int, limit: Int) = directory.pageOfIds(offset, limit)
+}
+
+// The weekly digest recipient.
+class ProfileDigestAccounts extends DigestAccounts {
+    ProfileDirectory directory
+    public constructor(database: Db, directory: ProfileDirectory) {
+        super(database)
+        this.directory = directory
+    }
+    DigestRecipient? find(userId: String) {
+        var p = directory.findById(userId)
+        if (p == null) {
+            return null
+        }
+        return DigestRecipient(p.id, p.name, p.email, p.emailVerifiedAt != null)
+    }
+}
+
+// The modules a person switched off (PersonalizationService.disabledModules).
+class PreferencesDigestPersonalization extends DigestPersonalization {
+    PreferencesService preferences
+    public constructor(database: Db, preferences: PreferencesService) {
+        super(database)
+        this.preferences = preferences
+    }
+    List<String> disabledModules(userId: String) = preferences.of(userId).disabledModules
+}
+
+// The post or comment behind an outbox event, read through the feed store.
+class FeedNotificationSources extends NotificationSources {
+    FeedStore posts
+    public constructor(database: Db, posts: FeedStore) {
+        super(database)
+        this.posts = posts
+    }
+    NotificationSource? post(postId: String) {
+        var p = posts.post(postId)
+        if (p == null) {
+            return null
+        }
+        return NotificationSource(p.id, p.authorId, p.content)
+    }
+    NotificationSource? comment(commentId: String) {
+        var c = posts.comment(commentId)
+        if (c == null) {
+            return null
+        }
+        return NotificationSource(c.id, c.authorId, c.content)
+    }
+}
