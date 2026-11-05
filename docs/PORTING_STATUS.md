@@ -841,3 +841,76 @@ Total: 70 of 70 endpoints, 148 of 151 Java behaviours ported as 158 Kof tests; t
 - **Mail**: `kernel/mail/SmtpTransport` is the only file that touches jakarta.mail / angus-mail (2.0.5, the family of spring-boot-starter-mail). `MAIL_HOST` (localhost), `MAIL_PORT` (587), `MAIL_USERNAME` (suporte@enois.ia.br, also the From), `MAIL_PASSWORD`; STARTTLS enabled and required, auth on, 5 s timeouts, as in Java (`MAIL_SMTP_STARTTLS_ENABLE`, `MAIL_SMTP_STARTTLS_REQUIRED`, `MAIL_SMTP_TIMEOUT_MS` override them for local servers). `ops.MailService` is the one service every sender uses (`sendHtml`, `sendBulk` with sender name, Reply-To and `List-Unsubscribe` + `List-Unsubscribe-Post: List-Unsubscribe=One-Click`): it records one `email_log` row (SENT, or FAILED with the cause cut at 500; the 2FA subject redacted) and never throws. Messages are multipart/alternative: a plain-text part derived from the HTML (Java sent HTML only) and the HTML part. Senders switched: identity (verification, reset, 2FA, parental consent, e-mail change, signup notice, generic HTML), age, jobs (application delivery and status e-mails), the blog newsletter, the weekly digest. Not ported because the domains are not: the support e-mails (named sender "Suporte Enois", attachment) and moderation notices.
 - **Tests**: `MailServiceTest` and `MailSendersTest` (17) run the real transport against `kernel.testkit.FakeSmtpServer` (loopback, AUTH PLAIN, DATA capture); domain suites use `MailTestKit.capturing(platform)` (`MailCapture`). `EmailTemplateParityTest` compares the five templates with goldens made by Thymeleaf 3.1.5. `EmailServiceListUnsubscribeTests` is ported in `MailServiceTest`.
 - **Event stream**: `GET /conversations/stream` (and `/v1`) runs on `app.sse` (see G312 to G314). Events `conversation` `{"conversationId"}` (send, read receipt, reaction) and `call` `{"callId","state","conversationId"?,"groupId"?}`, published after commit; 5 streams per user (the oldest is closed), 30 minutes per stream, heartbeat every `REDE_MESSAGING_STREAM_HEARTBEAT_MS` (25000) as a named `ping` event. Session via `X-Session-Token`, bearer or cookie; a refusal is the bare status. In-memory registry: one backend instance, like Java. `MessageStreamTest` (8 of the 4 Java tests plus heartbeat, alias, cookie, reaction) and `CallStreamTest`.
+
+## contributions, contributors, githubprofile, support
+
+| Domain | Endpoints ported/total | Java tests ported/total |
+|---|---|---|
+| contributions | 17/17 | 18/20 (see below) |
+| contributors | 6/6 | 7/7 |
+| githubprofile | 4/4 | 6/6 |
+| support | 9/9 + the webhook | 12/12 (the 6 route-authorization tests as one HTTP suite) |
+
+**contributions**: public seals and evidence, criteria, the account link state and "verify contributions" (per-user
+limit `UserRateLimiter.syncGithub()`), the admin queue of evidence (review with the status transition rules, seal
+grant and revoke, recalculation, the repositories switch, the manual sync with `dryRun`/`full`/`repositories`), the
+open pull requests queue and its review (the service token when the person has no write token of their own), the sync
+(on link, on demand, and on `kernel.jobs` when `GITHUB_SYNC_ENABLED=true`, cron `GITHUB_SYNC_CRON`, default
+`0 */10 * * * *` like `application.properties`; the annotation default of Java is 6 h but the property wins). The sync
+keeps the Java rules: a merged PR is born VALIDATED, an issue only counts with a qualifying label or after a human
+review, a human review is never overwritten, a "Revert ..." PR flags evidence N, the detail budget bounds the calls,
+the repositories of the organization are discovered (enabled on birth, an existing row is never touched).
+
+**contributors**: the public landing form (per-IP limit, public write), the confirmation of verified contributors
+(idempotent, the handle comes from the link), the account state, the admin queue and the panel (verified people
+appear on their own). `VerifiedContributors` (the Java `VerifiedContributorReaderAdapter`) lives in contributions.
+
+**githubprofile**: the repositories of the link, the README preview and import (rendered by
+`kernel.html.MarkdownBio`, sanitised by `SafeHtml`), the project import (same limits as the manual form), the cache
+(`githubRepositories`, `githubReadme` through `kernel.cache`; a failure and a missing README are never cached).
+
+**support**: tickets, throttle, triage, official reply (e-mail, in-app notice, thread, GitHub comment), the thread, the
+GitHub mirror (issue on open, close/reopen on status, comment on reply, signed webhook back), the encrypted settings.
+
+### Seams filled in `AppWiring`
+
+| Seam | Filled by | Test |
+|---|---|---|
+| `identity.IdentityOAuthLinks` (GitHub side) | `ContributionsOAuthLinks` (identity, write token only with `repo`/`public_repo` and the cipher on, sync after the commit) | `tests/contributions/ContributionsSeamsTest.kf` |
+| `cosmetics.CosmeticsContributors.isVerified` | `ContributionsCosmeticsContributors` (`VerifiedContributors.find`) | same file |
+| `suggestions.SuggestionsGithubToken` | `SuggestionsSupportToken` (reads the support settings on every use) | `tests/support/SupportSeamsTest.kf` |
+| support: who answers on GitHub | `SupportLinkedPeople` (login and write token from contributions) | same file |
+
+Seams owned by this slice: `GithubGateway` (the GitHub reader of contributions), `GithubProfileGateway`,
+`SupportGithubGateway`, `SupportGithubPeople` (all base classes with inert defaults and a real client, G30).
+
+### Decisions and deliberate differences
+
+- **webhook**: 503 without a secret, 401 for a missing/wrong signature (constant-time compare of `sha256=<hex>`), 200 for
+  everything else including a signed malformed body; the 2 MiB ceiling is a filter at order -975 (`WEBHOOK_TOO_LARGE`, no
+  timestamp, like the Java filter). Bodies are UTF-8 text (G161): GitHub sends UTF-8 JSON.
+- **support mail**: through the shared `ops.MailService.sendBulk`: the sender name is "Suporte Énóis" and the team mail has the
+  contact of the requester as Reply-To, like `EmailService`. The Java `fetchImage` (the attachment of the team mail) was dead
+  code and is not ported.
+- **GitHub rate limit message**: `Outbound` hides response headers, so `remaining=?` is always `?`.
+- **org repository filter**: `private` is a Kof keyword (G325), so the redundant `private` check of the listing is dropped;
+  the request already asks `type=public`. The user repository listing has the same reason.
+- **sync on link** runs on its own task with a `Gate` (Java: a single-thread executor); the suites run it inline.
+- **optional booleans** (`dryRun`, `full`, `enabled`, `acceptedTerms`) are `Troolean` (G140).
+- **`/admin/support/github;v=1`** is not an unknown path in Kof: it matches `PATCH/POST /admin/support/:id` as an id, so a
+  GET answers 405 and never reaches the settings handler (the other spellings of the Java matrix are unknown paths, 200 empty).
+- **sealed enums** travel as Strings; an unknown value in a body or query is a plain 400 like the Jackson/Spring conversion.
+- **not ported as separate tests**: `GitHubOAuthLinkTests.githubLoginIsRejected...` is `tests/identity/OAuthTest.kf`
+  (`githubOnlyLinksAndNeverSignsIn`); `linkWithoutOAuthConfigFailsClosed` is covered by the identity OAuth suite on main
+  (the `OAUTH_NOT_CONFIGURED` 501 of `IdentityOAuth`); the contributor tag colour test of `VerifiedContributorPanelTests`
+  is `tests/cosmetics/CommunityCosmeticsFlowTest.kf` plus the cosmetics seam test above.
+
+### Kernel changes of this slice
+
+`Hashes.hmacSha256Hex`, `Outbound.patch` (Apache `HttpPatch`: `HttpURLConnection` cannot PATCH), `ZoneDates.formatLocal`
+(documented in `docs/KERNEL.md`, tests in `tests/kernel`), `ProfileStore.updateBioHtml`.
+
+### Gaps
+
+G320 to G324 (Apache client interop) and G325: `private` is a Kof keyword and cannot be a record member; also seen again:
+G204/G304 (a field named `http` is read as the package, `VerifyError`/`COMPUTE_FRAMES` crash), G12.

@@ -1,0 +1,210 @@
+package githubprofile
+
+import contributions.*
+import kernel.cache.*
+import kernel.db.*
+import kernel.error.*
+import kernel.html.*
+import kernel.log.*
+import kernel.time.*
+import profile.*
+import projects.*
+
+// GitHub reads with a short cache per login. The repository list and the README are public data and each read goes
+// through the network (the list takes up to 3 pages): opening the import dialog and importing right after must not
+// pay the same trip twice. A failure and a missing README are not cached (someone who just created the profile
+// repository does not wait for the TTL). The cached value is the JSON text.
+class CachedGithubProfileReader {
+    GithubProfileGateway gateway
+    TtlCache repositoriesCache
+    TtlCache readmeCache
+    public constructor(gateway: GithubProfileGateway, repositoriesCache: TtlCache, readmeCache: TtlCache) {
+        this.gateway = gateway
+        this.repositoriesCache = repositoriesCache
+        this.readmeCache = readmeCache
+    }
+    static Int maxPages() = 3
+    List<GithubUserRepository> repositories(login: String) {
+        var key = login.toLowerCase()
+        var cached = repositoriesCache.get(key)
+        if (cached != null) {
+            return json.decode<List<GithubUserRepository>>(cached)
+        }
+        var fresh = gateway.listUserRepositories(login, CachedGithubProfileReader.maxPages())
+        repositoriesCache.put(key, json.encode(fresh))
+        return fresh
+    }
+    GithubProfileReadme? profileReadme(login: String) {
+        var key = login.toLowerCase()
+        var cached = readmeCache.get(key)
+        if (cached != null) {
+            return json.decode<GithubProfileReadme>(cached)
+        }
+        var fresh = gateway.profileReadme(login)
+        if (fresh != null) {
+            readmeCache.put(key, json.encode(fresh))
+        }
+        return fresh
+    }
+}
+
+// Imports what is already public on GitHub into the profile: repositories become project cards (the link points to
+// the repository) and the profile README becomes the HTML bio. The GitHub link is mandatory and the handle comes
+// from it, never from the body. Only repositories the API returned for that login enter; the project goes through the
+// same rules and limits as the manual form.
+class GithubProfileImport {
+    CachedGithubProfileReader github
+    ContributionsStore identities
+    ProfileDirectory directory
+    ProfileStore profiles
+    ProjectsService projects
+    public constructor(github: CachedGithubProfileReader, identities: ContributionsStore, directory: ProfileDirectory, profiles: ProfileStore, projects: ProjectsService) {
+        this.github = github
+        this.identities = identities
+        this.directory = directory
+        this.profiles = profiles
+        this.projects = projects
+    }
+    static Int maxImport() = 20
+    static Int maxStack() = 10
+    static Int maxStackItem() = 40
+    String login(userId: String) {
+        var identity = identities.identityByUser(userId)
+        if (identity == null) {
+            throw Errors.api(403, "GITHUB_NOT_LINKED", "Vincule sua conta GitHub para importar seus projetos e seu README.")
+        }
+        return identity.githubLogin()
+    }
+    List<GithubUserRepository> repositories(userId: String) = github.repositories(this.login(userId))
+    GithubReadmeView readmePreview(userId: String) {
+        var login = this.login(userId)
+        var readme = github.profileReadme(login)
+        if (readme == null) {
+            throw Errors.api(404, "GITHUB_README_NOT_FOUND", "Seu perfil do GitHub não tem um README público para importar.")
+        }
+        var branch = "main"
+        if (readme.defaultBranch().trim().length() > 0) {
+            branch = readme.defaultBranch()
+        }
+        var html = MarkdownBio.render(readme.markdown(), login, login, branch)
+        var repoUrl = "https://github.com/" + login + "/" + login
+        if (readme.repoUrl().trim().length() > 0) {
+            repoUrl = readme.repoUrl()
+        }
+        return GithubReadmeView(html, repoUrl)
+    }
+    GithubReadmeView importReadme(userId: String) {
+        var preview = this.readmePreview(userId)
+        if (directory.findById(userId) == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Perfil não encontrado.")
+        }
+        profiles.updateBioHtml(userId, preview.html(), Time.nowIso())
+        return preview
+    }
+    GithubImportResult importProjects(userId: String, requested: List<String>?) {
+        if (requested == null) {
+            throw Errors.api(400, "NO_REPOSITORIES", "Selecione pelo menos um repositório.")
+        }
+        if (requested.size() == 0) {
+            throw Errors.api(400, "NO_REPOSITORIES", "Selecione pelo menos um repositório.")
+        }
+        if (requested.size() > GithubProfileImport.maxImport()) {
+            throw Errors.api(400, "TOO_MANY_REPOSITORIES", "Importe no máximo 20 repositórios por vez.")
+        }
+        var login = this.login(userId)
+        var available = listOf<GithubUserRepository>()
+        var keys = listOf<String>()
+        for (var repo in github.repositories(login)) {
+            keys.add(repo.fullName().toLowerCase())
+            available.add(repo)
+        }
+        var existingUrls = listOf<String>()
+        for (var project in projects.of(userId)) {
+            var url = project.repoUrl()
+            if (url != null) {
+                if (url.trim().length() > 0) {
+                    existingUrls.add(url.toLowerCase())
+                }
+            }
+        }
+        var created = 0
+        var limitReached = false
+        var imported = listOf<String>()
+        var skipped = listOf<String>()
+        var invalid = listOf<String>()
+        var seen = listOf<String>()
+        for (var fullName in requested) {
+            if (!limitReached && fullName.trim().length() > 0 && !seen.contains(fullName)) {
+                seen.add(fullName)
+                var at = keys.indexOf(fullName.trim().toLowerCase())
+                if (at < 0) {
+                    invalid.add(fullName.trim())
+                }
+                else {
+                    var repo = available.get(at)
+                    if (existingUrls.contains(repo.htmlUrl().toLowerCase())) {
+                        skipped.add(repo.fullName())
+                    }
+                    else {
+                        var outcome = this.createProject(userId, repo)
+                        if (outcome == "LIMIT") {
+                            limitReached = true
+                        }
+                        else {
+                            existingUrls.add(repo.htmlUrl().toLowerCase())
+                            imported.add(repo.fullName())
+                            created = created + 1
+                        }
+                    }
+                }
+            }
+        }
+        return GithubImportResult(created, imported, skipped, invalid, limitReached)
+    }
+    // "OK", or "LIMIT" when the profile already has the maximum of projects; any other failure is rethrown.
+    String createProject(userId: String, repo: GithubUserRepository) {
+        var outcome = "OK"
+        var failure = ""
+        try {
+            projects.create(userId, ProjectRequest(GithubProfileImport.title(repo), repo.description(), null, null, GithubProfileImport.stack(repo), repo.htmlUrl(), null, listOf<ProjectDiaryInput>(), null))
+        } catch (String e) {
+            failure = e
+        }
+        if (failure.length() > 0) {
+            if (!Errors.hasCode(failure, "MAX_PROJECTS")) {
+                throw failure
+            }
+            outcome = "LIMIT"
+        }
+        return outcome
+    }
+    static String title(repo: GithubUserRepository) {
+        if (repo.name().trim().length() > 0) {
+            return repo.name()
+        }
+        return repo.fullName()
+    }
+    static List<String> stack(repo: GithubUserRepository) {
+        var items = listOf<String>()
+        for (var topic in repo.topics()) {
+            GithubProfileImport.addStack(items, topic)
+        }
+        var language = repo.language()
+        if (language != null) {
+            GithubProfileImport.addStack(items, language)
+        }
+        return items
+    }
+    static addStack(items: List<String>, value: String) {
+        if (items.size() >= GithubProfileImport.maxStack() || value.trim().length() == 0) {
+            return
+        }
+        var clean = value.trim()
+        if (clean.length() > GithubProfileImport.maxStackItem()) {
+            clean = clean.substring(0, GithubProfileImport.maxStackItem())
+        }
+        if (!items.contains(clean)) {
+            items.add(clean)
+        }
+    }
+}

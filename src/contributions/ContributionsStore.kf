@@ -1,0 +1,266 @@
+package contributions
+
+import kernel.db.*
+import kernel.id.*
+
+// github_contributions, github_contribution_events, github_identities, github_repositories, github_user_tokens,
+// user_seals and user_seal_events.
+class ContributionsStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // ---- evidence
+    static String columns() = "id, user_id, github_user_id, github_login, repository, kind, object_number, object_id, title, url, state, opened_at, merged_at, closed_at, github_updated_at, details_fetched, additions, deletions, changed_files, files_json, labels, reviews_count, approvals_count, changes_requested_count, has_tests, reverted, category, evaluation_status, score, signals_json, review_note, reviewed_by, reviewed_at, created_at, updated_at"
+    static GhContribution mapRow(r: DbRow) {
+        var c = GhContribution(r.getStr("id"), r.getStr("github_user_id"), r.getStr("github_login"), r.getStr("repository"), r.getStr("kind"), r.getInt("object_number"), r.getStr("category"), r.getStr("evaluation_status"), r.getInstant("created_at"))
+        c.userId = r.getStrOrNull("user_id")
+        c.objectId = r.getStrOrNull("object_id")
+        c.title = r.getStr("title")
+        c.url = r.getStr("url")
+        c.state = r.getStr("state")
+        c.openedAt = r.getInstantOrNull("opened_at")
+        c.mergedAt = r.getInstantOrNull("merged_at")
+        c.closedAt = r.getInstantOrNull("closed_at")
+        c.githubUpdatedAt = r.getInstantOrNull("github_updated_at")
+        c.detailsFetched = r.getBool("details_fetched")
+        c.additions = r.getInt("additions")
+        c.deletions = r.getInt("deletions")
+        c.changedFiles = r.getInt("changed_files")
+        c.filesJson = r.getStrOrNull("files_json")
+        c.labels = r.getStrOrNull("labels")
+        c.reviewsCount = r.getInt("reviews_count")
+        c.approvalsCount = r.getInt("approvals_count")
+        c.changesRequestedCount = r.getInt("changes_requested_count")
+        c.hasTests = r.getBool("has_tests")
+        c.reverted = r.getBool("reverted")
+        c.score = r.getInt("score")
+        c.signalsJson = r.getStrOrNull("signals_json")
+        c.reviewNote = r.getStrOrNull("review_note")
+        c.reviewedBy = r.getStrOrNull("reviewed_by")
+        c.reviewedAt = r.getInstantOrNull("reviewed_at")
+        c.updatedAt = r.getInstant("updated_at")
+        return c
+    }
+    static List<GhContribution> mapped(rows: List<DbRow>) {
+        var out = listOf<GhContribution>()
+        for (var r in rows) {
+            out.add(ContributionsStore.mapRow(r))
+        }
+        return out
+    }
+    // The 34 columns after the id, in the order of `columns()`.
+    static bindBody(p: DbParams, c: GhContribution) {
+        p.bindStrOrNull(c.userId)
+        p.bindStr(c.githubUserId)
+        p.bindStr(c.githubLogin)
+        p.bindStr(c.repository)
+        p.bindStr(c.kind)
+        p.bindInt(c.number)
+        p.bindStrOrNull(c.objectId)
+        p.bindStr(c.title)
+        p.bindStr(c.url)
+        p.bindStr(c.state)
+        p.bindInstantOrNull(c.openedAt)
+        p.bindInstantOrNull(c.mergedAt)
+        p.bindInstantOrNull(c.closedAt)
+        p.bindInstantOrNull(c.githubUpdatedAt)
+        p.bindBool(c.detailsFetched)
+        p.bindInt(c.additions)
+        p.bindInt(c.deletions)
+        p.bindInt(c.changedFiles)
+        p.bindStrOrNull(c.filesJson)
+        p.bindStrOrNull(c.labels)
+        p.bindInt(c.reviewsCount)
+        p.bindInt(c.approvalsCount)
+        p.bindInt(c.changesRequestedCount)
+        p.bindBool(c.hasTests)
+        p.bindBool(c.reverted)
+        p.bindStr(c.category)
+        p.bindStr(c.status)
+        p.bindInt(c.score)
+        p.bindStrOrNull(c.signalsJson)
+        p.bindStrOrNull(c.reviewNote)
+        p.bindStrOrNull(c.reviewedBy)
+        p.bindInstantOrNull(c.reviewedAt)
+        p.bindInstant(c.createdAt)
+        p.bindInstant(c.updatedAt)
+    }
+    static String updateSql() = "update github_contributions set user_id = ?, github_user_id = ?, github_login = ?, repository = ?, kind = ?, object_number = ?, object_id = ?, title = ?, url = ?, state = ?, opened_at = ?, merged_at = ?, closed_at = ?, github_updated_at = ?, details_fetched = ?, additions = ?, deletions = ?, changed_files = ?, files_json = ?, labels = ?, reviews_count = ?, approvals_count = ?, changes_requested_count = ?, has_tests = ?, reverted = ?, category = ?, evaluation_status = ?, score = ?, signals_json = ?, review_note = ?, reviewed_by = ?, reviewed_at = ?, created_at = ?, updated_at = ? where id = ?"
+    // Insert or update by id (JpaRepository.save).
+    save(c: GhContribution) {
+        var p = DbParams()
+        ContributionsStore.bindBody(p, c)
+        p.bindStr(c.id)
+        if (store.execute(ContributionsStore.updateSql(), p) > 0) {
+            return
+        }
+        var q = DbParams()
+        q.bindStr(c.id)
+        ContributionsStore.bindBody(q, c)
+        store.execute("insert into github_contributions (" + ContributionsStore.columns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", q)
+    }
+    GhContribution? findById(id: String) {
+        var row = store.queryOptional("select " + ContributionsStore.columns() + " from github_contributions where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return ContributionsStore.mapRow(row)
+    }
+    GhContribution? findByObject(repository: String, kind: String, number: Int) {
+        var row = store.queryOptional("select " + ContributionsStore.columns() + " from github_contributions where repository = ? and kind = ? and object_number = ?", DbParams().bindStr(repository).bindStr(kind).bindInt(number))
+        if (row == null) {
+            return null
+        }
+        return ContributionsStore.mapRow(row)
+    }
+    List<GhContribution> list(status: String?, kind: String?, limit: Int) {
+        var sql = "select " + ContributionsStore.columns() + " from github_contributions where 1 = 1"
+        var p = DbParams()
+        if (status != null) {
+            sql = sql + " and evaluation_status = ?"
+            p.bindStr(status)
+        }
+        if (kind != null) {
+            sql = sql + " and kind = ?"
+            p.bindStr(kind)
+        }
+        p.bindInt(limit)
+        return ContributionsStore.mapped(store.queryList(sql + " order by updated_at desc, id limit ?", p))
+    }
+    List<GhContribution> countablePage(userId: String, category: String, page: Int, size: Int) = ContributionsStore.mapped(store.queryList("select " + ContributionsStore.columns() + " from github_contributions where user_id = ? and evaluation_status = \'VALIDATED\' and reverted = false and category = ? order by updated_at desc, id limit ? offset ?", DbParams().bindStr(userId).bindStr(category).bindInt(size).bindInt(page * size)))
+    Int countCountable(userId: String, category: String) = store.queryLong("select count(*) from github_contributions where user_id = ? and evaluation_status = \'VALIDATED\' and reverted = false and category = ?", DbParams().bindStr(userId).bindStr(category)) as Int
+    // ---- evidence audit
+    appendAudit(contributionId: String, actor: String?, action: String, fromStatus: String?, toStatus: String?, note: String?, at: String) {
+        store.execute("insert into github_contribution_events (id, contribution_id, actor_user_id, action, from_status, to_status, note, created_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(Ids.prefixed("evt_")).bindStr(contributionId).bindStrOrNull(actor).bindStr(action).bindStrOrNull(fromStatus).bindStrOrNull(toStatus).bindStrOrNull(note).bindInstant(at))
+    }
+    List<ContributionAuditEvent> audit(contributionId: String, limit: Int) {
+        var out = listOf<ContributionAuditEvent>()
+        for (var r in store.queryList("select id, contribution_id, actor_user_id, action, from_status, to_status, note, created_at from github_contribution_events where contribution_id = ? order by created_at desc limit ?", DbParams().bindStr(contributionId).bindInt(limit))) {
+            out.add(ContributionAuditEvent(r.getStr("id"), r.getStr("contribution_id"), r.getStrOrNull("actor_user_id"), r.getStr("action"), r.getStrOrNull("from_status"), r.getStrOrNull("to_status"), r.getStrOrNull("note"), r.getInstant("created_at")))
+        }
+        return out
+    }
+    // ---- identities
+    static String identityColumns() = "id, user_id, github_user_id, github_login, linked_at, last_synced_at, sync_state, last_sync_error"
+    static GhIdentity mapIdentity(r: DbRow) = GhIdentity(r.getStr("id"), r.getStr("user_id"), r.getStr("github_user_id"), r.getStr("github_login"), r.getInstant("linked_at"), r.getInstantOrNull("last_synced_at"), r.getStrOrNull("sync_state"), r.getStrOrNull("last_sync_error"))
+    GhIdentity? identityByUser(userId: String) {
+        var row = store.queryOptional("select " + ContributionsStore.identityColumns() + " from github_identities where user_id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return ContributionsStore.mapIdentity(row)
+    }
+    GhIdentity? identityByGithub(githubUserId: String) {
+        var row = store.queryOptional("select " + ContributionsStore.identityColumns() + " from github_identities where github_user_id = ?", DbParams().bindStr(githubUserId))
+        if (row == null) {
+            return null
+        }
+        return ContributionsStore.mapIdentity(row)
+    }
+    List<GhIdentity> identities() {
+        var out = listOf<GhIdentity>()
+        for (var r in store.queryList("select " + ContributionsStore.identityColumns() + " from github_identities order by id", DbParams())) {
+            out.add(ContributionsStore.mapIdentity(r))
+        }
+        return out
+    }
+    saveIdentity(i: GhIdentity) {
+        var changed = store.execute("update github_identities set user_id = ?, github_user_id = ?, github_login = ?, linked_at = ?, last_synced_at = ?, sync_state = ?, last_sync_error = ? where id = ?", DbParams().bindStr(i.userId()).bindStr(i.githubUserId()).bindStr(i.githubLogin()).bindInstant(i.linkedAt()).bindInstantOrNull(i.lastSyncedAt()).bindStrOrNull(i.syncState()).bindStrOrNull(i.lastSyncError()).bindStr(i.id()))
+        if (changed == 0) {
+            store.execute("insert into github_identities (" + ContributionsStore.identityColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(i.id()).bindStr(i.userId()).bindStr(i.githubUserId()).bindStr(i.githubLogin()).bindInstant(i.linkedAt()).bindInstantOrNull(i.lastSyncedAt()).bindStrOrNull(i.syncState()).bindStrOrNull(i.lastSyncError()))
+        }
+    }
+    deleteIdentityByUser(userId: String) {
+        store.execute("delete from github_identities where user_id = ?", DbParams().bindStr(userId))
+    }
+    markSynced(githubUserId: String, state: String, error: String?, at: String) {
+        var clipped = ContribText.none()
+        if (error != null) {
+            clipped = ContributionsStore.clip(error, 1000)
+        }
+        store.execute("update github_identities set last_synced_at = ?, sync_state = ?, last_sync_error = ? where github_user_id = ?", DbParams().bindInstant(at).bindStr(state).bindStrOrNull(clipped).bindStr(githubUserId))
+    }
+    static String clip(v: String, max: Int) {
+        if (v.length() <= max) {
+            return v
+        }
+        return v.substring(0, max)
+    }
+    // ---- repositories
+    static GhRepository mapRepository(r: DbRow) = GhRepository(r.getStr("repository"), r.getBool("enabled"), r.getInstant("added_at"), r.getInstantOrNull("last_synced_at"))
+    List<GhRepository> repositories() {
+        var out = listOf<GhRepository>()
+        for (var r in store.queryList("select repository, enabled, added_at, last_synced_at from github_repositories order by repository", DbParams())) {
+            out.add(ContributionsStore.mapRepository(r))
+        }
+        return out
+    }
+    List<GhRepository> enabledRepositories() {
+        var out = listOf<GhRepository>()
+        for (var r in store.queryList("select repository, enabled, added_at, last_synced_at from github_repositories where enabled = true order by repository", DbParams())) {
+            out.add(ContributionsStore.mapRepository(r))
+        }
+        return out
+    }
+    saveRepository(g: GhRepository) {
+        var changed = store.execute("update github_repositories set enabled = ?, added_at = ?, last_synced_at = ? where repository = ?", DbParams().bindBool(g.enabled()).bindInstant(g.addedAt()).bindInstantOrNull(g.lastSyncedAt()).bindStr(g.repository()))
+        if (changed == 0) {
+            store.execute("insert into github_repositories (repository, enabled, added_at, last_synced_at) values (?, ?, ?, ?)", DbParams().bindStr(g.repository()).bindBool(g.enabled()).bindInstant(g.addedAt()).bindInstantOrNull(g.lastSyncedAt()))
+        }
+    }
+    // ---- seals
+    static String sealColumns() = "id, user_id, seal_type, category, status, granted_at, granted_by, revoked_at, revoked_by, revoke_reason, evidence_count"
+    static UserSealRecord mapSeal(r: DbRow) = UserSealRecord(r.getStr("id"), r.getStr("user_id"), r.getStr("seal_type"), r.getStr("category"), r.getStr("status"), r.getInstant("granted_at"), r.getStrOrNull("granted_by"), r.getInstantOrNull("revoked_at"), r.getStrOrNull("revoked_by"), r.getStrOrNull("revoke_reason"), r.getInt("evidence_count"))
+    UserSealRecord? findSeal(userId: String, sealType: String) {
+        var row = store.queryOptional("select " + ContributionsStore.sealColumns() + " from user_seals where user_id = ? and seal_type = ?", DbParams().bindStr(userId).bindStr(sealType))
+        if (row == null) {
+            return null
+        }
+        return ContributionsStore.mapSeal(row)
+    }
+    List<UserSealRecord> activeSeals(userId: String) {
+        var out = listOf<UserSealRecord>()
+        for (var r in store.queryList("select " + ContributionsStore.sealColumns() + " from user_seals where user_id = ? and status = \'ACTIVE\'", DbParams().bindStr(userId))) {
+            out.add(ContributionsStore.mapSeal(r))
+        }
+        return out
+    }
+    List<UserSealRecord> allActiveSeals() {
+        var out = listOf<UserSealRecord>()
+        for (var r in store.queryList("select " + ContributionsStore.sealColumns() + " from user_seals where status = \'ACTIVE\'", DbParams())) {
+            out.add(ContributionsStore.mapSeal(r))
+        }
+        return out
+    }
+    saveSeal(s: UserSealRecord) {
+        var changed = store.execute("update user_seals set user_id = ?, seal_type = ?, category = ?, status = ?, granted_at = ?, granted_by = ?, revoked_at = ?, revoked_by = ?, revoke_reason = ?, evidence_count = ? where id = ?", DbParams().bindStr(s.userId()).bindStr(s.sealType()).bindStr(s.category()).bindStr(s.status()).bindInstant(s.grantedAt()).bindStrOrNull(s.grantedBy()).bindInstantOrNull(s.revokedAt()).bindStrOrNull(s.revokedBy()).bindStrOrNull(s.revokeReason()).bindInt(s.evidenceCount()).bindStr(s.id()))
+        if (changed == 0) {
+            store.execute("insert into user_seals (" + ContributionsStore.sealColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(s.id()).bindStr(s.userId()).bindStr(s.sealType()).bindStr(s.category()).bindStr(s.status()).bindInstant(s.grantedAt()).bindStrOrNull(s.grantedBy()).bindInstantOrNull(s.revokedAt()).bindStrOrNull(s.revokedBy()).bindStrOrNull(s.revokeReason()).bindInt(s.evidenceCount()))
+        }
+    }
+    appendSealEvent(userId: String, sealType: String, action: String, actor: String?, note: String?, at: String) {
+        store.execute("insert into user_seal_events (id, user_id, seal_type, action, actor_user_id, note, created_at) values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(Ids.prefixed("sealevt_")).bindStr(userId).bindStr(sealType).bindStr(action).bindStrOrNull(actor).bindStrOrNull(note).bindInstant(at))
+    }
+    // ---- user tokens
+    String? tokenCipher(userId: String) {
+        var row = store.queryOptional("select token_cipher from github_user_tokens where user_id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return row.getStr("token_cipher")
+    }
+    String? tokenCreatedAt(userId: String) {
+        var row = store.queryOptional("select created_at from github_user_tokens where user_id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return row.getInstant("created_at")
+    }
+    saveToken(userId: String, cipher: String, scopes: String, createdAt: String, now: String) {
+        var changed = store.execute("update github_user_tokens set token_cipher = ?, scopes = ?, updated_at = ? where user_id = ?", DbParams().bindStr(cipher).bindStr(scopes).bindInstant(now).bindStr(userId))
+        if (changed == 0) {
+            store.execute("insert into github_user_tokens (user_id, token_cipher, scopes, created_at, updated_at) values (?, ?, ?, ?, ?)", DbParams().bindStr(userId).bindStr(cipher).bindStr(scopes).bindInstant(createdAt).bindInstant(now))
+        }
+    }
+}

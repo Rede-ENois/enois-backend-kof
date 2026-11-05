@@ -1,0 +1,53 @@
+import contributions.*
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import suggestions.*
+import support.*
+
+// The seams support fills: the GitHub identity of whoever answers (contributions) and the token the suggestions share.
+TestApp sapp() {
+    SupportTestKit.configure(mapOf("REDE_SECURITY_ENCRYPTION_KEY", SecretCipher.generateKeyBase64(), "GITHUB_ISSUES_TOKEN", "env-token"))
+    return SupportTestKit.app()
+}
+
+test "the suggestions read the support token on every use: the environment first, then the panel's" {
+    var app = sapp()
+    var admin = SupportTestKit.loginAdmin("seam_admin")
+    var shared = SupportTestKit.cachedShared
+    assert(shared != null)
+    if (shared != null) {
+        var seam = SuggestionsSupportToken(SupportTestKit.db(), shared.cipher, SupportTestKit.module().settings)
+        Check.eqStr("environment fallback", "env-token", seam.token())
+        Check.status(SupportTestKit.send("PUT", "/admin/support/github", admin, "{\"token\":\"ghp_from_panel\",\"repo\":\"org/support\"}"), 200)
+        Check.eqStr("the panel value wins at once", "ghp_from_panel", seam.token())
+        Check.status(SupportTestKit.send("PUT", "/admin/support/github", admin, "{\"token\":\"\"}"), 200)
+        Check.eqStr("removing it goes back to the environment", "env-token", seam.token())
+    }
+}
+
+test "the person who answers comments with their own GitHub identity and write token" {
+    var app = sapp()
+    var shared = SupportTestKit.cachedShared
+    assert(shared != null)
+    if (shared != null) {
+        var store = ContributionsStore(SupportTestKit.db())
+        var tokens = GithubUserTokens(store, shared.cipher)
+        var identities = GithubIdentities(store, tokens)
+        var people = SupportLinkedPeople(SupportTestKit.cachedProfiles().directory, identities, tokens)
+        SupportTestKit.login("seam_person")
+        assert(people.login("seam_person") == null)
+        assert(people.userToken("seam_person") == null)
+        identities.remember("seam_person", "gh-seam-person", "seam-dev")
+        tokens.remember("seam_person", "gho_person", "repo")
+        assert(people.login("seam_person") == "seam-dev")
+        assert(people.userToken("seam_person") == "gho_person")
+        assert(people.displayName("seam_person", "fallback") != "fallback")
+        assert(people.displayName("nobody-here", "fallback") == "fallback")
+    }
+}
+
+test "finish" {
+    SupportTestKit.finish()
+}

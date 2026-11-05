@@ -5,8 +5,17 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.lang.String
 import java.net.HttpURLConnection
+import java.net.URI
 import java.net.URL
 import kernel.files.*
+import org.apache.http.client.config.RequestConfig
+import org.apache.http.client.methods.HttpPatch
+import org.apache.http.HttpEntity
+import org.apache.http.HttpResponse
+import java.io.Closeable
+import java.lang.Class
+import org.apache.http.impl.client.HttpClients
+import org.apache.http.util.EntityUtils
 
 record OutboundReply(Int status, String body)
 
@@ -38,6 +47,13 @@ record OutboundProbe(Int status, String contentType)
 class Outbound {
     // headers: "Name: value" lines. body "" sends no payload.
     static OutboundReply request(method: String, url: String, headers: List<String>, body: String, timeoutMs: Int) {
+        // HttpURLConnection refuses PATCH (ProtocolException): that verb goes through the Apache client.
+        if (method == "PATCH") {
+            return Outbound.patch(url, headers, body, timeoutMs)
+        }
+        return Outbound.plain(method, url, headers, body, timeoutMs)
+    }
+    static OutboundReply plain(method: String, url: String, headers: List<String>, body: String, timeoutMs: Int) {
         var status = 0
         var text = ""
         var failure = ""
@@ -78,6 +94,54 @@ class Outbound {
             throw failure
         }
         return OutboundReply(status, text)
+    }
+    static OutboundReply patch(url: String, headers: List<String>, body: String, timeoutMs: Int) {
+        var status = 0
+        var text = ""
+        var failure = ""
+        try {
+            var config = RequestConfig.custom().setConnectTimeout(timeoutMs).setSocketTimeout(timeoutMs).setConnectionRequestTimeout(timeoutMs).build()
+            var request = new HttpPatch(URI.create(url))
+            request.setConfig(config)
+            for (var h in headers) {
+                var colon = h.indexOf(":")
+                if (colon > 0) {
+                    request.setHeader(h.substring(0, colon).trim(), h.substring(colon + 1).trim())
+                }
+            }
+            if (body.length() > 0) {
+                request.setEntity(Outbound.textBody(body))
+            }
+            var client = HttpClients.createDefault()
+            var reply = client.execute(request) as HttpResponse
+            status = reply.getStatusLine().getStatusCode()
+            var answer = reply.getEntity()
+            if (answer != null) {
+                var raw = EntityUtils.toByteArray(answer) as Byte[]
+                text = new String(raw, "UTF-8")
+            }
+            var closer = client as Closeable
+            closer.close()
+        } catch (String e) {
+            failure = "OUTBOUND_FAILED"
+        } catch (IOException e) {
+            failure = "OUTBOUND_FAILED"
+        }
+        if (failure.length() > 0) {
+            throw failure
+        }
+        return OutboundReply(status, text)
+    }
+    // StringEntity by reflection: `entity` is a Kof keyword, so `org.apache.http.entity.StringEntity` cannot be imported.
+    static HttpEntity textBody(body: String) {
+        var strCls = Class.forName("java.lang.String")
+        var types = new Class[2]
+        types[0] = strCls
+        types[1] = strCls
+        var args = new Object[2]
+        args[0] = body as Object
+        args[1] = "UTF-8" as Object
+        return Class.forName("org.apache.http.entity.StringEntity").getConstructor(types).newInstance(args) as HttpEntity
     }
     static OutboundReply postJson(url: String, headers: List<String>, body: String, timeoutMs: Int) = Outbound.request("POST", url, headers, body, timeoutMs)
     static OutboundReply postForm(url: String, form: String, timeoutMs: Int) = Outbound.request("POST", url, listOf("Content-Type: application/x-www-form-urlencoded"), form, timeoutMs)

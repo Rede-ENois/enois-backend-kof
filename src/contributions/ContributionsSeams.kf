@@ -1,0 +1,49 @@
+package contributions
+
+import cosmetics.*
+import identity.*
+import kernel.db.*
+
+// identity.IdentityOAuthLinks (GitHub side): where a linked GitHub identity goes. The identity is remembered (409
+// GITHUB_ACCOUNT_IN_USE / GITHUB_ALREADY_LINKED), the write token is kept only with the `repo` or `public_repo`
+// scope and the cipher on, and, after the commit, the contributions of the link are verified on their own task
+// (GitHubIdentityLinkedEvent -> GitHubLinkedSyncListener). The LinkedIn side stays with its own domain.
+class ContributionsOAuthLinks extends IdentityOAuthLinks {
+    GithubIdentities identities
+    GithubUserTokens tokens
+    GithubLinkSync linkSync
+    Db database
+    public constructor(database: Db, identities: GithubIdentities, tokens: GithubUserTokens, linkSync: GithubLinkSync) {
+        super()
+        this.database = database
+        this.identities = identities
+        this.tokens = tokens
+        this.linkSync = linkSync
+    }
+    rememberGithub(userId: String, externalUserId: String, name: String, accessToken: String?, scope: String?) {
+        database.transaction(() -> {
+    identities.remember(userId, externalUserId, name)
+    if (accessToken != null) {
+        var granted = ""
+        if (scope != null) {
+            granted = scope
+        }
+        tokens.remember(userId, accessToken, granted)
+    }
+    database.afterCommit(() -> linkSync.onLinked(userId, externalUserId))
+})
+    }
+    unlinkGithub(userId: String) {
+        identities.unlink(userId)
+    }
+}
+
+// cosmetics.CosmeticsContributors: the contributor tag is for whoever has an active seal and a GitHub identity.
+class ContributionsCosmeticsContributors extends CosmeticsContributors {
+    VerifiedContributors verified
+    public constructor(db: Db, verified: VerifiedContributors) {
+        super(db)
+        this.verified = verified
+    }
+    Bool isVerified(userId: String) = verified.find(userId) != null
+}

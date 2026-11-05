@@ -1,0 +1,91 @@
+package contributions
+
+import java.lang.Throwable
+import kernel.*
+import kernel.concurrent.*
+import kernel.log.*
+import kernel.security.*
+import profile.*
+
+// Verifies the contributions as soon as the GitHub link completes: without it, connecting the account showed
+// nothing until the next sweep. It runs after the commit and off the request: a GitHub failure never undoes the link.
+// One task at a time (Java used a single-thread executor); `inline` runs it in the caller (tests).
+class GithubLinkSync {
+    GithubContributionSync sync
+    Bool enabled
+    Bool inline
+    Gate gate = Gate()
+    Log log = Log("contributions.link")
+    public constructor(sync: GithubContributionSync, enabled: Bool, inline: Bool) {
+        this.sync = sync
+        this.enabled = enabled
+        this.inline = inline
+    }
+    onLinked(userId: String, githubUserId: String) {
+        if (!enabled) {
+            return
+        }
+        if (inline) {
+            this.runLinked(userId, githubUserId)
+            return
+        }
+        spawn this.runLinked(userId, githubUserId)
+    }
+    runLinked(userId: String, githubUserId: String) {
+        gate.enter()
+        try {
+            var report = sync.syncForGithubUser(githubUserId)
+            log.info("github_sync_on_link prs=" + (report.created() + report.updated()) + " issues=" + (report.issuesCreated() + report.issuesUpdated()) + " seals=" + report.sealsRecalculated())
+        } catch (Throwable failure) {
+            log.warn("github_sync_on_link_failed")
+        }
+        gate.leave()
+    }
+}
+
+// Composition of the contributions domain: evidence, seals, the GitHub link and its token, the sync (on link, on
+// demand and on a schedule) and the pull request review. Seam: GithubGateway (the GitHub reader).
+class ContributionsModule {
+    ContributionsStore store
+    GithubUserTokens tokens
+    GithubIdentities identities
+    ContributorSealService seals
+    GithubContributionSync sync
+    PullRequestReview review
+    GithubLinkSync linkSync
+    GithubGateway gateway
+    public constructor(store: ContributionsStore, tokens: GithubUserTokens, identities: GithubIdentities, seals: ContributorSealService, sync: GithubContributionSync, review: PullRequestReview, linkSync: GithubLinkSync, gateway: GithubGateway) {
+        this.store = store
+        this.tokens = tokens
+        this.identities = identities
+        this.seals = seals
+        this.sync = sync
+        this.review = review
+        this.linkSync = linkSync
+        this.gateway = gateway
+    }
+    static ContributionsModule install(platform: Platform, shared: SharedServices, parts: SecurityParts, profiles: ProfileModule) = ContributionsModule.installWith(platform, shared, parts, profiles.directory, GithubApiClient.fromConfig(platform.cfg), false)
+    static ContributionsModule installWith(platform: Platform, shared: SharedServices, parts: SecurityParts, directory: ProfileDirectory, gateway: GithubGateway, inlineLink: Bool) {
+        var store = ContributionsStore(platform.db)
+        var tokens = GithubUserTokens(store, shared.cipher)
+        var identities = GithubIdentities(store, tokens)
+        var seals = ContributorSealService(platform.db, store, directory)
+        var sync = GithubContributionSync(gateway, store, seals, platform.cfg.getInt("GITHUB_SYNC_MAX_PAGES", 3), platform.cfg.getInt("GITHUB_SYNC_MAX_DETAILS", 60), platform.cfg.getStr("GITHUB_QUALIFIED_ISSUE_LABELS", ""), platform.cfg.getStr("REDE_GITHUB_ORGANIZATION", "Rede-ENois"))
+        var review = PullRequestReview(gateway, store, tokens)
+        var linkSync = GithubLinkSync(sync, platform.cfg.getBool("GITHUB_SYNC_ON_LINK_ENABLED", true), inlineLink)
+        ContributionsRoutes.register(platform.server, seals, sync, identities, review, parts.userLimiter)
+        // GitHubContributionSyncWorker: off unless GITHUB_SYNC_ENABLED, then on the cron (every 10 minutes by default).
+        if (platform.cfg.getBool("GITHUB_SYNC_ENABLED", false)) {
+            shared.jobs.cron("github-contribution-sync", platform.cfg.getStr("GITHUB_SYNC_CRON", "0 */10 * * * *"), "UTC", () -> ContributionsModule.scheduledSync(sync))
+        }
+        return ContributionsModule(store, tokens, identities, seals, sync, review, linkSync, gateway)
+    }
+    static scheduledSync(sync: GithubContributionSync) {
+        try {
+            var report = sync.sync(false, false, listOf<String>())
+            Log("contributions.worker").info("github_sync_worker prs=" + report.fetched() + " issues=" + report.issuesFetched() + " seals=" + report.sealsRecalculated() + " rateLimited=" + report.rateLimited())
+        } catch (String failure) {
+            Log("contributions.worker").warn("github_sync_worker_failed")
+        }
+    }
+}

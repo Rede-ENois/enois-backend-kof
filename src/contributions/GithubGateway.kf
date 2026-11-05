@@ -1,0 +1,109 @@
+package contributions
+
+import kernel.http.*
+import kernel.log.*
+import kernel.text.*
+import kernel.time.*
+import kernel.url.*
+
+// Read port of the GitHub API for contribution evidence. A base class with inert defaults (a Kof interface cannot
+// be implemented across packages, G30): the real client and the test doubles extend it. A refused call because of
+// the API limit throws a String that starts with GithubGateway.rateLimitTag(); any other failure throws a
+// "GITHUB_ERROR: ..." String; the sync tells them apart.
+class GithubGateway {
+    static String rateLimitTag() = "GITHUB_RATE_LIMITED"
+    // Full names (org/repo) of the public repositories of the organization, without forks nor archived ones.
+    List<String> organizationRepositories(organization: String, maxPages: Int) = listOf<String>()
+    // Closed/merged pull requests, newest update first, with a page ceiling.
+    List<GhPullRequest> mergedPullRequests(repository: String, since: String?, maxPages: Int) = listOf<GhPullRequest>()
+    // Issues (without pull requests) updated since `since`.
+    List<GhIssue> issues(repository: String, since: String?, maxPages: Int) = listOf<GhIssue>()
+    // Completes files and reviews of a pull request (only for a new or updated one).
+    GhPullRequest withDetails(repository: String, pr: GhPullRequest) = pr
+    List<GhPullRequest> openPullRequests(repository: String, maxPages: Int) = listOf<GhPullRequest>()
+    // APPROVE / REQUEST_CHANGES / COMMENT; `tokenOverride` reviews as the person who linked GitHub with write.
+    Bool submitReview(repository: String, number: Long, decision: String, body: String?, tokenOverride: String?) = false
+}
+
+record GithubReply(Int status, String body)
+
+// The HTTP core shared by the GitHub readers. The token goes only to the API host: the raw README comes from
+// raw.githubusercontent.com, which is public and must not receive the credential.
+class GithubHttp {
+    String apiBase
+    String token
+    String userAgent
+    public constructor(apiBase: String, token: String, userAgent: String) {
+        this.apiBase = GithubHttp.trimSlashes(apiBase)
+        this.token = token.trim()
+        this.userAgent = userAgent
+    }
+    static String trimSlashes(v: String) {
+        var out = v.trim()
+        while (out.endsWith("/")) {
+            out = out.substring(0, out.length() - 1)
+        }
+        return out
+    }
+    GithubReply send(url: String, accept: String, method: String, body: String, tokenOverride: String?) {
+        var headers = listOf("Accept: " + accept, "X-GitHub-Api-Version: 2022-11-28", "User-Agent: " + userAgent)
+        var bearer = token
+        if (tokenOverride != null) {
+            if (tokenOverride.trim().length() > 0) {
+                bearer = tokenOverride.trim()
+            }
+        }
+        if (bearer.length() > 0 && url.startsWith(apiBase)) {
+            headers.add("Authorization: Bearer " + bearer)
+        }
+        if (method != "GET") {
+            headers.add("Content-Type: application/json")
+        }
+        var status = 0
+        var text = ""
+        var failed = false
+        try {
+            var reply = Outbound.request(method, url, headers, body, 15000)
+            status = reply.status()
+            text = reply.body()
+        } catch (String e) {
+            failed = true
+        }
+        if (failed) {
+            throw "GITHUB_ERROR: Falha ao consultar o GitHub"
+        }
+        return GithubReply(status, text)
+    }
+    // The body of a 2xx JSON answer; a limit refusal or any other failure throws.
+    String get(path: String) {
+        var reply = this.send(apiBase + path, "application/vnd.github+json", "GET", "", null)
+        this.check(reply.status(), path)
+        return reply.body()
+    }
+    // "" for a 404 (the caller treats it as "not there").
+    String getOptional(path: String) {
+        var reply = this.send(apiBase + path, "application/vnd.github+json", "GET", "", null)
+        if (reply.status() == 404) {
+            return ""
+        }
+        this.check(reply.status(), path)
+        return reply.body()
+    }
+    String getRaw(absoluteUrl: String) {
+        var reply = this.send(absoluteUrl, "text/plain", "GET", "", null)
+        if (reply.status() == 404) {
+            return ""
+        }
+        this.check(reply.status(), "raw")
+        return reply.body()
+    }
+    check(status: Int, label: String) {
+        if (status == 403 || status == 429) {
+            // The headers are not visible through the shared client: the remaining quota is not reported.
+            throw GithubGateway.rateLimitTag() + ": GitHub recusou a chamada (status=" + status + ", remaining=?)"
+        }
+        if (status >= 400) {
+            throw "GITHUB_ERROR: GitHub respondeu " + status + " em " + label
+        }
+    }
+}

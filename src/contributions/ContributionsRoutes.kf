@@ -1,0 +1,188 @@
+package contributions
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+
+// The public projection of the seals (only validated evidence, no internal notes), the account link state, the admin
+// queue of the seals (admin only) and the open pull requests review (moderators).
+class ContributionsRoutes {
+    static register(server: HttpServer, seals: ContributorSealService, sync: GithubContributionSync, identities: GithubIdentities, review: PullRequestReview, limiter: UserRateLimiter) {
+        server.get("/users/:username/seals", () -> json.encode(seals.publicSeals(Req.pathParam("username"))))
+        server.get("/users/:username/seals/:category/evidence", () -> ContributionsRoutes.evidence(seals))
+        server.get("/seals/criteria", () -> json.encode(seals.criteria()))
+        server.get("/me/github", () -> ContributionsRoutes.status(identities))
+        server.post("/me/github/sync", () -> ContributionsRoutes.mySync(sync, identities, limiter))
+        server.get("/admin/contributors/contributions", () -> ContributionsRoutes.list(seals))
+        server.get("/admin/contributors/contributions/:id", () -> ContributionsRoutes.detail(seals))
+        server.post("/admin/contributors/contributions/:id/review", () -> ContributionsRoutes.review(seals))
+        server.post("/admin/contributors/seals/:userId/revoke", () -> ContributionsRoutes.revoke(seals))
+        server.post("/admin/contributors/seals/:userId/grant", () -> ContributionsRoutes.grant(seals))
+        server.post("/admin/contributors/sync", () -> ContributionsRoutes.adminSync(sync))
+        server.post("/admin/contributors/users/:userId/recalculate", () -> ContributionsRoutes.recalculateUser(seals))
+        server.post("/admin/contributors/recalculate", () -> ContributionsRoutes.recalculateAll(seals))
+        server.get("/admin/contributors/repositories", () -> ContributionsRoutes.repositories(seals))
+        server.patch("/admin/contributors/repositories", () -> ContributionsRoutes.updateRepository(seals))
+        server.get("/admin/github/pulls", () -> ContributionsRoutes.pulls(review))
+        server.post("/admin/github/pulls/review", () -> ContributionsRoutes.reviewPull(review))
+    }
+    // An unknown enum constant is a value the converter or Jackson cannot read: a plain 400.
+    static String? enumOf(raw: String?, allowed: List<String>) {
+        if (raw == null) {
+            return null
+        }
+        if (!allowed.contains(raw)) {
+            throw Errors.badRequest()
+        }
+        return raw
+    }
+    static String? queryOrNull(name: String) {
+        var raw = Req.queryParam(name)
+        if (raw == null) {
+            return null
+        }
+        if (raw.length() == 0) {
+            return null
+        }
+        return raw
+    }
+    static String evidence(seals: ContributorSealService) {
+        var category = Req.pathParam("category")
+        if (!ContribEnums.categories().contains(category)) {
+            throw Errors.badRequest()
+        }
+        return json.encode(seals.publicEvidence(Req.pathParam("username"), category, Req.queryInt("page", 0), Req.queryInt("size", 50)))
+    }
+    static String status(identities: GithubIdentities) {
+        var userId = Auth.requireUser()
+        return json.encode(identities.status(userId))
+    }
+    // "Verify contributions": redoes the read of the link's contributions and recalculates the seals.
+    static String mySync(sync: GithubContributionSync, identities: GithubIdentities, limiter: UserRateLimiter) {
+        var userId = Auth.requireUser()
+        var githubUserId = identities.githubUserId(userId)
+        if (githubUserId.length() == 0) {
+            throw Errors.api(409, "GITHUB_NOT_LINKED", "Vincule sua conta do GitHub antes de verificar as contribuições.")
+        }
+        limiter.require(userId, UserRateLimiter.syncGithub())
+        var report = sync.syncForGithubUser(githubUserId)
+        return json.encode(GithubSyncResult(report.created() + report.updated(), report.issuesCreated() + report.issuesUpdated(), report.sealsRecalculated(), report.rateLimited()))
+    }
+    static String list(seals: ContributorSealService) {
+        Auth.requireAdmin()
+        var status = ContributionsRoutes.enumOf(ContributionsRoutes.queryOrNull("status"), ContribEnums.statuses())
+        var kind = ContributionsRoutes.enumOf(ContributionsRoutes.queryOrNull("kind"), ContribEnums.kinds())
+        return json.encode(seals.adminList(status, kind, Req.queryInt("limit", 100)))
+    }
+    static String detail(seals: ContributorSealService) {
+        Auth.requireAdmin()
+        return json.encode(seals.adminDetail(Req.pathParam("id")))
+    }
+    static String review(seals: ContributorSealService) {
+        var admin = Auth.requireAdmin()
+        var body = ContributionsRoutes.parseReview()
+        var status = ContributionsRoutes.enumOf(body.status(), ContribEnums.statuses())
+        return json.encode(seals.review(Req.pathParam("id"), status, body.note(), admin))
+    }
+    static String revoke(seals: ContributorSealService) {
+        var admin = Auth.requireAdmin()
+        var body = ContributionsRoutes.parseSeal()
+        seals.revokeSeal(Req.pathParam("userId"), body.type(), body.reason(), admin)
+        return json.encode(ContribStatusView("REVOKED"))
+    }
+    static String grant(seals: ContributorSealService) {
+        var admin = Auth.requireAdmin()
+        var body = ContributionsRoutes.parseSeal()
+        seals.grantSeal(Req.pathParam("userId"), body.type(), body.reason(), admin)
+        return json.encode(ContribStatusView("ACTIVE"))
+    }
+    static String adminSync(sync: GithubContributionSync) {
+        Auth.requireAdmin()
+        var body = ContributionsRoutes.parseSync()
+        var repositories = body.repositories()
+        var requested = listOf<String>()
+        if (repositories != null) {
+            requested = repositories
+        }
+        return json.encode(sync.sync(body.dryRun() == true, body.full() == true, requested))
+    }
+    static String recalculateUser(seals: ContributorSealService) {
+        Auth.requireAdmin()
+        seals.recalculate(Req.pathParam("userId"))
+        return json.encode(ContribStatusView("RECALCULATED"))
+    }
+    static String recalculateAll(seals: ContributorSealService) {
+        Auth.requireAdmin()
+        return json.encode(ContribUsersView(seals.recalculateAll()))
+    }
+    static String repositories(seals: ContributorSealService) {
+        Auth.requireAdmin()
+        return json.encode(seals.adminRepositories())
+    }
+    static String updateRepository(seals: ContributorSealService) {
+        Auth.requireAdmin()
+        var body = ContributionsRoutes.parseRepository()
+        return json.encode(seals.setRepositoryEnabled(body.repository(), body.enabled() == true))
+    }
+    static String pulls(review: PullRequestReview) {
+        Auth.requireModerator()
+        return json.encode(review.open(Req.queryInt("limit", 100)))
+    }
+    static String reviewPull(review: PullRequestReview) {
+        var userId = Auth.requireModerator()
+        var body = ContributionsRoutes.parsePull()
+        var number = 0L
+        var raw = body.number()
+        if (raw != null) {
+            number = raw
+        }
+        review.review(userId, body.repository(), number, body.decision(), body.comment())
+        var repository = ""
+        var named = body.repository()
+        if (named != null) {
+            repository = named
+        }
+        return json.encode(PullReviewedView(repository + "#" + number, "REVIEWED"))
+    }
+    static ContribReviewBody parseReview() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ContribReviewBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ContribSealBody parseSeal() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ContribSealBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ContribSyncBody parseSync() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ContribSyncBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ContribRepositoryBody parseRepository() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ContribRepositoryBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ContribPullReviewBody parsePull() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ContribPullReviewBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

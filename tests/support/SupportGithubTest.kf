@@ -1,0 +1,173 @@
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import notifications.*
+import support.*
+
+// Port of SupportGithubIssuesTests (the mirror in both directions, the webhook signature) and the reply side of
+// SupportGithubSync: who the comment is attributed to, the token used, the fallback.
+TestApp gapp() {
+    SupportTestKit.configure(mapOf("GITHUB_ISSUES_REPO", SupportTestKit.repo(), "GITHUB_ISSUES_WEBHOOK_SECRET", SupportTestKit.secret()))
+    return SupportTestKit.app()
+}
+
+test "a webhook without a valid signature touches nothing" {
+    var app = gapp()
+    var body = SupportTestKit.issueEvent(9999, "closed")
+    var unsigned = app.client.send("POST", "/webhooks/github", listOf("X-GitHub-Event: issues", "Content-Type: application/json"), "", body)
+    Check.eqInt("unsigned", 401, unsigned.status)
+    var wrong = app.client.send("POST", "/webhooks/github", listOf("X-GitHub-Event: issues", "X-Hub-Signature-256: sha256=00", "Content-Type: application/json"), "", body)
+    Check.eqInt("wrong", 401, wrong.status)
+    var noPrefix = app.client.send("POST", "/webhooks/github", listOf("X-GitHub-Event: issues", "X-Hub-Signature-256: " + Hashes.hmacSha256Hex(SupportTestKit.secret(), body), "Content-Type: application/json"), "", body)
+    Check.eqInt("a bare hex is not a signature", 401, noPrefix.status)
+}
+
+test "closing the issue concludes the ticket and keeps the mirror" {
+    var app = gapp()
+    var user = SupportTestKit.login("sg_user")
+    var admin = SupportTestKit.loginAdmin("sg_admin")
+    var id = SupportTestKit.open(user, "Falha ao anexar imagem")
+    SupportTestKit.attach(id, 4321)
+    var before = SupportTestKit.emailsOfKind("SUPPORT_CLOSED", "SENT")
+    Check.eqInt("signed event", 200, SupportTestKit.webhook("issues", SupportTestKit.issueEvent(4321, "closed")).status)
+    var queue = SupportTestKit.send("GET", "/admin/support", admin, "")
+    Check.status(queue, 200)
+    var at = SupportTestKit.indexOf(queue, id)
+    assert(at >= 0)
+    Check.jsonEq(queue, at + ".status", "CLOSED")
+    Check.jsonEq(queue, at + ".githubIssueNumber", "4321")
+    Check.jsonEq(queue, at + ".githubIssueUrl", "https://github.com/" + SupportTestKit.repo() + "/issues/4321")
+    var mine = SupportTestKit.send("GET", "/support/requests/mine", user, "")
+    Check.jsonEq(mine, "0.status", "CLOSED")
+    // The author is told once: e-mail and in-app notice; a repeated event changes nothing.
+    assert(SupportTestKit.emailsOfKind("SUPPORT_CLOSED", "SENT") == before + 1L)
+    Check.eqInt("repeat", 200, SupportTestKit.webhook("issues", SupportTestKit.issueEvent(4321, "closed")).status)
+    assert(SupportTestKit.emailsOfKind("SUPPORT_CLOSED", "SENT") == before + 1L)
+}
+
+test "the signed webhook is not subject to the user content link check" {
+    var app = gapp()
+    var body = "{\"action\":\"closed\",\"issue\":{\"number\":9998,\"state\":\"closed\",\"body\":\"[x](javascript:alert(1))\"},\"repository\":{\"full_name\":\"" + SupportTestKit.repo() + "\"}}"
+    Check.eqInt("accepted", 200, SupportTestKit.webhook("issues", body).status)
+}
+
+test "reopening the issue puts the ticket back to open" {
+    var app = gapp()
+    var user = SupportTestKit.login("sg_user2")
+    var id = SupportTestKit.open(user, "Reabrir")
+    SupportTestKit.attach(id, 8765)
+    Check.eqInt("closed", 200, SupportTestKit.webhook("issues", SupportTestKit.issueEvent(8765, "closed")).status)
+    Check.eqInt("reopened", 200, SupportTestKit.webhook("issues", SupportTestKit.issueEvent(8765, "open")).status)
+    Check.jsonEq(SupportTestKit.send("GET", "/support/requests/mine", user, ""), "0.status", "OPEN")
+}
+
+test "events that are not for the support answer 200 and change nothing" {
+    var app = gapp()
+    var user = SupportTestKit.login("sg_user4")
+    var id = SupportTestKit.open(user, "Evento de outro repositório")
+    SupportTestKit.attach(id, 5555)
+    var other = "{\"action\":\"closed\",\"issue\":{\"number\":5555,\"state\":\"closed\"},\"repository\":{\"full_name\":\"outra/org\"}}"
+    Check.eqInt("other repository", 200, SupportTestKit.webhook("issues", other).status)
+    Check.eqInt("push event", 200, SupportTestKit.webhook("push", SupportTestKit.issueEvent(5555, "closed")).status)
+    Check.eqInt("malformed body", 200, SupportTestKit.webhook("issues", "not json at all").status)
+    Check.eqInt("unknown issue", 200, SupportTestKit.webhook("issues", SupportTestKit.issueEvent(123456, "closed")).status)
+    var edited = "{\"action\":\"edited\",\"issue\":{\"number\":5555,\"state\":\"closed\"},\"repository\":{\"full_name\":\"" + SupportTestKit.repo() + "\"}}"
+    Check.eqInt("edited", 200, SupportTestKit.webhook("issues", edited).status)
+    Check.jsonEq(SupportTestKit.send("GET", "/support/requests/mine", user, ""), "0.status", "OPEN")
+}
+
+test "opening a ticket creates the issue and mirrors the number in the panel" {
+    var app = gapp()
+    var user = SupportTestKit.login("sg_user3")
+    var admin = SupportTestKit.loginAdmin("sg_admin3")
+    var gateway = SupportTestKit.gateway()
+    gateway.on = true
+    var id = SupportTestKit.open(user, "Abrir cria a issue")
+    gateway.on = false
+    assert(gateway.issueTitles.size() >= 1)
+    var last = gateway.issueTitles.size() - 1
+    Check.eqStr("title", "[Suporte] Abrir cria a issue", gateway.issueTitles.get(last))
+    var body = gateway.issueBodies.get(last)
+    assert(body.contains("**Ticket:** `" + id + "`"))
+    assert(body.contains("**Categoria:** BUG"))
+    assert(body.contains("**Solicitante:** `sg_user3`"))
+    assert(body.contains("**Contato:** contato@test.com"))
+    assert(body.contains("(America/Sao_Paulo)"))
+    var queue = SupportTestKit.send("GET", "/admin/support", admin, "")
+    var at = SupportTestKit.indexOf(queue, id)
+    assert(at >= 0)
+    Check.jsonEq(queue, at + ".githubIssueNumber", "2468")
+    Check.jsonEq(queue, at + ".githubIssueUrl", "https://github.com/Rede-ENois/enois-suporte/issues/2468")
+}
+
+test "a GitHub failure never undoes the ticket" {
+    var app = gapp()
+    var user = SupportTestKit.login("sg_user5")
+    var gateway = SupportTestKit.gateway()
+    gateway.on = true
+    gateway.failIssue = true
+    var id = SupportTestKit.open(user, "GitHub fora do ar")
+    gateway.on = false
+    gateway.failIssue = false
+    var mine = SupportTestKit.send("GET", "/support/requests/mine", user, "")
+    Check.jsonEq(mine, "0.id", id)
+    assert(!mine.jsonHas("0.githubIssueNumber"))
+}
+
+test "closing and reopening in the panel closes and reopens the issue" {
+    var app = gapp()
+    var user = SupportTestKit.login("sg_user6")
+    var admin = SupportTestKit.loginAdmin("sg_admin6")
+    var gateway = SupportTestKit.gateway()
+    var id = SupportTestKit.open(user, "Sincronizar status")
+    SupportTestKit.attach(id, 3030)
+    gateway.on = true
+    Check.status(SupportTestKit.send("PATCH", "/admin/support/" + id, admin, "{\"status\":\"CLOSED\"}"), 200)
+    assert(gateway.closed.contains(3030))
+    Check.status(SupportTestKit.send("PATCH", "/admin/support/" + id, admin, "{\"status\":\"CLOSED\"}"), 200)
+    Check.eqInt("an unchanged status does not call GitHub again", 1, gateway.closed.size())
+    Check.status(SupportTestKit.send("PATCH", "/admin/support/" + id, admin, "{\"status\":\"OPEN\"}"), 200)
+    assert(gateway.reopened.contains(3030))
+    gateway.on = false
+}
+
+test "the reply is commented on the issue as the person, with the service token as the fallback" {
+    var app = gapp()
+    var user = SupportTestKit.login("sg_user7")
+    var admin = SupportTestKit.loginAdmin("sg_admin7")
+    var gateway = SupportTestKit.gateway()
+    var people = SupportTestKit.people()
+    var id = SupportTestKit.open(user, "Resposta no GitHub")
+    SupportTestKit.attach(id, 3131)
+    gateway.on = true
+    // Nobody linked GitHub: the service token and the team signature.
+    Check.status(SupportTestKit.send("POST", "/admin/support/" + id + "/reply", admin, "{\"message\":\"Primeira resposta\"}"), 200)
+    var n = gateway.commentBodies.size() - 1
+    assert(gateway.commentBodies.get(n).startsWith("**Equipe Énois** (pelo Énóis):\n\nPrimeira resposta"))
+    Check.eqStr("service token", "service", gateway.commentTokens.get(n))
+    // A linked person with a write token comments as themselves.
+    people.loginOf = "octocat"
+    people.tokenOf = "user-token"
+    Check.status(SupportTestKit.send("POST", "/admin/support/" + id + "/reply", admin, "{\"message\":\"Segunda resposta\"}"), 200)
+    n = gateway.commentBodies.size() - 1
+    assert(gateway.commentBodies.get(n).startsWith("**@octocat** (pelo Énóis):\n\nSegunda resposta"))
+    Check.eqStr("person token", "user-token", gateway.commentTokens.get(n))
+    // The token has no permission on the repository: the service token answers instead.
+    gateway.failUserComment = true
+    Check.status(SupportTestKit.send("POST", "/admin/support/" + id + "/reply", admin, "{\"message\":\"Terceira resposta\"}"), 200)
+    n = gateway.commentBodies.size() - 1
+    Check.eqStr("fallback", "service", gateway.commentTokens.get(n))
+    gateway.failUserComment = false
+    gateway.on = false
+    people.clear()
+    // Each published comment id is recorded on its panel message, so the webhook echo is ignored.
+    var thread = SupportTestKit.send("GET", "/admin/support/" + id + "/messages", admin, "")
+    Check.eqInt("three panel messages", 3, thread.jsonSize(""))
+    var known = SupportTestKit.db().queryLong("select count(*) from support_messages where request_id = ? and github_comment_id is not null", DbParams().bindStr(id))
+    Check.eqInt("comment ids kept", 3, known as Int)
+    Check.jsonEq(thread, "1.authorGithubLogin", "octocat")
+}
+
+test "finish" {
+    SupportTestKit.finish()
+}

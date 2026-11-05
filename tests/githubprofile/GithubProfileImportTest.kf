@@ -1,0 +1,139 @@
+import githubprofile.*
+import kernel.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of GitHubProfileImportTests: import of repositories and README from GitHub into the profile.
+String sfx() = "" + Time.nowMillis()
+
+test "it imports the selected repositories idempotently" {
+    var app = GithubProfileTestKit.app()
+    var suffix = sfx()
+    var login = "import-dev-" + suffix
+    var userId = "import_" + suffix
+    var token = GithubProfileTestKit.login(userId)
+    GithubProfileTestKit.contributions().identities.remember(userId, "gh-" + login, login)
+    GithubProfileTestKit.gateway().repos = listOf(GithubProfileTestKit.repo(login, "alpha", "Projeto Alpha", "https://github.com/" + login + "/alpha", "Java", listOf("java", "spring"), 12, 3), GithubProfileTestKit.repo(login, "beta", "Projeto Beta", "https://github.com/" + login + "/beta", "TypeScript", listOf("react"), 5, 1))
+    var repos = GithubProfileTestKit.send("GET", "/me/github/repos", token, "")
+    Check.status(repos, 200)
+    Check.eqInt("repos", 2, repos.jsonSize(""))
+    Check.jsonEq(repos, "0.fullName", login + "/alpha")
+    Check.jsonEq(repos, "0.url", "https://github.com/" + login + "/alpha")
+    Check.jsonEq(repos, "0.stars", "12")
+    var res = GithubProfileTestKit.send("POST", "/me/github/import/projects", token, "{\"repos\":[\"" + login + "/alpha\",\"" + login + "/beta\",\"outro/repo\"]}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "created", "2")
+    Check.jsonEq(res, "invalid.0", "outro/repo")
+    var saved = GithubProfileTestKit.projects().service.of(userId)
+    Check.eqInt("saved", 2, saved.size())
+    var found = false
+    for (var project in saved) {
+        if (project.title() == "alpha") {
+            found = true
+            assert(project.description() == "Projeto Alpha")
+            assert(project.repoUrl() == "https://github.com/" + login + "/alpha")
+            assert(project.stack().contains("java"))
+            assert(project.stack().contains("spring"))
+            assert(project.stack().contains("Java"))
+        }
+    }
+    assert(found)
+    var again = GithubProfileTestKit.send("POST", "/me/github/import/projects", token, "{\"repos\":[\"" + login + "/alpha\",\"" + login + "/beta\"]}")
+    Check.status(again, 200)
+    Check.jsonEq(again, "created", "0")
+    Check.eqInt("skipped", 2, again.jsonSize("skipped"))
+    Check.eqInt("still two", 2, GithubProfileTestKit.projects().service.of(userId).size())
+    Check.apiError(GithubProfileTestKit.send("POST", "/me/github/import/projects", token, "{\"repos\":[]}"), 400, "NO_REPOSITORIES")
+    Check.apiError(GithubProfileTestKit.send("POST", "/me/github/import/projects", token, "{}"), 400, "NO_REPOSITORIES")
+    Check.apiError(GithubProfileTestKit.send("POST", "/me/github/import/projects", token, "not json"), 400, "BAD_REQUEST")
+}
+
+test "the README becomes a sanitized bio with absolute links" {
+    var app = GithubProfileTestKit.app()
+    var suffix = sfx()
+    var login = "readme-dev-" + suffix
+    var userId = "readme_" + suffix
+    var token = GithubProfileTestKit.login(userId)
+    GithubProfileTestKit.contributions().identities.remember(userId, "gh-" + login, login)
+    var gateway = GithubProfileTestKit.gateway()
+    gateway.hasReadme = true
+    gateway.readmeRepoUrl = "https://github.com/" + login + "/" + login
+    gateway.readmeMarkdown = "# Olá, eu sou a pessoa\n**negrito** e [guia](docs/guia.md)\n![logo](./logo.png)\n| a | b |\n|---|---|\n| 1 | 2 |\nriscado: ~~antigo~~\n<script>alert(1)</script>\n"
+    var preview = GithubProfileTestKit.send("GET", "/me/github/readme", token, "")
+    Check.status(preview, 200)
+    var html = preview.json("html")
+    assert(html.contains("<strong>negrito</strong>"))
+    assert(html.contains("https://raw.githubusercontent.com/" + login + "/" + login + "/main/logo.png"))
+    assert(html.contains("https://github.com/" + login + "/" + login + "/blob/main/docs/guia.md"))
+    assert(html.contains("<table>"))
+    // Strikethrough (GFM) is covered with the table: the two extensions the bio uses.
+    assert(html.contains("<del>antigo</del>"))
+    assert(!html.contains("<script"))
+    Check.jsonEq(preview, "repoUrl", "https://github.com/" + login + "/" + login)
+    Check.status(GithubProfileTestKit.send("POST", "/me/github/import/readme", token, ""), 200)
+    var profile = app.client.get("/users/" + userId)
+    Check.status(profile, 200)
+    var bio = profile.json("bioHtml")
+    assert(bio.contains("negrito"))
+    assert(bio.contains("https://raw.githubusercontent.com/" + login + "/" + login + "/main/logo.png"))
+    gateway.hasReadme = false
+}
+
+test "listing and importing share one trip to GitHub" {
+    var app = GithubProfileTestKit.app()
+    var suffix = sfx()
+    var login = "cache-dev-" + suffix
+    var userId = "cache_" + suffix
+    var token = GithubProfileTestKit.login(userId)
+    GithubProfileTestKit.contributions().identities.remember(userId, "gh-" + login, login)
+    GithubProfileTestKit.gateway().repos = listOf(GithubProfileTestKit.repo(login, "alpha", "Projeto Alpha", "https://github.com/" + login + "/alpha", "Java", listOf("java"), 1, 0))
+    Check.status(GithubProfileTestKit.send("GET", "/me/github/repos", token, ""), 200)
+    Check.status(GithubProfileTestKit.send("GET", "/me/github/repos", token, ""), 200)
+    var imported = GithubProfileTestKit.send("POST", "/me/github/import/projects", token, "{\"repos\":[\"" + login + "/alpha\"]}")
+    Check.status(imported, 200)
+    Check.jsonEq(imported, "created", "1")
+    Check.eqInt("trips", 1, GithubProfileTestKit.gateway().listTrips(login))
+}
+
+test "the README is cached but a missing README is not" {
+    var app = GithubProfileTestKit.app()
+    var suffix = sfx()
+    var login = "readmecache-dev-" + suffix
+    var userId = "readmecache_" + suffix
+    var token = GithubProfileTestKit.login(userId)
+    GithubProfileTestKit.contributions().identities.remember(userId, "gh-" + login, login)
+    var gateway = GithubProfileTestKit.gateway()
+    gateway.hasReadme = false
+    Check.status(GithubProfileTestKit.send("GET", "/me/github/readme", token, ""), 404)
+    gateway.hasReadme = true
+    gateway.readmeMarkdown = "# Oi"
+    gateway.readmeRepoUrl = "https://github.com/" + login + "/" + login
+    Check.status(GithubProfileTestKit.send("GET", "/me/github/readme", token, ""), 200)
+    Check.status(GithubProfileTestKit.send("GET", "/me/github/readme", token, ""), 200)
+    Check.eqInt("trips", 2, gateway.readmeTrips(login))
+    gateway.hasReadme = false
+}
+
+test "an unlinked user cannot import" {
+    var app = GithubProfileTestKit.app()
+    var token = GithubProfileTestKit.login("nolink_" + sfx())
+    Check.apiError(GithubProfileTestKit.send("GET", "/me/github/repos", token, ""), 403, "GITHUB_NOT_LINKED")
+    Check.apiError(GithubProfileTestKit.send("POST", "/me/github/import/readme", token, ""), 403, "GITHUB_NOT_LINKED")
+    Check.apiError(GithubProfileTestKit.send("GET", "/me/github/readme", token, ""), 403, "GITHUB_NOT_LINKED")
+    Check.apiError(app.client.get("/me/github/repos"), 401, "UNAUTHENTICATED")
+}
+
+test "a missing README answers a clear error" {
+    var app = GithubProfileTestKit.app()
+    var suffix = sfx()
+    var login = "noreadme-dev-" + suffix
+    var userId = "noreadme_" + suffix
+    var token = GithubProfileTestKit.login(userId)
+    GithubProfileTestKit.contributions().identities.remember(userId, "gh-" + login, login)
+    GithubProfileTestKit.gateway().hasReadme = false
+    Check.apiError(GithubProfileTestKit.send("GET", "/me/github/readme", token, ""), 404, "GITHUB_README_NOT_FOUND")
+}
+
+test "finish" {
+    GithubProfileTestKit.finish()
+}

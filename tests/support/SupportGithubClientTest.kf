@@ -1,0 +1,98 @@
+import kernel.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+import support.*
+
+// The real client against a local stand-in of the GitHub API: the verbs, the headers, the payloads, the token
+// override and every failure folding into "not done" without leaking the body.
+class SupportGhStub {
+    static TestApp? app = null
+    static List<String> calls = listOf<String>()
+    static List<String> bodies = listOf<String>()
+    static List<String> auths = listOf<String>()
+    static String answer(label: String, reply: String, code: Int) {
+        SupportGhStub.calls.add(label)
+        SupportGhStub.bodies.add(Req.bodyText())
+        var bearer = Req.bearerToken()
+        if (bearer == null) {
+            SupportGhStub.auths.add("none")
+        }
+        else {
+            SupportGhStub.auths.add(bearer)
+        }
+        return status(code, reply)
+    }
+}
+
+TestApp ghApp() {
+    var cur = SupportGhStub.app
+    if (cur != null) {
+        return cur
+    }
+    var created = TestApp.bootWire("supportgh", (p: Platform) -> {
+    p.server.post("/repos/org/support/issues", () -> SupportGhStub.answer("create", "{\"number\":7,\"html_url\":\"https://github.com/org/support/issues/7\"}", 201))
+    p.server.patch("/repos/org/support/issues/7", () -> SupportGhStub.answer("patch", "{\"number\":7}", 200))
+    p.server.post("/repos/org/support/issues/7/comments", () -> SupportGhStub.answer("comment", "{\"id\":8123456789}", 201))
+    p.server.post("/repos/org/boom/issues", () -> SupportGhStub.answer("boom", "{\"message\":\"secret detail\"}", 500))
+    p.server.post("/repos/org/zero/issues", () -> SupportGhStub.answer("zero", "{\"number\":0}", 201))
+    p.server.post("/repos/org/garbage/issues", () -> SupportGhStub.answer("garbage", "not json", 201))
+    p.server.post("/repos/org/nourl/issues", () -> SupportGhStub.answer("nourl", "{\"number\":9,\"html_url\":\"\"}", 201))
+})
+    SupportGhStub.app = created
+    return created
+}
+
+SupportGithubClient clientFor(app: TestApp, repo: String, token: String) = SupportGithubClient(SupportGithubConfig(SupportStore(app.db()), SecretCipher("", false), token, repo, ""), "http://127.0.0.1:" + app.port)
+
+test "the client opens, closes, reopens and comments with the right verbs, headers and payloads" {
+    var app = ghApp()
+    var client = clientFor(app, "org/support", "service-token")
+    assert(client.enabled())
+    var issue = client.createIssue("[Suporte] Olá", "corpo \"com aspas\"")
+    assert(issue != null)
+    if (issue != null) {
+        Check.eqInt("number", 7, issue.number())
+        Check.eqStr("url", "https://github.com/org/support/issues/7", issue.url() as String)
+    }
+    assert(client.closeIssue(7))
+    assert(client.reopenIssue(7))
+    var id = client.comment(7, "oi", "person-token")
+    assert(id == 8123456789L)
+    var service = client.comment(7, "oi", null)
+    assert(service == 8123456789L)
+    Check.eqStr("calls", "create,patch,patch,comment,comment", String.join(",", SupportGhStub.calls))
+    Check.eqStr("create payload", "{\"title\":\"[Suporte] Olá\",\"body\":\"corpo \\\"com aspas\\\"\"}", SupportGhStub.bodies.get(0))
+    Check.eqStr("close payload", "{\"state\":\"closed\",\"state_reason\":\"completed\"}", SupportGhStub.bodies.get(1))
+    Check.eqStr("reopen payload", "{\"state\":\"open\"}", SupportGhStub.bodies.get(2))
+    Check.eqStr("service token", "service-token", SupportGhStub.auths.get(0))
+    Check.eqStr("person token", "person-token", SupportGhStub.auths.get(3))
+    Check.eqStr("service token again", "service-token", SupportGhStub.auths.get(4))
+}
+
+test "a failing GitHub answers folded to nothing" {
+    var app = ghApp()
+    assert(clientFor(app, "org/boom", "t").createIssue("a", "b") == null)
+    assert(clientFor(app, "org/zero", "t").createIssue("a", "b") == null)
+    assert(clientFor(app, "org/garbage", "t").createIssue("a", "b") == null)
+    var noUrl = clientFor(app, "org/nourl", "t").createIssue("a", "b")
+    assert(noUrl != null)
+    if (noUrl != null) {
+        Check.eqInt("number", 9, noUrl.number())
+        assert(noUrl.url() == null)
+    }
+    // unreachable host, and a missing token or repository: off
+    var dead = SupportGithubClient(SupportGithubConfig(SupportStore(app.db()), SecretCipher("", false), "t", "org/support", ""), "http://127.0.0.1:1")
+    assert(dead.createIssue("a", "b") == null)
+    assert(!dead.closeIssue(7))
+    assert(dead.comment(7, "x", null) == 0L)
+    var off = clientFor(app, "", "t")
+    assert(!off.enabled())
+    assert(off.createIssue("a", "b") == null)
+    assert(!clientFor(app, "org/support", "").enabled())
+}
+
+test "finish" {
+    var app = ghApp()
+    app.stop()
+}

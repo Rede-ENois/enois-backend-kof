@@ -185,6 +185,11 @@ public class KofTool {
                     String out = Files.readString(log);
                     synchronized (printLock) {
                         System.out.print(out);
+                        // A child that dies without a verdict (killed, crashed JVM) must still name its file.
+                        if (code != 0 && !out.contains("FAIL " + f) && !out.contains("TIMEOUT " + f)) {
+                            System.out.println("FAIL " + f + " (child run exited " + code + " without a verdict; output "
+                                    + (out.isBlank() ? "empty" : "above") + ")");
+                        }
                         System.out.flush();
                     }
                     boolean skipped = out.contains("SKIP " + f) && !out.contains("SUITE " + f);

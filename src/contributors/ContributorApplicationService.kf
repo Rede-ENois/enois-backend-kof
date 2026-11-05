@@ -1,0 +1,251 @@
+package contributors
+
+import contributions.*
+import kernel.error.*
+import kernel.id.*
+import kernel.text.*
+import kernel.time.*
+import profile.*
+
+// The queue of the project's contributors. The landing is public, so the validation is conservative. Whoever already
+// has a contribution verified through GitHub enters the panel on its own and uses the same form only to confirm
+// the data: the application is born APPROVED (source GITHUB_VERIFIED), with no manual review. The GitHub handle
+// comes from the verified link, never from the text the client sent.
+class ContributorApplicationService {
+    ContributorsStore store
+    VerifiedContributors verified
+    ProfileDirectory directory
+    public constructor(store: ContributorsStore, verified: VerifiedContributors, directory: ProfileDirectory) {
+        this.store = store
+        this.verified = verified
+        this.directory = directory
+    }
+    static Int maxLimit() = 200
+    ContributorApplicationRecord apply(body: ContributorApplyBody) {
+        var now = Time.nowIso()
+        var created = ContributorApplicationRecord(Ids.prefixed("contrib_"), null, ContributorApplicationService.name(body), ContributorApplicationService.github(body), ContributorApplicationService.email(body), ContributorApplicationService.area(body), ContributorApplicationService.experience(body), ContributorApplicationService.message(body), now, "NEW", "LANDING", now)
+        store.save(created)
+        return created
+    }
+    // Confirmation of someone with a verified contribution. Idempotent: it updates the application of the account
+    // (or reuses the public one with the same handle) instead of duplicating.
+    ContributorApplicationRecord applyVerified(userId: String, body: ContributorApplyBody) {
+        var contributor = verified.find(userId)
+        if (contributor == null) {
+            throw Errors.api(403, "CONTRIBUTOR_NOT_VERIFIED", "Este perfil ainda não tem contribuição verificada pelo GitHub.")
+        }
+        var name = ContributorApplicationService.name(body)
+        var email = ContributorApplicationService.email(body)
+        var area = ContributorApplicationService.area(body)
+        var experience = ContributorApplicationService.experience(body)
+        var message = ContributorApplicationService.message(body)
+        var github = contributor.githubLogin().toLowerCase()
+        var now = Time.nowIso()
+        var existing = store.findByUser(userId)
+        if (existing == null) {
+            existing = store.findLandingByGithub(github)
+        }
+        var id = Ids.prefixed("contrib_")
+        var createdAt = now
+        if (existing != null) {
+            id = existing.id()
+            createdAt = existing.createdAt()
+        }
+        var saved = ContributorApplicationRecord(id, userId, name, github, email, area, experience, message, now, "APPROVED", "GITHUB_VERIFIED", createdAt)
+        store.save(saved)
+        return saved
+    }
+    ContributorUserStatusView statusForUser(userId: String) {
+        var contributor = verified.find(userId)
+        var application = store.findByUser(userId)
+        var profile = directory.findById(userId)
+        var github = ContributorEnums.none()
+        if (contributor != null) {
+            github = contributor.githubLogin()
+        }
+        var name = ContributorEnums.none()
+        var email = ContributorEnums.none()
+        if (profile != null) {
+            name = profile.name
+            email = profile.email
+        }
+        var summary = ContributorApplicationService.noSummary()
+        if (application != null) {
+            summary = ContributorApplicationSummary(application.id(), application.status(), application.source(), application.createdAt())
+        }
+        return ContributorUserStatusView(contributor != null, github, contributor != null && application == null, name, email, summary)
+    }
+    static ContributorApplicationSummary? noSummary() = null
+    // Contributors panel: applications (landing + confirmations) and, automatically, whoever has a verified
+    // contribution and has not confirmed the data yet. Newest first.
+    List<ContributorAdminView> panel() {
+        var applications = store.list(null, ContributorApplicationService.maxLimit())
+        var contributors = verified.list()
+        var withApplication = listOf<String>()
+        var entries = listOf<ContributorAdminView>()
+        var sortKeys = listOf<Long>()
+        for (var application in applications) {
+            var owner = application.userId()
+            var match = ContributorApplicationService.noVerified()
+            if (owner != null) {
+                withApplication.add(owner)
+                for (var c in contributors) {
+                    if (c.userId() == owner) {
+                        match = c
+                    }
+                }
+            }
+            entries.add(ContributorApplicationService.adminView(application, match, false))
+            sortKeys.add(Time.toMillis(application.createdAt()))
+        }
+        for (var c in contributors) {
+            if (!withApplication.contains(c.userId())) {
+                entries.add(ContributorApplicationService.synthetic(c))
+                sortKeys.add(Time.toMillis(c.grantedAt()))
+            }
+        }
+        var out = listOf<ContributorAdminView>()
+        while (entries.size() > 0 && out.size() < ContributorApplicationService.maxLimit()) {
+            var best = 0
+            var at = 1
+            while (at < entries.size()) {
+                if (sortKeys.get(at) > sortKeys.get(best)) {
+                    best = at
+                }
+                at = at + 1
+            }
+            out.add(entries.get(best))
+            entries.remove(best)
+            sortKeys.remove(best)
+        }
+        return out
+    }
+    static VerifiedContributor? noVerified() = null
+    List<ContributorAdminView> list(status: String?, limit: Int) {
+        var size = limit
+        if (size > ContributorApplicationService.maxLimit()) {
+            size = ContributorApplicationService.maxLimit()
+        }
+        if (size < 1) {
+            size = 1
+        }
+        var out = listOf<ContributorAdminView>()
+        for (var a in store.list(status, size)) {
+            out.add(ContributorApplicationService.adminView(a, ContributorApplicationService.noVerified(), false))
+        }
+        return out
+    }
+    ContributorAdminView updateStatus(id: String, status: String?) {
+        if (status == null) {
+            throw Errors.api(400, "INVALID_STATUS", "Informe o novo status da candidatura.")
+        }
+        var application = store.findById(id)
+        if (application == null) {
+            throw Errors.api(404, "CONTRIBUTOR_NOT_FOUND", "Candidatura não encontrada.")
+        }
+        var saved = ContributorApplicationRecord(application.id(), application.userId(), application.name(), application.github(), application.email(), application.area(), application.experience(), application.message(), application.acceptedTermsAt(), status, application.source(), application.createdAt())
+        store.save(saved)
+        return ContributorApplicationService.adminView(saved, ContributorApplicationService.noVerified(), false)
+    }
+    static ContributorAdminView adminView(a: ContributorApplicationRecord, v: VerifiedContributor?, formPending: Bool) {
+        var seal = ContributorEnums.none()
+        var evidence = ContributorApplicationService.noInt()
+        if (v != null) {
+            seal = v.sealName()
+            evidence = v.evidenceCount()
+        }
+        return ContributorAdminView(a.id(), a.userId(), a.name(), a.github(), a.email(), a.area(), a.experience(), a.message(), a.status(), a.source(), formPending, seal, evidence, a.acceptedTermsAt(), a.createdAt())
+    }
+    static Int? noInt() = null
+    static ContributorAdminView synthetic(v: VerifiedContributor) = ContributorAdminView(null, v.userId(), v.displayName(), v.githubLogin(), null, null, null, null, "APPROVED", "GITHUB_VERIFIED", true, v.sealName(), v.evidenceCount(), null, v.grantedAt())
+    // ---- validation
+    static Bool termsAccepted(body: ContributorApplyBody) = body.acceptedTerms() == true
+    static requireTerms(body: ContributorApplyBody) {
+        if (!ContributorApplicationService.termsAccepted(body)) {
+            throw Errors.api(400, "TERMS_NOT_ACCEPTED", "Para contribuir, aceite as regras de contribuição e os termos de uso.")
+        }
+    }
+    static String? clean(value: String?) {
+        if (value == null) {
+            return null
+        }
+        var clean = value.replaceAll("\\p{Cntrl}", "").trim()
+        if (clean.length() == 0) {
+            return null
+        }
+        return clean
+    }
+    static String name(body: ContributorApplyBody) {
+        ContributorApplicationService.requireTerms(body)
+        var clean = ContributorApplicationService.clean(body.name())
+        if (clean == null) {
+            throw Errors.api(400, "INVALID_NAME", "Informe seu nome (2 a 120 caracteres).")
+        }
+        if (clean.length() < 2 || clean.length() > 120) {
+            throw Errors.api(400, "INVALID_NAME", "Informe seu nome (2 a 120 caracteres).")
+        }
+        return clean
+    }
+    static String github(body: ContributorApplyBody) {
+        ContributorApplicationService.requireTerms(body)
+        var raw = ContributorApplicationService.clean(body.github())
+        if (raw == null) {
+            throw Errors.api(400, "INVALID_GITHUB", "Informe seu usuário do GitHub.")
+        }
+        var handle = raw
+        var at = raw.toLowerCase().indexOf("github.com/")
+        if (at >= 0) {
+            handle = raw.substring(at + "github.com/".length())
+        }
+        handle = handle.replaceFirst("^@", "").replaceAll("/+$", "").toLowerCase()
+        if (!Regexes.matches("^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$", handle)) {
+            throw Errors.api(400, "INVALID_GITHUB", "Usuário do GitHub inválido.")
+        }
+        return handle
+    }
+    static String email(body: ContributorApplyBody) {
+        ContributorApplicationService.requireTerms(body)
+        var clean = ContributorApplicationService.clean(body.email())
+        if (clean == null) {
+            throw Errors.api(400, "INVALID_EMAIL", "Informe um e-mail válido.")
+        }
+        if (clean.length() > 180 || !Regexes.matches("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$", clean)) {
+            throw Errors.api(400, "INVALID_EMAIL", "Informe um e-mail válido.")
+        }
+        return clean.toLowerCase()
+    }
+    static String? area(body: ContributorApplyBody) {
+        ContributorApplicationService.requireTerms(body)
+        var clean = ContributorApplicationService.clean(body.area())
+        if (clean == null) {
+            return null
+        }
+        var normalized = clean.toUpperCase()
+        if (!ContributorEnums.areas().contains(normalized)) {
+            throw Errors.api(400, "INVALID_AREA", "Área de contribuição inválida.")
+        }
+        return normalized
+    }
+    static String? experience(body: ContributorApplyBody) {
+        ContributorApplicationService.requireTerms(body)
+        var clean = ContributorApplicationService.clean(body.experience())
+        if (clean == null) {
+            return null
+        }
+        var normalized = clean.toUpperCase()
+        if (!ContributorEnums.experiences().contains(normalized)) {
+            throw Errors.api(400, "INVALID_EXPERIENCE", "Experiência inválida.")
+        }
+        return normalized
+    }
+    static String? message(body: ContributorApplyBody) {
+        ContributorApplicationService.requireTerms(body)
+        var clean = ContributorApplicationService.clean(body.message())
+        if (clean != null) {
+            if (clean.length() > 2000) {
+                throw Errors.api(400, "INVALID_MESSAGE", "A mensagem passa de 2000 caracteres.")
+            }
+        }
+        return clean
+    }
+}

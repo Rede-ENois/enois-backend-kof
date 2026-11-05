@@ -13,6 +13,7 @@ TestApp outboundApp() {
     }
     var created = TestApp.bootWire("outbound", (p: Platform) -> {
     p.server.post("/echo", () -> status(201, "{\"header\":" + json.encode(Req.headerOrNull("x-probe")) + ",\"body\":" + json.encode(Req.bodyText()) + "}"))
+    p.server.patch("/patched", () -> status(200, "{\"header\":" + json.encode(Req.headerOrNull("x-probe")) + ",\"body\":" + json.encode(Req.bodyText()) + "}"))
     p.server.get("/boom", () -> status(500, "{\"code\":\"X\"}"))
     p.server.get("/missing", () -> status(404, ""))
 })
@@ -51,4 +52,18 @@ test "a refused connection is an OUTBOUND_FAILED without the address" {
         bad = e
     }
     Check.eqStr("bad url", "OUTBOUND_FAILED", bad)
+}
+
+test "a PATCH carries the headers and the body (HttpURLConnection refuses the verb)" {
+    var app = outboundApp()
+    var reply = Outbound.request("PATCH", "http://127.0.0.1:" + app.port + "/patched", listOf("Content-Type: application/json", "X-Probe: yes"), "{\"state\":\"closed\"}", 3000)
+    Check.eqInt("status", 200, reply.status())
+    Check.eqStr("header and body echoed", "{\"header\":\"yes\",\"body\":\"{\\\"state\\\":\\\"closed\\\"}\"}", reply.body())
+    var failure = ""
+    try {
+        var ignored = Outbound.request("PATCH", "http://127.0.0.1:1/x", listOf(), "{}", 1000)
+    } catch (String e) {
+        failure = e
+    }
+    Check.eqStr("a refused PATCH is OUTBOUND_FAILED too", "OUTBOUND_FAILED", failure)
 }

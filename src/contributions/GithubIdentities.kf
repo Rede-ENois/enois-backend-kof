@@ -1,0 +1,148 @@
+package contributions
+
+import kernel.error.*
+import kernel.id.*
+import kernel.log.*
+import kernel.security.*
+import kernel.time.*
+
+// The GitHub write token of a person. Kept only when the link asked for the `repo` or `public_repo` scope and the
+// encryption key is configured; without it, actions that need write fall back to the service token (with an
+// explicit attribution) or fail clearly. A plain token is never stored nor returned.
+class GithubUserTokens {
+    ContributionsStore store
+    SecretCipher cipher
+    Log log = Log("contributions.tokens")
+    public constructor(store: ContributionsStore, cipher: SecretCipher) {
+        this.store = store
+        this.cipher = cipher
+    }
+    // Any other scope is ignored.
+    remember(userId: String, accessToken: String, scopes: String) {
+        if (userId.trim().length() == 0 || accessToken.trim().length() == 0) {
+            return
+        }
+        if (!GithubUserTokens.hasWriteScope(scopes)) {
+            return
+        }
+        if (!cipher.isEnabled()) {
+            log.info("Token de escrita do GitHub nao guardado: REDE_SECURITY_ENCRYPTION_KEY ausente.")
+            return
+        }
+        var now = Time.nowIso()
+        var created = store.tokenCreatedAt(userId)
+        var first = now
+        if (created != null) {
+            first = created
+        }
+        store.saveToken(userId, cipher.encrypt(accessToken), scopes, first, now)
+    }
+    // Empty when there is none, the cipher is off or the stored value cannot be decrypted.
+    String accessToken(userId: String) {
+        if (userId.trim().length() == 0 || !cipher.isEnabled()) {
+            return ""
+        }
+        var stored = store.tokenCipher(userId)
+        if (stored == null) {
+            return ""
+        }
+        var plain = ""
+        try {
+            plain = cipher.decrypt(stored)
+        } catch (String e) {
+            log.warn("Nao foi possivel decifrar o token GitHub de " + userId)
+            plain = ""
+        }
+        return plain
+    }
+    Bool hasWriteToken(userId: String) = this.accessToken(userId).length() > 0
+    static Bool hasWriteScope(scopes: String) {
+        if (scopes.trim().length() == 0) {
+            return false
+        }
+        for (var scope in scopes.toLowerCase().split("[,\\s]+")) {
+            if (scope == "repo" || scope == "public_repo") {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// GitHub <-> Énóis link. The numeric GitHub id is the key; the login can change and is refreshed. A GitHub account
+// can be tied to one Énóis account and the other way around.
+class GithubIdentities {
+    ContributionsStore store
+    GithubUserTokens tokens
+    public constructor(store: ContributionsStore, tokens: GithubUserTokens) {
+        this.store = store
+        this.tokens = tokens
+    }
+    GhIdentity remember(userId: String, githubUserId: String, githubLogin: String) {
+        if (userId.trim().length() == 0 || githubUserId.trim().length() == 0) {
+            throw Errors.api(400, "INVALID_GITHUB_IDENTITY", "Identidade GitHub inválida.")
+        }
+        var login = GithubIdentities.cleanLogin(githubLogin)
+        var byExternal = store.identityByGithub(githubUserId)
+        if (byExternal != null) {
+            if (byExternal.userId() != userId) {
+                throw Errors.api(409, "GITHUB_ACCOUNT_IN_USE", "Esta conta GitHub já está vinculada a outro perfil do Énóis.")
+            }
+        }
+        var current = store.identityByUser(userId)
+        var id = Ids.prefixed("ghid_")
+        var linkedAt = Time.nowIso()
+        var lastSyncedAt = ContribText.none()
+        var state = "STALE"
+        var lastError = ContribText.none()
+        if (current != null) {
+            if (current.githubUserId() != githubUserId) {
+                throw Errors.api(409, "GITHUB_ALREADY_LINKED", "Sua conta já tem outro GitHub vinculado. Desvincule antes de trocar.")
+            }
+            id = current.id()
+            linkedAt = current.linkedAt()
+            lastSyncedAt = current.lastSyncedAt()
+            lastError = current.lastSyncError()
+            var kept = current.syncState()
+            if (kept != null) {
+                state = kept
+            }
+        }
+        var identity = GhIdentity(id, userId, githubUserId, login, linkedAt, lastSyncedAt, state, lastError)
+        store.saveIdentity(identity)
+        return identity
+    }
+    unlink(userId: String) {
+        store.deleteIdentityByUser(userId)
+    }
+    // The linked numeric GitHub id (the immutable key of the sync), empty when none.
+    String githubUserId(userId: String) {
+        var identity = store.identityByUser(userId)
+        if (identity == null) {
+            return ""
+        }
+        return identity.githubUserId()
+    }
+    // The login of the link, empty when none.
+    String login(userId: String) {
+        var identity = store.identityByUser(userId)
+        if (identity == null) {
+            return ""
+        }
+        return identity.githubLogin()
+    }
+    GithubIdentityView status(userId: String) {
+        var identity = store.identityByUser(userId)
+        if (identity == null) {
+            return GithubIdentityView(false, null, null, null, null, null, false)
+        }
+        return GithubIdentityView(true, identity.githubLogin(), identity.linkedAt(), identity.lastSyncedAt(), identity.syncState(), identity.lastSyncError(), tokens.hasWriteToken(userId))
+    }
+    static String cleanLogin(login: String) {
+        var clean = login.replaceAll("[^A-Za-z0-9-]", "").trim()
+        if (clean.length() == 0 || clean.length() > 100) {
+            throw Errors.api(400, "INVALID_GITHUB_LOGIN", "Login do GitHub inválido.")
+        }
+        return clean
+    }
+}

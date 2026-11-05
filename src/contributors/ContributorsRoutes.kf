@@ -1,0 +1,82 @@
+package contributors
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+
+// The public landing form (per-IP limit; the route is a public write, so the origin gate lets it through), the
+// confirmation of verified contributors (a session), the account state and the internal queue (admins).
+class ContributorsRoutes {
+    static register(server: HttpServer, service: ContributorApplicationService, limiter: IpRateLimiter) {
+        server.post("/contributors/applications", () -> ContributorsRoutes.apply(service, limiter))
+        server.post("/contributors/applications/verified", () -> ContributorsRoutes.applyVerified(service))
+        server.get("/contributors/me", () -> ContributorsRoutes.me(service))
+        server.get("/admin/contributors/applications", () -> ContributorsRoutes.list(service))
+        server.get("/admin/contributors/panel", () -> ContributorsRoutes.panel(service))
+        server.patch("/admin/contributors/applications/:id", () -> ContributorsRoutes.updateStatus(service))
+    }
+    static String apply(service: ContributorApplicationService, limiter: IpRateLimiter) {
+        if (!limiter.tryAcquire(IpRateLimiter.contribution(), Req.clientIp())) {
+            throw Errors.api(429, "RATE_LIMITED", "Muitas tentativas. Tente de novo mais tarde.")
+        }
+        var body = ContributorsRoutes.parseApply()
+        var created = service.apply(body)
+        return status(201, json.encode(ContributorApplicationView(created.id(), created.status(), created.createdAt())))
+    }
+    static String applyVerified(service: ContributorApplicationService) {
+        var userId = Auth.requireUser()
+        var body = ContributorsRoutes.parseApply()
+        var saved = service.applyVerified(userId, body)
+        return status(201, json.encode(ContributorApplicationView(saved.id(), saved.status(), saved.createdAt())))
+    }
+    static String me(service: ContributorApplicationService) {
+        var userId = Auth.requireUser()
+        return json.encode(service.statusForUser(userId))
+    }
+    static String list(service: ContributorApplicationService) {
+        Auth.requireAdmin()
+        var raw = Req.queryParam("status")
+        var filter = ContributorEnums.none()
+        if (raw != null) {
+            if (raw.length() > 0) {
+                if (!ContributorEnums.statuses().contains(raw)) {
+                    throw Errors.badRequest()
+                }
+                filter = raw
+            }
+        }
+        return json.encode(service.list(filter, Req.queryInt("limit", 100)))
+    }
+    static String panel(service: ContributorApplicationService) {
+        Auth.requireAdmin()
+        return json.encode(service.panel())
+    }
+    static String updateStatus(service: ContributorApplicationService) {
+        Auth.requireAdmin()
+        var body = ContributorsRoutes.parseStatus()
+        var requested = body.status()
+        if (requested != null) {
+            if (!ContributorEnums.statuses().contains(requested)) {
+                throw Errors.badRequest()
+            }
+        }
+        return json.encode(service.updateStatus(Req.pathParam("id"), requested))
+    }
+    static ContributorApplyBody parseApply() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ContributorApplyBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ContributorStatusBody parseStatus() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ContributorStatusBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

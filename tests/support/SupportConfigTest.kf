@@ -1,0 +1,65 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import support.*
+
+// The mirror settings (encrypted in support_settings), the webhook with no secret and the body ceiling.
+TestApp capp() {
+    SupportTestKit.configure(mapOf("REDE_SECURITY_ENCRYPTION_KEY", SecretCipher.generateKeyBase64(), "GITHUB_ISSUES_TOKEN", "env-token"))
+    return SupportTestKit.app()
+}
+
+test "the webhook refuses everything while no secret is configured" {
+    var app = capp()
+    var res = app.client.send("POST", "/webhooks/github", listOf("X-GitHub-Event: issues", "X-Hub-Signature-256: sha256=00", "Content-Type: application/json"), "", "{}")
+    Check.eqInt("fail closed", 503, res.status)
+}
+
+test "an oversized webhook body is refused before it is read" {
+    var app = capp()
+    var big = SupportTestKit.bigBody()
+    var res = app.client.send("POST", "/webhooks/github", listOf("X-GitHub-Event: issues", "Content-Type: application/json"), "", big)
+    Check.eqInt("status", 413, res.status)
+    Check.jsonEq(res, "code", "WEBHOOK_TOO_LARGE")
+    Check.jsonEq(res, "message", "Corpo do webhook acima do limite.")
+    assert(!res.jsonHas("timestamp"))
+}
+
+test "the admin swaps the token, the repository and the secret without a restart" {
+    var app = capp()
+    var admin = SupportTestKit.loginAdmin("cfg_admin")
+    var start = SupportTestKit.send("GET", "/admin/support/github", admin, "")
+    Check.status(start, 200)
+    // The environment token is the fallback of a fresh install; no repository yet: the mirror is off.
+    Check.jsonEq(start, "tokenConfigured", "true")
+    Check.jsonEq(start, "enabled", "false")
+    Check.jsonEq(start, "webhookSecretConfigured", "false")
+    Check.apiError(SupportTestKit.send("PUT", "/admin/support/github", admin, "{\"repo\":\"sem-barra\"}"), 400, "INVALID_GITHUB_CONFIG")
+    Check.apiError(SupportTestKit.send("PUT", "/admin/support/github", admin, "{\"repo\":\"  \"}"), 400, "INVALID_GITHUB_CONFIG")
+    var saved = SupportTestKit.send("PUT", "/admin/support/github", admin, "{\"repo\":\"org/support\",\"token\":\"ghp_secret\",\"webhookSecret\":\"hook-secret\"}")
+    Check.status(saved, 200)
+    Check.jsonEq(saved, "repo", "org/support")
+    Check.jsonEq(saved, "enabled", "true")
+    Check.jsonEq(saved, "webhookSecretConfigured", "true")
+    // Nothing secret travels back, and what is stored is ciphertext.
+    assert(!saved.body.contains("ghp_secret"))
+    assert(!saved.body.contains("hook-secret"))
+    var stored = SupportTestKit.db().queryOne("select value_cipher from support_settings where name = ?", DbParams().bindStr("github_token"))
+    assert(!stored.getStr("value_cipher").contains("ghp_secret"))
+    // A null member keeps the value; an empty one removes it (the environment fallback comes back).
+    var kept = SupportTestKit.send("PUT", "/admin/support/github", admin, "{\"repo\":\"org/other\"}")
+    Check.jsonEq(kept, "repo", "org/other")
+    Check.jsonEq(kept, "webhookSecretConfigured", "true")
+    var cleared = SupportTestKit.send("PUT", "/admin/support/github", admin, "{\"webhookSecret\":\"\"}")
+    Check.jsonEq(cleared, "webhookSecretConfigured", "false")
+    var body = "{\"action\":\"closed\",\"issue\":{\"number\":1,\"state\":\"closed\"},\"repository\":{\"full_name\":\"org/other\"}}"
+    Check.eqInt("no secret again", 503, SupportTestKit.app().client.send("POST", "/webhooks/github", listOf("X-GitHub-Event: issues", "Content-Type: application/json"), "", body).status)
+    SupportTestKit.send("PUT", "/admin/support/github", admin, "{\"webhookSecret\":\"hook-secret\"}")
+    var signed = SupportTestKit.app().client.send("POST", "/webhooks/github", listOf("X-GitHub-Event: issues", "X-Hub-Signature-256: sha256=" + Hashes.hmacSha256Hex("hook-secret", body), "Content-Type: application/json"), "", body)
+    Check.eqInt("the new secret is live at once", 200, signed.status)
+}
+
+test "finish" {
+    SupportTestKit.finish()
+}

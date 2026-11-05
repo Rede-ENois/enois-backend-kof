@@ -1,0 +1,227 @@
+import contributions.*
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Port of ContributorSealFlowTests (levels derived from the count, issue qualification, audited admin actions),
+// PullRequestReviewTests (the open PRs queue) and the "seals criteria" endpoint.
+test "the code seal moves up and down with the verified count" {
+    var app = ContributionsTestKit.app()
+    var sfx = ContributionsTestKit.suffix()
+    var token = ContributionsTestKit.login("seal_user_" + sfx)
+    var module = ContributionsTestKit.module()
+    module.identities.remember("seal_user_" + sfx, "gh-seal-" + sfx, "seal-dev")
+    var repo = "Rede-ENois/seal-test-" + sfx
+    ContributionsTestKit.savePr("seal_user_" + sfx, "gh-seal-" + sfx, repo, 900)
+    module.seals.recalculate("seal_user_" + sfx)
+    assert(ContributionsTestKit.active("seal_user_" + sfx, "AJUDANTE"))
+    var n = 901
+    while (n <= 910) {
+        ContributionsTestKit.savePr("seal_user_" + sfx, "gh-seal-" + sfx, repo, n)
+        n = n + 1
+    }
+    module.seals.recalculate("seal_user_" + sfx)
+    assert(!ContributionsTestKit.active("seal_user_" + sfx, "AJUDANTE"))
+    assert(ContributionsTestKit.active("seal_user_" + sfx, "CONTRIBUINTE_SERIO"))
+    var seals = app.client.get("/users/seal_user_" + sfx + "/seals")
+    Check.status(seals, 200)
+    Check.jsonEq(seals, "0.type", "CONTRIBUINTE_SERIO")
+    Check.jsonEq(seals, "0.category", "CODE")
+    Check.jsonEq(seals, "0.categoryName", "Código")
+    Check.jsonEq(seals, "0.evidenceCount", "11")
+    Check.jsonEq(seals, "0.emblem", "contribuinte-serio")
+    Check.jsonEq(seals, "0.minCount", "11")
+    Check.jsonEq(seals, "0.maxCount", "50")
+    var first = app.client.get("/users/seal_user_" + sfx + "/seals/CODE/evidence?page=0&size=5")
+    Check.status(first, 200)
+    Check.jsonEq(first, "total", "11")
+    Check.eqInt("items", 5, first.jsonSize("items"))
+    Check.jsonEq(first, "hasMore", "true")
+    Check.jsonEq(first, "items.0.kind", "PULL_REQUEST")
+    var last = app.client.get("/users/seal_user_" + sfx + "/seals/CODE/evidence?page=2&size=5")
+    Check.eqInt("last page", 1, last.jsonSize("items"))
+    Check.jsonEq(last, "hasMore", "false")
+    Check.apiError(app.client.get("/users/seal_user_" + sfx + "/seals/NOPE/evidence"), 400, "BAD_REQUEST")
+    Check.apiError(app.client.get("/users/nobody-" + sfx + "/seals"), 404, "USER_NOT_FOUND")
+    // A reverted PR stops counting and the tier goes down.
+    var firstPr = module.store.findByObject(repo, "PULL_REQUEST", 900)
+    assert(firstPr != null)
+    if (firstPr != null) {
+        firstPr.reverted = true
+        module.store.save(firstPr)
+    }
+    module.seals.recalculate("seal_user_" + sfx)
+    assert(!ContributionsTestKit.active("seal_user_" + sfx, "CONTRIBUINTE_SERIO"))
+    assert(ContributionsTestKit.active("seal_user_" + sfx, "AJUDANTE"))
+}
+
+test "an issue only counts after qualification and the admin actions are auditable" {
+    var app = ContributionsTestKit.app()
+    var sfx = ContributionsTestKit.suffix()
+    var userId = "seal_issue_" + sfx
+    ContributionsTestKit.login(userId)
+    var admin = ContributionsTestKit.loginAdmin("seal-admin")
+    var regular = ContributionsTestKit.login("seal_regular_" + sfx)
+    var module = ContributionsTestKit.module()
+    module.identities.remember(userId, "gh-issue-seal-" + sfx, "issue-dev")
+    var repo = "Rede-ENois/seal-issue-" + sfx
+    var saved = ContributionsTestKit.saveIssue(userId, "gh-issue-seal-" + sfx, repo, 950, "PENDING")
+    var id = saved.id
+    module.seals.recalculate(userId)
+    assert(module.store.activeSeals(userId).size() == 0)
+    // A non-admin does not review.
+    Check.apiError(ContributionsTestKit.send("POST", "/admin/contributors/contributions/" + id + "/review", regular, "{\"status\":\"VALIDATED\",\"note\":\"ok\"}"), 403, "FORBIDDEN")
+    var reviewed = ContributionsTestKit.send("POST", "/admin/contributors/contributions/" + id + "/review", admin, "{\"status\":\"VALIDATED\",\"note\":\"Problema real e bem descrito.\"}")
+    Check.status(reviewed, 200)
+    Check.jsonEq(reviewed, "status", "VALIDATED")
+    Check.jsonEq(reviewed, "username", userId)
+    Check.jsonEq(reviewed, "reviewNote", "Problema real e bem descrito.")
+    assert(ContributionsTestKit.active(userId, "BETA_TESTER"))
+    var seals = app.client.get("/users/" + userId + "/seals")
+    Check.jsonEq(seals, "0.type", "BETA_TESTER")
+    Check.jsonEq(seals, "0.category", "ISSUES")
+    Check.jsonEq(seals, "0.evidenceCount", "1")
+    var evidence = app.client.get("/users/" + userId + "/seals/ISSUES/evidence")
+    Check.jsonEq(evidence, "total", "1")
+    Check.jsonEq(evidence, "items.0.kind", "ISSUE")
+    Check.jsonEq(evidence, "items.0.url", "https://github.com/Rede-ENois/x/issues/950")
+    var detail = ContributionsTestKit.send("GET", "/admin/contributors/contributions/" + id, admin, "")
+    Check.status(detail, 200)
+    assert(detail.jsonSize("audit") >= 1)
+    Check.jsonEq(detail, "contribution.id", id)
+    // Review rules.
+    Check.apiError(ContributionsTestKit.send("POST", "/admin/contributors/contributions/" + id + "/review", admin, "{\"status\":\"PENDING\"}"), 400, "INVALID_REVIEW_STATUS")
+    Check.apiError(ContributionsTestKit.send("POST", "/admin/contributors/contributions/" + id + "/review", admin, "{}"), 400, "INVALID_REVIEW_STATUS")
+    Check.apiError(ContributionsTestKit.send("POST", "/admin/contributors/contributions/" + id + "/review", admin, "{\"status\":\"NOPE\"}"), 400, "BAD_REQUEST")
+    Check.apiError(ContributionsTestKit.send("POST", "/admin/contributors/contributions/" + id + "/review", admin, "{\"status\":\"REJECTED\"}"), 409, "INVALID_STATUS_TRANSITION")
+    Check.apiError(ContributionsTestKit.send("POST", "/admin/contributors/contributions/" + id + "/review", admin, "{\"status\":\"PENDING\"}"), 400, "INVALID_REVIEW_STATUS")
+    Check.apiError(ContributionsTestKit.send("POST", "/admin/contributors/contributions/nope/review", admin, "{\"status\":\"VALIDATED\"}"), 404, "CONTRIBUTION_NOT_FOUND")
+    Check.apiError(ContributionsTestKit.send("GET", "/admin/contributors/contributions/nope", admin, ""), 404, "CONTRIBUTION_NOT_FOUND")
+}
+
+test "revoking and granting a seal by hand sticks until an explicit grant" {
+    var app = ContributionsTestKit.app()
+    var sfx = ContributionsTestKit.suffix()
+    var userId = "seal_manual_" + sfx
+    ContributionsTestKit.login(userId)
+    var admin = ContributionsTestKit.loginAdmin("seal-admin")
+    var module = ContributionsTestKit.module()
+    module.identities.remember(userId, "gh-manual-" + sfx, "manual-dev")
+    var repo = "Rede-ENois/seal-manual-" + sfx
+    ContributionsTestKit.saveIssue(userId, "gh-manual-" + sfx, repo, 960, "VALIDATED")
+    module.seals.recalculate(userId)
+    assert(ContributionsTestKit.active(userId, "BETA_TESTER"))
+    Check.apiError(ContributionsTestKit.send("POST", "/admin/contributors/seals/" + userId + "/revoke", admin, "{}"), 400, "SEAL_TYPE_REQUIRED")
+    Check.apiError(ContributionsTestKit.send("POST", "/admin/contributors/seals/" + userId + "/revoke", admin, "{\"type\":\"NOPE\"}"), 400, "BAD_REQUEST")
+    Check.apiError(ContributionsTestKit.send("POST", "/admin/contributors/seals/" + userId + "/revoke", admin, "{\"type\":\"HARDCORE\"}"), 404, "SEAL_NOT_ACTIVE")
+    var revoked = ContributionsTestKit.send("POST", "/admin/contributors/seals/" + userId + "/revoke", admin, "{\"type\":\"BETA_TESTER\",\"reason\":\"Revisão administrativa.\"}")
+    Check.status(revoked, 200)
+    Check.jsonEq(revoked, "status", "REVOKED")
+    assert(module.store.activeSeals(userId).size() == 0)
+    // The manual revocation does not come back on the next sync.
+    module.seals.recalculate(userId)
+    assert(module.store.activeSeals(userId).size() == 0)
+    var granted = ContributionsTestKit.send("POST", "/admin/contributors/seals/" + userId + "/grant", admin, "{\"type\":\"BETA_TESTER\",\"reason\":\"Revisão concluída: evidência legítima.\"}")
+    Check.status(granted, 200)
+    Check.jsonEq(granted, "status", "ACTIVE")
+    assert(ContributionsTestKit.active(userId, "BETA_TESTER"))
+    var events = ContributionsTestKit.db().queryLong("select count(*) from user_seal_events where user_id = ? and actor_user_id = ?", DbParams().bindStr(userId).bindStr("seal-admin"))
+    Check.eqInt("audited by the admin", 2, events as Int)
+    // Granting an active seal changes nothing; recalculating a user and everyone answers the counts.
+    Check.status(ContributionsTestKit.send("POST", "/admin/contributors/seals/" + userId + "/grant", admin, "{\"type\":\"BETA_TESTER\"}"), 200)
+    Check.jsonEq(ContributionsTestKit.send("POST", "/admin/contributors/users/" + userId + "/recalculate", admin, ""), "status", "RECALCULATED")
+    var all = ContributionsTestKit.send("POST", "/admin/contributors/recalculate", admin, "")
+    Check.status(all, 200)
+    assert(all.json("users") != "0")
+}
+
+test "the criteria publish both categories and every boundary" {
+    var app = ContributionsTestKit.app()
+    var res = app.client.get("/seals/criteria")
+    Check.status(res, 200)
+    Check.eqInt("categories", 2, res.jsonSize("categories"))
+    Check.jsonEq(res, "categories.0.category", "CODE")
+    Check.eqInt("code tiers", 5, res.jsonSize("categories.0.tiers"))
+    Check.jsonEq(res, "categories.0.tiers.0.type", "AJUDANTE")
+    Check.jsonEq(res, "categories.0.tiers.0.minCount", "1")
+    Check.jsonEq(res, "categories.0.tiers.0.maxCount", "10")
+    Check.jsonEq(res, "categories.0.tiers.0.emblem", "ajudante")
+    Check.jsonEq(res, "categories.0.tiers.4.type", "GET_A_LIFE")
+    assert(res.jsonIsNull("categories.0.tiers.4.maxCount"))
+    Check.jsonEq(res, "categories.1.category", "ISSUES")
+    Check.eqInt("issue tiers", 5, res.jsonSize("categories.1.tiers"))
+    Check.jsonEq(res, "categories.1.tiers.0.type", "BETA_TESTER")
+    Check.jsonEq(res, "categories.1.tiers.4.type", "GENKIDAMA")
+    assert(res.jsonSize("repositories") >= 2)
+    assert(res.jsonSize("policies") >= 4)
+    Check.eqInt("states", 5, res.jsonSize("states"))
+}
+
+test "the admin lists evidence with filters and switches repositories" {
+    var app = ContributionsTestKit.app()
+    var sfx = ContributionsTestKit.suffix()
+    var admin = ContributionsTestKit.loginAdmin("seal-admin")
+    var plain = ContributionsTestKit.login("seal_plain_" + sfx)
+    var repo = "Rede-ENois/list-" + sfx
+    var saved = ContributionsTestKit.saveIssue("seal_plain_" + sfx, "gh-list-" + sfx, repo, 970, "CONTESTED")
+    Check.apiError(ContributionsTestKit.send("GET", "/admin/contributors/contributions", plain, ""), 403, "FORBIDDEN")
+    var list = ContributionsTestKit.send("GET", "/admin/contributors/contributions?status=CONTESTED&kind=ISSUE&limit=200", admin, "")
+    Check.status(list, 200)
+    var found = false
+    var i = 0
+    while (i < list.jsonSize("")) {
+        if (list.jsonStr(i + ".id") == saved.id) {
+            found = true
+        }
+        i = i + 1
+    }
+    assert(found)
+    Check.apiError(ContributionsTestKit.send("GET", "/admin/contributors/contributions?status=NOPE", admin, ""), 400, "BAD_REQUEST")
+    var module = ContributionsTestKit.module()
+    module.store.saveRepository(GhRepository(repo, true, "2026-10-27T12:00:00Z", null))
+    var off = ContributionsTestKit.send("PATCH", "/admin/contributors/repositories", admin, "{\"repository\":\"" + repo + "\",\"enabled\":false}")
+    Check.status(off, 200)
+    Check.jsonEq(off, "enabled", "false")
+    Check.jsonEq(off, "repository", repo)
+    Check.apiError(ContributionsTestKit.send("PATCH", "/admin/contributors/repositories", admin, "{\"repository\":\"nope/nope\",\"enabled\":true}"), 404, "GITHUB_REPOSITORY_NOT_FOUND")
+    var repos = ContributionsTestKit.send("GET", "/admin/contributors/repositories", admin, "")
+    Check.status(repos, 200)
+    assert(repos.jsonSize("") >= 3)
+}
+
+test "a moderator lists and reviews open pull requests" {
+    var app = ContributionsTestKit.app()
+    var sfx = ContributionsTestKit.suffix()
+    var admin = ContributionsTestKit.loginAdmin("pull-admin")
+    var plain = ContributionsTestKit.login("pull_not_moderator")
+    var gateway = ContributionsTestKit.gateway()
+    var repo = "Rede-ENois/review-test-" + sfx
+    ContributionsTestKit.module().store.saveRepository(GhRepository(repo, true, "2026-10-27T12:00:00Z", null))
+    gateway.open = listOf(GhPullRequest(7L, "node-7", "Corrige o cálculo", "https://github.com/x/7", "", "gh-7", "dev-seven", "open", "2026-10-27T12:00:00Z", null, "2026-10-27T12:00:00Z", 1, 1, 1, listOf<String>(), 0, 0, 0))
+    var queue = ContributionsTestKit.send("GET", "/admin/github/pulls", admin, "")
+    Check.status(queue, 200)
+    assert(queue.jsonStr("0.repository") != null)
+    Check.jsonEq(queue, "0.title", "Corrige o cálculo")
+    Check.jsonEq(queue, "0.authorAvatarUrl", "https://github.com/dev-seven.png?size=80")
+    var approved = ContributionsTestKit.send("POST", "/admin/github/pulls/review", admin, "{\"repository\":\"" + repo + "\",\"number\":7,\"decision\":\"APPROVE\"}")
+    Check.status(approved, 200)
+    Check.jsonEq(approved, "id", repo + "#7")
+    Check.jsonEq(approved, "status", "REVIEWED")
+    assert(gateway.reviews.get(gateway.reviews.size() - 1) == repo + "|7|APPROVE||service")
+    Check.apiError(ContributionsTestKit.send("POST", "/admin/github/pulls/review", admin, "{\"repository\":\"" + repo + "\",\"number\":7,\"decision\":\"REQUEST_CHANGES\"}"), 400, "REVIEW_COMMENT_REQUIRED")
+    Check.apiError(ContributionsTestKit.send("POST", "/admin/github/pulls/review", admin, "{\"repository\":\"Outro/repo\",\"number\":7,\"decision\":\"APPROVE\"}"), 400, "UNKNOWN_REPOSITORY")
+    Check.apiError(ContributionsTestKit.send("POST", "/admin/github/pulls/review", admin, "{\"repository\":\"" + repo + "\",\"number\":7,\"decision\":\"MERGE\"}"), 400, "INVALID_REVIEW_DECISION")
+    var changes = ContributionsTestKit.send("POST", "/admin/github/pulls/review", admin, "{\"repository\":\"" + repo + "\",\"number\":7,\"decision\":\"request_changes\",\"comment\":\" Falta teste. \"}")
+    Check.status(changes, 200)
+    assert(gateway.reviews.get(gateway.reviews.size() - 1) == repo + "|7|REQUEST_CHANGES|Falta teste.|service")
+    Check.apiError(ContributionsTestKit.anonymous("POST", "/admin/github/pulls/review", "{\"repository\":\"" + repo + "\",\"number\":7,\"decision\":\"APPROVE\"}"), 401, "UNAUTHENTICATED")
+    Check.apiError(ContributionsTestKit.send("GET", "/admin/github/pulls", plain, ""), 403, "FORBIDDEN")
+    // GitHub refuses both tokens: an explicit error, never a fake approval.
+    gateway.acceptServiceToken = false
+    Check.apiError(ContributionsTestKit.send("POST", "/admin/github/pulls/review", admin, "{\"repository\":\"" + repo + "\",\"number\":7,\"decision\":\"APPROVE\"}"), 502, "GITHUB_REVIEW_FAILED")
+    gateway.acceptServiceToken = true
+}
+
+test "finish" {
+    ContributionsTestKit.finish()
+}
