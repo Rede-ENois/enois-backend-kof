@@ -40,7 +40,8 @@ The front end must not notice the switch.
 
 ```
 src/
-  Main.kf                      composition root: config, db, migrations, wiring, routes, jobs, listen
+  Main.kf                      composition root: config, db, migrations, AppWiring.install, listen
+  app/AppWiring.kf             every domain module installed in dependency order (shared with BootRoutesTest)
   kernel/                      platform layer: the ONLY place allowed to import Java/third-party APIs
     db/ http/ config/ jobs/ security/ ...
   <domain>/                    one folder per Java domain package (feed, identity, profile, ...)
@@ -60,7 +61,7 @@ the domain (`FeedPost`, `GroupMember`, `ProfileView`), never a bare `Item`/`Requ
 
 Idiomatic Kof first: `record` for data, `class` only for stateful services, `listOf/mapOf/setOf`,
 `map/filter/reduce`, `String?` with narrowing, `switch` with pattern matching, `test "..." {}`.
-No annotations, no reflection, no DI container: wiring is explicit constructor calls in `Main.kf`.
+No annotations, no reflection, no DI container: wiring is explicit constructor calls in `src/app/AppWiring.kf`.
 
 Measured limits (each one has a minimal repro in `docs/KOF_GAPS.md`):
 
@@ -115,9 +116,12 @@ unique-prefix fixtures, an ephemeral port per suite.
    a line in `docs/PORTING_STATUS.md` with the reason. Never weaken an assertion.
 4. Cross-domain calls go through a small interface owned by the caller
    (`interface FeedProfileLookup { ... }`), implemented by the other domain and wired in
-   `Main.kf`. Never reach into another domain's tables from your store.
+   `src/app/AppWiring.kf`. Never reach into another domain's tables from your store.
 5. Update `docs/PORTING_STATUS.md` (domain, endpoints ported/total, tests ported/total, gaps).
-6. `kof fmt`, full suite green, atomic semantic commits in English.
+6. Install the module in `src/app/AppWiring.kf` (the single production composition, called by `Main.kf`) and add its
+   representative route to `tests/integration/BootRoutesTest.kf`: the test boots the exact production wiring and fails
+   when a route is unknown to the kernel (answered by the unknown-path 200-empty fallback).
+7. `kof fmt`, full suite green, atomic semantic commits in English.
 
 ## 7. Security rules (inherited, non-negotiable)
 

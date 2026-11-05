@@ -1,0 +1,47 @@
+import app.*
+import java.util.HashMap
+import kernel.*
+import kernel.testkit.*
+
+// Boots the exact production wiring (app.AppWiring, the same call Main.kf makes) on H2 with an ephemeral port and checks
+// that one representative route of EVERY installed module is KNOWN to the kernel: a request without an Origin gets the
+// origin gate's 403 ORIGIN_REQUIRED (or, for a route that is public by design, a non-empty answer), never the
+// 200-with-empty-body fallback of an unknown path. The feed/media/... suites boot their own harness and cannot see a
+// wiring mistake in Main; this one can.
+// Every new module adds its representative route to `routes()`.
+// `status` is what a request without Origin gets: 403 ORIGIN_REQUIRED from the origin gate, or the status of the handler
+// for a route that is public by design (media GET).
+record BootRoute(String module, String method, String path, Int status)
+
+class BootRoutes {
+    static List<BootRoute> routes() = listOf(BootRoute("identity", "POST", "/auth/login", 403), BootRoute("age", "POST", "/age/parental/invite", 403), BootRoute("onboarding", "GET", "/me/onboarding/starter-pack", 403), BootRoute("ops", "GET", "/admin/monitoring/overview", 403), BootRoute("apiv1", "GET", "/developers/origins", 403), BootRoute("profile", "GET", "/me", 403), BootRoute("network", "GET", "/network/suggestions", 403), BootRoute("preferences", "GET", "/me/preferences", 403), BootRoute("presence", "GET", "/me/presence", 403), BootRoute("groups", "POST", "/groups", 403), BootRoute("communities", "GET", "/communities", 403), BootRoute("communityprojects", "GET", "/community-projects", 403), BootRoute("studypairs", "GET", "/study-pairs/me", 403), BootRoute("notifications", "GET", "/notifications", 403), BootRoute("push", "GET", "/push/config", 403), BootRoute("messaging", "GET", "/e2e/keypair", 403), BootRoute("calls", "POST", "/groups/1/calls", 403), BootRoute("feed", "GET", "/feed", 403), BootRoute("gifs", "GET", "/gifs/search", 403), BootRoute("linkedin", "GET", "/me/integrations/linkedin", 403), BootRoute("emotes", "GET", "/emotes", 403), BootRoute("media", "GET", "/media/x", 404), BootRoute("stats", "GET", "/stats/community", 403), BootRoute("notices", "GET", "/avisos/ativo", 403), BootRoute("releasenotes", "GET", "/novidades/atual", 403), BootRoute("search", "GET", "/search", 403), BootRoute("themes", "GET", "/temas/galeria", 403), BootRoute("projects", "GET", "/me/projects", 403), BootRoute("suggestions", "GET", "/suggestions/mine", 403), BootRoute("blog", "GET", "/blogs/me", 403))
+}
+
+test "every installed module's representative route is known to the kernel" {
+    var overrides = new HashMap<String, String>()
+    overrides.put("REDE_SECURITY_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+    var holder = new HashMap<String, SharedServices>()
+    var app = TestApp.bootWith("bootroutes", overrides, (p: Platform) -> {
+    holder.put("shared", AppWiring.install(p))
+})
+    var wrong = ""
+    for (var r in BootRoutes.routes()) {
+        var res = app.client.send(r.method(), r.path(), listOf<String>(), "", "")
+        var ok = res.status == r.status() && res.body.length() > 0
+        if (ok && r.status() == 403 && !res.body.contains("ORIGIN_REQUIRED")) {
+            ok = false
+        }
+        if (!ok) {
+            wrong = wrong + " " + r.module() + "(" + r.method() + " " + r.path() + " -> " + res.status + ")"
+        }
+    }
+    var unknown = app.client.get("/definitely/not/a/route")
+    Check.status(unknown, 200)
+    Check.eqStr("unknown path body", "", unknown.body)
+    app.stop()
+    var shared = holder.get("shared")
+    if (shared != null) {
+        shared.stop()
+    }
+    Check.eqStr("routes that did not reach the origin gate or their handler (unknown-path fallback?)", "", wrong)
+}
