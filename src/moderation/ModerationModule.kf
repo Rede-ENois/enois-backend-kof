@@ -31,7 +31,9 @@ class ModerationModule {
     ModerationModeratorStore moderators
     ModerationPreTriageService preTriage
     ModerationSignalWeights weights
-    public constructor(service: ModerationService, store: ModerationStore, targets: ModerationTargets, decisions: ModerationDecisions, sanctions: ModerationSanctionService, sanctionStore: ModerationSanctionStore, banCleanup: ModerationBanCleanup, quarantine: ModerationQuarantine, learning: ModerationLearning, verdicts: ModerationVerdicts, suspensions: ModerationSuspensions, contentTargets: ModerationContentTargets, panel: ModerationPanel, proposals: ModerationProposals, moderators: ModerationModeratorStore, preTriage: ModerationPreTriageService, weights: ModerationSignalWeights) {
+    ModerationAi ai
+    ModerationTriageJob triageJob
+    public constructor(service: ModerationService, store: ModerationStore, targets: ModerationTargets, decisions: ModerationDecisions, sanctions: ModerationSanctionService, sanctionStore: ModerationSanctionStore, banCleanup: ModerationBanCleanup, quarantine: ModerationQuarantine, learning: ModerationLearning, verdicts: ModerationVerdicts, suspensions: ModerationSuspensions, contentTargets: ModerationContentTargets, panel: ModerationPanel, proposals: ModerationProposals, moderators: ModerationModeratorStore, preTriage: ModerationPreTriageService, weights: ModerationSignalWeights, ai: ModerationAi, triageJob: ModerationTriageJob) {
         this.service = service
         this.store = store
         this.targets = targets
@@ -49,9 +51,11 @@ class ModerationModule {
         this.moderators = moderators
         this.preTriage = preTriage
         this.weights = weights
+        this.ai = ai
+        this.triageJob = triageJob
     }
-    static ModerationModule install(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications) = ModerationModule.installWith(platform, shared, parts, feed, groups, profiles, mail, notifications, ModerationReportEvents(), ModerationCompanies(platform.db), ModerationSanctionHooks())
-    static ModerationModule installWith(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications, events: ModerationReportEvents, companies: ModerationCompanies, sanctionHooks: ModerationSanctionHooks) {
+    static ModerationModule install(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications) = ModerationModule.installWith(platform, shared, parts, feed, groups, profiles, mail, notifications, ModerationReportEvents(), ModerationCompanies(platform.db), ModerationSanctionHooks(), ModerationLlmTransport(), ModerationImages())
+    static ModerationModule installWith(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications, events: ModerationReportEvents, companies: ModerationCompanies, sanctionHooks: ModerationSanctionHooks, llm: ModerationLlmTransport, images: ModerationImages) {
         var cfg = platform.cfg
         var store = ModerationStore(platform.db)
         var targets = ModerationTargets(feed.moderation, groups.reports, companies)
@@ -77,7 +81,10 @@ class ModerationModule {
         var weights = ModerationSignalWeights(platform.db)
         var preTriage = ModerationPreTriageService(platform.db, store, targets, profiles.directory, weights, cfg.getBool("MODERATION_PRETRIAGE_ENABLED", true), cfg.getInt("MODERATION_PRETRIAGE_MIN_SCORE", 30), 24)
         learning.schedule(shared.jobs, weights)
+        var ai = ModerationAi.fromConfig(cfg, store, targets, images, llm)
+        var triageJob = ModerationTriageJob(ai, preTriage, verdicts, cfg.getBool("MODERATION_AI_TRIAGE_ENABLED", true), cfg.getBool("MODERATION_AI_AUTO_PENALTY", true))
+        triageJob.schedule(shared.jobs)
         ModerationPanelRoutes.register(platform.server, panel, proposals, quarantine)
-        return ModerationModule(service, store, targets, decisions, sanctions, sanctionStore, banCleanup, quarantine, learning, verdicts, suspensions, contentTargets, panel, proposals, moderators, preTriage, weights)
+        return ModerationModule(service, store, targets, decisions, sanctions, sanctionStore, banCleanup, quarantine, learning, verdicts, suspensions, contentTargets, panel, proposals, moderators, preTriage, weights, ai, triageJob)
     }
 }
