@@ -1,0 +1,595 @@
+import cosmetics.*
+import economy.*
+import java.util.concurrent.atomic.AtomicInteger
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import profile.*
+
+// Port of SeasonalCosmeticsFlowTests: the seasonal shop on the duel day (2026-10-31), collections in and out of season,
+// rewards that are never sold, looks, every profile slot, the status bubble and seasonal name styles. The feed half of
+// the name style test (the style shows on a post and on a comment) belongs to the feed domain.
+class SeasonGate {
+    static AtomicInteger seasonGate = new AtomicInteger(0)
+}
+
+// Each test starts on the duel day.
+TestApp seasonApp() {
+    var app = CosmeticsTestKit.app("seasonalshop", mapOf<String, String>())
+    CosmeticsTestKit.clockAt(CosmeticsTestKit.duelDay())
+    return app
+}
+
+buy(user: ProfileCaller, itemId: String) {
+    var res = user.post("/loja/" + itemId + "/comprar", "")
+    Check.status(res, 200)
+    Check.jsonEq(res, "id", itemId)
+    Check.jsonEq(res, "owned", "true")
+}
+
+// The ids of the rows of a list response, comma separated.
+String ids(res: TestResponse) {
+    var out = listOf<String>()
+    var n = res.jsonSize("")
+    var i = 0
+    while (i < n) {
+        out.add(CosmeticsTestKit.text(res, "" + i + ".id"))
+        i = i + 1
+    }
+    return String.join(",", out)
+}
+
+// Checks a field of the row with this id.
+rowIs(res: TestResponse, id: String, field: String, expected: String) {
+    Check.eqStr(id + "." + field, expected, CosmeticsTestKit.rowStr(res, id, field))
+}
+
+Int looksOf(res: TestResponse, collectionId: String) = res.jsonSize("" + CosmeticsTestKit.rowIndex(res, collectionId) + ".looks")
+
+String lookPath(res: TestResponse, collectionId: String, path: String) = CosmeticsTestKit.text(res, "" + CosmeticsTestKit.rowIndex(res, collectionId) + ".looks." + path)
+
+test "the catalog lists kinds, collections, season and sale flags" {
+    var app = seasonApp()
+    // Only today's shop: the thirty classics plus Saci, Halloween, Essenciais and Aparencias, in season.
+    var res = ProfileTestApp.anonymous(app).get("/loja")
+    Check.status(res, 200)
+    Check.eqInt("items on the duel day", 177, res.jsonSize(""))
+    Check.isTrue("saci", CosmeticsTestKit.countWhere(res, "collection", "saci") > 0)
+    Check.isTrue("halloween", CosmeticsTestKit.countWhere(res, "collection", "halloween") > 0)
+    Check.isTrue("essenciais", CosmeticsTestKit.countWhere(res, "collection", "essenciais") > 0)
+    Check.isTrue("aparencias", CosmeticsTestKit.countWhere(res, "collection", "aparencias") > 0)
+    Check.eqInt("criancas is out", 0, CosmeticsTestKit.countWhere(res, "collection", "criancas"))
+    Check.eqInt("natal is out", 0, CosmeticsTestKit.countWhere(res, "collection", "natal"))
+    Check.isTrue("ambar has no collection", CosmeticsTestKit.rowIsNull(res, "moldura-ambar", "collection"))
+    rowIs(res, "moldura-ambar", "available", "true")
+    rowIs(res, "moldura-ambar", "kind", "FRAME")
+    rowIs(res, "tema-saci", "kind", "CARD_THEME")
+    rowIs(res, "tema-saci", "releaseOrder", "27")
+    rowIs(res, "tema-saci", "collection", "saci")
+    rowIs(res, "tema-saci", "priceMf", "4000")
+    rowIs(res, "tema-saci", "available", "true")
+    rowIs(res, "tema-saci", "purchasable", "true")
+    rowIs(res, "tema-saci", "cssRing", "")
+    rowIs(res, "moldura-redemoinho", "priceMf", "5000")
+    rowIs(res, "emblema-carapuca", "kind", "BADGE")
+    rowIs(res, "nome-saci", "kind", "NAME_STYLE")
+    rowIs(res, "placa-mata", "kind", "NAMEPLATE")
+    rowIs(res, "banner-saci", "kind", "BANNER")
+    rowIs(res, "efeito-redemoinho", "kind", "PROFILE_EFFECT")
+    rowIs(res, "garden-cerrado", "kind", "GARDEN")
+    rowIs(res, "garden-cerrado", "available", "true")
+    Check.isTrue("tema-criancas is out", CosmeticsTestKit.rowIndex(res, "tema-criancas") < 0)
+    rowIs(res, "emblema-time-saci", "purchasable", "false")
+    rowIs(res, "emblema-time-saci", "collection", "saci")
+    Check.isTrue("a guest row has no owned", !res.jsonHas("0.owned"))
+    Check.isTrue("a guest row has no equipped", !res.jsonHas("0.equipped"))
+}
+
+test "the collections expose windows, availability and looks" {
+    var app = seasonApp()
+    // Duel day: only the collections in season show up; the others are not even listed.
+    var res = ProfileTestApp.anonymous(app).get("/loja/colecoes")
+    Check.status(res, 200)
+    Check.eqInt("collections", 4, res.jsonSize(""))
+    Check.eqStr("ids", "saci,halloween,essenciais,aparencias", ids(res))
+    Check.isTrue("criancas", CosmeticsTestKit.rowIndex(res, "criancas") < 0)
+    Check.isTrue("natal", CosmeticsTestKit.rowIndex(res, "natal") < 0)
+    // Essenciais is permanent: on sale whatever the season.
+    rowIs(res, "essenciais", "available", "true")
+    Check.eqInt("essenciais looks", 11, looksOf(res, "essenciais"))
+    Check.eqStr("first essenciais look", "look-papel", lookPath(res, "essenciais", "0.id"))
+    Check.eqStr("first piece", "tema-papel", lookPath(res, "essenciais", "0.items.0"))
+    // The ready-made looks beyond the original four are Essenciais-only, so they never leave the shop.
+    Check.eqStr("fifth look", "look-manha-de-domingo", lookPath(res, "essenciais", "4.id"))
+    Check.eqStr("last look", "look-mar-de-pedra", lookPath(res, "essenciais", "10.id"))
+    // One look for each theme of the appearance gallery, all of them on sale all year.
+    rowIs(res, "aparencias", "available", "true")
+    Check.eqInt("appearance looks", 85, looksOf(res, "aparencias"))
+    Check.eqStr("first appearance look", "look-tubarao", lookPath(res, "aparencias", "0.id"))
+    Check.eqStr("first appearance theme", "tema-blahaj", lookPath(res, "aparencias", "0.items.0"))
+    Check.eqStr("last appearance theme", "tema-neumorfismo", lookPath(res, "aparencias", "84.items.0"))
+    rowIs(res, "saci", "name", "Dia do Saci")
+    rowIs(res, "saci", "available", "true")
+    var saci = CosmeticsTestKit.rowIndex(res, "saci")
+    Check.jsonEq(res, "" + saci + ".windows.0.start", "10-15")
+    Check.jsonEq(res, "" + saci + ".windows.0.end", "11-02")
+    Check.eqStr("saci look", "look-saci", lookPath(res, "saci", "0.id"))
+    Check.eqStr("saci look title", "Saci-pererê", lookPath(res, "saci", "0.title"))
+    Check.eqStr("saci look piece", "tema-saci", lookPath(res, "saci", "0.items.0"))
+    Check.eqStr("saci status icon", "carapuca", lookPath(res, "saci", "0.statusIcon"))
+    Check.eqStr("saci status text", "Procurando minha carapuça", lookPath(res, "saci", "0.statusText"))
+    // A seasonal collection carries only its own look; the ready-made ones live in Essenciais.
+    Check.eqInt("saci looks", 1, looksOf(res, "saci"))
+    Check.eqInt("halloween looks", 1, looksOf(res, "halloween"))
+    Check.eqInt("saci look pieces", 11, res.jsonSize("" + saci + ".looks.0.items"))
+}
+
+test "each collection keeps its own window and looks when it is in season" {
+    var app = seasonApp()
+    var guest = ProfileTestApp.anonymous(app)
+    // The programmer day has two windows in the year and the Reveillon turns the year in the middle of its window.
+    CosmeticsTestKit.clockAt("2026-09-10T15:00:00Z")
+    var september = guest.get("/loja/colecoes")
+    Check.status(september, 200)
+    var dev = CosmeticsTestKit.rowIndex(september, "dev")
+    Check.eqInt("dev windows", 2, september.jsonSize("" + dev + ".windows"))
+    Check.eqStr("dev look", "look-dev", lookPath(september, "dev", "0.id"))
+    CosmeticsTestKit.clockAt("2026-12-28T15:00:00Z")
+    var december = guest.get("/loja/colecoes")
+    Check.status(december, 200)
+    var reveillon = CosmeticsTestKit.rowIndex(december, "reveillon")
+    Check.jsonEq(december, "" + reveillon + ".windows.0.start", "12-26")
+    Check.jsonEq(december, "" + reveillon + ".windows.0.end", "01-06")
+    Check.eqInt("reveillon looks", 1, looksOf(december, "reveillon"))
+    Check.isTrue("dev is out", CosmeticsTestKit.rowIndex(december, "dev") < 0)
+}
+
+test "seasonal collections and their items leave the shop outside their window" {
+    var app = seasonApp()
+    var guest = ProfileTestApp.anonymous(app)
+    // Two weeks after the Saci day: the collection falls off the shop and no piece of it stays on display.
+    CosmeticsTestKit.clockAt("2026-11-20T15:00:00Z")
+    var collections = guest.get("/loja/colecoes")
+    Check.status(collections, 200)
+    Check.eqStr("only the permanent ones", "essenciais,aparencias", ids(collections))
+    Check.isTrue("saci left", CosmeticsTestKit.rowIndex(collections, "saci") < 0)
+    var res = guest.get("/loja")
+    Check.status(res, 200)
+    Check.eqInt("no saci piece", 0, CosmeticsTestKit.countWhere(res, "collection", "saci"))
+    Check.eqInt("no halloween piece", 0, CosmeticsTestKit.countWhere(res, "collection", "halloween"))
+    Check.isTrue("tema-saci left", CosmeticsTestKit.rowIndex(res, "tema-saci") < 0)
+    Check.isTrue("ambar stays", CosmeticsTestKit.rowIndex(res, "moldura-ambar") >= 0)
+    Check.isTrue("essenciais stays", CosmeticsTestKit.countWhere(res, "collection", "essenciais") > 0)
+    // The appearance themes do not follow any season: they stay on sale all year.
+    rowIs(res, "tema-blahaj", "available", "true")
+    Check.isTrue("aparencias stays", CosmeticsTestKit.countWhere(res, "collection", "aparencias") > 0)
+}
+
+test "a seasonal collection does not appear before its window opens" {
+    var app = seasonApp()
+    var guest = ProfileTestApp.anonymous(app)
+    // October starts outside the Saci window (15/10): on the 5th the collection does not exist in the shop yet.
+    CosmeticsTestKit.clockAt("2026-10-05T15:00:00Z")
+    var early = guest.get("/loja/colecoes")
+    Check.status(early, 200)
+    Check.isTrue("saci not yet", CosmeticsTestKit.rowIndex(early, "saci") < 0)
+    Check.isTrue("criancas is on", CosmeticsTestKit.rowIndex(early, "criancas") >= 0)
+    Check.eqInt("no saci piece", 0, CosmeticsTestKit.countWhere(guest.get("/loja"), "collection", "saci"))
+    // And on the first day of the window it is already there, with the pieces on sale.
+    CosmeticsTestKit.clockAt("2026-10-15T15:00:00Z")
+    var open = guest.get("/loja/colecoes")
+    rowIs(open, "saci", "available", "true")
+    rowIs(guest.get("/loja"), "tema-saci", "available", "true")
+}
+
+test "owned seasonal pieces stay in the shop after the season so they can be equipped" {
+    var app = seasonApp()
+    var shop = CosmeticsTestKit.shop()
+    var buyer = CosmeticsTestKit.wallet(app, "seasonal-after")
+    buy(buyer, "tema-saci")
+    CosmeticsTestKit.clockAt("2026-12-20T15:00:00Z")
+    // Out of season the piece bought stays in the list, marked as yours, but the one not bought leaves; buying the
+    // one that left stays refused.
+    var rows = shop.onSaleNow("seasonal-after", "oldest")
+    var keptOwned = false
+    var strayRows = 0
+    for (var row in rows) {
+        if (row.item().id() == "tema-saci") {
+            Check.isTrue("owned", row.owned())
+            Check.isTrue("out of season", !row.available())
+            keptOwned = true
+        }
+        var c = row.item().collection()
+        if (c != null) {
+            if (c == "saci" && row.item().id() != "tema-saci") {
+                strayRows = strayRows + 1
+            }
+        }
+    }
+    Check.isTrue("tema-saci kept", keptOwned)
+    Check.eqInt("no other saci piece", 0, strayRows)
+    Check.apiError(buyer.post("/loja/moldura-redemoinho/comprar", ""), 409, "OUT_OF_SEASON")
+    shop.equip("seasonal-after", "tema-saci")
+    Check.jsonEq(buyer.get("/me"), "cardTheme", "tema-saci")
+}
+
+test "buying respects the season, the sale flag and ownership" {
+    var app = seasonApp()
+    var shop = CosmeticsTestKit.shop()
+    var buyer = CosmeticsTestKit.wallet(app, "seasonal-buyer")
+    buy(buyer, "tema-saci")
+    Check.eqStr("after the purchase", "101000", "" + CosmeticsTestKit.balance(buyer))
+    Check.apiError(buyer.post("/loja/tema-saci/comprar", ""), 409, "ALREADY_OWNED")
+    Check.apiError(buyer.post("/loja/tema-criancas/comprar", ""), 409, "OUT_OF_SEASON")
+    Check.apiError(buyer.post("/loja/emblema-time-saci/comprar", ""), 403, "NOT_FOR_SALE")
+    Check.apiError(buyer.post("/loja/nao-existe/comprar", ""), 404, "ITEM_NOT_FOUND")
+    Check.status(ProfileTestApp.anonymous(app).post("/loja/tema-saci/comprar", ""), 401)
+    Check.eqStr("balance untouched", "101000", "" + CosmeticsTestKit.balance(buyer))
+    // Out of season the piece is gone from the shop and cannot be bought; the one already yours stays in the list (off
+    // sale) and can be equipped. The session does not need to survive the clock jump: this part talks to the service.
+    CosmeticsTestKit.clockAt("2026-11-03T15:00:00Z")
+    var found = false
+    for (var row in shop.shop("seasonal-buyer", "oldest")) {
+        if (row.item().id() == "tema-saci") {
+            Check.isTrue("not available", !row.available())
+            Check.isTrue("owned", row.owned())
+            found = true
+        }
+    }
+    Check.isTrue("tema-saci is listed", found)
+    var listed = listOf<String>()
+    for (var row in shop.onSaleNow("seasonal-buyer", "oldest")) {
+        listed.add(row.item().id())
+    }
+    Check.isTrue("owned stays", listed.contains("tema-saci"))
+    Check.isTrue("not owned leaves", !listed.contains("moldura-carapuca"))
+    var guestListed = listOf<String>()
+    for (var row in shop.onSaleNow(null, "oldest")) {
+        guestListed.add(row.item().id())
+    }
+    Check.isTrue("guest: tema-saci gone", !guestListed.contains("tema-saci"))
+    Check.isTrue("guest: carapuca gone", !guestListed.contains("moldura-carapuca"))
+    Check.isTrue("out of season", failsWithCode(() -> {
+    shop.buy("seasonal-buyer", "moldura-carapuca")
+}, "OUT_OF_SEASON"))
+    shop.equip("seasonal-buyer", "tema-saci")
+    Check.jsonEq(buyer.get("/me"), "cardTheme", "tema-saci")
+}
+
+// `size` letters.
+String longText(size: Int) {
+    var out = ""
+    var i = 0
+    while (i < size) {
+        out = out + "x"
+        i = i + 1
+    }
+    return out
+}
+
+// Does the call fail with this error code?
+Bool failsWithCode(call: () -> void, code: String) {
+    try {
+        call()
+    } catch (String e) {
+        return Errors.hasCode(e, code)
+    }
+    return false
+}
+
+test "a permanent look can be bought outside every season" {
+    var app = seasonApp()
+    var shop = CosmeticsTestKit.shop()
+    var buyer = CosmeticsTestKit.wallet(app, "seasonal-essenciais")
+    CosmeticsTestKit.clockAt("2027-03-15T15:00:00Z")
+    // March sits outside every seasonal window: only the permanent collection is open.
+    Check.isTrue("tema-saci is out", failsWithCode(() -> {
+    shop.buy("seasonal-essenciais", "tema-saci")
+}, "OUT_OF_SEASON"))
+    var purchase = shop.buyLook("seasonal-essenciais", "look-papel")
+    Check.eqStr("look id", "look-papel", purchase.id())
+    Check.eqStr("bought", "tema-papel,moldura-ambar,nome-papel,placa-papel,emblema-papel", String.join(",", purchase.bought()))
+    // 13 sparks of pieces at 75% = 9.75, rounded to 10.
+    Check.eqStr("price", "10000", "" + purchase.priceMf())
+    var owned = shop.ownedItemIds("seasonal-essenciais")
+    for (var id in purchase.bought()) {
+        Check.isTrue("owns " + id, owned.contains(id))
+    }
+}
+
+test "buying until the wallet runs out stops with insufficient sparks" {
+    var app = seasonApp()
+    var buyer = CosmeticsTestKit.wallet(app, "seasonal-broke")
+    var shop = ProfileTestApp.anonymous(app).get("/loja")
+    Check.status(shop, 200)
+    var lastStatus = 200
+    var n = shop.jsonSize("")
+    var i = 0
+    while (i < n && lastStatus == 200) {
+        if (shop.jsonStr("" + i + ".available") == "true" && shop.jsonStr("" + i + ".purchasable") == "true") {
+            var res = buyer.post("/loja/" + CosmeticsTestKit.text(shop, "" + i + ".id") + "/comprar", "")
+            lastStatus = res.status
+            if (lastStatus != 200) {
+                Check.jsonEq(res, "code", "INSUFFICIENT_SPARKS")
+            }
+        }
+        i = i + 1
+    }
+    Check.eqInt("the last purchase", 400, lastStatus)
+    var balance = CosmeticsTestKit.balance(buyer)
+    Check.isTrue("balance is left between 0 and 104.999", balance >= 0L && balance <= 104999L)
+}
+
+test "a look buys the missing pieces at a discount and equips everything" {
+    var app = seasonApp()
+    var buyer = CosmeticsTestKit.wallet(app, "seasonal-look")
+    var bought = buyer.post("/loja/looks/look-saci/comprar", "")
+    Check.status(bought, 200)
+    Check.jsonEq(bought, "id", "look-saci")
+    Check.eqInt("bought pieces", 11, bought.jsonSize("bought"))
+    // 31 sparks of pieces, 75% = 23.25, rounded to 23.
+    Check.jsonEq(bought, "priceMf", "23000")
+    Check.jsonEq(bought, "bought.0", "tema-saci")
+    Check.eqStr("balance", "82000", "" + CosmeticsTestKit.balance(buyer))
+    var me = buyer.get("/me")
+    Check.jsonEq(me, "cardTheme", "tema-saci")
+    Check.jsonEq(me, "avatarFrame", "moldura-saci-completo")
+    Check.jsonEq(me, "nameTheme", "nome-saci")
+    Check.jsonEq(me, "profileEffect", "efeito-redemoinho")
+    Check.jsonEq(me, "bannerItem", "banner-saci")
+    Check.jsonEq(me, "nameplate", "placa-mata")
+    Check.jsonEq(me, "statusText", "Procurando minha carapuça")
+    Check.jsonEq(me, "statusIcon", "carapuca")
+    Check.eqInt("badges", 5, me.jsonSize("badges"))
+    Check.eqStr("badges", "emblema-carapuca,emblema-cachimbo,emblema-redemoinho,emblema-pe,emblema-folhaSeca", String.join(",", listOf(CosmeticsTestKit.text(me, "badges.0"), CosmeticsTestKit.text(me, "badges.1"), CosmeticsTestKit.text(me, "badges.2"), CosmeticsTestKit.text(me, "badges.3"), CosmeticsTestKit.text(me, "badges.4"))))
+    // The public profile carries the same slots.
+    var pub = ProfileTestApp.anonymous(app).get("/users/" + CosmeticsTestKit.text(me, "username"))
+    Check.status(pub, 200)
+    Check.jsonEq(pub, "cardTheme", "tema-saci")
+    Check.jsonEq(pub, "nameplate", "placa-mata")
+    Check.jsonEq(pub, "bannerItem", "banner-saci")
+    Check.jsonEq(pub, "profileEffect", "efeito-redemoinho")
+    Check.jsonEq(pub, "statusText", "Procurando minha carapuça")
+    Check.jsonEq(pub, "statusIcon", "carapuca")
+    Check.jsonEq(pub, "nameTheme", "nome-saci")
+    Check.apiError(buyer.post("/loja/looks/look-saci/comprar", ""), 409, "ALREADY_OWNED")
+    Check.eqStr("balance untouched", "82000", "" + CosmeticsTestKit.balance(buyer))
+}
+
+test "a ready-made look buys its pieces and is on sale whatever the season" {
+    var app = seasonApp()
+    var buyer = CosmeticsTestKit.wallet(app, "seasonal-look-theme")
+    var bought = buyer.post("/loja/looks/look-manha-de-domingo/comprar", "")
+    Check.status(bought, 200)
+    Check.jsonEq(bought, "id", "look-manha-de-domingo")
+    Check.eqInt("bought pieces", 7, bought.jsonSize("bought"))
+    // 18 sparks of pieces, 75% = 13.5, rounded to 14.
+    Check.jsonEq(bought, "priceMf", "14000")
+    Check.jsonEq(bought, "bought.0", "tema-papel")
+    Check.eqStr("balance", "91000", "" + CosmeticsTestKit.balance(buyer))
+    var me = buyer.get("/me")
+    Check.jsonEq(me, "cardTheme", "tema-papel")
+    Check.jsonEq(me, "avatarFrame", "moldura-coral")
+    Check.jsonEq(me, "nameTheme", "nome-papel")
+    Check.jsonEq(me, "profileEffect", "efeito-estrelas")
+    Check.isTrue("no banner", me.jsonIsNull("bannerItem"))
+    Check.jsonEq(me, "nameplate", "placa-papel")
+    Check.jsonEq(me, "statusText", "Café, jornal e nada marcado")
+    Check.jsonEq(me, "statusIcon", "sol")
+    Check.eqInt("badges", 2, me.jsonSize("badges"))
+    Check.jsonEq(me, "badges.0", "emblema-papel")
+    Check.jsonEq(me, "badges.1", "emblema-estrela-calma")
+    // A look does not bypass the collection season: Carnaval is out on the duel day.
+    Check.apiError(buyer.post("/loja/looks/look-carnaval/comprar", ""), 409, "OUT_OF_SEASON")
+}
+
+test "an appearance look is bought and worn whatever the season" {
+    var app = seasonApp()
+    // Outside any season the appearance look stays on sale.
+    CosmeticsTestKit.clockAt("2026-04-01T15:00:00Z")
+    var buyer = CosmeticsTestKit.wallet(app, "appearance-look")
+    var bought = buyer.post("/loja/looks/look-tubarao/comprar", "")
+    Check.status(bought, 200)
+    Check.jsonEq(bought, "id", "look-tubarao")
+    Check.eqInt("bought pieces", 5, bought.jsonSize("bought"))
+    // 24 sparks of pieces, 75% = 18.
+    Check.jsonEq(bought, "priceMf", "18000")
+    Check.eqStr("balance", "87000", "" + CosmeticsTestKit.balance(buyer))
+    var me = buyer.get("/me")
+    Check.jsonEq(me, "cardTheme", "tema-blahaj")
+    Check.jsonEq(me, "avatarFrame", "moldura-mare")
+    Check.jsonEq(me, "nameTheme", "nome-papel")
+    Check.jsonEq(me, "nameplate", "placa-papel")
+    Check.jsonEq(me, "profileEffect", "efeito-estrelas")
+    Check.jsonEq(me, "statusText", "Nadando devagar entre as ondas")
+    Check.jsonEq(me, "statusIcon", "coracao")
+    // Wearing again charges nothing; buying again is refused.
+    Check.status(buyer.post("/loja/looks/look-tubarao/equipar", ""), 200)
+    Check.apiError(buyer.post("/loja/looks/look-tubarao/comprar", ""), 409, "ALREADY_OWNED")
+    Check.eqStr("balance untouched", "87000", "" + CosmeticsTestKit.balance(buyer))
+}
+
+test "a look charges only the missing pieces and respects the season" {
+    var app = seasonApp()
+    var buyer = CosmeticsTestKit.wallet(app, "seasonal-look-partial")
+    buy(buyer, "tema-halloween")
+    var bought = buyer.post("/loja/looks/look-halloween/comprar", "")
+    Check.status(bought, 200)
+    Check.eqInt("bought pieces", 10, bought.jsonSize("bought"))
+    // 27 sparks still missing, 75% = 20.25, rounded to 20.
+    Check.jsonEq(bought, "priceMf", "20000")
+    Check.eqStr("balance", "" + (105000 - 4000 - 20000), "" + CosmeticsTestKit.balance(buyer))
+    Check.apiError(buyer.post("/loja/looks/look-criancas/comprar", ""), 409, "OUT_OF_SEASON")
+    Check.apiError(buyer.post("/loja/looks/look-nada/comprar", ""), 404, "ITEM_NOT_FOUND")
+}
+
+// One buy of the look straight at the service: the price on success, the error code on a refusal.
+String lookOutcome(userId: String) {
+    var waited = 0
+    while (SeasonGate.seasonGate.get() == 0 && waited < 10000) {
+        time.sleep(1)
+        waited = waited + 1
+    }
+    try {
+        return "" + CosmeticsTestKit.shop().buyLook(userId, "look-saci").priceMf()
+    } catch (String e) {
+        return "ERROR " + Errors.parse(e).code()
+    }
+}
+
+test "concurrent look purchases charge once" {
+    var app = seasonApp()
+    var buyer = CosmeticsTestKit.wallet(app, "seasonal-look-race")
+    SeasonGate.seasonGate.set(0)
+    var one = __kof_spawn_expr(lookOutcome("seasonal-look-race"))
+    var two = __kof_spawn_expr(lookOutcome("seasonal-look-race"))
+    SeasonGate.seasonGate.set(1)
+    var first = __kof_await(one)
+    var second = __kof_await(two)
+    Check.isTrue("one purchase went through (" + first + ", " + second + ")", first == "23000" || second == "23000")
+    Check.eqStr("charged once", "82000", "" + CosmeticsTestKit.balance(buyer))
+}
+
+test "every kind equips and unequips into its slot" {
+    var app = seasonApp()
+    var user = CosmeticsTestKit.wallet(app, "seasonal-slots")
+    var items = listOf("moldura-carapuca", "nome-saci", "placa-mata", "banner-saci", "tema-saci", "efeito-redemoinho", "garden-cerrado")
+    var fields = listOf("avatarFrame", "nameTheme", "nameplate", "bannerItem", "cardTheme", "profileEffect", "gardenStyle")
+    for (var item in items) {
+        Check.apiError(user.post("/loja/" + item + "/equipar", ""), 403, "NOT_OWNED")
+        Check.apiError(user.post("/loja/" + item + "/desequipar", ""), 403, "NOT_OWNED")
+        buy(user, item)
+        var on = user.post("/loja/" + item + "/equipar", "")
+        Check.status(on, 200)
+        Check.jsonEq(on, "id", item)
+        Check.jsonEq(on, "equipped", "true")
+    }
+    buy(user, "emblema-carapuca")
+    Check.status(user.post("/loja/emblema-carapuca/equipar", ""), 200)
+    var me = user.get("/me")
+    var at = 0
+    while (at < items.size()) {
+        Check.jsonEq(me, fields.get(at), items.get(at))
+        at = at + 1
+    }
+    // The public profile carries the garden style and the garden itself (a new account: seeds, healthy).
+    var pub = ProfileTestApp.anonymous(app).get("/users/" + CosmeticsTestKit.text(me, "username"))
+    Check.status(pub, 200)
+    Check.jsonEq(pub, "gardenStyle", "garden-cerrado")
+    Check.jsonEq(pub, "garden.tenure", "0")
+    Check.jsonEq(pub, "garden.health", "2")
+    Check.jsonEq(me, "badges.0", "emblema-carapuca")
+    Check.eqInt("one badge", 1, me.jsonSize("badges"))
+    var shop = user.get("/loja")
+    Check.status(shop, 200)
+    rowIs(shop, "emblema-carapuca", "equipped", "true")
+    rowIs(shop, "emblema-carapuca", "owned", "true")
+    rowIs(shop, "emblema-cachimbo", "owned", "false")
+    rowIs(shop, "moldura-ambar", "equipped", "false")
+    for (var item in items) {
+        rowIs(shop, item, "equipped", "true")
+    }
+    for (var item in items) {
+        var off = user.post("/loja/" + item + "/desequipar", "")
+        Check.status(off, 200)
+        Check.jsonEq(off, "id", item)
+        Check.jsonEq(off, "equipped", "false")
+    }
+    Check.status(user.post("/loja/emblema-carapuca/desequipar", ""), 200)
+    var cleared = user.get("/me")
+    var cut = 0
+    while (cut < fields.size()) {
+        Check.isTrue(fields.get(cut) + " cleared", cleared.jsonIsNull(fields.get(cut)))
+        cut = cut + 1
+    }
+    Check.eqInt("no badges", 0, cleared.jsonSize("badges"))
+}
+
+test "picking an own cover takes the shop banner off" {
+    var app = seasonApp()
+    var user = CosmeticsTestKit.wallet(app, "seasonal-own-cover")
+    buy(user, "banner-saci")
+    Check.status(user.post("/loja/banner-saci/equipar", ""), 200)
+    // Editing other fields (the profile form sends the same cover back) keeps the banner on.
+    Check.status(user.patch("/me/profile", "{\"headline\":\"Dev\"}"), 200)
+    Check.jsonEq(user.get("/me"), "bannerItem", "banner-saci")
+    Check.status(user.patch("/me/profile", "{\"banner\":\"https://ik.imagekit.io/x/capa.jpg\"}"), 200)
+    Check.isTrue("the banner item left", user.get("/me").jsonIsNull("bannerItem"))
+    Check.status(user.post("/loja/banner-saci/equipar", ""), 200)
+    Check.status(user.patch("/me/profile", "{\"bannerHtml\":\"<p>minha capa</p>\"}"), 200)
+    Check.isTrue("the banner item left again", user.get("/me").jsonIsNull("bannerItem"))
+    // Still owned: it can go back on.
+    Check.status(user.post("/loja/banner-saci/equipar", ""), 200)
+}
+
+test "a sixth badge is refused but reordering an equipped one is not" {
+    var app = seasonApp()
+    var user = CosmeticsTestKit.wallet(app, "seasonal-badges")
+    Check.status(user.post("/loja/looks/look-saci/comprar", ""), 200)
+    buy(user, "emblema-morcego")
+    Check.apiError(user.post("/loja/emblema-morcego/equipar", ""), 409, "MAX_BADGES")
+    Check.status(user.post("/loja/emblema-pe/equipar", ""), 200)
+    var me = user.get("/me")
+    Check.jsonEq(me, "badges.0", "emblema-pe")
+    Check.eqInt("still five", 5, me.jsonSize("badges"))
+}
+
+test "official badges cannot be shown without owning them" {
+    var app = seasonApp()
+    var user = CosmeticsTestKit.wallet(app, "seasonal-badge-forge")
+    Check.apiError(user.put("/me/badges", "{\"badges\":[\"emblema-time-saci\"]}"), 403, "NOT_OWNED")
+    buy(user, "emblema-cachimbo")
+    var shown = user.put("/me/badges", "{\"badges\":[\"emblema-cachimbo\",\"https://cdn.test/meu-emblema.png\"]}")
+    Check.status(shown, 200)
+    Check.jsonEq(shown, "badges.0", "emblema-cachimbo")
+}
+
+test "the status accepts free and owned icons only" {
+    var app = seasonApp()
+    var user = CosmeticsTestKit.wallet(app, "seasonal-status")
+    var first = user.put("/me/status", "{\"text\":\"  Tomando um café\\u200b  \",\"icon\":\"cafe\"}")
+    Check.status(first, 200)
+    Check.jsonEq(first, "statusText", "Tomando um café")
+    Check.jsonEq(first, "statusIcon", "cafe")
+    Check.apiError(user.put("/me/status", "{\"text\":\"Procurando\",\"icon\":\"carapuca\"}"), 400, "INVALID_STATUS_ICON")
+    Check.apiError(user.put("/me/status", "{\"text\":\"Oi\",\"icon\":\"url(evil)\"}"), 400, "INVALID_STATUS_ICON")
+    buy(user, "emblema-carapuca")
+    var owned = user.put("/me/status", "{\"text\":\"Procurando\",\"icon\":\"carapuca\"}")
+    Check.status(owned, 200)
+    Check.jsonEq(owned, "statusIcon", "carapuca")
+    Check.apiError(user.put("/me/status", "{\"text\":\"" + longText(61) + "\"}"), 400, "FIELD_TOO_LONG")
+    var cleared = user.put("/me/status", "{\"text\":\"\",\"icon\":null}")
+    Check.status(cleared, 200)
+    Check.isTrue("the text is gone", cleared.jsonIsNull("statusText"))
+    var me = user.get("/me")
+    Check.isTrue("statusText cleared", me.jsonIsNull("statusText"))
+    Check.isTrue("statusIcon cleared", me.jsonIsNull("statusIcon"))
+}
+
+test "equipping a seasonal name style drops the font and color picked before" {
+    var app = seasonApp()
+    var user = CosmeticsTestKit.wallet(app, "seasonal-name-reset")
+    Check.status(user.put("/cosmetics/profile/name-style", "{\"theme\":\"GOLD\",\"font\":\"SERIF\",\"color\":\"#123ABC\"}"), 200)
+    buy(user, "nome-saci")
+    Check.status(user.post("/loja/nome-saci/equipar", ""), 200)
+    var me = user.get("/me")
+    Check.jsonEq(me, "nameTheme", "nome-saci")
+    Check.isTrue("font dropped", me.jsonIsNull("nameFont"))
+    Check.isTrue("color dropped", me.jsonIsNull("nameColor"))
+}
+
+test "the name style accepts free and owned seasonal themes" {
+    var app = seasonApp()
+    var user = CosmeticsTestKit.wallet(app, "seasonal-name-style")
+    var gold = user.put("/cosmetics/profile/name-style", "{\"theme\":\"GOLD\",\"font\":\"SERIF\",\"color\":\"#123ABC\"}")
+    Check.status(gold, 200)
+    Check.jsonEq(gold, "theme", "GOLD")
+    Check.jsonEq(gold, "color", "#123abc")
+    Check.apiError(user.put("/cosmetics/profile/name-style", "{\"theme\":\"nome-assombrado\"}"), 403, "NOT_OWNED")
+    buy(user, "nome-saci")
+    var saci = user.put("/cosmetics/profile/name-style", "{\"theme\":\"nome-saci\"}")
+    Check.status(saci, 200)
+    Check.jsonEq(saci, "theme", "nome-saci")
+    Check.isTrue("no font", saci.jsonIsNull("font"))
+    CosmeticsTestKit.finish()
+}

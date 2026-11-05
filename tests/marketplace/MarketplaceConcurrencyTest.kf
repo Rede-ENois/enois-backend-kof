@@ -1,0 +1,204 @@
+import coin.*
+import economy.*
+import java.util.concurrent.atomic.AtomicInteger
+import kernel.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.testkit.*
+import kernel.time.*
+import marketplace.*
+
+// Port of MarketplaceConcurrencyTests: what only the database can hold under real concurrency (one charge per buy,
+// one financial outcome per decision, one release per purchase) plus the rollback of a failed write. The calls go
+// out together (start gate) from virtual threads, each in its own transaction.
+class McHolder {
+    static AtomicInteger mcGate = new AtomicInteger(0)
+}
+
+TestApp mcApp() = MarketTestKit.app("marketconcurrency")
+
+MarketplaceService mcService() = MarketTestKit.stack().market.service
+
+CoinService mcCoins() = MarketTestKit.stack().coin.service
+
+waitGate() {
+    var waited = 0
+    while (McHolder.mcGate.get() == 0 && waited < 10000) {
+        time.sleep(1)
+        waited = waited + 1
+    }
+}
+
+String codeOf(e: String) {
+    if (Errors.isApi(e)) {
+        return Errors.parse(e).code()
+    }
+    return e
+}
+
+String mcBuy(listingId: String, buyer: String) {
+    waitGate()
+    try {
+        mcService().buy(listingId, buyer)
+        return "BOUGHT"
+    } catch (String e) {
+        return codeOf(e)
+    }
+}
+
+String mcConfirm(purchaseId: String, buyer: String) {
+    waitGate()
+    try {
+        mcService().confirm(purchaseId, buyer)
+        return "OK"
+    } catch (String e) {
+        return codeOf(e)
+    }
+}
+
+String mcRefund(purchaseId: String, buyer: String) {
+    waitGate()
+    try {
+        mcService().refund(purchaseId, buyer)
+        return "OK"
+    } catch (String e) {
+        return codeOf(e)
+    }
+}
+
+String mcRelease() {
+    waitGate()
+    mcService().releaseExpired()
+    return "OK"
+}
+
+MarketplaceListing mcListing() {
+    var marker = Ids.uuid()
+    return mcService().publish("seller-" + marker, "THEME", "item-" + marker, "Tema concorrente", null, MarketplaceService.minPrice())
+}
+
+String mcFundedBuyer() {
+    var buyer = "buyer-" + Ids.uuid()
+    mcCoins().reward(buyer, CoinService.fais(200L), "balance-" + buyer, "Saldo de teste")
+    return buyer
+}
+
+Long mcBalance(id: String) = mcCoins().walletSnapshot(id, id, 50).balance()
+
+Long mcLedger(id: String) = MarketTestKit.stack().coin.core.store.balanceFromLedger(id)
+
+MarketplacePurchase mcExpire(purchase: MarketplacePurchase) {
+    var eightDaysAgo = Time.fromMillis(Time.nowMillis() - 8L * 24L * 3600000L)
+    mcApp().db().execute("update marketplace_purchases set created_at = ? where id = ?", DbParams().bindInstant(eightDaysAgo).bindStr(purchase.id()))
+    return mcService().purchase(purchase.id())
+}
+
+test "simultaneous buys charge the same buyer once" {
+    mcApp()
+    var listing = mcListing()
+    var buyer = mcFundedBuyer()
+    var before = mcBalance(buyer)
+    McHolder.mcGate.set(0)
+    var one = __kof_spawn_expr(mcBuy(listing.id(), buyer))
+    var two = __kof_spawn_expr(mcBuy(listing.id(), buyer))
+    var three = __kof_spawn_expr(mcBuy(listing.id(), buyer))
+    var four = __kof_spawn_expr(mcBuy(listing.id(), buyer))
+    McHolder.mcGate.set(1)
+    var outcomes = listOf(__kof_await(one), __kof_await(two), __kof_await(three), __kof_await(four))
+    var bought = 0
+    for (var o in outcomes) {
+        if (o == "BOUGHT") {
+            bought = bought + 1
+        }
+        else {
+            Check.eqStr("the others are refused as owned", "ITEM_ALREADY_OWNED", o)
+        }
+    }
+    Check.eqInt("exactly one buy", 1, bought)
+    Check.eqInt("one purchase row", 1, mcService().purchasesByBuyer(buyer).size())
+    Check.eqStr("charged once", "" + (before - listing.price()), "" + mcBalance(buyer))
+    Check.eqStr("ledger agrees", "" + mcBalance(buyer), "" + mcLedger(buyer))
+}
+
+test "confirmation and refund have one financial outcome" {
+    mcApp()
+    var round = 0
+    while (round < 4) {
+        round = round + 1
+        var listing = mcListing()
+        var buyer = mcFundedBuyer()
+        var purchase = mcService().buy(listing.id(), buyer)
+        var buyerBefore = mcBalance(buyer)
+        var sellerBefore = mcBalance(listing.sellerId())
+        McHolder.mcGate.set(0)
+        var one = __kof_spawn_expr(mcConfirm(purchase.id(), buyer))
+        var two = __kof_spawn_expr(mcRefund(purchase.id(), buyer))
+        McHolder.mcGate.set(1)
+        var a = __kof_await(one)
+        var b = __kof_await(two)
+        Check.isTrue("one wins, the other finds it decided", a == "OK" && b == "PURCHASE_NOT_HELD" || a == "PURCHASE_NOT_HELD" && b == "OK")
+        var state = mcService().purchase(purchase.id()).state()
+        Check.isTrue("final state", state == "RELEASED" || state == "REFUNDED")
+        var buyerExpected = buyerBefore
+        var sellerExpected = sellerBefore
+        if (state == "REFUNDED") {
+            buyerExpected = buyerBefore + purchase.price()
+        }
+        else {
+            sellerExpected = sellerBefore + purchase.price() * 90L / 100L
+        }
+        Check.eqStr("buyer balance", "" + buyerExpected, "" + mcBalance(buyer))
+        Check.eqStr("seller balance", "" + sellerExpected, "" + mcBalance(listing.sellerId()))
+        Check.eqStr("buyer ledger", "" + mcBalance(buyer), "" + mcLedger(buyer))
+        Check.eqStr("seller ledger", "" + mcBalance(listing.sellerId()), "" + mcLedger(listing.sellerId()))
+    }
+}
+
+test "competing expiry workers release each purchase once" {
+    mcApp()
+    var listing = mcListing()
+    var buyer = mcFundedBuyer()
+    var purchase = mcExpire(mcService().buy(listing.id(), buyer))
+    var sellerBefore = mcBalance(listing.sellerId())
+    var buyerBefore = mcBalance(buyer)
+    McHolder.mcGate.set(0)
+    var w1 = __kof_spawn_expr(mcRelease())
+    var w2 = __kof_spawn_expr(mcRelease())
+    var w3 = __kof_spawn_expr(mcRelease())
+    var w4 = __kof_spawn_expr(mcRelease())
+    McHolder.mcGate.set(1)
+    __kof_await(w1)
+    __kof_await(w2)
+    __kof_await(w3)
+    __kof_await(w4)
+    Check.eqStr("released", "RELEASED", mcService().purchase(purchase.id()).state())
+    Check.eqStr("seller paid once", "" + (sellerBefore + purchase.price() * 90L / 100L), "" + mcBalance(listing.sellerId()))
+    Check.eqStr("buyer untouched", "" + buyerBefore, "" + mcBalance(buyer))
+    Check.eqStr("seller ledger", "" + mcBalance(listing.sellerId()), "" + mcLedger(listing.sellerId()))
+}
+
+test "a failed write rolls back the refund and allows a safe retry" {
+    var app = mcApp()
+    var listing = mcListing()
+    var buyer = mcFundedBuyer()
+    var purchase = mcService().buy(listing.id(), buyer)
+    var before = mcBalance(buyer)
+    // The write of the REFUNDED state fails once: the constraint refuses exactly this purchase.
+    app.db().execute("alter table marketplace_purchases add constraint ck_mc_fail check (state <> \'REFUNDED\' or id <> \'" + purchase.id() + "\')", DbParams())
+    var failed = false
+    try {
+        mcService().refund(purchase.id(), buyer)
+    } catch (String e) {
+        failed = true
+    }
+    app.db().execute("alter table marketplace_purchases drop constraint ck_mc_fail", DbParams())
+    Check.isTrue("the refund failed", failed)
+    Check.eqStr("balance rolled back", "" + before, "" + mcBalance(buyer))
+    Check.eqStr("ledger rolled back", "" + before, "" + mcLedger(buyer))
+    Check.eqStr("still held", "HELD", mcService().purchase(purchase.id()).state())
+    mcService().refund(purchase.id(), buyer)
+    Check.eqStr("refunded after the retry", "" + (before + purchase.price()), "" + mcBalance(buyer))
+    Check.eqStr("ledger agrees", "" + mcBalance(buyer), "" + mcLedger(buyer))
+    MarketTestKit.finish()
+}

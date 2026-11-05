@@ -1,0 +1,238 @@
+import cosmetics.*
+import java.util.HashSet
+import kernel.testkit.*
+import kernel.text.*
+
+// Port of CosmeticCatalogTests: the catalog resource is validated at startup, a broken file must stop the boot.
+CosmeticCatalog shipped() = CosmeticCatalog.load("resources/cosmetics/catalog.json")
+
+List<CatalogCollectionFile> saciCollections() {
+    var windows = listOf<CatalogWindowFile>()
+    windows.add(CatalogWindowFile("10-15", "11-02"))
+    var out = listOf<CatalogCollectionFile>()
+    out.add(CatalogCollectionFile("saci", "Dia do Saci", windows))
+    return out
+}
+
+CatalogItemFile fileItem(order: Int, id: String, kind: String, collection: String?) {
+    var icon = Nulls.str()
+    if (kind == "BADGE") {
+        icon = "pe"
+    }
+    return CatalogItemFile(order, id, kind, collection, id, "", 1000L, null, true, icon)
+}
+
+CatalogLookFile fileLook(id: String?, items: List<String>) = CatalogLookFile(id, "saci", "Saci", items, "pe", "oi")
+
+// Does building the catalog from this file fail with a message that has the fragment?
+Bool failsWith(file: CatalogFile, fragment: String) {
+    try {
+        CosmeticCatalog(file)
+    } catch (String e) {
+        return e.contains(fragment)
+    }
+    return false
+}
+
+Bool allDistinct(rows: List<String>) {
+    var seen = new HashSet<String>()
+    for (var r in rows) {
+        seen.add(r)
+    }
+    return seen.size() == rows.size()
+}
+
+String joined(items: List<String>) = String.join(",", items)
+
+CosmeticItem itemOf(catalog: CosmeticCatalog, id: String) {
+    var item = catalog.item(id)
+    if (item == null) {
+        throw "FAIL missing item " + id
+    }
+    return item
+}
+
+CosmeticLook lookOf(catalog: CosmeticCatalog, id: String) {
+    var look = catalog.look(id)
+    if (look == null) {
+        throw "FAIL missing look " + id
+    }
+    return look
+}
+
+CosmeticCollection collectionOf(catalog: CosmeticCatalog, id: String) {
+    var collection = catalog.collection(id)
+    if (collection == null) {
+        throw "FAIL missing collection " + id
+    }
+    return collection
+}
+
+List<String> lookIds(catalog: CosmeticCatalog, collection: String) {
+    var out = listOf<String>()
+    for (var l in catalog.looksOf(collection)) {
+        out.add(l.id())
+    }
+    return out
+}
+
+test "the shipped catalog loads with every collection and look" {
+    var catalog = shipped()
+    Check.eqInt("items", 356, catalog.allItems().size())
+    Check.eqInt("collections", 13, catalog.allCollections().size())
+    Check.eqInt("ambar order", 1, itemOf(catalog, "moldura-ambar").releaseOrder())
+    Check.eqInt("radar order", 26, itemOf(catalog, "moldura-radar").releaseOrder())
+    Check.isTrue("team badge is a reward", !itemOf(catalog, "emblema-time-saci").purchasable())
+    Check.eqStr("first piece of look-saci", "tema-saci", lookOf(catalog, "look-saci").items().get(0))
+    // A seasonal collection carries just its own look; the ready-made ones live in Essenciais.
+    Check.eqStr("saci looks", "look-saci", joined(lookIds(catalog, "saci")))
+    Check.eqStr("carnaval looks", "look-carnaval", joined(lookIds(catalog, "carnaval")))
+    Check.eqStr("carnaval title", "Destaque", lookOf(catalog, "look-carnaval").title())
+    Check.eqStr("carnaval first piece", "tema-carnaval", lookOf(catalog, "look-carnaval").items().get(0))
+    // Original frames are always on sale, whatever the date.
+    Check.isTrue("ambar on sale in April", catalog.available(itemOf(catalog, "moldura-ambar"), "2026-04-01T12:00:00Z"))
+    Check.isTrue("tema-saci out of season in April", !catalog.available(itemOf(catalog, "tema-saci"), "2026-04-01T12:00:00Z"))
+}
+
+test "essenciais stays on sale all year and its looks are ready made" {
+    var catalog = shipped()
+    var essenciais = collectionOf(catalog, "essenciais")
+    for (var iso in listOf("2026-01-01T12:00:00Z", "2026-04-01T12:00:00Z", "2026-07-15T12:00:00Z", "2026-12-31T12:00:00Z")) {
+        Check.isTrue("essenciais " + iso, catalog.availableCollection(essenciais, iso))
+        Check.isTrue("tema-papel " + iso, catalog.available(itemOf(catalog, "tema-papel"), iso))
+    }
+    Check.eqStr("essenciais looks", "look-papel,look-noite-limpa,look-jardim,look-fim-de-tarde,look-manha-de-domingo,look-carta-na-gaveta,look-sombra-fresca,look-quintal-ao-meio-dia,look-pedra-fria,look-nevoeiro,look-mar-de-pedra", joined(lookIds(catalog, "essenciais")))
+    var bundles = listOf<String>()
+    for (var look in catalog.looksOf("essenciais")) {
+        bundles.add(joined(look.items()))
+        for (var id in look.items()) {
+            Check.isTrue("sellable " + id, itemOf(catalog, id).purchasable())
+        }
+    }
+    // Each ready-made look has its own combination, so the shop never shows the same bundle twice.
+    Check.isTrue("no duplicated bundle", allDistinct(bundles))
+    // The permanent collections are listed last so the shop still opens on the one in season.
+    var all = catalog.allCollections()
+    Check.eqStr("second to last", "essenciais", all.get(all.size() - 2).id)
+    Check.eqStr("last", "aparencias", all.get(all.size() - 1).id)
+}
+
+test "every appearance theme has its own look on sale all year" {
+    var catalog = shipped()
+    var looks = catalog.looksOf("aparencias")
+    Check.eqInt("looks", 85, looks.size())
+    var firsts = listOf<String>()
+    var bundles = listOf<String>()
+    var texts = listOf<String>()
+    for (var look in looks) {
+        Check.isTrue("not Blahaj", look.title() != "Blahaj")
+        // One look per theme of the appearance gallery: its card theme comes first.
+        var theme = itemOf(catalog, look.items().get(0))
+        Check.eqStr("theme kind " + look.id(), "CARD_THEME", theme.kind())
+        Check.eqStr("theme collection " + look.id(), "aparencias", "" + theme.collection())
+        firsts.add(look.items().get(0))
+        bundles.add(joined(look.items()))
+        texts.add("" + look.statusText())
+        for (var iso in listOf("2026-01-01T12:00:00Z", "2026-04-01T12:00:00Z", "2026-11-20T12:00:00Z")) {
+            Check.isTrue("collection on sale " + iso, catalog.availableCollection(collectionOf(catalog, look.collection()), iso))
+        }
+        // Every piece is permanent, so a look never leaves the shop with a season.
+        for (var id in look.items()) {
+            var item = itemOf(catalog, id)
+            Check.isTrue("sellable " + id, item.purchasable())
+            var c = item.collection()
+            var permanent = c == null
+            if (c != null) {
+                permanent = c == "aparencias" || c == "essenciais"
+            }
+            Check.isTrue("permanent " + id, permanent)
+        }
+    }
+    Check.isTrue("one theme per look", allDistinct(firsts))
+    Check.isTrue("no duplicated bundle", allDistinct(bundles))
+    Check.isTrue("no duplicated status", allDistinct(texts))
+    var count = 0
+    for (var item in catalog.allItems()) {
+        if ("" + item.collection() == "aparencias") {
+            count = count + 1
+        }
+    }
+    Check.eqInt("appearance items", 85, count)
+}
+
+test "garden styles are always on sale" {
+    var catalog = shipped()
+    var ids = listOf<String>()
+    for (var item in catalog.allItems()) {
+        if (item.kind() == "GARDEN") {
+            ids.add(item.id())
+            Check.isTrue("no collection " + item.id(), item.collection() == null)
+            Check.isTrue("sellable " + item.id(), item.purchasable())
+            Check.isTrue("on sale in April " + item.id(), catalog.available(item, "2026-04-01T12:00:00Z"))
+        }
+    }
+    Check.eqStr("gardens", "garden-cerrado,garden-mata-atlantica,garden-caatinga,garden-pampa", joined(ids))
+}
+
+test "the season follows the Sao Paulo date, not UTC" {
+    var catalog = shipped()
+    var saci = itemOf(catalog, "tema-saci")
+    // 2026-11-03T01:00Z is still Nov 2nd, 22:00, in Sao Paulo: the last day of the season.
+    Check.isTrue("still in season", catalog.available(saci, "2026-11-03T01:00:00Z"))
+    Check.isTrue("season over", !catalog.available(saci, "2026-11-03T03:30:00Z"))
+}
+
+test "a duplicated id fails" {
+    var items = listOf<CatalogItemFile>()
+    items.add(fileItem(1, "a", "FRAME", null))
+    items.add(fileItem(2, "a", "FRAME", null))
+    Check.isTrue("duplicated catalog id", failsWith(CatalogFile(saciCollections(), items, listOf<CatalogLookFile>()), "duplicated catalog id"))
+}
+
+test "a look with an unknown item fails" {
+    var items = listOf<CatalogItemFile>()
+    items.add(fileItem(1, "tema-saci", "CARD_THEME", "saci"))
+    var looks = listOf<CatalogLookFile>()
+    looks.add(fileLook(null, listOf("tema-saci", "nao-existe")))
+    Check.isTrue("unknown item", failsWith(CatalogFile(saciCollections(), items, looks), "nao-existe"))
+}
+
+test "a named look keeps its id and an unnamed one falls back to the collection" {
+    var items = listOf<CatalogItemFile>()
+    items.add(fileItem(1, "tema-saci", "CARD_THEME", "saci"))
+    var looks = listOf<CatalogLookFile>()
+    looks.add(fileLook(null, listOf("tema-saci")))
+    looks.add(fileLook("look-mata-fechada", listOf("tema-saci")))
+    var catalog = CosmeticCatalog(CatalogFile(saciCollections(), items, looks))
+    Check.eqStr("look ids", "look-saci,look-mata-fechada", joined(lookIds(catalog, "saci")))
+}
+
+test "a duplicated or unsafe look id fails" {
+    var items = listOf<CatalogItemFile>()
+    items.add(fileItem(1, "tema-saci", "CARD_THEME", "saci"))
+    var twice = listOf<CatalogLookFile>()
+    twice.add(fileLook("look-repetido", listOf("tema-saci")))
+    twice.add(fileLook("look-repetido", listOf("tema-saci")))
+    Check.isTrue("duplicated look", failsWith(CatalogFile(saciCollections(), items, twice), "Duplicated look"))
+    var unsafe = listOf<CatalogLookFile>()
+    unsafe.add(fileLook("Look Saci", listOf("tema-saci")))
+    Check.isTrue("unsafe look id", failsWith(CatalogFile(saciCollections(), items, unsafe), "Invalid look id"))
+}
+
+test "an unparseable season window fails" {
+    var windows = listOf<CatalogWindowFile>()
+    windows.add(CatalogWindowFile("10-15", "11-31"))
+    var collections = listOf<CatalogCollectionFile>()
+    collections.add(CatalogCollectionFile("saci", "Dia do Saci", windows))
+    Check.isTrue("11-31", failsWith(CatalogFile(collections, listOf<CatalogItemFile>(), listOf<CatalogLookFile>()), "INVALID_SEASON_WINDOW"))
+}
+
+test "a duplicated release order and an unknown collection fail" {
+    var sameOrder = listOf<CatalogItemFile>()
+    sameOrder.add(fileItem(1, "a", "FRAME", null))
+    sameOrder.add(fileItem(1, "b", "FRAME", null))
+    Check.isTrue("release order", failsWith(CatalogFile(saciCollections(), sameOrder, listOf<CatalogLookFile>()), "duplicated release order"))
+    var orphan = listOf<CatalogItemFile>()
+    orphan.add(fileItem(1, "a", "FRAME", "natal"))
+    Check.isTrue("unknown collection", failsWith(CatalogFile(saciCollections(), orphan, listOf<CatalogLookFile>()), "Unknown collection"))
+}

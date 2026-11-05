@@ -1,0 +1,104 @@
+package economy
+
+import coin.*
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import marketplace.*
+import notifications.*
+import profile.*
+import themes.*
+
+class MarketStack {
+    ProfileModule profiles
+    CoinModule coin
+    ThemeModule themes
+    MarketplaceModule market
+    SharedServices shared
+    public constructor(profiles: ProfileModule, coin: CoinModule, themes: ThemeModule, market: MarketplaceModule, shared: SharedServices) {
+        this.profiles = profiles
+        this.coin = coin
+        this.themes = themes
+        this.market = market
+        this.shared = shared
+    }
+}
+
+// Test support of the marketplace: profile, notifications, coin, themes and the marketplace over the same request
+// pipeline as Main.kf. The jobs of the marketplace are parked (a day of initial delay): tests call the workers.
+//
+//   var app = MarketTestKit.app("mktflow")
+//   var buyer = MarketTestKit.login(app, "mkt-buyer")
+class MarketTestKit {
+    static MarketStack? marketStackHandle = null
+    static TestApp? marketAppHandle = null
+    static TestApp app(name: String) {
+        var cur = MarketTestKit.marketAppHandle
+        if (cur != null) {
+            return cur
+        }
+        var overrides = new HashMap<String, String>()
+        overrides.put("REDE_MARKETPLACE_RELEASE_INITIAL_DELAY_MS", "86400000")
+        overrides.put("REDE_MARKETPLACE_SANITIZE_INITIAL_DELAY_MS", "86400000")
+        overrides.put("REDE_MARKETPLACE_GALLERY_IMPORT_INITIAL_DELAY_MS", "86400000")
+        var created = DomainTestKit.boot(name, overrides, (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+    MarketTestKit.wire(p, s, parts)
+})
+        MarketTestKit.marketAppHandle = created
+        return created
+    }
+    static wire(p: Platform, shared: SharedServices, parts: SecurityParts) {
+        var hooks = SecurityHooks.defaults(p.db)
+        var profiles = ProfileModule.install(p, shared, hooks)
+        var core = CoinCore.create(p, shared, parts)
+        var seams = NotificationsSeams(p)
+        seams.coins = CoinNotificationCoins(core.service)
+        var notifications = NotificationsModule.installWith(p, shared, seams)
+        var coin = CoinModule.install(p, shared, parts, core, profiles, notifications)
+        var themes = ThemeModule.install(p, shared, hooks)
+        var market = MarketplaceModule.install(p, shared, coin, profiles, themes)
+        MarketTestKit.marketStackHandle = MarketStack(profiles, coin, themes, market, shared)
+    }
+    static MarketStack stack() {
+        var s = MarketTestKit.marketStackHandle
+        if (s == null) {
+            throw "MarketTestKit: boot the app first"
+        }
+        return s
+    }
+    static ProfileCaller login(app: TestApp, id: String) = ProfileTestApp.login(app, id)
+    static ProfileCaller loginAdmin(app: TestApp, id: String) {
+        var caller = ProfileTestApp.login(app, id)
+        app.db().execute("update users set is_admin = ? where id = ?", DbParams().bindBool(true).bindStr(id))
+        return caller
+    }
+    static ProfileCaller anonymous(app: TestApp) = ProfileTestApp.anonymous(app)
+    // Last test of a file: stops the background jobs.
+    static finish() {
+        MarketTestKit.stack().shared.stop()
+    }
+    // The sparks of an account, in thousandths (the wallet endpoint).
+    static Long balance(who: ProfileCaller) {
+        var res = who.get("/carteira")
+        Check.status(res, 200)
+        var v = res.jsonStr("balance")
+        if (v == null) {
+            return 0L
+        }
+        return v.toLong()
+    }
+    static String str(res: TestResponse, path: String) {
+        var v = res.jsonStr(path)
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    // Gives sparks (test balance) through the real ledger.
+    static fund(accountId: String, amount: Long, ref: String) {
+        MarketTestKit.stack().coin.service.reward(accountId, amount, ref, "Saldo de teste")
+    }
+    // A complete theme package (the gallery refuses anything shorter).
+    static String themePackage(bg: String, strong: String) = "{\"palette\":{\"background\":\"" + bg + "\",\"surface\":\"" + bg + "\",\"muted\":\"" + bg + "\",\"border\":\"" + bg + "\",\"primary\":\"#7c3aed\",\"onPrimary\":\"#ffffff\",\"soft\":\"#ede8f5\",\"text\":{\"strong\":\"" + strong + "\",\"subtle\":\"#555555\",\"date\":\"#777777\"},\"radius\":\"8px\"}}"
+}

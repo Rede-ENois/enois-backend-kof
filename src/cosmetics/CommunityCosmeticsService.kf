@@ -1,0 +1,507 @@
+package cosmetics
+
+import coin.*
+import java.util.HashMap
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.text.*
+import profile.*
+
+// The use cases of the visuals created by the community; separate from the native shop. Name styles live here too (the
+// theme is a free preset or a NAME_STYLE shop item the person owns).
+class CommunityCosmeticsService {
+    CosmeticsStore store
+    CosmeticCatalog shopCatalog
+    CosmeticsService shop
+    ProfileDirectory directory
+    ProfileSlots slots
+    CosmeticsContributors contributors
+    public constructor(store: CosmeticsStore, shopCatalog: CosmeticCatalog, shop: CosmeticsService, directory: ProfileDirectory, slots: ProfileSlots, contributors: CosmeticsContributors) {
+        this.store = store
+        this.shopCatalog = shopCatalog
+        this.shop = shop
+        this.directory = directory
+        this.slots = slots
+        this.contributors = contributors
+    }
+    static Int maxManifestChars() = 16384
+    static Int maxDescriptionChars() = 300
+    static String hexPattern() = "#[0-9a-fA-F]{6}"
+    static List<String> licenses() = listOf("ORIGINAL", "OPEN_SOURCE", "COMMERCIAL_LICENSE")
+    static List<String> nameThemes() = listOf("DEFAULT", "PIXEL", "GOTHIC", "NEON", "GLITCH", "CANDY", "RETRO", "OCEAN", "SUNSET", "MATRIX", "GOLD", "ICE")
+    static List<String> nameFonts() = listOf("SYSTEM", "SERIF", "MONO", "ROUNDED", "DISPLAY", "PIXEL", "GOTHIC", "CURSIVE", "CONDENSED", "COMIC", "SLAB")
+    static List<String> kinds() = listOf("FONT", "PALETTE", "EFFECT", "PROFILE_BORDER", "BUNDLE")
+    static List<String> allowedKeys(kind: String) {
+        if (kind == "FONT") {
+            return listOf("version", "kind", "family", "assetRef", "fallback")
+        }
+        if (kind == "PALETTE") {
+            return listOf("version", "kind", "colors")
+        }
+        if (kind == "EFFECT") {
+            return listOf("version", "kind", "effect")
+        }
+        if (kind == "PROFILE_BORDER") {
+            return listOf("version", "kind", "layers")
+        }
+        return listOf("version", "kind", "cosmeticIds")
+    }
+    // ---- profile name style and contributor tag
+    // Theme: one of the free presets, or the id of a NAME_STYLE shop item the person owns (stored as the id, e.g.
+    // "nome-saci"). Font and color are optional (null = design system default).
+    ProfileRecord updateNameStyle(userId: String, theme: String?, font: String?, color: String?) {
+        var normalizedTheme = this.normalizeTheme(userId, theme)
+        if (font != null) {
+            if (!CommunityCosmeticsService.nameFonts().contains(font)) {
+                throw Errors.api(400, "INVALID_NAME_FONT", "Fonte de nome inválida.")
+            }
+        }
+        var normalizedColor = Nulls.str()
+        if (color != null) {
+            if (!Regexes.matches(CommunityCosmeticsService.hexPattern(), color)) {
+                throw Errors.api(400, "INVALID_NAME_COLOR", "A cor do nome precisa ser hexadecimal.")
+            }
+            normalizedColor = color.toLowerCase()
+        }
+        this.profile(userId)
+        slots.updateNameStyle(userId, normalizedTheme, font, normalizedColor, EconomyClock.nowIso())
+        return this.profile(userId)
+    }
+    String normalizeTheme(userId: String, theme: String?) {
+        var trimmed = "DEFAULT"
+        if (theme != null) {
+            if (theme.trim().length() > 0) {
+                trimmed = theme.trim()
+            }
+        }
+        var shopTheme = shopCatalog.item(trimmed)
+        if (shopTheme != null) {
+            if (shopTheme.kind() == "NAME_STYLE") {
+                if (!shop.owns(userId, trimmed)) {
+                    throw Errors.api(403, "NOT_OWNED", "Você precisa ter este estilo de nome antes de usar.")
+                }
+                return trimmed
+            }
+        }
+        var preset = trimmed.toUpperCase()
+        if (!CommunityCosmeticsService.nameThemes().contains(preset)) {
+            throw Errors.api(400, "INVALID_NAME_THEME", "Tema de nome inválido.")
+        }
+        return preset
+    }
+    // Color of the "Contribuinte" tag; only who has a contribution verified by GitHub may choose (null = default).
+    ProfileRecord updateContributorTagColor(userId: String, color: String?) {
+        if (!contributors.isVerified(userId)) {
+            throw Errors.api(403, "CONTRIBUTOR_NOT_VERIFIED", "A tag de contribuinte é exclusiva de quem tem contribuição verificada pelo GitHub.")
+        }
+        var normalized = Nulls.str()
+        if (color != null) {
+            if (color.trim().length() > 0) {
+                normalized = color.trim().toLowerCase()
+            }
+        }
+        if (normalized != null) {
+            if (!Regexes.matches(CommunityCosmeticsService.hexPattern(), normalized)) {
+                throw Errors.api(400, "INVALID_CONTRIBUTOR_TAG_COLOR", "A cor da tag precisa ser hexadecimal.")
+            }
+        }
+        this.profile(userId)
+        slots.updateContributorTagColor(userId, normalized, EconomyClock.nowIso())
+        return this.profile(userId)
+    }
+    ProfileRecord profile(userId: String) {
+        var p = directory.findById(userId)
+        if (p == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Perfil não encontrado.")
+        }
+        return p
+    }
+    // ---- community cosmetics
+    CommunityCosmetic createDraft(creatorId: String, rawKind: String?, name: String?, description: String?, manifestJson: String?, license: String?, rightsConfirmed: Troolean) {
+        var kind = this.parseKind(rawKind)
+        this.validateFields(name, description, license, rightsConfirmed == true)
+        this.validateManifest(kind, manifestJson)
+        var now = EconomyClock.nowIso()
+        // validateFields/validateManifest proved these are present
+        var cleanName = CommunityCosmeticsService.text(name)
+        var cleanLicense = CommunityCosmeticsService.text(license)
+        var cleanManifest = CommunityCosmeticsService.text(manifestJson)
+        var cleanDescription = Nulls.str()
+        if (description != null) {
+            if (description.trim().length() > 0) {
+                cleanDescription = description.trim()
+            }
+        }
+        var created = CommunityCosmetic(Ids.prefixed("pcos_"), creatorId, kind, cleanName.trim(), cleanDescription, cleanManifest.trim(), cleanLicense.trim().toUpperCase(), true, "DRAFT", 1, 0, now, now)
+        store.insertCommunity(created)
+        return created
+    }
+    static String text(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    CommunityCosmetic update(id: String, creatorId: String, name: String?, description: String?, manifestJson: String?, license: String?, rightsConfirmed: Troolean) {
+        var existing = this.owned(id, creatorId)
+        if (existing.status() != "DRAFT" && existing.status() != "REJECTED") {
+            throw Errors.api(409, "COSMETIC_NOT_EDITABLE", "Este visual já foi enviado para moderação.")
+        }
+        if (name != null) {
+            this.validateName(name)
+        }
+        if (description != null) {
+            this.validateDescription(description)
+        }
+        if (manifestJson != null) {
+            this.validateManifest(existing.kind(), manifestJson)
+        }
+        var effectiveRights = existing.rightsConfirmed()
+        if (rightsConfirmed == true) {
+            effectiveRights = true
+        }
+        else 
+            if (rightsConfirmed == false) {
+                effectiveRights = false
+            }
+        if (license != null || rightsConfirmed != null) {
+            var nameForCheck = existing.name()
+            if (name != null) {
+                nameForCheck = name
+            }
+            var licenseForCheck = existing.license()
+            if (license != null) {
+                licenseForCheck = license
+            }
+            this.validateFields(nameForCheck, description, licenseForCheck, effectiveRights)
+        }
+        var nextName = existing.name()
+        if (name != null) {
+            nextName = name.trim()
+        }
+        var nextDescription = existing.description()
+        if (description != null) {
+            if (description.trim().length() == 0) {
+                nextDescription = Nulls.str()
+            }
+            else {
+                nextDescription = description.trim()
+            }
+        }
+        var nextManifest = existing.manifestJson()
+        if (manifestJson != null) {
+            nextManifest = manifestJson.trim()
+        }
+        var nextLicense = existing.license()
+        if (license != null) {
+            nextLicense = license.trim().toUpperCase()
+        }
+        var nextStatus = existing.status()
+        if (nextStatus == "REJECTED") {
+            nextStatus = "DRAFT"
+        }
+        var edited = CommunityCosmetic(existing.id(), existing.creatorId(), existing.kind(), nextName, nextDescription, nextManifest, nextLicense, effectiveRights, nextStatus, existing.version() + 1, existing.reported(), existing.createdAt(), EconomyClock.nowIso())
+        if (!store.updateCommunityEdit(edited)) {
+            throw Errors.api(409, "COSMETIC_NOT_EDITABLE", "Este visual já foi enviado para moderação.")
+        }
+        return edited
+    }
+    CommunityCosmetic submit(id: String, creatorId: String) {
+        var existing = this.owned(id, creatorId)
+        if (existing.status() != "DRAFT") {
+            throw Errors.api(409, "COSMETIC_NOT_EDITABLE", "Só um rascunho pode ser enviado para moderação.")
+        }
+        if (!store.submitCommunity(id, EconomyClock.nowIso())) {
+            throw Errors.api(409, "COSMETIC_NOT_EDITABLE", "Só um rascunho pode ser enviado para moderação.")
+        }
+        return this.find(id)
+    }
+    // At most `limit` (1..100) published visuals, filtered by kind after the limit (as the Java list did).
+    List<CommunityCosmetic> catalog(limit: Int, rawKind: String?) {
+        var kind = Nulls.str()
+        if (rawKind != null) {
+            if (rawKind.trim().length() > 0) {
+                kind = this.parseKind(rawKind)
+            }
+        }
+        var capped = limit
+        if (capped > 100) {
+            capped = 100
+        }
+        if (capped < 1) {
+            capped = 1
+        }
+        var out = listOf<CommunityCosmetic>()
+        for (var c in store.communityByStatus("PUBLISHED", capped)) {
+            if (kind == null) {
+                out.add(c)
+            }
+            else 
+                if (c.kind() == kind) {
+                    out.add(c)
+                }
+        }
+        return out
+    }
+    CommunityCosmetic getPublished(id: String) {
+        var item = this.find(id)
+        if (item.status() != "PUBLISHED") {
+            throw Errors.api(404, "COSMETIC_NOT_FOUND", "Visual não encontrado no catálogo.")
+        }
+        return item
+    }
+    List<CommunityCosmetic> mine(creatorId: String) = store.communityByCreator(creatorId, 50)
+    report(id: String) {
+        var item = this.find(id)
+        if (item.status() != "PUBLISHED") {
+            throw Errors.api(404, "COSMETIC_NOT_FOUND", "Visual não encontrado no catálogo.")
+        }
+        store.reportCommunity(id, EconomyClock.nowIso())
+    }
+    CommunityCosmetic owned(id: String, creatorId: String) {
+        var item = this.find(id)
+        if (item.creatorId() != creatorId) {
+            throw Errors.api(403, "NOT_AUTHORIZED", "Só o criador pode editar este visual.")
+        }
+        return item
+    }
+    CommunityCosmetic find(id: String) {
+        var item = store.findCommunity(id)
+        if (item == null) {
+            throw Errors.api(404, "COSMETIC_NOT_FOUND", "Visual não encontrado.")
+        }
+        return item
+    }
+    String parseKind(raw: String?) {
+        if (raw == null) {
+            throw Errors.api(400, "INVALID_COSMETIC_KIND", "Tipo de visual é obrigatório.")
+        }
+        if (raw.trim().length() == 0) {
+            throw Errors.api(400, "INVALID_COSMETIC_KIND", "Tipo de visual é obrigatório.")
+        }
+        var kind = raw.trim().toUpperCase()
+        if (!CommunityCosmeticsService.kinds().contains(kind)) {
+            throw Errors.api(400, "INVALID_COSMETIC_KIND", "Tipo de visual inválido.")
+        }
+        return kind
+    }
+    validateFields(name: String?, description: String?, license: String?, rightsConfirmed: Bool) {
+        this.validateName(name)
+        this.validateDescription(description)
+        if (license == null) {
+            throw Errors.api(400, "INVALID_COSMETIC_LICENSE", "A licença do visual é inválida.")
+        }
+        if (!CommunityCosmeticsService.licenses().contains(license.trim().toUpperCase())) {
+            throw Errors.api(400, "INVALID_COSMETIC_LICENSE", "A licença do visual é inválida.")
+        }
+        if (!rightsConfirmed) {
+            throw Errors.api(400, "RIGHTS_CONFIRMATION_REQUIRED", "Confirme que você tem autorização para publicar este visual.")
+        }
+    }
+    validateName(name: String?) {
+        if (name == null) {
+            throw Errors.api(400, "INVALID_COSMETIC_NAME", "O nome precisa de 3 a 80 caracteres.")
+        }
+        var size = name.trim().length()
+        if (size < 3 || size > 80) {
+            throw Errors.api(400, "INVALID_COSMETIC_NAME", "O nome precisa de 3 a 80 caracteres.")
+        }
+    }
+    validateDescription(description: String?) {
+        if (description != null) {
+            if (description.trim().length() > CommunityCosmeticsService.maxDescriptionChars()) {
+                throw Errors.api(400, "INVALID_COSMETIC_DESCRIPTION", "A descrição passa de " + CommunityCosmeticsService.maxDescriptionChars() + " caracteres.")
+            }
+        }
+    }
+    // ---- manifest (declarative: no code, no external URLs)
+    validateManifest(kind: String, manifestJson: String?) {
+        if (manifestJson == null) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "Manifest inválido ou grande demais.")
+        }
+        if (manifestJson.trim().length() == 0 || manifestJson.length() > CommunityCosmeticsService.maxManifestChars()) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "Manifest inválido ou grande demais.")
+        }
+        var lower = manifestJson.toLowerCase()
+        for (var forbidden in listOf("<script", "<style", "javascript:", "@import", "url(", "expression(", "data:")) {
+            if (lower.contains(forbidden)) {
+                throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "O manifest não pode conter código ou URLs externos.")
+            }
+        }
+        var trimmed = manifestJson.trim()
+        var root = new HashMap<String, Object>()
+        if (trimmed.startsWith("[")) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "Versão ou tipo do manifest não corresponde ao visual.")
+        }
+        if (!trimmed.startsWith("{")) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "O manifest precisa ser um JSON válido.")
+        }
+        try {
+            root = json.decode<Map<String,Object>>(trimmed)
+        } catch (String bad) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "O manifest precisa ser um JSON válido.")
+        }
+        var version = root.get("version")
+        var kindValue = root.get("kind")
+        if (!CommunityCosmeticsService.isOne(version) || kindValue == null || "" + kindValue != kind) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "Versão ou tipo do manifest não corresponde ao visual.")
+        }
+        var allowed = CommunityCosmeticsService.allowedKeys(kind)
+        for (var key in root.keys()) {
+            if (!allowed.contains(key)) {
+                throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "O manifest contém campos não permitidos.")
+            }
+        }
+        if (kind == "FONT") {
+            this.validateFont(root)
+        }
+        else 
+            if (kind == "PALETTE") {
+                this.validatePalette(root)
+            }
+            else 
+                if (kind == "EFFECT") {
+                    this.validateEffect(root)
+                }
+                else 
+                    if (kind == "PROFILE_BORDER") {
+                        this.validateLayers(root)
+                    }
+                    else {
+                        this.validateBundle(root)
+                    }
+    }
+    // JSON values come back as Object: a failed cast is the type test (a thrown String).
+    static Map<String,Object>? asMap(v: Object?) {
+        if (v == null) {
+            return null
+        }
+        try {
+            var m = v as Map<String,Object>
+            return m
+        } catch (String e) {
+            return null
+        }
+    }
+    static List<Object>? asList(v: Object?) {
+        if (v == null) {
+            return null
+        }
+        try {
+            var l = v as List<Object>
+            return l
+        } catch (String e) {
+            return null
+        }
+    }
+    static String? asString(v: Object?) {
+        if (v == null) {
+            return null
+        }
+        try {
+            var s = v as String
+            return s
+        } catch (String e) {
+            return null
+        }
+    }
+    // A JSON number: not a string, an object, an array, a boolean or null.
+    static Bool isNumber(v: Object?) {
+        if (v == null) {
+            return false
+        }
+        if (CommunityCosmeticsService.asString(v) != null) {
+            return false
+        }
+        if (CommunityCosmeticsService.asMap(v) != null) {
+            return false
+        }
+        if (CommunityCosmeticsService.asList(v) != null) {
+            return false
+        }
+        return Regexes.matches("-?[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?", "" + v)
+    }
+    // JsonNode.isNumber() && asInt() == 1 (asInt truncates, so 1.5 reads as 1).
+    static Bool isOne(v: Object?) {
+        if (!CommunityCosmeticsService.isNumber(v)) {
+            return false
+        }
+        var text = "" + v
+        var d = text.toDouble()
+        return d >= 1.0 && d < 2.0
+    }
+    validateFont(root: Map<String,Object>) {
+        var family = ""
+        var raw = root.get("family")
+        if (raw != null) {
+            family = "" + raw
+        }
+        if (!Regexes.matches("[A-Za-zÀ-ÿ][A-Za-z0-9À-ÿ _-]{0,63}", family)) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "A fonte precisa informar uma família válida.")
+        }
+    }
+    validatePalette(root: Map<String,Object>) {
+        var colors = CommunityCosmeticsService.asMap(root.get("colors"))
+        if (colors == null) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "A paleta precisa ter de 2 a 16 cores.")
+        }
+        if (colors.size() < 2 || colors.size() > 16) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "A paleta precisa ter de 2 a 16 cores.")
+        }
+        for (var key in colors.keys()) {
+            var text = CommunityCosmeticsService.asString(colors.get(key))
+            if (text == null) {
+                throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "As cores devem ser hexadecimais de 6 dígitos.")
+            }
+            if (!Regexes.matches(CommunityCosmeticsService.hexPattern(), text)) {
+                throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "As cores devem ser hexadecimais de 6 dígitos.")
+            }
+        }
+    }
+    validateEffect(root: Map<String,Object>) {
+        var effect = CommunityCosmeticsService.asMap(root.get("effect"))
+        if (effect == null) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "O efeito precisa informar um tipo válido.")
+        }
+        var effectType = CommunityCosmeticsService.asString(effect.get("type"))
+        if (effectType == null) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "O efeito precisa informar um tipo válido.")
+        }
+        if (effectType.length() > 32) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "O efeito precisa informar um tipo válido.")
+        }
+    }
+    validateLayers(root: Map<String,Object>) {
+        var layers = CommunityCosmeticsService.asList(root.get("layers"))
+        if (layers == null) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "A borda precisa ter de 1 a 4 camadas.")
+        }
+        if (layers.size() < 1 || layers.size() > 4) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "A borda precisa ter de 1 a 4 camadas.")
+        }
+        for (var layer in layers) {
+            if (CommunityCosmeticsService.asMap(layer) == null) {
+                throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "Cada camada da borda precisa ser declarativa.")
+            }
+        }
+    }
+    validateBundle(root: Map<String,Object>) {
+        var ids = CommunityCosmeticsService.asList(root.get("cosmeticIds"))
+        if (ids == null) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "O pacote precisa ter de 1 a 12 cosméticos.")
+        }
+        if (ids.size() < 1 || ids.size() > 12) {
+            throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "O pacote precisa ter de 1 a 12 cosméticos.")
+        }
+        for (var id in ids) {
+            var text = CommunityCosmeticsService.asString(id)
+            if (text == null) {
+                throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "O pacote contém um cosmético inválido.")
+            }
+            if (text.trim().length() == 0) {
+                throw Errors.api(400, "INVALID_COSMETIC_MANIFEST", "O pacote contém um cosmético inválido.")
+            }
+        }
+    }
+}

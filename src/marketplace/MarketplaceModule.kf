@@ -1,0 +1,34 @@
+package marketplace
+
+import coin.*
+import kernel.*
+import profile.*
+import themes.*
+
+// Composition of the marketplace: store, service, routes and the three jobs (hourly auto-release, theme import and
+// leftovers cleanup). Main.kf calls MarketplaceModule.install(platform, shared, coin, profiles, themes) after the
+// coin, profile and themes modules.
+class MarketplaceModule {
+    MarketplaceService service
+    MarketplaceSanitizer sanitizer
+    MarketplaceGalleryImport galleryImport
+    public constructor(service: MarketplaceService, sanitizer: MarketplaceSanitizer, galleryImport: MarketplaceGalleryImport) {
+        this.service = service
+        this.sanitizer = sanitizer
+        this.galleryImport = galleryImport
+    }
+    static MarketplaceModule install(platform: Platform, shared: SharedServices, coin: CoinModule, profiles: ProfileModule, themes: ThemeModule) {
+        var cfg = platform.cfg
+        var store = MarketplaceStore(platform.db)
+        var service = MarketplaceService(platform.db, store, coin.service)
+        var themeStore = ThemeStore(platform.db)
+        var suspicion = MarketplaceSuspicion(cfg.getStr("REDE_SECURITY_SUSPICIOUS_NAME_PATTERNS", "probe"))
+        var galleryImport = MarketplaceGalleryImport(themeStore, service, shared.sanctionReader, profiles.directory, suspicion)
+        var sanitizer = MarketplaceSanitizer(service, themeStore, store, shared.sanctionReader, profiles.directory, suspicion, galleryImport)
+        MarketplaceRoutes.register(platform.server, service, themes.service, sanitizer, profiles.directory, shared.idempotency)
+        shared.jobs.fixedDelay("marketplace-release-expired", cfg.getLong("REDE_MARKETPLACE_RELEASE_INITIAL_DELAY_MS", 600000L), cfg.getLong("REDE_MARKETPLACE_RELEASE_DELAY_MS", 3600000L), () -> service.releaseExpired())
+        shared.jobs.fixedDelay("marketplace-sanitize", cfg.getLong("REDE_MARKETPLACE_SANITIZE_INITIAL_DELAY_MS", 90000L), cfg.getLong("REDE_MARKETPLACE_SANITIZE_DELAY_MS", 3600000L), () -> sanitizer.sanitizeNow())
+        shared.jobs.fixedDelay("marketplace-gallery-import", cfg.getLong("REDE_MARKETPLACE_GALLERY_IMPORT_INITIAL_DELAY_MS", 90000L), cfg.getLong("REDE_MARKETPLACE_GALLERY_IMPORT_DELAY_MS", 3600000L), () -> galleryImport.importPublishedThemes())
+        return MarketplaceModule(service, sanitizer, galleryImport)
+    }
+}

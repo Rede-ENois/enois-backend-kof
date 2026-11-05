@@ -1,0 +1,165 @@
+package cosmetics
+
+import coin.*
+import java.util.LinkedHashMap
+import kernel.config.*
+import kernel.db.*
+import kernel.error.*
+import kernel.time.*
+
+// The free events of the Saci collection: the Saci x Halloween duel (pick a team, get the team badge; the winning team
+// gets the victory badge) and the Saci hunt (7 hiding places; who finds them all gets the badge). The windows come from
+// the configuration so QA can move them.
+class CosmeticEventService {
+    Db database
+    CosmeticsStore store
+    String duelStartsAt
+    String duelEndsAt
+    String huntStartsAt
+    String huntEndsAt
+    public constructor(database: Db, store: CosmeticsStore, cfg: Config) {
+        this.database = database
+        this.store = store
+        this.duelStartsAt = CosmeticEventService.instant(cfg.getStr("REDE_COSMETICS_EVENTS_DUEL_STARTS_AT", "2026-10-31T00:00:00"))
+        this.duelEndsAt = CosmeticEventService.instant(cfg.getStr("REDE_COSMETICS_EVENTS_DUEL_ENDS_AT", "2026-10-31T23:59:59"))
+        this.huntStartsAt = CosmeticEventService.instant(cfg.getStr("REDE_COSMETICS_EVENTS_HUNT_STARTS_AT", "2026-10-31T00:00:00"))
+        this.huntEndsAt = CosmeticEventService.instant(cfg.getStr("REDE_COSMETICS_EVENTS_HUNT_ENDS_AT", "2026-10-31T23:59:59"))
+        CosmeticEventService.requireOrdered(duelStartsAt, duelEndsAt)
+        CosmeticEventService.requireOrdered(huntStartsAt, huntEndsAt)
+    }
+    static String duelId() = "saci-halloween"
+    static String huntId() = "caca-saci"
+    static List<String> teams() = listOf("saci", "halloween")
+    static List<String> spots() = listOf("feed", "vagas", "comunidades", "blog", "carteira", "mensagens", "perfil")
+    // A local São Paulo date time as an instant ("2026-10-31T00:00:00" -> 2026-10-31T03:00:00Z).
+    static String instant(local: String) = ZoneDates.localToInstant(local, "America/Sao_Paulo")
+    static requireOrdered(startsAt: String, endsAt: String) {
+        if (Time.toMillis(endsAt) < Time.toMillis(startsAt)) {
+            throw "Event window ends before it starts: " + startsAt + " - " + endsAt
+        }
+    }
+    // Inclusive window: active from the first to the last instant.
+    static Bool active(startsAt: String, endsAt: String, nowMs: Long) = nowMs >= Time.toMillis(startsAt) && nowMs <= Time.toMillis(endsAt)
+    static Long countOf(counts: Map<String,Long>, team: String) {
+        var n = counts.get(team)
+        if (n == null) {
+            return 0L
+        }
+        return n
+    }
+    // The duel state. After the end, the first reads grant the victory badge to the winning team (a tie makes both teams
+    // win); the grant is idempotent, so concurrent readers are harmless.
+    CosmeticDuelView duel(viewerId: String?) {
+        var now = EconomyClock.nowIso()
+        var nowMs = Time.toMillis(now)
+        Map<String,Long> counts = new LinkedHashMap<String, Long>()
+        var stored = store.countByChoice(CosmeticEventService.duelId())
+        for (var team in CosmeticEventService.teams()) {
+            counts.put(team, CosmeticEventService.countOf(stored, team))
+        }
+        var winner = Nulls.str()
+        if (nowMs > Time.toMillis(duelEndsAt)) {
+            var saci = CosmeticEventService.countOf(counts, "saci")
+            var halloween = CosmeticEventService.countOf(counts, "halloween")
+            var top = saci
+            if (halloween > top) {
+                top = halloween
+            }
+            for (var team in CosmeticEventService.teams()) {
+                if (CosmeticEventService.countOf(counts, team) == top) {
+                    store.grantToChoosers(CosmeticEventService.duelId(), team, "emblema-vitoria-" + team, "evento:" + CosmeticEventService.duelId(), now)
+                }
+            }
+            // A tie has no single winner to report; both teams got the victory badge.
+            if (saci > halloween) {
+                winner = "saci"
+            }
+            else 
+                if (halloween > saci) {
+                    winner = "halloween"
+                }
+        }
+        var myChoice = Nulls.str()
+        if (viewerId != null) {
+            myChoice = store.choiceOf(CosmeticEventService.duelId(), viewerId)
+        }
+        return CosmeticDuelView(CosmeticEventService.active(duelStartsAt, duelEndsAt, nowMs), duelStartsAt, duelEndsAt, counts, myChoice, winner)
+    }
+    // One choice per person, only while the duel is on; the team badge comes with the choice.
+    CosmeticDuelView choose(userId: String, choice: String?) {
+        if (choice == null) {
+            throw Errors.api(400, "INVALID_CHOICE", "Escolha saci ou halloween.")
+        }
+        if (!CosmeticEventService.teams().contains(choice)) {
+            throw Errors.api(400, "INVALID_CHOICE", "Escolha saci ou halloween.")
+        }
+        var now = EconomyClock.nowIso()
+        if (!CosmeticEventService.active(duelStartsAt, duelEndsAt, Time.toMillis(now))) {
+            throw Errors.api(409, "EVENT_CLOSED", "O duelo não está aberto.")
+        }
+        if (store.choiceOf(CosmeticEventService.duelId(), userId) != null) {
+            throw Errors.api(409, "ALREADY_CHOSEN", "Você já escolheu um time.")
+        }
+        var self = this
+        try {
+            database.transaction(() -> {
+    self.store.insertEntry(CosmeticEventService.duelId(), userId, choice, now)
+    self.store.grant(userId, "emblema-time-" + choice, "evento:" + CosmeticEventService.duelId(), now)
+})
+        } catch (String e) {
+            // The primary key settled a concurrent double click: the first choice is the stored one.
+            if (Errors.hasCode(e, "CONFLICT")) {
+                throw Errors.api(409, "ALREADY_CHOSEN", "Você já escolheu um time.")
+            }
+            throw e
+        }
+        return this.duel(userId)
+    }
+    CosmeticHuntView hunt(viewerId: String?) {
+        var found = listOf<String>()
+        if (viewerId != null) {
+            found = this.found(viewerId)
+        }
+        var nowMs = Time.toMillis(EconomyClock.nowIso())
+        return CosmeticHuntView(CosmeticEventService.active(huntStartsAt, huntEndsAt, nowMs), huntStartsAt, huntEndsAt, CosmeticEventService.spots().size(), found, found.size() == CosmeticEventService.spots().size())
+    }
+    // Marks a spot as found (a repeat is a no-op); the seventh grants the hunt badge.
+    CosmeticHuntView find(userId: String, spot: String) {
+        if (!CosmeticEventService.spots().contains(spot)) {
+            throw Errors.api(404, "SPOT_NOT_FOUND", "Esconderijo não encontrado.")
+        }
+        var now = EconomyClock.nowIso()
+        if (!CosmeticEventService.active(huntStartsAt, huntEndsAt, Time.toMillis(now))) {
+            throw Errors.api(409, "EVENT_CLOSED", "A caça ao Saci não está aberta.")
+        }
+        try {
+            store.insertEntry(this.spotEvent(spot), userId, spot, now)
+        } catch (String e) {
+            // Finding the same spot again changes nothing.
+            if (!Errors.hasCode(e, "CONFLICT")) {
+                throw e
+            }
+        }
+        var view = this.hunt(userId)
+        if (view.completed()) {
+            // Checked after every find (not only the 7th insert), so two spots found at once still grant.
+            store.grant(userId, "emblema-achei-saci", "evento:" + CosmeticEventService.huntId(), now)
+        }
+        return view
+    }
+    List<String> found(userId: String) {
+        var events = listOf<String>()
+        for (var s in CosmeticEventService.spots()) {
+            events.add(this.spotEvent(s))
+        }
+        var stored = store.eventIdsOf(userId, events)
+        var out = listOf<String>()
+        for (var s in CosmeticEventService.spots()) {
+            if (stored.contains(this.spotEvent(s))) {
+                out.add(s)
+            }
+        }
+        return out
+    }
+    String spotEvent(spot: String) = CosmeticEventService.huntId() + ":" + spot
+}

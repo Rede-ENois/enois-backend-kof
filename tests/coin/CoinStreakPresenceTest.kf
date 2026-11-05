@@ -1,0 +1,142 @@
+import coin.*
+import economy.*
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import profile.*
+
+// Port of StreakPresenceFlowTests: the streak counts real actions (the feed is not ported here: the action is
+// CoinService.recordPresence, the exact call every domain makes) and nothing pays twice in a day.
+TestApp spApp() = EconomyTestKit.app("coinstreak", mapOf<String, String>())
+
+String spToday() = EconomyClock.brazilDay()
+
+// Does what a domain does after a meaningful action.
+spAct(userId: String) {
+    EconomyTestKit.stack().coin.service.recordPresenceNow(userId)
+}
+
+spSeedStreak(app: TestApp, userId: String, current: Int, last: String) {
+    app.db().execute("insert into user_streaks (user_id, current_days, longest_days, last_day, updated_at) values (?, ?, ?, ?, ?)", DbParams().bindStr(userId).bindInt(current).bindInt(current).bindDate(last).bindInstant(EconomyClock.nowIso()))
+}
+
+String spPresenceMessage(caller: ProfileCaller, userId: String) {
+    var wallet = caller.get("/carteira")
+    Check.status(wallet, 200)
+    var i = 0
+    while (wallet.jsonHas("entries." + i + ".refId")) {
+        if (EconomyTestKit.str(wallet, "entries." + i + ".refId") == "presenca:" + userId + ":" + spToday()) {
+            return EconomyTestKit.str(wallet, "entries." + i + ".message")
+        }
+        i = i + 1
+    }
+    throw "presence entry missing"
+}
+
+Int spPresenceCount(caller: ProfileCaller) {
+    var wallet = caller.get("/carteira")
+    var n = 0
+    var i = 0
+    while (wallet.jsonHas("entries." + i + ".refId")) {
+        if (EconomyTestKit.str(wallet, "entries." + i + ".refId").startsWith("presenca:")) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+test "an action without opening the wallet counts as presence once per day" {
+    var app = spApp()
+    var user = EconomyTestKit.login(app, "streak-poster")
+    spAct("streak-poster")
+    Check.isTrue("reward exists", EconomyTestKit.stack().coin.service.hasReward("presenca:streak-poster:" + spToday()))
+    var streak = user.get("/me/streak")
+    Check.status(streak, 200)
+    Check.jsonEq(streak, "currentDays", "1")
+    Check.jsonEq(streak, "longestDays", "1")
+    Check.jsonEq(streak, "todayDone", "true")
+    Check.jsonEq(streak, "freezesAvailable", "1")
+    Check.isTrue("no frozen day", streak.jsonStr("lastFrozenDay") == null)
+    spAct("streak-poster")
+    Check.eqInt("one presence payment", 1, spPresenceCount(user))
+    var wallet = user.get("/carteira")
+    Check.jsonEq(wallet, "streak.currentDays", "1")
+    Check.jsonEq(wallet, "streak.todayDone", "true")
+}
+
+test "the seventh day in a row pays the streak bonus" {
+    var app = spApp()
+    var user = EconomyTestKit.login(app, "streak-bonus")
+    spSeedStreak(app, "streak-bonus", 6, ZoneDates.plusDays(spToday(), -1))
+    spAct("streak-bonus")
+    Check.eqStr("message", "Presença diária (bônus de 7 dias seguidos)", spPresenceMessage(user, "streak-bonus"))
+    Check.jsonEq(user.get("/me/streak"), "currentDays", "7")
+}
+
+test "the bonus is paid every seven days, not every day after the seventh" {
+    var app = spApp()
+    var eighth = EconomyTestKit.login(app, "streak-day8")
+    var fourteenth = EconomyTestKit.login(app, "streak-day14")
+    spSeedStreak(app, "streak-day8", 7, ZoneDates.plusDays(spToday(), -1))
+    spSeedStreak(app, "streak-day14", 13, ZoneDates.plusDays(spToday(), -1))
+    spAct("streak-day8")
+    spAct("streak-day14")
+    Check.eqStr("day 8", "Presença diária", spPresenceMessage(eighth, "streak-day8"))
+    Check.eqStr("day 14", "Presença diária (bônus de 14 dias seguidos)", spPresenceMessage(fourteenth, "streak-day14"))
+}
+
+test "a frozen day does not count towards the bonus" {
+    var app = spApp()
+    var user = EconomyTestKit.login(app, "streak-bonus-freeze")
+    spSeedStreak(app, "streak-bonus-freeze", 6, ZoneDates.plusDays(spToday(), -2))
+    spAct("streak-bonus-freeze")
+    Check.eqStr("message", "Presença diária (bônus de 7 dias seguidos)", spPresenceMessage(user, "streak-bonus-freeze"))
+}
+
+test "existing presence history is kept on the first touch" {
+    var app = spApp()
+    var user = EconomyTestKit.login(app, "streak-legacy")
+    var coin = EconomyTestKit.stack().coin.service
+    for (var back in listOf(1, 2, 3)) {
+        coin.reward("streak-legacy", 1L, "presenca:streak-legacy:" + ZoneDates.plusDays(spToday(), 0 - back), "Presença diária")
+    }
+    var before = user.get("/me/streak")
+    Check.jsonEq(before, "currentDays", "3")
+    Check.jsonEq(before, "todayDone", "false")
+    spAct("streak-legacy")
+    var after = user.get("/me/streak")
+    Check.jsonEq(after, "currentDays", "4")
+    Check.jsonEq(after, "longestDays", "4")
+    Check.jsonEq(after, "todayDone", "true")
+}
+
+test "a missed yesterday is frozen on the next action" {
+    var app = spApp()
+    var user = EconomyTestKit.login(app, "streak-freeze")
+    spSeedStreak(app, "streak-freeze", 3, ZoneDates.plusDays(spToday(), -2))
+    spAct("streak-freeze")
+    var streak = user.get("/me/streak")
+    var yesterday = ZoneDates.plusDays(spToday(), -1)
+    Check.jsonEq(streak, "currentDays", "4")
+    Check.jsonEq(streak, "lastFrozenDay", yesterday)
+    var expected = "1"
+    if (ZoneDates.weekStart(yesterday) == ZoneDates.weekStart(spToday())) {
+        expected = "0"
+    }
+    Check.jsonEq(streak, "freezesAvailable", expected)
+}
+
+test "the streak requires a session" {
+    var app = spApp()
+    Check.status(ProfileTestApp.anonymous(app).get("/me/streak"), 401)
+}
+
+test "failing presence recording never throws into the action" {
+    var app = spApp()
+    EconomyTestKit.login(app, "streak-fail-poster")
+    app.db().execute("alter table user_streaks rename to user_streaks_off", DbParams())
+    spAct("streak-fail-poster")
+    app.db().execute("alter table user_streaks_off rename to user_streaks", DbParams())
+    EconomyTestKit.finish()
+}

@@ -1,0 +1,65 @@
+import coin.*
+import economy.*
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import profile.*
+
+// Port of CoinDisputeFlowTests: a true contestation reverses the transfer and restricts the receiver; a false one
+// restricts the contester. Plus the atomic decision claim (deliberate difference: Java never checked the state).
+TestApp cdApp() = EconomyTestKit.app("coindispute", mapOf<String, String>())
+
+Long cdBalance(c: ProfileCaller) {
+    var res = c.get("/carteira")
+    Check.status(res, 200)
+    return EconomyTestKit.str(res, "balance").toLong()
+}
+
+String cdTransfer(c: ProfileCaller, key: String, to: String, amount: Int, message: String) {
+    var res = c.callKey("POST", "/carteira/transferencias", key, json.encode(CoinTransferBody(to, amount as Long, message)))
+    Check.status(res, 200)
+    return EconomyTestKit.str(res, "refId")
+}
+
+String cdContest(c: ProfileCaller, ref: String, key: String, description: String) {
+    var res = c.callKey("POST", "/carteira/transacoes/" + ref + "/contestar", key, json.encode(CoinContestBody("golpe", description)))
+    Check.status(res, 200)
+    Check.jsonEq(res, "state", "OPEN")
+    return EconomyTestKit.str(res, "id")
+}
+
+Long cdSanctions(app: TestApp, userId: String) = app.db().queryLong("select count(*) from user_sanctions where user_id = ?", DbParams().bindStr(userId))
+
+test "contest uphold reverses and reject punishes the contester" {
+    var app = cdApp()
+    var admin = EconomyTestKit.loginAdmin(app, "disp-admin")
+    var victim = EconomyTestKit.login(app, "disp-victim")
+    var scammer = EconomyTestKit.login(app, "disp-scammer")
+    var contester = EconomyTestKit.login(app, "disp-contester")
+    Check.status(victim.get("/carteira"), 200)
+    Check.status(scammer.get("/carteira"), 200)
+    Check.status(contester.get("/carteira"), 200)
+    var ref = cdTransfer(victim, "disp-p2p-1", "disp-scammer", 20000, "compro o jogo")
+    Check.isTrue("ref in the victim extract", victim.get("/carteira").body.contains(ref))
+    var disputeId = cdContest(victim, ref, "disp-contest-1", "Paguei por um jogo e nunca recebi nada de volta.")
+    // the same transfer cannot be contested twice
+    Check.status(victim.callKey("POST", "/carteira/transacoes/" + ref + "/contestar", "disp-contest-2", json.encode(CoinContestBody("golpe", "Tentativa repetida da mesma contestação."))), 409)
+    var queue = admin.get("/admin/carteira/disputas?limit=30")
+    Check.status(queue, 200)
+    Check.isTrue("queue lists the dispute", queue.body.contains(disputeId))
+    var upheld = admin.callKey("POST", "/admin/carteira/disputas/" + disputeId + "/deferir", "", json.encode(CoinDecisionBody("golpe confirmado")))
+    Check.status(upheld, 200)
+    Check.jsonEq(upheld, "state", "UPHELD")
+    Check.eqStr("victim refunded", "105000", "" + cdBalance(victim))
+    Check.eqStr("scammer reversed", "105000", "" + cdBalance(scammer))
+    Check.isTrue("scammer restricted", cdSanctions(app, "disp-scammer") > 0L)
+    // a decided dispute cannot be decided again
+    Check.apiError(admin.callKey("POST", "/admin/carteira/disputas/" + disputeId + "/rejeitar", "", json.encode(CoinDecisionBody("late"))), 409, "DISPUTE_ALREADY_DECIDED")
+    var ref2 = cdTransfer(contester, "disp-p2p-2", "disp-scammer", 5000, "divida antiga")
+    var dispute2 = cdContest(contester, ref2, "disp-contest-3", "Contestando sem motivo, so para testar o sistema.")
+    var rejected = admin.callKey("POST", "/admin/carteira/disputas/" + dispute2 + "/rejeitar", "", json.encode(CoinDecisionBody("contester de má-fé")))
+    Check.status(rejected, 200)
+    Check.jsonEq(rejected, "state", "REJECTED")
+    Check.isTrue("contester restricted", cdSanctions(app, "disp-contester") > 0L)
+    EconomyTestKit.finish()
+}

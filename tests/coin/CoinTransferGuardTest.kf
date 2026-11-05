@@ -1,0 +1,38 @@
+import coin.*
+import economy.*
+import kernel.*
+import kernel.testkit.*
+import profile.*
+
+// Port of CoinTransferGuardTests: the same Pix repeated within seconds is one Pix, and an account cannot send
+// transfers non-stop (per minute/hour caps). Low limits so the test fits in seconds.
+TestApp ctgApp() = EconomyTestKit.app("coinguard", mapOf("REDE_COIN_TRANSFER_PER_MINUTE", "3", "REDE_COIN_TRANSFER_PER_HOUR", "30"))
+
+String ctgBody(to: String, amount: Int, message: String) = json.encode(CoinTransferBody(to, amount as Long, message))
+
+test "a repeated Pix within the window is sent once" {
+    var app = ctgApp()
+    var sender = EconomyTestKit.login(app, "guard-sender")
+    var receiver = EconomyTestKit.login(app, "guard-receiver")
+    Check.status(sender.get("/carteira"), 200)
+    Check.status(receiver.get("/carteira"), 200)
+    var first = sender.callKey("POST", "/carteira/transferencias", "guard-1", ctgBody("guard-receiver", 10000, "mesmo pix"))
+    var second = sender.callKey("POST", "/carteira/transferencias", "guard-2", ctgBody("guard-receiver", 10000, "mesmo pix"))
+    Check.status(first, 200)
+    Check.status(second, 200)
+    Check.eqStr("the second click answers the SAME transfer", EconomyTestKit.str(first, "refId"), EconomyTestKit.str(second, "refId"))
+    Check.jsonEq(sender.get("/carteira"), "balance", "95000")
+}
+
+test "bursts of transfers are throttled before touching the ledger" {
+    var app = ctgApp()
+    var sender = EconomyTestKit.login(app, "guard-burst-sender")
+    var receiver = EconomyTestKit.login(app, "guard-burst-receiver")
+    Check.status(sender.get("/carteira"), 200)
+    Check.status(receiver.get("/carteira"), 200)
+    for (var i in listOf(1, 2, 3)) {
+        Check.status(sender.callKey("POST", "/carteira/transferencias", "guard-burst-" + i, ctgBody("guard-burst-receiver", 1000 * i, "pix " + i)), 200)
+    }
+    Check.apiError(sender.callKey("POST", "/carteira/transferencias", "guard-burst-4", ctgBody("guard-burst-receiver", 4000, "pix 4")), 429, "ACTION_THROTTLED")
+    EconomyTestKit.finish()
+}

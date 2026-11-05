@@ -1,0 +1,126 @@
+import coin.*
+import economy.*
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Port of CoinEconomyServiceTests: one publication per period (spam on the button does not move the price) and the
+// FULL monthly round. The service runs over the real store with the clock pinned; the metrics come from seeded
+// ledger lines (escrow usage) and a treasury holding half of the supply, as in the Java mocks.
+String start() = "2026-10-01T03:10:00Z"
+
+TestApp ecoApp() = EconomyTestKit.app("coineconomy", mapOf<String, String>())
+
+CoinEconomyParams ecoParams() = CoinEconomyParams(30, 0.05, 0.5, 1.0, 0.5, 0.25, 0.01, 1000L, 1000000L)
+
+// Resets the economy state: one rate at 10.000 micro-BRL two days old, an escrow usage of `escrow` mf in the window
+// and the treasury at half of the supply. Returns a service with the economy ENABLED.
+CoinEconomyService ecoService(escrow: Long, rateMicros: Long) {
+    var app = ecoApp()
+    var db = app.db()
+    EconomyClock.fix(start())
+    db.execute("delete from coin_rate_history", DbParams())
+    db.execute("insert into coin_rate_history (id, brl_cents, brl_micros, note, effective_at) values (?, ?, ?, null, ?)", DbParams().bindStr("rate_fixture").bindLong(1L).bindLong(rateMicros).bindInstant("2026-09-29T03:10:00Z"))
+    db.execute("delete from coin_entries where id like \'eco-fixture-%\'", DbParams())
+    db.execute("delete from coin_accounts where account_id = ?", DbParams().bindStr(CoinService.treasuryAccount()))
+    db.execute("insert into coin_accounts (account_id, balance, version, created_at) values (?, ?, 0, ?)", DbParams().bindStr(CoinService.treasuryAccount()).bindLong(1000000000L).bindInstant(start()))
+    if (escrow > 0L) {
+        db.execute("insert into coin_entries (id, account_id, amount, kind, ref_id, message, idempotency_key, prev_hash, hash, created_at) values (?, ?, ?, \'ESCROW_HOLD\', \'eco-fixture-hold\', null, \'eco-fixture-hold\', ?, ?, ?)", DbParams().bindStr("eco-fixture-hold").bindStr(CoinService.treasuryAccount()).bindLong(escrow).bindStr(CoinService.zeroHash()).bindStr(CoinService.zeroHash()).bindInstant("2026-09-30T00:00:00Z"))
+    }
+    var stack = EconomyTestKit.stack()
+    return CoinEconomyService(stack.coin.core.store, stack.coin.rates, stack.coin.service, true, 24, 10000L, ecoParams())
+}
+
+advance(hours: Int) {
+    var next = Time.toMillis(EconomyClock.nowIso()) + (hours as Long) * 3600000L
+    EconomyClock.fix(Time.fromMillis(next))
+}
+
+Long publications() = ecoApp().db().queryLong("select count(*) from coin_rate_history where id <> \'rate_fixture\'", DbParams())
+
+test "spam on the button publishes only once" {
+    var service = ecoService(0L, 10000L)
+    var first = service.recalculate()
+    Check.isTrue("first published", first.published())
+    Check.eqStr("first micros", "9900", "" + first.currentMicros())
+    Check.isTrue("first not due", !first.due())
+    for (var click in listOf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50)) {
+        EconomyClock.fix(Time.fromMillis(Time.toMillis(EconomyClock.nowIso()) + 1000L))
+        var again = service.recalculate()
+        Check.isTrue("click " + click + " not published", !again.published())
+        Check.eqStr("micros", "9900", "" + again.currentMicros())
+        Check.isTrue("not due", !again.due())
+    }
+    Check.eqStr("one publication", "1", "" + publications())
+}
+
+test "after a whole period the step is full again" {
+    var service = ecoService(0L, 10000L)
+    service.recalculate()
+    advance(24)
+    Check.isTrue("due", service.snapshot().due())
+    var next = service.recalculate()
+    Check.eqStr("fraction", "1.0", "" + next.elapsedFraction())
+    Check.isTrue("published", next.published())
+    Check.eqStr("micros", "9801", "" + next.currentMicros())
+    Check.isTrue("not due", !next.due())
+}
+
+test "the cron after publishing does not publish again the same day" {
+    var service = ecoService(0L, 10000L)
+    service.recalculate()
+    advance(24)
+    service.scheduledRecalculate()
+    service.scheduledRecalculate()
+    service.scheduledRecalculate()
+    Check.eqStr("first day plus the next day", "2", "" + publications())
+}
+
+test "the panel shows the step that will be published" {
+    var service = ecoService(0L, 10000L)
+    service.recalculate()
+    advance(12)
+    var snapshot = service.snapshot()
+    Check.isTrue("not published", !snapshot.published())
+    Check.eqStr("current", "9900", "" + snapshot.currentMicros())
+    Check.eqStr("fraction", "0.5", "" + snapshot.elapsedFraction())
+    Check.eqStr("suggested", "9801", "" + snapshot.result().suggestedMicros())
+    Check.isTrue("not due", !snapshot.due())
+    Check.eqStr("next evaluation", "" + (Time.toMillis(EconomyClock.nowIso()) + 12L * 3600000L), "" + Time.toMillis(snapshot.nextEvaluationAt()))
+}
+
+test "the cron before the period closes does not publish" {
+    var service = ecoService(0L, 10000L)
+    service.recalculate()
+    advance(20)
+    service.scheduledRecalculate()
+    Check.eqStr("one publication", "1", "" + publications())
+}
+
+test "the monthly round publishes even with the 3h period open" {
+    // Turnover 1,6x the target with scarcity 1,25 -> index 2 -> full calculation: 10.000 x 2 = 20.000.
+    var service = ecoService(80000000L, 10000L)
+    service.recalculate()
+    advance(1)
+    var monthly = service.monthlyRecalculate()
+    Check.isTrue("published", monthly.published())
+    Check.eqStr("full price, not the 1% step", "20000", "" + monthly.result().suggestedMicros())
+    Check.eqStr("two publications", "2", "" + publications())
+}
+
+test "the monthly round does not start from the last value" {
+    var high = ecoService(80000000L, 90000L).monthlyRecalculate()
+    var low = ecoService(80000000L, 1000L).monthlyRecalculate()
+    Check.eqStr("from a high quote", "20000", "" + high.result().suggestedMicros())
+    Check.eqStr("same price from a low quote", "" + high.result().suggestedMicros(), "" + low.result().suggestedMicros())
+}
+
+test "a monthly round without change publishes nothing" {
+    // Turnover 0,8x the target with scarcity 1,25 -> index 1 -> reproduces the anchor 10.000, the current quote.
+    var service = ecoService(40000000L, 10000L)
+    var monthly = service.monthlyRecalculate()
+    Check.isTrue("not published", !monthly.published())
+    Check.eqStr("no publication", "0", "" + publications())
+    EconomyClock.unfix()
+    EconomyTestKit.finish()
+}

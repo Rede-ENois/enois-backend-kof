@@ -1,0 +1,91 @@
+import coin.*
+import kernel.*
+import kernel.testkit.*
+
+// Port of UserStreakTests (pure domain logic) and CoinRewardScalingTests. 2026-10-26 is a Monday.
+String mon(plus: Int) = ZoneDates.plusDays("2026-10-26", plus)
+
+CoinStreak empty() = CoinStreak("streak_u", 0, 0, null, null)
+
+Bool sameStreak(a: CoinStreak, b: CoinStreak) = a.currentDays() == b.currentDays() && a.longestDays() == b.longestDays() && a.lastDay() == b.lastDay() && a.lastFrozenDay() == b.lastFrozenDay()
+
+test "the day boundary follows Sao Paulo, not UTC" {
+    Check.eqStr("before", "2026-10-29", ZoneDates.dayOf("2026-10-30T02:59:00Z", "America/Sao_Paulo"))
+    Check.eqStr("at", "2026-10-30", ZoneDates.dayOf("2026-10-30T03:00:00Z", "America/Sao_Paulo"))
+}
+
+test "consecutive days increment and the same day is idempotent" {
+    var s = empty().touch(mon(0)).touch(mon(1)).touch(mon(2))
+    Check.eqInt("current", 3, s.currentDays())
+    Check.isTrue("idempotent", sameStreak(s, s.touch(mon(2))))
+    Check.eqInt("longest", 3, s.longestDays())
+    Check.isTrue("done today", s.doneOn(mon(2)))
+    Check.isTrue("not done tomorrow", !s.doneOn(mon(3)))
+}
+
+test "one missed day consumes the weekly freeze and keeps the streak" {
+    var s = empty().touch(mon(0)).touch(mon(1))
+    Check.eqInt("freezes", 1, s.freezesAvailable(mon(1)))
+    var afterGap = s.touch(mon(3))
+    Check.eqInt("the frozen day does not count", 3, afterGap.currentDays())
+    Check.eqStr("frozen day", mon(2), "" + afterGap.lastFrozenDay())
+    Check.eqInt("no freeze left", 0, afterGap.freezesAvailable(mon(3)))
+}
+
+test "a second miss in the same week breaks the streak" {
+    var s = empty().touch(mon(0)).touch(mon(1)).touch(mon(3))
+    var broken = s.touch(mon(5))
+    Check.eqInt("current", 1, broken.currentDays())
+    Check.eqInt("longest", 3, broken.longestDays())
+}
+
+test "the freeze renews each ISO week and does not accumulate" {
+    var s = CoinStreak("streak_u", 5, 5, mon(6), mon(2))
+    var next = s.touch(mon(8))
+    Check.eqInt("current", 6, next.currentDays())
+    Check.eqStr("frozen", mon(7), "" + next.lastFrozenDay())
+    Check.eqInt("fresh account", 1, empty().freezesAvailable(mon(0)))
+}
+
+test "two missed days break even with a freeze available" {
+    var s = empty().touch(mon(0)).touch(mon(1))
+    var broken = s.touch(mon(4))
+    Check.eqInt("current", 1, broken.currentDays())
+    Check.isTrue("no frozen day", broken.lastFrozenDay() == null)
+    Check.eqInt("settle", 0, s.settle(mon(4)).currentDays())
+}
+
+test "settle shows a pending freeze without counting today" {
+    var s = empty().touch(mon(0)).touch(mon(1))
+    var settled = s.settle(mon(3))
+    Check.eqInt("current", 2, settled.currentDays())
+    Check.isTrue("not done today", !settled.doneOn(mon(3)))
+    Check.eqInt("freezes", 0, settled.freezesAvailable(mon(3)))
+}
+
+test "rebuilds from existing presence days" {
+    var s = CoinStreak.fromPresenceDays("streak_u", listOf(mon(-10), mon(-9), mon(-8), mon(-7), mon(-2), mon(-1)))
+    Check.eqInt("current", 2, s.currentDays())
+    Check.eqInt("longest", 4, s.longestDays())
+    Check.eqStr("last", mon(-1), "" + s.lastDay())
+    Check.eqInt("touch", 3, s.touch(mon(0)).currentDays())
+    Check.eqInt("empty touch", 1, CoinStreak.fromPresenceDays("streak_u", listOf<String>()).touch(mon(0)).currentDays())
+}
+
+test "at the initial rate the base value does not change" {
+    Check.eqStr("5", "" + CoinService.fais(5L), "" + CoinService.scaleReward(CoinService.fais(5L), CoinRates.initialMicros()))
+    Check.eqStr("25", "" + CoinService.fais(25L), "" + CoinService.scaleReward(CoinService.fais(25L), CoinRates.initialMicros()))
+}
+
+test "a dearer spark pays fewer sparks for the same value" {
+    Check.eqStr("2 cents", "2500", "" + CoinService.scaleReward(CoinService.fais(5L), 2L * CoinRates.microsPerCent()))
+    Check.eqStr("3 cents rounds", "1667", "" + CoinService.scaleReward(CoinService.fais(5L), 3L * CoinRates.microsPerCent()))
+}
+
+test "a cheaper spark pays more sparks" {
+    Check.eqStr("half", "" + CoinService.fais(10L), "" + CoinService.scaleReward(CoinService.fais(5L), CoinRates.microsPerCent() / 2L))
+}
+
+test "the reward never returns zero" {
+    Check.eqStr("floor", "1", "" + CoinService.scaleReward(1L, 100L * CoinRates.microsPerCent()))
+}

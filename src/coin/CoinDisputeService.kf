@@ -1,0 +1,159 @@
+package coin
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.text.*
+import kernel.time.*
+import notifications.*
+
+// Dispute of a transfer (scam): the victim disputes WITHIN the window and the dispute enters the SAME flow as a report
+// (it becomes a SCAM report against the receiver in the moderation queue). Decision:
+//   - true  -> the transfer is REVERSED in the ledger (a mirror), the scammer is restricted by the sanction of the
+//              report and the victim gets the value back;
+//   - false -> the sanction goes to WHO DISPUTED (a bad faith disputer).
+class CoinDisputeService {
+    Db database
+    CoinStore ledger
+    CoinService coins
+    CoinDisputeModeration moderation
+    Notifications notifications
+    public constructor(database: Db, ledger: CoinStore, coins: CoinService, moderation: CoinDisputeModeration, notifications: Notifications) {
+        this.database = database
+        this.ledger = ledger
+        this.coins = coins
+        this.moderation = moderation
+        this.notifications = notifications
+    }
+    // Window to dispute: 7 days (after that, a Pix is a Pix).
+    static Long contestWindowMs() = 7L * 24L * 3600000L
+    // The victim (sender) disputes the transfer.
+    CoinDispute contest(senderId: String, entryRef: String, reason: String?, description: String?) {
+        var self = this
+        var box = listOf<CoinDispute>()
+        database.transaction(() -> {
+    box.add(self.openDispute(senderId, entryRef, reason, description))
+})
+        return box.get(0)
+    }
+    CoinDispute openDispute(senderId: String, entryRef: String, reason: String?, description: String?) {
+        // The ceilings are the ones of the COLUMNS (coin_disputes.reason varchar(400), description varchar(1000)).
+        TextFieldLimit.check("DISPUTE_FIELD_TOO_LONG", "motivo", reason, 400)
+        TextFieldLimit.check("DISPUTE_FIELD_TOO_LONG", "descricao", description, 1000)
+        if (reason == null) {
+            throw this.detailsRequired()
+        }
+        if (description == null) {
+            throw this.detailsRequired()
+        }
+        if (reason.trim().length() == 0 || description.trim().length() < 20) {
+            throw this.detailsRequired()
+        }
+        var transfer = ledger.findByAccountAndRef(senderId, entryRef)
+        if (transfer == null) {
+            throw Errors.api(404, "TRANSFER_NOT_FOUND", "Transferência não encontrada nessa conta.")
+        }
+        if (transfer.kind() != "TRANSFER_OUT") {
+            throw Errors.api(404, "TRANSFER_NOT_FOUND", "Transferência não encontrada nessa conta.")
+        }
+        var now = EconomyClock.nowIso()
+        if (Time.toMillis(now) - Time.toMillis(transfer.createdAt()) > CoinDisputeService.contestWindowMs()) {
+            throw Errors.api(403, "CONTEST_WINDOW_CLOSED", "O prazo para contestar (7 dias) já fechou.")
+        }
+        if (ledger.disputeExistsForEntry(entryRef)) {
+            throw Errors.api(409, "ALREADY_CONTESTED", "Esta transferência já foi contestada.")
+        }
+        var amount = transfer.amount()
+        if (amount < 0L) {
+            amount = 0L - amount
+        }
+        var receiverId = this.resolveReceiver(entryRef, senderId, amount)
+        var reportId = moderation.report(senderId, receiverId, "Contestação de transação (golpe): " + description.trim())
+        var dispute = CoinDispute(Ids.prefixed("cdisp_"), entryRef, senderId, receiverId, amount, reason.trim(), description.trim(), "OPEN", reportId, null, null, null, now)
+        ledger.insertDispute(dispute)
+        notifications.create(receiverId, "MODERACAO", senderId, "Transferência contestada", "Uma transferência que você recebeu foi contestada como golpe. Uma pessoa do time vai analisar os dois lados.", "/api/penalidades", "Ver")
+        return dispute
+    }
+    String detailsRequired() = Errors.api(400, "CONTESTATION_DETAILS_REQUIRED", "Explica o que aconteceu em pelo menos 20 caracteres.")
+    // A TRUE decision: reverses the transfer and restricts the scammer (through the report).
+    CoinDispute uphold(disputeId: String, reviewerId: String, note: String?) {
+        var self = this
+        var box = listOf<CoinDispute>()
+        database.transaction(() -> {
+    box.add(self.upholdNow(disputeId, reviewerId, note))
+})
+        return box.get(0)
+    }
+    CoinDispute upholdNow(disputeId: String, reviewerId: String, note: String?) {
+        var dispute = this.required(disputeId)
+        this.claim(dispute, "UPHELD", note, reviewerId)
+        coins.reverseTransfer(dispute.receiverId(), dispute.senderId(), dispute.amount(), dispute.entryRef(), "Reversão por contestação aceita (" + dispute.id() + ")")
+        var reportId = dispute.reportId()
+        if (reportId != null) {
+            moderation.applyForReport(reportId, "Golpe confirmado por contestação de transação (" + dispute.id() + ")")
+        }
+        notifications.create(dispute.senderId(), "MODERACAO", reviewerId, "Contestação aceita", "A transferência contestada foi REVERTIDA e o valor voltou para a sua carteira.", "/api/carteira", "Ver carteira")
+        return this.required(disputeId)
+    }
+    // A FALSE decision: the sanction goes to whoever disputed in bad faith.
+    CoinDispute reject(disputeId: String, reviewerId: String, note: String?) {
+        var self = this
+        var box = listOf<CoinDispute>()
+        database.transaction(() -> {
+    box.add(self.rejectNow(disputeId, reviewerId, note))
+})
+        return box.get(0)
+    }
+    CoinDispute rejectNow(disputeId: String, reviewerId: String, note: String?) {
+        var dispute = this.required(disputeId)
+        this.claim(dispute, "REJECTED", note, reviewerId)
+        moderation.restrictUser(dispute.senderId(), dispute.id(), "Contestação de transação julgada FALSA pela moderação (" + dispute.id() + ")")
+        notifications.create(dispute.senderId(), "SANCAO", reviewerId, "Contestação não procedeu", "A contestação foi analisada e julgada infundada. Sua conta foi restrita; se foi um erro, você pode recorrer.", "/api/penalidades", "Recorrer")
+        return this.required(disputeId)
+    }
+    // The decision is an atomic claim of the OPEN dispute: the second decision of the same dispute (an upheld one
+    // rejected later, or the reverse) finds nothing to claim. The Java service did not check the state.
+    claim(dispute: CoinDispute, state: String, note: String?, reviewerId: String) {
+        if (!ledger.decideDispute(dispute.id(), state, note, reviewerId, EconomyClock.nowIso())) {
+            throw Errors.api(409, "DISPUTE_ALREADY_DECIDED", "Esta contestação já foi decidida.")
+        }
+    }
+    List<CoinDispute> pending(limit: Int) {
+        if (limit < 1) {
+            throw Errors.badRequest()
+        }
+        return ledger.pendingDisputes(limit)
+    }
+    List<CoinDispute> bySender(senderId: String) = ledger.disputesBySender(senderId)
+    CoinDispute required(id: String) {
+        var found = ledger.findDispute(id)
+        if (found == null) {
+            throw Errors.api(404, "DISPUTE_NOT_FOUND", "Contestação não encontrada.")
+        }
+        return found
+    }
+    // The receiver of the transfer: whoever got the TRANSFER_IN with the SAME ref.
+    String resolveReceiver(entryRef: String, senderId: String, amount: Long) {
+        var inEntry = ledger.findByRefAndKind(entryRef, "TRANSFER_IN")
+        if (inEntry != null) {
+            if (inEntry.amount() == amount && inEntry.accountId() != senderId) {
+                return inEntry.accountId()
+            }
+        }
+        var escrowIn = ledger.findByRefAndKind(entryRef, "ESCROW_IN")
+        if (escrowIn != null) {
+            if (escrowIn.accountId() != senderId) {
+                return escrowIn.accountId()
+            }
+        }
+        throw Errors.api(409, "RECEIVER_NOT_FOUND", "Não foi possível identificar quem recebeu esta transferência.")
+    }
+    // The view of a dispute (for the app and the moderation queue): `reviewNote` only when there is one.
+    static String view(d: CoinDispute) {
+        var note = d.reviewNote()
+        if (note == null) {
+            return json.encode(CoinDisputeView(d.id(), d.entryRef(), d.amount(), d.reason(), d.state(), d.createdAt()))
+        }
+        return json.encode(CoinDisputeReviewedView(d.id(), d.entryRef(), d.amount(), d.reason(), d.state(), d.createdAt(), note))
+    }
+}

@@ -1,0 +1,37 @@
+import coin.*
+import economy.*
+import kernel.*
+import kernel.testkit.*
+import profile.*
+
+// Port of CoinEconomyEndpointTests: the admin panel reads the metrics and the recalculate button. The automatic
+// economy is DISABLED here (COIN_ECONOMY_ENABLED=false) so the recalculation publishes no quote.
+TestApp eeApp() = EconomyTestKit.app("coineconomyendpoint", mapOf("COIN_ECONOMY_ENABLED", "false"))
+
+test "reading the metrics requires a session and an admin" {
+    var app = eeApp()
+    Check.status(ProfileTestApp.anonymous(app).get("/admin/carteira/economia"), 401)
+    var user = EconomyTestKit.login(app, "eco-plain")
+    Check.status(user.get("/admin/carteira/economia"), 403)
+}
+
+test "the admin reads the economy and recalculates without publishing when disabled" {
+    var app = eeApp()
+    var admin = EconomyTestKit.loginAdmin(app, "eco-admin")
+    var reading = admin.get("/admin/carteira/economia")
+    Check.status(reading, 200)
+    Check.jsonEq(reading, "janelaDias", "30")
+    for (var field in listOf("cofre", "escassez", "indice", "cotacaoSugeridaMicros", "publicavelAgora", "proximaAvaliacaoEm")) {
+        Check.isTrue(field + " exists", reading.jsonHas(field))
+    }
+    Check.jsonEq(reading, "cotacaoAtualMicros", "10000")
+    var recalc = admin.post("/admin/carteira/economia/recalcular", "")
+    Check.status(recalc, 200)
+    Check.jsonEq(recalc, "publicada", "false")
+    Check.jsonEq(recalc, "cotacaoAnteriorMicros", "10000")
+    Check.jsonEq(recalc, "cotacaoAtualMicros", "10000")
+    for (var field in listOf("publicavelAgora", "proximaAvaliacaoEm", "retornoCofre", "escassez")) {
+        Check.isTrue(field + " exists", recalc.jsonHas(field))
+    }
+    EconomyTestKit.finish()
+}

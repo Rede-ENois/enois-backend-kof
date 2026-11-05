@@ -1,0 +1,76 @@
+package coin
+
+import java.util.concurrent.ConcurrentHashMap
+
+// The same Pix repeated within a few seconds is ONE Pix. A double click (or an automatic retry after a timeout) sent
+// two identical transfers with different idempotency keys: the key is born per request, so key-based idempotency
+// does not catch it. Here the key is the CONTENT: same account, same recipient, same amount and same note inside
+// the window return the first entry. The window is short on purpose (10 s) and lives in the pod, like the other
+// limiters: who really wants to send the same value again waits for the window to pass.
+class TransferDedupe {
+    Map<String,CoinEntry> entries = new ConcurrentHashMap<String, CoinEntry>()
+    Map<String,Long> sentAt = new ConcurrentHashMap<String, Long>()
+    Long windowMs
+    public constructor(seconds: Long) {
+        var clamped = seconds
+        if (clamped < 0L) {
+            clamped = 0L
+        }
+        if (clamped > 300L) {
+            clamped = 300L
+        }
+        this.windowMs = clamped * 1000L
+    }
+    static Int maxKeys() = 50000
+    static String key(fromAccountId: String, toUserId: String, amount: Long, message: String?) {
+        var note = ""
+        if (message != null) {
+            note = message.trim()
+        }
+        return fromAccountId + "|" + toUserId + "|" + amount + "|" + note
+    }
+    // The entry of the identical transfer still inside the window (or null).
+    CoinEntry? recent(fromAccountId: String, toUserId: String, amount: Long, message: String?) {
+        if (windowMs == 0L) {
+            return null
+        }
+        var k = TransferDedupe.key(fromAccountId, toUserId, amount, message)
+        var found = entries.get(k)
+        if (found == null) {
+            return null
+        }
+        var at = sentAt.get(k)
+        if (at == null) {
+            return null
+        }
+        if (at + windowMs < EconomyClock.nowMillis()) {
+            entries.remove(k)
+            sentAt.remove(k)
+            return null
+        }
+        return found
+    }
+    remember(fromAccountId: String, toUserId: String, amount: Long, message: String?, entry: CoinEntry) {
+        if (windowMs == 0L) {
+            return
+        }
+        var now = EconomyClock.nowMillis()
+        var k = TransferDedupe.key(fromAccountId, toUserId, amount, message)
+        entries.put(k, entry)
+        sentAt.put(k, now)
+        if (entries.size() > TransferDedupe.maxKeys()) {
+            this.dropExpired(now)
+        }
+    }
+    dropExpired(now: Long) {
+        for (var k in sentAt.keys()) {
+            var at = sentAt.get(k)
+            if (at != null) {
+                if (at + windowMs < now) {
+                    entries.remove(k)
+                    sentAt.remove(k)
+                }
+            }
+        }
+    }
+}

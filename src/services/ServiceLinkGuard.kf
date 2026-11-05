@@ -1,0 +1,68 @@
+package services
+
+import java.net.URI
+import kernel.error.*
+import kernel.url.*
+
+// PENDING PORT (games): the Java ServiceOfferService validated the optional link with GameUrlGuard, which belongs to
+// the games domain. The rule is copied here, with the games codes and messages (INVALID_GAME_URL: the front already
+// shows them), so a service link is checked the same way until games lands. Then the games domain subclasses this
+// class (or this one is deleted for its guard) and Main.kf passes it to ServicesModule.installWith.
+//
+// The platform never fetches the URL: the browser of whoever reads loads it. So the check is about the DESTINATION:
+// https only, no credentials, and the host must resolve to a PUBLIC address.
+class ServiceLinkGuard {
+    public constructor() {}
+    static Int maxUrl() = 500
+    static String invalid(message: String) = Errors.api(400, "INVALID_GAME_URL", message)
+    // The host resolves only to public addresses. Overridden by tests (no network in a suite).
+    Bool resolvesPublic(host: String) = OutboundUrlGuard.resolvesOnlyPublic(host)
+    // The normalised URL, or a 400 saying why.
+    String validate(rawUrl: String?) {
+        var value = ""
+        if (rawUrl != null) {
+            value = rawUrl.trim()
+        }
+        if (value.length() == 0) {
+            throw ServiceLinkGuard.invalid("Informe o endereço do jogo.")
+        }
+        if (value.length() > ServiceLinkGuard.maxUrl()) {
+            throw ServiceLinkGuard.invalid("Endereço longo demais.")
+        }
+        if (value.contains(" ") || value.contains("\t") || value.contains("\n")) {
+            throw ServiceLinkGuard.invalid("Endereço inválido.")
+        }
+        var uri = OutboundUrlGuard.parse(value)
+        if (uri == null) {
+            throw ServiceLinkGuard.invalid("Endereço inválido.")
+        }
+        var scheme = uri.getScheme()
+        if (scheme == null) {
+            throw ServiceLinkGuard.invalid("O jogo precisa ser servido em https.")
+        }
+        if (scheme.toLowerCase() != "https") {
+            throw ServiceLinkGuard.invalid("O jogo precisa ser servido em https.")
+        }
+        if (uri.getUserInfo() != null) {
+            throw ServiceLinkGuard.invalid("Endereço não pode levar usuário e senha.")
+        }
+        var host = uri.getHost()
+        if (host == null) {
+            throw ServiceLinkGuard.invalid("Endereço sem domínio.")
+        }
+        if (host.trim().length() == 0) {
+            throw ServiceLinkGuard.invalid("Endereço sem domínio.")
+        }
+        this.requirePublicHost(host)
+        return uri.toString()
+    }
+    requirePublicHost(host: String) {
+        var lower = host.toLowerCase()
+        if (lower == "localhost" || lower.endsWith(".localhost") || lower.endsWith(".local") || lower.endsWith(".internal")) {
+            throw ServiceLinkGuard.invalid("Endereço interno não é aceito.")
+        }
+        if (!this.resolvesPublic(host)) {
+            throw ServiceLinkGuard.invalid("Endereço de rede interna não é aceito.")
+        }
+    }
+}

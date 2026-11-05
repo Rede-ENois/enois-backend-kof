@@ -1,0 +1,177 @@
+package coin
+
+import kernel.time.*
+
+// Snapshot of a balance, derived from the ledger. `version` is the optimistic lock of the snapshot.
+record CoinAccount(String accountId, Long balance, Long version, String createdAt)
+
+// One ledger line: append-only, hash-chained to the previous line of the SAME account. `kind` is the Java enum
+// name (AIRDROP, GENESIS_TREASURY, TRANSFER_OUT, TRANSFER_IN, REWARD, PURCHASE, SALE, REFUND, ADJUSTMENT,
+// ESCROW_OUT, ESCROW_HOLD, ESCROW_RELEASE, ESCROW_IN, REFUND_IN, FEE_IN, REVERSAL_OUT, REVERSAL_IN): enums do not
+// cross packages safely (KOF_GAPS G43), so the kind travels as its name.
+record CoinEntry(String id, String accountId, Long amount, String kind, String refId, String? message, String idempotencyKey, String prevHash, String hash, String createdAt) {
+    // The same line with the message decrypted (the hash does NOT change: the ledger keeps the ciphertext).
+    CoinEntry withMessage(newMessage: String?) = CoinEntry(id, accountId, amount, kind, refId, newMessage, idempotencyKey, prevHash, hash, createdAt)
+}
+
+record CoinEntryPage(List<CoinEntry> entries, Bool hasNext)
+
+// The reference quote of the spark in BRL, stored in micro-reais (1 cent = 10.000 micros).
+record CoinRate(String id, Long brlCents, Long brlMicros, String? note, String effectiveAt)
+
+class CoinRates {
+    // 1 cent = 0,01 BRL = 10.000 micro-BRL.
+    static Long microsPerCent() = 10000L
+    // The initial quote: 100 sparks = R$ 1,00 (1 cent a spark).
+    static Long initialCents() = 1L
+    static Long initialMicros() = 10000L
+    // Cents with commercial rounding, never 0 (the minimum quote is 1 cent).
+    static Long toCents(brlMicros: Long) {
+        var cents = (brlMicros + CoinRates.microsPerCent() / 2L) / CoinRates.microsPerCent()
+        if (cents < 1L) {
+            return 1L
+        }
+        return cents
+    }
+}
+
+// What the person sees about the streak; `lastFrozenDay` is null when no freeze was ever used.
+record CoinStreakView(Int currentDays, Int longestDays, Bool todayDone, Int freezesAvailable, String? lastFrozenDay)
+
+// GET /carteira and the admin extract. `streak` is null for the audit read (no side effects).
+record CoinWallet(Long balance, String chave, Long escala, Long cotacaoBrlCents, Long cotacaoBrlMicros, List<CoinEntry> entries, CoinStreakView? streak)
+
+record CoinSupply(Long total, Long cofre, Long circulacao, Long somaSaldos, Bool coerente)
+
+// Daily presence streak (UserStreak). Days are `yyyy-MM-dd` in America/Sao_Paulo. A day counts when the person does
+// something meaningful. Freeze: one per ISO week, never accumulated; when exactly ONE day was missed and the week of
+// that day has not used its freeze, the missed day is frozen (the streak survives, the frozen day does not add to it).
+// Two or more missed days break the streak. Everything is applied lazily, on the next action or read.
+// `lastDay` is the last day the streak covers (an active day or a frozen one).
+record CoinStreak(String userId, Int currentDays, Int longestDays, String? lastDay, String? lastFrozenDay) {
+    static String zone() = "America/Sao_Paulo"
+    // First touch of someone who had presence before the table existed: rebuilt from the recent presence days.
+    static CoinStreak fromPresenceDays(userId: String, days: List<String>) {
+        if (days.size() == 0) {
+            return CoinStreak(userId, 0, 0, null, null)
+        }
+        var sorted = listOf<String>()
+        for (var d in days) {
+            if (!sorted.contains(d)) {
+                sorted.add(d)
+            }
+        }
+        var i = 1
+        while (i < sorted.size()) {
+            var j = i
+            while (j > 0 && sorted.get(j - 1).compareTo(sorted.get(j)) > 0) {
+                var swap = sorted.get(j)
+                sorted.set(j, sorted.get(j - 1))
+                sorted.set(j - 1, swap)
+                j = j - 1
+            }
+            i = i + 1
+        }
+        var run = 0
+        var longest = 0
+        var previous = ""
+        for (var day in sorted) {
+            if (previous.length() > 0 && ZoneDates.plusDays(previous, 1) == day) {
+                run = run + 1
+            }
+            else {
+                run = 1
+            }
+            if (run > longest) {
+                longest = run
+            }
+            previous = day
+        }
+        return CoinStreak(userId, run, longest, previous, null)
+    }
+    // The state at the start of `today`: a single missed yesterday is frozen if the week allows; more breaks it.
+    CoinStreak settle(today: String) {
+        var last = lastDay
+        if (last == null) {
+            return this
+        }
+        var yesterday = ZoneDates.plusDays(today, -1)
+        if (last.compareTo(yesterday) >= 0) {
+            return this
+        }
+        if (currentDays > 0 && last == ZoneDates.plusDays(today, -2) && this.freezeUnusedInWeekOf(yesterday)) {
+            return CoinStreak(userId, currentDays, longestDays, yesterday, yesterday)
+        }
+        return CoinStreak(userId, 0, longestDays, last, lastFrozenDay)
+    }
+    // Counts `today` as a present day (idempotent within the day).
+    CoinStreak touch(today: String) {
+        var settled = this.settle(today)
+        var settledLast = settled.lastDay
+        var continues = false
+        if (settledLast != null) {
+            if (settledLast == today) {
+                return settled
+            }
+            continues = settled.currentDays > 0 && ZoneDates.plusDays(today, -1) == settledLast
+        }
+        var current = 1
+        if (continues) {
+            current = settled.currentDays + 1
+        }
+        var longest = settled.longestDays
+        if (current > longest) {
+            longest = current
+        }
+        return CoinStreak(userId, current, longest, today, settled.lastFrozenDay)
+    }
+    // Freezes left in the week of `today` (0 or 1). Call on a settled streak.
+    Int freezesAvailable(today: String) {
+        if (this.freezeUnusedInWeekOf(today)) {
+            return 1
+        }
+        return 0
+    }
+    Bool doneOn(today: String) {
+        var last = lastDay
+        if (last == null) {
+            return false
+        }
+        return last == today && currentDays > 0
+    }
+    Bool freezeUnusedInWeekOf(day: String) {
+        var frozen = lastFrozenDay
+        if (frozen == null) {
+            return true
+        }
+        return ZoneDates.weekStart(frozen) != ZoneDates.weekStart(day)
+    }
+}
+
+// Dispute of a transfer (scam): OPEN -> UPHELD (reversal) | REJECTED (false claim).
+record CoinDispute(String id, String entryRef, String senderId, String receiverId, Long amount, String reason, String description, String state, String? reportId, String? reviewNote, String? reviewedBy, String? reviewedAt, String createdAt)
+
+// What the app and the moderation queue read (`reviewNote` leaves the JSON when there is none).
+record CoinDisputeView(String id, String entryRef, Long amount, String reason, String state, String createdAt)
+
+record CoinDisputeReviewedView(String id, String entryRef, Long amount, String reason, String state, String createdAt, String reviewNote)
+
+// The economy metrics measured on the ledger window (thousandths of a spark).
+record CoinMetrics(Long escrowUsage, Long p2pUsage, Long treasuryInflow, Long issuance, Long circulation, Long treasuryBalance)
+
+record CoinEconomyParams(Int windowDays, Double targetTurnover, Double p2pWeight, Double maxUsageRatio, Double scarcityWeight, Double sensitivity, Double maxStep, Long minMicros, Long maxMicros)
+
+record CoinEconomyResult(Long usage, Long effectiveUsage, Double scarcity, Double index, Long suggestedMicros)
+
+record CoinEconomySummary(Int windowDays, CoinMetrics metrics, CoinEconomyResult result, Long previousMicros, Long currentMicros, Bool published, Double elapsedFraction, Bool due, String nextEvaluationAt)
+
+// Request bodies (same property names as the Java records).
+record CoinQuoteBody(Long? brlCents, Long? brlMicros, String? note)
+
+record CoinPrizeBody(String? toUsername, Long? amount, String? ref, String? message)
+
+record CoinContestBody(String? reason, String? description)
+
+record CoinDecisionBody(String? note)
+
+record CoinTransferBody(String? toUsername, Long? amount, String? message)

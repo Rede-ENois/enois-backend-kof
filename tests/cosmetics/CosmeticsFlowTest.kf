@@ -1,0 +1,158 @@
+import cosmetics.*
+import economy.*
+import kernel.*
+import kernel.testkit.*
+import profile.*
+
+// Port of CosmeticsFlowTests: buy a frame with sparks (direct debit, no escrow: the item belongs to the platform),
+// equip it, and the catalog marks what is already yours. The feed half of the animated frame test (the frame shows on
+// a post and a comment) belongs to the feed domain and is checked there.
+TestApp shopApp() = CosmeticsTestKit.app("cosmeticsflow", mapOf<String, String>())
+
+test "the catalog orderings are independent copies of the shared catalog" {
+    var app = shopApp()
+    var shop = CosmeticsTestKit.shop()
+    var oldest = shop.catalogOrdered("oldest")
+    var newest = shop.catalogOrdered("newest")
+    var size = oldest.size()
+    oldest.remove(0)
+    newest.add(newest.get(0))
+    Check.eqInt("oldest again", size, shop.catalogOrdered("oldest").size())
+    Check.eqInt("newest again", size, shop.catalogOrdered("newest").size())
+    Check.eqStr("first oldest", "moldura-ambar", shop.catalogOrdered("oldest").get(0).id())
+    Check.eqStr("first newest is the last oldest", shop.catalogOrdered("oldest").get(size - 1).id(), shop.catalogOrdered("newest").get(0).id())
+}
+
+test "the catalog defaults to oldest and uses the release order instead of the declaration position" {
+    var app = shopApp()
+    var guest = ProfileTestApp.anonymous(app)
+    var res = guest.get("/loja")
+    Check.status(res, 200)
+    Check.jsonEq(res, "0.id", "moldura-ambar")
+    Check.jsonEq(res, "0.releaseOrder", "1")
+    var previous = 0
+    var n = res.jsonSize("")
+    var i = 0
+    while (i < n) {
+        var order = CosmeticsTestKit.text(res, "" + i + ".releaseOrder").toInt()
+        Check.isTrue("release order grows at " + i, order > previous)
+        previous = order
+        i = i + 1
+    }
+    // The classics come first, in order: the 26th piece is the last of them.
+    Check.jsonEq(res, "25.id", "moldura-radar")
+    var explicit = guest.get("/loja?order=oldest")
+    Check.status(explicit, 200)
+    Check.eqStr("explicit oldest is the default", res.body, explicit.body)
+}
+
+test "the catalog lists newest first by release order" {
+    var app = shopApp()
+    var guest = ProfileTestApp.anonymous(app)
+    var res = guest.get("/loja?order=newest")
+    Check.status(res, 200)
+    var radar = CosmeticsTestKit.rowIndex(res, "moldura-radar")
+    var neon = CosmeticsTestKit.rowIndex(res, "moldura-neon")
+    Check.isTrue("radar listed", radar >= 0)
+    Check.isTrue("neon listed", neon >= 0)
+    Check.jsonEq(res, "" + radar + ".releaseOrder", "26")
+    Check.jsonEq(res, "" + neon + ".releaseOrder", "25")
+    var n = res.jsonSize("")
+    var previous = CosmeticsTestKit.text(res, "0.releaseOrder").toInt() + 1
+    var i = 0
+    while (i < n) {
+        var order = CosmeticsTestKit.text(res, "" + i + ".releaseOrder").toInt()
+        Check.isTrue("release order shrinks at " + i, order < previous)
+        previous = order
+        i = i + 1
+    }
+    Check.jsonEq(res, "" + (n - 1) + ".id", "moldura-ambar")
+}
+
+test "an invalid catalog order is rejected" {
+    var app = shopApp()
+    var guest = ProfileTestApp.anonymous(app)
+    for (var order in listOf("", "recent", "OLDEST")) {
+        Check.apiError(guest.get("/loja?order=" + order), 400, "INVALID_CATALOG_ORDER")
+    }
+}
+
+test "an invalid session does not become an anonymous catalog" {
+    var app = shopApp()
+    var bad = ProfileCaller(app, "invalid-catalog-session")
+    Check.apiError(bad.get("/loja"), 401, "UNAUTHENTICATED")
+}
+
+test "catalog, buy, equip and a double buy is rejected" {
+    var app = shopApp()
+    var buyer = CosmeticsTestKit.wallet(app, "loja-buyer")
+    var catalog = ProfileTestApp.anonymous(app).get("/loja")
+    Check.status(catalog, 200)
+    Check.eqStr("violeta price", "5000", CosmeticsTestKit.rowStr(catalog, "moldura-violeta", "priceMf"))
+    Check.eqStr("buraco negro price", "10000", CosmeticsTestKit.rowStr(catalog, "moldura-buraco-negro", "priceMf"))
+    Check.eqStr("nebulosa price", "10000", CosmeticsTestKit.rowStr(catalog, "moldura-nebulosa", "priceMf"))
+    Check.eqStr("supernova price", "10000", CosmeticsTestKit.rowStr(catalog, "moldura-supernova", "priceMf"))
+    Check.eqStr("galaxia name", "Galáxia", CosmeticsTestKit.rowStr(catalog, "moldura-galaxia", "name"))
+    Check.eqStr("galaxia price", "10000", CosmeticsTestKit.rowStr(catalog, "moldura-galaxia", "priceMf"))
+    Check.eqStr("galaxia ring", "", CosmeticsTestKit.rowStr(catalog, "moldura-galaxia", "cssRing"))
+    Check.isTrue("prisma was replaced", CosmeticsTestKit.rowIndex(catalog, "moldura-prisma") < 0)
+    Check.isTrue("dragao was replaced", CosmeticsTestKit.rowIndex(catalog, "moldura-dragao") < 0)
+    // The direct purchase: 5.000 thousandths leave the wallet (105.000 -> 100.000).
+    var bought = buyer.post("/loja/moldura-violeta/comprar", "")
+    Check.status(bought, 200)
+    Check.jsonEq(bought, "owned", "true")
+    Check.eqStr("balance after the purchase", "100000", "" + CosmeticsTestKit.balance(buyer))
+    // Buying again is refused (it is already yours).
+    Check.apiError(buyer.post("/loja/moldura-violeta/comprar", ""), 409, "ALREADY_OWNED")
+    // Equip: the catalog now marks equipped.
+    var equipped = buyer.post("/loja/moldura-violeta/equipar", "")
+    Check.status(equipped, 200)
+    Check.jsonEq(equipped, "equipped", "true")
+    var mine = buyer.get("/loja")
+    Check.eqStr("owned", "true", CosmeticsTestKit.rowStr(mine, "moldura-violeta", "owned"))
+    Check.eqStr("equipped", "true", CosmeticsTestKit.rowStr(mine, "moldura-violeta", "equipped"))
+    // Equipping what you do not own is refused.
+    Check.apiError(buyer.post("/loja/moldura-coral/equipar", ""), 403, "NOT_OWNED")
+    // Unequipping (none) works without ownership.
+    var none = buyer.post("/loja/none/equipar", "")
+    Check.status(none, 200)
+    Check.jsonEq(none, "equipped", "false")
+}
+
+test "every animated frame is bought, owned and equipped" {
+    var app = shopApp()
+    var frames = listOf("moldura-aurora", "moldura-tempestade", "moldura-inferno", "moldura-buraco-negro", "moldura-orbita", "moldura-glacial", "moldura-toxica", "moldura-nebulosa", "moldura-supernova", "moldura-galaxia", "moldura-portal", "moldura-holograma", "moldura-mare", "moldura-trepadeira", "moldura-vendaval", "moldura-vaga-lumes", "moldura-fliperama", "moldura-circuito", "moldura-neon", "moldura-radar")
+    for (var frame in frames) {
+        var buyer = CosmeticsTestKit.wallet(app, "frame_" + frame.substring(8).replaceAll("-", "_"))
+        var price = "10000"
+        if (frame == "moldura-aurora") {
+            price = "5000"
+        }
+        var catalog = ProfileTestApp.anonymous(app).get("/loja")
+        Check.eqStr("price of " + frame, price, CosmeticsTestKit.rowStr(catalog, frame, "priceMf"))
+        Check.apiError(buyer.post("/loja/" + frame + "/equipar", ""), 403, "NOT_OWNED")
+        var bought = buyer.post("/loja/" + frame + "/comprar", "")
+        Check.status(bought, 200)
+        Check.jsonEq(bought, "owned", "true")
+        Check.apiError(buyer.post("/loja/" + frame + "/comprar", ""), 409, "ALREADY_OWNED")
+        var expected = "95000"
+        if (frame == "moldura-aurora") {
+            expected = "100000"
+        }
+        Check.eqStr("balance after " + frame, expected, "" + CosmeticsTestKit.balance(buyer))
+        Check.status(buyer.post("/loja/" + frame + "/equipar", ""), 200)
+        var mine = buyer.get("/loja")
+        Check.eqStr("owned " + frame, "true", CosmeticsTestKit.rowStr(mine, frame, "owned"))
+        Check.eqStr("equipped " + frame, "true", CosmeticsTestKit.rowStr(mine, frame, "equipped"))
+        Check.jsonEq(buyer.get("/me"), "avatarFrame", frame)
+    }
+}
+
+test "a replaced frame is unavailable and does not charge the wallet" {
+    var app = shopApp()
+    var buyer = CosmeticsTestKit.wallet(app, "frame_prisma_replaced")
+    Check.apiError(buyer.post("/loja/moldura-prisma/comprar", ""), 404, "ITEM_NOT_FOUND")
+    Check.apiError(buyer.post("/loja/moldura-prisma/equipar", ""), 404, "ITEM_NOT_FOUND")
+    Check.eqStr("balance untouched", "105000", "" + CosmeticsTestKit.balance(buyer))
+    CosmeticsTestKit.finish()
+}
