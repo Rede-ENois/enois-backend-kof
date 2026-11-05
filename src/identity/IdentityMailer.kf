@@ -4,28 +4,28 @@ import kernel.config.*
 import kernel.id.*
 import kernel.log.*
 import kernel.time.*
+import kernel.text.*
 import kernel.url.*
+import ops.*
 
 // Outgoing identity e-mails (EmailService): the subjects, the bodies and the links of the Java service.
-// Every message goes through `deliver`, the one overridable seam. The default renders the template and logs
-// the metadata (no address, no body, never a code) instead of speaking SMTP.
-// pending-port: mail transport. The SMTP sender (MAIL_HOST/PORT/USERNAME/PASSWORD with jakarta.mail) is not
-// ported: subclass this class, override `deliver` and wire it in Main.kf. With `capture` on, the messages
-// are kept in memory for tests (sent()).
+// Every message goes through `dispatch` into the shared MailService (SMTP in production, a recording
+// transport in tests), which records the email_log row. With `capture` on, the messages are also kept in
+// memory for tests (sent()).
 class IdentityMailer {
     Log log = Log("identity.mail")
     String frontendUrl
     String backendUrl
     String templatesDir
     Bool capture
-    IdentityStore store
+    MailService mail
     List<IdentityMail> captured = listOf<IdentityMail>()
-    public constructor(cfg: Config, store: IdentityStore, capture: Bool) {
+    public constructor(cfg: Config, mail: MailService, capture: Bool) {
         this.frontendUrl = IdentityMailer.trimSlash(cfg.getStr("FRONTEND_URL", "http://localhost:5173"))
         this.backendUrl = IdentityMailer.trimSlash(cfg.getStr("REDE_BACKEND_URL", "https://api.enois.ia.br"))
         this.templatesDir = cfg.getStr("TEMPLATES_DIR", "resources/templates")
         this.capture = capture
-        this.store = store
+        this.mail = mail
     }
     static String trimSlash(url: String) {
         if (url.endsWith("/")) {
@@ -33,40 +33,15 @@ class IdentityMailer {
         }
         return url
     }
-    // The transport. Return false when the message did not leave (the caller decides what to tell the user).
-    Bool deliver(to: String, subject: String, html: String) = true
     List<IdentityMail> sent() = captured
     clearSent() {
         captured.clear()
     }
+    // Sends through the mail service (which logs it); false when the message did not leave.
     Bool dispatch(kind: String, to: String, subject: String, html: String) {
-        var ok = false
-        var failure = IdentityText.none()
-        try {
-            ok = deliver(to, subject, html)
-        } catch (String e) {
-            failure = "delivery failed"
-            log.warn("email_delivery_failed kind=" + kind)
-        }
+        var ok = mail.sendHtml(to, subject, html, kind)
         if (capture) {
             captured.add(IdentityMail(kind, to, subject, html))
-        }
-        if (ok) {
-            log.info("email_sent kind=" + kind)
-        }
-        else 
-            if (failure == null) {
-                failure = "not delivered"
-            }
-        // Metadata only; the subject of a two-factor message is redacted, a code never reaches the table.
-        var safeSubject = subject
-        if (kind == "TWO_FACTOR") {
-            safeSubject = "Seu código de acesso (redigido)"
-        }
-        try {
-            store.logEmail(Ids.prefixed("email_"), to, safeSubject, kind, ok, failure, Time.nowIso())
-        } catch (String e) {
-            log.warn("email_log_failed kind=" + kind)
         }
         return ok
     }
@@ -75,7 +50,7 @@ class IdentityMailer {
         return dispatch("EMAIL_VERIFICATION", to, "Confirme seu e-mail no Énóis", html)
     }
     Bool sendPasswordResetEmail(to: String, userName: String, token: String) {
-        var html = render("password-reset", mapOf("userName", userName, "resetLink", frontendUrl + "/auth/reset?token=" + token, "#dates.format(#dates.createNow(), \'yyyy\')", year()))
+        var html = render("password-reset", mapOf("userName", userName, "resetLink", frontendUrl + "/auth/reset?token=" + token))
         return dispatch("PASSWORD_RESET", to, "Redefinição de senha", html)
     }
     Bool sendTwoFactorCode(to: String, userName: String, code: String) {
@@ -97,63 +72,13 @@ class IdentityMailer {
     }
     Bool sendHtml(to: String, subject: String, html: String) = dispatch("HTML", to, subject, html)
     String year() = Time.todayIso().substring(0, 4)
-    // The Thymeleaf subset the identity templates use: th:text="${x}" replaces the element text and
-    // th:href="${x}" becomes href. Values are HTML-escaped, like th:text/th:href.
+    // The Thymeleaf subset the identity templates use (kernel HtmlTemplate): th:text, th:href, the footer year.
     String render(template: String, vars: Map<String,String>) {
         var html = File(templatesDir + "/" + template + ".html").readText()
         if (html == null) {
             throw "TEMPLATE_MISSING: " + template
         }
-        var out = html
-        for (var name in vars.keys()) {
-            var value = vars.get(name)
-            if (value == null) {
-                continue
-            }
-            out = fillText(out, name, value)
-            out = fillHref(out, name, value)
-        }
-        return out
-    }
-    String fillText(html: String, name: String, value: String) {
-        var out = html
-        var marker = "th:text=\"${" + name + "}\""
-        if (name.startsWith("#")) {
-            marker = "th:text=\"${" + name + "}\""
-        }
-        var guard = 0
-        while (guard < 20) {
-            guard = guard + 1
-            var at = out.indexOf(marker)
-            if (at < 0) {
-                return out
-            }
-            var tagEnd = out.indexOf(">", at)
-            var close = out.indexOf("</", tagEnd)
-            if (tagEnd < 0 || close < 0) {
-                return out
-            }
-            var before = out.substring(0, at)
-            if (before.endsWith(" ")) {
-                before = before.substring(0, before.length() - 1)
-            }
-            out = before + out.substring(at + marker.length(), tagEnd + 1) + IdentityMailer.escapeHtml(value) + out.substring(close)
-        }
-        return out
-    }
-    String fillHref(html: String, name: String, value: String) {
-        var out = html
-        var marker = "th:href=\"${" + name + "}\""
-        var guard = 0
-        while (guard < 20) {
-            guard = guard + 1
-            var at = out.indexOf(marker)
-            if (at < 0) {
-                return out
-            }
-            out = out.substring(0, at) + "href=\"" + IdentityMailer.escapeHtml(value) + "\"" + out.substring(at + marker.length())
-        }
-        return out
+        return HtmlTemplate.render(html, vars)
     }
     // HtmlUtils.htmlEscape(value, "UTF-8"): & < > " ' only.
     static String escapeHtml(value: String?) {

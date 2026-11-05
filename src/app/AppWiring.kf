@@ -42,6 +42,9 @@ class AppWiring {
     static SharedServices install(platform: Platform) {
         // Shared services (idempotency, outbox worker, audit, cipher, caches, sanction gate, risk engine, ...).
         var shared = SharedServices.create(platform)
+        // The one mail service every sender shares (identity, age, jobs, notifications digest, blog newsletter):
+        // SMTP from MAIL_HOST / MAIL_PORT / MAIL_USERNAME / MAIL_PASSWORD, one email_log row per send.
+        var mail = MailService.fromConfig(platform.cfg, EmailLogStore(platform.db))
         // Request pipeline (filters, limiters, guards). Each domain port replaces its own seam in `hooks`
         // (moderators, monitoring, reports, origins) before this line.
         var hooks = SecurityHooks.defaults(platform.db)
@@ -57,14 +60,14 @@ class AppWiring {
         // eligibility rule of identity reads the live reputation of the profile domain.
         var profiles = ProfileModule.install(platform, shared, hooks)
         var jobSeams = JobSeamSet(platform, profiles)
-        var identitySeams = IdentitySeams.defaults(platform, IdentityStore(platform.db))
+        var identitySeams = IdentitySeams.defaults(platform, mail)
         identitySeams.reputations = JobsIdentityReputation(jobSeams.reputation)
         var identity = IdentityModule.installWith(platform, shared, hooks, parts, identitySeams)
         var age = AgeModule.install(platform, identity.mailer)
         OnboardingModule.install(platform, age.policy)
         FeedModule.install(platform, shared, hooks)
         // Domains (one block each, ordered by dependency): notifications is the sink the others write to.
-        var notificationsModule = NotificationsModule.install(platform, shared, hooks, parts)
+        var notificationsModule = NotificationsModule.install(platform, shared, hooks, parts, mail)
         PushModule.install(platform, shared, hooks, parts, notificationsModule)
         var messagingModule = MessagingModule.install(platform, shared, hooks, parts, notificationsModule)
         CallsModule.install(platform, shared, hooks, parts, notificationsModule, messagingModule)
@@ -92,7 +95,7 @@ class AppWiring {
         ThemeModule.install(platform, shared, hooks)
         ProjectsModule.install(platform, shared, hooks)
         SuggestionsModule.install(platform, shared, hooks)
-        BlogModule.install(platform, shared, hooks)
+        BlogModule.install(platform, shared, hooks, mail)
         return shared
     }
 }
