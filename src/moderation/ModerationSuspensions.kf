@@ -1,0 +1,68 @@
+package moderation
+
+import identity.*
+import kernel.config.*
+import kernel.jobs.*
+import kernel.log.*
+import kernel.time.*
+import notifications.*
+
+// SuspensionExpiryWorker: a SUSPENDED account that reaches the end of the grace period without an accepted appeal becomes a
+// definitive BAN and its content is purged. With an appeal pending the conversion waits for the human decision.
+class ModerationSuspensions {
+    ModerationSanctionStore sanctions
+    ModerationSanctionService service
+    ModerationBanCleanup banCleanup
+    IdentityStore sessions
+    Notifications notifications
+    Long graceSeconds
+    Bool enabled
+    Log log = Log("moderation.suspensions")
+    public constructor(sanctions: ModerationSanctionStore, service: ModerationSanctionService, banCleanup: ModerationBanCleanup, sessions: IdentityStore, notifications: Notifications, graceDays: Int, enabled: Bool) {
+        this.sanctions = sanctions
+        this.service = service
+        this.banCleanup = banCleanup
+        this.sessions = sessions
+        this.notifications = notifications
+        var days = graceDays
+        if (days < 1) {
+            days = 1
+        }
+        if (days > 365) {
+            days = 365
+        }
+        this.graceSeconds = (days as Long) * 86400L
+        this.enabled = enabled
+    }
+    static ModerationSuspensions fromConfig(cfg: Config, sanctions: ModerationSanctionStore, service: ModerationSanctionService, banCleanup: ModerationBanCleanup, sessions: IdentityStore, notifications: Notifications) = ModerationSuspensions(sanctions, service, banCleanup, sessions, notifications, cfg.getInt("SUSPENSION_GRACE_DAYS", 7), cfg.getBool("SUSPENSION_EXPIRY_ENABLED", true))
+    schedule(jobs: Scheduler, cfg: Config) {
+        var self = this
+        jobs.fixedDelay("moderation-suspension-expiry", cfg.getInt("REDE_MODERATION_SUSPENSION_EXPIRY_INITIAL_DELAY_MS", 120000) as Long, cfg.getInt("REDE_MODERATION_SUSPENSION_EXPIRY_DELAY_MS", 1800000) as Long, () -> self.expireSuspensions())
+    }
+    // Returns how many suspensions became bans.
+    Int expireSuspensions() {
+        if (!enabled) {
+            return 0
+        }
+        var cutoff = Time.plusSeconds(Time.nowIso(), 0L - graceSeconds)
+        var converted = 0
+        for (var s in sanctions.expiredSuspensions(cutoff, 200)) {
+            if (sanctions.existsPendingAppeal(s.userId)) {
+                continue
+            }
+            try {
+                var banned = service.saved(ModerationSanctions.escalated(s, "BAN", s.reason))
+                sessions.revokeAllByUser(s.userId, Time.nowIso())
+                banCleanup.cleanup(banned.id, s.userId)
+                notifications.create(s.userId, "SANCAO", "sistema", "Conta banida", "O prazo de recurso terminou sem contestação aceita e a suspensão virou banimento definitivo.", "/api/penalidades", "Ver")
+                converted = converted + 1
+            } catch (String e) {
+                log.warn("suspension_convert_failed sanction=" + s.id)
+            }
+        }
+        if (converted > 0) {
+            log.warn("suspension_expired converted=" + converted)
+        }
+        return converted
+    }
+}

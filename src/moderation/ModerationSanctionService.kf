@@ -1,0 +1,285 @@
+package moderation
+
+import identity.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.time.*
+import notifications.*
+import profile.*
+
+// Told after any sanction changes state, so caches that show sanction facts (public ranking, public profiles) drop the
+// account. A concrete class with a no-op default (G30); the AppWiring subclasses it.
+class ModerationSanctionHooks {
+    public constructor() {}
+    changed(userId: String);
+}
+
+// Sanctions (SanctionService): the AI applies a RESTRICTION when its verdict passes the gate and the author may appeal;
+// a human approves (frees) or denies (ban, sessions revoked). The AI never bans: a ban is a denied appeal or a human decision.
+class ModerationSanctionService {
+    Db database
+    ModerationSanctionStore sanctions
+    ModerationStore reports
+    ModerationTargets targets
+    ModerationContentRemover remover
+    Notifications notifications
+    ModerationBanCleanup banCleanup
+    IdentityStore sessions
+    ProfileDirectory profiles
+    ModerationSanctionHooks hooks
+    public constructor(database: Db, sanctions: ModerationSanctionStore, reports: ModerationStore, targets: ModerationTargets, remover: ModerationContentRemover, notifications: Notifications, banCleanup: ModerationBanCleanup, sessions: IdentityStore, profiles: ProfileDirectory, hooks: ModerationSanctionHooks) {
+        this.database = database
+        this.sanctions = sanctions
+        this.reports = reports
+        this.targets = targets
+        this.remover = remover
+        this.notifications = notifications
+        this.banCleanup = banCleanup
+        this.sessions = sessions
+        this.profiles = profiles
+        this.hooks = hooks
+    }
+    notify(userId: String, kind: String, actorId: String, title: String, body: String, cta: String) {
+        notifications.create(userId, kind, actorId, title, body, "/api/penalidades", cta)
+    }
+    ModerationSanction saved(s: ModerationSanction) {
+        var out = sanctions.save(s)
+        hooks.changed(s.userId)
+        return out
+    }
+    // The penalty of a PENALIZAR verdict: content removed, author restricted, notice with the appeal path. Only for a target
+    // with an unambiguous author (post, comment); the rest goes to a human.
+    Bool applyForReport(report: ModerationReport, motive: String) {
+        if (report.status != "PENDING") {
+            return false
+        }
+        var authorId = targets.authorOf(report.targetType, report.targetId)
+        if (authorId == null) {
+            return false
+        }
+        String author = authorId
+        var self = this
+        var done = listOf<Bool>()
+        database.transaction(() -> {
+    self.remover.remove(report, "ia-triagem", "IA")
+    if (self.sanctions.findActiveByUser(author) == null) {
+        self.saved(ModerationSanctions.restriction(ModerationSanctions.newId(), author, report.id, motive, Time.nowIso()))
+    }
+    self.reports.update(ModerationRules.decided(report, "AUTO_PENALIZED", report.reviewedBy, report.reviewedAt, motive))
+    self.notify(author, "SANCAO", "sistema", "Conta restrita", "Sua conta foi restringida apos analise automatica de uma denuncia: " + motive + ". Se foi um erro, voce pode recorrer e uma pessoa do time vai revisar.", "Recorrer")
+    done.add(true)
+})
+        return done.size() > 0
+    }
+    // A direct restriction by a human decision (a dispute judged false); the reference is the decision record id.
+    ModerationSanction restrictUser(userId: String, referenceId: String, motive: String) {
+        var existing = sanctions.findActiveByUser(userId)
+        if (existing != null) {
+            return existing
+        }
+        var created = this.saved(ModerationSanctions.restriction(ModerationSanctions.newId(), userId, referenceId, motive, Time.nowIso()))
+        this.notify(userId, "SANCAO", "sistema", "Conta restrita", "Sua conta foi restrita: " + motive + ". Se foi um erro, você pode recorrer.", "Recorrer")
+        return created
+    }
+    // A direct ban by a human decision: saves, escalates to BAN and revokes every session. SUSPENDED revokes sessions at once
+    // but stays SUSPENDED (it converts to BAN only when the grace ends without an appeal); PERMABAN is already permanent.
+    ModerationSanction banAuthor(sanction: ModerationSanction, authorId: String, reviewerId: String) {
+        if (sanction.type == "SUSPENDED") {
+            var s = this.saved(sanction)
+            sessions.revokeAllByUser(authorId, Time.nowIso())
+            return s
+        }
+        var persisted = this.saved(sanction)
+        var banned = persisted
+        if (sanction.type != "PERMABAN") {
+            banned = this.saved(ModerationSanctions.escalated(persisted, "BAN", persisted.reason))
+        }
+        sessions.revokeAllByUser(authorId, Time.nowIso())
+        banCleanup.cleanup(banned.id, authorId)
+        return banned
+    }
+    // The user's own appeal: only with an active restriction or suspension and no appeal pending.
+    ModerationAppeal appeal(userId: String, message: String?) {
+        var text = ""
+        if (message != null) {
+            text = message.trim()
+        }
+        if (text.length() < 10) {
+            throw Errors.api(400, "INVALID_APPEAL", "Explica o recurso em pelo menos 10 caracteres.")
+        }
+        var sanction = sanctions.findActiveByUser(userId)
+        if (sanction == null) {
+            throw Errors.api(404, "NO_ACTIVE_SANCTION", "Voce nao tem sancao ativa.")
+        }
+        if (ModerationSanctions.isBan(sanction)) {
+            throw Errors.api(409, "SANCTION_IS_BAN", "Conta banida: o recurso dela ja foi decidido.")
+        }
+        if (sanctions.existsPendingAppeal(userId)) {
+            throw Errors.api(409, "APPEAL_ALREADY_PENDING", "Voce ja tem um recurso em analise.")
+        }
+        var saved = sanctions.saveAppeal(ModerationSanctions.newAppeal(Ids.prefixed("appl_"), sanction.id, userId, text, Time.nowIso()))
+        this.notify(userId, "RECURSO", "sistema", "Recurso recebido", "Seu recurso esta na fila de revisao humana. Avisamos aqui quando houver decisao.", "Ver")
+        return saved
+    }
+    ModerationAppeal pendingAppeal(appealId: String) {
+        var appeal = sanctions.findAppeal(appealId)
+        if (appeal == null) {
+            throw Errors.api(404, "APPEAL_NOT_FOUND", "Recurso nao encontrado.")
+        }
+        if (appeal.status != "PENDING") {
+            throw Errors.api(409, "APPEAL_ALREADY_REVIEWED", "Este recurso ja foi revisado.")
+        }
+        return appeal
+    }
+    ModerationSanction requireSanction(id: String) {
+        var s = sanctions.findById(id)
+        if (s == null) {
+            throw Errors.api(404, "SANCTION_NOT_FOUND", "Sancao nao encontrada.")
+        }
+        return s
+    }
+    // The report behind a sanction is DISMISSED so the credibility returns to normal; references that are not reports have
+    // nothing to dismiss and a DISMISSED report keeps its earlier note.
+    dismissSourceReport(sanction: ModerationSanction, reviewerId: String, note: String, keepDismissed: Bool) {
+        if (!ModerationSanctions.isReportReference(sanction.reportId)) {
+            return
+        }
+        var ref = sanction.reportId
+        if (ref == null) {
+            return
+        }
+        var report = reports.findById(ref)
+        if (report == null) {
+            return
+        }
+        if (keepDismissed && report.status == "DISMISSED") {
+            return
+        }
+        reports.update(ModerationRules.decided(report, "DISMISSED", reviewerId, Time.nowIso(), note))
+    }
+    // Appeal approved: the sanction leaves and the account is back to normal.
+    ModerationSanction approveAppeal(appealId: String, reviewerId: String) {
+        var appeal = this.pendingAppeal(appealId)
+        var sanction = this.requireSanction(appeal.sanctionId)
+        var self = this
+        var out = listOf<ModerationSanction>()
+        database.transaction(() -> {
+    var now = Time.nowIso()
+    if (!self.sanctions.claimAppeal(ModerationSanctions.appealDecided(appeal, "APPROVED", reviewerId, now))) {
+        throw Errors.api(409, "APPEAL_ALREADY_REVIEWED", "Este recurso ja foi revisado.")
+    }
+    out.add(self.saved(ModerationSanctions.removed(sanction, reviewerId, now)))
+    self.dismissSourceReport(sanction, reviewerId, "Recurso aceito pela revisão humana", false)
+    self.notify(sanction.userId, "RECURSO", reviewerId, "Recurso aceito", "Uma pessoa do time revisou seu recurso e a restricao foi removida. Conta liberada.", "Ver")
+})
+        return out.get(0)
+    }
+    // Appeal denied: the restriction or suspension becomes BAN, sessions revoked at once, content purged.
+    ModerationSanction denyAppeal(appealId: String, reviewerId: String) {
+        var appeal = this.pendingAppeal(appealId)
+        var sanction = this.requireSanction(appeal.sanctionId)
+        var self = this
+        var out = listOf<ModerationSanction>()
+        database.transaction(() -> {
+    var now = Time.nowIso()
+    if (!self.sanctions.claimAppeal(ModerationSanctions.appealDecided(appeal, "DENIED", reviewerId, now))) {
+        throw Errors.api(409, "APPEAL_ALREADY_REVIEWED", "Este recurso ja foi revisado.")
+    }
+    var banned = self.saved(ModerationSanctions.escalated(sanction, "BAN", sanction.reason))
+    self.sessions.revokeAllByUser(sanction.userId, now)
+    self.banCleanup.cleanup(banned.id, sanction.userId)
+    self.notify(sanction.userId, "RECURSO", reviewerId, "Recurso negado", "Uma pessoa do time revisou seu recurso e manteve a penalidade. A conta agora esta banida.", "Ver")
+    out.add(banned)
+})
+        return out.get(0)
+    }
+    static String reasonText(value: String?, message: String) {
+        var clean = ""
+        if (value != null) {
+            clean = value.trim()
+        }
+        if (clean.length() < 10) {
+            throw Errors.api(400, "REASON_REQUIRED", message)
+        }
+        return clean
+    }
+    // Manual correction of a wrongly applied penalty: it leaves (REMOVED) and the source report is DISMISSED. Content already
+    // purged by a ban does not come back.
+    ModerationSanction revokeSanction(adminId: String, sanctionId: String, reason: String?) {
+        var clean = ModerationSanctionService.reasonText(reason, "Explique por que a penalidade foi removida (pelo menos 10 caracteres).")
+        var sanction = sanctions.findById(sanctionId)
+        if (sanction == null) {
+            throw Errors.api(404, "SANCTION_NOT_FOUND", "Sanção não encontrada.")
+        }
+        if (!ModerationSanctions.isActive(sanction)) {
+            throw Errors.api(409, "SANCTION_NOT_ACTIVE", "Esta penalidade já foi removida.")
+        }
+        if (sanction.userId == adminId) {
+            throw Errors.api(400, "CANNOT_REVOKE_OWN", "Você não pode revisar a penalidade da própria conta.")
+        }
+        var removed = this.saved(ModerationSanctions.removed(sanction, adminId, Time.nowIso()))
+        this.dismissSourceReport(sanction, adminId, "Penalidade removida por um administrador: " + clean, true)
+        this.notify(sanction.userId, "SANCAO", adminId, "Penalidade removida", "Uma pessoa do time revisou sua penalidade e ela foi removida. Conta liberada. Motivo: " + clean, "Ver")
+        return removed
+    }
+    // Changes type and reason keeping the SAME record. Closing the access drops the sessions; becoming a ban purges content.
+    ModerationSanction editSanction(adminId: String, sanctionId: String, type: String?, reason: String?) {
+        if (type == null) {
+            throw Errors.api(400, "INVALID_SANCTION_TYPE", "Escolha o novo tipo de penalidade.")
+        }
+        var clean = ModerationSanctionService.reasonText(reason, "Explique o motivo da correção (pelo menos 10 caracteres).")
+        var sanction = sanctions.findById(sanctionId)
+        if (sanction == null) {
+            throw Errors.api(404, "SANCTION_NOT_FOUND", "Sanção não encontrada.")
+        }
+        if (!ModerationSanctions.isActive(sanction)) {
+            throw Errors.api(409, "SANCTION_NOT_ACTIVE", "Esta penalidade já foi removida.")
+        }
+        if (sanction.userId == adminId) {
+            throw Errors.api(400, "CANNOT_EDIT_OWN", "Você não pode corrigir a penalidade da própria conta.")
+        }
+        var updated = this.saved(ModerationSanctions.escalated(sanction, type, clean))
+        if (!ModerationSanctions.isBlocked(sanction) && ModerationSanctions.isBlocked(updated)) {
+            sessions.revokeAllByUser(sanction.userId, Time.nowIso())
+        }
+        if (!ModerationSanctions.isBan(sanction) && ModerationSanctions.isBan(updated)) {
+            banCleanup.cleanup(updated.id, sanction.userId)
+        }
+        this.notify(sanction.userId, "SANCAO", adminId, "Penalidade atualizada", "Uma pessoa do time revisou a penalidade da sua conta: " + clean, "Ver")
+        return updated
+    }
+    ModerationSanction? activeSanctionOf(userId: String) = sanctions.findActiveByUser(userId)
+    List<ModerationSanction> sanctionsOf(userId: String) = sanctions.findByUser(userId, 20)
+    List<ModerationAppeal> appealsOf(userId: String) = sanctions.appealsByUser(userId, 20)
+    List<ModerationAppeal> pendingAppeals(limit: Int) = sanctions.appealsByStatus("PENDING", limit)
+    Bool isRestricted(userId: String) = sanctions.findActiveByUser(userId) != null
+    // The network's sanctions in one status, newest first, with the author for the screen (the profile may be gone).
+    List<ModerationSanctionEntry> adminSanctions(status: String, limit: Int) {
+        var rows = sanctions.findByStatus(status, limit)
+        var out = listOf<ModerationSanctionEntry>()
+        if (rows.size() == 0) {
+            return out
+        }
+        var ids = listOf<String>()
+        for (var s in rows) {
+            if (!ids.contains(s.userId)) {
+                ids.add(s.userId)
+            }
+        }
+        var names = mapOf<String, ProfileRecord>()
+        for (var p in profiles.findAllByIds(ids)) {
+            names.put(p.id, p)
+        }
+        for (var s in rows) {
+            var p = names.get(s.userId)
+            if (p == null) {
+                out.add(ModerationSanctionEntry(s, null, null))
+            }
+            else {
+                out.add(ModerationSanctionEntry(s, p.username, p.name))
+            }
+        }
+        return out
+    }
+}

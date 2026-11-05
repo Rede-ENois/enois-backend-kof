@@ -1,0 +1,112 @@
+package moderation
+
+import feed.*
+import kernel.db.*
+import kernel.log.*
+import notifications.*
+import profile.*
+
+// A post the content-automation check quarantined, waiting for a human (ContentQuarantineReviewService.PendingView).
+record ModerationQuarantineView(String postId, String authorId, String? authorUsername, String? content, String verdict, Double confidence, String? reason, String? checkedAt)
+
+// Review of the quarantine: release (back on the air), remove (confirmed violation) and the release a report decision
+// triggers (ContentQuarantineReviewService).
+class ModerationQuarantine {
+    Db database
+    FeedModeration feed
+    ModerationTargets targets
+    ProfileDirectory profiles
+    Notifications notifications
+    Log log = Log("moderation.quarantine")
+    public constructor(database: Db, feed: FeedModeration, targets: ModerationTargets, profiles: ProfileDirectory, notifications: Notifications) {
+        this.database = database
+        this.feed = feed
+        this.targets = targets
+        this.profiles = profiles
+        this.notifications = notifications
+    }
+    List<ModerationQuarantineView> pending(limit: Int) {
+        var cap = limit
+        if (cap < 1) {
+            cap = 1
+        }
+        var out = listOf<ModerationQuarantineView>()
+        var rows = database.queryList("select c.post_id, c.author_id, c.verdict, c.confidence, c.reason, c.checked_at from content_automation_checks c join posts p on p.id = c.post_id where c.review_status = \'PENDING\' and p.status = \'QUARANTINED\' order by c.checked_at desc limit ?", DbParams().bindInt(cap))
+        for (var r in rows) {
+            var postId = r.getStr("post_id")
+            var authorId = r.getStr("author_id")
+            out.add(ModerationQuarantineView(postId, authorId, this.usernameOf(authorId), this.contentOf(postId), r.getStr("verdict"), r.getDouble("confidence"), r.getStrOrNull("reason"), r.getInstantOrNull("checked_at")))
+        }
+        return out
+    }
+    String? usernameOf(userId: String) {
+        var p = profiles.findById(userId)
+        if (p == null) {
+            return null
+        }
+        return p.username
+    }
+    String? contentOf(postId: String) {
+        var p = feed.posts.post(postId)
+        if (p == null) {
+            return null
+        }
+        return p.content()
+    }
+    String? checkStatus(postId: String) {
+        var row = database.queryOptional("select review_status from content_automation_checks where post_id = ?", DbParams().bindStr(postId))
+        if (row == null) {
+            return null
+        }
+        return row.getStr("review_status")
+    }
+    setStatus(postId: String, status: String) {
+        database.execute("update content_automation_checks set review_status = ? where post_id = ?", DbParams().bindStr(status).bindStr(postId))
+    }
+    String? authorOf(postId: String) = targets.authorOf("POST", postId)
+    Bool release(reviewerId: String, postId: String) {
+        var status = this.checkStatus(postId)
+        if (status == null || status != "PENDING") {
+            return false
+        }
+        feed.release(reviewerId, postId)
+        this.setStatus(postId, "RELEASED")
+        this.notice(postId, reviewerId, "Post liberado", "Seu post passou pela revisão e voltou ao ar.", "/api/feed", "Ver feed", "quarantine_release_notice_failed")
+        return true
+    }
+    // A report decision releases the post: true when it was quarantined; a pending check closes as RELEASED.
+    Bool releaseByReport(reviewerId: String, postId: String) {
+        var wasQuarantined = feed.release(reviewerId, postId)
+        var status = this.checkStatus(postId)
+        if (status != null && status == "PENDING") {
+            this.setStatus(postId, "RELEASED")
+        }
+        return wasQuarantined
+    }
+    Bool remove(reviewerId: String, postId: String) {
+        var status = this.checkStatus(postId)
+        if (status == null || status != "PENDING") {
+            return false
+        }
+        var verdict = database.queryOptional("select verdict from content_automation_checks where post_id = ?", DbParams().bindStr(postId))
+        var name = ""
+        if (verdict != null) {
+            name = verdict.getStr("verdict")
+        }
+        feed.removeAsModerator(reviewerId, postId, "REVIEW: conteudo automatizado (" + name + ")")
+        this.setStatus(postId, "REMOVED")
+        this.notice(postId, reviewerId, "Post removido", "Seu post passou pela revisão do time e foi removido por descumprir as diretrizes de conteúdo humano da rede. Se discordar, use o canal de recurso.", "/api/diretrizes", "Ver diretrizes", "quarantine_remove_notice_failed")
+        return true
+    }
+    notice(postId: String, reviewerId: String, title: String, body: String, href: String, cta: String, failure: String) {
+        var authorId = this.authorOf(postId)
+        if (authorId == null) {
+            return
+        }
+        try {
+            notifications.create(authorId, "MODERACAO", reviewerId, title, body, href, cta)
+        } catch (String e) {
+            log.warn(failure + " post=" + postId)
+        }
+    }
+}

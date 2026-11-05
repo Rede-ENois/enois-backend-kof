@@ -1,0 +1,111 @@
+package moderation
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+
+// HTTP adapter of SanctionController: the user's own sanctions and appeals, the moderators' appeal queue and the admin
+// panel over the penalties already applied.
+class ModerationSanctionRoutes {
+    static register(server: HttpServer, service: ModerationSanctionService) {
+        server.get("/me/sanctions", () -> ModerationSanctionRoutes.mine(service))
+        server.post("/me/sanctions/appeals", () -> ModerationSanctionRoutes.appeal(service))
+        server.get("/admin/appeals", () -> ModerationSanctionRoutes.pendingAppeals(service))
+        server.post("/admin/appeals/:appealId/approve", () -> ModerationSanctionRoutes.approve(service))
+        server.post("/admin/appeals/:appealId/deny", () -> ModerationSanctionRoutes.deny(service))
+        server.get("/admin/sanctions", () -> ModerationSanctionRoutes.list(service))
+        server.post("/admin/sanctions/:sanctionId/revoke", () -> ModerationSanctionRoutes.revoke(service))
+        server.post("/admin/sanctions/:sanctionId/edit", () -> ModerationSanctionRoutes.edit(service))
+    }
+    static String mine(service: ModerationSanctionService) {
+        var userId = Auth.requireUser()
+        var sanctions = listOf<ModerationSanctionView>()
+        for (var s in service.sanctionsOf(userId)) {
+            sanctions.add(ModerationSanctions.view(s))
+        }
+        var appeals = listOf<ModerationAppealView>()
+        for (var a in service.appealsOf(userId)) {
+            appeals.add(ModerationSanctions.appealView(a))
+        }
+        return json.encode(ModerationMySanctions(sanctions, appeals))
+    }
+    static String appeal(service: ModerationSanctionService) {
+        var userId = Auth.requireUser()
+        SafeLinks.checkRequest()
+        ModerationAppealBody body
+        try {
+            body = json.decode<ModerationAppealBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        var created = service.appeal(userId, body.message)
+        return json.encode(ModerationAppealOpened("PENDING", created.id))
+    }
+    static String pendingAppeals(service: ModerationSanctionService) {
+        Auth.requireModerator()
+        var out = listOf<ModerationAppealView>()
+        for (var a in service.pendingAppeals(Req.queryInt("limit", 30))) {
+            out.add(ModerationSanctions.appealView(a))
+        }
+        return json.encode(out)
+    }
+    static String approve(service: ModerationSanctionService) {
+        var reviewer = Auth.requireModerator()
+        var s = service.approveAppeal(Req.pathParam("appealId"), reviewer)
+        return json.encode(ModerationSanctionResult("APPROVED", ModerationSanctions.view(s)))
+    }
+    static String deny(service: ModerationSanctionService) {
+        var reviewer = Auth.requireModerator()
+        var s = service.denyAppeal(Req.pathParam("appealId"), reviewer)
+        return json.encode(ModerationSanctionResult("DENIED", ModerationSanctions.view(s)))
+    }
+    static String list(service: ModerationSanctionService) {
+        Auth.requireAdmin()
+        var status = Req.queryStr("status", "ACTIVE").trim().toUpperCase()
+        if (!ModerationSanctions.statuses().contains(status)) {
+            throw Errors.api(400, "INVALID_STATUS", "Estado de penalidade inválido.")
+        }
+        var out = listOf<ModerationAdminSanctionView>()
+        for (var e in service.adminSanctions(status, Req.queryInt("limit", 100))) {
+            out.add(ModerationSanctions.adminView(e))
+        }
+        return json.encode(out)
+    }
+    static String revoke(service: ModerationSanctionService) {
+        var admin = Auth.requireAdmin()
+        ModerationRevokeBody body
+        try {
+            body = json.decode<ModerationRevokeBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        var s = service.revokeSanction(admin, Req.pathParam("sanctionId"), body.reason)
+        return json.encode(ModerationSanctionResult("REVOKED", ModerationSanctions.view(s)))
+    }
+    static String edit(service: ModerationSanctionService) {
+        var admin = Auth.requireAdmin()
+        ModerationEditBody body
+        try {
+            body = json.decode<ModerationEditBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        var type = ModerationSanctionRoutes.parseType(body.type)
+        if (type == null) {
+            throw Errors.api(400, "INVALID_SANCTION_TYPE", "Escolha o novo tipo de penalidade.")
+        }
+        var s = service.editSanction(admin, Req.pathParam("sanctionId"), type, body.reason)
+        return json.encode(ModerationSanctionResult("UPDATED", ModerationSanctions.view(s)))
+    }
+    static String? parseType(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        var candidate = raw.trim().toUpperCase()
+        if (ModerationSanctions.types().contains(candidate)) {
+            return candidate
+        }
+        return null
+    }
+}

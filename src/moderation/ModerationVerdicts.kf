@@ -1,0 +1,79 @@
+package moderation
+
+import kernel.log.*
+
+// The JSON verdict of the AI triage (the fields the backend reads). Absent fields stay null.
+record ModerationVerdict(String? acao, String? categoria, String? gravidade, Double? confianca, Troolean ambiguo, String? justificativa)
+
+// AiVerdictApplicationService: applies the PENALIZAR verdicts that passed the gate. The model only leaves a recorded guess;
+// the backend applies the penalty, and only when the action is PENALIZAR and the gate passes.
+class ModerationVerdicts {
+    ModerationStore reports
+    ModerationSanctionService sanctions
+    ModerationLearning learning
+    Log log = Log("moderation.verdicts")
+    public constructor(reports: ModerationStore, sanctions: ModerationSanctionService, learning: ModerationLearning) {
+        this.reports = reports
+        this.sanctions = sanctions
+        this.learning = learning
+    }
+    static Double minConfidence() = 0.7
+    // Confirmed violation (not ambiguous) with confidence above the floor. Severity classifies the case, it does not decide
+    // whether it is penalizable.
+    static Bool canAutoPenalize(v: ModerationVerdict) {
+        var ambiguous = v.ambiguo != false
+        var confidence = 0.0
+        var c = v.confianca
+        if (c != null) {
+            confidence = c
+        }
+        return !ambiguous && confidence >= ModerationVerdicts.minConfidence()
+    }
+    static ModerationVerdict? parse(raw: String) {
+        try {
+            return json.decode<ModerationVerdict>(raw)
+        } catch (String e) {
+            return null
+        }
+    }
+    Int applyPendingVerdicts(limit: Int) {
+        var applied = 0
+        for (var report in reports.findByStatus("PENDING", limit)) {
+            var stored = report.aiTriage
+            if (stored == null) {
+                continue
+            }
+            String raw = stored
+            if (raw.trim().length() == 0) {
+                continue
+            }
+            var verdict = ModerationVerdicts.parse(raw)
+            if (verdict == null) {
+                continue
+            }
+            var action = verdict.acao
+            if (action == null || action != "PENALIZAR" || !ModerationVerdicts.canAutoPenalize(verdict)) {
+                continue
+            }
+            var motive = ModerationVerdicts.text(verdict.justificativa)
+            if (motive.trim().length() == 0) {
+                motive = ModerationVerdicts.text(verdict.categoria)
+            }
+            try {
+                if (sanctions.applyForReport(report, motive)) {
+                    learning.feedback(report, "AUTO_PENALIZE", "AI", "ai-triage")
+                    applied = applied + 1
+                }
+            } catch (String e) {
+                log.warn("verdict_apply_failed report=" + report.id)
+            }
+        }
+        return applied
+    }
+    static String text(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+}

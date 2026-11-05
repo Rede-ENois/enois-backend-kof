@@ -6,8 +6,10 @@ import java.util.HashMap
 import kernel.*
 import kernel.db.*
 import kernel.mail.*
+import notifications.*
 import kernel.security.*
 import kernel.testkit.*
+import kernel.time.*
 import ops.*
 import profile.*
 
@@ -60,7 +62,8 @@ class ModerationTestKit {
         var feed = FeedModule.install(p, shared, hooks)
         ModerationTestKit.cachedFeed = feed
         var groups = GroupsModule.install(p, shared, hooks)
-        ModerationTestKit.cachedModule = ModerationModule.install(p, shared, parts, feed, groups, profiles, mail)
+        var notifications = NotificationsModule.install(p, shared, hooks, parts, mail)
+        ModerationTestKit.cachedModule = ModerationModule.install(p, shared, parts, feed, groups, profiles, mail, notifications.notifications)
         // Jobs registered by the modules above would keep the test process alive: stopped after all installs.
         shared.stop()
     }
@@ -139,6 +142,45 @@ class ModerationTestKit {
     }
     // POST /reports; the response.
     static TestResponse report(userId: String, targetType: String, targetId: String, reason: String, description: String) = ModerationTestKit.post(userId, "/reports", "{\"targetType\":\"" + targetType + "\",\"targetId\":\"" + targetId + "\",\"reason\":\"" + reason + "\",\"description\":\"" + description + "\"}")
+    static String str2(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    static FeedModule feed() {
+        ModerationTestKit.app()
+        var cur = ModerationTestKit.cachedFeed
+        if (cur == null) {
+            throw "ModerationTestKit: feed not wired"
+        }
+        return cur
+    }
+    // A company page row (the companies domain is not ported: its table is seeded by SQL).
+    static String company(ownerId: String, name: String) {
+        var id = "comp_" + name.replace(" ", "_")
+        var now = Time.nowIso()
+        ModerationTestKit.db().execute("insert into companies (id, slug, name, description, sector, size, location, owner_user_id, status, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, \'ACTIVE\', ?, ?)", DbParams().bindStr(id).bindStr(id).bindStr(name).bindStr("Pagina criada para o teste de denuncia.").bindStr("Tecnologia").bindStr("1-10").bindStr("Remoto").bindStr(ownerId).bindInstant(now).bindInstant(now))
+        return id
+    }
+    // The AI triage verdict of a report (what the triage job stores), written by hand.
+    static attachVerdict(reportId: String, verdictJson: String) {
+        ModerationTestKit.db().execute("update reports set ai_triage = ?, ai_triaged_at = ? where id = ?", DbParams().bindStr(verdictJson).bindInstant(Time.nowIso()).bindStr(reportId))
+    }
+    // The status of a report straight from the table.
+    static String reportStatus(reportId: String) {
+        var row = ModerationTestKit.db().queryOptional("select status from reports where id = ?", DbParams().bindStr(reportId))
+        if (row == null) {
+            return ""
+        }
+        return row.getStr("status")
+    }
+    static String publishReported(author: String, reporter: String, content: String, reason: String) {
+        var postId = ModerationTestKit.publish(author, content)
+        var res = ModerationTestKit.report(reporter, "POST", postId, reason, "denuncia de teste")
+        Check.status(res, 201)
+        return ModerationTestKit.str(res, "id")
+    }
     static finish() {
         var shared = ModerationTestKit.cachedShared
         if (shared != null) {

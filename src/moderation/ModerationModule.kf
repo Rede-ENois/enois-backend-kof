@@ -2,30 +2,63 @@ package moderation
 
 import feed.*
 import groups.*
+import identity.*
 import kernel.*
 import kernel.security.*
+import notifications.*
 import ops.*
 import profile.*
 
 // Composition of the moderation domain. Installed after the domains whose content it reads and whose actions it
-// triggers (feed, groups, profile); the request-pipeline seams that need only the database (moderators, automatic
-// reports) are set on `hooks` before Security.install by the AppWiring.
+// triggers (feed, groups, profile, notifications); the request-pipeline seams that need only the database (moderators,
+// automatic reports) are set on `hooks` before Security.install by the AppWiring.
 class ModerationModule {
     ModerationService service
     ModerationStore store
     ModerationTargets targets
-    public constructor(service: ModerationService, store: ModerationStore, targets: ModerationTargets) {
+    ModerationDecisions decisions
+    ModerationSanctionService sanctions
+    ModerationSanctionStore sanctionStore
+    ModerationBanCleanup banCleanup
+    ModerationQuarantine quarantine
+    ModerationLearning learning
+    ModerationVerdicts verdicts
+    ModerationSuspensions suspensions
+    ModerationContentTargets contentTargets
+    public constructor(service: ModerationService, store: ModerationStore, targets: ModerationTargets, decisions: ModerationDecisions, sanctions: ModerationSanctionService, sanctionStore: ModerationSanctionStore, banCleanup: ModerationBanCleanup, quarantine: ModerationQuarantine, learning: ModerationLearning, verdicts: ModerationVerdicts, suspensions: ModerationSuspensions, contentTargets: ModerationContentTargets) {
         this.service = service
         this.store = store
         this.targets = targets
+        this.decisions = decisions
+        this.sanctions = sanctions
+        this.sanctionStore = sanctionStore
+        this.banCleanup = banCleanup
+        this.quarantine = quarantine
+        this.learning = learning
+        this.verdicts = verdicts
+        this.suspensions = suspensions
+        this.contentTargets = contentTargets
     }
-    static ModerationModule install(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService) = ModerationModule.installWith(platform, shared, parts, feed, groups, profiles, mail, ModerationReportEvents(), ModerationCompanies(platform.db))
-    static ModerationModule installWith(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, events: ModerationReportEvents, companies: ModerationCompanies) {
+    static ModerationModule install(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications) = ModerationModule.installWith(platform, shared, parts, feed, groups, profiles, mail, notifications, ModerationReportEvents(), ModerationCompanies(platform.db), ModerationSanctionHooks())
+    static ModerationModule installWith(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications, events: ModerationReportEvents, companies: ModerationCompanies, sanctionHooks: ModerationSanctionHooks) {
         var cfg = platform.cfg
         var store = ModerationStore(platform.db)
         var targets = ModerationTargets(feed.moderation, groups.reports, companies)
         var service = ModerationService(platform.db, store, targets, parts.actionThrottle, mail, profiles.directory, events, cfg.getStr("SUPPORT_EMAIL", "suporte@enois.ia.br"), cfg.getStr("FRONTEND_URL", "http://localhost:5173"), cfg.getInt("REDE_MODERATION_REPORTS_PER_HOUR", 10))
-        ModerationRoutes.register(platform.server, service, store, shared.idempotency)
-        return ModerationModule(service, store, targets)
+        var contentTargets = ModerationContentTargets.fromConfig(cfg)
+        var sanctionStore = ModerationSanctionStore(platform.db)
+        var banCleanup = ModerationBanCleanup(platform.db, sanctionStore, feed.moderation, contentTargets)
+        var remover = ModerationContentRemover(feed.moderation)
+        var sessions = IdentityStore(platform.db)
+        var sanctions = ModerationSanctionService(platform.db, sanctionStore, store, targets, remover, notifications, banCleanup, sessions, profiles.directory, sanctionHooks)
+        var quarantine = ModerationQuarantine(platform.db, feed.moderation, targets, profiles.directory, notifications)
+        var learning = ModerationLearning(platform.db)
+        var decisions = ModerationDecisions(platform.db, store, targets, companies, remover, quarantine, learning, sanctions, notifications)
+        var verdicts = ModerationVerdicts(store, sanctions, learning)
+        var suspensions = ModerationSuspensions.fromConfig(cfg, sanctionStore, sanctions, banCleanup, sessions, notifications)
+        suspensions.schedule(shared.jobs, cfg)
+        ModerationRoutes.register(platform.server, service, store, decisions, shared.idempotency)
+        ModerationSanctionRoutes.register(platform.server, sanctions)
+        return ModerationModule(service, store, targets, decisions, sanctions, sanctionStore, banCleanup, quarantine, learning, verdicts, suspensions, contentTargets)
     }
 }

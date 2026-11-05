@@ -19,6 +19,12 @@ class ModerationStore {
     insert(r: ModerationReport) {
         store.execute("insert into reports (id, reporter_id, target_type, target_id, reason, description, status, created_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(r.id).bindStr(r.reporterId).bindStr(r.targetType).bindStr(r.targetId).bindStr(r.reason).bindStr(r.description).bindStr(r.status).bindInstant(r.createdAt))
     }
+    // Writes the mutable columns back (ReportPersistenceAdapter.save of an existing report).
+    update(r: ModerationReport) {
+        store.execute("update reports set status = ?, reviewed_by = ?, reviewed_at = ?, resolution_note = ?, ai_triage = ?, ai_triaged_at = ?, pre_triage = ?, pre_triage_score = ?, pre_triaged_at = ? where id = ?", DbParams().bindStr(r.status).bindStrOrNull(r.reviewedBy).bindInstantOrNull(r.reviewedAt).bindStrOrNull(r.resolutionNote).bindStrOrNull(r.aiTriage).bindInstantOrNull(r.aiTriagedAt).bindStrOrNull(r.preTriage).bindIntOrNull(r.preTriageScore).bindInstantOrNull(r.preTriagedAt).bindStr(r.id))
+    }
+    // Atomic claim of a PENDING report: only one concurrent decision moves it (UPDATE ... WHERE status = 'PENDING').
+    Bool claim(r: ModerationReport) = store.execute("update reports set status = ?, reviewed_by = ?, reviewed_at = ?, resolution_note = ? where id = ? and status = \'PENDING\'", DbParams().bindStr(r.status).bindStrOrNull(r.reviewedBy).bindInstantOrNull(r.reviewedAt).bindStrOrNull(r.resolutionNote).bindStr(r.id)) > 0
     ModerationReport? findById(id: String) {
         var row = store.queryOptional("select " + ModerationStore.columns() + " from reports where id = ?", DbParams().bindStr(id))
         if (row == null) {

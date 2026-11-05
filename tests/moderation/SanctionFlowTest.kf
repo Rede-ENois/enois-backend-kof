@@ -1,0 +1,109 @@
+import kernel.db.*
+import kernel.sanctions.*
+import kernel.testkit.*
+import moderation.*
+
+// Port of SanctionFlowTests: report -> AI verdict (PENALIZAR) -> penalty and notice -> appeal -> a human approves or denies.
+// The AI never bans: a ban comes from a denied appeal.
+String verdictOf(category: String, severity: String, confidence: String, ambiguous: String, why: String) = "{\"categoria\":\"" + category + "\",\"gravidade\":\"" + severity + "\",\"confianca\":" + confidence + ",\"ambiguo\":" + ambiguous + ",\"acao\":\"PENALIZAR\",\"justificativa\":\"" + why + "\"}"
+
+String statusIn(res: TestResponse, id: String) {
+    var n = res.jsonSize("")
+    var k = 0
+    while (k < n) {
+        if (res.jsonStr(k + ".id") == id) {
+            return ModerationTestKit.str(res, k + ".status")
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+TestResponse publishAttempt(userId: String, text: String) = ModerationTestKit.post(userId, "/feed/posts", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"" + text + "\",\"tags\":[],\"mediaIds\":[]}")
+
+test "penalize, notify, appeal, approve frees the author" {
+    var author = ModerationTestKit.login("sflow_author")
+    var viewer = ModerationTestKit.login("sflow_viewer")
+    var admin = ModerationTestKit.loginAdmin("sflow_admin")
+    var reportId = ModerationTestKit.publishReported(author, viewer, "Post que vai ser penalizado automaticamente.", "DISCRIMINATION")
+    ModerationTestKit.attachVerdict(reportId, verdictOf("discurso_de_odio", "HIGH", "0.95", "false", "Ofensa direcionada e discriminacao contra grupo."))
+    Check.isTrue("verdict applied", ModerationTestKit.module().verdicts.applyPendingVerdicts(10) >= 1)
+    var blocked = publishAttempt(author, "nao deveria passar")
+    Check.status(blocked, 403)
+    Check.jsonEq(blocked, "code", "ACCOUNT_RESTRICTED")
+    Check.jsonEq(ModerationTestKit.get(viewer, "/reports/mine"), "0.status", "AUTO_PENALIZED")
+    var appeal = ModerationTestKit.post(author, "/me/sanctions/appeals", "{\"message\":\"Foi discussao tecnica, nao discriminacao. Podem revisar.\"}")
+    Check.status(appeal, 200)
+    Check.jsonEq(appeal, "status", "PENDING")
+    var appealId = ModerationTestKit.str(appeal, "id")
+    Check.status(ModerationTestKit.post(author, "/me/sanctions/appeals", "{\"message\":\"outro recurso para a mesma sancao\"}"), 409)
+    var queue = ModerationTestKit.get(admin, "/admin/appeals")
+    Check.status(queue, 200)
+    Check.isTrue("appeal queued", statusIn(queue, appealId) == "PENDING")
+    var approved = ModerationTestKit.post(admin, "/admin/appeals/" + appealId + "/approve", "")
+    Check.status(approved, 200)
+    Check.jsonEq(approved, "sanction.status", "REMOVED")
+    Check.jsonEq(approved, "status", "APPROVED")
+    Check.status(publishAttempt(author, "livre de novo"), 201)
+    // The report behind the sanction is dismissed so the credibility returns to normal.
+    Check.isTrue("report dismissed", ModerationTestKit.reportStatus(reportId) == "DISMISSED")
+    var mine = ModerationTestKit.get(author, "/me/sanctions")
+    Check.status(mine, 200)
+    Check.jsonEq(mine, "sanctions.0.status", "REMOVED")
+    Check.jsonEq(mine, "appeals.0.status", "APPROVED")
+}
+
+test "a denied appeal bans the author and revokes the sessions" {
+    var author = ModerationTestKit.login("sflow_author2")
+    var viewer = ModerationTestKit.login("sflow_viewer2")
+    var admin = ModerationTestKit.loginAdmin("sflow_admin2")
+    var reportId = ModerationTestKit.publishReported(author, viewer, "Post do segundo fluxo, recurso sera negado.", "DISCRIMINATION")
+    ModerationTestKit.attachVerdict(reportId, verdictOf("ameaca", "CRITICAL", "0.97", "false", "Ameaca direta e inequivoca contra pessoa."))
+    Check.isTrue("verdict applied", ModerationTestKit.module().verdicts.applyPendingVerdicts(10) >= 1)
+    var appeal = ModerationTestKit.post(author, "/me/sanctions/appeals", "{\"message\":\"nao foi ameaca, foi figura de linguagem\"}")
+    Check.status(appeal, 200)
+    var denied = ModerationTestKit.post(admin, "/admin/appeals/" + ModerationTestKit.str(appeal, "id") + "/deny", "")
+    Check.status(denied, 200)
+    Check.jsonEq(denied, "sanction.type", "BAN")
+    Check.jsonEq(denied, "sanction.status", "ACTIVE")
+    Check.status(ModerationTestKit.get(author, "/me/sanctions"), 401)
+    // The login gate reads the same table: the account is banned even with the right password.
+    Check.isTrue("banned", SanctionGateReader(ModerationTestKit.db()).banned(author))
+    // The decided appeal cannot be decided twice.
+    var again = ModerationTestKit.post(admin, "/admin/appeals/" + ModerationTestKit.str(appeal, "id") + "/approve", "")
+    Check.status(again, 409)
+    Check.jsonEq(again, "code", "APPEAL_ALREADY_REVIEWED")
+}
+
+test "an ambiguous or low confidence verdict does not penalize" {
+    var author = ModerationTestKit.login("sflow_author3")
+    var viewer = ModerationTestKit.login("sflow_viewer3")
+    var reportId = ModerationTestKit.publishReported(author, viewer, "Post do fluxo de veredito ambiguo.", "DISCRIMINATION")
+    ModerationTestKit.attachVerdict(reportId, verdictOf("golpe", "HIGH", "0.6", "true", "parece golpe mas o contexto nao fecha"))
+    ModerationTestKit.module().verdicts.applyPendingVerdicts(10)
+    Check.isTrue("still pending", ModerationTestKit.reportStatus(reportId) == "PENDING")
+    Check.status(publishAttempt(author, "ainda publicando"), 201)
+}
+
+test "a confirmed verdict penalizes without high severity" {
+    var author = ModerationTestKit.login("sflow_author4")
+    var viewer = ModerationTestKit.login("sflow_viewer4")
+    var reportId = ModerationTestKit.publishReported(author, viewer, "Post do fluxo de veredito confirmado.", "SPAM")
+    ModerationTestKit.attachVerdict(reportId, verdictOf("spam", "MEDIUM", "0.8", "false", "Spam confirmado no conteudo"))
+    Check.isTrue("verdict applied", ModerationTestKit.module().verdicts.applyPendingVerdicts(10) >= 1)
+    Check.isTrue("auto penalized", ModerationTestKit.reportStatus(reportId) == "AUTO_PENALIZED")
+}
+
+test "appeal validation, ban without appeal and the moderator guard" {
+    var plain = ModerationTestKit.login("sflow_plain")
+    Check.status(ModerationTestKit.post(plain, "/me/sanctions/appeals", "{\"message\":\"curto\"}"), 400)
+    var none = ModerationTestKit.post(plain, "/me/sanctions/appeals", "{\"message\":\"mensagem longa o bastante\"}")
+    Check.status(none, 404)
+    Check.jsonEq(none, "code", "NO_ACTIVE_SANCTION")
+    Check.status(ModerationTestKit.get(plain, "/admin/appeals"), 403)
+    Check.status(ModerationTestKit.post(plain, "/admin/appeals/x/approve", ""), 403)
+    Check.status(ModerationTestKit.get("", "/me/sanctions"), 401)
+    var admin = ModerationTestKit.loginAdmin("sflow_admin5")
+    Check.status(ModerationTestKit.post(admin, "/admin/appeals/appl_missing/deny", ""), 404)
+    ModerationTestKit.finish()
+}

@@ -1,0 +1,67 @@
+package moderation
+
+import kernel.id.*
+
+// A sanction on an account (UserSanction in the Java domain). RESTRICTION blocks publishing and commenting and can be
+// appealed; SUSPENDED blocks like a ban but converts to BAN when the grace period ends without an accepted appeal;
+// BAN comes from a denied appeal; PERMABAN is an admin decision without appeal. Status is ACTIVE or REMOVED.
+record ModerationSanction(String id, String userId, String? reportId, String type, String? reason, String status, String createdAt, String? removedAt, String? removedBy)
+
+// An appeal of a sanction (Appeal): PENDING until a human approves or denies it.
+record ModerationAppeal(String id, String sanctionId, String userId, String message, String status, String createdAt, String? reviewedBy, String? reviewedAt)
+
+// What the sanction endpoints answer (SanctionView, AppealView, AdminSanctionView).
+record ModerationSanctionView(String id, String userId, String? reportId, String type, String? reason, String status, String createdAt, String? removedAt)
+
+record ModerationAppealView(String id, String sanctionId, String userId, String message, String status, String createdAt, String? reviewedBy, String? reviewedAt)
+
+record ModerationAdminSanctionView(String id, String userId, String? username, String? name, String? reportId, String type, String? reason, String status, String createdAt, String? removedAt)
+
+// The sanctions of one account and its appeals (GET /me/sanctions).
+record ModerationMySanctions(List<ModerationSanctionView> sanctions, List<ModerationAppealView> appeals)
+
+// {status, id} of an opened appeal, {status, sanction} of a decision.
+record ModerationAppealOpened(String status, String id)
+
+record ModerationSanctionResult(String status, ModerationSanctionView sanction)
+
+record ModerationAppealBody(String? message)
+
+record ModerationRevokeBody(String? reason)
+
+record ModerationEditBody(String? type, String? reason)
+
+// A sanction row with its author for the admin screen (SanctionEntry).
+record ModerationSanctionEntry(ModerationSanction sanction, String? username, String? name)
+
+class ModerationSanctions {
+    static List<String> types() = listOf("RESTRICTION", "SUSPENDED", "BAN", "PERMABAN")
+    static List<String> statuses() = listOf("ACTIVE", "REMOVED")
+    static String newId() = Ids.prefixed("sanc_")
+    static ModerationSanction restriction(id: String, userId: String, reportId: String?, reason: String, now: String) = ModerationSanction(id, userId, reportId, "RESTRICTION", reason, "ACTIVE", now, null, null)
+    static ModerationSanction suspended(id: String, userId: String, reportId: String?, reason: String, now: String) = ModerationSanction(id, userId, reportId, "SUSPENDED", reason, "ACTIVE", now, null, null)
+    static ModerationSanction permaBan(id: String, userId: String, reportId: String?, reason: String, now: String) = ModerationSanction(id, userId, reportId, "PERMABAN", reason, "ACTIVE", now, null, null)
+    static Bool isActive(s: ModerationSanction) = s.status == "ACTIVE"
+    // BAN or PERMABAN: no new session and no appeal.
+    static Bool isBan(s: ModerationSanction) = s.type == "BAN" || s.type == "PERMABAN"
+    // SUSPENDED, BAN or PERMABAN: no access at all.
+    static Bool isBlocked(s: ModerationSanction) = ModerationSanctions.isBan(s) || s.type == "SUSPENDED"
+    static ModerationSanction removed(s: ModerationSanction, reviewerId: String, at: String) = ModerationSanction(s.id, s.userId, s.reportId, s.type, s.reason, "REMOVED", s.createdAt, at, reviewerId)
+    // Escalating keeps the SAME id: a second row would leave two ACTIVE sanctions and the newest would mask the older.
+    static ModerationSanction escalated(s: ModerationSanction, type: String, reason: String?) = ModerationSanction(s.id, s.userId, s.reportId, type, reason, "ACTIVE", s.createdAt, s.removedAt, s.removedBy)
+    static ModerationAppeal newAppeal(id: String, sanctionId: String, userId: String, message: String, now: String) = ModerationAppeal(id, sanctionId, userId, message, "PENDING", now, null, null)
+    static ModerationAppeal appealDecided(a: ModerationAppeal, status: String, reviewerId: String, at: String) = ModerationAppeal(a.id, a.sanctionId, a.userId, a.message, status, a.createdAt, reviewerId, at)
+    static ModerationSanctionView view(s: ModerationSanction) = ModerationSanctionView(s.id, s.userId, s.reportId, s.type, s.reason, s.status, s.createdAt, s.removedAt)
+    static ModerationAppealView appealView(a: ModerationAppeal) = ModerationAppealView(a.id, a.sanctionId, a.userId, a.message, a.status, a.createdAt, a.reviewedBy, a.reviewedAt)
+    static ModerationAdminSanctionView adminView(e: ModerationSanctionEntry) {
+        var s = e.sanction
+        return ModerationAdminSanctionView(s.id, s.userId, e.username, e.name, s.reportId, s.type, s.reason, s.status, s.createdAt, s.removedAt)
+    }
+    // A reference that is a report id (report_...) has a report to dismiss; decisions of disputes and `admin:` notes do not.
+    static Bool isReportReference(reportId: String?) {
+        if (reportId == null) {
+            return false
+        }
+        return reportId.startsWith("report_")
+    }
+}

@@ -1,0 +1,47 @@
+package moderation
+
+import kernel.db.*
+import kernel.id.*
+import kernel.time.*
+
+record ModerationPreTriage(List<String>? signals)
+
+// The side of ModerationLearningService that decisions feed: one row per human or AI decision on a report that went
+// through the pre-triage (moderation_feedback). The weight learning job comes with the triage sub-area.
+class ModerationLearning {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // The signals of a stored pre-triage JSON as a CSV, or null when there are none (or the JSON is unreadable).
+    static String? signalsCsv(preTriage: String?) {
+        if (preTriage == null) {
+            return null
+        }
+        String raw = preTriage
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        try {
+            var signals = json.decode<ModerationPreTriage>(raw).signals
+            if (signals == null) {
+                return null
+            }
+            List<String> list = signals
+            if (list.size() == 0) {
+                return null
+            }
+            return String.join(",", list)
+        } catch (String e) {
+            return null
+        }
+    }
+    // decision: PUNISH, WARN, BAN, APPROVE, DISMISS, AUTO_PENALIZE. A report from before the pre-triage has nothing to learn.
+    feedback(report: ModerationReport, decision: String, source: String, decidedBy: String) {
+        var signals = ModerationLearning.signalsCsv(report.preTriage)
+        if (signals == null && report.preTriageScore == null) {
+            return
+        }
+        store.execute("insert into moderation_feedback (id, report_id, decision, source, decided_by, signals, score, created_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(Ids.prefixed("mfb_")).bindStr(report.id).bindStr(decision).bindStr(source).bindStr(decidedBy).bindStrOrNull(signals).bindIntOrNull(report.preTriageScore).bindInstant(Time.nowIso()))
+    }
+}
