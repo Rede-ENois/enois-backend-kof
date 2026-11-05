@@ -1,0 +1,104 @@
+import importlinkedin.*
+import kernel.bytes.*
+import kernel.db.*
+import kernel.files.*
+import kernel.testkit.*
+
+// HTTP tests of the two LinkedIn upload endpoints (multipart POSTs through the binary lane) and the port of
+// LinkedinImportUploadLimitTests. The app boots with the test profile of the Java service: 8 MB upload cap.
+String linkedinZip(extraNoise: Int) {
+    var zip = ZipFixtures.start()
+    zip.text("Positions.csv", "\"Position Title\",\"Company Name\",\"Location\",\"Description\",\"Started On\",\"Finished On\"\n\"Dev\",\"Acme\",\"Remoto\",\"Fez coisas\",\"2020-01\",\"2022-06\"")
+    zip.text("Profile.csv", "First Name,Last Name,Headline\nAna,Souza,Engenheira")
+    if (extraNoise > 0) {
+        // The CSV is padded with stored noise the importer never inflates (only the used CSVs are read).
+        zip.noise("Basic/Rich_Media/noise.bin", extraNoise, 7L)
+    }
+    return zip.finish()
+}
+
+MultipartBody withFile(name: String, filename: String, type: String, path: String) = MultipartBody.create().addFile(name, filename, type, TempFiles.readAll(path))
+
+test "aThreeMegabyteZipReachesTheControllerInsteadOfFailingAtTheLane" {
+    var path = linkedinZip(3000000)
+    Check.isTrue("above the old 1 MB default", UploadFiles.size(path) > 1048576L)
+    var res = ImportTestKit.upload("/me/import/linkedin", null, withFile("file", "linkedin.zip", "application/zip", path))
+    // Without a session the right answer is 401: what matters is that it is not the lane's limit error.
+    Check.eqInt("status", 401, res.status)
+}
+
+test "aFileAboveTheConfiguredLimitGetsAClearError" {
+    var path = linkedinZip(8450000)
+    Check.isTrue("above the limit", UploadFiles.size(path) > 8388608L)
+    var res = ImportTestKit.upload("/me/import/linkedin", null, withFile("file", "linkedin.zip", "application/zip", path))
+    Check.eqInt("status", 413, res.status)
+    Check.isTrue("code", res.text().contains("FILE_TOO_LARGE"))
+    var logged = ImportTestKit.login("li_big")
+    var again = ImportTestKit.upload("/me/import/linkedin", logged, withFile("file", "linkedin.zip", "application/zip", path))
+    Check.eqInt("status with a session", 413, again.status)
+    Check.isTrue("code with a session", again.text().contains("FILE_TOO_LARGE"))
+}
+
+test "theArchiveEndpointReturnsThePortrait" {
+    var user = ImportTestKit.login("li_upload")
+    var res = ImportTestKit.upload("/me/import/linkedin", user, withFile("file", "linkedin.zip", "application/zip", linkedinZip(0)))
+    Check.eqInt("status", 200, res.status)
+    Check.eqStr("title", "Dev", res.json("experiences.0.title"))
+    Check.eqStr("company", "Acme", res.json("experiences.0.company"))
+    Check.eqStr("name", "Ana Souza", res.json("profile.name"))
+}
+
+test "theArchiveEndpointNeedsAFileAndAKnownFormat" {
+    var user = ImportTestKit.login("li_upload2")
+    var none = ImportTestKit.upload("/me/import/linkedin", user, MultipartBody.create().addText("other", "x"))
+    Check.eqInt("no file part", 400, none.status)
+    Check.eqStr("code", "FILE_REQUIRED", none.json("code"))
+    var empty = ImportTestKit.upload("/me/import/linkedin", user, MultipartBody.create().addFile("file", "e.zip", "application/zip", "".getBytes()))
+    Check.eqInt("empty file", 400, empty.status)
+    Check.eqStr("empty code", "FILE_REQUIRED", empty.json("code"))
+    var junk = ImportTestKit.upload("/me/import/linkedin", user, MultipartBody.create().addFile("file", "x.zip", "application/zip", "not a zip".getBytes()))
+    Check.eqInt("not a zip", 400, junk.status)
+    var big = ImportTestKit.upload("/me/import/linkedin", user, withFile("file", "linkedin.zip", "application/zip", linkedinZip(6000000)))
+    Check.eqInt("above the 5 MB rule of the service", 400, big.status)
+    Check.eqStr("big code", "FILE_TOO_LARGE", big.json("code"))
+}
+
+test "theUploadEndpointsNeedASession" {
+    var archive = ImportTestKit.upload("/me/import/linkedin", null, MultipartBody.create().addFile("file", "a.zip", "application/zip", "x".getBytes()))
+    Check.eqInt("archive", 401, archive.status)
+    var contacts = ImportTestKit.upload("/me/import/linkedin/contatos", null, MultipartBody.create().addFile("file", "a.csv", "text/csv", "x".getBytes()))
+    Check.eqInt("contacts", 401, contacts.status)
+}
+
+test "theContactsEndpointImportsAConnectionsCsvAndTheNeighboursStayOrdinaryRoutes" {
+    var me = ImportTestKit.login("li_contacts_up")
+    var matched = ImportTestKit.login("li_contacts_match")
+    ImportTestKit.db().execute("update users set social_name = ? where id = ?", DbParams().bindStr("Zelia Upload Qa").bindStr(matched))
+    var csv = "First Name,Last Name,URL,Email Address,Company,Position,Connected On\nZelia Upload,Qa,https://www.linkedin.com/in/z,,Acme,Dev,01 Jan 2024\nNinguem,Aqui,https://www.linkedin.com/in/n,,Acme,Dev,01 Jan 2024\n"
+    var res = ImportTestKit.upload("/me/import/linkedin/contatos", me, MultipartBody.create().addFile("file", "Connections.csv", "text/csv", csv.getBytes()))
+    Check.eqInt("status", 200, res.status)
+    Check.eqStr("contacts", "2", res.json("contacts"))
+    // The neighbours below the same paths are not pulled into the upload dance.
+    var summary = ImportTestKit.get("/me/import/linkedin/contatos/resumo", me)
+    Check.status(summary, 200)
+    var list = ImportTestKit.get("/me/import/linkedin/contatos", me)
+    Check.status(list, 200)
+    var on = ImportTestKit.put("/me/import/linkedin/contatos/auto-convite", me, "{\"enabled\":true}")
+    Check.status(on, 200)
+    Check.jsonEq(on, "autoInvite", "true")
+    var text = ImportTestKit.post("/me/import/linkedin/texto", me, "{\"texto\":\"Ana Souza\\nEngenheira\"}")
+    Check.status(text, 200)
+    // A wrong method on the claimed path is an ordinary 405 from the runtime, not an upload.
+    var wrong = ImportTestKit.get("/me/import/linkedin", me)
+    Check.eqInt("GET on the upload path", 405, wrong.status)
+}
+
+test "theContactsEndpointAcceptsTheWholeZipToo" {
+    var me = ImportTestKit.login("li_contacts_zip")
+    var zip = ZipFixtures.start()
+    zip.text("Connections.csv", "First Name,Last Name,URL,Email Address,Company,Position,Connected On\nA,B,https://x,,C,D,01 Jan 2024\n")
+    var res = ImportTestKit.upload("/me/import/linkedin/contatos", me, withFile("file", "dados.zip", "application/zip", zip.finish()))
+    Check.eqInt("status", 200, res.status)
+    Check.eqStr("contacts", "1", res.json("contacts"))
+    ImportTestKit.finish()
+}

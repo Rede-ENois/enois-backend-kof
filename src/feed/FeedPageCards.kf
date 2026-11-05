@@ -1,0 +1,41 @@
+package feed
+
+import kernel.cache.*
+import kernel.config.*
+import kernel.db.*
+import kernel.image.*
+
+// The share card of a page (PagePreviewCardService + the author lookup of PageContentController): the drawing is
+// kernel.image.PageCards, this class owns the cache (`pagePreviewCards`, keyed by post id like the Java
+// @Cacheable) and the author name. Fonts: FONTS_DIR (default resources/fonts).
+class FeedPageCards {
+    Db store
+    TtlCache cardCache
+    String fontPath
+    public constructor(store: Db, entries: TtlCache, cfg: Config) {
+        this.store = store
+        this.cardCache = entries
+        this.fontPath = cfg.getStr("FONTS_DIR", "resources/fonts") + "/LiberationSans-Bold.ttf"
+    }
+    // PNG bytes of the card of `doc`, from the cache when it is fresh.
+    Byte[] cardOf(doc: FeedPageDoc) = PageCards.fromText(this.cardText(doc))
+    // The card as the base64 text the cache keeps.
+    String cardText(doc: FeedPageDoc) {
+        var cached = cardCache.get(doc.postId())
+        if (cached != null) {
+            return cached
+        }
+        var text = this.drawn(doc)
+        cardCache.put(doc.postId(), text)
+        return text
+    }
+    String drawn(doc: FeedPageDoc) = PageCards.toText(PageCards.render(doc.html(), this.authorName(doc.authorId()), fontPath))
+    // users.name of the author (UserProfile.name), null when the account is gone.
+    String? authorName(authorId: String) {
+        var row = store.queryOptional("select name from users where id = ?", DbParams().bindStr(authorId))
+        if (row == null) {
+            return null
+        }
+        return row.getStrOrNull("name")
+    }
+}

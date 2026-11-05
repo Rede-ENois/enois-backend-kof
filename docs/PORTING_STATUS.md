@@ -274,22 +274,23 @@ PROJECTS, NEWS, TUTORIALS, OPPORTUNITIES, REVIEWS, FUN; date-window pagination a
 `POST|GET|DELETE /feed/scheduled` with `feed-scheduled-publish` (3 attempts, batches of 20), post seals
 (`/feed/posts/seals`, `/{postId}/seals`, `/{postId}/seals/people`), `GET /feed/corporate`,
 `GET /corporate/{u}/posts`, post notes (`/feed/posts/{id}/notes`, `GET|PATCH /admin/notes`), accepted answers,
-`GET /pages/{postId}` (HTML with the CSP headers) and `GET /pages/{postId}/og.png`.
+`GET /pages/{postId}` (HTML with the CSP headers) and `GET /pages/{postId}/og.png` (the share card, drawn by `kernel.image.PageCards`
+with Java2D and the bundled Liberation font, cached in `pagePreviewCards`, streamed through a GET route claim of the binary lane).
 Jobs on `kernel.jobs` (`REDE_FEED_WORKERS_ENABLED`, default true): `feed-moment-expiry`, `feed-scheduled-publish`.
 Moderation use cases are exposed on `FeedModule.moderation` (`removeAsModerator`, `quarantine`, `release`,
 `removeCommentAsModerator`, `purgeAllByAuthor`); the purge also clears `post_reposts`, `poll_votes`, `poll_options` and
 `comment_media`, which the Java list missed.
 
 Deliberate differences:
-- `GET /pages/{postId}/og.png` answers 404 for non-pages and 501 `PAGE_CARD_UNAVAILABLE` for pages: the Kof handler
-  writes a String as UTF-8, so no binary body can be served (G145).
+- `GET /pages/{postId}/og.png` leaves the runtime as a stream (`X-Kernel-Stream`, `BinaryLane.claimDownload`), because a
+  handler writes a String as UTF-8 (G145): `GET /pages/{postId}` stays an ordinary route. The gradient is painted pixel by pixel
+  (`GradientPaint` takes floats, see KOF_GAPS), so the PNG is not byte-identical to the Java one.
 - `FeedDistributionService` and the in-memory feed cache are not ported: in Java `fromCache` is dead code and the cache
   is write-only, so nothing reads it.
 - `GET /feed/posts/seals` is registered before `/feed/posts/:postId` because routes match in registration order (G147).
 - Counters move with atomic `update ... set n = n + 1`.
 
-Tests not ported (9 of 170, with reason): the two PagePreviewCard tests and the og image test (binary body, G145);
-the actor-style notification test (notifications port); the BanCleanupService test (moderation port); the coin-ledger
+Tests not ported (6 of 170, with reason): the actor-style notification test (notifications port); the BanCleanupService test (moderation port); the coin-ledger
 reaction test (coins port; `FeedRecordingCoins` records the answer reward instead); the media-embedding Mockito `verify`
 test (media port); two identity-presentation tests that need the full profile cosmetics wiring.
 Test wiring: `feed.FeedTestSupport` (limits relaxed, duplicate filters off, outbox worker parked with
@@ -686,23 +687,33 @@ Slug `jobs`, branch `port/jobs`. Modules installed in `Main.kf`: `ProfileModule`
 | Domain | Endpoints ported/total | Kof tests | Java tests ported/total |
 |---|---|---|---|
 | jobs (`src/jobs`) | 20/20 | `tests/jobs/*` (108, 17 files; includes the eligibility policy, `OpenJobApiSource` over a stub transport, `UrlCanonical`, `HtmlEntities`, `Db.requiresNew`) | 94/94 methods (one loses two assertions, see below) |
-| importlinkedin (`src/importlinkedin`) | 4/6 (`POST /texto`, `GET /contatos/resumo`, `PUT /contatos/auto-convite`, `GET /contatos`); `POST /me/import/linkedin` and `POST /me/import/linkedin/contatos` wait for the binary lane | `tests/importlinkedin/*` | 18/20 (the two `LinkedinImportUploadLimitTests` are transport tests, they wait for the lane) |
-| importresume (`src/importresume`) | 0/2 over HTTP: `POST /me/import/resume` and `POST /me/import/resume/prefill/{jobId}` are multipart uploads, so they wait for the binary lane; the services behind them (`ResumeImportService.parse/extractText/prefill`, `ResumePrefillService`) are complete and tested on the uploaded temp file | `tests/importresume/ResumeImportServiceTest` | 9/9 |
+| importlinkedin (`src/importlinkedin`) | 6/6 (the two uploads `POST /me/import/linkedin` and `/contatos` go through the binary lane) | `tests/importlinkedin/*` (+ `LinkedinUploadRoutesTest`) | 20/20 (`LinkedinImportUploadLimitTests` ported over the lane) |
+| importresume (`src/importresume`) | 2/2 (`POST /me/import/resume` and `POST /me/import/resume/prefill/{jobId}`, multipart through the binary lane) | `tests/importresume/ResumeImportServiceTest`, `ResumeUploadRoutesTest` | 9/9 |
 
-### What wait for the binary lane
+### The four uploads on the binary lane
 
-`src/kernel/http/BinaryLane.kf` and `BinaryFront.kf` are on `main` and merged here, but they do not fit these four endpoints yet, so the routes are NOT registered (an unregistered route answers `200` with an empty body, so the front would see a silent success). Measured in `BinaryFront.kf`: the upload branch is `method == "PUT"` only (the download branch `GET`), the claim is a path PREFIX (`BinaryLane.owns` uses `startsWith`) and the body that reaches the route is the raw request body in a temp file. The four endpoints are `POST` `multipart/form-data`, and their prefixes share paths with ordinary routes (`PUT /me/import/linkedin/contatos/auto-convite`, `GET .../contatos`, `POST .../texto`), which a prefix claim would pull into the upload dance. What the lane needs for them (a kernel change owned by the media/lane work, not done here to avoid redesigning another agent's file):
+The four endpoints are `POST multipart/form-data` and share path prefixes with ordinary routes, so they are claimed by
+METHOD and exact path (`BinaryLane.claimRoute`, `docs/KERNEL.md`, "Method + path claims"); `PUT .../contatos/auto-convite`,
+`GET .../contatos`, `POST .../texto` stay ordinary routes and are exercised by `LinkedinUploadRoutesTest`. Each handler
+authenticates before the body is read (`Auth.requireUser`, then `BinaryUploads.receive`), the front streams the body
+through `MultipartParser` into temp files and the lane deletes them after the answer.
 
-1. `POST` accepted in the upload branch next to `PUT`, with claims matched by method and exact path (or a claim list of `(method, path)`).
-2. A multipart step that extracts the `file` part of the temp file (boundary from `Content-Type`) into its own temp file.
-
-Everything behind the upload is done and tested with files on disk, which is what step 2 would hand over (`UploadFiles`, a temp path); wiring each route is then a few lines:
-
-- `POST /me/import/linkedin` -> `LinkedinImportService.parseArchive(path)` (413 `IMPORT_TOO_LARGE` zip-bomb guard, `REDE_IMPORT_LINKEDIN_MAX_UNCOMPRESSED_BYTES`, 5 MB `FILE_TOO_LARGE`).
-- `POST /me/import/linkedin/contatos` -> `LinkedinImportService.parseContacts(path)` then `LinkedinContactInviteService.importContacts(userId, contacts)`.
-- `POST /me/import/resume` -> `ResumeImportService.parse(path, originalName, contentType)`.
-- `POST /me/import/resume/prefill/{jobId}` -> `ResumePrefillService.prefill(userId, jobId, ResumeImportService.extractText(path, name, type))`.
-- The Java `LinkedinImportUploadLimitTests` (a 3 MB zip reaches the controller, an 8.45 MB one gets 413 `FILE_TOO_LARGE` over a real socket) belong with the lane wiring; a module that claims a prefix must also stop the platform at the end of its suite (see `tests/media/MediaContractTest`).
+- `POST /me/import/linkedin` -> `LinkedinImportService.parseArchive(file)`; `POST /me/import/linkedin/contatos` ->
+  `parseContacts(file)` then `LinkedinContactInviteService.importContacts`; `POST /me/import/resume` ->
+  `ResumeImportService.parse(file, name, type)`; `POST /me/import/resume/prefill/{jobId}` ->
+  `ResumePrefillService.prefill(user, jobId, extractText(file, name, type))`.
+- Limits: `REDE_IMPORT_UPLOAD_MAX_BYTES` (default 16 MB) caps the request and its file part (`413 FILE_TOO_LARGE` from the
+  front). Spring allowed 520 MB and the services then refused above 5 MB (LinkedIn) / 10 MB (resume) with a `400
+  FILE_TOO_LARGE`: here a file between 16 MB and 520 MB answers 413 instead of 400, with the same code, and 520 MB never
+  reaches the disk of an authenticated user. The 5 MB / 10 MB service rules are unchanged (`400 FILE_TOO_LARGE`).
+- Differences from Spring: a missing `file` part is `400 FILE_REQUIRED` (Spring answered 500 through the generic handler),
+  a body that is not multipart is `415 UNSUPPORTED_MEDIA_TYPE`, a chunked body is `411 LENGTH_REQUIRED`, a broken multipart
+  body is `400 MALFORMED_MULTIPART`. One upload goes through the filter chain twice (authorize and commit).
+- The Java `LinkedinImportUploadLimitTests` run in `LinkedinUploadRoutesTest` over a real socket with the 8 MB cap of the Java
+  test profile (`ImportTestKit` sets `REDE_IMPORT_UPLOAD_MAX_BYTES=8388608`): the 3 MB zip reaches the route (401 without
+  a session), the 8.45 MB one gets `413 FILE_TOO_LARGE`, with and without a session. In Spring the limit was checked before
+  authentication; here too (the declared length), while the file itself is only read after the session is accepted.
+- Lane gaps found: G300 to G303 (`docs/KOF_GAPS.md`).
 
 ### Seams replaced by real module APIs
 

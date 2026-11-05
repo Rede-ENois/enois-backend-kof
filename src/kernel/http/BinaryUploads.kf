@@ -1,0 +1,61 @@
+package kernel.http
+
+import kernel.error.*
+
+// Handler side of a multipart POST claimed with `BinaryLane.claimRoute`. The front calls the route twice (see
+// BinaryLane); the handler runs the same code both times and lets `receive` tell the phases apart:
+//
+//   String importResume() {
+//       var userId = Auth.requireUser()                                  // every check BEFORE any body is spooled
+//       var form = BinaryUploads.receive(userId, "POST /me/import/resume")
+//       if (form == null) {
+//           return BinaryUploads.authorized()                            // authorize phase: 202 and a ticket
+//       }
+//       var file = form.file("file")                                     // commit phase: the parsed body
+//       ...
+//   }
+//
+// The temp files of the form belong to the lane: it deletes them after the answer (or when the ticket expires).
+class BinaryUploads {
+    // null in the authorize phase (the ticket is on the response); the parsed form in the commit phase.
+    static MultipartForm? receive(userId: String, key: String) {
+        var phase = Req.headerOrNull("x-kernel-binary")
+        if (phase == null) {
+            // Not through the lane: an empty body, a body that is not multipart (415, like Spring's `consumes`) or
+            // direct access to the web runtime.
+            var type = Req.headerOrNull("content-type")
+            var multipart = false
+            if (type != null) {
+                multipart = type.toLowerCase().trim().startsWith("multipart/form-data")
+            }
+            if (!multipart) {
+                throw Errors.api(415, "UNSUPPORTED_MEDIA_TYPE", "Tipo de conteudo nao suportado.")
+            }
+            throw Errors.api(400, "FILE_REQUIRED", "Envie o arquivo.")
+        }
+        if (phase == "authorize") {
+            var declared = 0L
+            var raw = Req.headerOrNull("x-kernel-declared-length")
+            if (raw != null) {
+                try {
+                    declared = raw.trim().toLong()
+                } catch (String e) {
+                    declared = 0L
+                }
+            }
+            ResponseHeaders.set("X-Kernel-Accept", BinaryLane.accept(userId, key, declared))
+            return null
+        }
+        var ticket = Req.headerOrNull("x-kernel-ticket")
+        if (ticket == null) {
+            throw Errors.api(400, "UPLOAD_FAILED", "Nao foi possivel ler o arquivo enviado.")
+        }
+        var form = BinaryLane.form(ticket, userId, key)
+        if (form == null) {
+            throw Errors.api(400, "UPLOAD_FAILED", "Nao foi possivel ler o arquivo enviado.")
+        }
+        return form
+    }
+    // The answer of the authorize phase.
+    static String authorized() = Http.respond(202, "{}")
+}
