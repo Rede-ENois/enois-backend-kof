@@ -837,3 +837,75 @@ Total: 70 of 70 endpoints, 148 of 151 Java behaviours ported as 158 Kof tests; t
 ### Kernel files added or changed by this slice
 
 `kernel/jobs/ProcessLock.kf` (new: the `synchronized` of Java), `kernel/time/ZoneDates.kf` (`localToInstant`, `dayOfWeek`, `weekStart`), both with tests in `tests/kernel`. Config: `COSMETICS_CATALOG` (default `resources/cosmetics/catalog.json`; the deploy must ship the file next to `resources/templates`), `REDE_COSMETICS_EVENTS_{DUEL,HUNT}_{STARTS,ENDS}_AT`, `REDE_MARKETPLACE_*`, `COIN_ECONOMY_*`. Test support in `src/economy/` (`EconomyTestKit`, `CosmeticsTestKit`, `MarketTestKit`, `ServicesTestKit`). Gaps found: G240 to G248 in `KOF_GAPS.md`.
+
+## contributions, contributors, githubprofile, support
+
+| Domain | Endpoints ported/total | Java tests ported/total |
+|---|---|---|
+| contributions | 17/17 | 18/20 (see below) |
+| contributors | 6/6 | 7/7 |
+| githubprofile | 4/4 | 6/6 |
+| support | 9/9 + the webhook | 12/12 (the 6 route-authorization tests as one HTTP suite) |
+
+**contributions**: public seals and evidence, criteria, the account link state and "verify contributions" (per-user
+limit `UserRateLimiter.syncGithub()`), the admin queue of evidence (review with the status transition rules, seal
+grant and revoke, recalculation, the repositories switch, the manual sync with `dryRun`/`full`/`repositories`), the
+open pull requests queue and its review (the service token when the person has no write token of their own), the sync
+(on link, on demand, and on `kernel.jobs` when `GITHUB_SYNC_ENABLED=true`, cron `GITHUB_SYNC_CRON`, default
+`0 */10 * * * *` like `application.properties`; the annotation default of Java is 6 h but the property wins). The sync
+keeps the Java rules: a merged PR is born VALIDATED, an issue only counts with a qualifying label or after a human
+review, a human review is never overwritten, a "Revert ..." PR flags evidence N, the detail budget bounds the calls,
+the repositories of the organization are discovered (enabled on birth, an existing row is never touched).
+
+**contributors**: the public landing form (per-IP limit, public write), the confirmation of verified contributors
+(idempotent, the handle comes from the link), the account state, the admin queue and the panel (verified people
+appear on their own). `VerifiedContributors` (the Java `VerifiedContributorReaderAdapter`) lives in contributions.
+
+**githubprofile**: the repositories of the link, the README preview and import (rendered by
+`kernel.html.MarkdownBio`, sanitised by `SafeHtml`), the project import (same limits as the manual form), the cache
+(`githubRepositories`, `githubReadme` through `kernel.cache`; a failure and a missing README are never cached).
+
+**support**: tickets, throttle, triage, official reply (e-mail, in-app notice, thread, GitHub comment), the thread, the
+GitHub mirror (issue on open, close/reopen on status, comment on reply, signed webhook back), the encrypted settings.
+
+### Seams filled in `AppWiring`
+
+| Seam | Filled by | Test |
+|---|---|---|
+| `identity.IdentityOAuthLinks` (GitHub side) | `ContributionsOAuthLinks` (identity, write token only with `repo`/`public_repo` and the cipher on, sync after the commit) | `tests/contributions/ContributionsSeamsTest.kf` |
+| `cosmetics.CosmeticsContributors.isVerified` | `ContributionsCosmeticsContributors` (`VerifiedContributors.find`) | same file |
+| `suggestions.SuggestionsGithubToken` | `SuggestionsSupportToken` (reads the support settings on every use) | `tests/support/SupportSeamsTest.kf` |
+| support: who answers on GitHub | `SupportLinkedPeople` (login and write token from contributions) | same file |
+
+Seams owned by this slice: `GithubGateway` (the GitHub reader of contributions), `GithubProfileGateway`,
+`SupportGithubGateway`, `SupportGithubPeople` (all base classes with inert defaults and a real client, G30).
+
+### Decisions and deliberate differences
+
+- **webhook**: 503 without a secret, 401 for a missing/wrong signature (constant-time compare of `sha256=<hex>`), 200 for
+  everything else including a signed malformed body; the 2 MiB ceiling is a filter at order -975 (`WEBHOOK_TOO_LARGE`, no
+  timestamp, like the Java filter). Bodies are UTF-8 text (G161): GitHub sends UTF-8 JSON.
+- **support mail**: the shared `IdentityMailer` carries no "Suporte Énóis" sender name nor Reply-To; the reply-to of the
+  team mail (the contact of the requester) is therefore not a header. The Java `fetchImage` was dead code and is not ported.
+- **GitHub rate limit message**: `Outbound` hides response headers, so `remaining=?` is always `?`.
+- **org repository filter**: `private` is a Kof keyword (G325), so the redundant `private` check of the listing is dropped;
+  the request already asks `type=public`. The user repository listing has the same reason.
+- **sync on link** runs on its own task with a `Gate` (Java: a single-thread executor); the suites run it inline.
+- **optional booleans** (`dryRun`, `full`, `enabled`, `acceptedTerms`) are `Troolean` (G140).
+- **`/admin/support/github;v=1`** is not an unknown path in Kof: it matches `PATCH/POST /admin/support/:id` as an id, so a
+  GET answers 405 and never reaches the settings handler (the other spellings of the Java matrix are unknown paths, 200 empty).
+- **sealed enums** travel as Strings; an unknown value in a body or query is a plain 400 like the Jackson/Spring conversion.
+- **not ported as separate tests**: `GitHubOAuthLinkTests.githubLoginIsRejected...` is `tests/identity/OAuthTest.kf`
+  (`githubOnlyLinksAndNeverSignsIn`); `linkWithoutOAuthConfigFailsClosed` is covered by the identity OAuth suite on main
+  (the `OAUTH_NOT_CONFIGURED` 501 of `IdentityOAuth`); the contributor tag colour test of `VerifiedContributorPanelTests`
+  is `tests/cosmetics/CommunityCosmeticsFlowTest.kf` plus the cosmetics seam test above.
+
+### Kernel changes of this slice
+
+`Hashes.hmacSha256Hex`, `Outbound.patch` (Apache `HttpPatch`: `HttpURLConnection` cannot PATCH), `ZoneDates.formatLocal`
+(documented in `docs/KERNEL.md`, tests in `tests/kernel`), `ProfileStore.updateBioHtml`.
+
+### Gaps
+
+G320 to G324 (Apache client interop) and G325: `private` is a Kof keyword and cannot be a record member; also seen again:
+G204/G304 (a field named `http` is read as the package, `VerifyError`/`COMPUTE_FRAMES` crash), G12.
