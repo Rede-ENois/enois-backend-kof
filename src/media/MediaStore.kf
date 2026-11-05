@@ -1,0 +1,176 @@
+package media
+
+import kernel.db.*
+import kernel.error.*
+
+// SQL of the media domain: media_assets, media_deletion_jobs, media_url_migrations (same tables and
+// columns as the Java JPA adapters).
+class MediaStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, owner_id, file_name, mime_type, size_bytes, purpose, object_key, cdn_url, status, delete_status, created_at, expires_at, deleted_at, storage_provider, s3_cdn_url, s3_migrated_at, s3_migration_attempts, s3_last_error, width, height, dimension_attempts"
+    static MediaAsset assetOf(r: DbRow) = MediaAsset(r.getStr("id"), r.getStr("owner_id"), r.getStr("file_name"), r.getStr("mime_type"), r.getLong("size_bytes"), r.getStrOrNull("purpose"), r.getStr("object_key"), r.getStr("cdn_url"), r.getStr("status"), r.getStr("delete_status"), r.getInstant("created_at"), r.getInstant("expires_at"), r.getInstantOrNull("deleted_at"), r.getStr("storage_provider"), r.getStrOrNull("s3_cdn_url"), r.getInstantOrNull("s3_migrated_at"), r.getInt("s3_migration_attempts"), r.getStrOrNull("s3_last_error"), r.getIntOrNull("width"), r.getIntOrNull("height"), r.getInt("dimension_attempts"))
+    // JPA `save`: update the row when it exists, insert it otherwise.
+    save(a: MediaAsset) {
+        var changed = store.execute("update media_assets set owner_id = ?, file_name = ?, mime_type = ?, size_bytes = ?, purpose = ?, object_key = ?, cdn_url = ?, status = ?, delete_status = ?, created_at = ?, expires_at = ?, deleted_at = ?, storage_provider = ?, s3_cdn_url = ?, s3_migrated_at = ?, s3_migration_attempts = ?, s3_last_error = ?, width = ?, height = ?, dimension_attempts = ? where id = ?", MediaStore.assetParams(a).bindStr(a.id))
+        if (changed == 0) {
+            store.execute("insert into media_assets (owner_id, file_name, mime_type, size_bytes, purpose, object_key, cdn_url, status, delete_status, created_at, expires_at, deleted_at, storage_provider, s3_cdn_url, s3_migrated_at, s3_migration_attempts, s3_last_error, width, height, dimension_attempts, id) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", MediaStore.assetParams(a).bindStr(a.id))
+        }
+    }
+    static DbParams assetParams(a: MediaAsset) = DbParams().bindStr(a.ownerId).bindStr(a.fileName).bindStr(a.mimeType).bindLong(a.size).bindStrOrNull(a.purpose).bindStr(a.objectKey).bindStr(a.cdnUrl).bindStr(a.status).bindStr(a.deleteStatus).bindInstant(a.createdAt).bindInstant(a.expiresAt).bindInstantOrNull(a.deletedAt).bindStr(a.storageProvider).bindStrOrNull(a.s3CdnUrl).bindInstantOrNull(a.s3MigratedAt).bindInt(a.s3MigrationAttempts).bindStrOrNull(a.s3LastError).bindIntOrNull(a.width).bindIntOrNull(a.height).bindInt(a.dimensionAttempts)
+    MediaAsset? findById(id: String) {
+        var row = store.queryOptional("select " + MediaStore.columns() + " from media_assets where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return MediaStore.assetOf(row)
+    }
+    List<MediaAsset> findByIds(ids: List<String>) {
+        if (ids.isEmpty()) {
+            return listOf<MediaAsset>()
+        }
+        var marks = ""
+        var params = DbParams()
+        for (var id in ids) {
+            if (marks.length() > 0) {
+                marks = marks + ", "
+            }
+            marks = marks + "?"
+            params = params.bindStr(id)
+        }
+        return MediaStore.toAssets(store.queryList("select " + MediaStore.columns() + " from media_assets where id in (" + marks + ")", params))
+    }
+    // Next batch of phase 1: still on ImageKit, old enough, not deleted, under the attempts cap, no live claim.
+    List<MediaAsset> findForS3Copy(limit: Int, before: String, maxAttempts: Int) = MediaStore.toAssets(store.queryList("select " + MediaStore.columns() + " from media_assets where storage_provider = \'IMAGEKIT\' and s3_migrated_at is null and delete_status = \'NONE\' and created_at < ? and s3_migration_attempts < ? and (s3_claimed_at is null or s3_claimed_at < ?) order by s3_migration_attempts asc, created_at asc limit ?", DbParams().bindInstant(before).bindInt(maxAttempts).bindInstant(before).bindInt(MediaStore.atLeastOne(limit))))
+    // Atomic claim: only the replica that writes the claim copies this asset now; stale claims expire.
+    Bool claimForS3Copy(id: String, now: String, staleBefore: String, maxAttempts: Int) = store.execute("update media_assets set s3_claimed_at = ?, s3_migration_attempts = s3_migration_attempts + 1 where id = ? and s3_migrated_at is null and s3_migration_attempts < ? and (s3_claimed_at is null or s3_claimed_at < ?)", DbParams().bindInstant(now).bindStr(id).bindInt(maxAttempts).bindInstant(staleBefore)) > 0
+    // Phase 2: copy ready and cdn_url still on the old provider.
+    List<MediaAsset> findForS3Flip(limit: Int) = MediaStore.toAssets(store.queryList("select " + MediaStore.columns() + " from media_assets where storage_provider = \'S3\' and s3_cdn_url is not null and cdn_url <> s3_cdn_url and delete_status = \'NONE\' order by created_at asc limit ?", DbParams().bindInt(MediaStore.atLeastOne(limit))))
+    Long countAll() = store.queryLong("select count(*) from media_assets", DbParams())
+    Long countByStorageProvider(provider: String) = store.queryLong("select count(*) from media_assets where storage_provider = ?", DbParams().bindStr(provider))
+    Long countMigratedToS3() = store.queryLong("select count(*) from media_assets where s3_migrated_at is not null", DbParams())
+    Long countWithMigrationError() = store.queryLong("select count(*) from media_assets where s3_last_error is not null", DbParams())
+    Long countActiveOnS3() = store.queryLong("select count(*) from media_assets where storage_provider = \'S3\' and s3_cdn_url is not null and cdn_url = s3_cdn_url", DbParams())
+    String? lastMigrationError() {
+        var row = store.queryOptional("select s3_last_error from media_assets where s3_last_error is not null order by created_at desc limit 1", DbParams())
+        if (row == null) {
+            return null
+        }
+        return row.getStrOrNull("s3_last_error")
+    }
+    markDeleteRequested(id: String, now: String) {
+        store.execute("update media_assets set delete_status = \'REQUESTED\', deleted_at = ? where id = ? and delete_status in (\'NONE\', \'FAILED\')", DbParams().bindInstant(now).bindStr(id))
+    }
+    markObjectDeleted(id: String, now: String) {
+        store.execute("update media_assets set delete_status = \'OBJECT_DELETED\', deleted_at = ? where id = ?", DbParams().bindInstant(now).bindStr(id))
+    }
+    // Phase 1 done: the copy exists in the bucket (the cdn_url does not change yet).
+    markS3Copy(id: String, s3Url: String, now: String) {
+        store.execute("update media_assets set storage_provider = \'S3\', s3_cdn_url = ?, s3_migrated_at = ?, s3_last_error = null where id = ?", DbParams().bindStr(s3Url).bindInstant(now).bindStr(id))
+    }
+    markS3Failure(id: String, error: String?) {
+        store.execute("update media_assets set s3_migration_attempts = s3_migration_attempts + 1, s3_last_error = coalesce(?, s3_last_error) where id = ?", DbParams().bindStrOrNull(MediaStore.cutOrNull(error, 300)).bindStr(id))
+    }
+    // Phase 2: the public address of the copy answers, so cdn_url moves to it.
+    activateS3(id: String) {
+        store.execute("update media_assets set cdn_url = s3_cdn_url where id = ? and s3_cdn_url is not null", DbParams().bindStr(id))
+    }
+    recordDimensions(id: String, width: Int, height: Int) {
+        store.execute("update media_assets set width = ?, height = ? where id = ?", DbParams().bindInt(width).bindInt(height).bindStr(id))
+    }
+    recordDimensionFailure(id: String) {
+        store.execute("update media_assets set dimension_attempts = dimension_attempts + 1 where id = ?", DbParams().bindStr(id))
+    }
+    // Newest first: recent posts are the ones being scrolled right now.
+    List<MediaAsset> findForDimensionBackfill(limit: Int, maxAttempts: Int, createdBefore: String) = MediaStore.toAssets(store.queryList("select " + MediaStore.columns() + " from media_assets where width is null and mime_type like \'image/%\' and storage_provider = \'S3\' and delete_status = \'NONE\' and dimension_attempts < ? and created_at < ? order by created_at desc limit ?", DbParams().bindInt(maxAttempts).bindInstant(createdBefore).bindInt(MediaStore.atLeastOne(limit))))
+    // ---------------------------------------------------------------- deletion jobs
+    requestDeletionJob(id: String, mediaId: String, postId: String?, ownerId: String, createdAt: String) {
+        if (store.queryLong("select count(*) from media_deletion_jobs where media_id = ?", DbParams().bindStr(mediaId)) > 0L) {
+            return
+        }
+        store.execute("insert into media_deletion_jobs (id, media_id, post_id, owner_id, status, attempts, created_at, next_attempt_at) values (?, ?, ?, ?, \'REQUESTED\', 0, ?, ?)", DbParams().bindStr(id).bindStr(mediaId).bindStrOrNull(postId).bindStr(ownerId).bindInstant(createdAt).bindInstant(createdAt))
+    }
+    String? deletionJobStatus(mediaId: String) {
+        var row = store.queryOptional("select status from media_deletion_jobs where media_id = ?", DbParams().bindStr(mediaId))
+        if (row == null) {
+            return null
+        }
+        return row.getStr("status")
+    }
+    List<MediaDeletionJob> pendingDeletionJobs(now: String, limit: Int) = MediaStore.toJobs(store.queryList("select id, media_id, post_id, owner_id, status, attempts from media_deletion_jobs where status = \'REQUESTED\' and next_attempt_at <= ? order by created_at asc limit ?", DbParams().bindInstant(now).bindInt(limit)))
+    completeDeletionJob(mediaId: String, processedAt: String) {
+        store.execute("update media_deletion_jobs set status = \'COMPLETED\', processed_at = ?, error_message = null where media_id = ?", DbParams().bindInstant(processedAt).bindStr(mediaId))
+    }
+    failDeletionJob(mediaId: String, error: String, nextAttemptAt: String) {
+        store.execute("update media_deletion_jobs set status = \'REQUESTED\', attempts = attempts + 1, next_attempt_at = ?, error_message = ? where media_id = ?", DbParams().bindInstant(nextAttemptAt).bindStr(MediaRules.cut(error, 1024)).bindStr(mediaId))
+    }
+    // ---------------------------------------------------------------- url migrations (media_url_migrations)
+    static MediaUrlMigration urlRow(r: DbRow) = MediaUrlMigration(r.getStr("url_hash"), r.getStr("source_url"), r.getStr("status"), r.getStrOrNull("s3_url"), r.getInt("attempts"), r.getStrOrNull("last_error"))
+    MediaUrlMigration? findUrlMigration(urlHash: String) {
+        var row = store.queryOptional("select url_hash, source_url, status, s3_url, attempts, last_error from media_url_migrations where url_hash = ?", DbParams().bindStr(urlHash))
+        if (row == null) {
+            return null
+        }
+        return MediaStore.urlRow(row)
+    }
+    // Idempotent: another replica creating the row first is fine.
+    ensureUrlPending(urlHash: String, sourceUrl: String, now: String) {
+        if (store.queryLong("select count(*) from media_url_migrations where url_hash = ?", DbParams().bindStr(urlHash)) > 0L) {
+            return
+        }
+        try {
+            store.execute("insert into media_url_migrations (url_hash, source_url, status, attempts, updated_at) values (?, ?, \'PENDING\', 0, ?)", DbParams().bindStr(urlHash).bindStr(MediaRules.cut(sourceUrl, 1000)).bindInstant(now))
+        } catch (String e) {
+            if (!Errors.hasCode(e, "CONFLICT")) {
+                throw e
+            }
+        }
+    }
+    Bool claimUrl(urlHash: String, now: String, staleBefore: String, maxAttempts: Int) = store.execute("update media_url_migrations set claimed_at = ?, attempts = attempts + 1 where url_hash = ? and status in (\'PENDING\', \'FAILED\') and attempts < ? and (claimed_at is null or claimed_at < ?)", DbParams().bindInstant(now).bindStr(urlHash).bindInt(maxAttempts).bindInstant(staleBefore)) > 0
+    markUrlCopied(urlHash: String, s3Url: String, now: String) {
+        store.execute("update media_url_migrations set status = \'COPIED\', s3_url = ?, last_error = null, claimed_at = null, updated_at = ? where url_hash = ?", DbParams().bindStr(MediaRules.cut(s3Url, 1000)).bindInstant(now).bindStr(urlHash))
+    }
+    markUrlActive(urlHash: String, now: String) {
+        store.execute("update media_url_migrations set status = \'ACTIVE\', claimed_at = null, updated_at = ? where url_hash = ?", DbParams().bindInstant(now).bindStr(urlHash))
+    }
+    markUrlFailed(urlHash: String, error: String?, now: String) {
+        store.execute("update media_url_migrations set status = \'FAILED\', last_error = ?, claimed_at = null, updated_at = ? where url_hash = ?", DbParams().bindStrOrNull(MediaStore.cutOrNull(error, 500)).bindInstant(now).bindStr(urlHash))
+    }
+    List<MediaUrlMigration> findUrlsForFlip(limit: Int) = MediaStore.toUrlRows(store.queryList("select url_hash, source_url, status, s3_url, attempts, last_error from media_url_migrations where status = \'COPIED\' order by updated_at asc limit ?", DbParams().bindInt(MediaStore.atLeastOne(limit))))
+    // Plain loops: a lambda returning a record of a named package fails to load (KOF_GAPS G162).
+    static List<MediaAsset> toAssets(rows: List<DbRow>) {
+        var out = listOf<MediaAsset>()
+        for (var r in rows) {
+            out.add(MediaStore.assetOf(r))
+        }
+        return out
+    }
+    static List<MediaUrlMigration> toUrlRows(rows: List<DbRow>) {
+        var out = listOf<MediaUrlMigration>()
+        for (var r in rows) {
+            out.add(MediaStore.urlRow(r))
+        }
+        return out
+    }
+    static List<MediaDeletionJob> toJobs(rows: List<DbRow>) {
+        var out = listOf<MediaDeletionJob>()
+        for (var r in rows) {
+            out.add(MediaDeletionJob(r.getStr("id"), r.getStr("media_id"), r.getStrOrNull("post_id"), r.getStr("owner_id"), r.getStr("status"), r.getInt("attempts")))
+        }
+        return out
+    }
+    static Int atLeastOne(n: Int) {
+        if (n < 1) {
+            return 1
+        }
+        return n
+    }
+    static String? cutOrNull(text: String?, max: Int) {
+        if (text == null) {
+            return null
+        }
+        return MediaRules.cut(text, max)
+    }
+}

@@ -1,0 +1,259 @@
+package feed
+
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.id.*
+import kernel.security.*
+import kernel.text.*
+import kernel.url.*
+
+record FeedStatusBody(String status)
+
+record FeedPinBody(String status, String commentId)
+
+// HTTP adapter of FeedController (the post, comment, reaction, save, share and poll endpoints).
+class FeedRoutes {
+    static FeedPublishBody publishBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<FeedPublishBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static FeedCommentBody commentBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<FeedCommentBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static FeedEditBody editBody() {
+        try {
+            return json.decode<FeedEditBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static FeedBulkDeleteBody bulkBody() {
+        try {
+            return json.decode<FeedBulkDeleteBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    // Type of an edit: blank keeps it, an unknown spelling is a 400 (never a 500).
+    static String? editType(raw: String?) {
+        if (!FeedRules.hasText(raw)) {
+            return null
+        }
+        var t = FeedRules.trimmed(raw).toUpperCase()
+        if (!FeedRules.postTypes().contains(t)) {
+            throw Errors.api(400, "TIPO_INVALIDO", "Tipo de publicação desconhecido.")
+        }
+        return t
+    }
+    static List<String> sortedDistinct(raw: List<String>?) {
+        var out = FeedRules.cleanList(raw)
+        out.sort()
+        return out
+    }
+    static FeedReactBody reactBody() {
+        try {
+            return json.decode<FeedReactBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static FeedPollVoteBody voteBody() {
+        try {
+            return json.decode<FeedPollVoteBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String honeypotReply(prefix: String) = status(201, "{\"id\":\"" + prefix + Ids.uuid().replace("-", "") + "\"}")
+    static String hashOf(parts: String) = Idempotency.hash(parts)
+    static register(server: HttpServer, svc: FeedService, idem: Idempotency, honeypot: FeedHoneypot) {
+        server.post("/feed/posts", () -> {
+    var userId = Auth.requireUser()
+    var b = FeedRoutes.publishBody()
+    if (honeypot.triggered(userId, b.website(), "post")) {
+        return FeedRoutes.honeypotReply("post_")
+    }
+    if (!FeedRules.hasText(b.communityId()) && !FeedRules.hasText(b.topic())) {
+        throw Errors.api(400, "TOPIC_REQUIRED", "Escolha o assunto da publicação.")
+    }
+    InlineMedia.validate(b.content(), b.mediaIds())
+    return idem.handle(userId, "POST", "/api/feed/posts", FeedRoutes.hashOf(json.encode(b)), 201, () -> json.encode(svc.publish(userId, b)))
+})
+        // A standalone post must declare its topic (checked at the person's entry point).
+        server.get("/feed/posts/:postId", () -> json.encode(svc.getPost(Req.pathParam("postId"), Auth.viewerIdOrNull())))
+        server.delete("/feed/posts/:postId", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    var reasonOrNull = query("reason")
+    var reason = Req.queryStr("reason", "")
+    return idem.handle(userId, "DELETE", "/api/feed/posts/{postId}", FeedRoutes.hashOf("postId=" + postId + "&reason=" + reason), 200, () -> json.encode(svc.deletePost(userId, postId, reasonOrNull)))
+})
+        server.patch("/feed/posts/:postId", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    SafeLinks.checkRequest()
+    var b = FeedRoutes.editBody()
+    var newType = FeedRoutes.editType(b.type())
+    InlineMedia.validate(b.content(), svc.mediaIdsOf(postId))
+    return idem.handle(userId, "PATCH", "/api/feed/posts/{postId}", FeedRoutes.hashOf(postId + "|" + json.encode(b)), 200, () -> json.encode(svc.edit(userId, postId, b, newType)))
+})
+        server.post("/feed/posts/:postId/restore", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    return idem.handle(userId, "POST", "/api/feed/posts/{postId}/restore", FeedRoutes.hashOf(postId + "|restore"), 200, () -> json.encode(svc.restore(userId, postId)))
+})
+        server.post("/feed/posts/bulk-delete", () -> {
+    var userId = Auth.requireUser()
+    var b = FeedRoutes.bulkBody()
+    var ids = FeedRoutes.sortedDistinct(b.postIds())
+    return idem.handle(userId, "POST", "/api/feed/posts/bulk-delete", FeedRoutes.hashOf(String.join(",", ids) + "|" + FeedRules.nz(b.reason())), 200, () -> json.encode(svc.bulkDelete(userId, ids, b.reason())))
+})
+        server.get("/feed/saved", () -> json.encode(svc.savedFeed(Auth.requireUser())))
+        server.post("/feed/posts/:postId/comments", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    var b = FeedRoutes.commentBody()
+    svc.requireVisible(postId, userId)
+    if (honeypot.triggered(userId, b.website(), "comment")) {
+        return FeedRoutes.honeypotReply("comment_")
+    }
+    InlineMedia.validate(b.content(), b.mediaIds())
+    return idem.handle(userId, "POST", "/api/feed/posts/{postId}/comments", FeedRoutes.hashOf(postId + "|" + json.encode(b)), 201, () -> json.encode(svc.comment(userId, postId, b)))
+})
+        server.get("/feed/posts/:postId/comments", () -> {
+    var viewer = Auth.viewerIdOrNull()
+    var postId = Req.pathParam("postId")
+    var limit = Req.queryInt("limit", 20)
+    svc.requireVisible(postId, viewer)
+    return json.encode(svc.comments(postId, FeedCursor.decode(Req.queryStr("cursor", "")), limit, viewer))
+})
+        server.post("/feed/posts/:postId/reactions", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    var b = FeedRoutes.reactBody()
+    svc.requireVisible(postId, userId)
+    var type = b.type()
+    var kind = ""
+    if (type != null) {
+        kind = type
+    }
+    return idem.handle(userId, "POST", "/api/feed/posts/{postId}/reactions", FeedRoutes.hashOf(postId + "|" + kind), 200, () -> json.encode(svc.react(userId, postId, type)))
+})
+        server.delete("/feed/posts/:postId/reactions", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    svc.requireVisible(postId, userId)
+    return idem.handle(userId, "DELETE", "/api/feed/posts/{postId}/reactions", FeedRoutes.hashOf(postId), 200, () -> json.encode(svc.removeReaction(userId, postId)))
+})
+        server.get("/feed/posts/:postId/reactions", () -> json.encode(svc.listReactions(Req.pathParam("postId"), Auth.viewerIdOrNull())))
+        server.post("/feed/posts/:postId/saves", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    svc.requireVisible(postId, userId)
+    return idem.handle(userId, "POST", "/api/feed/posts/{postId}/saves", FeedRoutes.hashOf(postId), 200, () -> json.encode(svc.save(userId, postId)))
+})
+        server.delete("/feed/posts/:postId/saves", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    svc.requireVisible(postId, userId)
+    return idem.handle(userId, "DELETE", "/api/feed/posts/{postId}/saves", FeedRoutes.hashOf(postId), 200, () -> json.encode(svc.removeSave(userId, postId)))
+})
+        server.post("/feed/posts/:postId/shares", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    svc.requireVisible(postId, userId)
+    return idem.handle(userId, "POST", "/api/feed/posts/{postId}/shares", FeedRoutes.hashOf(postId), 200, () -> json.encode(svc.share(userId, postId)))
+})
+        server.delete("/feed/posts/:postId/comments/:commentId", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    var commentId = Req.pathParam("commentId")
+    svc.requireVisible(postId, userId)
+    return idem.handle(userId, "DELETE", "/api/feed/posts/{postId}/comments/{commentId}", FeedRoutes.hashOf(commentId + "|" + postId), 200, () -> {
+    svc.deleteComment(userId, commentId)
+    return json.encode(FeedStatusBody("COMMENT_DELETED"))
+})
+})
+        server.post("/feed/posts/:postId/comments/:commentId/pin", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    var commentId = Req.pathParam("commentId")
+    svc.requireVisible(postId, userId)
+    return idem.handle(userId, "POST", "/api/feed/posts/{postId}/comments/{commentId}/pin", FeedRoutes.hashOf(commentId + "|" + postId + "|pinned"), 200, () -> {
+    svc.pinComment(userId, postId, commentId, true)
+    return json.encode(FeedPinBody("COMMENT_PINNED", commentId))
+})
+})
+        server.delete("/feed/posts/:postId/comments/:commentId/pin", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    var commentId = Req.pathParam("commentId")
+    svc.requireVisible(postId, userId)
+    return idem.handle(userId, "DELETE", "/api/feed/posts/{postId}/comments/{commentId}/pin", FeedRoutes.hashOf(commentId + "|" + postId + "|unpinned"), 200, () -> {
+    svc.pinComment(userId, postId, commentId, false)
+    return json.encode(FeedPinBody("COMMENT_UNPINNED", commentId))
+})
+})
+        server.patch("/feed/posts/:postId/comments/:commentId", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    var commentId = Req.pathParam("commentId")
+    var b = FeedRoutes.commentBody()
+    svc.requireVisible(postId, userId)
+    return idem.handle(userId, "PATCH", "/api/feed/posts/{postId}/comments/{commentId}", FeedRoutes.hashOf(commentId + "|" + json.encode(b)), 200, () -> json.encode(svc.editComment(userId, commentId, b.content(), b.mediaIds())))
+})
+        server.post("/feed/posts/:postId/comments/:commentId/reactions", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    var commentId = Req.pathParam("commentId")
+    var b = FeedRoutes.reactBody()
+    svc.requireVisible(postId, userId)
+    return idem.handle(userId, "POST", "/api/feed/posts/{postId}/comments/{commentId}/reactions", FeedRoutes.hashOf(commentId + "|" + json.encode(b)), 200, () -> json.encode(FeedStatusBody(svc.reactToComment(userId, postId, commentId, b.type()))))
+})
+        server.delete("/feed/posts/:postId/comments/:commentId/reactions", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    var commentId = Req.pathParam("commentId")
+    svc.requireVisible(postId, userId)
+    return idem.handle(userId, "DELETE", "/api/feed/posts/{postId}/comments/{commentId}/reactions", FeedRoutes.hashOf(commentId), 200, () -> json.encode(FeedStatusBody(svc.removeCommentReaction(userId, commentId))))
+})
+        server.get("/feed/posts/:postId/comments/:commentId/reactions", () -> json.encode(svc.listCommentReactions(Req.pathParam("postId"), Req.pathParam("commentId"), Auth.viewerIdOrNull())))
+        server.post("/feed/posts/:postId/poll/vote", () -> {
+    var userId = Auth.requireUser()
+    var postId = Req.pathParam("postId")
+    var b = FeedRoutes.voteBody()
+    svc.requireVisible(postId, userId)
+    var option = b.option()
+    var chosen = -1
+    if (option != null) {
+        chosen = option
+    }
+    return json.encode(svc.vote(userId, postId, chosen))
+})
+    }
+}
+
+// CursorCodec: an ISO-8601 instant, else 400 INVALID_CURSOR.
+class FeedCursor {
+    static String? decode(raw: String) {
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        try {
+            var ms = Time.toMillis(raw)
+        } catch (String e) {
+            throw Errors.api(400, "INVALID_CURSOR", "Cursor invalido.")
+        }
+        return raw
+    }
+}

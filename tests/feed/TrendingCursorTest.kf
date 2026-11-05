@@ -1,0 +1,46 @@
+import feed.*
+import kernel.error.*
+import kernel.testkit.*
+import kernel.text.*
+
+// Port of TrendingCursorTests.
+test "an empty ranking ends without a cursor" {
+    Check.isTrue("no cursor", FeedReader.trendingNext(listOf<FeedPostRow>(), listOf<FeedPostRow>(), 20, "2030-01-01T12:00:00Z") == null)
+}
+
+test "the cursor preserves the window and all the ranking keys" {
+    var cursor = FeedTrendingCursor("2030-01-01T12:00:00Z", 25, "2030-01-01T11:59:50Z", "synthetic_post")
+    var decoded = FeedTrending.decode(FeedTrending.encode(cursor))
+    Check.isTrue("decoded", decoded != null)
+    if (decoded != null) {
+        Check.eqStr("window", cursor.windowEnd(), decoded.windowEnd())
+        Check.eqInt("reactions", 25, decoded.reactions())
+        Check.eqStr("created", cursor.createdAt(), decoded.createdAt())
+        Check.eqStr("post", "synthetic_post", decoded.postId())
+    }
+    Check.isTrue("null", FeedTrending.decode("") == null)
+    Check.isTrue("blank", FeedTrending.decode(" ") == null)
+}
+
+invalidCursor(value: String) {
+    var thrown = ""
+    try {
+        FeedTrending.decode(value)
+    } catch (String e) {
+        thrown = e
+    }
+    Check.isTrue("rejected " + value, Errors.hasCode(thrown, "INVALID_CURSOR"))
+    Check.eqInt("status", 400, Errors.parse(thrown).status())
+}
+
+test "malformed and legacy timestamp cursors are rejected" {
+    invalidCursor("not-a-cursor!")
+    invalidCursor("2030-01-01T12:00:00Z")
+}
+
+test "invalid ranking keys are rejected" {
+    for (var raw in listOf("2|2030-01-01T12:00:00Z|25|2030-01-01T11:00:00Z|post", "1|invalid|25|2030-01-01T11:00:00Z|post", "1|2030-01-01T12:00:00Z|-1|2030-01-01T11:00:00Z|post", "1|2030-01-01T12:00:00Z|25|2030-01-01T13:00:00Z|post", "1|2030-01-01T12:00:00Z|25|2029-12-30T11:00:00Z|post", "1|2030-01-01T12:00:00Z|25|2030-01-01T11:00:00Z|")) {
+        invalidCursor(Base64Url.encode(raw))
+    }
+    FeedTestSupport.finish()
+}

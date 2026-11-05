@@ -1,0 +1,493 @@
+package feed
+
+import kernel.db.*
+
+// SQL of the feed domain: same tables and shapes as the Java JPA adapters (posts, post_tags, post_media,
+// comments, comment_media, reactions, comment_reactions, saved_posts, post_shares, poll_*, articles).
+class FeedStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // "?,?,?" for an IN list.
+    static String marks(n: Int) {
+        var parts = listOf<String>()
+        var i = 0
+        while (i < n) {
+            parts.add("?")
+            i = i + 1
+        }
+        return String.join(",", parts)
+    }
+    static String postColumns() = "id, author_id, type, content, page_html, community_id, channel_id, repost_of, repost_of_author, repost_with_opinion, accepted_comment_id, created_at, visibility, reactions, comments, saves, shares, reposts, status, deleted_at, edited_at, expires_at, author_identity, topic, media_spoiler"
+    static FeedPostRow postOf(r: DbRow) = FeedPostRow(r.getStr("id"), r.getStr("author_id"), r.getStr("type"), r.getStr("content"), r.getStrOrNull("page_html"), r.getStrOrNull("community_id"), r.getStrOrNull("channel_id"), r.getStrOrNull("repost_of"), r.getStrOrNull("repost_of_author"), r.getBool("repost_with_opinion"), r.getStrOrNull("accepted_comment_id"), r.getInstant("created_at"), r.getStr("visibility"), r.getInt("reactions"), r.getInt("comments"), r.getInt("saves"), r.getInt("shares"), r.getInt("reposts"), r.getStr("status"), r.getInstantOrNull("deleted_at"), r.getInstantOrNull("edited_at"), r.getInstantOrNull("expires_at"), r.getStr("author_identity"), r.getStrOrNull("topic"), r.getBool("media_spoiler"))
+    static String commentColumns() = "id, post_id, author_id, parent_comment_id, content, created_at, status, edited_at, pinned, media_spoiler"
+    static FeedCommentRow commentOf(r: DbRow) = FeedCommentRow(r.getStr("id"), r.getStr("post_id"), r.getStr("author_id"), r.getStrOrNull("parent_comment_id"), r.getStr("content"), r.getInstant("created_at"), r.getStr("status"), r.getInstantOrNull("edited_at"), r.getBool("pinned"), r.getBool("media_spoiler"))
+    // ---- posts ----
+    insertPost(p: FeedPostRow, tags: List<String>, mediaIds: List<String>) {
+        store.execute("insert into posts (" + FeedStore.postColumns() + ") values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", DbParams().bindStr(p.id()).bindStr(p.authorId()).bindStr(p.type()).bindStr(p.content()).bindStrOrNull(p.pageHtml()).bindStrOrNull(p.communityId()).bindStrOrNull(p.channelId()).bindStrOrNull(p.repostOf()).bindStrOrNull(p.repostOfAuthor()).bindBool(p.repostWithOpinion()).bindStrOrNull(p.acceptedCommentId()).bindInstant(p.createdAt()).bindStr(p.visibility()).bindInt(p.reactions()).bindInt(p.comments()).bindInt(p.saves()).bindInt(p.shares()).bindInt(p.reposts()).bindStr(p.status()).bindInstantOrNull(p.deletedAt()).bindInstantOrNull(p.editedAt()).bindInstantOrNull(p.expiresAt()).bindStr(p.authorIdentity()).bindStrOrNull(p.topic()).bindBool(p.mediaSpoiler()))
+        for (var t in tags) {
+            store.execute("insert into post_tags (post_id, tag) values (?, ?)", DbParams().bindStr(p.id()).bindStr(t))
+        }
+        for (var m in mediaIds) {
+            store.execute("insert into post_media (post_id, media_id) values (?, ?)", DbParams().bindStr(p.id()).bindStr(m))
+        }
+    }
+    // PostRepository.save of an edited post: type, content, page, topic, dates; tags are replaced as a whole.
+    updateEdited(id: String, type: String, content: String, pageHtml: String?, topic: String?, editedAt: String, expiresAt: String?, tags: List<String>) {
+        store.execute("update posts set type = ?, content = ?, page_html = ?, topic = ?, edited_at = ?, expires_at = ? where id = ?", DbParams().bindStr(type).bindStr(content).bindStrOrNull(pageHtml).bindStrOrNull(topic).bindInstant(editedAt).bindInstantOrNull(expiresAt).bindStr(id))
+        store.execute("delete from post_tags where post_id = ?", DbParams().bindStr(id))
+        for (var t in tags) {
+            store.execute("insert into post_tags (post_id, tag) values (?, ?)", DbParams().bindStr(id).bindStr(t))
+        }
+    }
+    updateArticle(postId: String, body: String, at: String) {
+        store.execute("update articles set body = ?, edited_at = ? where post_id = ?", DbParams().bindStr(body).bindInstant(at).bindStr(postId))
+    }
+    Int undelete(postId: String) = store.execute("update posts set status = \'ACTIVE\', deleted_at = null where id = ? and status = \'DELETED\'", DbParams().bindStr(postId))
+    FeedPostRow? post(id: String) {
+        var r = store.queryOptional("select " + FeedStore.postColumns() + " from posts where id = ?", DbParams().bindStr(id))
+        if (r == null) {
+            return null
+        }
+        return FeedStore.postOf(r)
+    }
+    List<FeedPostRow> posts(ids: List<String>) {
+        var out = listOf<FeedPostRow>()
+        if (ids.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        for (var id in ids) {
+            p.bindStr(id)
+        }
+        for (var r in store.queryList("select " + FeedStore.postColumns() + " from posts where id in (" + FeedStore.marks(ids.size()) + ")", p)) {
+            out.add(FeedStore.postOf(r))
+        }
+        return out
+    }
+    Map<String,List<String>> childrenOf(table: String, keyCol: String, valueCol: String, ids: List<String>) {
+        var out = new HashMap<String, List<String>>()
+        if (ids.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        for (var id in ids) {
+            p.bindStr(id)
+        }
+        for (var r in store.queryList("select " + keyCol + ", " + valueCol + " from " + table + " where " + keyCol + " in (" + FeedStore.marks(ids.size()) + ")", p)) {
+            var k = r.getStr(keyCol)
+            var cur = FeedRules.orEmpty(out.get(k))
+            out.put(k, cur)
+            cur.add(r.getStr(valueCol))
+        }
+        return out
+    }
+    Map<String,List<String>> tagsOf(ids: List<String>) = this.childrenOf("post_tags", "post_id", "tag", ids)
+    Map<String,List<String>> mediaOf(ids: List<String>) = this.childrenOf("post_media", "post_id", "media_id", ids)
+    Map<String,List<String>> commentMediaOf(ids: List<String>) = this.childrenOf("comment_media", "comment_id", "media_id", ids)
+    // Atomic counter moves (Java read-modify-write on the entity): never below zero.
+    bump(postId: String, column: String, up: Bool) {
+        if (up) {
+            store.execute("update posts set " + column + " = " + column + " + 1 where id = ?", DbParams().bindStr(postId))
+        }
+        else {
+            store.execute("update posts set " + column + " = case when " + column + " > 0 then " + column + " - 1 else 0 end where id = ?", DbParams().bindStr(postId))
+        }
+    }
+    markDeleted(postId: String, at: String) {
+        store.execute("update posts set status = \'DELETED\', deleted_at = ? where id = ?", DbParams().bindInstant(at).bindStr(postId))
+    }
+    // Moments past their deadline and still active (MomentExpiryScheduler batch).
+    List<String> expiredMomentIds(now: String, limit: Int) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select id from posts where type = \'MOMENT\' and status = \'ACTIVE\' and expires_at < ? limit " + limit, DbParams().bindInstant(now))) {
+            out.add(r.getStr("id"))
+        }
+        return out
+    }
+    List<String> savedPostIds(userId: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select post_id from saved_posts where user_id = ? order by created_at desc", DbParams().bindStr(userId))) {
+            out.add(r.getStr("post_id"))
+        }
+        return out
+    }
+    // Active reposts of a post (they never outlive their source).
+    List<String> activeRepostIds(sourceId: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select id from posts where repost_of = ? and status = \'ACTIVE\'", DbParams().bindStr(sourceId))) {
+            out.add(r.getStr("id"))
+        }
+        return out
+    }
+    insertArticle(postId: String, body: String, at: String) {
+        store.execute("insert into articles (post_id, body, created_at) values (?, ?, ?)", DbParams().bindStr(postId).bindStr(body).bindInstant(at))
+    }
+    String? articleBody(postId: String) {
+        var r = store.queryOptional("select body from articles where post_id = ?", DbParams().bindStr(postId))
+        if (r == null) {
+            return null
+        }
+        return r.getStrOrNull("body")
+    }
+    // ---- reactions, saves, shares ----
+    String? reactionTypeOf(postId: String, userId: String) {
+        var r = store.queryOptional("select reaction_type from reactions where post_id = ? and user_id = ?", DbParams().bindStr(postId).bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        return r.getStrOrNull("reaction_type")
+    }
+    Int deleteReaction(postId: String, userId: String) = store.execute("delete from reactions where post_id = ? and user_id = ?", DbParams().bindStr(postId).bindStr(userId))
+    insertReaction(id: String, postId: String, userId: String, type: String, at: String) {
+        store.execute("insert into reactions (id, post_id, user_id, reaction_type, created_at) values (?,?,?,?,?)", DbParams().bindStr(id).bindStr(postId).bindStr(userId).bindStr(type).bindInstant(at))
+    }
+    List<DbRow> reactionsOfPost(postId: String, limit: Int) = store.queryList("select user_id, reaction_type, created_at from reactions where post_id = ? and created_at < ? order by created_at desc limit " + limit, DbParams().bindStr(postId).bindInstant("9999-12-31T23:59:59Z"))
+    Map<String,String> userReactions(userId: String, postIds: List<String>) {
+        var out = new HashMap<String, String>()
+        if (postIds.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        for (var id in postIds) {
+            p.bindStr(id)
+        }
+        p.bindStr(userId)
+        for (var r in store.queryList("select post_id, reaction_type from reactions where post_id in (" + FeedStore.marks(postIds.size()) + ") and user_id = ?", p)) {
+            out.put(r.getStr("post_id"), r.getStr("reaction_type"))
+        }
+        return out
+    }
+    // post id -> reaction type -> count, ignoring the hidden users.
+    Map<String,Map<String,Long>> reactionSummaries(postIds: List<String>, hidden: List<String>) {
+        var out = new HashMap<String, Map<String,Long>>()
+        if (postIds.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        for (var id in postIds) {
+            p.bindStr(id)
+        }
+        var excluded = hidden
+        if (excluded.size() == 0) {
+            excluded = listOf("")
+        }
+        for (var h in excluded) {
+            p.bindStr(h)
+        }
+        var sql = "select post_id, reaction_type, count(*) as n from reactions where post_id in (" + FeedStore.marks(postIds.size()) + ") and user_id not in (" + FeedStore.marks(excluded.size()) + ") group by post_id, reaction_type"
+        for (var r in store.queryList(sql, p)) {
+            var k = r.getStr("post_id")
+            var cur = FeedRules.orNone(out.get(k))
+            out.put(k, cur)
+            cur.put(r.getStr("reaction_type"), r.getLong("n"))
+        }
+        return out
+    }
+    Bool saveExists(postId: String, userId: String) = store.queryLong("select count(*) from saved_posts where post_id = ? and user_id = ?", DbParams().bindStr(postId).bindStr(userId)) > 0L
+    insertSave(id: String, postId: String, userId: String, at: String) {
+        store.execute("insert into saved_posts (id, post_id, user_id, created_at) values (?,?,?,?)", DbParams().bindStr(id).bindStr(postId).bindStr(userId).bindInstant(at))
+    }
+    Int deleteSave(postId: String, userId: String) = store.execute("delete from saved_posts where post_id = ? and user_id = ?", DbParams().bindStr(postId).bindStr(userId))
+    Bool shareExists(postId: String, userId: String) = store.queryLong("select count(*) from post_shares where post_id = ? and user_id = ?", DbParams().bindStr(postId).bindStr(userId)) > 0L
+    insertShare(id: String, postId: String, userId: String, at: String) {
+        store.execute("insert into post_shares (id, post_id, user_id, created_at) values (?,?,?,?)", DbParams().bindStr(id).bindStr(postId).bindStr(userId).bindInstant(at))
+    }
+    // ---- comments ----
+    insertComment(c: FeedCommentRow, mediaIds: List<String>) {
+        store.execute("insert into comments (" + FeedStore.commentColumns() + ") values (?,?,?,?,?,?,?,?,?,?)", DbParams().bindStr(c.id()).bindStr(c.postId()).bindStr(c.authorId()).bindStrOrNull(c.parentCommentId()).bindStr(c.content()).bindInstant(c.createdAt()).bindStr(c.status()).bindInstantOrNull(c.editedAt()).bindBool(c.pinned()).bindBool(c.mediaSpoiler()))
+        for (var m in mediaIds) {
+            store.execute("insert into comment_media (comment_id, media_id) values (?, ?)", DbParams().bindStr(c.id()).bindStr(m))
+        }
+    }
+    FeedCommentRow? comment(id: String) {
+        var r = store.queryOptional("select " + FeedStore.commentColumns() + " from comments where id = ?", DbParams().bindStr(id))
+        if (r == null) {
+            return null
+        }
+        return FeedStore.commentOf(r)
+    }
+    List<FeedCommentRow> activeCommentsExcludingPinned(postId: String, before: String, limit: Int) {
+        var out = listOf<FeedCommentRow>()
+        for (var r in store.queryList("select " + FeedStore.commentColumns() + " from comments where post_id = ? and status = \'ACTIVE\' and pinned = false and created_at < ? order by created_at desc limit " + limit, DbParams().bindStr(postId).bindInstant(before))) {
+            out.add(FeedStore.commentOf(r))
+        }
+        return out
+    }
+    FeedCommentRow? pinnedComment(postId: String) {
+        var r = store.queryOptional("select " + FeedStore.commentColumns() + " from comments where post_id = ? and status = \'ACTIVE\' and pinned = true order by created_at desc limit 1", DbParams().bindStr(postId))
+        if (r == null) {
+            return null
+        }
+        return FeedStore.commentOf(r)
+    }
+    setPinned(commentId: String, pinned: Bool) {
+        store.execute("update comments set pinned = ? where id = ?", DbParams().bindBool(pinned).bindStr(commentId))
+    }
+    unpinAll(postId: String) {
+        store.execute("update comments set pinned = false where post_id = ? and pinned = true", DbParams().bindStr(postId))
+    }
+    // Hard delete (CommentRepository.deleteById): a deleted accepted answer cannot keep its question resolved.
+    deleteComment(commentId: String) {
+        store.execute("update posts set accepted_comment_id = null, resolved_at = null where accepted_comment_id = ?", DbParams().bindStr(commentId))
+        store.execute("delete from comment_media where comment_id = ?", DbParams().bindStr(commentId))
+        store.execute("delete from comments where id = ?", DbParams().bindStr(commentId))
+    }
+    updateComment(commentId: String, content: String, at: String, replaceMedia: Bool, mediaIds: List<String>) {
+        store.execute("update comments set content = ?, edited_at = ? where id = ?", DbParams().bindStr(content).bindInstant(at).bindStr(commentId))
+        if (replaceMedia) {
+            store.execute("delete from comment_media where comment_id = ?", DbParams().bindStr(commentId))
+            for (var m in mediaIds) {
+                store.execute("insert into comment_media (comment_id, media_id) values (?, ?)", DbParams().bindStr(commentId).bindStr(m))
+            }
+        }
+    }
+    Map<String,String> userCommentReactions(userId: String, commentIds: List<String>) {
+        var out = new HashMap<String, String>()
+        if (commentIds.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        for (var id in commentIds) {
+            p.bindStr(id)
+        }
+        p.bindStr(userId)
+        for (var r in store.queryList("select comment_id, reaction_type from comment_reactions where comment_id in (" + FeedStore.marks(commentIds.size()) + ") and user_id = ?", p)) {
+            out.put(r.getStr("comment_id"), r.getStr("reaction_type"))
+        }
+        return out
+    }
+    Map<String,Map<String,Long>> commentReactionSummaries(commentIds: List<String>, hidden: List<String>) {
+        var out = new HashMap<String, Map<String,Long>>()
+        if (commentIds.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        for (var id in commentIds) {
+            p.bindStr(id)
+        }
+        var excluded = hidden
+        if (excluded.size() == 0) {
+            excluded = listOf("")
+        }
+        for (var h in excluded) {
+            p.bindStr(h)
+        }
+        var sql = "select comment_id, reaction_type, count(*) as n from comment_reactions where comment_id in (" + FeedStore.marks(commentIds.size()) + ") and user_id not in (" + FeedStore.marks(excluded.size()) + ") group by comment_id, reaction_type"
+        for (var r in store.queryList(sql, p)) {
+            var k = r.getStr("comment_id")
+            var cur = FeedRules.orNone(out.get(k))
+            out.put(k, cur)
+            cur.put(r.getStr("reaction_type"), r.getLong("n"))
+        }
+        return out
+    }
+    String? commentReactionTypeOf(commentId: String, userId: String) {
+        var r = store.queryOptional("select reaction_type from comment_reactions where comment_id = ? and user_id = ?", DbParams().bindStr(commentId).bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        return r.getStrOrNull("reaction_type")
+    }
+    Int deleteCommentReaction(commentId: String, userId: String) = store.execute("delete from comment_reactions where comment_id = ? and user_id = ?", DbParams().bindStr(commentId).bindStr(userId))
+    insertCommentReaction(id: String, commentId: String, userId: String, type: String, at: String) {
+        store.execute("insert into comment_reactions (id, comment_id, user_id, reaction_type, created_at) values (?,?,?,?,?)", DbParams().bindStr(id).bindStr(commentId).bindStr(userId).bindStr(type).bindInstant(at))
+    }
+    List<DbRow> reactionsOfComment(commentId: String) = store.queryList("select user_id, reaction_type, created_at from comment_reactions where comment_id = ? order by created_at desc", DbParams().bindStr(commentId))
+    // ---- polls ----
+    insertPollOption(id: String, postId: String, position: Int, text: String) {
+        store.execute("insert into poll_options (id, post_id, position, text) values (?,?,?,?)", DbParams().bindStr(id).bindStr(postId).bindInt(position).bindStr(text))
+    }
+    Map<String,List<String>> pollOptions(postIds: List<String>) {
+        var out = new HashMap<String, List<String>>()
+        if (postIds.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        for (var id in postIds) {
+            p.bindStr(id)
+        }
+        for (var r in store.queryList("select post_id, text from poll_options where post_id in (" + FeedStore.marks(postIds.size()) + ") order by position asc", p)) {
+            var k = r.getStr("post_id")
+            var cur = FeedRules.orEmpty(out.get(k))
+            out.put(k, cur)
+            cur.add(r.getStr("text"))
+        }
+        return out
+    }
+    // post id -> option position -> votes
+    Map<String,Map<Int,Long>> pollCounts(postIds: List<String>) {
+        var out = new HashMap<String, Map<Int,Long>>()
+        if (postIds.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        for (var id in postIds) {
+            p.bindStr(id)
+        }
+        for (var r in store.queryList("select post_id, option_position, count(*) as n from poll_votes where post_id in (" + FeedStore.marks(postIds.size()) + ") group by post_id, option_position", p)) {
+            var k = r.getStr("post_id")
+            var cur = FeedRules.orNoneInt(out.get(k))
+            out.put(k, cur)
+            cur.put(r.getInt("option_position"), r.getLong("n"))
+        }
+        return out
+    }
+    Map<String,Int> pollVotesOf(userId: String, postIds: List<String>) {
+        var out = new HashMap<String, Int>()
+        if (postIds.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        for (var id in postIds) {
+            p.bindStr(id)
+        }
+        p.bindStr(userId)
+        for (var r in store.queryList("select post_id, option_position from poll_votes where post_id in (" + FeedStore.marks(postIds.size()) + ") and user_id = ?", p)) {
+            out.put(r.getStr("post_id"), r.getInt("option_position"))
+        }
+        return out
+    }
+    insertPollVote(id: String, postId: String, userId: String, position: Int, at: String) {
+        store.execute("insert into poll_votes (id, post_id, user_id, option_position, created_at) values (?,?,?,?,?)", DbParams().bindStr(id).bindStr(postId).bindStr(userId).bindInt(position).bindInstant(at))
+    }
+    // ---- feed reads (PostPersistenceAdapter queries) ----
+    List<FeedPostRow> queryPosts(where: String, params: DbParams, limit: Int) {
+        var out = listOf<FeedPostRow>()
+        for (var r in store.queryList("select " + FeedStore.postColumns() + " from posts where " + where + " limit " + limit, params)) {
+            out.add(FeedStore.postOf(r))
+        }
+        return out
+    }
+    static DbParams withList(p: DbParams, values: List<String>) {
+        for (var v in values) {
+            p.bindStr(v)
+        }
+        return p
+    }
+    static String notBlocked(blocked: List<String>) {
+        if (blocked.size() == 0) {
+            return ""
+        }
+        return " and (topic is null or topic not in (" + FeedStore.marks(blocked.size()) + "))"
+    }
+    static String excludedTypes() = "type not in (\'BLOG\', \'BUSINESS\')"
+    // "Tudo": no BLOG, no BUSINESS, no channel posts; blocked topics filtered (posts without topic always pass).
+    List<FeedPostRow> activeAll(blocked: List<String>, before: String, limit: Int) {
+        var p = FeedStore.withList(DbParams().bindStr("ACTIVE").bindInstant(before), blocked)
+        return this.queryPosts("status = ? and " + FeedStore.excludedTypes() + " and channel_id is null and created_at < ?" + FeedStore.notBlocked(blocked) + " order by created_at desc", p, limit)
+    }
+    List<FeedPostRow> activeByTypes(types: List<String>, resolved: Int, before: String, limit: Int) {
+        var p = DbParams().bindStr("ACTIVE")
+        for (var t in types) {
+            p.bindStr(t)
+        }
+        p.bindInstant(before)
+        var filter = ""
+        if (resolved == 1) {
+            filter = " and resolved_at is not null"
+        }
+        if (resolved == 0) {
+            filter = " and resolved_at is null"
+        }
+        return this.queryPosts("status = ? and type in (" + FeedStore.marks(types.size()) + ") and channel_id is null and created_at < ?" + filter + " order by created_at desc", p, limit)
+    }
+    List<FeedPostRow> activeUnseen(reader: String, blocked: List<String>, before: String, limit: Int) {
+        var p = FeedStore.withList(DbParams().bindStr("ACTIVE").bindStr(reader).bindInstant(before), blocked).bindStr(reader).bindStr(reader)
+        return this.queryPosts("status = ? and " + FeedStore.excludedTypes() + " and channel_id is null and author_id <> ? and created_at < ?" + FeedStore.notBlocked(blocked) + " and not exists (select 1 from reactions r where r.post_id = posts.id and r.user_id = ?) and not exists (select 1 from comments c where c.post_id = posts.id and c.author_id = ?) order by created_at desc", p, limit)
+    }
+    List<FeedPostRow> activeInteracted(reader: String, before: String, limit: Int) {
+        var p = DbParams().bindStr("ACTIVE").bindInstant(before).bindStr(reader).bindStr(reader)
+        return this.queryPosts("status = ? and created_at < ? and (exists (select 1 from reactions r where r.post_id = posts.id and r.user_id = ?) or exists (select 1 from comments c where c.post_id = posts.id and c.author_id = ?)) order by created_at desc", p, limit)
+    }
+    List<FeedPostRow> activeByType(type: String, before: String, limit: Int) = this.queryPosts("type = ? and status = \'ACTIVE\' and channel_id is null and created_at < ? order by created_at desc", DbParams().bindStr(type).bindInstant(before), limit)
+    // Para voce / Seguindo: only what the SOCIAL identity signed.
+    List<FeedPostRow> activeByAuthors(authorIds: List<String>, blocked: List<String>, before: String, limit: Int) {
+        if (authorIds.size() == 0) {
+            return listOf<FeedPostRow>()
+        }
+        var p = FeedStore.withList(FeedStore.withList(DbParams(), authorIds).bindStr("ACTIVE").bindInstant(before), blocked)
+        return this.queryPosts("author_id in (" + FeedStore.marks(authorIds.size()) + ") and status = ? and author_identity = \'SOCIAL\' and channel_id is null and created_at < ?" + FeedStore.notBlocked(blocked) + " order by created_at desc", p, limit)
+    }
+    // Social profile of an author: no BLOG pointer, nothing signed by the professional identity.
+    List<FeedPostRow> activeByAuthor(authorId: String, before: String, limit: Int) = this.queryPosts("author_id = ? and status = \'ACTIVE\' and author_identity = \'SOCIAL\' and type <> \'BLOG\' and channel_id is null and created_at < ? order by created_at desc", DbParams().bindStr(authorId).bindInstant(before), limit)
+    Int countActiveByAuthor(authorId: String) = store.queryLong("select count(*) from posts where author_id = ? and status = \'ACTIVE\' and author_identity = \'SOCIAL\' and type <> \'BLOG\' and channel_id is null", DbParams().bindStr(authorId)) as Int
+    List<FeedPostRow> activeCorporate(before: String, limit: Int) = this.queryPosts("status = \'ACTIVE\' and author_identity = \'CORPORATE\' and channel_id is null and created_at < ? order by created_at desc", DbParams().bindInstant(before), limit)
+    List<FeedPostRow> activeCorporateByAuthor(authorId: String, before: String, limit: Int) = this.queryPosts("author_id = ? and status = \'ACTIVE\' and author_identity = \'CORPORATE\' and channel_id is null and created_at < ? order by created_at desc", DbParams().bindStr(authorId).bindInstant(before), limit)
+    List<FeedPostRow> activeByCommunity(communityId: String, before: String, limit: Int) = this.queryPosts("community_id = ? and status = \'ACTIVE\' and channel_id is null and created_at < ? order by created_at desc", DbParams().bindStr(communityId).bindInstant(before), limit)
+    List<FeedPostRow> activeByChannel(channelId: String, before: String, limit: Int) = this.queryPosts("channel_id = ? and status = \'ACTIVE\' and created_at < ? order by created_at desc", DbParams().bindStr(channelId).bindInstant(before), limit)
+    // Em alta: most reacted inside the window, keyset-paged by (reactions, created_at, id).
+    List<FeedPostRow> trending(since: String, until: String, after: FeedTrendingCursor?, limit: Int) {
+        var p = DbParams().bindStr("ACTIVE").bindInstant(since).bindInstant(until)
+        var keyset = ""
+        if (after != null) {
+            keyset = " and (reactions < ? or (reactions = ? and (created_at < ? or (created_at = ? and id < ?))))"
+            p.bindInt(after.reactions()).bindInt(after.reactions()).bindInstant(after.createdAt()).bindInstant(after.createdAt()).bindStr(after.postId())
+        }
+        return this.queryPosts("status = ? and " + FeedStore.excludedTypes() + " and channel_id is null and created_at >= ? and created_at <= ?" + keyset + " order by reactions desc, created_at desc, id desc", p, limit)
+    }
+    // Active repost copies (with opinion) of a source by one author.
+    String? activeRepostCopyId(authorId: String, sourceId: String) {
+        var r = store.queryOptional("select id from posts where author_id = ? and repost_of = ? and status = \'ACTIVE\'", DbParams().bindStr(authorId).bindStr(sourceId))
+        if (r == null) {
+            return null
+        }
+        return r.getStr("id")
+    }
+    // ---- seen marker ----
+    String? lastSeenAt(userId: String) {
+        var r = store.queryOptional("select last_seen_at from feed_seen_markers where user_id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        return r.getInstantOrNull("last_seen_at")
+    }
+    advanceSeen(userId: String, seenUntil: String, now: String) {
+        var updated = store.execute("update feed_seen_markers set last_seen_at = case when last_seen_at > ? then last_seen_at else ? end, updated_at = ? where user_id = ?", DbParams().bindInstant(seenUntil).bindInstant(seenUntil).bindInstant(now).bindStr(userId))
+        if (updated == 0) {
+            store.execute("insert into feed_seen_markers (user_id, last_seen_at, updated_at) values (?, ?, ?)", DbParams().bindStr(userId).bindInstant(seenUntil).bindInstant(now))
+        }
+    }
+    // ---- pure reposts (post_reposts) ----
+    Bool repostExists(userId: String, postId: String) = store.queryLong("select count(*) from post_reposts where user_id = ? and post_id = ?", DbParams().bindStr(userId).bindStr(postId)) > 0L
+    insertRepost(userId: String, postId: String, at: String) {
+        store.execute("insert into post_reposts (user_id, post_id, created_at) values (?, ?, ?)", DbParams().bindStr(userId).bindStr(postId).bindInstant(at))
+    }
+    deleteRepost(userId: String, postId: String) {
+        store.execute("delete from post_reposts where user_id = ? and post_id = ?", DbParams().bindStr(userId).bindStr(postId))
+    }
+    // Reposts of one user before an instant, newest first: (post id, repost instant).
+    List<FeedRepostPointer> repostsOf(userId: String, before: String, limit: Int) {
+        var out = listOf<FeedRepostPointer>()
+        for (var r in store.queryList("select user_id, post_id, created_at from post_reposts where user_id = ? and created_at < ? order by created_at desc limit " + limit, DbParams().bindStr(userId).bindInstant(before))) {
+            out.add(FeedRepostPointer(r.getStr("user_id"), r.getStr("post_id"), r.getInstant("created_at")))
+        }
+        return out
+    }
+    // Every repost of these users, newest first (the For you tab trims them itself).
+    List<FeedRepostPointer> repostsOfUsers(userIds: List<String>) {
+        var out = listOf<FeedRepostPointer>()
+        if (userIds.size() == 0) {
+            return out
+        }
+        for (var r in store.queryList("select user_id, post_id, created_at from post_reposts where user_id in (" + FeedStore.marks(userIds.size()) + ") order by created_at desc", FeedStore.withList(DbParams(), userIds))) {
+            out.add(FeedRepostPointer(r.getStr("user_id"), r.getStr("post_id"), r.getInstant("created_at")))
+        }
+        return out
+    }
+    List<String> repostedAmong(userId: String, postIds: List<String>) {
+        var out = listOf<String>()
+        if (postIds.size() == 0) {
+            return out
+        }
+        for (var r in store.queryList("select post_id from post_reposts where user_id = ? and post_id in (" + FeedStore.marks(postIds.size()) + ")", FeedStore.withList(DbParams().bindStr(userId), postIds))) {
+            out.add(r.getStr("post_id"))
+        }
+        return out
+    }
+    // updateAcceptedAnswer: the only write that touches both columns.
+    setAccepted(postId: String, commentId: String?, resolvedAt: String?) {
+        store.execute("update posts set accepted_comment_id = ?, resolved_at = ? where id = ?", DbParams().bindStrOrNull(commentId).bindInstantOrNull(resolvedAt).bindStr(postId))
+    }
+}

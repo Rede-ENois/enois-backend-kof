@@ -1,0 +1,288 @@
+package feed
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.log.*
+import kernel.time.*
+
+// Seams owned by the feed. Each default reads the owner's tables read-only with the owner's SQL, so the
+// feed is real from day one; the owner subclasses and Main.kf passes the subclass in (PORTING_GUIDE).
+// Concrete classes with overridable methods: Kof interfaces cannot be implemented across packages (G30).
+// pending-port: profile (UserProfileRepository.findAllByIds, UserProfile.displayWithNickname/allBadges) and
+// contributions (UserSealRepository.findActiveUserIds).
+class FeedAuthors {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    Map<String,FeedAuthor> byIds(ids: List<String>) {
+        var out = new HashMap<String, FeedAuthor>()
+        if (ids.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        for (var id in ids) {
+            p.bindStr(id)
+        }
+        var sql = "select id, username, name, social_name, nickname, avatar, badge, badges, avatar_frame, name_theme, name_font, name_color, nameplate, contributor_tag_color from users where id in (" + FeedStore.marks(ids.size()) + ")"
+        for (var r in store.queryList(sql, p)) {
+            var base = r.getStr("name")
+            var social = r.getStrOrNull("social_name")
+            if (social != null && social.trim().length() > 0) {
+                base = social
+            }
+            var nick = r.getStrOrNull("nickname")
+            if (nick != null && nick.trim().length() > 0) {
+                base = base + " (" + nick + ")"
+            }
+            var badges = listOf<String>()
+            var raw = r.getStrOrNull("badges")
+            if (raw != null && raw.trim().length() > 0) {
+                for (var b in raw.split("\n")) {
+                    badges.add(b)
+                }
+            }
+            var legacy = r.getStrOrNull("badge")
+            if (badges.size() == 0 && legacy != null && legacy.trim().length() > 0) {
+                badges.add(legacy)
+            }
+            out.put(r.getStr("id"), FeedAuthor(r.getStr("id"), r.getStrOrNull("username"), base, r.getStrOrNull("avatar"), badges, r.getStrOrNull("avatar_frame"), r.getStrOrNull("name_theme"), r.getStrOrNull("name_font"), r.getStrOrNull("name_color"), r.getStrOrNull("nameplate"), r.getStrOrNull("contributor_tag_color")))
+        }
+        return out
+    }
+    // Professional identity of CORPORATE posts: name, @ and avatar come from corporate_profiles.
+    Map<String,FeedAuthor> corporateByIds(ids: List<String>) {
+        var out = new HashMap<String, FeedAuthor>()
+        if (ids.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        for (var id in ids) {
+            p.bindStr(id)
+        }
+        for (var r in store.queryList("select user_id, username, name, avatar from corporate_profiles where user_id in (" + FeedStore.marks(ids.size()) + ")", p)) {
+            out.put(r.getStr("user_id"), FeedAuthor(r.getStr("user_id"), r.getStrOrNull("username"), r.getStr("name"), r.getStrOrNull("avatar"), listOf<String>(), null, null, null, null, null, null))
+        }
+        return out
+    }
+    // CoinService.NEW_ACCOUNT_WINDOW (7 days): an account younger than that never earns the answer reward.
+    Bool isNewAccount(userId: String) {
+        var r = store.queryOptional("select created_at from users where id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return true
+        }
+        var created = r.getInstantOrNull("created_at")
+        if (created == null) {
+            return true
+        }
+        return Time.toMillis(created) > Time.nowMillis() - 7L * 86400000L
+    }
+    // GET /users/{username}/posts: the path takes a username or an id; the content stores author_id.
+    String idOfUsername(usernameOrId: String) {
+        var r = store.queryOptional("select id from users where username = ?", DbParams().bindStr(usernameOrId))
+        if (r == null) {
+            return usernameOrId
+        }
+        return r.getStr("id")
+    }
+    // The registered `name` of each user (what a repost badge shows in For you).
+    Map<String,String> plainNames(ids: List<String>) {
+        var out = new HashMap<String, String>()
+        if (ids.size() == 0) {
+            return out
+        }
+        for (var r in store.queryList("select id, name from users where id in (" + FeedStore.marks(ids.size()) + ")", FeedStore.withList(DbParams(), ids))) {
+            out.put(r.getStr("id"), r.getStr("name"))
+        }
+        return out
+    }
+    // Users with an ACTIVE contributor seal (user_seals).
+    List<String> contributorIds(ids: List<String>) {
+        var out = listOf<String>()
+        if (ids.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        for (var id in ids) {
+            p.bindStr(id)
+        }
+        for (var r in store.queryList("select distinct user_id from user_seals where status = \'ACTIVE\' and user_id in (" + FeedStore.marks(ids.size()) + ")", p)) {
+            out.add(r.getStr("user_id"))
+        }
+        return out
+    }
+}
+
+// pending-port: media (MediaService.validateOwnedBy / visibleByIds over media_assets).
+class FeedMedia {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // 404 MEDIA_NOT_FOUND / 403 MEDIA_OWNER_MISMATCH like ValidateMediaOwnershipUseCase.
+    requireOwned(ownerId: String, mediaIds: List<String>) {
+        if (mediaIds.size() == 0) {
+            return
+        }
+        var p = DbParams()
+        for (var id in mediaIds) {
+            p.bindStr(id)
+        }
+        var rows = store.queryList("select id, owner_id from media_assets where id in (" + FeedStore.marks(mediaIds.size()) + ")", p)
+        if (rows.size() != mediaIds.size()) {
+            throw Errors.api(404, "MEDIA_NOT_FOUND", "Uma ou mais midias nao foram encontradas.")
+        }
+        for (var r in rows) {
+            if (r.getStr("owner_id") != ownerId) {
+                throw Errors.api(403, "MEDIA_OWNER_MISMATCH", "Todas as midias precisam pertencer ao autor do post.")
+            }
+        }
+    }
+    // Attachments a card may draw (delete_status NONE), by id.
+    Map<String,FeedMediaSummary> visibleByIds(mediaIds: List<String>) {
+        var out = new HashMap<String, FeedMediaSummary>()
+        if (mediaIds.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        for (var id in mediaIds) {
+            p.bindStr(id)
+        }
+        for (var r in store.queryList("select id, cdn_url, mime_type, width, height from media_assets where delete_status = \'NONE\' and id in (" + FeedStore.marks(mediaIds.size()) + ")", p)) {
+            out.put(r.getStr("id"), FeedMediaSummary(r.getStr("id"), r.getStr("cdn_url"), r.getStr("mime_type"), r.getIntOrNull("width"), r.getIntOrNull("height")))
+        }
+        return out
+    }
+    // PostPublished/PostDeleted: the media is released with the post. pending-port: media deletion jobs.
+    requestPostMediaDeletion(ownerId: String, postId: String, mediaIds: List<String>);
+}
+
+// pending-port: communities (PostCommunityReaderAdapter over communities / community_members).
+class FeedCommunities {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    FeedCommunityRef? byId(communityId: String, viewerId: String?) {
+        var r = store.queryOptional("select id, name, topic from communities where id = ?", DbParams().bindStr(communityId))
+        if (r == null) {
+            return null
+        }
+        var joined = false
+        if (viewerId != null) {
+            joined = store.queryLong("select count(*) from community_members where community_id = ? and user_id = ?", DbParams().bindStr(communityId).bindStr(viewerId)) > 0L
+        }
+        return FeedCommunityRef(r.getStr("id"), r.getStr("name"), r.getStrOrNull("topic"), joined)
+    }
+    // Private channel of a community. pending-port: communities (community_channels).
+    FeedChannelRef? channel(channelId: String) {
+        var r = store.queryOptional("select id, community_id, topic from community_channels where id = ?", DbParams().bindStr(channelId))
+        if (r == null) {
+            return null
+        }
+        return FeedChannelRef(r.getStr("id"), r.getStr("community_id"), r.getStrOrNull("topic"))
+    }
+}
+
+// pending-port: notifications (NotificationService.create). The default is the single insert that service
+// does; the push to the phone (NotificationCreatedEvent listener) belongs to the notifications port.
+class FeedNotifier {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    notify(userId: String, kind: String, actorId: String, title: String, body: String, href: String, cta: String) {
+        store.execute("insert into notifications (id, user_id, kind, actor_id, title, body, href, cta_label, is_read, created_at, actor_count) values (?,?,?,?,?,?,?,?,?,?,?)", DbParams().bindStr(Ids.prefixed("notification_")).bindStr(userId).bindStr(kind).bindStr(actorId).bindStr(title).bindStr(body).bindStr(href).bindStr(cta).bindBool(false).bindInstant(Time.nowIso()).bindInt(1))
+    }
+}
+
+// pending-port: profile/age (AgeGate.requireCanWrite: birth date declared, parental consent).
+class FeedAgeGate {
+    requireCanWrite(userId: String);
+}
+
+// pending-port: moderation (HoneypotGuard.triggered: hidden `website` field filled by a bot).
+class FeedHoneypot {
+    Bool triggered(userId: String, website: String?, surface: String) = false
+}
+
+// pending-port: coins (CoinService.recordPresence).
+class FeedCoins {
+    recordPresence(userId: String);
+    // QuestionAnswerService.rewardAfterCommit: pays who answered, once per question, never to new accounts.
+    rewardAnswer(answererId: String, askerId: String, postId: String);
+}
+
+// pending-port: corporate (CorporateProfileRepository.findByUserId(...).active()).
+class FeedCorporate {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // GetFeedService.getCorporateProfilePosts: the active profile behind an address, null when missing or deactivated.
+    String? activeUserIdOf(username: String) {
+        var r = store.queryOptional("select user_id from corporate_profiles where username = ? and status = \'ACTIVE\'", DbParams().bindStr(username.trim().toLowerCase()))
+        if (r == null) {
+            return null
+        }
+        return r.getStr("user_id")
+    }
+    Bool hasActiveProfile(userId: String) = store.queryLong("select count(*) from corporate_profiles where user_id = ? and status = \'ACTIVE\'", DbParams().bindStr(userId)) > 0L
+}
+
+// pending-port: network (NetworkService.findFriends: accepted user_connections in either direction).
+class FeedGraph {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    List<String> friendIds(userId: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select receiver_user_id as other from user_connections where requester_user_id = ? and status = \'ACCEPTED\' union select requester_user_id as other from user_connections where receiver_user_id = ? and status = \'ACCEPTED\'", DbParams().bindStr(userId).bindStr(userId))) {
+            out.add(r.getStr("other"))
+        }
+        return out
+    }
+}
+
+// pending-port: blog (SubscribedBlogAuthorsAdapter: owners of the blogs the reader subscribed to).
+class FeedBlogs {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    List<String> authorsFollowedBy(userId: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select b.user_id from blog_subscriptions s join blogs b on b.id = s.blog_id where s.user_id = ?", DbParams().bindStr(userId))) {
+            var owner = r.getStr("user_id")
+            if (!out.contains(owner)) {
+                out.add(owner)
+            }
+        }
+        return out
+    }
+}
+
+// pending-port: preferences (PersonalizationService: user_preferences.liked_topics / blocked_topics, CSV).
+class FeedReaderPrefs {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    List<String> csv(userId: String, column: String) {
+        var out = listOf<String>()
+        var r = store.queryOptional("select " + column + " from user_preferences where user_id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return out
+        }
+        for (var item in FeedRules.nz(r.getStrOrNull(column)).split(",")) {
+            if (item.trim().length() > 0) {
+                out.add(item.trim())
+            }
+        }
+        return out
+    }
+    List<String> blockedTopics(userId: String) = this.csv(userId, "blocked_topics")
+    List<String> likedTopics(userId: String) = this.csv(userId, "liked_topics")
+}

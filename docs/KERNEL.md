@@ -353,6 +353,7 @@ hooks.reports = ModerationAutoReports(...)          // moderation: SecurityAutoR
 hooks.origins = DeveloperOrigins(...)               // apiv1: OriginDirectory (default: JdbcOriginDirectory on developer_origins)
 var parts = Security.install(platform, hooks)       // filters, routes, statics; returns SecurityParts
 parts.userLimiter.require(userId, UserRateLimiter.createPost())    // limiter instances for the domains
+Security.parts()                                    // the same SecurityParts from a domain module (after Security.install)
 ```
 
 The seams are classes with a safe default, not interfaces: a Kof interface declared in a package cannot be
@@ -700,6 +701,8 @@ other pods, the TTL is the guarantee. Caches: `publicProfiles` (20 s, 5000), `pu
 ```kotlin
 import kernel.text.*
 
+Base64Url.encode(text)  Base64Url.decode(encoded)   // URL-safe Base64 without padding (opaque cursors); decode throws on bad input
+
 PlainText.defuse(raw): String?                 // bidi/zero-width removed, <=5 combining marks, runs capped at 12 ("travazap")
 TextFieldLimit.check("COMPANY_FIELD_TOO_LONG", "nome", value, 160)   // 400 "O campo nome aceita no máximo 160 caracteres."
 LikePattern.contains(q)  LikePattern.startsWith(q)  LikePattern.escape(t) // null for blank; SQL must say `escape '!'`
@@ -804,6 +807,61 @@ shared.jobs  shared.stop()
 `TestApp.bootWith/bootWire` now stop the platform when the `wire` callback throws (the open pool kept the
 test process from exiting).
 
+## kernel.bytes, kernel.files, kernel.image, kernel.concurrent (media support)
+
+```kotlin
+import kernel.bytes.*   import kernel.files.*   import kernel.image.*   import kernel.concurrent.*
+
+var sink = ByteSink()                           // growable buffer: add(data, off, len) addAll addByte addAscii addLittleInt
+sink.toBytes(): Byte[]                          //   size()
+Bytes.at(data, i)  Bytes.bigShort/bigInt/littleShort/littleInt(data, off)  Bytes.ascii(data, off, len)
+Bytes.hex("89504e47"): Byte[]   Bytes.toHex(data)                           // fixtures and assertions
+```
+
+`ByteStream` (kernel.files) wraps a readable byte stream: `ByteStream.ofFile(path)`, `ofBytes(data)`,
+`copyToFile(path, max)` (throws `STREAM_TOO_LARGE`), `copyExactToFile(path, length)` (`STREAM_TRUNCATED`),
+`readUpTo(n)`, `transferTo(out)`, `close()`. `TempFiles`: `create(prefix, suffix)`, `delete`, `exists`, `size`,
+`readAll`, `write`. `ProcessRunner.run(listOf("ffmpeg", ...), timeoutSeconds): Int` runs a program with its output
+discarded: exit code, `-1` when missing or timed out (and killed).
+
+`Images` (kernel.image): `dimensions(data, exifOrientation): ImageSize?` reads the header only, `rotateJpeg(data,
+orientation)` applies EXIF orientations 2 to 8 to the pixels (16 megapixel cap), `sample/halves` build test
+fixtures. `Gate` is a lock (`enter()` / `leave()`), `Permits(max)` a non-waiting semaphore (`tryAcquire`, `release`).
+
+## kernel.storage: S3 without the SDK
+
+```kotlin
+import kernel.storage.*
+var rest = S3Rest.fromConfig(platform.cfg)   // REDE_MEDIA_S3_ENDPOINT (empty = AWS), _REGION, _BUCKET, _FORCE_PATH_STYLE,
+                                             // AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
+rest.putFile(key, contentType, path)         // streamed, signed payload hash; S3_FAILED status=N on a refusal
+rest.get(key, "bytes=0-99"): S3Object        // body ByteStream, length, contentType, contentRange, eTag
+rest.head(key): Long                         // -1 when absent
+rest.delete(key)                             // idempotent
+rest.presignPut(key, contentType, 3600)      // URL for a browser PUT
+```
+
+AWS Signature V4, path-style or virtual-hosted, verified against the AWS documentation vectors
+(`tests/media/S3RestTest.kf`). The SDK itself cannot be called from Kof (G160). `Uris` (kernel.url):
+`encodePathSegment`, `encodeAws`, `decode`, `base64`, `host`, `path`, `scheme`, `parses`.
+
+## kernel.http: the binary lane
+
+```kotlin
+BinaryLane.claim("/storage/")                // in the module install: this prefix (and /v1/...) goes through the lane
+// upload handler (PUT)
+var phase = Req.headerOrNull("x-kernel-binary")          // "authorize" | "commit"
+ResponseHeaders.set("X-Kernel-Accept", BinaryLane.accept(userId, key, declaredLength)); return Http.respond(202, "{}")
+var path = BinaryLane.bodyPath(ticket, userId, key)      // commit: the temp file holding the body
+// download handler (GET)
+ResponseHeaders.set("X-Kernel-Stream", BinaryLane.stream(byteStream, length)); return Http.respond(200, "")
+```
+
+With a claimed prefix `Platform.start`/`startAsync` run the web runtime on a loopback port and serve the public
+port with `BinaryFront` (every other request is forwarded byte for byte, `X-Kernel-Peer` carries the client
+address and `Req.peerAddress()` honours it only from a loopback peer; client-sent `X-Kernel-*` and `Expect` are
+dropped). `REDE_BINARY_MAX_BODY_BYTES` (default 545259520) caps one upload. Why and what it costs: `docs/PORTING_STATUS.md`
+(media) and G161. Tests use `BinaryClient(app.port)` (`get`, `put`, `send` with `Byte[]` bodies, `BinaryResponse.body`).
 ## kernel.push (web push adapter)
 
 `kernel.push.WebPushAdapter` is the only file that imports the web-push library (jars in `kofdeps`:
@@ -832,6 +890,48 @@ adapter.close()
 a verified account (once) with a live session and returns a `ProfileCaller` (token, JSON content type and a fresh
 `Idempotency-Key` on every write). `ProfileTestApp.finish()` must be the last test of every file: the shared
 jobs keep the test process alive otherwise (G124).
+## kernel.http.Outbound (the only outbound HTTP client) and kernel.concurrent.Gate
+
+```kotlin
+import kernel.http.*
+var reply = Outbound.request("POST", url, listOf("Content-Type: application/json"), "{}", 15000)   // reply.status, reply.body; also postJson / postForm / get
+var posted = Outbound.attempt("POST", url, headers, "{}", 15000)    // same, but unreachable = status 0 and empty body instead of a throw
+var res = Outbound.getBytes(url, listOf("Accept: image/*"), 4000, 6000, 1048576)   // connect ms, read ms, max bytes
+res.status   res.contentType   res.body: Byte[]   res.size()   res.text()
+var probe = Outbound.probe(url, 10000)             // HEAD (ranged GET on 405), follows redirects: probe.status (0 = unreachable), probe.contentType
+var path = Outbound.download(url, maxBytes)        // temp file path, 200 only, no redirects, throws "download falhou: ..."
+```
+
+One class for every outgoing call (identity, suggestions, linkedin, media, emotes): do not add another client.
+It exists because `kof.http` hides the status, content type, bytes and request headers (G15). Failures to connect or
+read throw exactly `"OUTBOUND_FAILED"` (never the URL, address or a header, so a caller maps it to its own 503
+without leaking secrets); `attempt` and `probe` fold that into status 0. Redirects are not followed except by
+`probe`. An error status (4xx/5xx) returns its body; `getBytes` reads up to `maxBytes + 1` so the caller can detect
+"too large". Wrap it in an overridable class and stub that in tests (no network).
+
+`Uris` (kernel.url, percent-encoding with an explicit safe set, host/path parsing) and `UrlCodec` (form encoding,
+`+` for a space) do not overlap: use `UrlCodec` for query values and forms, `Uris` for URL paths and AWS signing.
+
+```kotlin
+import kernel.concurrent.*
+var gate = Gate()      gate.enter()   gate.leave()   gate.tryEnter(): Bool    // reentrant ReentrantLock
+```
+
+Domain code cannot import `java.util.concurrent`; use `Gate`. `tryEnter` is the "skip if another thread is already
+doing it" form used by the emotes refresh (call `leave()` after a true).
+
+### BinaryFront: design, cost and the rule about its port
+
+Active only when a module called `BinaryLane.claim(prefix)` before `Platform.start`. With no claimed prefix
+`Platform` runs the web runtime directly on the public port (no front, no extra hop; asserted by
+`tests/kernel/BinaryLaneTest.kf`). With a claim, the web runtime listens on a loopback port chosen at boot and the
+front owns the public one: every request is parsed up to its head and piped byte for byte, except `PUT` and `GET`
+under a claimed prefix (two internal calls for an upload, a stream swap for a download). Cost: one loopback hop per
+request, one temp file per upload (`java.io.tmpdir`), and a thread per connection.
+
+**The internal port must never be published or routed to** (docker `ports:`, a Traefik/Cloudflare route, a
+firewall rule): it trusts `X-Kernel-Peer`, `X-Kernel-Binary` and ticket headers that only the front sets. The front
+drops client-sent `X-Kernel-*` headers, and `Req.peerAddress()` honours `X-Kernel-Peer` only from a loopback peer.
 
 ## Identity adapters (`Tokens`, `Jwt`, `Outbound`, `UrlCodec`)
 
@@ -842,14 +942,13 @@ Java interop for the identity flows lives here; domain code only sees Strings.
 - `Jwt.verifyRs256(token, jwks)`: payload JSON or null (shape, algorithm, key, signature); issuer, audience, expiry and
   nonce are the caller's. `Jwt.sign("RS256" | "ES256", pkcs8Base64OrPem, header, payload)`; `newRsaPair` and `newEcPair`
   are test support. `Jwt.looksLikeJwt(value)` tells an id_token from an authorization code.
-- `Outbound.request(method, url, headers, body, timeoutMs)` / `postForm` / `get`: status and body, throws
-  `OUTBOUND_FAILED: ...` on connect or IO failure. Wrap it in an overridable class and stub that in tests.
+- `Outbound`: see the kernel.http.Outbound section (the only outbound HTTP client).
 - `UrlCodec.encode(value)` / `decode(value)`: form url encoding, UTF-8.
 ## Leaf-domain kernel additions
 
 - `Req.queryAll(name)`, `Req.queryParam(name)`, `Req.formDecode(raw)`; `queryStr/queryInt/queryLong/queryBool` read the raw query (`+` is a space, `%2B` a plus, repeated names supported).
 - `Regexes.matches(regex, text)`, `Texts.fromHex4`, `Numbers.round/round2/pow`, `Contrast.ratio/over/wholePart` (WCAG contrast with the integer-division message of the Java service).
-- `Outbound.request/postJson/postForm/get(...)` returning `OutboundReply(status, body)`; throws exactly `"OUTBOUND_FAILED"` (no URL or address). The only outbound HTTP client: do not add another.
+- `Outbound`: see the kernel.http.Outbound section (the only outbound HTTP client).
 - `HtmlTemplate.render(template, vars)`: Thymeleaf subset (`th:text`, `th:href`, drops `xmlns:th`).
 - `OriginNormalizer.normalize(raw)`: developer origin validation (`INVALID_ORIGIN`).
 - `ZoneDates.dayOf/startOfDay/plusDays/today(zone)`: calendar days in a named zone.

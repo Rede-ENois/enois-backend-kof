@@ -1,0 +1,54 @@
+package media
+
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+import kernel.url.*
+
+// HTTP adapter of the media contract (MediaContractController + MediaMigrationController).
+class MediaRoutes {
+    static register(server: HttpServer, module: MediaModule) {
+        // The literal route is registered before `/media/:mediaId`, which would also match it.
+        server.get("/media/migration", () -> json.encode(module.migrationStatus()))
+        server.post("/media/uploads", () -> MediaRoutes.upload(module))
+        // Public on purpose: the id only appears in posts and profiles anyone can already read, and the
+        // answer is what the publication exposes. Upload and delete require the session.
+        server.get("/media/:mediaId", () -> json.encode(module.service.getMedia(Req.pathParam("mediaId"))))
+        server.delete("/media/:mediaId", () -> MediaRoutes.remove(module))
+    }
+    static MediaUploadRequest parseUpload() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<MediaUploadRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String text(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    static Long number(v: Long?) {
+        if (v == null) {
+            return 0L
+        }
+        return v
+    }
+    static String upload(module: MediaModule) {
+        var request = MediaRoutes.parseUpload()
+        var userId = Auth.requireUser()
+        var hash = Idempotency.hash(json.encode(request))
+        var service = module.service
+        return module.idempotency.handle(userId, "POST", "/api/media/uploads", hash, 201, () -> json.encode(service.createUpload(userId, MediaRoutes.text(request.fileName), MediaRoutes.text(request.mimeType), MediaRoutes.number(request.size), MediaRoutes.text(request.purpose))))
+    }
+    static String remove(module: MediaModule) {
+        var userId = Auth.requireUser()
+        var mediaId = Req.pathParam("mediaId")
+        var hash = Idempotency.hash("{\"mediaId\":" + json.encode(mediaId) + "}")
+        var service = module.service
+        return module.idempotency.handle(userId, "DELETE", "/api/media/{mediaId}", hash, 200, () -> json.encode(service.requestDeletion(userId, mediaId)))
+    }
+}

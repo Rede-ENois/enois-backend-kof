@@ -1,0 +1,36 @@
+import feed.*
+import kernel.testkit.*
+
+// Port of CommentReactionStateTests.
+test "a comment reaction is returned on reload" {
+    var author = FeedTestSupport.user("creact_author")
+    var reactor = FeedTestSupport.user("creact_reactor")
+    var postId = FeedFixtures.publish(author, "creact-pub-1", "Post para reacao de comentario.")
+    var commentId = FeedFixtures.comment(reactor, postId, "Comentario com reacao.", "creact-c-1")
+    var react = FeedTestSupport.send("POST", "/feed/posts/" + postId + "/comments/" + commentId + "/reactions", reactor, "creact-1", "{\"type\":\"LIKE\"}")
+    Check.status(react, 200)
+    var mine = FeedFixtures.comments(reactor, postId)
+    Check.jsonEq(mine, "items.0.currentUserReaction", "LIKE")
+    Check.jsonEq(mine, "items.0.reactionSummary.LIKE", "1")
+    Check.jsonEq(mine, "items.0.reactionCount", "1")
+    var other = FeedFixtures.comments(author, postId)
+    Check.status(other, 200)
+    Check.isTrue("no own reaction for another user", other.jsonIsNull("items.0.currentUserReaction"))
+}
+
+test "the newer reaction types work" {
+    var author = FeedTestSupport.user("creact_author2")
+    var reactor = FeedTestSupport.user("creact_reactor2")
+    var postId = FeedFixtures.publish(author, "creact-pub-2", "Post para reacao de comentario.")
+    var commentId = FeedFixtures.comment(reactor, postId, "Comentario com reacao.", "creact-c-2")
+    var path = "/feed/posts/" + postId + "/comments/" + commentId + "/reactions"
+    for (var type in listOf("EYES", "NOTE", "FIRE", "CLAP")) {
+        Check.status(FeedTestSupport.send("POST", path, reactor, "creact2-" + type, "{\"type\":\"" + type + "\"}"), 200)
+        Check.jsonEq(FeedFixtures.comments(reactor, postId), "items.0.currentUserReaction", type)
+    }
+    var del = FeedTestSupport.send("DELETE", path, reactor, "creact2-del", "")
+    Check.status(del, 200)
+    Check.jsonEq(del, "status", "REMOVED")
+    Check.isTrue("back to no reaction", FeedFixtures.comments(reactor, postId).jsonIsNull("items.0.currentUserReaction"))
+    FeedTestSupport.finish()
+}

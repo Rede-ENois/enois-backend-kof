@@ -1,0 +1,129 @@
+import feed.*
+import kernel.error.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of FeedPaginationTests (fixtures written straight through the store, read through GET /feed).
+String base() = "2090-01-01T12:00:00Z"
+
+String baseMinus(seconds: Int) = Time.plusSeconds(base(), 0L - seconds)
+
+test "unseen reaches posts after an entire window of interacted posts" {
+    var p = "pagination_unseen"
+    var t = FeedTestSupport.user(p + "_reader")
+    var i = 0
+    while (i < 100) {
+        var post = FeedRows.insert(p + "_post_" + i, p + "_author", baseMinus(i))
+        if (i % 2 == 0) {
+            FeedRows.react(p + "_reaction_" + i, post.id(), p + "_reader", baseMinus(i))
+        }
+        else {
+            FeedRows.comment(p + "_comment_" + i, post.id(), p + "_reader", baseMinus(i))
+        }
+        i = i + 1
+    }
+    var unread = FeedRows.insert(p + "_post_100", p + "_author", baseMinus(100))
+    var cursor = Time.plusSeconds(base(), 1L)
+    var res = FeedTestSupport.app().client.getWith("/feed?tab=UNSEEN&limit=20&cursor=" + cursor, FeedTestSupport.read(t))
+    Check.status(res, 200)
+    var ids = FeedRows.ids(res)
+    Check.isTrue("the unread post is reached", ids.contains(unread.id()))
+    Check.isTrue("interacted posts are skipped", !ids.contains(p + "_post_0") && !ids.contains(p + "_post_1"))
+}
+
+test "interacted paginates past three pages of reactions" {
+    var p = "pagination_interacted"
+    var t = FeedTestSupport.user(p + "_reader")
+    var expected = listOf<String>()
+    var i = 0
+    while (i < 61) {
+        var post = FeedRows.insert(p + "_post_" + i, p + "_author", baseMinus(i))
+        FeedRows.react(p + "_reaction_" + i, post.id(), p + "_reader", baseMinus(i))
+        expected.add(post.id())
+        i = i + 1
+    }
+    var all = FeedRows.readAll(t, "INTERACTED", Time.plusSeconds(base(), 1L), 20)
+    Check.eqInt("count", 61, all.size())
+    var k = 0
+    while (k < expected.size()) {
+        Check.eqStr("order " + k, expected.get(k), all.get(k))
+        k = k + 1
+    }
+}
+
+test "interacted unifies comments and reactions without repeating posts" {
+    var p = "pagination_unify"
+    var t = FeedTestSupport.user(p + "_reader")
+    var first = FeedRows.insert(p + "_post_0", p + "_author", base())
+    var second = FeedRows.insert(p + "_post_1", p + "_author", baseMinus(1))
+    var untouched = FeedRows.insert(p + "_post_2", p + "_author", baseMinus(2))
+    FeedRows.react(p + "_reaction_0", first.id(), p + "_reader", base())
+    FeedRows.comment(p + "_comment_0", first.id(), p + "_reader", base())
+    FeedRows.comment(p + "_comment_1", first.id(), p + "_reader", baseMinus(1))
+    FeedRows.comment(p + "_comment_2", second.id(), p + "_reader", baseMinus(2))
+    var all = FeedRows.readAll(t, "INTERACTED", Time.plusSeconds(base(), 1L), 1)
+    Check.eqInt("count", 2, all.size())
+    Check.eqStr("first", first.id(), all.get(0))
+    Check.eqStr("second", second.id(), all.get(1))
+    Check.isTrue("untouched is out", !all.contains(untouched.id()))
+}
+
+String rankKey(reactions: Int, createdAt: String, id: String) = "" + (1000 + reactions) + "|" + createdAt + "|" + id
+
+test "trending paginates the ranking instead of repeating its first page" {
+    var p = "pagination_trending"
+    var t = FeedTestSupport.user(p + "_reader")
+    var now = Time.fromMillis(Time.nowMillis() - 60000L)
+    var keys = listOf<String>()
+    var i = 0
+    while (i < 45) {
+        var at = Time.plusSeconds(now, 0L - i / 2)
+        var reactions = 100 + i / 2 % 3
+        var row = FeedRows.post(p + "_post_" + i, p + "_author", "INSIGHT", at, reactions)
+        FeedRows.insertRow(row)
+        keys.add(rankKey(reactions, row.createdAt(), row.id()))
+        i = i + 1
+    }
+    keys.sort()
+    var expected = listOf<String>()
+    var k = keys.size() - 1
+    while (k >= 0) {
+        var parts = keys.get(k).split("\\|")
+        expected.add(parts[2])
+        k = k - 1
+    }
+    var own = listOf<String>()
+    for (var id in FeedRows.readAll(t, "TRENDING", null, 20)) {
+        if (id.startsWith(p)) {
+            own.add(id)
+        }
+    }
+    Check.eqInt("count", 45, own.size())
+    var j = 0
+    while (j < expected.size()) {
+        Check.eqStr("rank " + j, expected.get(j), own.get(j))
+        j = j + 1
+    }
+}
+
+test "trending keeps its window and excludes posts outside its scope" {
+    var p = "pagination_window"
+    var t = FeedTestSupport.user(p + "_reader")
+    var until = Time.fromMillis(Time.nowMillis() - 60000L)
+    var eligible = FeedRows.insert(p + "_post_0", p + "_author", Time.plusSeconds(until, -1L))
+    var afterWindow = FeedRows.insert(p + "_post_1", p + "_author", Time.plusSeconds(until, 1L))
+    var old = FeedRows.insert(p + "_post_2", p + "_author", Time.plusSeconds(until, -86401L))
+    var deleted = FeedRows.insert(p + "_post_3", p + "_author", Time.plusSeconds(until, -2L))
+    FeedTestSupport.module().store.markDeleted(deleted.id(), until)
+    FeedRows.insertRow(FeedRows.post(p + "BLOG", p + "_reader", "BLOG", Time.plusSeconds(until, -3L), 0))
+    FeedRows.insertRow(FeedRows.post(p + "BUSINESS", p + "_reader", "BUSINESS", Time.plusSeconds(until, -3L), 0))
+    var channel = FeedPostRow(p + "_channel_post", p + "_reader", "INSIGHT", "Synthetic", null, null, p + "_channel", null, null, false, null, Time.plusSeconds(until, -4L), "PUBLIC", 0, 0, 0, 0, 0, "ACTIVE", null, null, null, "SOCIAL", null, false)
+    FeedRows.insertRow(channel)
+    var cursor = FeedTrending.encode(FeedTrendingCursor(until, 1, until, "synthetic_boundary"))
+    var ids = FeedRows.readAll(t, "TRENDING", cursor, 20)
+    Check.isTrue("eligible is there", ids.contains(eligible.id()))
+    for (var gone in listOf(afterWindow.id(), old.id(), deleted.id(), p + "BLOG", p + "BUSINESS", channel.id())) {
+        Check.isTrue("excluded " + gone, !ids.contains(gone))
+    }
+    FeedTestSupport.finish()
+}

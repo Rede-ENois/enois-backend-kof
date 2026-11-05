@@ -1,0 +1,226 @@
+package media
+
+import kernel.*
+import kernel.config.*
+import kernel.db.*
+import kernel.error.*
+import kernel.files.*
+import kernel.time.*
+import kernel.idempotency.*
+import kernel.jobs.*
+import kernel.log.*
+import kernel.security.*
+import kernel.storage.*
+
+// Status of the S3 migration (GET /media/migration): aggregate counts only, no id, URL or owner.
+record MediaMigrationStatus(Bool enabled, Bool flipEnabled, Long total, Long imagekit, Long s3Copied, Long s3Active, Long errors, String? lastError)
+
+// The media domain wired once (see docs/PORTING_STATUS.md). Fields stay mutable on purpose: Main.kf and
+// the tests replace a seam (`objectStore`, `gateway`, `classifier`, `reviewer`) before the first request.
+//
+//   var media = MediaModule.install(platform, shared, hooks)
+//   media.service.visibleByIds(ids)          // cards for feed / groups / profile
+class MediaModule {
+    Config cfg
+    MediaStore store
+    MediaUrlFactory urls
+    MediaService service
+    Idempotency idempotency
+    MediaStorageGateway gateway
+    MediaObjectStore? objectStore
+    MediaUploadSigner? signer
+    MediaSanitizer sanitizer
+    MediaModeration moderation
+    MediaDimensions dimensions
+    Log log = Log("media.module")
+    MediaMigrationService? migration = MediaModule.noMigration()
+    LazyUrlMigrationService? lazyUrls = MediaModule.noLazyUrls()
+    Bool storageIsS3
+    Bool migrationEnabled
+    Bool flipEnabled
+    public constructor(cfg: Config, store: MediaStore, urls: MediaUrlFactory, service: MediaService, idempotency: Idempotency, gateway: MediaStorageGateway, objectStore: MediaObjectStore?, signer: MediaUploadSigner?, storageIsS3: Bool, migrationEnabled: Bool, flipEnabled: Bool) {
+        this.cfg = cfg
+        this.store = store
+        this.urls = urls
+        this.service = service
+        this.idempotency = idempotency
+        this.gateway = gateway
+        this.objectStore = objectStore
+        this.signer = signer
+        var ffmpeg = cfg.getStr("REDE_MEDIA_FFMPEG_PATH", "ffmpeg")
+        this.sanitizer = MediaSanitizer(ffmpeg, MediaPdfCleaner())
+        this.moderation = MediaModeration(cfg.getBool("REDE_MEDIA_NSFW_ENABLED", true), MediaModule.threshold(cfg), MediaImageClassifier(), MediaImageReviewer())
+        this.dimensions = MediaDimensions(store, this)
+        this.storageIsS3 = storageIsS3
+        this.migrationEnabled = migrationEnabled
+        this.flipEnabled = flipEnabled
+    }
+    // REDE_MEDIA_STORAGE=s3 (REDE_MEDIA_S3_BUCKET required: fail at boot rather than store media pointing
+    // nowhere) or imagekit (the default). Registers the routes and the workers.
+    static MediaModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks) {
+        var module = MediaModule.build(platform.cfg, platform.db, shared)
+        MediaRoutes.register(platform.server, module)
+        MediaStorageRoutes.register(platform.server, module)
+        module.schedule(shared.jobs)
+        return module
+    }
+    static MediaModule build(cfg: Config, database: Db, shared: SharedServices) {
+        var mode = cfg.getStr("REDE_MEDIA_STORAGE", "imagekit").trim().toLowerCase()
+        var store = MediaStore(database)
+        var s3 = mode == "s3"
+        var urls = MediaUrlFactory()
+        var gateway = MediaStorageGateway()
+        var objectStore = MediaModule.noStore()
+        var signer = MediaModule.noSigner()
+        var moderation = cfg.getBool("REDE_MEDIA_NSFW_ENABLED", true)
+        if (s3) {
+            var rest = S3Rest.fromConfig(cfg)
+            urls = MediaS3UrlFactory(cfg.getStr("REDE_MEDIA_S3_BUCKET", ""), cfg.getStr("REDE_MEDIA_S3_REGION", "us-east-1"), cfg.getStr("REDE_MEDIA_S3_PREFIX", "uploads/"), cfg.getStr("REDE_MEDIA_S3_PUBLIC_BASE_URL", ""))
+            objectStore = MediaS3ObjectStore(rest)
+            gateway = MediaGuardedGateway(MediaS3Gateway(rest), MediaResilience.standard())
+            signer = MediaSigners.forS3(rest, cfg.getStr("REDE_MEDIA_S3_PUBLIC_BASE_URL", ""), cfg.has("REDE_MEDIA_S3_UPLOAD_THROUGH_API"), cfg.getBool("REDE_MEDIA_S3_UPLOAD_THROUGH_API", true), moderation)
+        }
+        else {
+            urls = MediaImageKitUrlFactory(cfg.getStr("IMAGEKIT_URL_ENDPOINT", ""))
+            var key = cfg.getStr("IMAGEKIT_PRIVATE_KEY", "")
+            if (key.length() > 0) {
+                gateway = MediaGuardedGateway(MediaImageKitGateway(key), MediaResilience.standard())
+            }
+            else {
+                Log("media.module").warn("IMAGEKIT_PRIVATE_KEY not set: media deletion will not reach the ImageKit account")
+            }
+        }
+        var migrating = cfg.getBool("REDE_MEDIA_MIGRATION_ENABLED", false)
+        var service = MediaService(store, urls, signer, MediaLazyCopy())
+        var module = MediaModule(cfg, store, urls, service, shared.idempotency, gateway, objectStore, signer, s3, migrating, cfg.getBool("REDE_MEDIA_MIGRATION_FLIP_ENABLED", false))
+        if (migrating) {
+            module.enableMigration(database)
+        }
+        return module
+    }
+    // The S3 copy of the old archive (REDE_MEDIA_MIGRATION_ENABLED): it needs the bucket settings even while
+    // new uploads still go to ImageKit, and fails at boot without them (as the Java service does).
+    enableMigration(database: Db) {
+        var rest = S3Rest.fromConfig(cfg)
+        var target = MediaS3UrlFactory(cfg.getStr("REDE_MEDIA_S3_BUCKET", ""), cfg.getStr("REDE_MEDIA_S3_REGION", "us-east-1"), cfg.getStr("REDE_MEDIA_S3_PREFIX", "uploads/"), cfg.getStr("REDE_MEDIA_S3_PUBLIC_BASE_URL", ""))
+        var copier = MediaBucketCopier(MediaS3ObjectStore(rest), target.baseUrl())
+        var endpoint = cfg.getStr("IMAGEKIT_URL_ENDPOINT", "")
+        var created = MediaMigrationService(store, MediaHttpDownloader(), copier, MediaHttpVerifier(), endpoint, flipEnabled)
+        migration = created
+        lazyUrls = LazyUrlMigrationService(store, MediaHttpDownloader(), copier, MediaHttpVerifier(), MediaUrlReferences(database), MediaExecutor(), endpoint)
+        service.lazyCopy = MediaLazyCopyTrigger(created, MediaExecutor())
+    }
+    // Profiles, covers and logos call this when they serve a URL: a legacy ImageKit one schedules its copy.
+    onUrlAccess(url: String) {
+        var lazy = lazyUrls
+        if (lazy != null) {
+            lazy.onAccess(url)
+        }
+    }
+    static MediaMigrationService? noMigration() = null
+    static LazyUrlMigrationService? noLazyUrls() = null
+    // Stores an uploaded body (a temp file of `length` bytes) for `asset`: strip metadata, check the image
+    // content, write to the bucket, measure the image. Failures of the bucket are a 502 with its own code.
+    storeUpload(asset: MediaAsset, objectKey: String, path: String, length: Long) {
+        var mime = asset.mimeType
+        var started = Time.nowMillis()
+        if (length > MediaSanitizer.maxInMemory()) {
+            if (sanitizer.supportsInMemory(mime)) {
+                throw Errors.api(413, "MEDIA_TOO_LARGE", "Arquivo grande demais para a limpeza de metadados.")
+            }
+            // Large video/audio: temp file + ffmpeg, never the whole body in memory.
+            var clean = sanitizer.sanitizeToFile(path, mime, objectKey)
+            var failure = ""
+            try {
+                writeToBucket(objectKey, mime, clean, length, started)
+            } catch (String e) {
+                failure = e
+            }
+            if (clean != path) {
+                TempFiles.delete(clean)
+            }
+            if (failure.length() > 0) {
+                throw failure
+            }
+            return
+        }
+        var raw = TempFiles.readAll(path)
+        // Cleaning on write: EXIF/GPS/XMP/IPTC never reach the bucket.
+        var cleaned = sanitizer.sanitize(raw, mime, objectKey)
+        moderation.verifyBeforeStorage(cleaned, mime)
+        var out = TempFiles.create("media-store-", ".bin")
+        var failure = ""
+        try {
+            TempFiles.write(out, cleaned)
+            writeToBucket(objectKey, mime, out, length, started)
+        } catch (String e) {
+            failure = e
+        }
+        TempFiles.delete(out)
+        if (failure.length() > 0) {
+            throw failure
+        }
+        dimensions.recordUploaded(asset, cleaned)
+    }
+    // A bucket failure (gateway down, refusal, dropped connection) used to be the generic "unexpected error":
+    // now a 502 with its own code, the cause in the log and no infrastructure detail for the user.
+    writeToBucket(objectKey: String, mime: String, filePath: String, receivedBytes: Long, started: Long) {
+        var store = objectStore
+        if (store == null) {
+            throw Errors.api(503, "MEDIA_STORAGE_DISABLED", "Armazenamento de midia indisponivel.")
+        }
+        try {
+            store.write(objectKey, mime, filePath)
+        } catch (String e) {
+            if (Errors.isApi(e)) {
+                throw e
+            }
+            log.error("media_storage_write_failed mime=" + mime + " receivedBytes=" + receivedBytes + " storedBytes=" + TempFiles.size(filePath) + " elapsedMs=" + (Time.nowMillis() - started) + " cause=" + e)
+            throw Errors.api(502, "MEDIA_STORAGE_WRITE_FAILED", "Nao foi possivel gravar a midia agora. Tente novamente em instantes.")
+        }
+    }
+    static Double threshold(cfg: Config) {
+        try {
+            return cfg.getStr("REDE_MEDIA_NSFW_THRESHOLD", "0.70").trim().toDouble()
+        } catch (String e) {
+            throw "CONFIG_INVALID: REDE_MEDIA_NSFW_THRESHOLD must be a number"
+        }
+    }
+    static MediaObjectStore? noStore() = null
+    static MediaUploadSigner? noSigner() = null
+    MediaMigrationStatus migrationStatus() = MediaMigrationStatus(migrationEnabled, flipEnabled, store.countAll(), store.countByStorageProvider("IMAGEKIT"), store.countMigratedToS3(), store.countActiveOnS3(), store.countWithMigrationError(), store.lastMigrationError())
+    // Scheduled jobs (fixed delay, like the Spring @Scheduled ones).
+    schedule(jobs: Scheduler) {
+        var batchMigration = migration
+        var urlMigration = lazyUrls
+        if (batchMigration != null && urlMigration != null) {
+            var worker = MediaMigrationWorker(batchMigration, cfg.getInt("REDE_MEDIA_MIGRATION_BATCH_SIZE", 10))
+            var initial = cfg.getLong("REDE_MEDIA_MIGRATION_INITIAL_DELAY_MS", 45000L)
+            var delay = cfg.getLong("REDE_MEDIA_MIGRATION_DELAY_MS", 30000L)
+            jobs.fixedDelay("media-migration", initial, delay, () -> {
+    worker.run()
+})
+            jobs.fixedDelay("media-url-migration", initial, delay, () -> {
+    urlMigration.flipAndSweep()
+})
+        }
+        if (cfg.getBool("REDE_MEDIA_DIMENSIONS_BACKFILL_ENABLED", true)) {
+            var batch = cfg.getInt("REDE_MEDIA_DIMENSIONS_BACKFILL_BATCH_SIZE", 20)
+            if (batch < 1) {
+                batch = 1
+            }
+            if (batch > 100) {
+                batch = 100
+            }
+            var size = batch
+            var measured = dimensions
+            jobs.fixedDelay("media-dimensions-backfill", cfg.getLong("REDE_MEDIA_DIMENSIONS_BACKFILL_INITIAL_DELAY_MS", 90000L), cfg.getLong("REDE_MEDIA_DIMENSIONS_BACKFILL_DELAY_MS", 60000L), () -> {
+    measured.backfill(size)
+})
+        }
+        var worker = MediaDeletionWorker(store, gateway)
+        jobs.fixedDelay("media-deletion", 0L, cfg.getLong("REDE_MEDIA_DELETION_WORKER_DELAY_MS", 5000L), () -> {
+    worker.processPendingJobs()
+})
+    }
+}

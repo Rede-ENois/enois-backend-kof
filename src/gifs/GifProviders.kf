@@ -1,0 +1,228 @@
+package gifs
+
+import kernel.error.*
+
+// Tolerant readers of the third-party payloads (the format changes without notice): every field is
+// optional, numbers may arrive as text, unknown properties are ignored.
+record TenorFormat(String? url, List<Int>? dims)
+
+record TenorFormats(TenorFormat? gif, TenorFormat? tinygif)
+
+record TenorNode(String? id, String? content_description, TenorFormats? media_formats)
+
+record TenorBody(List<TenorNode>? results)
+
+record GiphyImage(String? url, String? width, String? height)
+
+record GiphyImages(GiphyImage? original, GiphyImage? fixed_width)
+
+record GiphyNode(String? id, String? title, GiphyImages? images)
+
+record GiphyBody(List<GiphyNode>? data)
+
+class GifText {
+    // Null for null or blank, like the Java `text()` helpers.
+    static String? text(v: String?) {
+        if (v == null) {
+            return null
+        }
+        if (v.trim().length() == 0) {
+            return null
+        }
+        return v
+    }
+    static String? first(a: String?, b: String?) {
+        if (a != null) {
+            return a
+        }
+        return b
+    }
+    static Bool has(v: String?) = GifText.text(v) != null
+    // Integer.parseInt semantics with 0 for anything unreadable.
+    static Int intOr0(v: String?) {
+        if (v == null) {
+            return 0
+        }
+        try {
+            return v.toInt()
+        } catch (String e) {
+            return 0
+        }
+    }
+    static String providerError() = Errors.api(502, "GIF_PROVIDER_ERROR", "A busca de GIF nao respondeu. Tente de novo.")
+    static String enc(v: String) = encoding.urlEncode(v)
+}
+
+// Tenor API v2: search and featured. Needs a key; without it the provider is unavailable.
+class TenorGifProvider extends GifProvider {
+    String apiKey
+    GifHttp client
+    public constructor(apiKey: String, client: GifHttp) {
+        super()
+        this.apiKey = apiKey
+        this.client = client
+    }
+    String name() = "Tenor"
+    Bool available() = apiKey.trim().length() > 0
+    static String url(apiKey: String, query: String, limit: Int) {
+        var hasQuery = query.trim().length() > 0
+        var out = "https://tenor.googleapis.com/v2"
+        if (hasQuery) {
+            out = out + "/search"
+        }
+        else {
+            out = out + "/featured"
+        }
+        out = out + "?key=" + GifText.enc(apiKey) + "&limit=" + limit + "&media_filter=gif,tinygif"
+        if (hasQuery) {
+            out = out + "&q=" + GifText.enc(query)
+        }
+        return out
+    }
+    List<GifItem> search(query: String, limit: Int) {
+        try {
+            return TenorGifProvider.map(client.get(TenorGifProvider.url(apiKey, query, limit)))
+        } catch (String e) {
+            throw GifText.providerError()
+        }
+    }
+    static String? formatUrl(f: TenorFormat?) {
+        if (f == null) {
+            return null
+        }
+        return GifText.text(f.url)
+    }
+    // Maps the Tenor answer; separate from the call so a test covers the format without network.
+    static List<GifItem> map(body: String) {
+        var items = listOf<GifItem>()
+        var parsed = json.decode<TenorBody>(body)
+        var nodes = parsed.results
+        if (nodes == null) {
+            return items
+        }
+        for (var node in nodes) {
+            var formats = node.media_formats
+            if (formats != null) {
+                var gif = formats.gif
+                var tiny = formats.tinygif
+                var preview = TenorGifProvider.formatUrl(tiny)
+                var url = GifText.first(TenorGifProvider.formatUrl(gif), preview)
+                if (url != null) {
+                    var width = 0
+                    var height = 0
+                    if (gif != null) {
+                        var dims = gif.dims
+                        if (dims != null) {
+                            if (dims.size() > 0) {
+                                width = dims.get(0)
+                            }
+                            if (dims.size() > 1) {
+                                height = dims.get(1)
+                            }
+                        }
+                    }
+                    var previewUrl = url
+                    if (preview != null) {
+                        previewUrl = preview
+                    }
+                    items.add(GifItem(GifText.text(node.id), url, previewUrl, width, height, GifText.text(node.content_description), "Tenor"))
+                }
+            }
+        }
+        return items
+    }
+}
+
+// GIPHY API v1: search and trending. `rating=pg-13` keeps the community tone, the `messaging` bundle
+// drops stickers and clips (chat GIFs only).
+class GiphyGifProvider extends GifProvider {
+    String apiKey
+    GifHttp client
+    public constructor(apiKey: String, client: GifHttp) {
+        super()
+        this.apiKey = apiKey
+        this.client = client
+    }
+    String name() = "GIPHY"
+    Bool available() = apiKey.trim().length() > 0
+    static String url(apiKey: String, query: String, limit: Int) {
+        var hasQuery = query.trim().length() > 0
+        var out = "https://api.giphy.com/v1/gifs"
+        if (hasQuery) {
+            out = out + "/search"
+        }
+        else {
+            out = out + "/trending"
+        }
+        out = out + "?api_key=" + GifText.enc(apiKey) + "&limit=" + limit + "&rating=pg-13&bundle=messaging_non_clips"
+        if (hasQuery) {
+            out = out + "&q=" + GifText.enc(query)
+        }
+        return out
+    }
+    List<GifItem> search(query: String, limit: Int) {
+        try {
+            return GiphyGifProvider.map(client.get(GiphyGifProvider.url(apiKey, query, limit)))
+        } catch (String e) {
+            throw GifText.providerError()
+        }
+    }
+    static String? imageUrl(i: GiphyImage?) {
+        if (i == null) {
+            return null
+        }
+        return GifText.text(i.url)
+    }
+    static List<GifItem> map(body: String) {
+        var items = listOf<GifItem>()
+        var parsed = json.decode<GiphyBody>(body)
+        var nodes = parsed.data
+        if (nodes == null) {
+            return items
+        }
+        for (var node in nodes) {
+            var images = node.images
+            if (images != null) {
+                var original = images.original
+                var fixed = images.fixed_width
+                var url = GiphyGifProvider.imageUrl(original)
+                if (url != null) {
+                    var preview = url
+                    if (fixed != null) {
+                        var p = GifText.text(fixed.url)
+                        if (p != null) {
+                            preview = p
+                        }
+                    }
+                    var width = 0
+                    var height = 0
+                    if (original != null) {
+                        width = GifText.intOr0(original.width)
+                        height = GifText.intOr0(original.height)
+                    }
+                    items.add(GifItem(GifText.text(node.id), url, preview, width, height, GifText.text(node.title), "GIPHY"))
+                }
+            }
+        }
+        return items
+    }
+}
+
+// Always available: the GIFs the network already shared. Java declares it but never registers it as a
+// provider (no bean), so the module does not wire it either; kept for the day the feed port exists.
+class CommunityGifProvider extends GifProvider {
+    GifCommunityReader reader
+    public constructor(reader: GifCommunityReader) {
+        super()
+        this.reader = reader
+    }
+    String name() = "Comunidade"
+    Bool available() = true
+    List<GifItem> search(query: String, limit: Int) {
+        var out = listOf<GifItem>()
+        for (var url in reader.search(query.toLowerCase(), limit)) {
+            out.add(GifItem(url, url, url, 0, 0, null, "Comunidade"))
+        }
+        return out
+    }
+}

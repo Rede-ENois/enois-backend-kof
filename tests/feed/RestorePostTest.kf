@@ -1,0 +1,30 @@
+import feed.*
+import kernel.testkit.*
+
+// Port of RestorePostTests.
+test "a deleted post is restored by its owner" {
+    var author = FeedTestSupport.user("restore_owner")
+    var postId = FeedFixtures.publish(author, "pub-restore-1", "Post que sera excluido e restaurado.")
+    Check.status(FeedTestSupport.send("DELETE", "/feed/posts/" + postId, author, "del-1", ""), 200)
+    var client = FeedTestSupport.app().client
+    Check.status(client.get("/feed/posts/" + postId), 404)
+    var res = FeedTestSupport.send("POST", "/feed/posts/" + postId + "/restore", author, "restore-1", "")
+    Check.status(res, 200)
+    Check.jsonEq(res, "content", "Post que sera excluido e restaurado.")
+    Check.status(client.get("/feed/posts/" + postId), 200)
+}
+
+test "restoring an active post is a conflict" {
+    var author = FeedTestSupport.user("restore_active")
+    var postId = FeedFixtures.publish(author, "pub-restore-2", "Post que sera excluido e restaurado.")
+    Check.apiError(FeedTestSupport.send("POST", "/feed/posts/" + postId + "/restore", author, "restore-active-1", ""), 409, "POST_NOT_DELETED")
+}
+
+test "only the owner restores a post" {
+    var author = FeedTestSupport.user("restore_owner2")
+    var intruder = FeedTestSupport.user("restore_intruder")
+    var postId = FeedFixtures.publish(author, "pub-restore-3", "Post que sera excluido e restaurado.")
+    Check.status(FeedTestSupport.send("DELETE", "/feed/posts/" + postId, author, "del-2", ""), 200)
+    Check.apiError(FeedTestSupport.send("POST", "/feed/posts/" + postId + "/restore", intruder, "restore-intrude-1", ""), 403, "POST_OWNER_MISMATCH")
+    FeedTestSupport.finish()
+}

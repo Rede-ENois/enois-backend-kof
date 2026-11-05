@@ -1,0 +1,83 @@
+package media
+
+// A row of media_assets. Instants are ISO-8601 UTC strings (kernel convention).
+record MediaAsset(String id, String ownerId, String fileName, String mimeType, Long size, String? purpose, String objectKey, String cdnUrl, String status, String deleteStatus, String createdAt, String expiresAt, String? deletedAt, String storageProvider, String? s3CdnUrl, String? s3MigratedAt, Int s3MigrationAttempts, String? s3LastError, Int? width, Int? height, Int dimensionAttempts)
+
+// Response of POST /media/uploads (MediaUploadView).
+record MediaUploadView(String id, String ownerId, String fileName, String mimeType, Long size, String? purpose, String objectKey, String cdnUrl, String uploadUrl, String? uploadMethod, Map<String,String> uploadHeaders, String provider, String status, String deleteStatus, String expiresAt)
+
+// Response of GET /media/{id} (MediaAssetView).
+record MediaAssetView(String id, String ownerId, String fileName, String mimeType, Long size, String? purpose, String objectKey, String cdnUrl, String status, String deleteStatus, String createdAt, String expiresAt, String? deletedAt, Int? width, Int? height)
+
+// What a card needs to draw an attachment (MediaSummaryView): other domains embed these.
+record MediaSummaryView(String id, String cdnUrl, String mimeType, Int? width, Int? height)
+
+// Response of DELETE /media/{id} (StatusResponse).
+record MediaStatusResponse(String id, String status)
+
+// Request body of POST /media/uploads.
+record MediaUploadRequest(String? fileName, String? mimeType, Long? size, String? purpose)
+
+// A pending deletion (media_deletion_jobs).
+record MediaDeletionJob(String id, String mediaId, String? postId, String ownerId, String status, Int attempts)
+
+// A media_url_migrations row.
+record MediaUrlMigration(String urlHash, String sourceUrl, String status, String? s3Url, Int attempts, String? lastError)
+
+// Pure rules of the domain: allowed types, limits, state tests, views.
+class MediaRules {
+    // 500 MB per file: the product limit, not the transport's.
+    static Long maxBytes() = 500L * 1024L * 1024L
+    // Upload window of a pending asset (60 minutes).
+    static Long uploadWindowSeconds() = 3600L
+    // Extension of the server-generated object name for an allowed type, null when the type is refused.
+    // HTML, SVG and active JS stay out on purpose.
+    static String? extensionOf(mime: String) {
+        var table = mapOf("image/jpeg", ".jpg", "image/png", ".png", "image/gif", ".gif", "image/webp", ".webp", "image/avif", ".avif", "video/mp4", ".mp4", "video/webm", ".webm", "video/quicktime", ".mov", "audio/mpeg", ".mp3", "audio/ogg", ".ogg", "audio/wav", ".wav", "audio/webm", ".weba", "application/pdf", ".pdf")
+        return table.get(mime)
+    }
+    static Bool isImageType(mime: String) = mime == "image/jpeg" || mime == "image/png" || mime == "image/gif" || mime == "image/webp" || mime == "image/avif"
+    // Purposes narrower than the general list: images only, or PDF only. Null = the general list.
+    static Bool purposeAllows(purpose: String, mime: String) {
+        if (purpose == "AVATAR" || purpose == "BANNER" || purpose == "COVER" || purpose == "BADGE" || purpose == "GAME_ICON" || purpose == "GAME_BANNER" || purpose == "MENTOR_BANNER") {
+            return MediaRules.isImageType(mime)
+        }
+        if (purpose == "RESUME") {
+            return mime == "application/pdf"
+        }
+        return true
+    }
+    // Lower case, without parameters ("Image/PNG; x=y" -> "image/png"), "" for null.
+    static String baseType(mime: String?) {
+        if (mime == null) {
+            return ""
+        }
+        var t = mime.trim().toLowerCase()
+        var semi = t.indexOf(";")
+        if (semi >= 0) {
+            return t.substring(0, semi).trim()
+        }
+        return t
+    }
+    // Whether a stored type may be rendered inline (the same list the upload accepts).
+    static Bool isAllowedMimeType(mime: String?) {
+        if (mime == null) {
+            return false
+        }
+        return MediaRules.extensionOf(MediaRules.baseType(mime)) != null
+    }
+    static Bool isVisible(asset: MediaAsset) = asset.deleteStatus == "NONE"
+    static Bool needsS3Copy(asset: MediaAsset) = asset.storageProvider == "IMAGEKIT" && asset.s3MigratedAt == null
+    static Bool canActivateS3(asset: MediaAsset) {
+        var s3 = asset.s3CdnUrl
+        return asset.storageProvider == "S3" && s3 != null && s3 != asset.cdnUrl
+    }
+    static MediaAssetView view(a: MediaAsset) = MediaAssetView(a.id, a.ownerId, a.fileName, a.mimeType, a.size, a.purpose, a.objectKey, a.cdnUrl, a.status, a.deleteStatus, a.createdAt, a.expiresAt, a.deletedAt, a.width, a.height)
+    static MediaSummaryView summary(a: MediaAsset) = MediaSummaryView(a.id, a.cdnUrl, a.mimeType, a.width, a.height)
+    static String cut(text: String, max: Int) {
+        if (text.length() > max) {
+            return text.substring(0, max)
+        }
+        return text
+    }
+}

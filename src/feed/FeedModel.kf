@@ -1,0 +1,259 @@
+package feed
+
+import kernel.error.*
+import kernel.text.*
+import kernel.time.*
+
+// Request bodies (Troolean for booleans: a missing field of a Bool fails to decode, G140).
+record FeedPublishBody(String? type, String? content, String? pageHtml, String? articleBody, List<String>? tags, List<String>? mediaIds, String? communityId, List<String>? mentionedUserIds, String? topic, String? channelId, Troolean mediaSpoiler, List<String>? pollOptions, String? website)
+
+record FeedCommentBody(String? content, String? parentCommentId, List<String>? mediaIds, List<String>? mentionedUserIds, Troolean mediaSpoiler, String? website)
+
+record FeedEditBody(String? content, String? pageHtml, String? articleBody, List<String>? tags, String? type, String? topic)
+
+record FeedBulkDeleteBody(List<String>? postIds, String? reason)
+
+record FeedBulkItem(String postId, String status)
+
+record FeedBulkResult(String status, List<FeedBulkItem> items)
+
+record FeedReactBody(String? type)
+
+record FeedPollVoteBody(Int? option)
+
+// Response shapes, field order as the Java records (Jackson writes record components in order).
+record FeedCounters(Int reactions, Int comments, Int saves, Int shares, Int reposts)
+
+record FeedNameStyle(String? theme, String? font, String? color, String? nameplate)
+
+record FeedContributorTag(String? color)
+
+record FeedCommunityView(String id, String name, Bool joined)
+
+record FeedPollView(List<String> options, List<Long> counts, Int? myVote, Long totalVotes)
+
+record FeedMediaSummary(String id, String cdnUrl, String mimeType, Int? width, Int? height)
+
+record FeedRepostedBy(String? name, String? username, String? avatar, String? at)
+
+record FeedPostView(String id, String authorId, String? authorUsername, String? authorName, String? authorAvatar, String? authorBadge, List<String> authorBadges, String type, String content, String? pageHtml, String? articleBody, List<String> tags, List<String> mediaIds, String createdAt, FeedCounters counters, String? currentUserReaction, String? communityId, FeedCommunityView? community, String? editedAt, String? expiresAt, String authorIdentity, String? authorAvatarFrame, String? topic, String? repostOf, String? repostOfAuthor, Bool repostWithOpinion, String? repostOfContent, List<String>? repostOfMediaIds, Map<String,Long>? reactionSummary, Bool mediaSpoiler, FeedNameStyle? authorStyle, FeedContributorTag? authorContributor, List<FeedNoteView> communityNotes, FeedMyNote? myNote, String? acceptedCommentId, FeedPollView? poll, FeedRepostedBy? repostedBy, Bool currentUserReposted, List<FeedMediaSummary> media, Bool resolved)
+
+record FeedCommentView(String id, String postId, String authorId, String? authorName, String? authorUsername, String? authorAvatar, String? authorBadge, List<String> authorBadges, String? parentCommentId, String content, List<String> mediaIds, String createdAt, String? editedAt, String? currentUserReaction, String? authorAvatarFrame, Int reactionCount, Bool pinned, Bool mediaSpoiler, FeedNameStyle? authorStyle, FeedContributorTag? authorContributor, Map<String,Long> reactionSummary, Bool accepted)
+
+record FeedCommentsPage(List<FeedCommentView> items, String? nextCursor)
+
+record FeedPage(List<FeedPostView> items, String? nextCursor)
+
+record FeedActionResult(String postId, String status, FeedCounters counters)
+
+record FeedDeleteResult(String postId, String status)
+
+record FeedIdBody(String id)
+
+// Database snapshots.
+record FeedPostRow(String id, String authorId, String type, String content, String? pageHtml, String? communityId, String? channelId, String? repostOf, String? repostOfAuthor, Bool repostWithOpinion, String? acceptedCommentId, String createdAt, String visibility, Int reactions, Int comments, Int saves, Int shares, Int reposts, String status, String? deletedAt, String? editedAt, String? expiresAt, String authorIdentity, String? topic, Bool mediaSpoiler)
+
+record FeedCommentRow(String id, String postId, String authorId, String? parentCommentId, String content, String createdAt, String status, String? editedAt, Bool pinned, Bool mediaSpoiler)
+
+// What the feed needs to know about an author (the profile domain owns the data, see FeedAuthors).
+record FeedAuthor(String id, String? username, String name, String? avatar, List<String> badges, String? avatarFrame, String? nameTheme, String? nameFont, String? nameColor, String? nameplate, String? contributorTagColor)
+
+record FeedCommunityRef(String id, String name, String? topic, Bool joined)
+
+record FeedChannelRef(String id, String communityId, String? topic)
+
+// A pure repost pointer (post_reposts): who reposted which post, and when.
+record FeedRepostPointer(String userId, String postId, String createdAt)
+
+record FeedPageDoc(String postId, String authorId, String html)
+
+record FeedSeenBody(String? seenUntil)
+
+record FeedResponse(List<FeedPostView> items, String? nextCursor, String? lastSeenAt)
+
+// TrendingCursor: opaque keyset of the "Em alta" tab, valid inside its 24h window.
+record FeedTrendingCursor(String windowEnd, Int reactions, String createdAt, String postId)
+
+class FeedTrending {
+    static String encode(c: FeedTrendingCursor) = Base64Url.encode("1|" + c.windowEnd() + "|" + c.reactions() + "|" + c.createdAt() + "|" + c.postId())
+    static Bool valid(parts: List<String>) {
+        if (parts.size() != 5) {
+            return false
+        }
+        if (parts.get(0) != "1") {
+            return false
+        }
+        if (parts.get(4).trim().length() == 0) {
+            return false
+        }
+        return true
+    }
+    static FeedTrendingCursor? decode(raw: String) {
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        try {
+            var text = Base64Url.decode(raw)
+            var parts = FeedTrending.split(text)
+            if (!FeedTrending.valid(parts)) {
+                throw "bad"
+            }
+            var reactions = parts.get(2).toInt()
+            var windowEnd = Time.toMillis(parts.get(1))
+            var created = Time.toMillis(parts.get(3))
+            if (reactions < 0 || created > windowEnd || created < windowEnd - 86400000L) {
+                throw "bad"
+            }
+            return FeedTrendingCursor(parts.get(1), reactions, parts.get(3), parts.get(4))
+        } catch (String e) {
+            throw Errors.api(400, "INVALID_CURSOR", "Cursor invalido.")
+        }
+    }
+    static List<String> split(text: String) {
+        var out = listOf<String>()
+        for (var part in text.split("\\|")) {
+            out.add(part)
+        }
+        return out
+    }
+}
+
+class FeedRules {
+    static List<String> postTypes() = listOf("INSIGHT", "ARTICLE", "QUESTION", "PROJECT", "OPPORTUNITY", "PAGE", "NEWS", "TUTORIAL", "REVIEW", "DIVERTIDO", "MOMENT", "POLL", "BLOG", "BUSINESS")
+    static List<String> reactionTypes() = listOf("LIKE", "LOVE", "LAUGH", "WOW", "SAD", "CELEBRATE", "SUPPORT", "INSIGHTFUL", "ROFL", "ANGRY", "DISGUST", "SKEPTICAL", "EYES", "NOTE", "FIRE", "CLAP", "CLOWN", "NAILS")
+    static Int maxArticleBody() = 10000
+    static Int maxCommentLength() = 800
+    // PostContentLimits: characters each type accepts.
+    static Int contentLimit(type: String) {
+        if (type == "DIVERTIDO") {
+            return 400
+        }
+        if (type == "MOMENT") {
+            return 500
+        }
+        if (type == "POLL") {
+            return 400
+        }
+        if (type == "REVIEW") {
+            return 600
+        }
+        if (type == "PROJECT" || type == "NEWS" || type == "BUSINESS") {
+            return 2000
+        }
+        if (type == "OPPORTUNITY") {
+            return 1500
+        }
+        if (type == "TUTORIAL") {
+            return 5000
+        }
+        return 1200
+    }
+    static List<String> orEmpty(l: List<String>?) {
+        if (l == null) {
+            return listOf<String>()
+        }
+        return l
+    }
+    static Map<String,Long> orNone(m: Map<String,Long>?) {
+        if (m == null) {
+            return new HashMap<String, Long>()
+        }
+        return m
+    }
+    static Map<Int,Long> orNoneInt(m: Map<Int,Long>?) {
+        if (m == null) {
+            return new HashMap<Int, Long>()
+        }
+        return m
+    }
+    static Long plusOne(v: Long?) {
+        if (v == null) {
+            return 1L
+        }
+        return v + 1L
+    }
+    // Null-safe string equality (`==` on a nullable String compared references in the cases hit here, G141).
+    static Bool same(a: String?, b: String?) {
+        if (a == null) {
+            return false
+        }
+        if (b == null) {
+            return false
+        }
+        return a.equals(b)
+    }
+    static String actorOr(actorId: String?, fallback: String) {
+        if (actorId == null) {
+            return fallback
+        }
+        if (actorId.trim().length() == 0) {
+            return fallback
+        }
+        return actorId
+    }
+    static String nz(s: String?) {
+        if (s == null) {
+            return ""
+        }
+        return s
+    }
+    static String trimmed(s: String?) {
+        if (s == null) {
+            return ""
+        }
+        return s.trim()
+    }
+    static List<String> topics() = listOf("TECNOLOGIA", "ENGENHARIA", "DESIGN", "PRODUTO", "LIDERANCA", "CARREIRA", "FREELANCE", "OUTROS", "GAMES", "ART", "MUSIC", "EDUCACAO", "CIENCIA", "EMPREENDER", "FINANCAS", "MARKETING", "RH", "DADOS", "FUN", "QUALIDADE_VIDA", "SAUDE", "VIAGEM", "COMIDA", "ESPORTES", "CINEMA", "LIVROS", "FOTOGRAFIA", "CASA", "PETS", "PARENTALIDADE", "RELACIONAMENTOS", "MODA", "POLITICA", "RELIGIAO")
+    static String? trimmedOrNull(s: String?) {
+        if (s == null) {
+            return null
+        }
+        var t = s.trim()
+        if (t.length() == 0) {
+            return null
+        }
+        return t
+    }
+    static Bool hasText(s: String?) {
+        if (s == null) {
+            return false
+        }
+        return s.trim().length() > 0
+    }
+    // Trimmed, blanks dropped, repeats dropped (the stream().filter(hasText).map(trim).distinct() of the Java services).
+    static List<String> cleanList(raw: List<String>?) {
+        var out = listOf<String>()
+        if (raw == null) {
+            return out
+        }
+        for (var s in raw) {
+            var t = s.trim()
+            if (t.length() > 0 && !out.contains(t)) {
+                out.add(t)
+            }
+        }
+        return out
+    }
+    static FeedCounters counters(r: FeedPostRow) = FeedCounters(r.reactions(), r.comments(), r.saves(), r.shares(), r.reposts())
+    static FeedPostRow? quoteOf(quoted: Map<String,FeedPostRow>, source: String?, opinion: Bool) {
+        if (source == null) {
+            return null
+        }
+        if (!opinion) {
+            return null
+        }
+        return quoted.get(source)
+    }
+    static String? quoteContent(q: FeedPostRow?) {
+        if (q == null) {
+            return null
+        }
+        return q.content()
+    }
+    static List<String>? quoteMedia(q: FeedPostRow?, mediaOf: Map<String,List<String>>) {
+        if (q == null) {
+            return listOf<String>()
+        }
+        return orEmpty(mediaOf.get(q.id()))
+    }
+}

@@ -1,0 +1,54 @@
+package media
+
+import kernel.log.*
+import kernel.time.*
+
+// Drains media_deletion_jobs: purge the CDN, delete the object, mark the asset OBJECT_DELETED. A failure
+// keeps the job REQUESTED with a growing backoff (MediaDeletionWorker).
+class MediaDeletionWorker {
+    MediaStore assets
+    MediaStorageGateway gateway
+    Log log = Log("media.deletion")
+    public constructor(assets: MediaStore, gateway: MediaStorageGateway) {
+        this.assets = assets
+        this.gateway = gateway
+    }
+    // One pass over up to 50 due jobs; returns how many assets were deleted.
+    Int processPendingJobs() {
+        var deleted = 0
+        for (var job in assets.pendingDeletionJobs(Time.nowIso(), 50)) {
+            var asset = assets.findById(job.mediaId)
+            if (asset == null) {
+                assets.completeDeletionJob(job.mediaId, Time.nowIso())
+            }
+            else {
+                if (this.deleteOne(job, asset)) {
+                    deleted = deleted + 1
+                }
+            }
+        }
+        return deleted
+    }
+    Bool deleteOne(job: MediaDeletionJob, asset: MediaAsset) {
+        try {
+            gateway.purgeCdn(asset)
+            gateway.deleteObject(asset)
+            assets.markObjectDeleted(asset.id, Time.nowIso())
+            assets.completeDeletionJob(asset.id, Time.nowIso())
+            return true
+        } catch (String e) {
+            assets.failDeletionJob(job.mediaId, e, Time.plusSeconds(Time.nowIso(), MediaDeletionWorker.backoffSeconds(job.attempts)))
+            return false
+        }
+    }
+    static Long backoffSeconds(attempts: Int) {
+        var seconds = (attempts + 1) * 10
+        if (seconds < 5) {
+            seconds = 5
+        }
+        if (seconds > 300) {
+            seconds = 300
+        }
+        return seconds as Long
+    }
+}

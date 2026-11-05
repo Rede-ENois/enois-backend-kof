@@ -1,0 +1,519 @@
+package media
+
+import kernel.concurrent.*
+import kernel.db.*
+import kernel.files.*
+import kernel.http.*
+import kernel.log.*
+import kernel.security.*
+import kernel.storage.*
+import kernel.time.*
+import kernel.url.*
+import kernel.config.*
+
+// Clock of the migration services: real time, or a fixed instant in tests.
+class MediaClock {
+    static String fixedInstant = ""
+    static String now() {
+        if (MediaClock.fixedInstant.length() > 0) {
+            return MediaClock.fixedInstant
+        }
+        return Time.nowIso()
+    }
+    static String minusSeconds(iso: String, seconds: Long) = Time.plusSeconds(iso, 0L - seconds)
+}
+
+// Downloads an object of the old provider to a temp file (path). Throws a message on any refusal.
+class MediaSourceDownloader {
+    public constructor() {}
+    String download(sourceUrl: String) {
+        throw "MEDIA_DOWNLOADER_NOT_IMPLEMENTED"
+    }
+}
+
+// The real downloader: only what OutboundUrlGuard accepts (SSRF), no redirects (a 302 to the metadata
+// service would skip the host check), 512 MB cap, an empty answer is a failure.
+class MediaHttpDownloader extends MediaSourceDownloader {
+    public constructor() {
+        super()
+    }
+    String download(sourceUrl: String) {
+        if (!OutboundUrlGuard.safe(sourceUrl)) {
+            throw "origem de midia nao permitida"
+        }
+        return Outbound.download(sourceUrl, 512L * 1024L * 1024L)
+    }
+}
+
+// Copies a file to the bucket under `objectKey` and returns the public URL of the copy.
+class MediaS3Copier {
+    public constructor() {}
+    String copy(objectKey: String, source: String, mimeType: String) {
+        throw "MEDIA_COPIER_NOT_IMPLEMENTED"
+    }
+}
+
+// The real copier: PUT then verifies the size with a HEAD (a short copy never counts as migrated).
+class MediaBucketCopier extends MediaS3Copier {
+    MediaObjectStore bucket
+    String baseUrl
+    public constructor(bucket: MediaObjectStore, baseUrl: String) {
+        super()
+        this.bucket = bucket
+        this.baseUrl = baseUrl
+    }
+    String copy(objectKey: String, source: String, mimeType: String) {
+        var size = TempFiles.size(source)
+        var failure = ""
+        try {
+            bucket.write(objectKey, mimeType, source)
+            if (bucket.length(objectKey) != size) {
+                failure = "tamanho no S3 difere do arquivo enviado"
+            }
+        } catch (String e) {
+            throw "copia para o S3 falhou: " + e
+        }
+        if (failure.length() > 0) {
+            throw failure
+        }
+        return baseUrl + objectKey
+    }
+}
+
+// Whether a public URL answers: 2xx and a content type of the expected family.
+class MediaPublicUrlVerifier {
+    public constructor() {}
+    Bool verify(url: String, mimeType: String) = false
+}
+
+class MediaHttpVerifier extends MediaPublicUrlVerifier {
+    public constructor() {
+        super()
+    }
+    Bool verify(url: String, mimeType: String) {
+        var probe = Outbound.probe(url, 10000)
+        if (probe.status() < 200 || probe.status() >= 300) {
+            return false
+        }
+        if (probe.contentType().length() == 0 || mimeType.length() == 0) {
+            return true
+        }
+        return probe.contentType().startsWith(mimeType.split("/")[0])
+    }
+}
+
+// Where the lazy migration work runs. The default is a background task, at most two at a time; a task
+// that finds both busy is dropped (the batch sweep picks the object up later).
+class MediaExecutor {
+    Permits slots = Permits(2)
+    public constructor() {}
+    execute(task: () -> void) {
+        if (!slots.tryAcquire()) {
+            return
+        }
+        var gate = slots
+        var done = __kof_spawn_expr(MediaExecutor.runTask(task, gate))
+    }
+    static runTask(task: () -> void, gate: Permits) {
+        try {
+            task()
+        } catch (String e) {
+            Log("media.migration").warn("lazy_migration_task_failed " + e)
+        }
+        gate.release()
+    }
+}
+
+// Phase 1 copies old ImageKit objects to S3 keeping the cdn_url; phase 2 (flip) moves the cdn_url once the
+// public address of the copy answers. Failures are recorded on the asset and never touch the old reference.
+class MediaMigrationService {
+    MediaStore assets
+    MediaSourceDownloader downloader
+    MediaS3Copier copier
+    MediaPublicUrlVerifier verifier
+    String imageKitBase
+    Bool flipEnabled
+    Log log = Log("media.migration")
+    public constructor(assets: MediaStore, downloader: MediaSourceDownloader, copier: MediaS3Copier, verifier: MediaPublicUrlVerifier, imageKitBase: String, flipEnabled: Bool) {
+        this.assets = assets
+        this.downloader = downloader
+        this.copier = copier
+        this.verifier = verifier
+        if (imageKitBase.trim().length() > 0) {
+            this.imageKitBase = MediaMigrationService.trimSlash(imageKitBase.trim())
+        }
+        else {
+            this.imageKitBase = "https://ik.imagekit.io/socialcoisa"
+        }
+        this.flipEnabled = flipEnabled
+    }
+    static Long minAgeSeconds() = 3600L
+    static Int maxAttempts() = 10
+    static Long staleClaimSeconds() = 600L
+    // One round of both phases; returns "copied,flipped" as two counters in a list.
+    List<Int> runOnce(copyLimit: Int, flipLimit: Int) {
+        var copied = copyBatch(copyLimit)
+        var flipped = 0
+        if (flipEnabled) {
+            flipped = flipBatch(flipLimit)
+        }
+        return listOf(copied, flipped)
+    }
+    Int copyBatch(limit: Int) {
+        var copied = 0
+        var now = MediaClock.now()
+        for (var asset in assets.findForS3Copy(limit, MediaClock.minusSeconds(now, MediaMigrationService.minAgeSeconds()), MediaMigrationService.maxAttempts())) {
+            if (copyAsset(asset)) {
+                copied = copied + 1
+            }
+        }
+        return copied
+    }
+    // Opportunistic copy: only the replica that wins the database claim copies this asset now.
+    Bool copyOne(mediaId: String) {
+        var now = MediaClock.now()
+        if (!assets.claimForS3Copy(mediaId, now, MediaClock.minusSeconds(now, MediaMigrationService.staleClaimSeconds()), MediaMigrationService.maxAttempts())) {
+            return false
+        }
+        var asset = assets.findById(mediaId)
+        if (asset == null) {
+            return false
+        }
+        if (!MediaRules.needsS3Copy(asset)) {
+            return false
+        }
+        return copyAsset(asset)
+    }
+    Bool copyAsset(asset: MediaAsset) {
+        if (!MediaRules.needsS3Copy(asset)) {
+            return false
+        }
+        var source = ""
+        var ok = false
+        try {
+            source = downloader.download(sourceUrl(asset))
+            var s3Url = copier.copy(MediaMigrationService.s3Key(asset.objectKey), source, asset.mimeType)
+            assets.markS3Copy(asset.id, s3Url, MediaClock.now())
+            ok = true
+        } catch (String e) {
+            assets.markS3Failure(asset.id, e)
+            log.warn("Falha ao copiar a midia " + asset.id + " para o S3: " + e)
+        }
+        if (source.length() > 0) {
+            TempFiles.delete(source)
+        }
+        return ok
+    }
+    Int flipBatch(limit: Int) {
+        if (!flipEnabled) {
+            return 0
+        }
+        var flipped = 0
+        for (var asset in assets.findForS3Flip(limit)) {
+            var s3 = asset.s3CdnUrl
+            if (MediaRules.canActivateS3(asset) && s3 != null) {
+                if (verifier.verify(s3, asset.mimeType)) {
+                    assets.activateS3(asset.id)
+                    flipped = flipped + 1
+                }
+                else {
+                    // CDN down or 403: keep ImageKit and try again next round.
+                    log.warn("S3 ainda nao responde para a midia " + asset.id + "; mantendo o provedor antigo")
+                }
+            }
+        }
+        return flipped
+    }
+    // The URL the old object is read from; video and audio ask ImageKit for the original (`tr=orig-true`),
+    // or its transformation quota answers 403.
+    String sourceUrl(asset: MediaAsset) {
+        var raw = asset.cdnUrl
+        var absolute = raw
+        if (!raw.startsWith("http://") && !raw.startsWith("https://")) {
+            var slash = "/"
+            if (raw.startsWith("/")) {
+                slash = ""
+            }
+            absolute = imageKitBase + slash + raw
+        }
+        absolute = absolute.replace("%2F", "/").replace("%2f", "/")
+        if ((asset.mimeType.startsWith("video/") || asset.mimeType.startsWith("audio/")) && Uris.host(absolute).endsWith("imagekit.io") && !absolute.contains("tr=")) {
+            var joiner = "?"
+            if (absolute.contains("?")) {
+                joiner = "&"
+            }
+            absolute = absolute + joiner + "tr=orig-true"
+        }
+        return absolute
+    }
+    // Real slashes (the old key kept `%2F` encoded).
+    static String s3Key(objectKey: String) = Uris.decode(objectKey)
+    static String trimSlash(value: String) {
+        var t = value
+        while (t.endsWith("/")) {
+            t = t.substring(0, t.length() - 1)
+        }
+        return t
+    }
+}
+
+// Rounds of the batch migration (MediaMigrationWorker).
+class MediaMigrationWorker {
+    MediaMigrationService service
+    Int batchSize
+    Log log = Log("media.migration")
+    public constructor(service: MediaMigrationService, batchSize: Int) {
+        this.service = service
+        var n = batchSize
+        if (n < 1) {
+            n = 1
+        }
+        if (n > 100) {
+            n = 100
+        }
+        this.batchSize = n
+    }
+    run() {
+        try {
+            var result = service.runOnce(batchSize, batchSize)
+            if (result.get(0) > 0 || result.get(1) > 0) {
+                log.info("Migracao de midia: copiados=" + result.get(0) + ", relinkados=" + result.get(1))
+            }
+        } catch (String e) {
+            log.warn("Rodada da migracao falhou: " + e)
+        }
+    }
+}
+
+// Reading an asset schedules its copy to S3 (LazyMediaCopyTrigger): nothing blocks the read.
+class MediaLazyCopyTrigger extends MediaLazyCopy {
+    MediaMigrationService migration
+    MediaExecutor executor
+    Log log = Log("media.migration")
+    public constructor(migration: MediaMigrationService, executor: MediaExecutor) {
+        super()
+        this.migration = migration
+        this.executor = executor
+    }
+    copySoon(asset: MediaAsset) {
+        if (!MediaRules.needsS3Copy(asset)) {
+            return
+        }
+        var id = asset.id
+        var service = migration
+        var logger = log
+        executor.execute(() -> {
+    try {
+        service.copyOne(id)
+    } catch (String e) {
+        logger.warn("Migracao oportunista da midia " + id + " falhou: " + e)
+    }
+})
+    }
+}
+
+// References to media URLs held by other domains' tables, swapped by compare-and-set so a concurrent
+// change of the picture is never overwritten (UrlReferencePersistenceAdapter). Same list as the Java
+// service; one `update ... where col = old` per column.
+class MediaUrlReferences {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    static List<String> tables() = listOf("users", "users", "communities", "communities", "groups", "groups", "companies", "companies", "jobs", "events", "games", "developer_profiles", "developer_profiles")
+    static List<String> columns() = listOf("avatar", "banner", "avatar", "cover", "avatar", "banner", "logo", "cover", "logo", "cover", "cover", "avatar", "cover")
+    // Rows changed across every column.
+    Int updateReferences(oldUrl: String, newUrl: String) {
+        var updated = 0
+        var i = 0
+        while (i < MediaUrlReferences.tables().size()) {
+            var t = MediaUrlReferences.tables().get(i)
+            var c = MediaUrlReferences.columns().get(i)
+            updated = updated + database.execute("update " + t + " set " + c + " = ? where " + c + " = ?", DbParams().bindStr(newUrl).bindStr(oldUrl))
+            i = i + 1
+        }
+        return updated
+    }
+    // Distinct legacy URLs (ImageKit host or `/uploads/` path) still referenced, up to `limit`.
+    List<String> findLegacyUrls(limit: Int) {
+        var selects = listOf<String>()
+        var i = 0
+        while (i < MediaUrlReferences.tables().size()) {
+            var t = MediaUrlReferences.tables().get(i)
+            var c = MediaUrlReferences.columns().get(i)
+            selects.add("select " + c + " as url from " + t + " where " + c + " is not null and (" + c + " like \'%ik.imagekit.io%\' or " + c + " like \'/uploads/%\')")
+            i = i + 1
+        }
+        var out = listOf<String>()
+        var n = limit
+        if (n < 1) {
+            n = 1
+        }
+        for (var row in database.queryList("select distinct url from (" + String.join(" union ", selects) + ") legadas limit " + n, DbParams())) {
+            out.add(row.getStr("url"))
+        }
+        return out
+    }
+}
+
+// Opportunistic migration of legacy URLs held by profiles, covers, logos... (LazyUrlMigrationService): only
+// https on the ImageKit hosts or the old `/uploads/` path is fetched (anti-SSRF), one claim per URL, the
+// references change only after the public address of the copy answers, a failure keeps everything.
+class LazyUrlMigrationService {
+    MediaStore migrations
+    MediaSourceDownloader downloader
+    MediaS3Copier copier
+    MediaPublicUrlVerifier verifier
+    MediaUrlReferences references
+    MediaExecutor executor
+    String imageKitEndpoint
+    Log log = Log("media.migration")
+    public constructor(migrations: MediaStore, downloader: MediaSourceDownloader, copier: MediaS3Copier, verifier: MediaPublicUrlVerifier, references: MediaUrlReferences, executor: MediaExecutor, imageKitEndpoint: String) {
+        this.migrations = migrations
+        this.downloader = downloader
+        this.copier = copier
+        this.verifier = verifier
+        this.references = references
+        this.executor = executor
+        this.imageKitEndpoint = imageKitEndpoint.trim()
+    }
+    static Long staleClaimSeconds() = 600L
+    static Int maxAttempts() = 5
+    static Int sweepLimit() = 50
+    onAccess(sourceUrl: String) {
+        if (sourceUrl.trim().length() == 0 || !isLegacy(sourceUrl.trim())) {
+            return
+        }
+        var url = sourceUrl.trim()
+        var hash = LazyUrlMigrationService.hash(url)
+        try {
+            var now = MediaClock.now()
+            migrations.ensureUrlPending(hash, url, now)
+            if (!migrations.claimUrl(hash, now, MediaClock.minusSeconds(now, LazyUrlMigrationService.staleClaimSeconds()), LazyUrlMigrationService.maxAttempts())) {
+                return
+            }
+            var self = this
+            executor.execute(() -> self.copy(hash, url))
+        } catch (String e) {
+            log.warn("Falha ao agendar a migração da URL " + hash + ": " + e)
+        }
+    }
+    copy(hash: String, sourceUrl: String) {
+        var source = ""
+        try {
+            source = downloader.download(absoluteSourceOf(sourceUrl))
+            var s3Url = copier.copy(s3Key(sourceUrl), source, mimeOf(sourceUrl))
+            migrations.markUrlCopied(hash, s3Url, MediaClock.now())
+            log.info("URL migrada para o S3 (aguardando verificação pública): " + hash)
+            tryActivate(hash, sourceUrl, s3Url)
+        } catch (String e) {
+            migrations.markUrlFailed(hash, e, MediaClock.now())
+            log.warn("Falha ao migrar a URL " + hash + " para o S3: " + e)
+        }
+        if (source.length() > 0) {
+            TempFiles.delete(source)
+        }
+    }
+    tryActivate(hash: String, sourceUrl: String, s3Url: String) {
+        if (!verifier.verify(s3Url, mimeOf(sourceUrl))) {
+            log.warn("S3 ainda nao responde para " + hash + "; referencias mantidas no provedor antigo")
+            return
+        }
+        migrations.markUrlActive(hash, MediaClock.now())
+        var changed = references.updateReferences(sourceUrl, s3Url)
+        log.info("URL ativada no S3 (" + changed + " referencias atualizadas): " + hash)
+    }
+    // Scheduled: flip the copies whose address answers now, then pick up legacy references nobody accessed.
+    flipAndSweep() {
+        try {
+            for (var row in migrations.findUrlsForFlip(LazyUrlMigrationService.sweepLimit())) {
+                var s3 = row.s3Url
+                if (s3 != null) {
+                    tryActivate(row.urlHash, row.sourceUrl, s3)
+                }
+            }
+            for (var url in references.findLegacyUrls(LazyUrlMigrationService.sweepLimit())) {
+                onAccess(url)
+            }
+        } catch (String e) {
+            log.warn("Falha na rodada da migração oportunista: " + e)
+        }
+    }
+    Bool isLegacy(url: String) {
+        if (url.startsWith("/uploads/")) {
+            return true
+        }
+        if (!Uris.parses(url)) {
+            return false
+        }
+        if (Uris.scheme(url) != "https") {
+            return false
+        }
+        var host = Uris.host(url)
+        if (host.length() == 0) {
+            return false
+        }
+        return host == "ik.imagekit.io" || imageKitEndpoint.length() > 0 && host == Uris.host(imageKitEndpoint)
+    }
+    String absoluteSourceOf(sourceUrl: String) {
+        var reversed = sourceUrl.replace("%2F", "/").replace("%2f", "/")
+        if (!reversed.startsWith("/uploads/")) {
+            return reversed
+        }
+        var base = "https://ik.imagekit.io/socialcoisa"
+        if (imageKitEndpoint.length() > 0) {
+            base = imageKitEndpoint
+            if (base.endsWith("/")) {
+                base = base.substring(0, base.length() - 1)
+            }
+        }
+        return base + reversed
+    }
+    String s3Key(sourceUrl: String) {
+        var path = sourceUrl
+        if (!sourceUrl.startsWith("/uploads/")) {
+            path = Uris.path(sourceUrl)
+            var basePath = endpointPath()
+            if (basePath.length() > 0 && path.startsWith(basePath)) {
+                path = path.substring(basePath.length())
+            }
+        }
+        // URLDecoder semantics: `+` is a space as well.
+        var decoded = Uris.decode(path.replace("+", "%20"))
+        if (decoded.startsWith("/")) {
+            return decoded.substring(1)
+        }
+        return decoded
+    }
+    String endpointPath() {
+        var basePath = ""
+        if (imageKitEndpoint.length() > 0) {
+            basePath = Uris.path(imageKitEndpoint)
+        }
+        if (basePath.length() == 0 || basePath == "/") {
+            if (imageKitEndpoint.length() == 0) {
+                return "/socialcoisa"
+            }
+            return ""
+        }
+        if (basePath.endsWith("/")) {
+            return basePath.substring(0, basePath.length() - 1)
+        }
+        return basePath
+    }
+    String mimeOf(sourceUrl: String) {
+        var path = sourceUrl.toLowerCase().split("\\?")[0]
+        var dot = path.lastIndexOf(".")
+        var ext = ""
+        if (dot >= 0) {
+            ext = path.substring(dot + 1)
+        }
+        var table = mapOf("png", "image/png", "jpg", "image/jpeg", "jpeg", "image/jpeg", "gif", "image/gif", "webp", "image/webp", "avif", "image/avif", "mp4", "video/mp4", "webm", "video/webm", "mov", "video/quicktime", "mp3", "audio/mpeg", "ogg", "audio/ogg", "wav", "audio/wav")
+        var mime = table.get(ext)
+        if (mime == null) {
+            return "application/octet-stream"
+        }
+        return mime
+    }
+    static String hash(url: String) = Hashes.sha256Hex(url)
+}

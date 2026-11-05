@@ -1,0 +1,177 @@
+package media
+
+import kernel.error.*
+import kernel.files.*
+import kernel.http.*
+import kernel.log.*
+import kernel.security.*
+import kernel.url.*
+
+// Body of the successful PUT /storage/{key}.
+record MediaStoredResponse(String status, String objectKey)
+
+// `/storage/{key}`: media goes through our own host, not straight to the bucket (the b7cloud S3 gateway
+// answers no CORS and the bucket is not public). The key is the objectKey stored on the asset, so old
+// URLs only need a prefix swap. Binary bodies cannot cross the web runtime: these routes sit behind the
+// binary lane (kernel.http.BinaryLane), see KOF_GAPS G160.
+class MediaStorageRoutes {
+    // Keys have up to ten segments (`uploads/media_x/media/uuid/file.ext` plus a bucket prefix): the
+    // router matches by segment count, so one route per depth stands for Spring's `{*key}`.
+    static Int maxDepth() = 10
+    static register(server: HttpServer, module: MediaModule) {
+        BinaryLane.claim("/storage/")
+        var depth = 1
+        while (depth <= MediaStorageRoutes.maxDepth()) {
+            var pattern = "/storage"
+            var n = 1
+            while (n <= depth) {
+                pattern = pattern + "/:k" + n
+                n = n + 1
+            }
+            var size = depth
+            server.get(pattern, () -> MediaStorageRoutes.read(module, size))
+            server.put(pattern, () -> MediaStorageRoutes.write(module, size))
+            depth = depth + 1
+        }
+    }
+    // The path after `/storage/`, joined from the segment params.
+    static String keyOf(depth: Int) {
+        var key = ""
+        var n = 1
+        while (n <= depth) {
+            if (n > 1) {
+                key = key + "/"
+            }
+            key = key + Uris.decode(Req.pathParam("k" + n))
+            n = n + 1
+        }
+        return key
+    }
+    // Relative to the bucket; blank keys and traversal are refused.
+    static String objectKey(key: String) {
+        var trimmed = key
+        while (trimmed.startsWith("/")) {
+            trimmed = trimmed.substring(1)
+        }
+        if (trimmed.trim().length() == 0 || trimmed.contains("..")) {
+            throw Errors.api(400, "MEDIA_INVALID_KEY", "Chave de midia invalida.")
+        }
+        return trimmed
+    }
+    // `uploads/media_<id>/media/<uuid>/file`: the bucket prefix may or may not have `uploads/`.
+    static String mediaIdOf(objectKey: String) {
+        for (var part in objectKey.split("/")) {
+            if (part.startsWith("media_")) {
+                return part
+            }
+        }
+        throw Errors.api(400, "MEDIA_INVALID_KEY", "Chave de midia invalida.")
+    }
+    static MediaObjectStore requireStore(module: MediaModule) {
+        var store = module.objectStore
+        if (store == null) {
+            throw Errors.api(503, "MEDIA_STORAGE_DISABLED", "Armazenamento de midia indisponivel.")
+        }
+        return store
+    }
+    // Public read, like GET /media/{id}: the key only appears in content anyone can see, and `<img src>`
+    // sends no Origin. No write inside a read: the stream goes straight from the storage.
+    static String read(module: MediaModule, depth: Int) {
+        var objectKey = MediaStorageRoutes.objectKey(MediaStorageRoutes.keyOf(depth))
+        var store = MediaStorageRoutes.requireStore(module)
+        var found = MediaStorageRoutes.open(store, objectKey, Req.headerOrNull("range"))
+        var asset = module.store.findById(MediaStorageRoutes.mediaIdOf(objectKey))
+        var mime = found.contentType
+        if (asset != null) {
+            mime = asset.mimeType
+        }
+        // Only the types the upload accepts render inline; anything else (legacy objects) downloads.
+        var inline = MediaRules.isAllowedMimeType(mime)
+        if (inline) {
+            ResponseHeaders.set("Content-Type", mime)
+            ResponseHeaders.set("Content-Disposition", "inline")
+        }
+        else {
+            ResponseHeaders.set("Content-Type", "application/octet-stream")
+            ResponseHeaders.set("Content-Disposition", "attachment")
+        }
+        ResponseHeaders.set("Accept-Ranges", "bytes")
+        // The key carries a uuid: what lives at an address never changes, so it may be cached for good.
+        ResponseHeaders.set("Cache-Control", "public, max-age=31536000, immutable")
+        var status = 200
+        var range = found.contentRange
+        if (range != null) {
+            status = 206
+            ResponseHeaders.set("Content-Range", range)
+        }
+        var tag = found.eTag
+        if (tag != null) {
+            ResponseHeaders.set("ETag", tag)
+        }
+        ResponseHeaders.set("X-Kernel-Stream", BinaryLane.stream(found.body, found.length))
+        return Http.respond(status, "")
+    }
+    static MediaStoredObject open(store: MediaObjectStore, objectKey: String, range: String?) {
+        try {
+            return store.read(objectKey, range)
+        } catch (String e) {
+            throw Errors.api(404, "MEDIA_NOT_FOUND", "Midia nao encontrada.")
+        }
+    }
+    // Upload through the app. Authorised by the owner's session and by the exact key registered for the
+    // asset, so this route is never "write anywhere in the bucket".
+    static String write(module: MediaModule, depth: Int) {
+        var userId = Auth.requireUser()
+        var objectKey = MediaStorageRoutes.objectKey(MediaStorageRoutes.keyOf(depth))
+        var asset = module.store.findById(MediaStorageRoutes.mediaIdOf(objectKey))
+        if (asset == null) {
+            throw Errors.api(404, "MEDIA_NOT_FOUND", "Midia nao encontrada.")
+        }
+        if (asset.ownerId != userId) {
+            throw Errors.api(403, "MEDIA_FORBIDDEN", "Esta midia nao e sua.")
+        }
+        if (asset.objectKey != objectKey) {
+            throw Errors.api(400, "MEDIA_KEY_MISMATCH", "Chave de midia invalida.")
+        }
+        var phase = Req.headerOrNull("x-kernel-binary")
+        var declared = MediaStorageRoutes.declaredLength(phase)
+        if (declared <= 0L) {
+            throw Errors.api(411, "MEDIA_LENGTH_REQUIRED", "Informe o tamanho do arquivo.")
+        }
+        // The declared size in POST /media/uploads is the upload contract: without this comparison an asset
+        // of 68 bytes accepted a body of hundreds of MB and was served publicly.
+        if (declared != asset.size) {
+            throw Errors.api(400, "MEDIA_SIZE_MISMATCH", "O tamanho enviado nao corresponde ao declarado no upload.")
+        }
+        if (phase == null) {
+            // Not through the lane (direct access to the web runtime): the body would be corrupted.
+            throw Errors.api(400, "MEDIA_UPLOAD_FAILED", "Nao foi possivel ler o arquivo enviado.")
+        }
+        if (phase == "authorize") {
+            ResponseHeaders.set("X-Kernel-Accept", BinaryLane.accept(userId, objectKey, declared))
+            return Http.respond(202, "{}")
+        }
+        var ticket = Req.headerOrNull("x-kernel-ticket")
+        var path = ""
+        if (ticket != null) {
+            path = BinaryLane.bodyPath(ticket, userId, objectKey)
+        }
+        if (path.length() == 0) {
+            throw Errors.api(400, "MEDIA_UPLOAD_FAILED", "Nao foi possivel ler o arquivo enviado.")
+        }
+        module.storeUpload(asset, objectKey, path, declared)
+        return json.encode(MediaStoredResponse("STORED", objectKey))
+    }
+    // Content-Length the client announced: the lane forwards it as X-Kernel-Declared-Length.
+    static Long declaredLength(phase: String?) {
+        var raw = Req.headerOrNull("x-kernel-declared-length")
+        if (raw == null) {
+            return -1L
+        }
+        try {
+            return raw.trim().toLong()
+        } catch (String e) {
+            return -1L
+        }
+    }
+}

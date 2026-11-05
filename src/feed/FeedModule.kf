@@ -1,0 +1,55 @@
+package feed
+
+import kernel.*
+import kernel.security.*
+
+// Composition of the feed domain: stores, services, routes. Seams default to read-only readers over the
+// owners' tables (see docs/PORTING_STATUS.md, "feed"); the owner subclasses and passes its own in.
+class FeedModule {
+    FeedService service
+    FeedStore store
+    FeedReader reader
+    FeedModeration moderation
+    FeedScheduled scheduled
+    FeedNotes notes
+    FeedSeals seals
+    public constructor(service: FeedService, store: FeedStore, reader: FeedReader, moderation: FeedModeration, scheduled: FeedScheduled, notes: FeedNotes, seals: FeedSeals) {
+        this.service = service
+        this.store = store
+        this.reader = reader
+        this.moderation = moderation
+        this.scheduled = scheduled
+        this.notes = notes
+        this.seals = seals
+    }
+    static FeedModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks) = FeedModule.installWith(platform, shared, hooks, FeedCoins())
+    // The coins port passes its own FeedCoins here (and tests a recording one).
+    static FeedModule installWith(platform: Platform, shared: SharedServices, hooks: SecurityHooks, coins: FeedCoins) {
+        var database = platform.db
+        var parts = Security.parts()
+        var store = FeedStore(database)
+        var authors = FeedAuthors(database)
+        var communities = FeedCommunities(database)
+        var corporate = FeedCorporate(database)
+        var notes = FeedNotes(database, store, authors, shared.blockedUsers, parts.userLimiter)
+        var service = FeedService(database, store, authors, FeedMedia(database), communities, FeedNotifier(database), FeedAgeGate(), coins, corporate, shared.blockedUsers, shared.sanctionGate, shared.risk, shared.duplication, shared.outbox, shared.audit, parts, notes)
+        var reader = FeedReader(service, store, authors, communities, corporate, FeedGraph(database), FeedBlogs(database), FeedReaderPrefs(database))
+        var reposts = FeedReposts(database, store, service, parts.actionThrottle)
+        var scheduled = FeedScheduled(database, service)
+        var seals = FeedSeals(database, store)
+        var answers = FeedAnswers(database, store, service)
+        var moderation = FeedModeration(database, store, service, shared.outbox, shared.audit)
+        if (platform.cfg.getBool("REDE_FEED_WORKERS_ENABLED", true)) {
+            // MomentExpiryScheduler: every 5 minutes, first run after 2 (REDE_FEED_WORKERS_ENABLED=false in tests).
+            shared.jobs.fixedDelay("feed-moment-expiry", 120000L, 300000L, () -> service.expireDueMoments(200))
+            // ScheduledPostPublishWorker: every rede.feed.schedule-delay-ms (30 s) after the previous run.
+            shared.jobs.fixedDelay("feed-scheduled-publish", 0L, platform.cfg.getLong("REDE_FEED_SCHEDULE_DELAY_MS", 30000L), () -> {
+    scheduled.publishDue()
+})
+        }
+        FeedExtraRoutes.registerLiteralRoutes(platform.server, seals)
+        FeedRoutes.register(platform.server, service, shared.idempotency, FeedHoneypot())
+        FeedExtraRoutes.register(platform.server, shared.idempotency, service, reader, reposts, scheduled, seals, notes, answers, platform.cfg.getStr("REDE_PAGES_CONTENT_SECURITY_POLICY", FeedExtraRoutes.defaultCsp()))
+        return FeedModule(service, store, reader, moderation, scheduled, notes, seals)
+    }
+}

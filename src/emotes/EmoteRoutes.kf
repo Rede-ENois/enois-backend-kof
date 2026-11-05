@@ -1,0 +1,101 @@
+package emotes
+
+import kernel.files.*
+import kernel.http.*
+
+// Public reads (no session on purpose: a public post draws stickers for people who never signed in, and the
+// picker opens before the login ends). The browser no longer talks to api.betterttv.net or
+// api.frankerfacez.com: this backend does, every 3 hours, with the result in memory.
+//
+//   GET /emotes?page&limit&q&provider   the picker, one page at a time (40 squares)
+//   GET /emotes/index                   the compact code -> image path map every page loads to draw `KEKW`
+//
+//   GET /emotes/image/{provider}/{id}   the artwork bytes, through the binary lane (`registerImage`), 404 when unknown
+class EmoteRoutes {
+    static Int defaultLimit() = 40
+    static Int maxLimit() = 100
+    static register(server: HttpServer, service: EmoteCatalogService) {
+        server.get("/emotes", () -> EmoteRoutes.list(service))
+        server.get("/emotes/index", () -> EmoteRoutes.index(service))
+    }
+    // The image route answers raw bytes, which the web runtime cannot carry: the lane claims the prefix and the
+    // handler hands it the bytes with `X-Kernel-Stream` (see kernel.http.BinaryLane).
+    static registerImage(server: HttpServer, module: EmotesModule) {
+        BinaryLane.claim("/emotes/image/")
+        server.get("/emotes/image/:provider/:id", () -> EmoteRoutes.image(module))
+    }
+    static String image(module: EmotesModule) {
+        var found = module.image(Req.pathParam("provider"), Req.pathParam("id"), Req.queryStr("variant", "full"))
+        if (found == null) {
+            return Http.respond(404, "")
+        }
+        var bytes = found.bytes()
+        ResponseHeaders.set("Content-Type", found.contentType())
+        ResponseHeaders.set("X-Content-Type-Options", "nosniff")
+        ResponseHeaders.set("Cache-Control", "max-age=604800, public, immutable")
+        ResponseHeaders.set("X-Kernel-Stream", BinaryLane.stream(ByteStream.ofBytes(bytes), bytes.length))
+        return Http.respond(200, "")
+    }
+    static String list(service: EmoteCatalogService) {
+        var current = service.catalog()
+        var limit = Req.queryInt("limit", EmoteRoutes.defaultLimit())
+        if (limit < 1) {
+            limit = 1
+        }
+        if (limit > EmoteRoutes.maxLimit()) {
+            limit = EmoteRoutes.maxLimit()
+        }
+        var page = Req.queryInt("page", 1)
+        var result = service.page(page, limit, Req.queryStr("q", ""), Req.queryStr("provider", "ALL"))
+        var views = listOf<EmoteView>()
+        for (var e in result.items()) {
+            views.add(EmoteRoutes.view(e))
+        }
+        var body = EmotePageView(views, result.page(), result.limit(), result.total(), result.totalPages(), current.generatedAt)
+        return EmoteRoutes.cached(current.etag(), "max-age=600, public", json.encode(body))
+    }
+    static String index(service: EmoteCatalogService) {
+        var current = service.catalog()
+        var entries = mapOf<String, String>()
+        for (var e in service.index()) {
+            entries.put(e.code(), EmoteImages.publicPathOf(e, "full"))
+        }
+        return EmoteRoutes.cached(current.etag(), "max-age=3600, public", json.encode(EmoteIndexView(entries, current.generatedAt)))
+    }
+    static EmoteView view(e: Emote) {
+        var image = EmoteImages.publicPathOf(e, "full")
+        var thumb = EmoteImages.publicPathOf(e, "thumb")
+        if (EmoteRules.popular(e)) {
+            return EmoteView(e.code(), e.provider(), e.id(), e.animated(), e.popularRank(), image, thumb)
+        }
+        return EmoteView(e.code(), e.provider(), e.id(), e.animated(), null, image, thumb)
+    }
+    // ETag + Cache-Control on the answer; a matching `If-None-Match` gets 304 with no body (what Spring's
+    // ResponseEntity.eTag does in the controller).
+    static String cached(etag: String, cacheControl: String, body: String) {
+        ResponseHeaders.set("ETag", etag)
+        ResponseHeaders.set("Cache-Control", cacheControl)
+        var sent = Req.headerOrNull("if-none-match")
+        if (sent != null && EmoteRoutes.matches(sent, etag)) {
+            return status(304, "")
+        }
+        return body
+    }
+    // Weak comparison of If-None-Match (a list, or `*`) against the current etag.
+    static Bool matches(header: String, etag: String) {
+        var wanted = EmoteRoutes.opaque(etag)
+        for (var token in header.split(",")) {
+            var t = token.trim()
+            if (t == "*" || EmoteRoutes.opaque(t) == wanted) {
+                return true
+            }
+        }
+        return false
+    }
+    static String opaque(tag: String) {
+        if (tag.startsWith("W/")) {
+            return tag.substring(2)
+        }
+        return tag
+    }
+}

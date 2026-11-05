@@ -1,0 +1,198 @@
+import kernel.*
+import kernel.config.*
+import kernel.db.*
+import kernel.outbox.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import linkedin.*
+
+// Stub of the LinkedIn API: records every share instead of calling the network.
+class LiApiClient extends LinkedInShareClient {
+    List<String> captured = listOf<String>()
+    LinkedInShareOutcome share(accessToken: String, memberSub: String, commentary: String, url: String, title: String) {
+        captured.add(accessToken + "|" + memberSub + "|" + commentary + "|" + url + "|" + title)
+        return LinkedInShareOutcome(true, null)
+    }
+}
+
+class LiApiHolder {
+    static TestApp? app = null
+    static LinkedInModule? module = null
+    static Outbox? outbox = null
+    static SharedServices? shared = null
+    static LiApiClient client = LiApiClient()
+}
+
+wireLinkedIn(p: Platform) {
+    SecurityClock.reset()
+    Security.install(p, SecurityHooks.defaults(p.db))
+    var shared = SharedServices.create(p)
+    LiApiHolder.outbox = shared.outbox
+    LiApiHolder.shared = shared
+    LiApiHolder.module = LinkedInModule.installWith(p, shared, LinkedInPostLookup(p.db), LiApiHolder.client, LinkedInClock())
+}
+
+TestApp liApp() {
+    var cur = LiApiHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = TestApp.bootWith("linkedin", mapOf("REDE_ORIGINS_ENFORCE", "false", "REDE_SECURITY_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="), (p: Platform) -> wireLinkedIn(p))
+    LiApiHolder.app = created
+    return created
+}
+
+LinkedInService liService() {
+    liApp()
+    var m = LiApiHolder.module
+    if (m == null) {
+        throw "module not wired"
+    }
+    return m.service
+}
+
+String liLogin(id: String) {
+    var token = "tok-" + id + "-1234567890"
+    SecurityFixtures.login(liApp().db(), id, token)
+    return token
+}
+
+List<String> liAuth(token: String) = listOf("X-Session-Token: " + token)
+
+String liFuture() = Time.plusSeconds(Time.nowIso(), 3600L)
+
+putSync(token: String, enabled: Bool) {
+    var res = liApp().client.send("PUT", "/me/integrations/linkedin", listOf("Content-Type: application/json", "X-Session-Token: " + token), "", "{\"postSync\":" + enabled + "}")
+    Check.status(res, 200)
+}
+
+test "no session neither reads nor changes" {
+    var app = liApp()
+    Check.apiError(app.client.get("/me/integrations/linkedin"), 401, "UNAUTHENTICATED")
+    Check.apiError(app.client.putJson("/me/integrations/linkedin", "{\"postSync\":true}"), 401, "UNAUTHENTICATED")
+}
+
+test "without a connection the preference cannot be turned on" {
+    var app = liApp()
+    var token = liLogin("li_sync_sem_conexao")
+    var res = app.client.getWith("/me/integrations/linkedin", liAuth(token))
+    Check.status(res, 200)
+    Check.eqStr("connected", "false", res.json("connected"))
+    Check.eqStr("canPost", "false", res.json("canPost"))
+    Check.eqStr("reason", "NOT_CONNECTED", res.json("reason"))
+    var put = app.client.send("PUT", "/me/integrations/linkedin", listOf("Content-Type: application/json", "X-Session-Token: " + token), "", "{\"postSync\":true}")
+    Check.apiError(put, 409, "LINKEDIN_NOT_CONNECTED")
+    Check.eqStr("message", "Vincule o LinkedIn antes de ativar a sincronizacao.", put.json("message"))
+}
+
+test "a stored connection can be turned on and off" {
+    var app = liApp()
+    var token = liLogin("li_sync_com_conexao")
+    liService().remember("li_sync_com_conexao", "sub-int", "token-int", liFuture())
+    var res = app.client.getWith("/me/integrations/linkedin", liAuth(token))
+    Check.status(res, 200)
+    Check.eqStr("connected", "true", res.json("connected"))
+    Check.eqStr("canPost", "true", res.json("canPost"))
+    Check.eqStr("postSync", "false", res.json("postSync"))
+    Check.isTrue("reason is null", res.jsonIsNull("reason"))
+    putSync(token, true)
+    Check.eqStr("postSync on", "true", app.client.getWith("/me/integrations/linkedin", liAuth(token)).json("postSync"))
+    putSync(token, false)
+    Check.eqStr("postSync off", "false", app.client.getWith("/me/integrations/linkedin", liAuth(token)).json("postSync"))
+}
+
+test "one person's connection does not show for another" {
+    var app = liApp()
+    var owner = liLogin("li_sync_dona")
+    var other = liLogin("li_sync_outra")
+    liService().remember("li_sync_dona", "sub-dona", "token-dona", liFuture())
+    var res = app.client.getWith("/me/integrations/linkedin", liAuth(other))
+    Check.status(res, 200)
+    Check.eqStr("connected", "false", res.json("connected"))
+    Check.eqStr("reason", "NOT_CONNECTED", res.json("reason"))
+    Check.eqStr("owner sees hers", "true", app.client.getWith("/me/integrations/linkedin", liAuth(owner)).json("connected"))
+}
+
+test "a missing or null postSync is a 400 and a bad body too" {
+    var app = liApp()
+    var token = liLogin("li_sync_bad_body")
+    var headers = listOf("Content-Type: application/json", "X-Session-Token: " + token)
+    var missing = app.client.send("PUT", "/me/integrations/linkedin", headers, "", "{}")
+    Check.apiError(missing, 400, "BAD_REQUEST")
+    Check.eqStr("message", "Informe a preferencia de sincronizacao.", missing.json("message"))
+    Check.apiError(app.client.send("PUT", "/me/integrations/linkedin", headers, "", "{\"postSync\":null}"), 400, "BAD_REQUEST")
+    Check.apiError(app.client.send("PUT", "/me/integrations/linkedin", headers, "", "not json"), 400, "BAD_REQUEST")
+}
+
+test "the token is stored encrypted and unlinking removes the connection" {
+    var db = liApp().db()
+    liService().remember("li_enc_user", "sub-enc", "token-secreto", liFuture())
+    var enc = db.queryOne("select access_token_enc from linkedin_connections where user_id = ?", DbParams().bindStr("li_enc_user")).getStr("access_token_enc")
+    Check.isTrue("not in clear", enc != "token-secreto")
+    liService().remove("li_enc_user")
+    Check.eqStr("removed", "0", "" + db.queryLong("select count(*) from linkedin_connections where user_id = ?", DbParams().bindStr("li_enc_user")))
+}
+
+// ---- LinkedInShareOutboxEventHandler (through the real outbox worker, which proves the registration) ----
+
+liPost(id: String, type: String, identity: String) {
+    var now = Time.nowIso()
+    liApp().db().execute("insert into posts (id, author_id, type, content, created_at, visibility, reactions, comments, saves, shares, status, author_identity) values (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?)", DbParams().bindStr(id).bindStr("li_out_u1").bindStr(type).bindStr("meu texto").bindInstant(now).bindStr("PUBLIC").bindStr("ACTIVE").bindStr(identity))
+}
+
+Int liPublish(postId: String, eventType: String) {
+    var before = LiApiHolder.client.captured.size()
+    var outbox = LiApiHolder.outbox
+    if (outbox == null) {
+        throw "outbox not wired"
+    }
+    outbox.append(eventType, postId, "{}")
+    outbox.processPending()
+    return LiApiHolder.client.captured.size() - before
+}
+
+liSyncedUser() {
+    liApp()
+    var u = liService()
+    u.remember("li_out_u1", "sub-1", "token", liFuture())
+    u.setPostSync("li_out_u1", true)
+}
+
+test "a professional post becomes a share" {
+    liSyncedUser()
+    liPost("li_post_1", "BUSINESS", "CORPORATE")
+    Check.eqInt("shares", 1, liPublish("li_post_1", "PostPublished"))
+    var last = LiApiHolder.client.captured.get(LiApiHolder.client.captured.size() - 1)
+    Check.isTrue("token and sub", last.startsWith("token|sub-1|"))
+    Check.isTrue("public link", last.contains("https://enois.ia.br/post/li_post_1"))
+    var status = liApp().db().queryOne("select last_share_status from linkedin_connections where user_id = ?", DbParams().bindStr("li_out_u1")).getStr("last_share_status")
+    Check.eqStr("outcome stored", "OK", status)
+}
+
+test "a social post never goes to LinkedIn" {
+    liSyncedUser()
+    liPost("li_post_2", "INSIGHT", "SOCIAL")
+    Check.eqInt("shares", 0, liPublish("li_post_2", "PostPublished"))
+}
+
+test "a moment never goes to LinkedIn" {
+    liSyncedUser()
+    liPost("li_post_3", "MOMENT", "SOCIAL")
+    Check.eqInt("shares", 0, liPublish("li_post_3", "PostPublished"))
+}
+
+test "another event type publishes nothing" {
+    liSyncedUser()
+    liPost("li_post_4", "BUSINESS", "CORPORATE")
+    Check.eqInt("shares", 0, liPublish("li_post_4", "PostCommented"))
+}
+
+// Last test of the file: the outbox worker and the server keep the process alive otherwise.
+test "teardown stops the jobs and the app" {
+    var sh = LiApiHolder.shared
+    if (sh != null) {
+        sh.stop()
+    }
+    liApp().stop()
+}

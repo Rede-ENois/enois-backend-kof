@@ -1,0 +1,41 @@
+package kernel.concurrent
+
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
+
+// A mutual-exclusion gate: `enter()` ... `leave()` around a short critical section (no `finally` after a
+// rethrow in Kof, KOF_GAPS G12: keep the section free of calls that throw).
+class Gate {
+    ReentrantLock lock = new ReentrantLock()
+    public constructor() {}
+    enter() {
+        lock.lock()
+    }
+    leave() {
+        lock.unlock()
+    }
+    // The "skip if somebody else is already doing it" form (background refreshes); `leave()` after a true.
+    Bool tryEnter() = lock.tryLock()
+}
+
+// A counting semaphore without waiting: `tryAcquire()` fails at once when all `max` permits are taken
+// (the resilience4j bulkhead with max-wait-duration=0).
+class Permits {
+    AtomicInteger taken = new AtomicInteger(0)
+    Int max
+    public constructor(max: Int) {
+        this.max = max
+    }
+    Bool tryAcquire() {
+        var now = taken.incrementAndGet()
+        if (now > max) {
+            taken.decrementAndGet()
+            return false
+        }
+        return true
+    }
+    release() {
+        taken.decrementAndGet()
+    }
+    Int inUse() = taken.get()
+}
