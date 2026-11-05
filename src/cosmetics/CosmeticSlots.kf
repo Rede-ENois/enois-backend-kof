@@ -1,0 +1,171 @@
+package cosmetics
+
+import kernel.text.*
+import profile.*
+
+// The cosmetic slots of one profile, loaded once and changed in memory (the Java service loaded the UserProfile,
+// changed several slots and saved once). `write` stores only the groups that changed, each with its own columns, so
+// a look change never rewrites (or zeroes) a neighbour field it did not touch.
+class CosmeticSlots {
+    String userId
+    String? avatarFrame
+    String? nameTheme
+    String? nameFont
+    String? nameColor
+    String? cardTheme
+    String? nameplate
+    String? bannerItem
+    String? profileEffect
+    String? gardenStyle
+    String? statusText
+    String? statusIcon
+    List<String> badges = listOf<String>()
+    Bool frameDirty = false
+    Bool nameDirty = false
+    Bool cardDirty = false
+    Bool gardenDirty = false
+    Bool statusDirty = false
+    Bool badgesDirty = false
+    public constructor(p: ProfileRecord) {
+        this.userId = p.id
+        this.avatarFrame = p.avatarFrame
+        this.nameTheme = p.nameTheme
+        this.nameFont = p.nameFont
+        this.nameColor = p.nameColor
+        this.cardTheme = p.cardTheme
+        this.nameplate = p.nameplate
+        this.bannerItem = p.bannerItem
+        this.profileEffect = p.profileEffect
+        this.gardenStyle = p.gardenStyle
+        this.statusText = p.statusText
+        this.statusIcon = p.statusIcon
+        for (var b in p.allBadges()) {
+            this.badges.add(b)
+        }
+    }
+    // The slot value after equipping (the id) or unequipping (empty only when it holds this id).
+    static String? swap(current: String?, id: String, equip: Bool) {
+        if (equip) {
+            return id
+        }
+        if (current == null) {
+            return current
+        }
+        if (id == current) {
+            return Nulls.str()
+        }
+        return current
+    }
+    static Bool holds(current: String?, id: String) {
+        if (current == null) {
+            return false
+        }
+        return id == current
+    }
+    // Is this item in its slot?
+    Bool equipped(item: CosmeticItem) {
+        var id = item.id()
+        var kind = item.kind()
+        if (kind == "FRAME") {
+            return CosmeticSlots.holds(avatarFrame, id)
+        }
+        if (kind == "BADGE") {
+            return badges.contains(id)
+        }
+        if (kind == "NAME_STYLE") {
+            return CosmeticSlots.holds(nameTheme, id)
+        }
+        if (kind == "NAMEPLATE") {
+            return CosmeticSlots.holds(nameplate, id)
+        }
+        if (kind == "BANNER") {
+            return CosmeticSlots.holds(bannerItem, id)
+        }
+        if (kind == "CARD_THEME") {
+            return CosmeticSlots.holds(cardTheme, id)
+        }
+        if (kind == "PROFILE_EFFECT") {
+            return CosmeticSlots.holds(profileEffect, id)
+        }
+        return CosmeticSlots.holds(gardenStyle, id)
+    }
+    // Puts the item in its slot (equip) or empties the slot when it holds this item (unequip). Badges go to setBadges.
+    applySlot(item: CosmeticItem, equip: Bool) {
+        var id = item.id()
+        var kind = item.kind()
+        if (kind == "FRAME") {
+            this.avatarFrame = CosmeticSlots.swap(avatarFrame, id, equip)
+            this.frameDirty = true
+            return
+        }
+        if (kind == "NAME_STYLE") {
+            // A seasonal name style brings its own font and colors: a kept font or color would repaint it.
+            if (equip) {
+                this.nameTheme = id
+                this.nameFont = Nulls.str()
+                this.nameColor = Nulls.str()
+            }
+            else {
+                this.nameTheme = CosmeticSlots.swap(nameTheme, id, false)
+            }
+            this.nameDirty = true
+            return
+        }
+        if (kind == "CARD_THEME") {
+            this.cardTheme = CosmeticSlots.swap(cardTheme, id, equip)
+            this.cardDirty = true
+            return
+        }
+        if (kind == "NAMEPLATE") {
+            this.nameplate = CosmeticSlots.swap(nameplate, id, equip)
+            this.cardDirty = true
+            return
+        }
+        if (kind == "BANNER") {
+            this.bannerItem = CosmeticSlots.swap(bannerItem, id, equip)
+            this.cardDirty = true
+            return
+        }
+        if (kind == "PROFILE_EFFECT") {
+            this.profileEffect = CosmeticSlots.swap(profileEffect, id, equip)
+            this.cardDirty = true
+            return
+        }
+        if (kind == "GARDEN") {
+            this.gardenStyle = CosmeticSlots.swap(gardenStyle, id, equip)
+            this.gardenDirty = true
+            return
+        }
+        throw "Badges go to the badge list."
+    }
+    setBadges(list: List<String>) {
+        this.badges = list
+        this.badgesDirty = true
+    }
+    setStatus(text: String?, icon: String?) {
+        this.statusText = text
+        this.statusIcon = icon
+        this.statusDirty = true
+    }
+    // Stores the groups that changed.
+    write(slots: ProfileSlots, now: String) {
+        if (frameDirty) {
+            slots.updateAvatarFrame(userId, avatarFrame, now)
+        }
+        if (nameDirty) {
+            slots.updateNameStyle(userId, nameTheme, nameFont, nameColor, now)
+        }
+        if (cardDirty) {
+            slots.updateProfileCosmetics(userId, cardTheme, nameplate, bannerItem, profileEffect, now)
+        }
+        if (gardenDirty) {
+            slots.updateGardenStyle(userId, gardenStyle, now)
+        }
+        if (statusDirty) {
+            slots.updateStatus(userId, statusText, statusIcon, now)
+        }
+        if (badgesDirty) {
+            slots.updateBadges(userId, badges, now)
+        }
+    }
+}
