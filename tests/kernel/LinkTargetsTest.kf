@@ -1,0 +1,73 @@
+import kernel.*
+import kernel.http.*
+import kernel.image.*
+import kernel.testkit.*
+import kernel.url.*
+
+// LinkTargets (address normalisation), Uris.query, Images.shrinkJpeg and the Location header / charset decoding of Outbound.
+class LtHolder {
+    static TestApp? cached = null
+    static TestApp app() {
+        var cur = LtHolder.cached
+        if (cur != null) {
+            return cur
+        }
+        var created = TestApp.bootWire("linktargets", (p: Platform) -> {
+    p.server.get("/moved", () -> {
+    ResponseHeaders.set("Location", "http://127.0.0.1:1/elsewhere")
+    return status(302, "")
+})
+    p.server.get("/plain", () -> status(200, "abc"))
+})
+        LtHolder.cached = created
+        return created
+    }
+    static String sizeOf(data: Byte[]) {
+        var size = Images.dimensions(data, 0)
+        if (size == null) {
+            return "unreadable"
+        }
+        return size.width() + "x" + size.height()
+    }
+    static String url(path: String) = "http://127.0.0.1:" + LtHolder.app().port + path
+}
+
+test "www, trailing slash, host case and tracking parameters do not change the destination" {
+    var expected = "https://youtube.com/watch?v=abc123"
+    assert(LinkTargets.normalize("https://www.YouTube.com/watch?v=abc123&utm_source=x") == expected)
+    assert(LinkTargets.normalize("https://youtube.com/watch/?v=abc123") == expected)
+    assert(LinkTargets.normalize("https://youtube.com/watch?v=abc123.") == expected)
+    assert(LinkTargets.normalize("https://youtube.com:443/watch?v=abc123#frag") == expected)
+}
+
+test "the query that changes the content stays and invalid destinations are null" {
+    assert(LinkTargets.normalize("https://youtube.com/watch?v=abc") != LinkTargets.normalize("https://youtube.com/watch?v=xyz"))
+    assert(LinkTargets.normalize("https://localhost:8080/admin") == null)
+    assert(LinkTargets.normalize("https:///sem-host") == null)
+    assert(LinkTargets.normalize("ftp://exemplo.com/a") == null)
+    assert(LinkTargets.normalize("javascript:alert(1)") == null)
+}
+
+test "Uris.query is the decoded query" {
+    assert(Uris.query("https://a.com/x?id=1&q=a%20b") == "id=1&q=a b")
+    assert(Uris.query("https://a.com/x") == "")
+}
+
+test "shrinkJpeg scales the longest side down and never enlarges" {
+    var big = Images.sample("png", 1600, 800)
+    var small = Images.shrinkJpeg(big, 768)
+    assert(LtHolder.sizeOf(small) == "768x384")
+    var tiny = Images.shrinkJpeg(Images.sample("png", 40, 20), 768)
+    assert(LtHolder.sizeOf(tiny) == "40x20")
+}
+
+test "getBytes exposes the Location header and decodes in a named charset" {
+    var moved = Outbound.getBytes(LtHolder.url("/moved"), listOf<String>(), 2000, 2000, 1000)
+    assert(moved.status == 302)
+    assert(moved.location == "http://127.0.0.1:1/elsewhere")
+    var plain = Outbound.getBytes(LtHolder.url("/plain"), listOf<String>(), 2000, 2000, 1000)
+    assert(plain.location == "")
+    assert(plain.textAs("ISO-8859-1") == "abc")
+    assert(plain.textAs("no-such-charset") == "abc")
+    LtHolder.app().platform.stop()
+}

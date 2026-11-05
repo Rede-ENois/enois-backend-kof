@@ -108,6 +108,71 @@ class Images {
         }
         return Images.encode(target, "jpeg")
     }
+    // Decodes `data`, scales it down so the longest side is at most `maxSide` (area average, never enlarges) and encodes a
+    // new JPEG: no EXIF survives, and transparency is dropped over black like drawing onto an RGB canvas.
+    // Throws IMAGE_UNREADABLE / IMAGE_TOO_LARGE.
+    static Byte[] shrinkJpeg(data: Byte[], maxSide: Int) {
+        var source = Images.decode(data)
+        var w = source.getWidth()
+        var h = source.getHeight()
+        var longest = w
+        if (h > w) {
+            longest = h
+        }
+        var outW = w
+        var outH = h
+        if (longest > maxSide) {
+            var factor = (maxSide as Double) / (longest as Double)
+            outW = (((w as Double) * factor) + 0.5) as Int
+            outH = (((h as Double) * factor) + 0.5) as Int
+            if (outW < 1) {
+                outW = 1
+            }
+            if (outH < 1) {
+                outH = 1
+            }
+        }
+        var target = new BufferedImage(outW, outH, 1)
+        var ty = 0
+        while (ty < outH) {
+            var y0 = (ty * h) / outH
+            var y1 = ((ty + 1) * h) / outH
+            if (y1 <= y0) {
+                y1 = y0 + 1
+            }
+            var tx = 0
+            while (tx < outW) {
+                var x0 = (tx * w) / outW
+                var x1 = ((tx + 1) * w) / outW
+                if (x1 <= x0) {
+                    x1 = x0 + 1
+                }
+                var r = 0L
+                var g = 0L
+                var b = 0L
+                var n = 0L
+                var y = y0
+                while (y < y1) {
+                    var x = x0
+                    while (x < x1) {
+                        var argb = source.getRGB(x, y)
+                        var a = (argb >> 24) & 255
+                        r = r + (((((argb >> 16) & 255) * a) / 255) as Long)
+                        g = g + (((((argb >> 8) & 255) * a) / 255) as Long)
+                        b = b + ((((argb & 255) * a) / 255) as Long)
+                        n = n + 1L
+                        x = x + 1
+                    }
+                    y = y + 1
+                }
+                var rgb = ((r / n) as Int) * 65536 + ((g / n) as Int) * 256 + ((b / n) as Int)
+                target.setRGB(tx, ty, rgb)
+                tx = tx + 1
+            }
+            ty = ty + 1
+        }
+        return Images.encode(target, "jpeg")
+    }
     static BufferedImage decode(data: Byte[]) {
         var failure = ""
         try {
