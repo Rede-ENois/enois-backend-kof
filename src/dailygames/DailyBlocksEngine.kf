@@ -1,0 +1,362 @@
+package dailygames
+
+import kernel.text.*
+
+// Falling blocks, rules version 2: 100 ms ticks, automatic gravity every five ticks; the caller owns the
+// clock. Port of BlocksEngine, byte-identical: the same java.util.Random sequence (JavaRandom) and the same
+// bag shuffle (Collections.shuffle: for i = size down to 2, swap(i - 1, nextInt(i))), so a seed gives the same
+// pieces on both sides.
+record BlocksCell(Int x, Int y)
+
+record BlocksEvent(Int tick, String action)
+
+record BlocksResult(String status, Int score, Int lines, Int actions, Int elapsedTicks, List<String> board, List<BlocksCell> activeCells, List<BlocksCell> nextCells, Int rulesVersion, Int piecesSpawned)
+
+class BlocksEngine {
+    static Int width() = 10
+    static Int height() = 20
+    static Int maxTicks() = 6000
+    static Int maxActions() = 6000
+    static Int tickMillis() = 100
+    static Int rulesVersion() = 2
+    static String playing() = "PLAYING"
+    static String won() = "WON"
+    static String lost() = "LOST"
+    static String timedOut() = "TIMED_OUT"
+    // The seven pieces as x0, y0, x1, y1, ... (rotation is clockwise around the origin; the O does not turn).
+    static List<Int> shape(piece: Int) {
+        if (piece == 0) {
+            return listOf(0, 0, 1, 0, 2, 0, 3, 0)
+        }
+        if (piece == 1) {
+            return listOf(0, 0, 1, 0, 0, 1, 1, 1)
+        }
+        if (piece == 2) {
+            return listOf(0, 0, 1, 0, 2, 0, 1, 1)
+        }
+        if (piece == 3) {
+            return listOf(0, 0, 1, 0, 1, 1, 2, 1)
+        }
+        if (piece == 4) {
+            return listOf(1, 0, 2, 0, 0, 1, 1, 1)
+        }
+        if (piece == 5) {
+            return listOf(0, 0, 0, 1, 1, 1, 2, 1)
+        }
+        return listOf(2, 0, 0, 1, 1, 1, 2, 1)
+    }
+    static Int shapes() = 7
+    // Replays a bounded action sequence. Seed and target must come from the server challenge.
+    static BlocksResult replay(seed: Long, targetLines: Int, actions: List<BlocksEvent>, elapsedTicks: Int) {
+        if (targetLines < 1 || targetLines > 100 || actions.size() > BlocksEngine.maxActions() || elapsedTicks < 0 || elapsedTicks > BlocksEngine.maxTicks()) {
+            throw "ILLEGAL_ARGUMENT: Invalid target or replay length"
+        }
+        var previous = 0
+        for (var event in actions) {
+            if (event.tick() <= previous || event.tick() > elapsedTicks) {
+                throw "ILLEGAL_ARGUMENT: Invalid event order or tick"
+            }
+            previous = event.tick()
+        }
+        var game = BlocksGame(seed, targetLines)
+        var tick = 0
+        var index = 0
+        while (index < actions.size()) {
+            var event = actions.get(index)
+            index = index + 1
+            if (tick >= elapsedTicks) {
+                index = actions.size()
+            }
+            else {
+                while (tick < event.tick() && tick < elapsedTicks && game.phase == BlocksEngine.playing()) {
+                    tick = tick + 1
+                    if (tick % 5 == 0) {
+                        game.gravity()
+                    }
+                }
+                if (game.phase == BlocksEngine.playing() && tick >= event.tick()) {
+                    game.step(event.action())
+                }
+            }
+        }
+        while (tick < elapsedTicks && game.phase == BlocksEngine.playing()) {
+            tick = tick + 1
+            if (tick % 5 == 0) {
+                game.gravity()
+            }
+        }
+        if (tick == BlocksEngine.maxTicks() && game.phase == BlocksEngine.playing()) {
+            game.phase = BlocksEngine.timedOut()
+        }
+        return game.result(actions.size(), tick)
+    }
+    // Only terminal replays can be submitted as competitive results.
+    static BlocksResult validateCompleted(seed: Long, targetLines: Int, actions: List<BlocksEvent>, elapsedTicks: Int) {
+        var result = BlocksEngine.replay(seed, targetLines, actions, elapsedTicks)
+        if (result.status() == BlocksEngine.playing()) {
+            throw "ILLEGAL_ARGUMENT: Incomplete replay"
+        }
+        return result
+    }
+    // Piece order for a seed, with the same bag shuffle as the replay, advanced past the pieces the game has
+    // already consumed: the client plays the real daily sequence while the server keeps the clock and
+    // validates by replay.
+    static List<Int> pieceSequence(seed: Long, count: Int, alreadySpawned: Int) {
+        if (count < 0 || count > BlocksEngine.maxActions() || alreadySpawned < 0) {
+            throw "ILLEGAL_ARGUMENT: Invalid sequence length"
+        }
+        var rng = JavaRandom(seed)
+        var bag = listOf<Int>()
+        var left = 0
+        var out = listOf<Int>()
+        var i = 0
+        while (i < alreadySpawned + count) {
+            if (left == 0) {
+                bag = BlocksEngine.shuffledBag(rng)
+                left = BlocksEngine.shapes()
+            }
+            left = left - 1
+            if (i >= alreadySpawned) {
+                out.add(bag.get(left))
+            }
+            i = i + 1
+        }
+        return out
+    }
+    // A fresh bag 0..6 shuffled with Collections.shuffle(list, random).
+    static List<Int> shuffledBag(rng: JavaRandom) {
+        var bag = listOf<Int>()
+        var s = 0
+        while (s < BlocksEngine.shapes()) {
+            bag.add(s)
+            s = s + 1
+        }
+        var i = bag.size()
+        while (i > 1) {
+            var j = rng.nextInt(i)
+            var held = bag.get(i - 1)
+            bag.set(i - 1, bag.get(j))
+            bag.set(j, held)
+            i = i - 1
+        }
+        return bag
+    }
+}
+
+// One match in progress. Mutable on purpose (the Java Game): the board is 200 cells, 0 empty / 1 filled.
+class BlocksGame {
+    List<Int> board = listOf<Int>()
+    JavaRandom rng
+    List<Int> bag = listOf<Int>()
+    Int bagLeft = 0
+    Int target
+    Int piece = 0
+    Int rotation = 0
+    Int px = 0
+    Int py = 0
+    Int lines = 0
+    Int score = 0
+    Int spawned = 0
+    String phase = "PLAYING"
+    public constructor(seed: Long, target: Int) {
+        this.rng = JavaRandom(seed)
+        this.target = target
+        var i = 0
+        while (i < 200) {
+            board.add(0)
+            i = i + 1
+        }
+        this.spawn()
+    }
+    spawn() {
+        this.refill()
+        bagLeft = bagLeft - 1
+        piece = bag.get(bagLeft)
+        rotation = 0
+        px = 3
+        py = 0
+        spawned = spawned + 1
+        this.refill()
+        if (!this.fits(px, py, rotation)) {
+            phase = BlocksEngine.lost()
+        }
+    }
+    // The next piece is always known: the bag is refilled as soon as it is empty.
+    refill() {
+        if (bagLeft == 0) {
+            bag = BlocksEngine.shuffledBag(rng)
+            bagLeft = BlocksEngine.shapes()
+        }
+    }
+    step(action: String) {
+        if (action == "LEFT") {
+            if (this.fits(px - 1, py, rotation)) {
+                px = px - 1
+            }
+        }
+        if (action == "RIGHT") {
+            if (this.fits(px + 1, py, rotation)) {
+                px = px + 1
+            }
+        }
+        if (action == "ROTATE") {
+            if (this.fits(px, py, (rotation + 1) % 4)) {
+                rotation = (rotation + 1) % 4
+            }
+        }
+        if (action == "HARD_DROP") {
+            while (this.fits(px, py + 1, rotation)) {
+                py = py + 1
+            }
+            this.lock()
+        }
+        if (action == "SOFT_DROP") {
+            this.gravity()
+        }
+    }
+    gravity() {
+        if (this.fits(px, py + 1, rotation)) {
+            py = py + 1
+        }
+        else {
+            this.lock()
+        }
+    }
+    // The four cells of the piece turned `r` quarter turns, as x0, y0, x1, y1, ...
+    List<Int> cells(r: Int) {
+        var base = BlocksEngine.shape(piece)
+        var out = listOf<Int>()
+        var i = 0
+        while (i < 4) {
+            var cx = base.get(i * 2)
+            var cy = base.get(i * 2 + 1)
+            if (piece != 1) {
+                var turn = 0
+                while (turn < r) {
+                    var old = cx
+                    cx = 0 - cy
+                    cy = old
+                    turn = turn + 1
+                }
+            }
+            out.add(cx)
+            out.add(cy)
+            i = i + 1
+        }
+        return out
+    }
+    Bool fits(x: Int, y: Int, r: Int) {
+        var c = this.cells(r)
+        var i = 0
+        while (i < 4) {
+            var bx = x + c.get(i * 2)
+            var by = y + c.get(i * 2 + 1)
+            if (bx < 0 || bx >= 10 || by < 0 || by >= 20) {
+                return false
+            }
+            if (board.get(by * 10 + bx) == 1) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    lock() {
+        var c = this.cells(rotation)
+        var i = 0
+        while (i < 4) {
+            board.set((py + c.get(i * 2 + 1)) * 10 + px + c.get(i * 2), 1)
+            i = i + 1
+        }
+        // Full rows leave, the rows above fall: the surviving rows keep their order below the new empty ones.
+        var kept = listOf<Int>()
+        var cleared = 0
+        var row = 0
+        while (row < 20) {
+            var full = true
+            var col = 0
+            while (col < 10) {
+                if (board.get(row * 10 + col) == 0) {
+                    full = false
+                }
+                col = col + 1
+            }
+            if (full) {
+                cleared = cleared + 1
+            }
+            else {
+                col = 0
+                while (col < 10) {
+                    kept.add(board.get(row * 10 + col))
+                    col = col + 1
+                }
+            }
+            row = row + 1
+        }
+        var next = listOf<Int>()
+        var pad = 0
+        while (pad < cleared * 10) {
+            next.add(0)
+            pad = pad + 1
+        }
+        for (var cell in kept) {
+            next.add(cell)
+        }
+        board = next
+        lines = lines + cleared
+        if (cleared == 1) {
+            score = score + 100
+        }
+        if (cleared == 2) {
+            score = score + 300
+        }
+        if (cleared == 3) {
+            score = score + 500
+        }
+        if (cleared == 4) {
+            score = score + 800
+        }
+        if (lines >= target) {
+            phase = BlocksEngine.won()
+        }
+        else {
+            this.spawn()
+        }
+    }
+    BlocksResult result(count: Int, ticks: Int) {
+        var rows = listOf<String>()
+        var row = 0
+        while (row < 20) {
+            var line = ""
+            var col = 0
+            while (col < 10) {
+                if (board.get(row * 10 + col) == 1) {
+                    line = line + "#"
+                }
+                else {
+                    line = line + "."
+                }
+                col = col + 1
+            }
+            rows.add(line)
+            row = row + 1
+        }
+        var active = listOf<BlocksCell>()
+        var next = listOf<BlocksCell>()
+        if (phase == BlocksEngine.playing()) {
+            var c = this.cells(rotation)
+            var i = 0
+            while (i < 4) {
+                active.add(BlocksCell(px + c.get(i * 2), py + c.get(i * 2 + 1)))
+                i = i + 1
+            }
+            var upcoming = BlocksEngine.shape(bag.get(bagLeft - 1))
+            i = 0
+            while (i < 4) {
+                next.add(BlocksCell(upcoming.get(i * 2), upcoming.get(i * 2 + 1)))
+                i = i + 1
+            }
+        }
+        return BlocksResult(phase, score, lines, count, ticks, rows, active, next, BlocksEngine.rulesVersion(), spawned)
+    }
+}

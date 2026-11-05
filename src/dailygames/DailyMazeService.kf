@@ -1,0 +1,171 @@
+package dailygames
+
+import games.*
+import kernel.db.*
+import kernel.error.*
+import kernel.text.*
+import kernel.time.*
+
+// `passages` (the maze) is null until the player starts; `position` is the cell index, 0 to 80.
+record DailyMazeState(String date, String status, List<Int>? passages, Int position, Int moves, String? startedAt, String? completedAt)
+
+record DailyMazeEntry(String username, String name, Long elapsedMillis, Int moves)
+
+record DailyMazeRanking(List<DailyMazeEntry> items)
+
+record DailyMazeMoveBody(String? direction, String? requestId)
+
+// The daily maze: a deterministic maze per seed, a trail of validated moves. Port of DailyMazeService.
+class DailyMazeService {
+    Db database
+    DailyGamesClock clock
+    GamesCoins coins
+    public constructor(database: Db, clock: DailyGamesClock, coins: GamesCoins) {
+        this.database = database
+        this.clock = clock
+        this.coins = coins
+    }
+    static Int lastCell() = MazeRules.size() * MazeRules.size() - 1
+    DailyMazeState state(userId: String, date: String?) = this.stateFor(DailyRules.requestedDay(clock, date), userId)
+    DailyMazeState stateFor(day: String, userId: String) {
+        var found = database.queryOptional("select position, moves, started_at, completed_at from daily_maze_sessions where challenge_date = ? and user_id = ?", DbParams().bindDate(day).bindStr(userId))
+        if (found == null) {
+            return DailyMazeState(day, "NOT_STARTED", null, 0, 0, null, null)
+        }
+        var seed = database.queryOne("select maze_seed from daily_maze_challenges where challenge_date = ?", DbParams().bindDate(day)).getLong("maze_seed")
+        var completed = found.getInstantOrNull("completed_at")
+        var status = "IN_PROGRESS"
+        if (completed != null) {
+            status = "WON"
+        }
+        return DailyMazeState(day, status, MazeRules.generate(seed), found.getInt("position"), found.getInt("moves"), found.getInstant("started_at"), completed)
+    }
+    DailyMazeState start(userId: String) {
+        var day = clock.today()
+        var self = this
+        database.transaction(() -> {
+    self.database.execute("insert into daily_maze_challenges (challenge_date, maze_seed) values (?, ?) on duplicate key update challenge_date = challenge_date", DbParams().bindDate(day).bindLong(JavaRandom.secureLong()))
+    self.database.execute("insert into daily_maze_sessions (challenge_date, user_id, position, moves, started_at) values (?, ?, 0, 0, ?) on duplicate key update user_id = user_id", DbParams().bindDate(day).bindStr(userId).bindInstant(self.clock.nowIso()))
+})
+        return this.stateFor(day, userId)
+    }
+    DailyMazeState move(userId: String, direction: String?, requestId: String?, requestedDate: String?) {
+        if (!DailyRules.validRequestId(requestId)) {
+            throw Errors.api(400, "INVALID_REQUEST_ID", "Identificador invalido.")
+        }
+        var day = DailyRules.requestedDay(clock, requestedDate)
+        var self = this
+        var reachedEnd = false
+        database.transaction(() -> {
+    reachedEnd = self.moveInTransaction(userId, direction, requestId as String, day)
+})
+        if (reachedEnd) {
+            coins.recordPresence(userId)
+        }
+        return this.stateFor(day, userId)
+    }
+    // The move under the row lock; true when it reached the exit.
+    Bool moveInTransaction(userId: String, direction: String?, requestId: String, day: String) {
+        var sessions = database.queryList("select position, moves, completed_at from daily_maze_sessions where challenge_date = ? and user_id = ? for update", DbParams().bindDate(day).bindStr(userId))
+        if (sessions.size() == 0) {
+            throw Errors.api(409, "GAME_NOT_STARTED", "Inicie o desafio primeiro.")
+        }
+        var session = sessions.get(0)
+        var existing = database.queryList("select direction from daily_maze_moves where challenge_date = ? and user_id = ? and request_id = ?", DbParams().bindDate(day).bindStr(userId).bindStr(requestId))
+        if (existing.size() > 0) {
+            if (existing.get(0).getStr("direction") != direction) {
+                throw Errors.api(409, "IDEMPOTENCY_CONFLICT", "Identificador ja usado.")
+            }
+            return false
+        }
+        if (session.getInstantOrNull("completed_at") != null) {
+            throw Errors.api(409, "GAME_FINISHED", "Desafio encerrado.")
+        }
+        var seed = database.queryOne("select maze_seed from daily_maze_challenges where challenge_date = ?", DbParams().bindDate(day)).getLong("maze_seed")
+        var next = DailyMazeService.nextCell(MazeRules.generate(seed), session.getInt("position"), direction)
+        database.execute("insert into daily_maze_moves (challenge_date, user_id, request_id, direction) values (?, ?, ?, ?)", DbParams().bindDate(day).bindStr(userId).bindStr(requestId).bindStr(direction as String))
+        var atEnd = next == DailyMazeService.lastCell()
+        database.execute("update daily_maze_sessions set position = ?, moves = ?, completed_at = ? where challenge_date = ? and user_id = ?", DbParams().bindInt(next).bindInt(session.getInt("moves") + 1).bindInstantOrNull(DailyMazeService.completionStamp(atEnd, clock.nowIso())).bindDate(day).bindStr(userId))
+        return atEnd
+    }
+    static String? completionStamp(atEnd: Bool, now: String) {
+        if (atEnd) {
+            return now
+        }
+        return null
+    }
+    // A wall or an unknown direction is 400 INVALID_MOVE.
+    static Int nextCell(maze: List<Int>, position: Int, direction: String?) {
+        var d = -1
+        if (direction == "UP") {
+            d = 0
+        }
+        if (direction == "RIGHT") {
+            d = 1
+        }
+        if (direction == "DOWN") {
+            d = 2
+        }
+        if (direction == "LEFT") {
+            d = 3
+        }
+        if (d < 0 || position < 0 || position >= maze.size()) {
+            throw Errors.api(400, "INVALID_MOVE", "Movimento invalido.")
+        }
+        if (!MazeRules.open(maze.get(position), d)) {
+            throw Errors.api(400, "INVALID_MOVE", "Movimento invalido.")
+        }
+        return MazeRules.move(maze, position, direction)
+    }
+    // Today's finishers: least time, then fewest moves, then username (top 100).
+    DailyMazeRanking leaderboard() {
+        var entries = this.finishers(clock.today())
+        var items = listOf<DailyMazeEntry>()
+        var i = 0
+        while (i < entries.size() && i < 100) {
+            items.add(entries.get(i))
+            i = i + 1
+        }
+        return DailyMazeRanking(items)
+    }
+    // Everybody who left the maze that day, in scoreboard order.
+    List<DailyMazeEntry> finishers(day: String) {
+        var keys = listOf<String>()
+        var byKey = mapOf<String, DailyMazeEntry>()
+        for (var row in database.queryList("select u.username, u.name, s.user_id, s.started_at, s.completed_at, s.moves from daily_maze_sessions s join users u on u.id = s.user_id where s.challenge_date = ? and s.completed_at is not null", DbParams().bindDate(day))) {
+            var elapsed = DailyRules.elapsedMillis(row.getInstant("started_at"), row.getInstant("completed_at"))
+            var entry = DailyMazeEntry(row.getStr("username"), row.getStr("name"), elapsed, row.getInt("moves"))
+            // time, then moves, then username (String order), then the account to keep the keys unique
+            var key = DailyRules.pad(elapsed, 15) + "|" + DailyRules.pad(row.getLong("moves"), 10) + "|" + row.getStr("username") + "|" + row.getStr("user_id")
+            keys.add(key)
+            byKey.put(key, entry)
+        }
+        var out = listOf<DailyMazeEntry>()
+        for (var key in keys.sorted()) {
+            var entry = byKey.get(key)
+            if (entry != null) {
+                out.add(entry)
+            }
+        }
+        return out
+    }
+    // Accounts in the order of the day's scoreboard, without the cap of 100 and without who did not leave: the prize queue.
+    List<String> payoutOrder(day: String) {
+        var keys = listOf<String>()
+        var owners = mapOf<String, String>()
+        for (var row in database.queryList("select u.username, s.user_id, s.started_at, s.completed_at, s.moves from daily_maze_sessions s join users u on u.id = s.user_id where s.challenge_date = ? and s.completed_at is not null", DbParams().bindDate(day))) {
+            var elapsed = DailyRules.elapsedMillis(row.getInstant("started_at"), row.getInstant("completed_at"))
+            var key = DailyRules.pad(elapsed, 15) + "|" + DailyRules.pad(row.getLong("moves"), 10) + "|" + row.getStr("username") + "|" + row.getStr("user_id")
+            keys.add(key)
+            owners.put(key, row.getStr("user_id"))
+        }
+        var out = listOf<String>()
+        for (var key in keys.sorted()) {
+            var owner = owners.get(key)
+            if (owner != null) {
+                out.add(owner)
+            }
+        }
+        return out
+    }
+}

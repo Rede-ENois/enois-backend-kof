@@ -1,0 +1,172 @@
+package games
+
+import age.*
+import dailygames.*
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.url.*
+import notifications.*
+import profile.*
+import kernel.time.*
+
+// Names resolve to a public address without DNS (no suite depends on the network); literal IPs still go
+// through the real classification, so the loopback / private / link-local cases are the real thing.
+class GamesTestHosts extends GamesHosts {
+    public constructor() {}
+    String classify(host: String) {
+        if (host.contains(":") || host.replaceAll("[0-9.]", "").length() == 0) {
+            return HostAddresses.classify(host)
+        }
+        return HostAddresses.ok()
+    }
+}
+
+// A daily-games clock a test can pin: `GamesTestClock.pin("2026-10-16T12:00:00Z")`, `unpin()` goes back to the system clock.
+class GamesTestClock extends DailyGamesClock {
+    static String pinnedSlot = ""
+    public constructor() {}
+    static pin(iso: String) {
+        GamesTestClock.pinnedSlot = iso
+    }
+    static unpin() {
+        GamesTestClock.pinnedSlot = ""
+    }
+    String nowIso() {
+        if (GamesTestClock.pinnedSlot.length() > 0) {
+            return GamesTestClock.pinnedSlot
+        }
+        return super.nowIso()
+    }
+}
+
+// Remembers who got presence credit (the coin owner's streak is a no-op seam in the default).
+class GamesRecordingCoins extends GamesCoins {
+    static List<String> presenceSlot = listOf<String>()
+    public constructor(store: Db, cipher: SecretCipher) {
+        super(store, cipher)
+    }
+    recordPresence(userId: String) {
+        GamesRecordingCoins.presenceSlot.add(userId)
+    }
+}
+
+// Fixtures of the games suites. One booted app per test file (Security.install sets process-wide statics).
+//
+//   var app = GamesTestKit.app()
+//   var token = GamesTestKit.login("gflow-creator")         // verified adult user + live session; the id is the username
+//   var res = GamesTestKit.send("POST", "/games", GamesTestKit.auth(token), "{...}")
+class GamesTestKit {
+    static TestApp? cachedApp = null
+    static GamesModule? cachedGames = null
+    static DailyGamesModule? cachedDaily = null
+    static SharedServices? cachedShared = null
+    static Notifications? cachedNotifications = null
+    static TestApp app() {
+        var cur = GamesTestKit.cachedApp
+        if (cur != null) {
+            return cur
+        }
+        var created = DomainTestKit.boot("games", mapOf(), (p: Platform, s: SharedServices, parts: SecurityParts) -> GamesTestKit.wire(p, s, parts))
+        GamesTestKit.cachedApp = created
+        return created
+    }
+    static wire(p: Platform, shared: SharedServices, parts: SecurityParts) {
+        var hooks = SecurityHooks.defaults(p.db)
+        var profile = ProfileModule.install(p, shared, hooks)
+        var notificationsModule = NotificationsModule.install(p, shared, hooks, parts)
+        var gate = AgeGate(AgePolicyReader(AgeStore(p.db)))
+        var coins = GamesRecordingCoins(p.db, shared.cipher)
+        var games = GamesModule.installFull(p, profile, notificationsModule, coins, GamesFeed(p.db, gate, shared.sanctionGate), GamesTestHosts())
+        GamesTestKit.cachedGames = games
+        GamesTestKit.cachedShared = shared
+        GamesTestKit.cachedNotifications = notificationsModule.notifications
+        GamesTestKit.cachedDaily = DailyGamesModule.installWith(p, shared, notificationsModule.notifications, coins, GamesTestClock(), "resources/dailygames")
+    }
+    static GamesModule module() {
+        GamesTestKit.app()
+        var cur = GamesTestKit.cachedGames
+        if (cur == null) {
+            throw "GamesTestKit: module not wired"
+        }
+        return cur
+    }
+    static DailyGamesModule daily() {
+        GamesTestKit.app()
+        var cur = GamesTestKit.cachedDaily
+        if (cur == null) {
+            throw "GamesTestKit: daily games not wired"
+        }
+        return cur
+    }
+    static Db db() = GamesTestKit.app().db()
+    static String tokenOf(userId: String) = "tok-" + userId + "-1234567890"
+    // A verified adult (birth date declared) with a live one-hour session; the id doubles as username and name.
+    // Returns the session token. Safe to call twice for the same id.
+    static String login(userId: String) {
+        var store = GamesTestKit.db()
+        if (store.queryLong("select count(*) from users where id = ?", DbParams().bindStr(userId)) == 0L) {
+            SecurityFixtures.login(store, userId, GamesTestKit.tokenOf(userId))
+            store.execute("update users set birth_date = ? where id = ?", DbParams().bindDate("1990-05-10").bindStr(userId))
+        }
+        return GamesTestKit.tokenOf(userId)
+    }
+    // Same, with the platform admin flag.
+    static String loginAdmin(userId: String) {
+        var token = GamesTestKit.login(userId)
+        GamesTestKit.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr(userId))
+        return token
+    }
+    static List<String> auth(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+    static TestResponse send(method: String, path: String, headers: List<String>, body: String) = GamesTestKit.app().client.send(method, path, headers, "", body)
+    static TestResponse get(path: String, headers: List<String>) = GamesTestKit.app().client.send("GET", path, headers, "", "")
+    static TestResponse anonymous(method: String, path: String, body: String) = GamesTestKit.app().client.send(method, path, listOf("Content-Type: application/json"), "", body)
+    // Submits a game as `token` and returns its id.
+    static String submit(token: String, title: String, url: String) {
+        var res = GamesTestKit.send("POST", "/games", GamesTestKit.auth(token), "{\"title\":\"" + title + "\",\"url\":\"" + url + "\"}")
+        Check.status(res, 200)
+        return res.json("id")
+    }
+    // Submits and approves: the game is PUBLISHED.
+    static String publish(token: String, adminToken: String, title: String, url: String) {
+        var id = GamesTestKit.submit(token, title, url)
+        Check.status(GamesTestKit.send("POST", "/admin/games/" + id + "/approve", GamesTestKit.auth(adminToken), "{\"note\":\"ok\"}"), 200)
+        return id
+    }
+    // Position of the item whose `field` equals `value` in the array at `listPath` ("" = the document itself), or -1.
+    static Int indexOf(res: TestResponse, listPath: String, field: String, value: String) {
+        var prefix = ""
+        if (listPath.length() > 0) {
+            prefix = listPath + "."
+        }
+        var n = res.jsonSize(listPath)
+        var i = 0
+        while (i < n) {
+            if (res.jsonStr(prefix + i + "." + field) == value) {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+    // The faisca balance of an account (`coin_accounts`), 0 when it has none yet.
+    static Long balance(accountId: String) {
+        var row = GamesTestKit.db().queryOptional("select balance from coin_accounts where account_id = ?", DbParams().bindStr(accountId))
+        if (row == null) {
+            return 0L
+        }
+        return row.getLong("balance")
+    }
+    // Gives the account a wallet with `milli` milli-faiscas (the airdrop belongs to the coin port).
+    static fund(accountId: String, milli: Long) {
+        GamesTestKit.db().execute("insert into coin_accounts (account_id, balance, version, created_at) values (?, ?, 0, ?)", DbParams().bindStr(accountId).bindLong(milli).bindInstant(Time.nowIso()))
+    }
+    // Last test of every file: the shared jobs keep the test process alive otherwise (G124).
+    static finish() {
+        var shared = GamesTestKit.cachedShared
+        if (shared != null) {
+            shared.stop()
+        }
+    }
+}

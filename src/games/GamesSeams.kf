@@ -1,0 +1,203 @@
+package games
+
+import age.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.security.*
+import kernel.sanctions.*
+import kernel.text.*
+import kernel.time.*
+import kernel.url.*
+
+// Caller-owned seams of the games domain (PORTING_GUIDE). Profile (ProfileDirectory), notifications
+// (Notifications API) and the age gate are called through the owners' real classes; what is still
+// unported goes through the two classes below.
+// pending-port: coin. The faisca ledger (CoinService): rewards, purchases and the rate. The default runs
+// exactly the SQL the Java CoinService + CoinLedgerPersistenceAdapter end up executing on `coin_accounts`,
+// `coin_entries` and `coin_rate_history`: hash-chained entries, optimistic snapshot, idempotency by
+// (account, "kind:ref"), messages encrypted with SecretCipher when a key is configured. The presence
+// streak (`recordPresence`, user_streaks) is the coin owner's: the default does nothing.
+class GamesCoins {
+    Db store
+    SecretCipher cipher
+    public constructor(store: Db, cipher: SecretCipher) {
+        this.store = store
+        this.cipher = cipher
+    }
+    // A meaningful action happened (daily game finished): counts as today's presence. pending-port: coin.
+    recordPresence(userId: String);
+    static String treasuryAccount() = "coin_tesouraria"
+    // CoinService.scaledReward: a base value (milli-faiscas at the initial rate) converted to the current rate.
+    Long scaledReward(baseMf: Long) {
+        var micros = this.currentMicros()
+        var safe = 1000L
+        if (micros > safe) {
+            safe = micros
+        }
+        var scaled = (baseMf * 10000L + safe / 2L) / safe
+        if (scaled < 1L) {
+            return 1L
+        }
+        return scaled
+    }
+    // CoinRateService.latest().brlMicros(): the last published rate, seeded with R$ 0,01 per faisca.
+    Long currentMicros() {
+        var row = store.queryOptional("select brl_cents, brl_micros from coin_rate_history order by effective_at desc limit 1", DbParams())
+        if (row == null) {
+            store.execute("insert into coin_rate_history (id, brl_cents, brl_micros, note, effective_at) values (?, ?, ?, ?, ?)", DbParams().bindStr(Ids.prefixed("rate_")).bindLong(1L).bindLong(10000L).bindStr("Cotação inicial de referência").bindInstant(Time.nowIso()))
+            return 10000L
+        }
+        var micros = 0L
+        var stored = row.getLongOrNull("brl_micros")
+        if (stored != null) {
+            micros = stored
+        }
+        if (micros > 0L) {
+            return micros
+        }
+        return row.getLong("brl_cents") * 10000L
+    }
+    // CoinService.hasReward: has this reference already been paid (a REWARD entry with it)?
+    Bool hasReward(ref: String) = this.entryExists("REWARD", ref)
+    // CoinLedgerRepository.existsByKindAndRefId(PURCHASE, ref).
+    Bool hasPurchase(ref: String) = this.entryExists("PURCHASE", ref)
+    Bool entryExists(kind: String, ref: String) = store.queryLong("select count(*) from coin_entries where kind = ? and ref_id = ?", DbParams().bindStr(kind).bindStr(ref)) > 0L
+    // CoinService.reward: treasury -> account, idempotent by reference.
+    reward(accountId: String, amount: Long, ref: String, message: String) {
+        if (amount <= 0L) {
+            throw Errors.api(400, "INVALID_AMOUNT", "O valor precisa ser positivo.")
+        }
+        var self = this
+        store.transaction(() -> {
+    if (self.hasReward(ref)) {
+        return
+    }
+    self.ensureTreasury()
+    var now = Time.nowIso()
+    self.grant(GamesCoins.treasuryAccount(), 0L - amount, "GENESIS_TREASURY", "reward-tesouraria:" + ref, message, now)
+    self.grant(accountId, amount, "REWARD", ref, message, now)
+})
+    }
+    // CoinService.purchase: account -> treasury (the faisca circulates back), idempotent by reference.
+    purchase(accountId: String, amount: Long, ref: String, message: String) {
+        if (amount <= 0L) {
+            throw Errors.api(400, "INVALID_AMOUNT", "O preço precisa ser positivo.")
+        }
+        var self = this
+        store.transaction(() -> {
+    if (self.hasPurchase(ref)) {
+        return
+    }
+    self.ensureTreasury()
+    var now = Time.nowIso()
+    self.grant(accountId, 0L - amount, "PURCHASE", ref, message, now)
+    self.grant(GamesCoins.treasuryAccount(), amount, "GENESIS_TREASURY", "loja-tesouraria:" + ref, message, now)
+})
+    }
+    Bool accountExists(accountId: String) = store.queryLong("select count(*) from coin_accounts where account_id = ?", DbParams().bindStr(accountId)) > 0L
+    ensureAccount(accountId: String) {
+        if (this.accountExists(accountId)) {
+            return
+        }
+        store.execute("insert into coin_accounts (account_id, balance, version, created_at) values (?, ?, ?, ?)", DbParams().bindStr(accountId).bindLong(0L).bindLong(0L).bindInstant(Time.nowIso()))
+    }
+    // The treasury is born with the fixed genesis supply (2,000,000 faiscas) the first time it is touched.
+    ensureTreasury() {
+        if (this.accountExists(GamesCoins.treasuryAccount())) {
+            return
+        }
+        this.ensureAccount(GamesCoins.treasuryAccount())
+        this.grant(GamesCoins.treasuryAccount(), 2000000000L, "GENESIS_TREASURY", "genesis:tesouraria", "Gênese da faísca (supply fixo)", Time.nowIso())
+    }
+    // CoinService.grant: one hash-chained entry and the optimistic balance update (debit when amount < 0).
+    grant(accountId: String, amount: Long, kind: String, refId: String, message: String, now: String) {
+        this.ensureAccount(accountId)
+        var account = store.queryOne("select balance, version from coin_accounts where account_id = ?", DbParams().bindStr(accountId))
+        var balance = account.getLong("balance")
+        var version = account.getLong("version")
+        if (amount < 0L && balance + amount < 0L) {
+            throw Errors.api(400, "INSUFFICIENT_SPARKS", "Faíscas insuficientes.")
+        }
+        var prev = "0000000000000000000000000000000000000000000000000000000000000000"
+        var last = store.queryOptional("select hash from coin_entries where account_id = ? order by created_at desc limit 1", DbParams().bindStr(accountId))
+        if (last != null) {
+            prev = last.getStr("hash")
+        }
+        var idem = kind.toLowerCase() + ":" + refId
+        var hash = Hashes.sha256Hex(prev + "|" + accountId + "|" + amount + "|" + kind + "|" + refId + "|" + idem)
+        var duplicate = store.queryLong("select count(*) from coin_entries where account_id = ? and idempotency_key = ?", DbParams().bindStr(accountId).bindStr(idem)) > 0L
+        if (duplicate) {
+            return
+        }
+        store.execute("insert into coin_entries (id, account_id, amount, kind, ref_id, message, idempotency_key, prev_hash, hash, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(Ids.prefixed("cent_")).bindStr(accountId).bindLong(amount).bindStr(kind).bindStr(refId).bindStrOrNull(this.seal(message)).bindStr(idem).bindStr(prev).bindStr(hash).bindInstant(now))
+        var updated = store.execute("update coin_accounts set balance = ?, version = ? where account_id = ? and version = ?", DbParams().bindLong(balance + amount).bindLong(version + 1L).bindStr(accountId).bindLong(version))
+        if (updated == 0) {
+            throw Errors.api(409, "COIN_CONCURRENCY", "Movimentação concorrente; tente de novo.")
+        }
+    }
+    // The message of a transfer is personal data: encrypted at rest (AES-GCM) when the key exists.
+    String? seal(message: String) {
+        if (message.trim().length() == 0 || !cipher.isEnabled()) {
+            return message
+        }
+        return "enc:v1:" + cipher.encrypt(message)
+    }
+}
+
+// pending-port: feed (PublishPostService.publish). The default writes the post the way Post.publish
+// builds it (type INSIGHT, public, active, social identity, counters zero) with its tags and media, after the
+// age gate (ECA Digital) and the sanction gate. Not in the default: the new-account cooldown, the per-user
+// post limiter, the timing and risk signals, the content duplication guard, media ownership, feed
+// distribution, the `PostPublished` outbox event and the spam automod. The feed owner subclasses this.
+class GamesFeed {
+    Db store
+    AgeGate ageGate
+    SanctionGate sanctions
+    public constructor(store: Db, ageGate: AgeGate, sanctions: SanctionGate) {
+        this.store = store
+        this.ageGate = ageGate
+        this.sanctions = sanctions
+    }
+    // Publishes an achievement text in the author's feed and returns the post id.
+    String publishShare(authorId: String, text: String, tags: List<String>, mediaIds: List<String>) {
+        ageGate.requireCanWrite(authorId)
+        sanctions.requireNotRestricted(authorId)
+        var content = ""
+        var cleaned = PlainText.defuse(text.trim())
+        if (cleaned != null) {
+            content = cleaned
+        }
+        var id = Ids.prefixed("post_")
+        var chained = DbParams()
+        chained.bindStr(id)
+        chained.bindStr(authorId)
+        chained.bindStr("INSIGHT")
+        chained.bindStr(content)
+        chained.bindInstant(Time.nowIso())
+        chained.bindStr("PUBLIC")
+        chained.bindInt(0)
+        chained.bindInt(0)
+        chained.bindInt(0)
+        chained.bindInt(0)
+        chained.bindInt(0)
+        chained.bindStr("ACTIVE")
+        chained.bindStr("SOCIAL")
+        chained.bindBool(false)
+        store.execute("insert into posts (id, author_id, type, content, created_at, visibility, reactions, comments, saves, shares, reposts, status, author_identity, media_spoiler) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", chained)
+        for (var tag in tags) {
+            store.execute("insert into post_tags (post_id, tag) values (?, ?)", DbParams().bindStr(id).bindStr(tag))
+        }
+        for (var media in mediaIds) {
+            store.execute("insert into post_media (post_id, media_id) values (?, ?)", DbParams().bindStr(id).bindStr(media))
+        }
+        return id
+    }
+}
+
+// The DNS side of the game address guard. Production resolves the host (HostAddresses); tests stub the
+// names so no suite depends on the network (literal IPs still go through the real classification).
+class GamesHosts {
+    // "OK", "INTERNAL" or "UNRESOLVED".
+    String classify(host: String) = HostAddresses.classify(host)
+}

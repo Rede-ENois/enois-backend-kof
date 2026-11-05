@@ -1,0 +1,421 @@
+package games
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.text.*
+import kernel.time.*
+import notifications.*
+import profile.*
+
+// The games aggregator: the creator sends the LINK, moderation reviews it in the frame it will run in and
+// the published game runs EMBEDDED (sandbox, full screen). Port of GameService; every code and pt-BR
+// message is the Java one. Profile data comes from the profile module (ProfileDirectory), notices from the
+// Notifications API.
+class GamesService {
+    Db database
+    GamesStore games
+    GameUrlGuard urlGuard
+    ProfileDirectory profiles
+    Notifications notifications
+    GamesCoins coins
+    GamesFeed feed
+    public constructor(database: Db, games: GamesStore, urlGuard: GameUrlGuard, profiles: ProfileDirectory, notifications: Notifications, coins: GamesCoins, feed: GamesFeed) {
+        this.database = database
+        this.games = games
+        this.urlGuard = urlGuard
+        this.profiles = profiles
+        this.notifications = notifications
+        this.coins = coins
+        this.feed = feed
+    }
+    static Long boostPriceMf() = 5000L
+    // The column ceilings (games.title varchar(200), description 4000, tags 500, url 500): without the check
+    // the database refused with "Data too long" and the person got a 409 about "the state of the data".
+    static checkLimits(title: String?, description: String?, tags: String?, url: String?) {
+        TextFieldLimit.check("GAME_FIELD_TOO_LONG", "titulo", title, 200)
+        TextFieldLimit.check("GAME_FIELD_TOO_LONG", "descricao", description, 4000)
+        TextFieldLimit.check("GAME_FIELD_TOO_LONG", "tags", tags, 500)
+        TextFieldLimit.check("GAME_FIELD_TOO_LONG", "link", url, 500)
+    }
+    static String requireTitle(title: String?) {
+        var clean = GameRules.trimOrNull(title)
+        if (clean == null) {
+            throw Errors.api(400, "INVALID_TITLE", "Título do jogo precisa de pelo menos 3 caracteres.")
+        }
+        if (clean.length() < 3) {
+            throw Errors.api(400, "INVALID_TITLE", "Título do jogo precisa de pelo menos 3 caracteres.")
+        }
+        return clean
+    }
+    GameRecord submit(userId: String, slugBase: String?, title: String?, description: String?, cover: String?, url: String?, tags: String?) {
+        GamesService.checkLimits(title, description, tags, url)
+        var cleanTitle = GamesService.requireTitle(title)
+        var safeUrl = urlGuard.validate(url)
+        var base = GameRules.slugFrom(cleanTitle)
+        if (GameRules.hasText(slugBase)) {
+            base = GameRules.slugFrom(slugBase as String)
+        }
+        var now = Time.nowIso()
+        var self = this
+        var id = Ids.prefixed("game_")
+        database.transaction(() -> {
+    var slug = self.uniqueSlug(userId, base)
+    var created = GameRecord(id, userId, slug, cleanTitle, GameRules.trimOrNull(description), GameRules.trimOrNull(cover), safeUrl, GameRules.trimOrNull(tags), GameStatus.submitted(), Nulls.str(), Nulls.str(), Nulls.str(), Nulls.str(), Nulls.str(), Nulls.str(), Nulls.str(), Nulls.str(), "RELEASED", "FREE", 0, "WIDESCREEN", Nulls.str(), Nulls.str(), Nulls.str(), Nulls.str(), Nulls.str(), Nulls.str(), Nulls.str(), 0, Nulls.str(), Nulls.str(), Nulls.str(), now, Nulls.str(), now, now)
+    self.games.insert(created)
+})
+        return this.game(id)
+    }
+    GameRecord resubmit(gameId: String, userId: String) {
+        var current = this.game(gameId)
+        if (current.userId() != userId) {
+            throw Errors.api(403, "NOT_AUTHORIZED", "Só o criador pode reenviar.")
+        }
+        if (current.status() != GameStatus.rejected()) {
+            throw Errors.api(409, "NOT_REJECTED", "Só jogo recusado pode ser reenviado.")
+        }
+        games.resubmit(gameId, Time.nowIso())
+        return this.game(gameId)
+    }
+    // Owner edit: the whole sheet, the public address (slug) and the visual identity. The address goes through
+    // the same guard as the submission, and the edit does NOT publish by itself: a published game stays
+    // published, a rejected one goes back to the queue through `resubmit`.
+    GameRecord edit(gameId: String, userId: String, title: String?, description: String?, cover: String?, url: String?, tags: String?, details: GameDetailsInput, slug: String?) {
+        var current = this.owned(gameId, userId)
+        GamesService.checkLimits(title, description, tags, url)
+        var cleanTitle = GamesService.requireTitle(title)
+        var safeUrl = urlGuard.validate(url)
+        var newSlug = this.slugChange(current, slug)
+        games.update(gameId, cleanTitle, GameRules.trimOrNull(description), GameRules.trimOrNull(cover), safeUrl, GameRules.trimOrNull(tags), details, newSlug, Time.nowIso())
+        return this.game(gameId)
+    }
+    // The new slug when the edit asks for a different one (validated), null to keep the current.
+    String? slugChange(current: GameRecord, requested: String?) {
+        if (!GameRules.hasText(requested)) {
+            return null
+        }
+        var candidate = GameRules.slugFrom(requested as String)
+        if (candidate == current.slug()) {
+            return null
+        }
+        if (candidate.length() < 3) {
+            throw Errors.api(400, "INVALID_SLUG", "O endereço do jogo precisa de pelo menos 3 caracteres (letras, números ou hífen).")
+        }
+        if (games.existsByUserAndSlug(current.userId(), candidate)) {
+            throw Errors.api(409, "SLUG_IN_USE", "Você já tem um jogo nesse endereço. Escolha outro.")
+        }
+        return candidate
+    }
+    // Delete from the store (owner only): what exists BECAUSE of the game goes with it (updates, favorites,
+    // usage history, identity tokens). Collections keep ids; an id that no longer resolves is skipped.
+    remove(gameId: String, userId: String) {
+        this.owned(gameId, userId)
+        var self = this
+        database.transaction(() -> {
+    self.games.deleteUpdates(gameId)
+    self.games.deleteFavorites(gameId)
+    self.games.deleteEvents(gameId)
+    self.games.deleteTokens(gameId)
+    self.games.delete(gameId)
+})
+    }
+    // Moderation takes the game off the air. The record and the history stay (suspending is not deleting).
+    GameRecord suspend(gameId: String, reviewerId: String, note: String?) {
+        TextFieldLimit.check("GAME_FIELD_TOO_LONG", "nota", note, 500)
+        var current = this.game(gameId)
+        if (current.status() == GameStatus.suspended()) {
+            throw Errors.api(409, "ALREADY_SUSPENDED", "Este jogo já está suspenso.")
+        }
+        games.suspend(gameId, reviewerId, GameRules.trimOrNull(note), Time.nowIso())
+        return this.game(gameId)
+    }
+    GameRecord unsuspend(gameId: String, reviewerId: String) {
+        var current = this.game(gameId)
+        if (current.status() != GameStatus.suspended()) {
+            throw Errors.api(409, "NOT_SUSPENDED", "Este jogo não está suspenso.")
+        }
+        games.unsuspend(gameId, reviewerId, Time.nowIso())
+        return this.game(gameId)
+    }
+    // A development diary note: what changed in this version. Whoever follows the creator is told.
+    GameUpdateRecord publishUpdate(gameId: String, userId: String, title: String?, body: String?, version: String?) {
+        var current = this.owned(gameId, userId)
+        var cleanTitle = GameRules.trimOrNull(title)
+        if (cleanTitle == null) {
+            throw Errors.api(400, "INVALID_TITLE", "A novidade precisa de um título.")
+        }
+        var shownVersion = GameRules.trimOrNull(version)
+        if (shownVersion == null) {
+            shownVersion = current.version()
+        }
+        var created = GameUpdateRecord(Ids.prefixed("gup_"), current.id(), userId, cleanTitle, GameRules.trimOrNull(body), shownVersion, Time.nowIso())
+        var self = this
+        database.transaction(() -> {
+    self.games.insertUpdate(created)
+    self.notifyFollowers(current, "Novidade em " + current.title(), created.title())
+})
+        return created
+    }
+    List<GameUpdateRecord> updatesOf(gameId: String, limit: Int) = games.updatesOf(gameId, limit)
+    GameRecord owned(gameId: String, userId: String) {
+        var found = this.game(gameId)
+        if (found.userId() != userId) {
+            throw Errors.api(403, "NOT_AUTHORIZED", "Este jogo não é seu.")
+        }
+        return found
+    }
+    // Whoever follows the creator gets a notice, never the creator.
+    notifyFollowers(game: GameRecord, title: String, body: String) {
+        var author = "Um criador"
+        var username = ""
+        var profile = profiles.findById(game.userId())
+        if (profile != null) {
+            author = profile.name()
+            username = profile.username()
+        }
+        var href = "/games/" + username + "/" + game.slug()
+        for (var followerId in games.followersOf(game.userId())) {
+            if (followerId != game.userId()) {
+                notifications.create(followerId, "NEW_GAME", game.userId(), author + " · " + title, body, href, "Ver")
+            }
+        }
+    }
+    // The id of the profile behind a username in the URL (404 when the profile does not exist).
+    String userIdFromUsername(username: String) {
+        var found = profiles.findByUsername(username)
+        if (found == null) {
+            throw Errors.api(404, "GAME_NOT_FOUND", "Criador não encontrado.")
+        }
+        return found.id()
+    }
+    // With the reader: the owner sees the game in any state, the others only when published. A PUBLIC
+    // opening records the page view (the "views" series of the panel); the owner's does not count.
+    GameRecord byUserAndSlug(username: String, slug: String, viewerId: String?) {
+        var found = games.findByUserAndSlug(this.userIdFromUsername(username), slug)
+        if (found == null) {
+            throw Errors.api(404, "GAME_NOT_FOUND", "Jogo não encontrado.")
+        }
+        var owner = false
+        if (viewerId != null) {
+            owner = found.userId() == viewerId
+        }
+        if (found.status() != GameStatus.published() && !owner) {
+            throw Errors.api(404, "GAME_NOT_FOUND", "Jogo não encontrado.")
+        }
+        if (!owner) {
+            games.recordEvent(Ids.prefixed("gevt_"), found.id(), GameEventKind.pageView(), viewerId, Time.nowIso())
+        }
+        return found
+    }
+    List<GameRecord> publishedByUser(username: String) = games.findByUserAndStatus(this.userIdFromUsername(username), GameStatus.published(), 50)
+    List<GameRecord> ownedBy(userId: String) = games.findByUser(userId)
+    List<GameRecord> pending(limit: Int) = games.findByStatus(GameStatus.submitted(), limit)
+    GameRecord approve(gameId: String, reviewerId: String, note: String?) {
+        // The ceiling of the column (games.review_note varchar(500)).
+        TextFieldLimit.check("GAME_FIELD_TOO_LONG", "nota", note, 500)
+        var current = this.game(gameId)
+        if (current.status() != GameStatus.submitted()) {
+            throw Errors.api(409, "NOT_SUBMITTED", "Este jogo não está na fila de revisão.")
+        }
+        var self = this
+        database.transaction(() -> {
+    self.games.approve(gameId, reviewerId, GameRules.trimOrNull(note), Time.nowIso())
+    self.notifyFollowers(self.game(gameId), "Jogo publicado no Énóis", current.title())
+})
+        return this.game(gameId)
+    }
+    GameRecord reject(gameId: String, reviewerId: String, note: String?) {
+        var current = this.game(gameId)
+        if (current.status() != GameStatus.submitted()) {
+            throw Errors.api(409, "NOT_SUBMITTED", "Este jogo não está na fila de revisão.")
+        }
+        var reason = GameRules.trimOrNull(note)
+        if (reason == null) {
+            throw Errors.api(400, "REVIEW_NOTE_REQUIRED", "A recusa precisa de um motivo.")
+        }
+        games.reject(gameId, reviewerId, reason, Time.nowIso())
+        return this.game(gameId)
+    }
+    GameRecord game(gameId: String) {
+        var found = games.findById(gameId)
+        if (found == null) {
+            throw Errors.api(404, "GAME_NOT_FOUND", "Jogo não encontrado.")
+        }
+        return found
+    }
+    String uniqueSlug(userId: String, base: String) {
+        var slug = base
+        if (slug.length() == 0) {
+            slug = "jogo"
+        }
+        var candidate = slug
+        var n = 2
+        while (games.existsByUserAndSlug(userId, candidate)) {
+            candidate = slug + "-" + n
+            n = n + 1
+        }
+        return candidate
+    }
+    // Spending inside the game: the game ASKS (postMessage) and the person CONFIRMS on the platform; the debit
+    // is made here, with THEIR session. Idempotent by (game, the game's requestId): a repeated request does not
+    // charge twice. The value goes back to the treasury (fixed supply).
+    spendInGame(userId: String, gameId: String, amount: Long?, motivo: String?, requestId: String?) {
+        var current = this.game(gameId)
+        if (current.status() != GameStatus.published()) {
+            throw Errors.api(409, "GAME_NOT_PUBLISHED", "Só jogo publicado cobra faíscas.")
+        }
+        var value = 0L
+        if (amount != null) {
+            value = amount
+        }
+        if (value <= 0L) {
+            throw Errors.api(400, "INVALID_AMOUNT", "Valor da despesa obrigatório.")
+        }
+        if (!GameRules.hasText(requestId)) {
+            throw Errors.api(400, "REQUEST_ID_REQUIRED", "O pedido do jogo precisa de um id.")
+        }
+        var ref = "game:" + gameId + ":" + GameRules.trimText(requestId)
+        var reason = ""
+        if (GameRules.hasText(motivo)) {
+            reason = " — " + GameRules.trimText(motivo)
+        }
+        var self = this
+        database.transaction(() -> {
+    self.coins.purchase(userId, value, ref, "Gasto no jogo " + current.title() + reason)
+    self.games.recordEvent(Ids.prefixed("gev_"), gameId, GameEventKind.share(), userId, Time.nowIso())
+})
+    }
+    // Paid boost (G2): the creator boosts their OWN game, 5 faiscas for 7 days, one boost per week per game.
+    // It leaves the creator and goes to the treasury (fixed supply kept); the ledger entry is the stamp's owner.
+    GameRecord boost(gameId: String, userId: String) {
+        var current = this.game(gameId)
+        if (current.userId() != userId) {
+            throw Errors.api(403, "NOT_THE_CREATOR", "Só o criador impulsiona o próprio jogo.")
+        }
+        if (current.status() != GameStatus.published()) {
+            throw Errors.api(409, "GAME_NOT_PUBLISHED", "Só jogo publicado pode ser impulsionado.")
+        }
+        var now = Time.nowIso()
+        var ref = "boost:" + gameId + ":" + IsoWeeks.key(now.substring(0, 10))
+        if (coins.hasPurchase(ref)) {
+            throw Errors.api(409, "ALREADY_BOOSTED", "Este jogo já foi impulsionado nesta semana — volta no catálogo em sete dias.")
+        }
+        var base = now
+        if (GameRules.isFuture(current.boostUntil(), now)) {
+            base = current.boostUntil() as String
+        }
+        var until = Time.plusSeconds(base, 604800L)
+        var self = this
+        database.transaction(() -> {
+    self.coins.purchase(userId, GamesService.boostPriceMf(), ref, "Impulso do jogo: " + current.title())
+    self.games.boost(gameId, until, now)
+})
+        return this.game(gameId)
+    }
+    // ---- G3: curated themed collections (v1: administration) ----
+    GameCollectionRecord createCollection(curatorId: String, title: String?, description: String?, gameIds: List<String>?) {
+        // The column ceilings (game_collections.title varchar(160), description varchar(500)).
+        TextFieldLimit.check("GAME_FIELD_TOO_LONG", "titulo", title, 160)
+        TextFieldLimit.check("GAME_FIELD_TOO_LONG", "descricao", description, 500)
+        var cleanTitle = GameRules.trimOrNull(title)
+        if (cleanTitle == null) {
+            throw Errors.api(400, "TITLE_REQUIRED", "O título precisa de pelo menos 5 caracteres.")
+        }
+        if (cleanTitle.length() < 5) {
+            throw Errors.api(400, "TITLE_REQUIRED", "O título precisa de pelo menos 5 caracteres.")
+        }
+        var ids = listOf<String>()
+        if (gameIds != null) {
+            for (var id in gameIds) {
+                if (id.trim().length() > 0 && !ids.contains(id.trim())) {
+                    ids.add(id.trim())
+                }
+            }
+        }
+        if (ids.size() == 0) {
+            throw Errors.api(400, "GAMES_REQUIRED", "A coleção precisa de pelo menos um jogo.")
+        }
+        var now = Time.nowIso()
+        var created = GameCollectionRecord(Ids.prefixed("gcol_"), curatorId, cleanTitle, GameCollections.describe(description), ids, "PUBLISHED", now, now)
+        games.insertCollection(created)
+        return created
+    }
+    GameCollectionRecord hideCollection(collectionId: String, curatorId: String) {
+        var found = games.findCollection(collectionId)
+        if (found == null) {
+            throw Errors.api(404, "COLLECTION_NOT_FOUND", "Coleção não encontrada.")
+        }
+        if (found.curatorId() != curatorId) {
+            throw Errors.api(403, "NOT_THE_CURATOR", "Só quem curou esconde a coleção.")
+        }
+        games.hideCollection(collectionId, Time.nowIso())
+        var hidden = games.findCollection(collectionId)
+        if (hidden == null) {
+            throw Errors.api(404, "COLLECTION_NOT_FOUND", "Coleção não encontrada.")
+        }
+        return hidden
+    }
+    // The published collections with the games RESOLVED (hidden or suspended games leave the list).
+    List<GameCollectionView> collections(limit: Int) {
+        var out = listOf<GameCollectionView>()
+        for (var collection in games.publishedCollections(GameRules.clamp(limit, 1, 60))) {
+            var resolved = listOf<GameView>()
+            for (var id in collection.gameIds()) {
+                var found = games.findById(id)
+                if (found != null) {
+                    if (found.status() == GameStatus.published()) {
+                        resolved.add(GameRules.view(found, null, 0, false, null))
+                    }
+                }
+            }
+            out.add(GameCollectionView(collection.id(), collection.title(), collection.description(), resolved, collection.createdAt()))
+        }
+        return out
+    }
+    // G-share (share progress): the game (an iframe of another origin, WITHOUT a session) sends the text and
+    // media by postMessage; the app confirms with the player and publishes HERE, with their session, so the
+    // session never leaks to the game and the human click is what publishes. Cap of 12 shares per person per
+    // day in each game. Returns the id of the post.
+    String compartilhar(userId: String, gameId: String, texto: String?, mediaIds: List<String>?) {
+        var current = this.game(gameId)
+        if (current.status() != GameStatus.published()) {
+            throw Errors.api(409, "GAME_NOT_PUBLISHED", "Só jogo publicado compartilha progresso.")
+        }
+        if (!GameRules.hasText(texto)) {
+            throw Errors.api(400, "TEXT_REQUIRED", "A conquista precisa de um texto.")
+        }
+        var clean = GameRules.trimText(texto)
+        if (clean.length() > 600) {
+            throw Errors.api(400, "TEXT_TOO_LONG", "A conquista aceita no máximo 600 caracteres.")
+        }
+        var now = Time.nowIso()
+        var startOfDay = now.substring(0, 10) + "T00:00:00Z"
+        if (games.countEventsSince(gameId, GameEventKind.share(), userId, startOfDay) >= 12L) {
+            throw Errors.api(429, "SHARE_LIMIT", "Você já compartilhou 12 conquistas deste jogo hoje — amanhã tem mais.")
+        }
+        var media = listOf<String>()
+        if (mediaIds != null) {
+            media = mediaIds
+        }
+        var tags = listOf<String>()
+        tags.add("game")
+        tags.add(current.slug())
+        var self = this
+        var postId = ""
+        database.transaction(() -> {
+    postId = self.feed.publishShare(userId, clean, tags, media)
+    self.games.recordEvent(Ids.prefixed("gev_"), gameId, GameEventKind.share(), userId, now)
+})
+        return postId
+    }
+}
+
+class GameCollections {
+    // The description of a collection: trimmed, null when there is none.
+    static String? describe(description: String?) {
+        if (description == null) {
+            return null
+        }
+        return description.trim()
+    }
+}

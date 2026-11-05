@@ -1,0 +1,62 @@
+import games.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of GameSocialTests: reviews and comments on the game page.
+test "reviews and comments flow" {
+    var owner = GamesTestKit.login("social-game-owner")
+    var reviewer = GamesTestKit.login("social-game-reviewer")
+    var db = GamesTestKit.db()
+    // A published game inserted as the Java test saved it through the repository.
+    var id = "game_social_0001"
+    var now = Time.nowIso()
+    db.execute("insert into games (id, user_id, slug, title, description, url, tags, status, reviewed_by, review_note, submitted_at, reviewed_at, published_at, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, \'PUBLISHED\', \'admin\', \'ok\', ?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr("social-game-owner").bindStr("social-" + id).bindStr("Jogo social").bindStr("desc").bindStr("https://example.com/jogo").bindStr("puzzle").bindInstant(now).bindInstant(now).bindInstant(now).bindInstant(now).bindInstant(now))
+    var review = GamesTestKit.send("POST", "/games/" + id + "/reviews", GamesTestKit.auth(reviewer), "{\"rating\":5,\"body\":\"Muito bom!\"}")
+    Check.status(review, 200)
+    Check.jsonEq(review, "rating", "5")
+    var ratings = GamesTestKit.get("/games/ratings?ids=" + id, listOf<String>())
+    Check.status(ratings, 200)
+    Check.jsonEq(ratings, id + ".average", "5.0")
+    Check.jsonEq(ratings, id + ".reviews", "1")
+    Check.jsonEq(ratings, id + ".comments", "0")
+    var reviews = GamesTestKit.get("/games/" + id + "/reviews", listOf<String>())
+    Check.status(reviews, 200)
+    Check.jsonEq(reviews, "count", "1")
+    Check.jsonEq(reviews, "average", "5.0")
+    Check.jsonEq(reviews, "items.0.username", "social-game-reviewer")
+    // The owner does not review their own game.
+    Check.apiError(GamesTestKit.send("POST", "/games/" + id + "/reviews", GamesTestKit.auth(owner), "{\"rating\":5}"), 403, "OWNER_CANNOT_REVIEW")
+    // The rating goes from 1 to 5; sending again updates the one review of the person.
+    Check.apiError(GamesTestKit.send("POST", "/games/" + id + "/reviews", GamesTestKit.auth(reviewer), "{\"rating\":6}"), 400, "INVALID_RATING")
+    Check.apiError(GamesTestKit.send("POST", "/games/" + id + "/reviews", GamesTestKit.auth(reviewer), "{}"), 400, "INVALID_RATING")
+    Check.status(GamesTestKit.send("POST", "/games/" + id + "/reviews", GamesTestKit.auth(reviewer), "{\"rating\":3}"), 200)
+    var updated = GamesTestKit.get("/games/" + id + "/reviews", listOf<String>())
+    Check.jsonEq(updated, "count", "1")
+    Check.jsonEq(updated, "average", "3.0")
+    var comment = GamesTestKit.send("POST", "/games/" + id + "/comments", GamesTestKit.auth(reviewer), "{\"body\":\"Tem multiplayer?\"}")
+    Check.status(comment, 200)
+    var commentId = comment.json("id")
+    var comments = GamesTestKit.get("/games/" + id + "/comments", listOf<String>())
+    Check.status(comments, 200)
+    Check.jsonEq(comments, "items.0.body", "Tem multiplayer?")
+    Check.jsonEq(comments, "count", "1")
+    Check.apiError(GamesTestKit.send("POST", "/games/" + id + "/comments", GamesTestKit.auth(reviewer), "{\"body\":\"a\"}"), 400, "COMMENT_REQUIRED")
+    // Somebody who is neither the author nor the owner cannot delete the comment; the author can.
+    var other = GamesTestKit.login("social-game-other")
+    Check.apiError(GamesTestKit.send("DELETE", "/games/" + id + "/comments/" + commentId, GamesTestKit.auth(other), ""), 403, "FORBIDDEN")
+    Check.status(GamesTestKit.send("DELETE", "/games/" + id + "/comments/" + commentId, GamesTestKit.auth(reviewer), ""), 204)
+    var empty = GamesTestKit.get("/games/" + id + "/comments", listOf<String>())
+    Check.eqInt("no comments left", 0, empty.jsonSize("items"))
+    Check.apiError(GamesTestKit.send("DELETE", "/games/" + id + "/comments/" + commentId, GamesTestKit.auth(reviewer), ""), 404, "COMMENT_NOT_FOUND")
+    // Deleting the own review.
+    Check.status(GamesTestKit.send("DELETE", "/games/" + id + "/reviews/mine", GamesTestKit.auth(reviewer), ""), 204)
+    Check.apiError(GamesTestKit.send("DELETE", "/games/" + id + "/reviews/mine", GamesTestKit.auth(reviewer), ""), 404, "REVIEW_NOT_FOUND")
+    Check.apiError(GamesTestKit.get("/games/nao-existe/reviews", listOf<String>()), 404, "GAME_NOT_FOUND")
+    // The ratings batch answers every asked id, even the ones with no reviews.
+    var batch = GamesTestKit.get("/games/ratings?ids=" + id + ",other-game-id", listOf<String>())
+    Check.jsonEq(batch, "other-game-id.reviews", "0")
+    Check.jsonEq(batch, "other-game-id.average", "0.0")
+    Check.apiError(GamesTestKit.get("/games/ratings", listOf<String>()), 400, "BAD_REQUEST")
+    GamesTestKit.finish()
+}

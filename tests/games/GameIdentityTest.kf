@@ -1,0 +1,66 @@
+import games.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of GameIdentityTests: the identity OF THE GAME: a single-use opaque token (the game never sees the
+// session), a stable pseudonym and the faisca spend, confirmed on the platform side and idempotent. The wallet
+// of the Java test (airdrop 100 + `/carteira`) belongs to the coin port: the player gets 105.000 mf by a
+// ledger row and the balance is read from `coin_accounts`.
+test "the identity token is single use and the spend is confirmed and idempotent" {
+    var admin = GamesTestKit.loginAdmin("gid-admin")
+    var player = GamesTestKit.login("gid-player")
+    GamesTestKit.fund("gid-player", 105000L)
+    var gameId = GamesTestKit.publish(player, admin, "Jogo de Identidade", "https://player.itch.io/gid")
+    // Without a session, no identity.
+    Check.apiError(GamesTestKit.anonymous("POST", "/games/" + gameId + "/identity", ""), 401, "UNAUTHENTICATED")
+    // Issues the token + pseudonym.
+    var minted = GamesTestKit.send("POST", "/games/" + gameId + "/identity", GamesTestKit.auth(player), "")
+    Check.status(minted, 200)
+    var token = minted.json("token")
+    var playerRef = minted.json("playerRef")
+    Check.eqInt("token has 64 hex characters", 64, token.length())
+    Check.isTrue("pseudonym prefix", playerRef.startsWith("plr_"))
+    Check.eqInt("pseudonym length", 36, playerRef.length())
+    // The token is stored only as a hash.
+    var stored = GamesTestKit.db().queryOne("select token_hash, player_ref from game_tokens where player_ref = ? order by created_at desc limit 1", DbParams().bindStr(playerRef))
+    Check.isTrue("no clear token in the table", stored.getStr("token_hash") != token)
+    // The pseudonym is stable for the same person and game, and different per game.
+    var again = GamesTestKit.send("POST", "/games/" + gameId + "/identity", GamesTestKit.auth(player), "")
+    Check.eqStr("stable pseudonym", playerRef, again.json("playerRef"))
+    // THE GAME'S SERVER exchanges the token for the identity (single use), with no session at all.
+    var validated = GamesTestKit.anonymous("POST", "/games/tokens/validate", "{\"token\":\"" + token + "\"}")
+    Check.status(validated, 200)
+    Check.jsonEq(validated, "gameId", gameId)
+    Check.jsonEq(validated, "playerRef", playerRef)
+    // Repeating the token is refused.
+    Check.apiError(GamesTestKit.anonymous("POST", "/games/tokens/validate", "{\"token\":\"" + token + "\"}"), 409, "TOKEN_ALREADY_USED")
+    Check.apiError(GamesTestKit.anonymous("POST", "/games/tokens/validate", "{\"token\":\"\"}"), 400, "TOKEN_REQUIRED")
+    Check.apiError(GamesTestKit.anonymous("POST", "/games/tokens/validate", "{\"token\":\"nao-existe\"}"), 404, "TOKEN_INVALID")
+    // An expired token: 410.
+    var other = GamesTestKit.send("POST", "/games/" + gameId + "/identity", GamesTestKit.auth(player), "")
+    GamesTestKit.db().execute("update game_tokens set expires_at = ? where token_hash = ?", DbParams().bindInstant(Time.plusSeconds(Time.nowIso(), -60L)).bindStr(Hashes.sha256Hex(other.json("token"))))
+    Check.apiError(GamesTestKit.anonymous("POST", "/games/tokens/validate", "{\"token\":\"" + other.json("token") + "\"}"), 410, "TOKEN_EXPIRED")
+    // SPEND confirmed on OUR side: 1.000 mf leave the player (105.000 -> 104.000).
+    var spent = GamesTestKit.send("POST", "/games/" + gameId + "/despesas", GamesTestKit.auth(player), "{\"amount\":1000,\"motivo\":\"comprar sementes\",\"requestId\":\"req-1\"}")
+    Check.status(spent, 200)
+    Check.jsonEq(spent, "status", "DEBITED")
+    Check.jsonEq(spent, "requestId", "req-1")
+    Check.eqStr("balance after the spend", "104000", "" + GamesTestKit.balance("gid-player"))
+    // The SAME request from the game again does not charge twice (idempotent by requestId).
+    Check.status(GamesTestKit.send("POST", "/games/" + gameId + "/despesas", GamesTestKit.auth(player), "{\"amount\":1000,\"motivo\":\"comprar sementes\",\"requestId\":\"req-1\"}"), 200)
+    Check.eqStr("a repeated request does not charge again", "104000", "" + GamesTestKit.balance("gid-player"))
+    // The treasury got it back (the supply is fixed) and the entry is in the ledger chain.
+    var entry = GamesTestKit.db().queryOne("select amount, kind, ref_id from coin_entries where account_id = ? and ref_id = ?", DbParams().bindStr("gid-player").bindStr("game:" + gameId + ":req-1"))
+    Check.eqStr("debit amount", "-1000", entry.getStr("amount"))
+    Check.eqStr("debit kind", "PURCHASE", entry.getStr("kind"))
+    // Validations of the spend.
+    Check.apiError(GamesTestKit.send("POST", "/games/" + gameId + "/despesas", GamesTestKit.auth(player), "{\"amount\":0,\"requestId\":\"req-2\"}"), 400, "INVALID_AMOUNT")
+    Check.apiError(GamesTestKit.send("POST", "/games/" + gameId + "/despesas", GamesTestKit.auth(player), "{\"amount\":10}"), 400, "REQUEST_ID_REQUIRED")
+    Check.apiError(GamesTestKit.send("POST", "/games/" + gameId + "/despesas", GamesTestKit.auth(player), "{\"amount\":999999999,\"requestId\":\"req-3\"}"), 400, "INSUFFICIENT_SPARKS")
+    var draft = GamesTestKit.submit(player, "Jogo Nao Publicado", "https://player.itch.io/draft")
+    Check.apiError(GamesTestKit.send("POST", "/games/" + draft + "/identity", GamesTestKit.auth(player), ""), 409, "GAME_NOT_PUBLISHED")
+    Check.apiError(GamesTestKit.send("POST", "/games/" + draft + "/despesas", GamesTestKit.auth(player), "{\"amount\":10,\"requestId\":\"req-4\"}"), 409, "GAME_NOT_PUBLISHED")
+    GamesTestKit.finish()
+}

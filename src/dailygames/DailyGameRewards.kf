@@ -1,0 +1,113 @@
+package dailygames
+
+import games.*
+import kernel.db.*
+import kernel.time.*
+import notifications.*
+
+record DailyPrizeTier(String label, Long amount)
+
+record DailyPrizeTable(List<DailyPrizeTier> tiers)
+
+// The faisca prize of the daily games. It is paid when the day CLOSES, never at the win: while somebody can
+// still climb, the scoreboard is not final. As yesterday's challenge accepts resuming during today, the day
+// only closes the day after tomorrow (see `settleClosedDays`). Each credit uses the reference
+// `jogos:<game>:<day>:<account>`: the faisca ledger is idempotent by reference, so running the settlement as
+// many times as needed duplicates neither the prize nor the notice. Port of DailyGameRewardsService.
+class DailyGameRewards {
+    Db database
+    DailyGamesClock clock
+    GamesCoins coins
+    Notifications notifications
+    DailyWordService word
+    DailyMazeService maze
+    DailyBlocksService blocks
+    public constructor(database: Db, clock: DailyGamesClock, coins: GamesCoins, notifications: Notifications, word: DailyWordService, maze: DailyMazeService, blocks: DailyBlocksService) {
+        this.database = database
+        this.clock = clock
+        this.coins = coins
+        this.notifications = notifications
+        this.word = word
+        this.maze = maze
+        this.blocks = blocks
+    }
+    // Faiscas are milli-faiscas in the ledger (1 faisca = 1000).
+    static Long top1() = 10000L
+    static Long podium() = 5000L
+    static Long top10() = 3000L
+    static Long completion() = 1000L
+    // Scoreboard band (1st onwards) -> faiscas. Whoever did not complete is not in the queue.
+    static Long prizeFor(rank: Int) {
+        if (rank == 1) {
+            return DailyGameRewards.top1()
+        }
+        if (rank <= 3) {
+            return DailyGameRewards.podium()
+        }
+        if (rank <= 10) {
+            return DailyGameRewards.top10()
+        }
+        return DailyGameRewards.completion()
+    }
+    static List<DailyPrizeTier> tiers() = listOf(DailyPrizeTier("1º lugar", DailyGameRewards.top1()), DailyPrizeTier("2º ao 3º", DailyGameRewards.podium()), DailyPrizeTier("4º ao 10º", DailyGameRewards.top10()), DailyPrizeTier("Demais que completaram", DailyGameRewards.completion()))
+    String today() = clock.today()
+    // Closes and pays the days ended up to `lookbackDays` ago. The look-back exists so the job catches the
+    // days that closed while the application was down; idempotency makes repeating harmless.
+    Int settleClosedDays(lookbackDays: Int) {
+        var self = this
+        var paid = 0
+        database.transaction(() -> {
+    var ago = 2
+    while (ago <= lookbackDays) {
+        paid = paid + self.settle(ZoneDates.plusDays(self.today(), 0 - ago))
+        ago = ago + 1
+    }
+})
+        return paid
+    }
+    // Pays the day's scoreboard in the three games; returns how many new credits went in.
+    Int settle(day: String) {
+        var self = this
+        var paid = 0
+        database.transaction(() -> {
+    paid = paid + self.settleGame("palavras", "Palavras", day, self.word.payoutOrder(day))
+    paid = paid + self.settleGame("labirinto", "Labirinto", day, self.maze.payoutOrder(day))
+    paid = paid + self.settleGame("blocos", "Blocos", day, self.blocks.payoutOrder(day))
+})
+        return paid
+    }
+    Int settleGame(key: String, label: String, day: String, ranked: List<String>) {
+        var paid = 0
+        var i = 0
+        while (i < ranked.size()) {
+            if (this.grant(key, label, day, ranked.get(i), i + 1)) {
+                paid = paid + 1
+            }
+            i = i + 1
+        }
+        return paid
+    }
+    Bool grant(key: String, label: String, day: String, userId: String, rank: Int) {
+        var ref = "jogos:" + key + ":" + day + ":" + userId
+        if (coins.hasReward(ref)) {
+            return false
+        }
+        var amount = coins.scaledReward(DailyGameRewards.prizeFor(rank))
+        coins.reward(userId, amount, ref, "Jogo diário " + label + " de " + day + " (" + rank + "º lugar)")
+        notifications.create(userId, "JOGO_DIARIO", "", "Faíscas do jogo diário", "Você ficou em " + rank + "º lugar em " + label + " de " + day + " e ganhou " + DailyGameRewards.formatFaiscas(amount) + " faíscas.", "/carteira", "Ver carteira")
+        return true
+    }
+    // The prize may come fractioned (scaled by the rate); shown without useless decimals: 10000 -> "10", 1500 -> "1.5".
+    static String formatFaiscas(milli: Long) {
+        var whole = milli / 1000L
+        var fraction = milli % 1000L
+        if (fraction == 0L) {
+            return "" + whole
+        }
+        var digits = DailyRules.pad(fraction, 3)
+        while (digits.endsWith("0")) {
+            digits = digits.substring(0, digits.length() - 1)
+        }
+        return whole + "." + digits
+    }
+}

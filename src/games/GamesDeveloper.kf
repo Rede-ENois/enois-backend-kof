@@ -1,0 +1,129 @@
+package games
+
+import kernel.error.*
+import kernel.id.*
+import kernel.text.*
+import kernel.time.*
+import kernel.url.*
+import profile.*
+
+// The creator page: who they are, what they published and who follows them. The identity is NOT duplicated:
+// name, handle, photo and cover keep coming from the Énóis profile; the creator page only adds what belongs
+// to Games (studio name, headline, creator bio, links). Whoever filled nothing has no page. Port of
+// DeveloperProfileService.
+record GameDeveloperPage(ProfileRecord user, DeveloperRecord? profile, List<GameRecord> games, Long followers, Bool following, Bool owner)
+
+class GamesDeveloper {
+    GamesStore games
+    ProfileDirectory profiles
+    public constructor(games: GamesStore, profiles: ProfileDirectory) {
+        this.games = games
+        this.profiles = profiles
+    }
+    static Int maxName() = 120
+    static Int maxHeadline() = 200
+    static Int maxBio() = 2000
+    static Int maxLinks() = 500
+    GameDeveloperPage page(username: String, viewerId: String?) {
+        var user = profiles.findByUsername(username)
+        if (user == null) {
+            throw Errors.api(404, "DEVELOPER_NOT_FOUND", "Criador não encontrado.")
+        }
+        var profile = games.findDeveloper(user.id())
+        var published = games.findByUserAndStatus(user.id(), GameStatus.published(), 60)
+        var owner = false
+        if (viewerId != null) {
+            owner = viewerId == user.id()
+        }
+        // An "empty" page is not a page: a developer profile saved with no field filled does not count as
+        // developer presence. With no published game and nothing filled there is nothing to show.
+        if (published.size() == 0 && !GamesDeveloper.hasContent(profile) && !owner) {
+            throw Errors.api(404, "DEVELOPER_NOT_FOUND", "Criador não encontrado.")
+        }
+        var followers = games.countFollowers(user.id())
+        var following = false
+        if (viewerId != null) {
+            following = games.followExists(viewerId, user.id())
+        }
+        return GameDeveloperPage(user, profile, published, followers, following, owner)
+    }
+    static Bool hasContent(profile: DeveloperRecord?) {
+        if (profile == null) {
+            return false
+        }
+        return GameRules.hasText(profile.displayName()) || GameRules.hasText(profile.headline()) || GameRules.hasText(profile.bio()) || GameRules.hasText(profile.links())
+    }
+    // The owner edits their own page. Empty clears the field.
+    DeveloperRecord save(userId: String, displayName: String?, headline: String?, bio: String?, links: String?, avatar: String?, cover: String?) {
+        var cleanName = GamesDeveloper.clean(displayName, GamesDeveloper.maxName())
+        var cleanHeadline = GamesDeveloper.clean(headline, GamesDeveloper.maxHeadline())
+        var cleanBio = GamesDeveloper.clean(bio, GamesDeveloper.maxBio())
+        var cleanLinks = SafeUrl.requireHttpUrlsJoined(GamesDeveloper.clean(links, GamesDeveloper.maxLinks()), "[,\\n]", "links")
+        var cleanAvatar = GamesDeveloper.clean(avatar, 500)
+        var cleanCover = GamesDeveloper.clean(cover, 500)
+        var saved = DeveloperRecord(userId, cleanName, cleanHeadline, cleanBio, cleanLinks, cleanAvatar, cleanCover, Time.nowIso())
+        games.saveDeveloper(saved)
+        return saved
+    }
+    // Following is one-way and idempotent; following yourself makes no sense.
+    Bool toggleFollow(followerId: String, developerUserId: String) {
+        if (followerId == developerUserId) {
+            throw Errors.api(400, "CANNOT_FOLLOW_SELF", "Você não pode acompanhar você mesmo.")
+        }
+        if (games.followExists(followerId, developerUserId)) {
+            games.deleteFollow(followerId, developerUserId)
+            return false
+        }
+        games.insertFollow(Ids.prefixed("dfol_"), followerId, developerUserId, Time.nowIso())
+        return true
+    }
+    static String? clean(value: String?, max: Int) {
+        if (!GameRules.hasText(value)) {
+            return null
+        }
+        var trimmed = GameRules.trimText(value)
+        if (trimmed.length() > max) {
+            throw Errors.api(400, "FIELD_TOO_LONG", "O campo aceita no máximo " + max + " caracteres.")
+        }
+        return trimmed
+    }
+    // The page as the front consumes it. `badges` are ALL the creator's badges (`badge` stays the first one for
+    // an old app version).
+    static DeveloperPageView view(page: GameDeveloperPage) {
+        var user = page.user()
+        var profile = page.profile()
+        var badges = user.allBadges()
+        var badge = Nulls.str()
+        if (badges.size() > 0) {
+            badge = badges.get(0)
+        }
+        var avatar = user.avatar()
+        var cover = Nulls.str()
+        var displayName = Nulls.str()
+        var headline = Nulls.str()
+        var bio = Nulls.str()
+        var links = Nulls.str()
+        if (profile != null) {
+            avatar = GamesDeveloper.firstNonBlank(profile.avatar(), user.avatar())
+            cover = profile.cover()
+            displayName = profile.displayName()
+            headline = profile.headline()
+            bio = profile.bio()
+            links = profile.links()
+        }
+        var views = listOf<GameView>()
+        for (var game in page.games()) {
+            views.add(GameRules.view(game, user.username(), 0, false, null))
+        }
+        return DeveloperPageView(user.id(), user.username(), user.name(), badge, badges, avatar, cover, displayName, headline, bio, GameRules.splitLinks(links), views, page.followers(), page.following(), page.owner())
+    }
+    static String? firstNonBlank(first: String?, second: String?) {
+        if (first == null) {
+            return second
+        }
+        if (first.trim().length() == 0) {
+            return second
+        }
+        return first
+    }
+}

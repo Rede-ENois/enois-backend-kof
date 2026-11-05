@@ -1,0 +1,49 @@
+import games.*
+import kernel.testkit.*
+
+// Port of GameTrendingTests: "played today": the card of the feed reads the last 24 hours of PLAY_START,
+// counted by the server. The assertions compare the TWO games published here with each other (and not "the
+// first of the ranking"): the window is global.
+test "orders by sessions and counts them" {
+    var admin = GamesTestKit.loginAdmin("gtrend-admin")
+    var creator = GamesTestKit.login("gtrend-creator")
+    var most = GamesTestKit.publish(creator, admin, "Jogo Mais Jogado", "https://creator.itch.io/maisa")
+    var least = GamesTestKit.publish(creator, admin, "Jogo Menos Jogado", "https://creator.itch.io/menosa")
+    var n = 0
+    while (n < 5) {
+        Check.status(GamesTestKit.send("POST", "/games/" + most + "/play", GamesTestKit.auth(creator), ""), 200)
+        n = n + 1
+    }
+    n = 0
+    while (n < 2) {
+        Check.status(GamesTestKit.send("POST", "/games/" + least + "/play", GamesTestKit.auth(creator), ""), 200)
+        n = n + 1
+    }
+    // The card opens with no session at all: whoever just arrived also sees what is catching on.
+    var res = GamesTestKit.get("/games/hoje?limit=12", listOf<String>())
+    Check.status(res, 200)
+    var atMost = GamesTestKit.indexOf(res, "", "id", most)
+    var atLeast = GamesTestKit.indexOf(res, "", "id", least)
+    Check.isTrue("both games entered the ranking", atMost >= 0 && atLeast >= 0)
+    Check.isTrue("the most played comes first", atMost < atLeast)
+    Check.jsonEq(res, atMost + ".title", "Jogo Mais Jogado")
+    Check.jsonEq(res, atMost + ".plays", "5")
+    // One person in five sessions is ONE person: the two numbers are not the same thing.
+    Check.jsonEq(res, atMost + ".players", "1")
+    Check.jsonEq(res, atMost + ".username", "gtrend-creator")
+    Check.jsonEq(res, atMost + ".slug", "jogo-mais-jogado")
+}
+
+test "respects the limit and leaves out games that are off the air" {
+    var admin = GamesTestKit.loginAdmin("gtrend-admin")
+    var creator = GamesTestKit.login("gtrend-limit")
+    var game = GamesTestKit.publish(creator, admin, "Jogo Do Limite", "https://creator.itch.io/limita")
+    Check.status(GamesTestKit.send("POST", "/games/" + game + "/play", GamesTestKit.auth(creator), ""), 200)
+    Check.eqInt("limit 1", 1, GamesTestKit.get("/games/hoje?limit=1", listOf<String>()).jsonSize(""))
+    // A suspended game leaves the ranking.
+    Check.status(GamesTestKit.send("POST", "/admin/games/" + game + "/suspend", GamesTestKit.auth(admin), "{}"), 200)
+    Check.eqInt("suspended is out", -1, GamesTestKit.indexOf(GamesTestKit.get("/games/hoje?limit=12", listOf<String>()), "", "id", game))
+    Check.apiError(GamesTestKit.send("POST", "/games/" + game + "/play", GamesTestKit.auth(creator), ""), 409, "GAME_NOT_PUBLISHED")
+    Check.apiError(GamesTestKit.send("POST", "/games/nao-existe/play", GamesTestKit.auth(creator), ""), 404, "GAME_NOT_FOUND")
+    GamesTestKit.finish()
+}

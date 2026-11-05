@@ -1,0 +1,64 @@
+import dailygames.*
+import games.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Port of the prize tier test and DailyGameRewardsSettlementTests (the ledger rows are read from coin_entries).
+test "prize tiers follow the agreed bands" {
+    assert(DailyGameRewards.prizeFor(1) == 10000L)
+    assert(DailyGameRewards.prizeFor(2) == 5000L)
+    assert(DailyGameRewards.prizeFor(3) == 5000L)
+    assert(DailyGameRewards.prizeFor(4) == 3000L)
+    assert(DailyGameRewards.prizeFor(10) == 3000L)
+    assert(DailyGameRewards.prizeFor(11) == 1000L)
+    assert(DailyGameRewards.formatFaiscas(10000L) == "10")
+    assert(DailyGameRewards.formatFaiscas(1500L) == "1.5")
+    assert(DailyGameRewards.formatFaiscas(1005L) == "1.005")
+}
+
+test "the prize table endpoint lists the bands" {
+    var token = GamesTestKit.login("drw-viewer")
+    var res = GamesTestKit.get("/daily-games/rewards/prizes", GamesTestKit.auth(token))
+    Check.status(res, 200)
+    Check.eqInt("four bands", 4, res.jsonSize("tiers"))
+    Check.jsonEq(res, "tiers.0.label", "1º lugar")
+    Check.jsonEq(res, "tiers.0.amount", "10000")
+    Check.jsonEq(res, "tiers.3.amount", "1000")
+}
+
+Long rewardPrize(day: String, userId: String) = GamesTestKit.db().queryLong("select amount from coin_entries where account_id = ? and ref_id = ?", DbParams().bindStr(userId).bindStr("jogos:palavras:" + day + ":" + userId))
+
+Long rewardCount(userId: String, kind: String) = GamesTestKit.db().queryLong("select count(*) from notifications where user_id = ? and kind = ?", DbParams().bindStr(userId).bindStr(kind))
+
+test "settlement pays the ranking once and notifies" {
+    GamesTestClock.pin("2026-10-20T12:00:00Z")
+    var rewards = GamesTestKit.daily().rewards
+    var day = "2026-10-17"
+    GamesTestKit.login("drs-campea")
+    GamesTestKit.login("drs-vice")
+    GamesTestKit.login("drs-desistiu")
+    var db = GamesTestKit.db()
+    db.execute("insert into daily_word_challenges (challenge_date, answer) values (?, ?)", DbParams().bindDate(day).bindStr("AMORA"))
+    var started = "2026-10-17T11:50:00Z"
+    for (var id in listOf("drs-campea", "drs-vice", "drs-desistiu")) {
+        db.execute("insert into daily_word_sessions (challenge_date, user_id, status, started_at, completed_at) values (?, ?, \'WON\', ?, ?)", DbParams().bindDate(day).bindStr(id).bindInstant(started).bindInstant("2026-10-17T12:00:00Z"))
+    }
+    db.execute("update daily_word_sessions set status = \'LOST\' where challenge_date = ? and user_id = ?", DbParams().bindDate(day).bindStr("drs-desistiu"))
+    db.execute("insert into daily_word_guesses values (?, ?, 1, ?, \'AMORA\', \'CORRECT,CORRECT,CORRECT,CORRECT,CORRECT\')", DbParams().bindDate(day).bindStr("drs-campea").bindStr("req-c1-" + day))
+    db.execute("insert into daily_word_guesses values (?, ?, 1, ?, \'AMIGO\', \'ABSENT,ABSENT,ABSENT,PRESENT,PRESENT\')", DbParams().bindDate(day).bindStr("drs-vice").bindStr("req-r1-" + day))
+    db.execute("insert into daily_word_guesses values (?, ?, 2, ?, \'AMORA\', \'CORRECT,CORRECT,CORRECT,CORRECT,CORRECT\')", DbParams().bindDate(day).bindStr("drs-vice").bindStr("req-r2-" + day))
+    Check.eqInt("two credits", 2, rewards.settle(day))
+    assert(rewardPrize(day, "drs-campea") == 10000L)
+    assert(rewardPrize(day, "drs-vice") == 5000L)
+    assert(db.queryLong("select count(*) from coin_entries where ref_id like ?", DbParams().bindStr("jogos:palavras:" + day + ":drs-desistiu%")) == 0L)
+    assert(rewardCount("drs-campea", "JOGO_DIARIO") == 1L)
+    var note = db.queryOne("select title, href from notifications where user_id = ? and kind = \'JOGO_DIARIO\'", DbParams().bindStr("drs-campea"))
+    Check.eqStr("href", "/carteira", note.getStr("href"))
+    // Reopening the same day pays nothing and notifies nobody again; the look-back sweep is idempotent too.
+    Check.eqInt("no second payment", 0, rewards.settle(day))
+    Check.eqInt("no second sweep", 0, rewards.settleClosedDays(7))
+    assert(rewardCount("drs-campea", "JOGO_DIARIO") == 1L)
+    assert(GamesTestKit.balance("drs-campea") >= 10000L)
+    GamesTestClock.unpin()
+    GamesTestKit.finish()
+}

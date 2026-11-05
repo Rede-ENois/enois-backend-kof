@@ -1,0 +1,54 @@
+import games.*
+import kernel.error.*
+import kernel.testkit.*
+
+// Port of GameUrlGuardTests: the address of the game. It is pasted by the creator and may carry accents and
+// special characters in the path; what must keep holding is the essential: https only, no credentials in the
+// URL and a host that resolves to a public address. Names resolve through the stub (no DNS in the suite).
+GameUrlGuard guardUnderTest() = GameUrlGuard(GamesTestHosts())
+
+String guardMessage(url: String) {
+    try {
+        guardUnderTest().validate(url)
+    } catch (String e) {
+        var parsed = Errors.parse(e)
+        Check.eqInt("status of " + url, 400, parsed.status())
+        Check.eqStr("code of " + url, "INVALID_GAME_URL", parsed.code())
+        return parsed.message()
+    }
+    return ""
+}
+
+test "accepts a plain https address" {
+    Check.eqStr("plain", "https://example.com/jogo", guardUnderTest().validate("https://example.com/jogo"))
+}
+
+// java.net.URI keeps the international characters as typed; the browser encodes them when it asks.
+test "accepts an accent in the path instead of refusing it" {
+    Check.eqStr("accent", "https://example.com/cafés-da-manhã", guardUnderTest().validate("https://example.com/cafés-da-manhã"))
+}
+
+test "accepts a special character in the query" {
+    Check.eqStr("query", "https://example.com/j?nome=maçã", guardUnderTest().validate("https://example.com/j?nome=maçã"))
+}
+
+test "refuses plain http" {
+    Check.isTrue("mentions https", guardMessage("http://example.com/jogo").contains("https"))
+}
+
+test "refuses credentials in the URL" {
+    Check.isTrue("mentions user and password", guardMessage("https://user:pass@example.com/jogo").contains("usuário e senha"))
+}
+
+test "refuses an internal address" {
+    Check.isTrue("mentions internal", guardMessage("https://localhost/jogo").contains("interno"))
+}
+
+test "refuses whitespace in the address" {
+    Check.isTrue("mentions invalid", guardMessage("https://example.com/jogo demo").contains("Endereço inválido"))
+}
+
+test "refuses a strange scheme" {
+    Check.isTrue("mentions https", guardMessage("ftp://example.com/jogo").contains("https"))
+    GamesTestKit.finish()
+}

@@ -1,0 +1,197 @@
+package games
+
+import kernel.text.*
+import kernel.time.*
+
+// Closed lists of the games domain, spelled like the Java enums (they are stored by name).
+class GameStatus {
+    static String submitted() = "SUBMITTED"
+    static String published() = "PUBLISHED"
+    static String rejected() = "REJECTED"
+    static String suspended() = "SUSPENDED"
+}
+
+class GameEventKind {
+    static String pageView() = "PAGE_VIEW"
+    static String playStart() = "PLAY_START"
+    static String share() = "SHARE"
+}
+
+// One row of `games` (Game + GameDetails). Instants are ISO strings.
+record GameRecord(String id, String userId, String slug, String title, String? description, String? cover, String url, String? tags, String status, String? reviewedBy, String? reviewNote, String? shortDescription, String? genres, String? languages, String? controls, String? requirements, String? contentWarnings, String stage, String distribution, Int priceCoins, String aspect, String? version, String? websiteUrl, String? supportUrl, String? mediaIds, String? icon, String? banner, String? bannerHtml, Int plays, String? boostUntil, String? publishedAt, String? suspendedAt, String submittedAt, String? reviewedAt, String createdAt, String updatedAt)
+
+// The edit form of the owner: the whole sheet (GameDetails), already parsed and validated.
+record GameDetailsInput(String? shortDescription, String? genres, String? languages, String? controls, String? requirements, String? contentWarnings, String stage, String distribution, Int priceCoins, String aspect, String? version, String? websiteUrl, String? supportUrl, String? mediaIds, String? icon, String? banner, String? bannerHtml)
+
+// GameView: what the front consumes for the catalogue, the game page and the panel.
+record GameView(String id, String userId, String? username, String slug, String title, String? description, String? cover, String url, String? tags, String status, String? reviewNote, String submittedAt, String? shortDescription, List<String> genres, List<String> languages, String? controls, String? requirements, String? contentWarnings, String stage, String distribution, Int priceCoins, String aspect, String? version, String? websiteUrl, String? supportUrl, List<String> mediaIds, Int plays, Int favorites, String? publishedAt, Bool owned, Bool favorited, Bool boosted, String? icon, String? banner, String? bannerHtml)
+
+record GamePageView(List<GameView> items, String? nextCursor)
+
+record GameUpdateRecord(String id, String gameId, String userId, String title, String? body, String? version, String createdAt)
+
+// GameUpdateView (the same fields: the Java view copies the record).
+record GameUpdateView(String id, String gameId, String title, String? body, String? version, String createdAt)
+
+record GameCollectionRecord(String id, String curatorId, String title, String? description, List<String> gameIds, String status, String createdAt, String updatedAt)
+
+record GameCollectionView(String id, String title, String? description, List<GameView> jogos, String createdAt)
+
+record GameReviewRecord(String id, String gameId, String userId, Int rating, String? body, String createdAt, String updatedAt)
+
+record GameCommentRecord(String id, String gameId, String userId, String body, String createdAt)
+
+record GameReviewView(String id, String userId, String? username, String? name, String? avatar, Int rating, String? body, String createdAt, String updatedAt)
+
+record GameReviewsView(Double average, Long count, List<GameReviewView> items)
+
+record GameCommentView(String id, String userId, String? username, String? name, String? avatar, String body, String createdAt)
+
+record GameCommentsView(Long count, List<GameCommentView> items)
+
+record GameRatingSummary(Double average, Long reviews, Long comments)
+
+record GameTally(String gameId, Long plays, Long players)
+
+record GameTrendingView(String id, String? username, String slug, String title, String? cover, String? icon, String url, Long plays, Long players)
+
+record GameDayUsage(String date, Long pageViews, Long plays, Long shares, Long players)
+
+record GameAnalytics(String from, String to, Int days, Long plays, Long players, Long favorites, Long updates, List<GameDayUsage> series)
+
+record GameStats(Int plays, Long players, Long favorites, Long updates)
+
+record DeveloperRecord(String userId, String? displayName, String? headline, String? bio, String? links, String? avatar, String? cover, String updatedAt)
+
+record DeveloperPageView(String userId, String username, String name, String? badge, List<String> badges, String? avatar, String? cover, String? displayName, String? headline, String? bio, List<String> links, List<GameView> games, Long followers, Bool following, Bool owner)
+
+record GameIdView(String id, String slug, String status)
+
+record GameStatusView(String id, String status)
+
+record GameSubmittedView(String id, String slug, String status)
+
+record GameBoostView(String id, Bool boosted)
+
+record GameIdentityView(String token, String expiresAt, String playerRef)
+
+record GameValidatedView(String gameId, String playerRef)
+
+record GameSpendView(String status, String requestId)
+
+record GameSharedView(String postId, String status)
+
+record GameFollowView(Bool following)
+
+record GameFavoriteView(Bool favorited, Long favorites)
+
+record GamePlaysView(Int plays)
+
+// Request bodies. Every field optional; unknown properties are ignored (Jackson defaults).
+record GameSubmitBody(String? slug, String? title, String? description, String? cover, String? url, String? tags)
+
+record GameEditBody(String? title, String? description, String? cover, String? url, String? tags, String? shortDescription, String? genres, String? languages, String? controls, String? requirements, String? contentWarnings, String? stage, String? distribution, Int? priceCoins, String? aspect, String? version, String? websiteUrl, String? supportUrl, List<String>? mediaIds, String? slug, String? icon, String? banner, String? bannerHtml)
+
+record GameReviewNoteBody(String? note)
+
+record GameTokenBody(String? token)
+
+record GameSpendBody(Long? amount, String? motivo, String? requestId)
+
+record GameCollectionBody(String? title, String? description, List<String>? gameIds)
+
+record GameShareBody(String? texto, List<String>? mediaIds)
+
+record GameRatingBody(Int? rating, String? body)
+
+record GameCommentBody(String? body)
+
+record GameDeveloperBody(String? displayName, String? headline, String? bio, String? links, String? avatar, String? cover)
+
+record GameUpdateBody(String? title, String? body, String? version)
+
+// Pure rules shared by the services and the routes.
+class GameRules {
+    // Math.min/max on Int arguments compile to the float overload (VerifyError): clamp by hand.
+    static Int clamp(v: Int, lo: Int, hi: Int) {
+        if (v < lo) {
+            return lo
+        }
+        if (v > hi) {
+            return hi
+        }
+        return v
+    }
+    // StringUtils.hasText: not null and not blank.
+    static Bool hasText(value: String?) {
+        if (value == null) {
+            return false
+        }
+        return value.trim().length() > 0
+    }
+    // hasText ? value.trim() : null
+    // The trimmed text, "" for null (call sites check hasText first; a cast would be reformatted into `x as String.trim()`).
+    static String trimText(value: String?) {
+        if (value == null) {
+            return ""
+        }
+        return value.trim()
+    }
+    static String? trimOrNull(value: String?) {
+        if (value == null) {
+            return null
+        }
+        if (value.trim().length() == 0) {
+            return null
+        }
+        return value.trim()
+    }
+    // The ficha lists travel as comma separated text: split, trim, drop the empty ones.
+    static List<String> splitCsv(value: String?) {
+        var out = listOf<String>()
+        if (value == null) {
+            return out
+        }
+        if (value.trim().length() == 0) {
+            return out
+        }
+        for (var part in value.split(",")) {
+            if (part.trim().length() > 0) {
+                out.add(part.trim())
+            }
+        }
+        return out
+    }
+    // Same for the links of a developer page (comma or line break).
+    static List<String> splitLinks(value: String?) {
+        var out = listOf<String>()
+        if (value == null) {
+            return out
+        }
+        if (value.trim().length() == 0) {
+            return out
+        }
+        for (var part in value.split("[,\\n]")) {
+            if (part.trim().length() > 0) {
+                out.add(part.trim())
+            }
+        }
+        return out
+    }
+    // The address of a game from its title: the accent becomes the letter (é -> e), the rest a hyphen.
+    static String slugFrom(value: String) = Texts.stripAccents(value).toLowerCase().replaceAll("[^a-z0-9]+", "-").replaceAll("(^-|-$)", "")
+    static Bool isFuture(iso: String?, nowIso: String) {
+        if (iso == null) {
+            return false
+        }
+        return Time.toMillis(iso) > Time.toMillis(nowIso)
+    }
+    static GameView view(g: GameRecord, username: String?, favorites: Int, favorited: Bool, viewerId: String?) {
+        var owned = false
+        if (viewerId != null) {
+            owned = g.userId() == viewerId
+        }
+        var boosted = GameRules.isFuture(g.boostUntil(), Time.nowIso())
+        return GameView(g.id(), g.userId(), username, g.slug(), g.title(), g.description(), g.cover(), g.url(), g.tags(), g.status(), g.reviewNote(), g.submittedAt(), g.shortDescription(), GameRules.splitCsv(g.genres()), GameRules.splitCsv(g.languages()), g.controls(), g.requirements(), g.contentWarnings(), g.stage(), g.distribution(), g.priceCoins(), g.aspect(), g.version(), g.websiteUrl(), g.supportUrl(), GameRules.splitCsv(g.mediaIds()), g.plays(), favorites, g.publishedAt(), owned, favorited, boosted, g.icon(), g.banner(), g.bannerHtml())
+    }
+}

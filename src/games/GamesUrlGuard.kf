@@ -1,0 +1,70 @@
+package games
+
+import kernel.error.*
+import kernel.text.*
+import kernel.url.*
+
+// Validates the address where a game is published. Port of GameUrlGuard.
+//
+// Nobody on the server fetches this URL: the browser of whoever plays loads it inside the frame. That is
+// what the validation protects: the MACHINE OF THE READER (a game pointing at http://192.168.0.1/ would
+// make the player's browser hit their router). So the check is on the destination, not on the content:
+// https only, no credentials, and a host that resolves to a PUBLIC address.
+class GameUrlGuard {
+    GamesHosts hosts
+    public constructor(hosts: GamesHosts) {
+        this.hosts = hosts
+    }
+    static Int maxUrl() = 500
+    // The normalised URL, or 400 INVALID_GAME_URL with the reason.
+    String validate(rawUrl: String?) {
+        var value = ""
+        if (rawUrl != null) {
+            value = rawUrl.trim()
+        }
+        if (value.length() == 0) {
+            throw GameUrlGuard.invalid("Informe o endereço do jogo.")
+        }
+        if (value.length() > GameUrlGuard.maxUrl()) {
+            throw GameUrlGuard.invalid("Endereço longo demais.")
+        }
+        if (Regexes.matches(".*\\p{javaWhitespace}.*", value)) {
+            throw GameUrlGuard.invalid("Endereço inválido.")
+        }
+        var parts = UrlParser.parse(value)
+        if (parts == null) {
+            throw GameUrlGuard.invalid("Endereço inválido.")
+        }
+        if (parts.scheme() != "https") {
+            throw GameUrlGuard.invalid("O jogo precisa ser servido em https.")
+        }
+        if (parts.userInfo() != null) {
+            throw GameUrlGuard.invalid("Endereço não pode levar usuário e senha.")
+        }
+        var host = parts.host()
+        if (host == null) {
+            throw GameUrlGuard.invalid("Endereço sem domínio.")
+        }
+        if (host.trim().length() == 0) {
+            throw GameUrlGuard.invalid("Endereço sem domínio.")
+        }
+        this.requirePublicHost(host)
+        return parts.text()
+    }
+    // Loopback, private ranges, link-local (cloud metadata), multicast and IPv6 unique-local are refused,
+    // and so is a host that does not resolve: an address that does not exist is not a game.
+    requirePublicHost(host: String) {
+        var lower = host.toLowerCase()
+        if (lower == "localhost" || lower.endsWith(".localhost") || lower.endsWith(".local") || lower.endsWith(".internal")) {
+            throw GameUrlGuard.invalid("Endereço interno não é aceito.")
+        }
+        var verdict = hosts.classify(host)
+        if (verdict == HostAddresses.unresolved()) {
+            throw GameUrlGuard.invalid("Não foi possível resolver o endereço do jogo.")
+        }
+        if (verdict == HostAddresses.internal()) {
+            throw GameUrlGuard.invalid("Endereço de rede interna não é aceito.")
+        }
+    }
+    static String invalid(message: String) = Errors.api(400, "INVALID_GAME_URL", message)
+}
