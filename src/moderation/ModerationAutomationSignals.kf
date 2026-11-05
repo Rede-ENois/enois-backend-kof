@@ -1,0 +1,57 @@
+package moderation
+
+import kernel.text.*
+
+// AutomationSignals: deterministic markers that a text may have come out of an AI tool or a bot. Only the CHEAP trigger: with no
+// marker the post never reaches the model; with one, the classifier decides (no phrase hides a post by itself).
+class ModerationAutomationSignals {
+    // Phrases that only show up when someone pastes an assistant's output.
+    static List<String> declarations() = listOf("como um modelo de linguagem", "como uma ia", "sou uma ia", "sou um modelo de linguagem", "como assistente", "como uma inteligencia artificial", "enquanto ia", "as an ai language model", "i am an ai", "i'm an ai", "como modelo de linguagem", "nao tenho acesso a informacoes", "nao tenho acesso a dados", "meu treinamento", "fui treinado", "nao tenho sentimentos", "nao possuo sentimentos")
+    // Assistant posture: the typical opening and closing of an answer to a prompt.
+    static List<String> posture() = listOf("claro! aqui esta", "claro, aqui esta", "certamente! aqui", "aqui esta o texto", "aqui esta a versao", "aqui estao os", "espero que isso ajude", "espero ter ajudado", "espero que ajude", "se precisar de mais alguma coisa", "posso ajudar com mais alguma", "posso te ajudar com mais", "sinta-se a vontade para perguntar", "fico a disposicao para", "here is the", "hope this helps", "let me know if you", "feel free to ask", "em resumo,", "em conclusao,", "resumindo os pontos", "pontos principais:", "principais pontos:", "conclusao:", "resumo executivo")
+    // Shorter than this is a conversation, not generator formatting.
+    static Int structureMinLength() = 420
+    // Worth sending to the classifier? false is "no machine trace here": the post is recorded as human at no model cost.
+    static Bool suspect(content: String?) {
+        if (content == null) {
+            return false
+        }
+        String text = content
+        if (text.trim().length() == 0) {
+            return false
+        }
+        var normalized = ModerationAutomationSignals.normalize(text)
+        for (var marker in ModerationAutomationSignals.declarations()) {
+            if (normalized.contains(marker)) {
+                return true
+            }
+        }
+        for (var marker in ModerationAutomationSignals.posture()) {
+            if (normalized.contains(marker)) {
+                return true
+            }
+        }
+        return ModerationAutomationSignals.looksStructured(text, normalized)
+    }
+    // A long post with many headings and lists: how a model formats, not how people write on a network. A weak marker on
+    // purpose, it only leads to the classifier.
+    static Bool looksStructured(original: String, normalized: String) {
+        if (original.length() < ModerationAutomationSignals.structureMinLength()) {
+            return false
+        }
+        var headings = ModerationAutomationSignals.occurrences(original, "##") + ModerationAutomationSignals.occurrences(original, "**") / 2
+        var items = ModerationAutomationSignals.occurrences(normalized, "\n- ") + ModerationAutomationSignals.occurrences(normalized, "\n* ")
+        return headings >= 2 && items >= 3
+    }
+    static Int occurrences(text: String, needle: String) {
+        var total = 0
+        var index = text.indexOf(needle)
+        while (index >= 0) {
+            total = total + 1
+            index = text.indexOf(needle, index + needle.length())
+        }
+        return total
+    }
+    // Lower case without accents: "Aqui está" and "aqui esta" are the same marker.
+    static String normalize(value: String) = Texts.stripAccents(value).toLowerCase()
+}

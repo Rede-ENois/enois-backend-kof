@@ -1,0 +1,147 @@
+package moderation
+
+import feed.*
+import kernel.files.*
+import kernel.image.*
+import kernel.log.*
+import media.*
+
+// The bytes of a stored image for the moderation reads: the bucket when the media module has one (S3), otherwise the public
+// address through the guarded downloader (OutboundUrlGuard, no redirects). A concrete class so tests answer with fixture bytes.
+// null = could not read (the image is ignored, never an error).
+class ModerationMediaBytes {
+    MediaModule module
+    public constructor(module: MediaModule) {
+        this.module = module
+    }
+    static Int maxBytes() = 16 * 1024 * 1024
+    Byte[]? bytesOf(asset: MediaAsset) {
+        try {
+            var bucket = module.objectStore
+            if (bucket != null) {
+                var found = bucket.read(asset.objectKey, null)
+                var bytes = found.body.readUpTo(ModerationMediaBytes.maxBytes())
+                found.body.close()
+                return bytes
+            }
+            var path = MediaHttpDownloader().download(asset.cdnUrl)
+            var downloaded = TempFiles.readAll(path)
+            TempFiles.delete(path)
+            return downloaded
+        } catch (String e) {
+            return null
+        }
+    }
+}
+
+// ReportedMediaAdapter: the images of the target for the vision call, as base64 JPEG. Two cares that are not detail: it SHRINKS
+// before sending (the model does not need 4000px to say there is nudity; the reduction also drops the metadata, what goes out is a
+// new JPEG without EXIF) and it NEVER throws (a report of explicit content is exactly the one that cannot die for a slow
+// download; a failure in one image does not stop the others). Video and audio stay out: extracting a frame would need ffmpeg on the
+// triage path, and the media sweep covers the case with human review.
+class ModerationMediaImages extends ModerationImages {
+    MediaStore assets
+    FeedStore posts
+    ModerationMediaBytes bytes
+    Log log = Log("moderation.images")
+    public constructor(assets: MediaStore, posts: FeedStore, bytes: ModerationMediaBytes) {
+        super()
+        this.assets = assets
+        this.posts = posts
+        this.bytes = bytes
+    }
+    // Longest side of the image sent to the model: above that is detail that does not change the verdict.
+    static Int maxSide() = 768
+    static List<String> imageTypes() = listOf("image/jpeg", "image/png", "image/gif", "image/webp", "image/avif")
+    List<String> imagesOf(targetType: String, targetId: String, max: Int) {
+        var out = listOf<String>()
+        if (max <= 0) {
+            return out
+        }
+        try {
+            var ids = this.mediaIdsOf(targetType, targetId)
+            if (ids.size() == 0) {
+                return out
+            }
+            for (var asset in assets.findByIds(ids)) {
+                if (out.size() >= max) {
+                    break
+                }
+                if (!ModerationMediaImages.imageTypes().contains(asset.mimeType)) {
+                    continue
+                }
+                var image = this.shrink(asset)
+                if (image != null) {
+                    String encoded = image
+                    out.add(encoded)
+                }
+            }
+        } catch (String e) {
+            log.warn("reported_media_not_read")
+        }
+        return out
+    }
+    // The media of the target. A media sweep does not start from a post: the target IS the media.
+    List<String> mediaIdsOf(targetType: String, targetId: String) {
+        if (targetType == "MEDIA") {
+            return listOf(targetId)
+        }
+        if (targetType == "POST") {
+            return ModerationMediaImages.first(posts.mediaOf(listOf(targetId)).get(targetId))
+        }
+        if (targetType == "COMMENT") {
+            return ModerationMediaImages.first(posts.commentMediaOf(listOf(targetId)).get(targetId))
+        }
+        return listOf<String>()
+    }
+    static List<String> first(found: List<String>?) {
+        if (found == null) {
+            return listOf<String>()
+        }
+        return found
+    }
+    // Downloads, decodes and reduces to a base64 JPEG. Any failure is null (the image is ignored).
+    String? shrink(asset: MediaAsset) {
+        try {
+            var raw = bytes.bytesOf(asset)
+            if (raw == null) {
+                return null
+            }
+            Byte[] data = raw
+            return Images.toBase64(Images.shrinkJpeg(data, ModerationMediaImages.maxSide()))
+        } catch (String e) {
+            log.debug("reported_media_unreadable")
+            return null
+        }
+    }
+}
+
+// ModerationImageContentReviewer: the semantic second opinion of the upload gate (the images the fast local classifier flags).
+// SAFE only with confidence above the floor; PROHIBITED when the barrier would act alone on it; anything else, UNSURE; "" when the
+// model returned nothing usable (the upload is then refused with a retry message).
+class ModerationMediaReviewer extends MediaImageReviewer {
+    ModerationMediaAnalyzer analyzer
+    public constructor(analyzer: ModerationMediaAnalyzer) {
+        super()
+        this.analyzer = analyzer
+    }
+    String review(image: Byte[]) {
+        var base64 = ""
+        try {
+            base64 = Images.toBase64(Images.shrinkJpeg(image, ModerationMediaImages.maxSide()))
+        } catch (String e) {
+            return ""
+        }
+        var verdict = analyzer.analyze(base64)
+        if (verdict == null) {
+            return ""
+        }
+        if (verdict.verdict == "SAFE" && verdict.confidence >= ModerationMediaAnalyzer.minConfidence()) {
+            return "SAFE"
+        }
+        if (ModerationMediaAnalyzer.canActAlone(verdict) && ModerationMediaAnalyzer.isViolation(verdict.verdict)) {
+            return "PROHIBITED"
+        }
+        return "UNSURE"
+    }
+}

@@ -1,0 +1,291 @@
+package moderation
+
+import feed.*
+import kernel.concurrent.*
+import kernel.config.*
+import kernel.log.*
+import kernel.security.*
+import kernel.time.*
+
+record ModerationSpamOutcome(String status, Int removed, String? sanction)
+
+// PostSpamAutomodService: the SPAM/FLOOD automod, moderation that does NOT depend on a report. The trigger is deterministic and
+// cheap (counts in the database): many posts in a short window (flood), the same text repeated, or a run of practically empty
+// posts. The deterministic part only RAISES THE SUSPICION; the AI decides, with the same structured verdict and the same gate
+// as the report triage (PENALIZAR + no ambiguity + confidence >= 0.7). Without that verdict NOTHING is deleted nor applied: short
+// and repeated posts are not an infraction by themselves, and a false positive deletes honest people's content.
+// When the AI confirms: deletes (moderation removal) the posts the evidence points to, the EARLIER ones included, and applies the
+// sanction: a RESTRICTION with appeal on the first case and a BAN when the flood is massive (>= auto-ban-threshold in the window).
+// Staff stays out on purpose.
+class ModerationSpamAutomod {
+    Log log = Log("moderation.spam")
+    ModerationPosts posts
+    ModerationAi ai
+    FeedModeration feed
+    ModerationSanctionService sanctions
+    AdminGuard admins
+    ModerationModeratorStore moderators
+    Bool enabled
+    Int minLength
+    Int floodWindowMinutes
+    Int floodThreshold
+    Int repeatThreshold
+    Int shortFloodThreshold
+    Int lookbackHours
+    Int sanitizeLimit
+    Int autoBanThreshold
+    Int minIntervalMinutes
+    // Last evaluation per author (process memory): a flood of 50 posts must not queue 50 AI analyses; one per `min-interval` per person.
+    Map<String,Long> lastEvaluation = mapOf<String, Long>()
+    Gate lastGate = Gate()
+    public constructor(posts: ModerationPosts, ai: ModerationAi, feed: FeedModeration, sanctions: ModerationSanctionService, admins: AdminGuard, moderators: ModerationModeratorStore, enabled: Bool, minLength: Int, floodWindowMinutes: Int, floodThreshold: Int, repeatThreshold: Int, shortFloodThreshold: Int, lookbackHours: Int, sanitizeLimit: Int, autoBanThreshold: Int, minIntervalMinutes: Int) {
+        this.posts = posts
+        this.ai = ai
+        this.feed = feed
+        this.sanctions = sanctions
+        this.admins = admins
+        this.moderators = moderators
+        this.enabled = enabled
+        this.minLength = ModerationContentTargets.clampInt(minLength, 1, 100000)
+        this.floodWindowMinutes = ModerationContentTargets.clampInt(floodWindowMinutes, 1, 100000)
+        this.floodThreshold = ModerationContentTargets.clampInt(floodThreshold, 2, 100000)
+        this.repeatThreshold = ModerationContentTargets.clampInt(repeatThreshold, 2, 100000)
+        this.shortFloodThreshold = ModerationContentTargets.clampInt(shortFloodThreshold, 2, 100000)
+        this.lookbackHours = ModerationContentTargets.clampInt(lookbackHours, 1, 100000)
+        this.sanitizeLimit = ModerationContentTargets.clampInt(sanitizeLimit, 1, 100000)
+        this.autoBanThreshold = ModerationContentTargets.clampInt(autoBanThreshold, this.floodThreshold, 1000000)
+        this.minIntervalMinutes = ModerationContentTargets.clampInt(minIntervalMinutes, 0, 100000)
+    }
+    static ModerationSpamAutomod fromConfig(cfg: Config, posts: ModerationPosts, ai: ModerationAi, feed: FeedModeration, sanctions: ModerationSanctionService, admins: AdminGuard, moderators: ModerationModeratorStore) = ModerationSpamAutomod(posts, ai, feed, sanctions, admins, moderators, cfg.getBool("MODERATION_SPAM_ENABLED", true), cfg.getInt("MODERATION_SPAM_MIN_LENGTH", 3), cfg.getInt("MODERATION_SPAM_FLOOD_WINDOW_MINUTES", 10), cfg.getInt("MODERATION_SPAM_FLOOD_THRESHOLD", 8), cfg.getInt("MODERATION_SPAM_REPEAT_THRESHOLD", 3), cfg.getInt("MODERATION_SPAM_SHORT_FLOOD_THRESHOLD", 8), cfg.getInt("MODERATION_SPAM_LOOKBACK_HOURS", 168), cfg.getInt("MODERATION_SPAM_SANITIZE_LIMIT", 50), cfg.getInt("MODERATION_SPAM_AUTO_BAN_THRESHOLD", 20), 2)
+    // The synthetic moderator id that stays in the history of the removed post.
+    static String systemModerator() = "automod-spam"
+    // How many recent posts of the author enter the count (reading cap).
+    static Int scanLimit() = 100
+    // How many posts become a sample for the AI (the rest only enters the counts).
+    static Int aiSample() = 12
+    // Cut of each post text in the sample: the model needs the pattern, not the whole text.
+    static Int aiSampleText() = 400
+    static Int throttleEntries() = 10000
+    // Evaluates the author of a just-published post. Never throws to the caller (the publication is already on the air).
+    ModerationSpamOutcome evaluate(userId: String) {
+        if (!enabled) {
+            return ModerationSpamOutcome("DISABLED", 0, null)
+        }
+        // Staff stays out: a false positive banning who takes care of the network would be worse than the spam.
+        if (admins.isAdmin(userId) || moderators.findApprovedByUser(userId) != null) {
+            return ModerationSpamOutcome("STAFF_SKIPPED", 0, null)
+        }
+        var now = Time.nowIso()
+        var nowMillis = Time.toMillis(now)
+        if (this.throttled(userId, nowMillis)) {
+            return ModerationSpamOutcome("THROTTLED", 0, null)
+        }
+        // An account already sanctioned (restricted/banned) is not reanalysed: the sanction stands and the restriction already
+        // prevents publishing again.
+        if (sanctions.activeSanctionOf(userId) != null) {
+            return ModerationSpamOutcome("ALREADY_SANCTIONED", 0, null)
+        }
+        var since = nowMillis - (lookbackHours as Long) * 3600000L
+        var windowStart = nowMillis - (floodWindowMinutes as Long) * 60000L
+        var recent = listOf<FeedPostRow>()
+        for (var p in posts.activeByAuthor(userId, now, ModerationSpamAutomod.scanLimit())) {
+            if (Time.toMillis(p.createdAt()) > since) {
+                recent.add(p)
+            }
+        }
+        if (recent.size() == 0) {
+            return ModerationSpamOutcome("NO_SIGNAL", 0, null)
+        }
+        var ids = listOf<String>()
+        for (var p in recent) {
+            ids.add(p.id())
+        }
+        var media = posts.mediaByPost(ids)
+        var inWindow = listOf<FeedPostRow>()
+        for (var p in recent) {
+            if (Time.toMillis(p.createdAt()) > windowStart) {
+                inWindow.add(p)
+            }
+        }
+        var shortInWindow = listOf<FeedPostRow>()
+        for (var p in inWindow) {
+            if (this.suspiciouslyShort(p, media)) {
+                shortInWindow.add(p)
+            }
+        }
+        var keys = listOf<String>()
+        var groups = mapOf<String, List<FeedPostRow>>()
+        for (var p in recent) {
+            var text = ModerationSpamAutomod.normalized(p.content())
+            if (text.length() == 0 || text.length() > 1000) {
+                continue
+            }
+            var group = groups.get(text)
+            if (group == null) {
+                var created = listOf<FeedPostRow>()
+                created.add(p)
+                groups.put(text, created)
+                keys.add(text)
+            }
+            else {
+                group.add(p)
+            }
+        }
+        var biggest = 0
+        for (var k in keys) {
+            var size = ModerationSpamAutomod.sizeOf(groups.get(k))
+            if (size > biggest) {
+                biggest = size
+            }
+        }
+        var flood = inWindow.size() >= floodThreshold
+        var repetition = biggest >= repeatThreshold
+        var shortFlood = shortInWindow.size() >= shortFloodThreshold
+        if (!flood && !repetition && !shortFlood) {
+            return ModerationSpamOutcome("NO_SIGNAL", 0, null)
+        }
+        // Candidates = what the evidence points to. Includes the EARLIER ones (retroactive search inside the analysis window),
+        // not only the post that triggered.
+        var candidates = listOf<FeedPostRow>()
+        var seen = listOf<String>()
+        if (flood) {
+            ModerationSpamAutomod.addAll(candidates, seen, inWindow)
+        }
+        if (repetition) {
+            for (var k in keys) {
+                var g = groups.get(k)
+                if (g != null) {
+                    if (g.size() >= repeatThreshold) {
+                        ModerationSpamAutomod.addAll(candidates, seen, g)
+                    }
+                }
+            }
+        }
+        if (shortFlood) {
+            ModerationSpamAutomod.addAll(candidates, seen, shortInWindow)
+        }
+        var targets = listOf<FeedPostRow>()
+        for (var c in candidates) {
+            if (targets.size() < sanitizeLimit) {
+                targets.add(c)
+            }
+        }
+        // The AI decides. Without a valid verdict (offline/invalid) NOTHING is deleted.
+        var sample = this.sampleOf(targets, media)
+        var evidence = "Automod (sem denúncia): o mesmo autor publicou " + inWindow.size() + " posts em " + floodWindowMinutes + " minutos; " + biggest + " posts idênticos na janela de análise e " + shortInWindow.size() + " posts praticamente vazios. Verifique se é spam/flood ou uso legítimo da rede."
+        var verdict = ai.parseVerdict(ai.triage(ModerationPrompts.user(sample, "SPAM", evidence), listOf<String>()))
+        if (verdict == null) {
+            log.info("automod_spam_unconfirmed flood=" + inWindow.size() + " repeated=" + biggest + " short=" + shortInWindow.size())
+            return ModerationSpamOutcome("NEEDS_REVIEW", 0, null)
+        }
+        if (ModerationVerdicts.text(verdict.acao) != "PENALIZAR" || !ModerationVerdicts.canAutoPenalize(verdict)) {
+            log.info("automod_spam_unconfirmed flood=" + inWindow.size() + " repeated=" + biggest + " short=" + shortInWindow.size())
+            return ModerationSpamOutcome("NEEDS_REVIEW", 0, null)
+        }
+        var motive = ModerationSpamAutomod.motive(verdict)
+        var removed = 0
+        for (var t in targets) {
+            feed.removeAsModerator(ModerationSpamAutomod.systemModerator(), t.id(), motive)
+            removed = removed + 1
+        }
+        var massive = inWindow.size() >= autoBanThreshold
+        var sanction = sanctions.restrictUser(userId, "automod_spam_" + nowMillis, motive)
+        var kind = "RESTRICTION"
+        if (massive) {
+            sanctions.banAuthor(sanction, userId, ModerationSpamAutomod.systemModerator())
+            kind = "BAN"
+        }
+        log.warn("automod_spam_penalized removed=" + removed + " ban=" + massive)
+        return ModerationSpamOutcome("PENALIZED", removed, kind)
+    }
+    // At most one evaluation per author per `min-interval`; the map is capped (cleared when it grows too big).
+    Bool throttled(userId: String, nowMillis: Long) {
+        lastGate.enter()
+        var last = lastEvaluation.get(userId)
+        var skip = false
+        if (last != null) {
+            if (last + (minIntervalMinutes as Long) * 60000L > nowMillis) {
+                skip = true
+            }
+        }
+        if (!skip) {
+            if (lastEvaluation.size() > ModerationSpamAutomod.throttleEntries()) {
+                lastEvaluation.clear()
+            }
+            lastEvaluation.put(userId, nowMillis)
+        }
+        lastGate.leave()
+        return skip
+    }
+    static Int sizeOf(list: List<FeedPostRow>?) {
+        if (list == null) {
+            return 0
+        }
+        return list.size()
+    }
+    static Int sizeOfIds(list: List<String>?) {
+        if (list == null) {
+            return 0
+        }
+        return list.size()
+    }
+    static addAll(into: List<FeedPostRow>, seen: List<String>, from: List<FeedPostRow>) {
+        for (var p in from) {
+            if (!seen.contains(p.id())) {
+                seen.add(p.id())
+                into.add(p)
+            }
+        }
+    }
+    // Text normalised to find repetition: no case, no duplicate spaces.
+    static String normalized(content: String?) {
+        if (content == null) {
+            return ""
+        }
+        String text = content
+        if (text.trim().length() == 0) {
+            return ""
+        }
+        return text.trim().replaceAll("\\s+", " ").toLowerCase()
+    }
+    // "Practically empty": text below the minimum AND no media. Only counts as a signal together (a run of them), never one post.
+    Bool suspiciouslyShort(post: FeedPostRow, media: Map<String,List<String>>) {
+        if (ModerationSpamAutomod.sizeOfIds(media.get(post.id())) > 0) {
+            return false
+        }
+        var text = ModerationSpamAutomod.normalized(post.content())
+        return text.length() > 0 && text.length() < minLength
+    }
+    String sampleOf(targets: List<FeedPostRow>, media: Map<String,List<String>>) {
+        var parts = listOf<String>()
+        for (var p in targets) {
+            if (parts.size() >= ModerationSpamAutomod.aiSample()) {
+                break
+            }
+            var text = p.content().trim()
+            if (text.length() > ModerationSpamAutomod.aiSampleText()) {
+                text = text.substring(0, ModerationSpamAutomod.aiSampleText()) + "…"
+            }
+            var line = "[" + p.createdAt() + "] " + text
+            if (ModerationSpamAutomod.sizeOfIds(media.get(p.id())) > 0) {
+                line = line + " (com mídia)"
+            }
+            parts.add(line)
+        }
+        return String.join("\n---\n", parts)
+    }
+    static String motive(verdict: ModerationVerdict) {
+        var why = ModerationVerdicts.text(verdict.justificativa)
+        if (why.trim().length() > 0) {
+            if (why.length() > 300) {
+                return why.substring(0, 300)
+            }
+            return why
+        }
+        var category = ModerationVerdicts.text(verdict.categoria)
+        if (category.trim().length() > 0) {
+            return category
+        }
+        return "flood/spam detectado automaticamente"
+    }
+}

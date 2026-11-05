@@ -1,0 +1,277 @@
+package moderation
+
+// The JSON the three barrier prompts ask for (the fields the backend reads). Absent fields stay null.
+record ModerationAutomationWire(String? veredito, String? gravidade, Double? confianca, String? motivo)
+
+// A guess of a barrier's model. `verdict` is the enum name of the barrier (HUMAN/AUTOMATED/UNSURE, SAFE/EXPLICIT/SUSPICIOUS/UNSURE,
+// SAFE/EXPLICIT/SEXUAL_MINOR/UNSURE); the model only guesses, the backend decides and acts.
+record ModerationContentVerdict(String verdict, Double confidence, String reason)
+
+record ModerationLinkVerdict(String verdict, String severity, Double confidence, String reason)
+
+record ModerationMediaVerdict(String verdict, String severity, Double confidence, String reason)
+
+class ModerationAnalyzerRules {
+    static ModerationAutomationWire? wire(raw: String) {
+        try {
+            return json.decode<ModerationAutomationWire>(raw)
+        } catch (String e) {
+            return null
+        }
+    }
+    static Bool inRange(c: Double?) {
+        if (c == null) {
+            return false
+        }
+        Double value = c
+        return value >= 0.0 && value <= 1.0
+    }
+    static String severity(v: String?) {
+        if (v == null) {
+            return "LOW"
+        }
+        String s = v
+        if (listOf("LOW", "MEDIUM", "HIGH", "CRITICAL").contains(s)) {
+            return s
+        }
+        return "LOW"
+    }
+    static String text(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    static Double number(v: Double?) {
+        if (v == null) {
+            return 0.0
+        }
+        return v
+    }
+    static Bool blank(v: String?) {
+        if (v == null) {
+            return true
+        }
+        String s = v
+        return s.trim().length() == 0
+    }
+}
+
+// ContentAutomationAnalyzer: is the post a person's voice or a machine's output published as if it were? Using AI as a TOOL is
+// legitimate; the account that exists to publish generator output is not. The model gives a structured guess; the backend
+// quarantines, a person decides. Nothing here punishes.
+class ModerationContentAnalyzer {
+    ModerationAi ai
+    public constructor(ai: ModerationAi) {
+        this.ai = ai
+    }
+    // Confidence needed to take a post off the air alone. Quarantine is reversible, but it hides.
+    static Double minConfidence() = 0.8
+    String modelName() = ai.model
+    static String truncate(content: String?) {
+        if (content == null) {
+            return ""
+        }
+        String text = content
+        var clean = text.trim()
+        if (clean.length() <= 4000) {
+            return clean
+        }
+        return clean.substring(0, 4000) + "…"
+    }
+    static String systemPrompt() = ModerationAutomationPrompts.contentSystem()
+    static String userPrompt(content: String?) = ModerationAutomationPrompts.contentUser(ModerationContentAnalyzer.truncate(content))
+    // Analyses a post text. null = no valid guess (the post follows its normal course).
+    ModerationContentVerdict? analyze(content: String?) {
+        if (ModerationAnalyzerRules.blank(content) || !ai.available()) {
+            return null
+        }
+        var raw = ai.triageVision(ModerationContentAnalyzer.systemPrompt(), ModerationContentAnalyzer.userPrompt(content), listOf<String>())
+        return this.parse(raw)
+    }
+    // Extracts and validates the JSON. Anything outside the contract voids the guess (fail-safe).
+    ModerationContentVerdict? parse(modelOutput: String?) {
+        if (ModerationAnalyzerRules.blank(modelOutput)) {
+            return null
+        }
+        String output = ModerationAnalyzerRules.text(modelOutput)
+        var wire = ModerationAnalyzerRules.wire(output)
+        if (wire == null) {
+            return null
+        }
+        var verdict = wire.veredito
+        if (verdict == null) {
+            return null
+        }
+        if (verdict != "HUMAN" && verdict != "AUTOMATED" && verdict != "UNSURE") {
+            return null
+        }
+        if (!ModerationAnalyzerRules.inRange(wire.confianca)) {
+            return null
+        }
+        return ModerationContentVerdict(verdict, ModerationAnalyzerRules.number(wire.confianca), ModerationAnalyzerRules.text(wire.motivo))
+    }
+    // May the automation take the post off the air alone? Only a confirmed AUTOMATED above the floor, and "off the air" means
+    // quarantine: nothing is deleted and nobody is punished.
+    static Bool canQuarantine(v: ModerationContentVerdict?) {
+        if (v == null) {
+            return false
+        }
+        return v.verdict == "AUTOMATED" && v.confidence >= ModerationContentAnalyzer.minConfidence()
+    }
+}
+
+// LinkSafetyAnalyzer: classifies the DESTINATION of a link by what the page says about itself (the case: a video hosted on a
+// legitimate site). The model receives only that summary, never the whole page.
+class ModerationLinkAnalyzer {
+    ModerationAi ai
+    public constructor(ai: ModerationAi) {
+        this.ai = ai
+    }
+    // Below this the destination is not blocked alone: it goes to a person.
+    static Double minConfidence() = 0.7
+    String modelName() = ai.model
+    static String systemPrompt() = ModerationAutomationPrompts.linkSystem()
+    static String userPrompt(page: ModerationPageSummary) = ModerationAutomationPrompts.linkUser(ModerationPages.promptLine(page))
+    ModerationLinkVerdict? analyze(page: ModerationPageSummary?) {
+        if (page == null) {
+            return null
+        }
+        if (!ModerationPages.hasAnything(page) || !ai.available()) {
+            return null
+        }
+        var raw = ai.triageVision(ModerationLinkAnalyzer.systemPrompt(), ModerationLinkAnalyzer.userPrompt(page), listOf<String>())
+        return this.parse(raw)
+    }
+    ModerationLinkVerdict? parse(modelOutput: String?) {
+        if (ModerationAnalyzerRules.blank(modelOutput)) {
+            return null
+        }
+        String output = ModerationAnalyzerRules.text(modelOutput)
+        var wire = ModerationAnalyzerRules.wire(output)
+        if (wire == null) {
+            return null
+        }
+        var verdict = wire.veredito
+        if (verdict == null) {
+            return null
+        }
+        if (verdict != "SAFE" && verdict != "EXPLICIT" && verdict != "SUSPICIOUS" && verdict != "UNSURE") {
+            return null
+        }
+        if (!ModerationAnalyzerRules.inRange(wire.confianca)) {
+            return null
+        }
+        return ModerationLinkVerdict(verdict, ModerationAnalyzerRules.severity(wire.gravidade), ModerationAnalyzerRules.number(wire.confianca), ModerationAnalyzerRules.text(wire.motivo))
+    }
+    static Bool isViolation(verdict: String) = verdict == "EXPLICIT" || verdict == "SUSPICIOUS"
+    // May the destination be blocked without a person looking? A violation above the floor.
+    static Bool canActAlone(v: ModerationLinkVerdict?) {
+        if (v == null) {
+            return false
+        }
+        return ModerationLinkAnalyzer.isViolation(v.verdict) && v.confidence >= ModerationLinkAnalyzer.minConfidence()
+    }
+}
+
+// MediaSafetyAnalyzer: classifies ONE image as safe, explicit or sexual content with a minor. Separate from the report triage on
+// purpose: there the model judges a REPORT, here it only says what it sees, so the automatic decision does not depend on
+// somebody having reported.
+class ModerationMediaAnalyzer {
+    ModerationAi ai
+    public constructor(ai: ModerationAi) {
+        this.ai = ai
+    }
+    // Below this the image is not blocked alone: it goes to a person.
+    static Double minConfidence() = 0.7
+    String modelName() = ai.model
+    static String systemPrompt() = ModerationAutomationPrompts.mediaSystem()
+    static String userPrompt() = ModerationAutomationPrompts.mediaUser()
+    // Analyses an image (JPEG already reduced, base64). null = no valid guess and the media stays without an automatic decision.
+    ModerationMediaVerdict? analyze(base64Image: String?) {
+        if (ModerationAnalyzerRules.blank(base64Image) || !ai.available()) {
+            return null
+        }
+        String image = ModerationAnalyzerRules.text(base64Image)
+        var raw = ai.triageVision(ModerationMediaAnalyzer.systemPrompt(), ModerationMediaAnalyzer.userPrompt(), listOf(image))
+        return this.parse(raw)
+    }
+    ModerationMediaVerdict? parse(modelOutput: String?) {
+        if (ModerationAnalyzerRules.blank(modelOutput)) {
+            return null
+        }
+        var extracted = ModerationMediaAnalyzer.extractJsonObject(ModerationAnalyzerRules.text(modelOutput))
+        if (extracted == null) {
+            return null
+        }
+        String jsonText = extracted
+        var wire = ModerationAnalyzerRules.wire(jsonText)
+        if (wire == null) {
+            return null
+        }
+        var verdict = wire.veredito
+        if (verdict == null) {
+            return null
+        }
+        if (verdict != "SAFE" && verdict != "EXPLICIT" && verdict != "SEXUAL_MINOR" && verdict != "UNSURE") {
+            return null
+        }
+        if (!ModerationAnalyzerRules.inRange(wire.confianca)) {
+            return null
+        }
+        return ModerationMediaVerdict(verdict, ModerationAnalyzerRules.severity(wire.gravidade), ModerationAnalyzerRules.number(wire.confianca), ModerationAnalyzerRules.text(wire.motivo))
+    }
+    // The first JSON object of the model reply. Even when told "ONLY the JSON", vision providers wrap the object in a markdown
+    // fence or an introduction: the contract is the object, not the envelope. The scanner respects strings and escapes so a brace
+    // inside the reason does not end the object.
+    static String? extractJsonObject(raw: String) {
+        var start = raw.indexOf("{")
+        if (start < 0) {
+            return null
+        }
+        var inString = false
+        var escaped = false
+        var depth = 0
+        var i = start
+        while (i < raw.length()) {
+            var c = raw.substring(i, i + 1)
+            if (inString) {
+                if (escaped) {
+                    escaped = false
+                }
+                else if (c == "\\") {
+                    escaped = true
+                }
+                else if (c == "\"") {
+                    inString = false
+                }
+            }
+            else if (c == "\"") {
+                inString = true
+            }
+            else if (c == "{") {
+                depth = depth + 1
+            }
+            else if (c == "}") {
+                depth = depth - 1
+                if (depth == 0) {
+                    return raw.substring(start, i + 1)
+                }
+            }
+            i = i + 1
+        }
+        return null
+    }
+    static Bool isViolation(verdict: String) = verdict == "EXPLICIT" || verdict == "SEXUAL_MINOR"
+    // May the image be blocked without a person looking? A violation above the floor; sexual content with a minor skips the floor
+    // (reasonable doubt is enough to take it down).
+    static Bool canActAlone(v: ModerationMediaVerdict?) {
+        if (v == null) {
+            return false
+        }
+        if (!ModerationMediaAnalyzer.isViolation(v.verdict)) {
+            return false
+        }
+        return v.verdict == "SEXUAL_MINOR" || v.confidence >= ModerationMediaAnalyzer.minConfidence()
+    }
+}

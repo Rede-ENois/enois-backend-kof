@@ -1,0 +1,121 @@
+package moderation
+
+import kernel.http.*
+import kernel.log.*
+import kernel.text.*
+import kernel.url.*
+
+// One hop of the page read: the answer of a GET that does not follow redirects.
+record ModerationHop(Int status, String contentType, String location, String html)
+
+// LinkedPageReader + HttpLinkedPageReader: reads the title and the description of a destination published in a text, with the rule
+// that the server does not visit its own network. Whoever publishes picks the address, so the address is untrusted data: before
+// EVERY hop (the first and each redirect) it must pass OutboundUrlGuard (http/https, ports 80/443, no local names, DNS only to
+// public addresses). Redirects are followed by hand with the same check and a short cap. The read stops at the first chunk of the
+// page and at the byte cap: nothing read is stored or served, it only goes to the triage as data. A failure answers null: a link
+// that does not answer never becomes an accusation. The network goes only through kernel.http.Outbound; tests subclass `hop`
+// and `isPublicDestination` (or answer from a local stand-in server).
+class ModerationLinkedPageReader {
+    Log log = Log("moderation.links.reader")
+    public constructor() {}
+    static Int maxRedirects() = 3
+    static Int maxBytes() = 65536
+    static Int connectTimeoutMs() = 4000
+    static Int readTimeoutMs() = 6000
+    ModerationPageSummary? summaryOf(url: String) {
+        var current = url
+        var hops = 0
+        while (hops <= ModerationLinkedPageReader.maxRedirects()) {
+            if (!this.isPublicDestination(current)) {
+                log.debug("link_destination_refused")
+                return null
+            }
+            var hop = this.hop(current)
+            if (hop == null) {
+                return null
+            }
+            if (hop.status / 100 == 3) {
+                if (hop.location.length() == 0) {
+                    return null
+                }
+                current = Uris.resolve(current, hop.location)
+                if (current.length() == 0) {
+                    return null
+                }
+                hops = hops + 1
+                continue
+            }
+            if (hop.status != 200) {
+                return null
+            }
+            if (!hop.contentType.startsWith("text/html")) {
+                return null
+            }
+            return ModerationLinkedPageReader.summaryOfHtml(current, hop.html)
+        }
+        return null
+    }
+    // May the server visit this address? Everything the DNS answers must be public.
+    Bool isPublicDestination(url: String) = OutboundUrlGuard.safe(url)
+    // One GET without redirects, the body capped and decoded in the page charset; null on any network failure.
+    ModerationHop? hop(url: String) {
+        try {
+            var headers = listOf("User-Agent: enois-moderacao/1.0 (+verificacao de link)", "Accept: text/html,application/xhtml+xml", "Accept-Language: pt-BR,pt;q=0.9")
+            var res = Outbound.getBytes(url, headers, ModerationLinkedPageReader.connectTimeoutMs(), ModerationLinkedPageReader.readTimeoutMs(), ModerationLinkedPageReader.maxBytes())
+            if (res.status != 200) {
+                return ModerationHop(res.status, res.contentType, res.location, "")
+            }
+            if (!res.contentType.startsWith("text/html")) {
+                return ModerationHop(res.status, res.contentType, res.location, "")
+            }
+            return ModerationHop(res.status, res.contentType, res.location, res.textAs(ModerationLinkedPageReader.charsetOf(res.contentType)))
+        } catch (String e) {
+            log.debug("link_read_failed")
+            return null
+        }
+    }
+    static String charsetOf(contentType: String) {
+        for (var part in contentType.split(";")) {
+            var clean = part.trim().toLowerCase()
+            if (clean.startsWith("charset=")) {
+                return clean.substring(8).replace("\"", "").trim()
+            }
+        }
+        return "UTF-8"
+    }
+    static String meta(key: String) = "(?is)<meta[^>]*(?:property|name)\\s*=\\s*[\"']\\Q" + key + "\\E[\"'][^>]*content\\s*=\\s*[\"']([^\"']*)[\"']"
+    static String? first(regex: String, html: String) {
+        var m = Regexes.first(regex, html)
+        if (m == null) {
+            return null
+        }
+        return m.groups.get(1)
+    }
+    // Title and description: the Open Graph ones first (the summary the site publishes), then the HTML ones.
+    static ModerationPageSummary summaryOfHtml(url: String, html: String) {
+        var title = ModerationLinkedPageReader.first(ModerationLinkedPageReader.meta("og:title"), html)
+        if (title == null) {
+            title = ModerationLinkedPageReader.first("(?is)<title[^>]*>(.*?)</title>", html)
+        }
+        var description = ModerationLinkedPageReader.first(ModerationLinkedPageReader.meta("og:description"), html)
+        if (description == null) {
+            description = ModerationLinkedPageReader.first(ModerationLinkedPageReader.meta("description"), html)
+        }
+        var site = ModerationLinkedPageReader.first(ModerationLinkedPageReader.meta("og:site_name"), html)
+        if (site != null && title != null) {
+            String name = site
+            String heading = title
+            if (!heading.toLowerCase().contains(name.toLowerCase())) {
+                title = heading + " (" + name + ")"
+            }
+        }
+        return ModerationPages.of(url, ModerationLinkedPageReader.decode(title), ModerationLinkedPageReader.decode(description))
+    }
+    static String? decode(value: String?) {
+        if (value == null) {
+            return null
+        }
+        String text = value
+        return text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&apos;", "'").replace("&nbsp;", " ")
+    }
+}

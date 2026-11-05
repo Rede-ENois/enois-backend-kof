@@ -1,0 +1,267 @@
+package moderation
+
+import kernel.concurrent.*
+import kernel.config.*
+import kernel.db.*
+import kernel.jobs.*
+import kernel.log.*
+import kernel.outbox.*
+import kernel.time.*
+
+// The executor of the barriers (spamAutomodExecutor): ONE lane with a bounded queue. The analyses call the model (up to 30 s) and
+// must not compete with the request threads. When the queue is full the event is dropped (the automod is best effort and the sweeps
+// cover it) instead of bringing down the publication or the heap. `inline` runs the task on the caller (tests).
+class ModerationExecutor {
+    Permits queue = Permits(200)
+    Gate lane = Gate()
+    Bool inline = false
+    Log log = Log("moderation.executor")
+    public constructor() {}
+    execute(task: () -> void) {
+        if (inline) {
+            ModerationExecutor.runTask(task)
+            return
+        }
+        if (!queue.tryAcquire()) {
+            log.warn("automod queue full; event dropped")
+            return
+        }
+        var slots = queue
+        var gate = lane
+        var done = __kof_spawn_expr(ModerationExecutor.runLane(task, slots, gate))
+    }
+    static runLane(task: () -> void, slots: Permits, gate: Gate) {
+        gate.enter()
+        ModerationExecutor.runTask(task)
+        gate.leave()
+        slots.release()
+    }
+    static runTask(task: () -> void) {
+        try {
+            task()
+        } catch (String e) {
+            Log("moderation.executor").warn("automod_task_failed " + e)
+        }
+    }
+}
+
+// The listeners of PostPublishedEvent (spam automod, content automation, link safety, media safety) on the outbox event of the
+// feed: after the commit of the publication, never on its thread; a failure here never reaches the post already on the air.
+class ModerationPostPublishedHandler extends OutboxEventHandler {
+    Log log = Log("moderation.published")
+    ModerationExecutor executor
+    ModerationPosts posts
+    ModerationContentAutomation content
+    ModerationLinkSafety links
+    ModerationMediaSafety media
+    ModerationSpamAutomod spam
+    public constructor(executor: ModerationExecutor, posts: ModerationPosts, content: ModerationContentAutomation, links: ModerationLinkSafety, media: ModerationMediaSafety, spam: ModerationSpamAutomod) {
+        super()
+        this.executor = executor
+        this.posts = posts
+        this.content = content
+        this.links = links
+        this.media = media
+        this.spam = spam
+    }
+    handle(eventType: String, aggregateId: String, payload: String) {
+        if (eventType != "PostPublished") {
+            return
+        }
+        var postId = aggregateId
+        var self = this
+        this.submit(() -> self.spamOf(postId), postId)
+        if (content.enabled) {
+            this.submit(() -> self.contentOf(postId), postId)
+        }
+        if (links.enabled) {
+            this.submit(() -> self.linksOf(postId), postId)
+        }
+        if (media.enabled) {
+            this.submit(() -> self.mediaOf(postId), postId)
+        }
+    }
+    // Even an unavailable queue cannot turn a confirmed publication into an error.
+    submit(task: () -> void, postId: String) {
+        try {
+            executor.execute(task)
+        } catch (String e) {
+            log.warn("automod_schedule_failed post=" + postId)
+        }
+    }
+    spamOf(postId: String) {
+        try {
+            var post = posts.byId(postId)
+            if (post != null) {
+                spam.evaluate(post.authorId())
+            }
+        } catch (String e) {
+            log.warn("automod_spam_failed post=" + postId)
+        }
+    }
+    contentOf(postId: String) {
+        try {
+            content.evaluate(postId)
+        } catch (String e) {
+            log.warn("content_automation_failed post=" + postId)
+        }
+    }
+    linksOf(postId: String) {
+        try {
+            links.check(postId)
+        } catch (String e) {
+            log.warn("link_safety_failed post=" + postId)
+        }
+    }
+    // One media with a problem does not stop the others nor affect the post already published; the periodic sweep covers failed reads.
+    mediaOf(postId: String) {
+        try {
+            for (var mediaId in posts.mediaIdsOf(postId)) {
+                try {
+                    media.check(mediaId)
+                } catch (String e) {
+                    log.warn("media_safety_failed post=" + postId + " media=" + mediaId)
+                }
+            }
+        } catch (String e) {
+            log.warn("media_safety_failed post=" + postId)
+        }
+    }
+}
+
+// SexualContentReportListener: a report of SEXUAL content on a POST starts the immediate path (quarantine + bot before the common
+// queue); every other reason and every other target keeps going only to human review (if the trigger opened too wide, every post
+// reported for anything would leave the air by itself). Runs after the commit of the report and off its thread.
+class ModerationSexualEvents extends ModerationReportEvents {
+    Db database
+    ModerationExecutor executor
+    ModerationSexualReport sexual
+    Log log = Log("moderation.sexual.events")
+    public constructor(database: Db, executor: ModerationExecutor, sexual: ModerationSexualReport) {
+        super()
+        this.database = database
+        this.executor = executor
+        this.sexual = sexual
+    }
+    reportCreated(report: ModerationReport) {
+        if (report.targetType != "POST" || report.reason != "SEXUAL_CONTENT") {
+            return
+        }
+        if (!sexual.enabled) {
+            return
+        }
+        var postId = report.targetId
+        var description = report.description
+        var self = this
+        database.afterCommit(() -> self.submit(postId, description))
+    }
+    submit(postId: String, description: String) {
+        var flow = sexual
+        try {
+            executor.execute(() -> {
+    flow.handle(postId, description)
+})
+        } catch (String e) {
+            log.warn("sexual_report_schedule_failed post=" + postId)
+        }
+    }
+}
+
+// The three periodic sweeps, the safety net of the hooks: what escaped them (a post published while the pod restarted, a batch that
+// predates the barrier, a transient failure). The ledgers guarantee the same item is never analysed twice. Each round has its own
+// scheduler loop, so a pass that outlasts the interval never overlaps itself.
+class ModerationBarrierSweeps {
+    Log log = Log("moderation.sweeps")
+    ModerationContentAutomation content
+    ModerationLinkSafety links
+    ModerationMediaSafety media
+    ModerationPosts posts
+    Int contentBatch
+    Int contentLookbackHours
+    Int linkBatch
+    Int linkLookbackHours
+    Int mediaBatch
+    Int mediaLookbackHours
+    public constructor(content: ModerationContentAutomation, links: ModerationLinkSafety, media: ModerationMediaSafety, posts: ModerationPosts, contentBatch: Int, contentLookbackHours: Int, linkBatch: Int, linkLookbackHours: Int, mediaBatch: Int, mediaLookbackHours: Int) {
+        this.content = content
+        this.links = links
+        this.media = media
+        this.posts = posts
+        this.contentBatch = ModerationContentTargets.clampInt(contentBatch, 1, 100000)
+        this.contentLookbackHours = ModerationContentTargets.clampInt(contentLookbackHours, 1, 100000)
+        this.linkBatch = ModerationContentTargets.clampInt(linkBatch, 1, 100000)
+        this.linkLookbackHours = ModerationContentTargets.clampInt(linkLookbackHours, 1, 100000)
+        this.mediaBatch = ModerationContentTargets.clampInt(mediaBatch, 1, 100000)
+        this.mediaLookbackHours = ModerationContentTargets.clampInt(mediaLookbackHours, 1, 100000)
+    }
+    static ModerationBarrierSweeps fromConfig(cfg: Config, content: ModerationContentAutomation, links: ModerationLinkSafety, media: ModerationMediaSafety, posts: ModerationPosts) = ModerationBarrierSweeps(content, links, media, posts, cfg.getInt("MODERATION_AUTOMATION_SWEEP_BATCH", 20), cfg.getInt("MODERATION_AUTOMATION_LOOKBACK_HOURS", 72), cfg.getInt("MODERATION_LINKS_SWEEP_BATCH", 15), cfg.getInt("MODERATION_LINKS_LOOKBACK_HOURS", 72), cfg.getInt("MODERATION_MEDIA_SWEEP_BATCH", 25), cfg.getInt("MODERATION_MEDIA_LOOKBACK_HOURS", 72))
+    static String since(hours: Int) = Time.plusSeconds(Time.nowIso(), 0L - (hours as Long) * 3600L)
+    // One pass of the automated-content sweep; returns how many posts went to quarantine.
+    Int contentSweep() {
+        if (!content.enabled) {
+            return 0
+        }
+        var quarantined = 0
+        var evaluated = 0
+        for (var postId in content.pending(ModerationBarrierSweeps.since(contentLookbackHours), contentBatch)) {
+            var outcome = content.evaluate(postId)
+            evaluated = evaluated + 1
+            if (outcome.quarantined) {
+                quarantined = quarantined + 1
+            }
+        }
+        if (evaluated > 0) {
+            log.info("content_automation_sweep done evaluated=" + evaluated + " quarantined=" + quarantined)
+        }
+        return quarantined
+    }
+    // One pass of the link sweep; returns how many posts were checked. Window of hours: a judged link is in the ledger, so
+    // revisiting the same period is cheap, visiting a new destination is what costs.
+    Int linkSweep() {
+        if (!links.enabled) {
+            return 0
+        }
+        var checked = 0
+        for (var post in posts.activeWithLinksSince(ModerationBarrierSweeps.since(linkLookbackHours), linkBatch)) {
+            try {
+                links.check(post.id())
+                checked = checked + 1
+            } catch (String e) {
+                log.warn("link_sweep_post_failed post=" + post.id())
+            }
+        }
+        return checked
+    }
+    // One pass of the media sweep; returns how many media were blocked. Short window on purpose: explicit content has to leave
+    // the air in minutes, not days.
+    Int mediaSweep() {
+        if (!media.enabled) {
+            return 0
+        }
+        var enforced = 0
+        var checked = 0
+        for (var mediaId in media.pending(ModerationBarrierSweeps.since(mediaLookbackHours), mediaBatch)) {
+            var outcome = media.check(mediaId)
+            checked = checked + 1
+            if (outcome.status == "ENFORCED") {
+                enforced = enforced + 1
+            }
+        }
+        if (checked > 0) {
+            log.info("media_safety_sweep done checked=" + checked + " enforced=" + enforced)
+        }
+        return enforced
+    }
+    schedule(jobs: Scheduler, cfg: Config) {
+        var self = this
+        jobs.fixedDelay("moderation-content-automation-sweep", cfg.getInt("MODERATION_AUTOMATION_INITIAL_DELAY_MS", 90000) as Long, cfg.getInt("MODERATION_AUTOMATION_INTERVAL_MS", 600000) as Long, () -> {
+    self.contentSweep()
+})
+        jobs.fixedDelay("moderation-link-sweep", cfg.getInt("MODERATION_LINKS_INITIAL_DELAY_MS", 60000) as Long, cfg.getInt("MODERATION_LINKS_INTERVAL_MS", 300000) as Long, () -> {
+    self.linkSweep()
+})
+        jobs.fixedDelay("moderation-media-sweep", cfg.getInt("MODERATION_MEDIA_INITIAL_DELAY_MS", 45000) as Long, cfg.getInt("MODERATION_MEDIA_INTERVAL_MS", 300000) as Long, () -> {
+    self.mediaSweep()
+})
+    }
+}

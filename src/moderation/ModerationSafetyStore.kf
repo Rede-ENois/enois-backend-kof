@@ -1,0 +1,204 @@
+package moderation
+
+import feed.*
+import kernel.db.*
+import kernel.security.*
+
+// A row of the automated-content ledger: what was evaluated, with which verdict and where the review stands. Status is
+// NONE (nothing to review: the post never left the air), PENDING (quarantined, waiting for a person), RELEASED or REMOVED.
+record ModerationContentCheck(String postId, String authorId, String verdict, Double confidence, String reason, String model, String checkedAt, String status)
+
+// The result of checking a published destination (one row per normalised URL; the key is the hash of the address).
+record ModerationLinkCheck(String urlHash, String url, String ownerId, String verdict, String severity, Double confidence, String reason, String model, String checkedAt)
+
+// The result of checking a media (one row per media id): stops the same image being sent to the model again and keeps the
+// automatic decision auditable (which model, when, with what confidence).
+record ModerationMediaCheck(String mediaId, String ownerId, String verdict, String severity, Double confidence, String reason, String model, String checkedAt)
+
+class ModerationSafetyRules {
+    static Int maxReason() = 280
+    static Int maxUrl() = 1000
+    static String clip(value: String?, max: Int) {
+        if (value == null) {
+            return ""
+        }
+        String text = value
+        if (text.length() <= max) {
+            return text
+        }
+        return text.substring(0, max)
+    }
+    // A reason is one sentence of the model: blank becomes the verdict name, trimmed and capped.
+    static String reason(value: String?, verdict: String) {
+        if (ModerationAnalyzerRules.blank(value)) {
+            return verdict
+        }
+        String text = ModerationAnalyzerRules.text(value)
+        return ModerationSafetyRules.clip(text.trim(), ModerationSafetyRules.maxReason())
+    }
+    static Double clamp(c: Double) {
+        if (c < 0.0) {
+            return 0.0
+        }
+        if (c > 1.0) {
+            return 1.0
+        }
+        return c
+    }
+    static ModerationContentCheck content(postId: String, authorId: String, verdict: String, confidence: Double, reason: String?, model: String, checkedAt: String, status: String) = ModerationContentCheck(postId, authorId, verdict, confidence, ModerationSafetyRules.clip(reason, ModerationSafetyRules.maxReason()), model, checkedAt, status)
+    static ModerationLinkCheck link(url: String, ownerId: String, verdict: String, severity: String?, confidence: Double, reason: String?, model: String, checkedAt: String) {
+        var cleanUrl = ModerationSafetyRules.clip(url, ModerationSafetyRules.maxUrl())
+        var sev = "LOW"
+        if (severity != null) {
+            sev = severity
+        }
+        return ModerationLinkCheck(Hashes.sha256Hex(cleanUrl), cleanUrl, ownerId, verdict, sev, ModerationSafetyRules.clamp(confidence), ModerationSafetyRules.reason(reason, verdict), model, checkedAt)
+    }
+    static ModerationMediaCheck media(mediaId: String, ownerId: String, verdict: String, severity: String?, confidence: Double, reason: String?, model: String, checkedAt: String) {
+        var sev = "LOW"
+        if (severity != null) {
+            sev = severity
+        }
+        return ModerationMediaCheck(mediaId, ownerId, verdict, sev, ModerationSafetyRules.clamp(confidence), ModerationSafetyRules.reason(reason, verdict), model, checkedAt)
+    }
+}
+
+// The three ledgers of the barriers (content_automation_checks, link_safety_checks, media_safety_checks): history that only
+// grows, read by sweeps. The upsert by key is what avoids reprocessing.
+class ModerationSafetyStore {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    static String contentColumns() = "post_id, author_id, verdict, confidence, reason, model, checked_at, review_status"
+    static String linkColumns() = "url_hash, url, owner_id, verdict, severity, confidence, reason, model, checked_at"
+    static String mediaColumns() = "media_id, owner_id, verdict, severity, confidence, reason, model, checked_at"
+    static ModerationContentCheck contentOf(r: DbRow) = ModerationContentCheck(r.getStr("post_id"), r.getStr("author_id"), r.getStr("verdict"), r.getDouble("confidence"), r.getStr("reason"), r.getStr("model"), r.getInstant("checked_at"), r.getStr("review_status"))
+    static ModerationLinkCheck linkOf(r: DbRow) = ModerationLinkCheck(r.getStr("url_hash"), r.getStr("url"), r.getStr("owner_id"), r.getStr("verdict"), r.getStr("severity"), r.getDouble("confidence"), r.getStr("reason"), r.getStr("model"), r.getInstant("checked_at"))
+    static ModerationMediaCheck mediaOf(r: DbRow) = ModerationMediaCheck(r.getStr("media_id"), r.getStr("owner_id"), r.getStr("verdict"), r.getStr("severity"), r.getDouble("confidence"), r.getStr("reason"), r.getStr("model"), r.getInstant("checked_at"))
+    // Content automation ledger.
+    ModerationContentCheck? findContent(postId: String) {
+        var row = database.queryOptional("select " + ModerationSafetyStore.contentColumns() + " from content_automation_checks where post_id = ?", DbParams().bindStr(postId))
+        if (row == null) {
+            return null
+        }
+        return ModerationSafetyStore.contentOf(row)
+    }
+    saveContent(c: ModerationContentCheck) {
+        var changed = database.execute("update content_automation_checks set author_id = ?, verdict = ?, confidence = ?, reason = ?, model = ?, checked_at = ?, review_status = ? where post_id = ?", DbParams().bindStr(c.authorId).bindStr(c.verdict).bindDouble(c.confidence).bindStr(c.reason).bindStr(c.model).bindInstant(c.checkedAt).bindStr(c.status).bindStr(c.postId))
+        if (changed == 0) {
+            database.execute("insert into content_automation_checks (" + ModerationSafetyStore.contentColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(c.postId).bindStr(c.authorId).bindStr(c.verdict).bindDouble(c.confidence).bindStr(c.reason).bindStr(c.model).bindInstant(c.checkedAt).bindStr(c.status))
+        }
+    }
+    updateContentStatus(postId: String, status: String) {
+        database.execute("update content_automation_checks set review_status = ? where post_id = ?", DbParams().bindStr(status).bindStr(postId))
+    }
+    // Active posts of the recent window with no ledger row: the left join is what keeps the sweep from reading again what was
+    // already evaluated, human verdicts included.
+    List<String> uncheckedPostIdsSince(since: String, limit: Int) {
+        var ids = listOf<String>()
+        for (var r in database.queryList("select p.id from posts p left join content_automation_checks c on c.post_id = p.id where c.post_id is null and p.status = \'ACTIVE\' and p.created_at >= ? order by p.created_at desc limit ?", DbParams().bindInstant(since).bindInt(ModerationSafetyStore.atLeastOne(limit)))) {
+            ids.add(r.getStr("id"))
+        }
+        return ids
+    }
+    static Int atLeastOne(v: Int) {
+        if (v < 1) {
+            return 1
+        }
+        return v
+    }
+    // Link ledger.
+    ModerationLinkCheck? findLink(url: String) {
+        var row = database.queryOptional("select " + ModerationSafetyStore.linkColumns() + " from link_safety_checks where url_hash = ?", DbParams().bindStr(Hashes.sha256Hex(url)))
+        if (row == null) {
+            return null
+        }
+        return ModerationSafetyStore.linkOf(row)
+    }
+    saveLink(c: ModerationLinkCheck) {
+        var changed = database.execute("update link_safety_checks set url = ?, owner_id = ?, verdict = ?, severity = ?, confidence = ?, reason = ?, model = ?, checked_at = ? where url_hash = ?", DbParams().bindStr(c.url).bindStr(c.ownerId).bindStr(c.verdict).bindStr(c.severity).bindDouble(c.confidence).bindStr(c.reason).bindStr(c.model).bindInstant(c.checkedAt).bindStr(c.urlHash))
+        if (changed == 0) {
+            database.execute("insert into link_safety_checks (" + ModerationSafetyStore.linkColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(c.urlHash).bindStr(c.url).bindStr(c.ownerId).bindStr(c.verdict).bindStr(c.severity).bindDouble(c.confidence).bindStr(c.reason).bindStr(c.model).bindInstant(c.checkedAt))
+        }
+    }
+    // Destinations already blocked, for the panel to follow what the automation took down.
+    List<ModerationLinkCheck> linkViolationsSince(since: String, limit: Int) {
+        var out = listOf<ModerationLinkCheck>()
+        for (var r in database.queryList("select " + ModerationSafetyStore.linkColumns() + " from link_safety_checks where verdict in (\'EXPLICIT\', \'SUSPICIOUS\') and checked_at >= ? order by checked_at desc limit ?", DbParams().bindInstant(since).bindInt(ModerationSafetyStore.atLeastOne(limit)))) {
+            out.add(ModerationSafetyStore.linkOf(r))
+        }
+        return out
+    }
+    // Media ledger.
+    ModerationMediaRef? mediaRef(mediaId: String) {
+        var row = database.queryOptional("select owner_id, mime_type from media_assets where id = ?", DbParams().bindStr(mediaId))
+        if (row == null) {
+            return null
+        }
+        return ModerationMediaRef(row.getStr("owner_id"), row.getStr("mime_type"))
+    }
+    ModerationMediaCheck? findMedia(mediaId: String) {
+        var row = database.queryOptional("select " + ModerationSafetyStore.mediaColumns() + " from media_safety_checks where media_id = ?", DbParams().bindStr(mediaId))
+        if (row == null) {
+            return null
+        }
+        return ModerationSafetyStore.mediaOf(row)
+    }
+    saveMedia(c: ModerationMediaCheck) {
+        var changed = database.execute("update media_safety_checks set owner_id = ?, verdict = ?, severity = ?, confidence = ?, reason = ?, model = ?, checked_at = ? where media_id = ?", DbParams().bindStr(c.ownerId).bindStr(c.verdict).bindStr(c.severity).bindDouble(c.confidence).bindStr(c.reason).bindStr(c.model).bindInstant(c.checkedAt).bindStr(c.mediaId))
+        if (changed == 0) {
+            database.execute("insert into media_safety_checks (" + ModerationSafetyStore.mediaColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(c.mediaId).bindStr(c.ownerId).bindStr(c.verdict).bindStr(c.severity).bindDouble(c.confidence).bindStr(c.reason).bindStr(c.model).bindInstant(c.checkedAt))
+        }
+    }
+    // Image media that exists, is not deleted and has no ledger row: the join with media_assets is what guarantees only what is
+    // still up gets checked.
+    List<String> uncheckedMediaIdsSince(since: String, limit: Int) {
+        var ids = listOf<String>()
+        for (var r in database.queryList("select a.id from media_assets a left join media_safety_checks c on c.media_id = a.id where c.media_id is null and a.created_at >= ? and a.delete_status = \'NONE\' and a.mime_type in (\'image/jpeg\', \'image/png\', \'image/gif\', \'image/webp\', \'image/avif\') order by a.created_at desc limit ?", DbParams().bindInstant(since).bindInt(ModerationSafetyStore.atLeastOne(limit)))) {
+            ids.add(r.getStr("id"))
+        }
+        return ids
+    }
+    List<ModerationMediaCheck> mediaViolationsSince(since: String, limit: Int) {
+        var out = listOf<ModerationMediaCheck>()
+        for (var r in database.queryList("select " + ModerationSafetyStore.mediaColumns() + " from media_safety_checks where verdict in (\'EXPLICIT\', \'SEXUAL_MINOR\') and checked_at >= ? order by checked_at desc limit ?", DbParams().bindInstant(since).bindInt(ModerationSafetyStore.atLeastOne(limit)))) {
+            out.add(ModerationSafetyStore.mediaOf(r))
+        }
+        return out
+    }
+}
+
+// The posts (and the media they use) the barriers read, through the feed store's own row mapping. Read-only.
+class ModerationPosts {
+    Db database
+    FeedStore feed
+    public constructor(database: Db, feed: FeedStore) {
+        this.database = database
+        this.feed = feed
+    }
+    FeedPostRow? byId(postId: String) = feed.post(postId)
+    List<FeedPostRow> rows(sql: String, p: DbParams) {
+        var out = listOf<FeedPostRow>()
+        for (var r in database.queryList(sql, p)) {
+            out.add(FeedStore.postOf(r))
+        }
+        return out
+    }
+    // The social profile list of the author (Java findActiveByAuthor): no blog pointer, nothing the professional identity signed.
+    List<FeedPostRow> activeByAuthor(authorId: String, before: String, limit: Int) = this.rows("select " + FeedStore.postColumns() + " from posts where author_id = ? and status = \'ACTIVE\' and author_identity = \'SOCIAL\' and type <> \'BLOG\' and channel_id is null and created_at < ? order by created_at desc limit ?", DbParams().bindStr(authorId).bindInstant(before).bindInt(limit))
+    List<FeedPostRow> allByAuthor(authorId: String) = this.rows("select " + FeedStore.postColumns() + " from posts where author_id = ?", DbParams().bindStr(authorId))
+    // Posts that attach the media: the check takes down everything that uses the same image.
+    List<FeedPostRow> byMedia(mediaId: String) = this.rows("select " + FeedStore.postColumns() + " from posts where id in (select post_id from post_media where media_id = ?)", DbParams().bindStr(mediaId))
+    // Active posts with a link in the body or the mini page (the link sweep).
+    List<FeedPostRow> activeWithLinksSince(since: String, limit: Int) = this.rows("select " + FeedStore.postColumns() + " from posts where status = \'ACTIVE\' and created_at >= ? and (content like \'%http%\' or page_html like \'%http%\') order by created_at desc limit ?", DbParams().bindInstant(since).bindInt(ModerationSafetyStore.atLeastOne(limit)))
+    // Media ids per post id (a post with no media has no entry).
+    Map<String,List<String>> mediaByPost(ids: List<String>) = feed.mediaOf(ids)
+    List<String> mediaIdsOf(postId: String) {
+        var found = feed.mediaOf(listOf(postId)).get(postId)
+        if (found == null) {
+            return listOf<String>()
+        }
+        return found
+    }
+}

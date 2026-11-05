@@ -1,0 +1,73 @@
+package moderation
+
+import feed.*
+import kernel.*
+import kernel.security.*
+import notifications.*
+
+// Two report listeners in a row (the one the caller passed and the sexual-content flow).
+class ModerationEventChain extends ModerationReportEvents {
+    ModerationReportEvents first
+    ModerationReportEvents second
+    public constructor(first: ModerationReportEvents, second: ModerationReportEvents) {
+        super()
+        this.first = first
+        this.second = second
+    }
+    reportCreated(report: ModerationReport) {
+        first.reportCreated(report)
+        second.reportCreated(report)
+    }
+}
+
+// The barriers of the domain wired once: ledger and readers, the analyzers, the five services, the shared executor and the sweeps.
+class ModerationBarrierSet {
+    ModerationSafetyStore ledger
+    ModerationPosts posts
+    ModerationExecutor executor
+    ModerationContentAnalyzer contentAnalyzer
+    ModerationLinkAnalyzer linkAnalyzer
+    ModerationMediaAnalyzer mediaAnalyzer
+    ModerationContentAutomation content
+    ModerationLinkSafety links
+    ModerationMediaSafety media
+    ModerationSpamAutomod spam
+    ModerationSexualReport sexual
+    ModerationPostPublishedHandler published
+    ModerationBarrierSweeps sweeps
+    public constructor(ledger: ModerationSafetyStore, posts: ModerationPosts, executor: ModerationExecutor, contentAnalyzer: ModerationContentAnalyzer, linkAnalyzer: ModerationLinkAnalyzer, mediaAnalyzer: ModerationMediaAnalyzer, content: ModerationContentAutomation, links: ModerationLinkSafety, media: ModerationMediaSafety, spam: ModerationSpamAutomod, sexual: ModerationSexualReport, published: ModerationPostPublishedHandler, sweeps: ModerationBarrierSweeps) {
+        this.ledger = ledger
+        this.posts = posts
+        this.executor = executor
+        this.contentAnalyzer = contentAnalyzer
+        this.linkAnalyzer = linkAnalyzer
+        this.mediaAnalyzer = mediaAnalyzer
+        this.content = content
+        this.links = links
+        this.media = media
+        this.spam = spam
+        this.sexual = sexual
+        this.published = published
+        this.sweeps = sweeps
+    }
+    static ModerationBarrierSet install(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, service: ModerationService, sanctions: ModerationSanctionService, panel: ModerationPanel, moderators: ModerationModeratorStore, notifications: Notifications, ai: ModerationAi, images: ModerationImages, pages: ModerationLinkedPageReader, events: ModerationReportEvents) {
+        var cfg = platform.cfg
+        var ledger = ModerationSafetyStore(platform.db)
+        var posts = ModerationPosts(platform.db, feed.store)
+        var executor = ModerationExecutor()
+        var contentAnalyzer = ModerationContentAnalyzer(ai)
+        var linkAnalyzer = ModerationLinkAnalyzer(ai)
+        var mediaAnalyzer = ModerationMediaAnalyzer(ai)
+        var content = ModerationContentAutomation(ledger, posts, contentAnalyzer, feed.moderation, notifications, parts.admin, moderators, cfg.getBool("MODERATION_AUTOMATION_ENABLED", true))
+        var links = ModerationLinkSafety(ledger, pages, linkAnalyzer, posts, feed.moderation, panel, cfg.getBool("MODERATION_LINKS_ENABLED", true), cfg.getInt("MODERATION_LINKS_RETRY_HOURS", 24))
+        var media = ModerationMediaSafety(ledger, images, mediaAnalyzer, posts, feed.moderation, panel, cfg.getBool("MODERATION_MEDIA_ENABLED", true))
+        var spam = ModerationSpamAutomod.fromConfig(cfg, posts, ai, feed.moderation, sanctions, parts.admin, moderators)
+        var sexual = ModerationSexualReport(ledger, posts, feed.moderation, images, ai, notifications, cfg.getBool("MODERATION_SEXUAL_ENABLED", true))
+        service.events = ModerationEventChain(events, ModerationSexualEvents(platform.db, executor, sexual))
+        var published = ModerationPostPublishedHandler(executor, posts, content, links, media, spam)
+        shared.outbox.register("PostPublished", published)
+        var sweeps = ModerationBarrierSweeps.fromConfig(cfg, content, links, media, posts)
+        sweeps.schedule(shared.jobs, cfg)
+        return ModerationBarrierSet(ledger, posts, executor, contentAnalyzer, linkAnalyzer, mediaAnalyzer, content, links, media, spam, sexual, published, sweeps)
+    }
+}
