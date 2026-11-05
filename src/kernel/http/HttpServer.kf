@@ -149,6 +149,48 @@ class HttpServer {
         runAfter(out)
         return out
     }
+    // A text/event-stream route (`GET path`, and its /v1 alias). The web runtime writes the response head and
+    // then runs the handler on its own thread, so the session is checked first, in the filter chain (a refusal
+    // is the bare status EventSource needs), and again on the stream thread to find the key. Frames come from
+    // the hub: events as they are published, a "ping" heartbeat every `hub.heartbeatMs`. The runtime ends
+    // the stream after `hub.timeoutMs`; EventSource reconnects. Register it BEFORE any route whose pattern could
+    // also match `path` (the runtime serves the first match). See KOF_GAPS G312 and G313.
+    sse(path: String, source: SseSource, hub: SseHub) {
+        app.configure("idleMs", (hub.timeoutMs / 4L) as Int)
+        this.registerSse(path, source, hub)
+        this.registerSse("/v1" + path, source, hub)
+    }
+    registerSse(path: String, source: SseSource, hub: SseHub) {
+        routes.add(HttpRoute("GET", path))
+        use("sse-session:" + path, 900, () -> {
+    if (method() != "GET" || path() != path) {
+        return Http.next()
+    }
+    try {
+        source.authorize()
+    } catch (String rejected) {
+        return status(Errors.parse(rejected).status(), "")
+    }
+    return Http.next()
+})
+        app.sse(path, () -> {
+    Req.captureAuthorization()
+    var key = source.authorize()
+    var sub = hub.open(key)
+    sse.event("open", "{}")
+    while (sse.isOpen() && sub.isLive()) {
+        var frame = sub.next(hub.heartbeatMs)
+        var name = SseSubscriber.nameOf(frame)
+        if (name == "close") {
+            sse.close()
+        }
+        else {
+            sse.event(name, SseSubscriber.dataOf(frame))
+        }
+    }
+    hub.remove(sub)
+})
+    }
     // True when some route has this path (any method).
     Bool knowsPath(p: String) {
         for (var r in routes) {

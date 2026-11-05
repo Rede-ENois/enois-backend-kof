@@ -1,0 +1,45 @@
+package messaging
+
+import kernel.config.*
+import kernel.http.*
+import kernel.security.*
+
+// Who the inbox stream belongs to: the signed-in user (401 without a session, 403 EMAIL_NOT_VERIFIED),
+// resolved from X-Session-Token, the bearer token or the session cookie like every other route.
+class MessageStreamSource extends SseSource {
+    public constructor() {}
+    String authorize() = Auth.requireUser()
+}
+
+// The inbox event streams (MessageStreamHub): one open stream per browser tab, keyed by user. A stream only
+// carries "this conversation / call changed": the client refetches through the regular endpoints, so message
+// content never travels here and every read keeps its usual authorization.
+//   event: conversation   data: {"conversationId":"..."}
+//   event: call           data: {"callId":"...","state":"...","conversationId":"...","groupId":"..."}  (ids when present)
+// Java parity: 5 streams per user (the oldest is closed), 30 minutes per stream, a heartbeat every 25 s. Two
+// deviations the runtime forces (KOF_GAPS G312): the opening frame and the heartbeat are named events
+// ("open", "ping") instead of the comments `: open` / `: ping`, and the `retry: 5000` field cannot be written.
+class MessageStreams {
+    SseHub hub
+    public constructor(heartbeatMs: Long) {
+        this.hub = SseHub(MessageStreams.maxStreamsPerUser(), heartbeatMs, 1800000L)
+    }
+    static MessageStreams fromConfig(cfg: Config) = MessageStreams(cfg.getLong("REDE_MESSAGING_STREAM_HEARTBEAT_MS", 25000L))
+    static Int maxStreamsPerUser() = 5
+    Int openStreams(userId: String) = hub.openStreams(userId)
+    // Something visible in a conversation changed (new message, read receipt, reaction).
+    conversationChanged(conversationId: String, userIds: List<String>) {
+        hub.publish(userIds, "conversation", "{\"conversationId\":" + json.encode(conversationId) + "}")
+    }
+    // "Call X changed": ids and state only; the receiver reads the real state from the calls endpoint.
+    callChanged(callId: String, conversationId: String?, groupId: String?, state: String, userIds: List<String>) {
+        var data = "{\"callId\":" + json.encode(callId) + ",\"state\":" + json.encode(state)
+        if (conversationId != null) {
+            data = data + ",\"conversationId\":" + json.encode(conversationId)
+        }
+        if (groupId != null) {
+            data = data + ",\"groupId\":" + json.encode(groupId)
+        }
+        hub.publish(userIds, "call", data + "}")
+    }
+}

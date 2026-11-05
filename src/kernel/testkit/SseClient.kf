@@ -1,0 +1,147 @@
+package kernel.testkit
+
+import java.io.BufferedReader
+import java.io.IOException
+import java.io.InputStream
+import java.io.InputStreamReader
+import java.io.OutputStream
+import java.io.Reader
+import java.lang.System
+import java.net.Socket
+import java.net.SocketTimeoutException
+
+// One parsed event of a text/event-stream body. `name` is "message" when the frame had no `event:` line.
+record SseEvent(String name, String data)
+
+// A streaming client for tests: opens a GET on a raw socket, keeps the connection and reads the head and the
+// events as they arrive (TestClient reads a whole response, which never ends here). Loopback only.
+class SseClient {
+    Socket socket
+    BufferedReader reader
+    String statusLine = ""
+    List<String> headerLines = listOf<String>()
+    public constructor(socket: Socket, reader: BufferedReader) {
+        this.socket = socket
+        this.reader = reader
+    }
+    // GET `path` with the given "Name: value" headers; returns once the response head is read.
+    static SseClient open(port: Int, path: String, headers: List<String>) {
+        var socket = new Socket("127.0.0.1", port)
+        socket.setSoTimeout(5000)
+        var out = socket.getOutputStream() as OutputStream
+        var text = "GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n"
+        for (var h in headers) {
+            text = text + h + "\r\n"
+        }
+        var bytes = (text + "\r\n").getBytes()
+        out.write(bytes, 0, bytes.length)
+        out.flush()
+        var input = socket.getInputStream() as InputStream
+        var chars = new InputStreamReader(input, "UTF-8") as Reader
+        var client = SseClient(socket, new BufferedReader(chars))
+        client.readHead()
+        return client
+    }
+    readHead() {
+        statusLine = this.line()
+        var l = this.line()
+        while (l.length() > 0 && l != SseClient.timedOut()) {
+            headerLines.add(l)
+            l = this.line()
+        }
+    }
+    static String timedOut() = "<<TIMEOUT>>"
+    static String ended() = "<<END>>"
+    // One line, or timedOut() when nothing arrived within the socket timeout, ended() at the end of the stream.
+    String line() {
+        try {
+            var l = reader.readLine()
+            if (l == null) {
+                return SseClient.ended()
+            }
+            return l
+        } catch (SocketTimeoutException e) {
+            return SseClient.timedOut()
+        } catch (IOException e) {
+            return SseClient.ended()
+        }
+    }
+    // What is left of the response (a refusal carries a short body), read until the stream ends or goes quiet.
+    String rest() {
+        var text = ""
+        var l = this.line()
+        while (l != SseClient.timedOut() && l != SseClient.ended()) {
+            text = text + l + "\n"
+            l = this.line()
+        }
+        return text
+    }
+    Int status() {
+        var parts = statusLine.split(" ")
+        if (parts.length < 2) {
+            return 0
+        }
+        return parts[1].toInt()
+    }
+    String header(name: String) {
+        for (var h in headerLines) {
+            if (h.toLowerCase().startsWith(name.toLowerCase() + ":")) {
+                return h.substring(name.length() + 1).trim()
+            }
+        }
+        return ""
+    }
+    // Waits at most `waitMs` for the next event. Comment lines are skipped. An empty name and data with the
+    // name "timeout" is returned when nothing came, "end" when the server closed the stream.
+    SseEvent next(waitMs: Int) {
+        socket.setSoTimeout(waitMs)
+        var name = "message"
+        var data = ""
+        var seen = false
+        var l = this.line()
+        while (true) {
+            if (l == SseClient.timedOut()) {
+                return SseEvent("timeout", "")
+            }
+            if (l == SseClient.ended()) {
+                return SseEvent("end", "")
+            }
+            if (l.length() == 0) {
+                if (seen) {
+                    return SseEvent(name, data)
+                }
+            }
+            else if (l.startsWith("event:")) {
+                name = l.substring(6).trim()
+                seen = true
+            }
+            else if (l.startsWith("data:")) {
+                data = l.substring(5).trim()
+                seen = true
+            }
+            l = this.line()
+        }
+        return SseEvent("end", "")
+    }
+    // The next event named `name` within `waitMs` overall (others, like open and ping, are skipped); the
+    // "timeout" event when none came, "end" when the server closed the stream.
+    SseEvent waitFor(name: String, waitMs: Int) {
+        var deadline = System.currentTimeMillis() + waitMs
+        var e = this.next(waitMs)
+        while (e.name != name && e.name != "timeout" && e.name != "end") {
+            var left = deadline - System.currentTimeMillis()
+            if (left <= 0L) {
+                return SseEvent("timeout", "")
+            }
+            e = this.next(left as Int)
+        }
+        return e
+    }
+    close() {
+        try {
+            socket.close()
+        } catch (IOException e) {
+            statusLine = statusLine
+        }
+    }
+}

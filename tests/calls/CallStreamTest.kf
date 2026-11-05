@@ -1,0 +1,50 @@
+import ops.*
+import java.util.HashMap
+import kernel.*
+import kernel.security.*
+import kernel.testkit.*
+import calls.*
+import messaging.*
+import notifications.*
+
+// The call events ride the inbox stream (CallChanged of the Java service): ids and state only.
+class CallStreamHolder {
+    static TestApp? cached = null
+}
+
+TestApp callStreamApp() {
+    var cur = CallStreamHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var cfg = new HashMap<String, String>()
+    cfg.put("REDE_CALLS_JITSI_URL", "https://chamadas.example.test/")
+    cfg.put("REDE_CALLS_JITSI_JWT_SECRET", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+    var created = DomainTestKit.boot("callstream", cfg, (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+    var notifications = NotificationsModule.install(p, s, SecurityHooks(), parts, MailTestKit.capturing(p))
+    var messaging = MessagingModule.install(p, s, SecurityHooks(), parts, notifications)
+    CallsModule.install(p, s, SecurityHooks(), parts, notifications, messaging)
+})
+    CallStreamHolder.cached = created
+    return created
+}
+
+test "starting a call tells the other participant's stream, with ids and state only" {
+    var app = callStreamApp()
+    var a = DomainTestKit.loginAdult(app, "call_stream_a")
+    var b = DomainTestKit.loginAdult(app, "call_stream_b")
+    var conversationId = MessagingTestKit.direct(app, a, "call-stream-direct", "call_stream_b")
+    var stream = SseClient.open(app.port, "/conversations/stream", DomainTestKit.auth(b))
+    Check.eqInt("status", 200, stream.status())
+    Check.eqStr("open", "open", stream.next(3000).name)
+    var started = MessagingTestKit.call(app, a, "call-stream-start", "/conversations/" + conversationId + "/calls", "")
+    Check.status(started, 200)
+    var event = stream.waitFor("call", 3000)
+    Check.eqStr("event name", "call", event.name)
+    Check.isTrue("call id", event.data.contains("\"callId\":\"" + started.jsonStr("id") + "\""))
+    Check.isTrue("conversation id", event.data.contains("\"conversationId\":\"" + conversationId + "\""))
+    Check.isTrue("state", event.data.contains("\"state\":"))
+    Check.isTrue("no group id", !event.data.contains("groupId"))
+    stream.close()
+    app.stop()
+}
