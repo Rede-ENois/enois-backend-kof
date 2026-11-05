@@ -1,0 +1,46 @@
+import identity.*
+import jobs.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+
+// The identity eligibility rule (JobPublishingPolicy) fed by the jobs reputation seam, as Main.kf wires it:
+// reputation > 150 AND (when identity is enforced) a verified identity.
+IdentityEligibility policy(reputation: Int, enforced: Bool) {
+    JobsTestKit.app()
+    var verifications = IdentityVerifications(JobsTestKit.db(), IdentityVerificationStore(JobsTestKit.db()), listOf<IdentityVerificationProvider>())
+    return IdentityEligibility(JobsTestKit.db(), verifications, enforced, JobsIdentityReputation(JobFixedReputation(reputation)))
+}
+
+test "reputationAboveTheMinimumAllowsPublishing" {
+    var user = JobsTestKit.login("elig_ok")
+    var body = policy(300, false).evaluate(user)
+    Check.isTrue("allowed", body.allowed)
+    Check.eqInt("reputation", 300, body.reputation)
+    Check.eqInt("required", 150, body.requiredReputation)
+}
+
+test "exactlyTheMinimumReputationStillDoesNotPublish" {
+    var user = JobsTestKit.login("elig_edge")
+    var body = policy(150, false).evaluate(user)
+    Check.isTrue("not allowed", !body.allowed)
+    Check.eqStr("reason", "LOW_REPUTATION", "" + body.reason)
+}
+
+test "enforcedIdentityRequiresVerification" {
+    var user = JobsTestKit.login("elig_enforced")
+    var body = policy(300, true).evaluate(user)
+    Check.isTrue("not allowed", !body.allowed)
+    Check.isTrue("identityEnforced", body.identityEnforced)
+    Check.eqStr("reason", "IDENTITY_REQUIRED", "" + body.reason)
+    JobsTestKit.db().execute("insert into identity_verifications (id, user_id, provider, state, updated_at) values (?, ?, 'test', 'VERIFIED', ?)", DbParams().bindStr("iv-" + user).bindStr(user).bindInstant(Time.nowIso()))
+    Check.isTrue("verified allowed", policy(300, true).evaluate(user).allowed)
+}
+
+test "profileReputationBacksTheJobsSeam" {
+    var user = JobsTestKit.login("elig_profile")
+        // The seam wired in Main reads the live reputation of the profile domain: a fresh account has none.
+    var live = JobsIdentityReputation(ProfileJobReputation(JobsTestKit.profiles().reputation))
+    Check.isTrue("fresh account is below the minimum", live.of(JobsTestKit.db(), user) <= 150)
+    JobsTestKit.finish()
+}
