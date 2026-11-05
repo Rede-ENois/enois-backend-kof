@@ -1,0 +1,181 @@
+import contributors.*
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of ContributorApplicationTests and VerifiedContributorPanelTests (the contributor-tag half lives in the
+// cosmetics suite plus the seam test of the contributions domain).
+String sfx() = "" + Time.nowMillis()
+
+
+// The per-IP limit of the public form (5 per hour) has its own suite; here it is out of the way.
+TestApp capp() {
+    ContributorsTestKit.configure(mapOf("CONTRIBUTION_RATE_LIMIT", "1000"))
+    return ContributorsTestKit.app()
+}
+
+String applyBody(name: String, github: String, email: String, terms: String) = "{\"name\":\"" + name + "\",\"github\":\"" + github + "\",\"email\":\"" + email + "\",\"acceptedTerms\":" + terms + "}"
+
+test "a public application is stored and an admin sees and triages it" {
+    var app = capp()
+    var admin = ContributorsTestKit.loginAdmin("contrib-admin")
+    var regular = ContributorsTestKit.login("contrib_regular")
+    var payload = "{\"name\":\"Maria Contribuidora\",\"github\":\"https://github.com/Maria-Contrib/\",\"email\":\"Maria@Example.com\",\"area\":\"engenharia\",\"experience\":\"avancado\",\"message\":\"Quero ajudar com testes e revisão de código.\",\"acceptedTerms\":true}"
+    var created = ContributorsTestKit.anonymous("POST", "/contributors/applications", payload)
+    Check.status(created, 201)
+    Check.jsonEq(created, "status", "NEW")
+    var id = created.json("id")
+    assert(id.startsWith("contrib_"))
+    // The public answer carries only the protocol and the state.
+    assert(!created.jsonHas("email"))
+    assert(!created.jsonHas("message"))
+    // A non-admin does not see the queue.
+    Check.apiError(ContributorsTestKit.send("GET", "/admin/contributors/applications", regular, ""), 403, "FORBIDDEN")
+    var listed = ContributorsTestKit.send("GET", "/admin/contributors/applications", admin, "")
+    Check.status(listed, 200)
+    var at = ContributorsTestKit.entryOf(listed, "id", id)
+    assert(at >= 0)
+    Check.jsonEq(listed, at + ".github", "maria-contrib")
+    Check.jsonEq(listed, at + ".email", "maria@example.com")
+    Check.jsonEq(listed, at + ".area", "ENGENHARIA")
+    Check.jsonEq(listed, at + ".experience", "AVANCADO")
+    Check.jsonEq(listed, at + ".source", "LANDING")
+    assert(listed.jsonStr(at + ".acceptedTermsAt") != null)
+    var moved = ContributorsTestKit.send("PATCH", "/admin/contributors/applications/" + id, admin, "{\"status\":\"REVIEWING\"}")
+    Check.status(moved, 200)
+    Check.jsonEq(moved, "status", "REVIEWING")
+    Check.apiError(ContributorsTestKit.send("PATCH", "/admin/contributors/applications/" + id, admin, "{}"), 400, "INVALID_STATUS")
+    Check.apiError(ContributorsTestKit.send("PATCH", "/admin/contributors/applications/" + id, admin, "{\"status\":\"NOPE\"}"), 400, "BAD_REQUEST")
+    Check.apiError(ContributorsTestKit.send("PATCH", "/admin/contributors/applications/nope", admin, "{\"status\":\"APPROVED\"}"), 404, "CONTRIBUTOR_NOT_FOUND")
+    var filtered = ContributorsTestKit.send("GET", "/admin/contributors/applications?status=REVIEWING", admin, "")
+    assert(ContributorsTestKit.entryOf(filtered, "id", id) >= 0)
+    Check.apiError(ContributorsTestKit.send("GET", "/admin/contributors/applications?status=NOPE", admin, ""), 400, "BAD_REQUEST")
+}
+
+test "the terms and the GitHub handle are required, the other fields are validated" {
+    var app = capp()
+    Check.apiError(ContributorsTestKit.anonymous("POST", "/contributors/applications", applyBody("Sem Aceite", "sem-aceite", "sem-aceite@example.com", "false")), 400, "TERMS_NOT_ACCEPTED")
+    Check.apiError(ContributorsTestKit.anonymous("POST", "/contributors/applications", "{\"name\":\"Sem Campo\",\"github\":\"sem-campo\",\"email\":\"a@b.com\"}"), 400, "TERMS_NOT_ACCEPTED")
+    Check.apiError(ContributorsTestKit.anonymous("POST", "/contributors/applications", applyBody("Espaço", "nome com espaço", "sem-aceite@example.com", "true")), 400, "INVALID_GITHUB")
+    Check.apiError(ContributorsTestKit.anonymous("POST", "/contributors/applications", applyBody("Sem Github", "", "sem-aceite@example.com", "true")), 400, "INVALID_GITHUB")
+    Check.apiError(ContributorsTestKit.anonymous("POST", "/contributors/applications", applyBody("M", "ok-dev", "sem-aceite@example.com", "true")), 400, "INVALID_NAME")
+    Check.apiError(ContributorsTestKit.anonymous("POST", "/contributors/applications", applyBody("Nome Ok", "ok-dev", "sem-arroba", "true")), 400, "INVALID_EMAIL")
+    Check.apiError(ContributorsTestKit.anonymous("POST", "/contributors/applications", "{\"name\":\"Nome Ok\",\"github\":\"ok-dev\",\"email\":\"a@b.com\",\"area\":\"NOPE\",\"acceptedTerms\":true}"), 400, "INVALID_AREA")
+    Check.apiError(ContributorsTestKit.anonymous("POST", "/contributors/applications", "{\"name\":\"Nome Ok\",\"github\":\"ok-dev\",\"email\":\"a@b.com\",\"experience\":\"NOPE\",\"acceptedTerms\":true}"), 400, "INVALID_EXPERIENCE")
+    Check.apiError(ContributorsTestKit.anonymous("POST", "/contributors/applications", "not json"), 400, "BAD_REQUEST")
+    var handle = ContributorsTestKit.anonymous("POST", "/contributors/applications", applyBody("Com Arroba", "@Com-Arroba", "arroba@example.com", "true"))
+    Check.status(handle, 201)
+}
+
+test "a verified contributor appears in the panel and confirms without approval" {
+    var app = capp()
+    var suffix = sfx()
+    var userId = "verified_" + suffix
+    var token = ContributorsTestKit.login(userId)
+    var admin = ContributorsTestKit.loginAdmin("contrib-admin")
+    var github = "verified-dev-" + suffix
+    ContributorsTestKit.verify(userId, github, suffix)
+    var me = ContributorsTestKit.send("GET", "/contributors/me", token, "")
+    Check.status(me, 200)
+    Check.jsonEq(me, "verified", "true")
+    Check.jsonEq(me, "applicationPending", "true")
+    Check.jsonEq(me, "github", github)
+    var before = ContributorsTestKit.send("GET", "/admin/contributors/panel", admin, "")
+    Check.status(before, 200)
+    var pendingAt = ContributorsTestKit.entryOf(before, "userId", userId)
+    assert(pendingAt >= 0)
+    assert(before.jsonIsNull(pendingAt + ".id"))
+    Check.jsonEq(before, pendingAt + ".source", "GITHUB_VERIFIED")
+    Check.jsonEq(before, pendingAt + ".formPending", "true")
+    Check.jsonEq(before, pendingAt + ".status", "APPROVED")
+    Check.jsonEq(before, pendingAt + ".github", github)
+    Check.jsonEq(before, pendingAt + ".sealName", "Ajudante")
+    Check.jsonEq(before, pendingAt + ".evidenceCount", "1")
+    var email = "verified+" + suffix + "@example.com"
+    var confirmed = ContributorsTestKit.send("POST", "/contributors/applications/verified", token, "{\"name\":\"Pessoa Verificada\",\"github\":\"handle-que-o-cliente-inventou\",\"email\":\"" + email + "\",\"area\":\"ENGENHARIA\",\"experience\":\"AVANCADO\",\"message\":\"Contribuo com código e testes.\",\"acceptedTerms\":true}")
+    Check.status(confirmed, 201)
+    Check.jsonEq(confirmed, "status", "APPROVED")
+    var firstId = confirmed.json("id")
+    var saved = ContributorsTestKit.module().service.store.findByUser(userId)
+    assert(saved != null)
+    if (saved != null) {
+        assert(saved.source() == "GITHUB_VERIFIED")
+        // The handle comes from the verified link, never from the body.
+        assert(saved.github() == github)
+        assert(saved.id() == firstId)
+    }
+    // Repeating the confirmation updates the same application.
+    var again = ContributorsTestKit.send("POST", "/contributors/applications/verified", token, "{\"name\":\"Pessoa Verificada\",\"email\":\"" + email + "\",\"message\":\"Mensagem atualizada.\",\"acceptedTerms\":true}")
+    Check.status(again, 201)
+    Check.jsonEq(again, "id", firstId)
+    var after = ContributorsTestKit.send("GET", "/contributors/me", token, "")
+    Check.jsonEq(after, "applicationPending", "false")
+    Check.jsonEq(after, "application.id", firstId)
+    Check.jsonEq(after, "application.source", "GITHUB_VERIFIED")
+    var panel = ContributorsTestKit.send("GET", "/admin/contributors/panel", admin, "")
+    var at = ContributorsTestKit.entryOf(panel, "userId", userId)
+    Check.jsonEq(panel, at + ".id", firstId)
+    Check.jsonEq(panel, at + ".formPending", "false")
+    Check.jsonEq(panel, at + ".email", email)
+    Check.jsonEq(panel, at + ".github", github)
+    Check.jsonEq(panel, at + ".source", "GITHUB_VERIFIED")
+    Check.jsonEq(panel, at + ".sealName", "Ajudante")
+}
+
+test "an unverified user cannot confirm" {
+    var app = capp()
+    var suffix = sfx()
+    var token = ContributorsTestKit.login("not_verified_" + suffix)
+    var me = ContributorsTestKit.send("GET", "/contributors/me", token, "")
+    Check.status(me, 200)
+    Check.jsonEq(me, "verified", "false")
+    Check.jsonEq(me, "applicationPending", "false")
+    assert(me.jsonIsNull("github"))
+    assert(me.jsonIsNull("application"))
+    Check.apiError(ContributorsTestKit.send("POST", "/contributors/applications/verified", token, "{\"name\":\"Sem Contribuição\",\"email\":\"sem+" + suffix + "@example.com\",\"acceptedTerms\":true}"), 403, "CONTRIBUTOR_NOT_VERIFIED")
+    Check.apiError(ContributorsTestKit.anonymous("GET", "/contributors/me", ""), 401, "UNAUTHENTICATED")
+}
+
+test "a landing application still goes through the manual queue" {
+    var app = capp()
+    var suffix = sfx()
+    var admin = ContributorsTestKit.loginAdmin("contrib-admin")
+    var github = "landing-" + suffix
+    var created = ContributorsTestKit.anonymous("POST", "/contributors/applications", applyBody("Candidato da Landing", github, "landing+" + suffix + "@example.com", "true"))
+    Check.status(created, 201)
+    Check.jsonEq(created, "status", "NEW")
+    var panel = ContributorsTestKit.send("GET", "/admin/contributors/panel", admin, "")
+    var at = ContributorsTestKit.entryOf(panel, "github", github)
+    assert(at >= 0)
+    assert(!panel.jsonIsNull(at + ".id"))
+    Check.jsonEq(panel, at + ".source", "LANDING")
+    Check.jsonEq(panel, at + ".formPending", "false")
+    Check.jsonEq(panel, at + ".status", "NEW")
+}
+
+test "a landing application with the same GitHub handle is reused on confirmation" {
+    var app = capp()
+    var suffix = sfx()
+    var userId = "reuse_" + suffix
+    var token = ContributorsTestKit.login(userId)
+    var github = "reuse-dev-" + suffix
+    ContributorsTestKit.verify(userId, github, suffix)
+    var landing = ContributorsTestKit.anonymous("POST", "/contributors/applications", applyBody("Nome Antigo", github, "reuse+" + suffix + "@example.com", "true"))
+    Check.status(landing, 201)
+    var landingId = landing.json("id")
+    var confirmed = ContributorsTestKit.send("POST", "/contributors/applications/verified", token, "{\"name\":\"Nome Confirmado\",\"email\":\"reuse+" + suffix + "@example.com\",\"acceptedTerms\":true}")
+    Check.status(confirmed, 201)
+    var saved = ContributorsTestKit.module().service.store.findByUser(userId)
+    assert(saved != null)
+    if (saved != null) {
+        assert(saved.id() == landingId)
+        assert(saved.source() == "GITHUB_VERIFIED")
+        assert(saved.status() == "APPROVED")
+        assert(saved.name() == "Nome Confirmado")
+    }
+}
+
+test "finish" {
+    ContributorsTestKit.finish()
+}

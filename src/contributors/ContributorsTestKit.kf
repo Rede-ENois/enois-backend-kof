@@ -1,0 +1,104 @@
+package contributors
+
+import contributions.*
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import profile.*
+
+class ContributorsTestKit {
+    static TestApp? cachedApp = null
+    static ContributionsModule? cachedContributions = null
+    static ContributorsModule? cachedContributors = null
+    static SharedServices? cachedShared = null
+    static Map<String,String> extra = mapOf<String, String>()
+    static configure(overrides: Map<String,String>) {
+        ContributorsTestKit.extra = overrides
+    }
+    static TestApp app() {
+        var cur = ContributorsTestKit.cachedApp
+        if (cur != null) {
+            return cur
+        }
+        var created = DomainTestKit.boot("contributors", ContributorsTestKit.extra, (p: Platform, s: SharedServices, parts: SecurityParts) -> ContributorsTestKit.wire(p, s, parts))
+        ContributorsTestKit.cachedApp = created
+        return created
+    }
+    static wire(p: Platform, shared: SharedServices, parts: SecurityParts) {
+        var hooks = SecurityHooks.defaults(p.db)
+        var profiles = ProfileModule.install(p, shared, hooks)
+        var contributions = ContributionsModule.installWith(p, shared, parts, profiles.directory, GithubGateway(), true)
+        ContributorsTestKit.cachedContributions = contributions
+        ContributorsTestKit.cachedShared = shared
+        ContributorsTestKit.cachedContributors = ContributorsModule.install(p, parts, contributions, profiles)
+    }
+    static ContributionsModule contributions() {
+        ContributorsTestKit.app()
+        var cur = ContributorsTestKit.cachedContributions
+        if (cur == null) {
+            throw "ContributorsTestKit: contributions not wired"
+        }
+        return cur
+    }
+    static ContributorsModule module() {
+        ContributorsTestKit.app()
+        var cur = ContributorsTestKit.cachedContributors
+        if (cur == null) {
+            throw "ContributorsTestKit: module not wired"
+        }
+        return cur
+    }
+    static Db db() = ContributorsTestKit.app().db()
+    static String login(userId: String) {
+        var token = "tok-" + userId + "-1234567890"
+        if (ContributorsTestKit.db().queryLong("select count(*) from users where id = ?", DbParams().bindStr(userId)) == 0L) {
+            SecurityFixtures.login(ContributorsTestKit.db(), userId, token)
+        }
+        return token
+    }
+    static String loginAdmin(userId: String) {
+        var token = ContributorsTestKit.login(userId)
+        ContributorsTestKit.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr(userId))
+        return token
+    }
+    static List<String> auth(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+    static TestResponse send(method: String, path: String, token: String, body: String) = ContributorsTestKit.app().client.send(method, path, ContributorsTestKit.auth(token), "", body)
+    static TestResponse anonymous(method: String, path: String, body: String) = ContributorsTestKit.app().client.send(method, path, listOf("Content-Type: application/json"), "", body)
+    // A verified contributor: linked GitHub plus a validated PR and the seal that follows.
+    static verify(userId: String, github: String, sfx: String) {
+        var module = ContributorsTestKit.contributions()
+        module.identities.remember(userId, "gh-" + github, github)
+        var now = Time.nowIso()
+        var c = GhContribution("ghc_verified_" + sfx, "gh-" + github, github, "Rede-ENois/verified-test-" + sfx, "PULL_REQUEST", 1, "CODE", "VALIDATED", now)
+        c.userId = userId
+        c.objectId = "node-verified-1"
+        c.title = "Corrige um problema real"
+        c.url = "https://github.com/Rede-ENois/x/pull/1"
+        c.mergedAt = now
+        c.openedAt = now
+        c.githubUpdatedAt = now
+        c.detailsFetched = true
+        module.store.save(c)
+        module.seals.recalculate(userId)
+    }
+    // Position of the panel entry of this user (or github handle), -1 when absent.
+    static Int entryOf(res: TestResponse, field: String, value: String) {
+        var n = res.jsonSize("")
+        var i = 0
+        while (i < n) {
+            if (res.jsonStr(i + "." + field) == value) {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+    static finish() {
+        var shared = ContributorsTestKit.cachedShared
+        if (shared != null) {
+            shared.stop()
+        }
+    }
+}
