@@ -828,7 +828,7 @@ Java interop for the identity flows lives here; domain code only sees Strings.
 
 - `Req.queryAll(name)`, `Req.queryParam(name)`, `Req.formDecode(raw)`; `queryStr/queryInt/queryLong/queryBool` read the raw query (`+` is a space, `%2B` a plus, repeated names supported).
 - `Regexes.matches(regex, text)`, `Texts.fromHex4`, `Numbers.round/round2/pow`, `Contrast.ratio/over/wholePart` (WCAG contrast with the integer-division message of the Java service).
-- `OutboundHttp.postJson/get/call(...)` returning `OutboundReply(status, body)`; throws `"OUTBOUND_FAILED"`.
+- `Outbound.request/postJson/postForm/get(...)` returning `OutboundReply(status, body)`; throws exactly `"OUTBOUND_FAILED"` (no URL or address). The only outbound HTTP client: do not add another.
 - `HtmlTemplate.render(template, vars)`: Thymeleaf subset (`th:text`, `th:href`, drops `xmlns:th`).
 - `OriginNormalizer.normalize(raw)`: developer origin validation (`INVALID_ORIGIN`).
 - `ZoneDates.dayOf/startOfDay/plusDays/today(zone)`: calendar days in a named zone.

@@ -11,7 +11,8 @@ record OutboundReply(Int status, String body)
 
 // Outgoing HTTP for the integrations (Turnstile, OAuth providers, Gov.br): one blocking call with
 // timeouts, any method and headers, status and body back (kof.http returns only the body, G15).
-// A failure to connect or read is thrown as "OUTBOUND_FAILED: ..." so callers map it to their own 503.
+// A failure to connect or read (refused, timeout, bad URL) is thrown as exactly "OUTBOUND_FAILED", with no
+// URL, address or header in the message, so callers map it to their own 503 without leaking secrets.
 // Callers that must be testable wrap this in a small overridable class and stub it: tests never hit the
 // network.
 class Outbound {
@@ -49,15 +50,16 @@ class Outbound {
             }
             conn.disconnect()
         } catch (String e) {
-            failure = e
+            failure = "OUTBOUND_FAILED"
         } catch (IOException e) {
-            failure = "io error"
+            failure = "OUTBOUND_FAILED"
         }
         if (failure.length() > 0) {
-            throw "OUTBOUND_FAILED: " + failure
+            throw failure
         }
         return OutboundReply(status, text)
     }
+    static OutboundReply postJson(url: String, headers: List<String>, body: String, timeoutMs: Int) = Outbound.request("POST", url, headers, body, timeoutMs)
     static OutboundReply postForm(url: String, form: String, timeoutMs: Int) = Outbound.request("POST", url, listOf("Content-Type: application/x-www-form-urlencoded"), form, timeoutMs)
     static OutboundReply get(url: String, headers: List<String>, timeoutMs: Int) = Outbound.request("GET", url, headers, "", timeoutMs)
     static String readAll(s: InputStream?) {
@@ -65,6 +67,7 @@ class Outbound {
             return ""
         }
         var bytes = s.readAllBytes()
+        s.close()
         return new String(bytes, "UTF-8")
     }
 }
