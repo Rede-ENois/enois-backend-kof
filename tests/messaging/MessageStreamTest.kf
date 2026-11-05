@@ -1,0 +1,155 @@
+import ops.*
+import kernel.*
+import kernel.http.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import messaging.*
+import notifications.*
+
+// Ports MessageStreamTests: the inbox stream tells participants a conversation changed. The stream is read
+// from a raw socket (SseClient), as a browser EventSource would, against the booted app.
+class StreamHolder {
+    static TestApp? cached = null
+    static MessagingModule? module = null
+}
+
+TestApp streamApp() {
+    var cur = StreamHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = DomainTestKit.boot("msgstream", mapOf("REDE_MESSAGING_STREAM_HEARTBEAT_MS", "300"), (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+    var notifications = NotificationsModule.install(p, s, SecurityHooks(), parts, MailTestKit.capturing(p))
+    StreamHolder.module = MessagingModule.install(p, s, SecurityHooks(), parts, notifications)
+})
+    StreamHolder.cached = created
+    return created
+}
+
+MessageStreams streamsOf() {
+    streamApp()
+    var m = StreamHolder.module
+    if (m == null) {
+        throw "MODULE_NOT_WIRED"
+    }
+    return m.streams
+}
+
+String who(id: String) = DomainTestKit.loginAdult(streamApp(), id)
+
+// Opens the stream and waits for its first frame, so the hub already knows it.
+SseClient openStream(token: String) {
+    var client = SseClient.open(streamApp().port, "/conversations/stream", DomainTestKit.auth(token))
+    if (client.status() != 200) {
+        throw "stream refused " + client.status() + " " + client.rest()
+    }
+    var first = client.next(3000)
+    Check.eqStr("opening frame", "open", first.name)
+    return client
+}
+
+test "a new message is signalled to the recipient stream and only to the participants" {
+    var app = streamApp()
+    var sender = who("msg_stream_sender")
+    var recipient = who("msg_stream_recipient")
+    var outsider = who("msg_stream_outsider")
+    var conversationId = MessagingTestKit.direct(app, sender, "msg-stream-direct", "msg_stream_recipient")
+    var recipientStream = openStream(recipient)
+    var outsiderStream = openStream(outsider)
+    Check.isTrue("event stream content type", recipientStream.header("Content-Type").startsWith("text/event-stream"))
+    Check.eqStr("no proxy buffering", "no", recipientStream.header("X-Accel-Buffering"))
+    MessagingTestKit.sendOk(app, sender, "msg-stream-send", conversationId, "oi")
+    var event = recipientStream.waitFor("conversation", 3000)
+    Check.eqStr("event name", "conversation", event.name)
+    Check.eqStr("only the id travels", "{\"conversationId\":\"" + conversationId + "\"}", event.data)
+    Check.isTrue("the text never travels", !event.data.contains("oi\""))
+    var other = outsiderStream.waitFor("conversation", 1200)
+    Check.eqStr("the outsider hears nothing", "timeout", other.name)
+    recipientStream.close()
+    outsiderStream.close()
+}
+
+test "a read receipt is signalled to the other participant" {
+    var app = streamApp()
+    var sender = who("msg_stream_read_a")
+    var reader = who("msg_stream_read_b")
+    var conversationId = MessagingTestKit.direct(app, sender, "msg-stream-read-direct", "msg_stream_read_b")
+    var senderStream = openStream(sender)
+    var res = MessagingTestKit.call(app, reader, "msg-stream-read", "/conversations/" + conversationId + "/read", "")
+    Check.isTrue("read accepted", res.status >= 200 && res.status < 300)
+    var event = senderStream.waitFor("conversation", 3000)
+    Check.eqStr("event name", "conversation", event.name)
+    Check.isTrue("names the conversation", event.data.contains(conversationId))
+    senderStream.close()
+}
+
+test "streams per user are capped and the oldest is closed" {
+    var user = who("msg_stream_cap")
+    var streams = streamsOf()
+    var opened = listOf<SseClient>()
+    var i = 0
+    while (i < MessageStreams.maxStreamsPerUser() + 3) {
+        opened.add(openStream(user))
+        i = i + 1
+    }
+    Check.eqInt("capped", MessageStreams.maxStreamsPerUser(), streams.openStreams("msg_stream_cap"))
+    // The first stream was dropped by the hub: its connection ends.
+    var first = opened.get(0).waitFor("never", 3000)
+    Check.eqStr("the oldest ended", "end", first.name)
+    for (var c in opened) {
+        c.close()
+    }
+}
+
+test "the stream needs a session and answers the bare status" {
+    var app = streamApp()
+    var anon = SseClient.open(app.port, "/conversations/stream", listOf<String>())
+    Check.eqInt("anonymous", 401, anon.status())
+    anon.close()
+    var bad = SseClient.open(app.port, "/conversations/stream", DomainTestKit.auth("not-a-session"))
+    Check.eqInt("invalid token", 401, bad.status())
+    bad.close()
+}
+
+test "an idle stream gets a heartbeat" {
+    var user = who("msg_stream_beat")
+    var stream = openStream(user)
+    var beat = stream.next(3000)
+    Check.eqStr("ping", "ping", beat.name)
+    stream.close()
+}
+
+test "the stream is also served under the v1 alias and with the session cookie" {
+    var user = who("msg_stream_alias")
+    var app = streamApp()
+    var viaAlias = SseClient.open(app.port, "/v1/conversations/stream", DomainTestKit.auth(user))
+    Check.eqInt("alias", 200, viaAlias.status())
+    Check.eqStr("open", "open", viaAlias.next(3000).name)
+    viaAlias.close()
+    var viaCookie = SseClient.open(app.port, "/conversations/stream", listOf("Cookie: " + SessionCookies.session() + "=" + user))
+    Check.eqInt("cookie", 200, viaCookie.status())
+    Check.eqStr("open by cookie", "open", viaCookie.next(3000).name)
+    viaCookie.close()
+}
+
+test "a reaction is signalled to the participants" {
+    var app = streamApp()
+    var a = who("msg_stream_react_a")
+    var b = who("msg_stream_react_b")
+    var conversationId = MessagingTestKit.direct(app, a, "msg-stream-react-direct", "msg_stream_react_b")
+    var messageId = MessagingTestKit.sendOk(app, a, "msg-stream-react-send", conversationId, "oi")
+    var stream = openStream(a)
+    var res = MessagingTestKit.call(app, b, "msg-stream-react", "/conversations/" + conversationId + "/messages/" + messageId + "/reactions", "{\"type\":\"LIKE\"}")
+    Check.isTrue("reaction accepted", res.status >= 200 && res.status < 300)
+    var event = stream.waitFor("conversation", 3000)
+    Check.eqStr("event name", "conversation", event.name)
+    Check.isTrue("names the conversation", event.data.contains(conversationId))
+    stream.close()
+}
+
+test "the streams are closed at the end of the file" {
+    streamsOf().hub.closeAll()
+    streamApp().stop()
+    Check.isTrue("closed", true)
+}

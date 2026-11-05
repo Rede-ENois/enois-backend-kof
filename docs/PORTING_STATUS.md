@@ -220,7 +220,7 @@ The `GroupNotifier` outbox handler (`GroupPostPublished`) does not overlap with
 | `NotificationCoins` | grants every reward, `hasReward(ref)` is false | coin: the daily/first notification rewards |
 | `NotificationAccounts`, `DigestAccounts`, `DigestPersonalization` | read `users` and the digest sources | identity and feed: who gets the weekly digest and what it shows |
 | `NotificationPlaceReader` | reads `communities`, `posts`, `groups`, `events` | communities, groups, events: the place a notice points to |
-| `DigestMailer` | logs and answers `false` (nothing is sent) | identity: `EmailService` (the digest and the apology mail) |
+| `DigestMailer` | sends through the shared `MailService` (SMTP, `email_log`, List-Unsubscribe) | none: wired in `AppWiring` |
 | `PushPresence` (`push`) | reads `user_presence` | presence: who is online (no push to them) |
 | `MessagingAgePolicy` | reads `users.birth_date` and `parental_links` | profile/age: `AgeGate` and `AgePolicyReader` (`BIRTH_DATE_REQUIRED`, `PARENTAL_CONSENT_REQUIRED`) |
 | `MessagingConnections` | reads `user_connections` (ACCEPTED) | network: `ConnectionRepository` |
@@ -229,7 +229,7 @@ The `GroupNotifier` outbox handler (`GroupPostPublished`) does not overlap with
 | `CallGroups` (`calls`) | reads `group_members` | groups: `GroupService.roleOf` and `memberIds` |
 | `CallProfiles` | reads `users.social_name`, `users.name` | profile: `displayName` |
 | `CallClock` | the security clock (tests move it with `SecurityClock.advanceSeconds`) | none: kept as a seam for tests |
-| call events (`CallService.publish`) | no listener | the event stream (G201); `CallChanged` has no consumer yet |
+| call events (`CallService.publish`) | `call` events on the inbox stream (after commit) | none |
 
 Seams are concrete classes with overridable methods (interfaces across packages do not work, G30/G42): the
 owner subclasses the default and passes it in `NotificationsSeams` / `MessagingSeamSet` / `CallsSeamSet`.
@@ -240,11 +240,10 @@ Configuration: `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` (push is
 `REDE_CALLS_JITSI_TOKEN_TTL_MINUTES` (120). Without the Jitsi address and secret every call start is
 `503 CALLS_NOT_CONFIGURED`.
 
-### Java tests not ported (5 of 122)
+### Java tests not ported (1 of 122)
 
 | Java test | Why |
 |---|---|
-| `MessageStreamTests` (4: `newMessageIsSignalledToTheRecipientStream`, `readReceiptIsSignalledToTheOtherParticipant`, `streamsPerUserAreCapped`, `streamRequiresASession`) | the runtime cannot hold a response open (G201). `streamRequiresASession` is covered in spirit by `MessagesTest` ("the event stream needs a session and ends with a retry hint": 401 without a session, a closed `text/event-stream` body with `retry: 5000` otherwise); the three that read events from an open stream have no equivalent until the runtime streams |
 | `CallMediaProbe.gravaTokensDosDoisLadosDaChamada` | a manual probe, disabled unless `-Dcall.probe.url` points to a real Jitsi stack; it needs a browser and external infrastructure, not a suite |
 
 Ported with a changed setup: `GroupCreationQueryCountTests` (3) keep the behaviour (a large group with one
@@ -593,7 +592,7 @@ and any method), `kernel/url/UrlCodec.kf`. The jose4j/nimbus jars were not neede
 | Seam | Default | Replaced by |
 | --- | --- | --- |
 | `IdentityUsers` (profile reads and writes of `users`) | direct SQL on `users` | profile |
-| `IdentityMailer` (mail transport) | renders the Thymeleaf template text, logs metadata only, writes `email_log`, `deliver()` true. **SMTP is not ported** | the mail owner |
+| `IdentityMailer` (mail) | renders the templates with the kernel `HtmlTemplate` (byte for byte what Thymeleaf renders, proven by golden files) and sends through the shared `MailService` | none |
 | `IdentityTurnstileTransport` | `Outbound.postForm` to siteverify, fail-closed | tests stub it |
 | `IdentityIpBlocks`, `IdentitySignupGuard` | read `blocked_ips` (5 s cache); per-pod name pattern and cooldown guard | moderation |
 | `IdentityNotifier` | logging no-op (new device, parental events) | notifications |
@@ -616,7 +615,6 @@ onboarding joins need the real communities, groups and network services (`Onboar
 - `AuthProfileFlowTests` profile and feed parts, `AccountHardening` rename-to-admin (profile PATCH).
 - `PasswordChangeEndsSessionTests` end-to-end keypair and `TwoFactorFlowTests` `/notifications`: replaced by probe routes.
 - `AuthThrottleKeyTests`: already ported in the security `LimitersTest`.
-- `EmailServiceListUnsubscribeTests` (List-Unsubscribe header): needs the SMTP sender, which is not ported.
 - `OnboardingFlowTests.completeFollowsTheManualJoinRules`, `connectionRequestsSkipInvalidTargetsAndAreNotDuplicated`,
   `manualJoinOfUnknownCommunityIs404`: need communities, groups and network. Ported with seeded rows: only what is already
   in place counts as joined, self and unknown ids are skipped, an approval group is never joined.
@@ -658,7 +656,7 @@ Total: 49 of 49 endpoints, 102 of 103 Java tests ported.
 | `BlogFeedPointers` (`publish`, `delete`) | feed | mints the post id and logs `blog_feed_pointer_pending`; the feed owner writes the BLOG pointer post (tag `blog`, visible only in "Para voce" of subscribers) |
 | `BlogNotifier` (`notifyNewPost`) | notifications | logs `blog_notification_pending`; the owner writes the `NEW_BLOG_POST` notification |
 | `BlogCoins` (`recordPresence`) | coin | no-op |
-| `BlogEmailSender` (`sendHtml`) | identity (EmailService) | cannot send: records a FAILED `email_log` row `EMAIL_SENDER_NOT_WIRED` |
+| `BlogEmailSender` (`sendHtml`) | sends through the shared `MailService` (named sender, Reply-To, List-Unsubscribe) | none |
 | `BlogModule.withSeams` | feed, notifications, coin, identity | wiring point for the four blog seams above; `BlogService.authorsFollowedBy` is what the feed adds to "Para voce" |
 | ops hooks | kernel | `OpsMonitoring` replaces `hooks.monitoring`; `OpsLogTap` replaces the Java logback appender and `GlobalExceptionHandler` calls (`Log.installTap`) |
 | apiv1 hooks | kernel | `DeveloperOriginService` calls `hooks.origins.invalidate()` after every table change |
@@ -837,3 +835,9 @@ Total: 70 of 70 endpoints, 148 of 151 Java behaviours ported as 158 Kof tests; t
 ### Kernel files added or changed by this slice
 
 `kernel/jobs/ProcessLock.kf` (new: the `synchronized` of Java), `kernel/time/ZoneDates.kf` (`localToInstant`, `dayOfWeek`, `weekStart`), both with tests in `tests/kernel`. Config: `COSMETICS_CATALOG` (default `resources/cosmetics/catalog.json`; the deploy must ship the file next to `resources/templates`), `REDE_COSMETICS_EVENTS_{DUEL,HUNT}_{STARTS,ENDS}_AT`, `REDE_MARKETPLACE_*`, `COIN_ECONOMY_*`. Test support in `src/economy/` (`EconomyTestKit`, `CosmeticsTestKit`, `MarketTestKit`, `ServicesTestKit`). Gaps found: G240 to G248 in `KOF_GAPS.md`.
+
+## Mail and event streams (feat/mail-sse)
+
+- **Mail**: `kernel/mail/SmtpTransport` is the only file that touches jakarta.mail / angus-mail (2.0.5, the family of spring-boot-starter-mail). `MAIL_HOST` (localhost), `MAIL_PORT` (587), `MAIL_USERNAME` (suporte@enois.ia.br, also the From), `MAIL_PASSWORD`; STARTTLS enabled and required, auth on, 5 s timeouts, as in Java (`MAIL_SMTP_STARTTLS_ENABLE`, `MAIL_SMTP_STARTTLS_REQUIRED`, `MAIL_SMTP_TIMEOUT_MS` override them for local servers). `ops.MailService` is the one service every sender uses (`sendHtml`, `sendBulk` with sender name, Reply-To and `List-Unsubscribe` + `List-Unsubscribe-Post: List-Unsubscribe=One-Click`): it records one `email_log` row (SENT, or FAILED with the cause cut at 500; the 2FA subject redacted) and never throws. Messages are multipart/alternative: a plain-text part derived from the HTML (Java sent HTML only) and the HTML part. Senders switched: identity (verification, reset, 2FA, parental consent, e-mail change, signup notice, generic HTML), age, jobs (application delivery and status e-mails), the blog newsletter, the weekly digest. Not ported because the domains are not: the support e-mails (named sender "Suporte Enois", attachment) and moderation notices.
+- **Tests**: `MailServiceTest` and `MailSendersTest` (17) run the real transport against `kernel.testkit.FakeSmtpServer` (loopback, AUTH PLAIN, DATA capture); domain suites use `MailTestKit.capturing(platform)` (`MailCapture`). `EmailTemplateParityTest` compares the five templates with goldens made by Thymeleaf 3.1.5. `EmailServiceListUnsubscribeTests` is ported in `MailServiceTest`.
+- **Event stream**: `GET /conversations/stream` (and `/v1`) runs on `app.sse` (see G312 to G314). Events `conversation` `{"conversationId"}` (send, read receipt, reaction) and `call` `{"callId","state","conversationId"?,"groupId"?}`, published after commit; 5 streams per user (the oldest is closed), 30 minutes per stream, heartbeat every `REDE_MESSAGING_STREAM_HEARTBEAT_MS` (25000) as a named `ping` event. Session via `X-Session-Token`, bearer or cookie; a refusal is the bare status. In-memory registry: one backend instance, like Java. `MessageStreamTest` (8 of the 4 Java tests plus heartbeat, alias, cookie, reaction) and `CallStreamTest`.

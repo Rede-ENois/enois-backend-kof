@@ -5,6 +5,7 @@ import kernel.error.*
 import kernel.id.*
 import kernel.security.*
 import kernel.time.*
+import messaging.*
 import notifications.*
 
 // The wall clock of the calls (the Java tests moved a java.time.Clock). Tests move the security clock.
@@ -30,7 +31,8 @@ class CallService {
     CallProfiles profiles
     UserRateLimiter rateLimiter
     CallClock clock
-    public constructor(database: Db, store: CallsStore, audience: CallAudience, tokens: MeetingTokenIssuer, notifications: Notifications, profiles: CallProfiles, rateLimiter: UserRateLimiter, clock: CallClock) {
+    MessageStreams streams
+    public constructor(database: Db, store: CallsStore, audience: CallAudience, tokens: MeetingTokenIssuer, notifications: Notifications, profiles: CallProfiles, rateLimiter: UserRateLimiter, clock: CallClock, streams: MessageStreams) {
         this.database = database
         this.store = store
         this.audience = audience
@@ -39,6 +41,7 @@ class CallService {
         this.profiles = profiles
         this.rateLimiter = rateLimiter
         this.clock = clock
+        this.streams = streams
     }
     static String callHref(callId: String) = "/call/" + callId
     static String newId() = Ids.prefixed("call_")
@@ -47,9 +50,11 @@ class CallService {
     static CallView blank() = CallView("", "AUDIO", "DIRECT", null, null, "", "", "ENDED", "", null, null, null, null, 0, false, null)
     // ------------------------------------------------------------------ views
     CallView view(call: CallRecord, actorId: String) = CallView(call.id(), call.kind(), call.modality(), call.conversationId(), call.groupId(), call.initiatorId(), call.displayName(), call.state(), call.createdAt(), call.answeredAt(), call.endedAt(), call.endReason(), call.expiresAt(), store.countPresent(call.id()), call.initiatorId() == actorId, store.participantState(call.id(), actorId))
-    // Nobody is listening for call changes until the event stream exists (G201): the hook stays so the
-    // stream adapter has one place to attach.
-    publish(call: CallRecord, userIds: List<String>);
+    // "Call X changed" on the inbox streams, after the commit (CallChanged event of the Java service).
+    publish(call: CallRecord, userIds: List<String>) {
+        var self = this
+        database.afterCommit(() -> self.streams.callChanged(call.id(), call.conversationId(), call.groupId(), call.state(), userIds))
+    }
     List<String> audienceOf(call: CallRecord) {
         var conversationId = call.conversationId()
         if (conversationId != null) {

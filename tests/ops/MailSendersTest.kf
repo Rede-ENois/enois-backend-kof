@@ -1,0 +1,110 @@
+import blog.*
+import identity.*
+import kernel.*
+import kernel.config.*
+import kernel.db.*
+import kernel.mail.*
+import kernel.testkit.*
+import notifications.*
+import ops.*
+
+// The senders of identity, blog and the weekly digest over the real SMTP transport and the in-process fake
+// server: what each one puts on the wire is what the Java EmailService put.
+class SendersHolder {
+    static TestApp? app = null
+    static FakeSmtpServer? smtp = null
+    static MailService? mail = null
+}
+
+MailService sendersMail() {
+    var cur = SendersHolder.mail
+    if (cur != null) {
+        return cur
+    }
+    var smtp = FakeSmtpServer()
+    smtp.start()
+    SendersHolder.smtp = smtp
+    var app = TestApp.boot("mailsenders")
+    SendersHolder.app = app
+    var cfg = Config.of(mapOf("MAIL_HOST", "127.0.0.1", "MAIL_PORT", "" + smtp.port(), "MAIL_USERNAME", "noreply@test.com", "MAIL_PASSWORD", "x", "MAIL_SMTP_STARTTLS_ENABLE", "false", "MAIL_SMTP_STARTTLS_REQUIRED", "false", "FRONTEND_URL", "https://app.test"))
+    var created = MailService.fromConfig(cfg, EmailLogStore(app.db()))
+    SendersHolder.mail = created
+    return created
+}
+
+FakeSmtpServer senderSmtp() {
+    sendersMail()
+    var smtp = SendersHolder.smtp
+    if (smtp == null) {
+        throw "SMTP_NOT_STARTED"
+    }
+    return smtp
+}
+
+TestApp sendersApp() {
+    sendersMail()
+    var app = SendersHolder.app
+    if (app == null) {
+        throw "APP_NOT_BOOTED"
+    }
+    return app
+}
+
+Config frontendConfig() = Config.of(mapOf("FRONTEND_URL", "https://app.test"))
+
+test "identity mail renders the template, sends it and redacts the two-factor subject in the log" {
+    var mailer = IdentityMailer(frontendConfig(), sendersMail(), false)
+    Check.isTrue("sent", mailer.sendTwoFactorCode("dois@test.com", "Ana", "654321"))
+    var got = senderSmtp().last()
+    Check.eqStr("subject", "Seu código de acesso ao Énóis", FakeSmtpServer.header(got.raw, "Subject"))
+    Check.isTrue("code in the html part", got.raw.contains("654321"))
+    var row = sendersApp().db().queryOne("select subject, kind, status from email_log where to_email = ?", DbParams().bindStr("dois@test.com"))
+    Check.eqStr("redacted", "Seu código de acesso (redigido)", row.getStr("subject"))
+    Check.eqStr("kind", "TWO_FACTOR", row.getStr("kind"))
+    Check.eqStr("status", "SENT", row.getStr("status"))
+}
+
+test "the verification mail carries the link built from FRONTEND_URL" {
+    var mailer = IdentityMailer(frontendConfig(), sendersMail(), false)
+    Check.isTrue("sent", mailer.sendVerificationEmail("verifica@test.com", "Bia", "tok123"))
+    var raw = senderSmtp().last().raw
+    Check.eqStr("subject", "Confirme seu e-mail no Énóis", FakeSmtpServer.header(raw, "Subject"))
+    Check.isTrue("link", raw.contains("https://app.test/auth/verify?token=3Dtok123") || raw.contains("https://app.test/auth/verify?token=tok123"))
+}
+
+test "the blog newsletter sender sends the named sender, the Reply-To and the one-click headers" {
+    var sender = BlogEmailSender(sendersMail())
+    Check.isTrue("sent", sender.sendHtml("leitor@test.com", "Novo post", "<p>oi</p>", "Meu Blog via Énóis", "autor@test.com", "https://app.test/api/blogs/descadastrar?token=abc", "BLOG_POST"))
+    var raw = senderSmtp().last().raw
+    Check.eqStr("from", "Meu Blog via Énóis <noreply@test.com>", FakeSmtpServer.header(raw, "From"))
+    Check.eqStr("reply-to", "autor@test.com", FakeSmtpServer.header(raw, "Reply-To"))
+    Check.eqStr("unsubscribe", "<https://app.test/api/blogs/descadastrar?token=abc>", FakeSmtpServer.header(raw, "List-Unsubscribe"))
+    Check.eqStr("one click", "List-Unsubscribe=One-Click", FakeSmtpServer.header(raw, "List-Unsubscribe-Post"))
+}
+
+test "the weekly digest sender sends the one-click headers and logs WEEKLY_DIGEST" {
+    var digest = DigestMailer(sendersMail())
+    Check.isTrue("sent", digest.sendHtml("semana@test.com", "Sua semana no Énóis", "<p>oi</p>", "Énóis", "https://app.test/api/notifications/digest/unsubscribe?token=z", "WEEKLY_DIGEST"))
+    var raw = senderSmtp().last().raw
+    Check.eqStr("unsubscribe", "<https://app.test/api/notifications/digest/unsubscribe?token=z>", FakeSmtpServer.header(raw, "List-Unsubscribe"))
+    Check.eqStr("one click", "List-Unsubscribe=One-Click", FakeSmtpServer.header(raw, "List-Unsubscribe-Post"))
+    Check.eqStr("kind", "WEEKLY_DIGEST", sendersApp().db().queryOne("select kind from email_log where to_email = ?", DbParams().bindStr("semana@test.com")).getStr("kind"))
+}
+
+test "a dead SMTP server makes the sender answer false and log FAILED" {
+    var smtp = FakeSmtpServer()
+    var port = smtp.port()
+    smtp.stop()
+    var cfg = Config.of(mapOf("MAIL_HOST", "127.0.0.1", "MAIL_PORT", "" + port, "MAIL_SMTP_STARTTLS_ENABLE", "false", "MAIL_SMTP_STARTTLS_REQUIRED", "false"))
+    sendersMail()
+    var dead = MailService.fromConfig(cfg, EmailLogStore(sendersApp().db()))
+    var sender = BlogEmailSender(dead)
+    Check.isTrue("not sent", !sender.sendHtml("morto@test.com", "Novo post", "<p>oi</p>", "Blog", "", "https://app.test/u", "BLOG_POST"))
+    Check.eqStr("status", "FAILED", sendersApp().db().queryOne("select status from email_log where to_email = ?", DbParams().bindStr("morto@test.com")).getStr("status"))
+}
+
+test "the fake server is stopped at the end of the file" {
+    senderSmtp().stop()
+    sendersApp().stop()
+    Check.isTrue("stopped", true)
+}

@@ -1,0 +1,157 @@
+import kernel.*
+import kernel.config.*
+import kernel.db.*
+import kernel.mail.*
+import kernel.testkit.*
+import ops.*
+
+// The mail service over the real SMTP transport and an in-process fake server: no network, no mocks of the
+// transport. Ports EmailServiceListUnsubscribeTests and adds the rest of what EmailService does.
+class MailHolder {
+    static TestApp? app = null
+    static FakeSmtpServer? smtp = null
+}
+
+FakeSmtpServer fakeSmtp() {
+    var cur = MailHolder.smtp
+    if (cur != null) {
+        return cur
+    }
+    var created = FakeSmtpServer()
+    created.start()
+    MailHolder.smtp = created
+    return created
+}
+
+TestApp mailApp() {
+    var cur = MailHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = TestApp.boot("mailservice")
+    MailHolder.app = created
+    return created
+}
+
+Config mailConfig(port: Int) = Config.of(mapOf("MAIL_HOST", "127.0.0.1", "MAIL_PORT", "" + port, "MAIL_USERNAME", "noreply@test.com", "MAIL_PASSWORD", "s3cret", "MAIL_SMTP_STARTTLS_ENABLE", "false", "MAIL_SMTP_STARTTLS_REQUIRED", "false"))
+
+MailService smtpService(port: Int) {
+    var cfg = mailConfig(port)
+    return MailService.fromConfig(cfg, EmailLogStore(mailApp().db()))
+}
+
+String logValue(column: String, to: String) = mailApp().db().queryOne("select " + column + " from email_log where to_email = ? order by created_at desc limit 1", DbParams().bindStr(to)).getStr(column)
+
+test "an unsubscribe url adds the RFC 2369 and RFC 8058 one-click headers" {
+    var smtp = fakeSmtp()
+    var mail = smtpService(smtp.port())
+    var sent = mail.sendBulk("reader@test.com", "Assunto", "<p>oi</p>", "Énóis", "", "https://app.test/api/notifications/digest/unsubscribe?token=abc", "WEEKLY_DIGEST")
+    Check.isTrue("sent", sent)
+    var raw = smtp.last().raw
+    Check.eqStr("List-Unsubscribe", "<https://app.test/api/notifications/digest/unsubscribe?token=abc>", FakeSmtpServer.header(raw, "List-Unsubscribe"))
+    Check.eqStr("List-Unsubscribe-Post", "List-Unsubscribe=One-Click", FakeSmtpServer.header(raw, "List-Unsubscribe-Post"))
+}
+
+test "without an unsubscribe url the message carries no List-Unsubscribe header" {
+    var smtp = fakeSmtp()
+    var mail = smtpService(smtp.port())
+    Check.isTrue("sent", mail.sendHtml("plain@test.com", "Oi", "<p>oi</p>", "HTML"))
+    var raw = smtp.last().raw
+    Check.eqStr("no header", "", FakeSmtpServer.header(raw, "List-Unsubscribe"))
+    Check.eqStr("no header post", "", FakeSmtpServer.header(raw, "List-Unsubscribe-Post"))
+    Check.eqStr("no reply-to", "", FakeSmtpServer.header(raw, "Reply-To"))
+}
+
+test "the sender, the named from, the reply-to, the subject and the recipient reach the server" {
+    var smtp = fakeSmtp()
+    var mail = smtpService(smtp.port())
+    Check.isTrue("sent", mail.sendBulk("leitor@test.com", "Novo post: ação", "<p>oi</p>", "Blog do Zé via Énóis", "autor@test.com", "", "BLOG_POST"))
+    var got = smtp.last()
+    Check.eqStr("envelope from", "<noreply@test.com>", got.envelopeFrom)
+    Check.eqInt("one recipient", 1, got.recipients.size())
+    Check.eqStr("envelope to", "<leitor@test.com>", got.recipients.get(0))
+    Check.eqStr("from", "Blog do Zé via Énóis <noreply@test.com>", FakeSmtpServer.header(got.raw, "From"))
+    Check.eqStr("reply-to", "autor@test.com", FakeSmtpServer.header(got.raw, "Reply-To"))
+    Check.eqStr("subject", "Novo post: ação", FakeSmtpServer.header(got.raw, "Subject"))
+    Check.eqStr("to", "leitor@test.com", FakeSmtpServer.header(got.raw, "To"))
+}
+
+test "the plain default sender is the bare MAIL_USERNAME address" {
+    var smtp = fakeSmtp()
+    var mail = smtpService(smtp.port())
+    Check.isTrue("sent", mail.sendHtml("bare@test.com", "Oi", "<p>oi</p>", "HTML"))
+    Check.eqStr("from", "noreply@test.com", FakeSmtpServer.header(smtp.last().raw, "From"))
+}
+
+test "the message is multipart/alternative with a text part and an html part" {
+    var smtp = fakeSmtp()
+    var mail = smtpService(smtp.port())
+    Check.isTrue("sent", mail.sendHtml("parts@test.com", "Oi", "<style>p{color:red}</style><p>Ola &amp; bem-vindo</p><p>Segunda linha</p>", "HTML"))
+    var raw = smtp.last().raw
+    Check.isTrue("alternative", FakeSmtpServer.header(raw, "Content-Type").startsWith("multipart/alternative"))
+    Check.isTrue("text part", raw.contains("Content-Type: text/plain"))
+    Check.isTrue("html part", raw.contains("Content-Type: text/html"))
+    Check.isTrue("text body", raw.contains("Ola & bem-vindo\r\nSegunda linha"))
+    Check.isTrue("html body", raw.contains("<p>Ola &amp; bem-vindo</p>"))
+    Check.isTrue("no css in text", !raw.contains("color:red}</style><p>Ola & "))
+}
+
+test "SMTP credentials come from MAIL_USERNAME and MAIL_PASSWORD" {
+    var smtp = fakeSmtp()
+    var mail = smtpService(smtp.port())
+    Check.isTrue("sent", mail.sendHtml("auth@test.com", "Oi", "<p>oi</p>", "HTML"))
+    // base64("noreply@test.com\0noreply@test.com\0s3cret"): the AUTH PLAIN initial response (authzid, user, password).
+    Check.eqStr("plain login", "bm9yZXBseUB0ZXN0LmNvbQBub3JlcGx5QHRlc3QuY29tAHMzY3JldA==", smtp.last().login)
+}
+
+test "a send writes a SENT row with the kind and without an error" {
+    var smtp = fakeSmtp()
+    var mail = smtpService(smtp.port())
+    Check.isTrue("sent", mail.sendHtml("row@test.com", "Assunto da linha", "<p>oi</p>", "PASSWORD_RESET"))
+    Check.eqStr("status", "SENT", logValue("status", "row@test.com"))
+    Check.eqStr("kind", "PASSWORD_RESET", logValue("kind", "row@test.com"))
+    Check.eqStr("subject", "Assunto da linha", logValue("subject", "row@test.com"))
+}
+
+test "the subject of a TWO_FACTOR row is redacted" {
+    var smtp = fakeSmtp()
+    var mail = smtpService(smtp.port())
+    Check.isTrue("sent", mail.sendHtml("2fa@test.com", "Seu codigo 123456", "<p>123456</p>", "TWO_FACTOR"))
+    Check.eqStr("redacted", "Seu código de acesso (redigido)", logValue("subject", "2fa@test.com"))
+}
+
+test "a server refusal answers false and writes a FAILED row with the cause" {
+    var smtp = fakeSmtp()
+    smtp.rejectWith = "550 mailbox unavailable"
+    var mail = smtpService(smtp.port())
+    var sent = mail.sendHtml("refused@test.com", "Oi", "<p>oi</p>", "HTML")
+    smtp.rejectWith = ""
+    Check.isTrue("not sent", !sent)
+    Check.eqStr("status", "FAILED", logValue("status", "refused@test.com"))
+    Check.isTrue("cause kept", logValue("error", "refused@test.com").contains("550"))
+}
+
+test "an unreachable server answers false and writes a FAILED row" {
+    var smtp = FakeSmtpServer()
+    var port = smtp.port()
+    smtp.stop()
+    var mail = smtpService(port)
+    var sent = mail.sendHtml("down@test.com", "Oi", "<p>oi</p>", "EMAIL_VERIFICATION")
+    Check.isTrue("not sent", !sent)
+    Check.eqStr("status", "FAILED", logValue("status", "down@test.com"))
+    Check.eqStr("kind", "EMAIL_VERIFICATION", logValue("kind", "down@test.com"))
+}
+
+test "a transport that throws nothing readable still yields a FAILED row" {
+    var capture = MailCapture()
+    capture.failWith = "boom"
+    var mail = MailService(mailConfig(1), capture, EmailLogStore(mailApp().db()))
+    Check.isTrue("not sent", !mail.sendHtml("boom@test.com", "Oi", "<p>oi</p>", "HTML"))
+    Check.eqStr("error", "boom", logValue("error", "boom@test.com"))
+}
+
+test "the fake server is stopped at the end of the file" {
+    fakeSmtp().stop()
+    mailApp().stop()
+    Check.isTrue("stopped", true)
+}

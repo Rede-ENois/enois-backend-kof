@@ -48,6 +48,9 @@ class AppWiring {
     static SharedServices install(platform: Platform) {
         // Shared services (idempotency, outbox worker, audit, cipher, caches, sanction gate, risk engine, ...).
         var shared = SharedServices.create(platform)
+        // The one mail service every sender shares (identity, age, jobs, notifications digest, blog newsletter):
+        // SMTP from MAIL_HOST / MAIL_PORT / MAIL_USERNAME / MAIL_PASSWORD, one email_log row per send.
+        var mail = MailService.fromConfig(platform.cfg, EmailLogStore(platform.db))
         // Request pipeline (filters, limiters, guards). Each domain port replaces its own seam in `hooks`
         // (moderators, monitoring, reports, origins) before this line.
         var hooks = SecurityHooks.defaults(platform.db)
@@ -65,7 +68,7 @@ class AppWiring {
         var cosmeticsCore = CosmeticsCore.create(platform)
         var profiles = ProfileModule.installWith(platform, shared, ProfileNotifier(platform.db), cosmeticsCore.badges, ProfileParentalLinks(platform.db), ProfileForeignCounts(platform.db), PreferencesThemeGallery(platform.db))
         var jobSeams = JobSeamSet(platform, profiles)
-        var identitySeams = IdentitySeams.defaults(platform, IdentityStore(platform.db))
+        var identitySeams = IdentitySeams.defaults(platform, mail)
         identitySeams.reputations = JobsIdentityReputation(jobSeams.reputation)
         var identity = IdentityModule.installWith(platform, shared, hooks, parts, identitySeams)
         var age = AgeModule.install(platform, identity.mailer)
@@ -75,7 +78,7 @@ class AppWiring {
         // economy (coin): the ledger service is built first because the domains below call it (presence, rewards);
         // the routes, the disputes and the jobs come after notifications (CoinModule.install).
         var coinCore = CoinCore.create(platform, shared, parts)
-        var notificationSeams = NotificationsSeams(platform)
+        var notificationSeams = NotificationsSeams(platform, mail)
         notificationSeams.coins = CoinNotificationCoins(coinCore.service)
         var notificationsModule = NotificationsModule.installWith(platform, shared, notificationSeams)
         var coinModule = CoinModule.install(platform, shared, parts, coinCore, profiles, notificationsModule)
@@ -113,7 +116,7 @@ class AppWiring {
         var themeModule = ThemeModule.install(platform, shared, hooks)
         ProjectsModule.install(platform, shared, hooks)
         SuggestionsModule.install(platform, shared, hooks)
-        BlogModule.withSeams(platform, shared, BlogProfiles(platform.db), BlogFeedPointers(), BlogNotifier(), CoinBlogCoins(coinCore.service), BlogEmailSender(EmailLogStore(platform.db)))
+        BlogModule.withSeams(platform, shared, BlogProfiles(platform.db), BlogFeedPointers(), BlogNotifier(), CoinBlogCoins(coinCore.service), BlogEmailSender(mail))
         // economy: the marketplace (escrow, workers) and the services directory/contracts sit on the coin service.
         MarketplaceModule.install(platform, shared, coinModule, profiles, themeModule)
         ServicesModule.install(platform, shared, coinModule, profiles, messagingModule)

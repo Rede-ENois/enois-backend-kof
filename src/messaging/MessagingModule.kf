@@ -28,20 +28,26 @@ class MessagingModule {
     MessagingService service
     ConversationViewers viewers
     MessagingCorporate corporate
-    public constructor(store: MessagingStore, service: MessagingService, viewers: ConversationViewers, corporate: MessagingCorporate) {
+    MessageStreams streams
+    public constructor(store: MessagingStore, service: MessagingService, viewers: ConversationViewers, corporate: MessagingCorporate, streams: MessageStreams) {
         this.store = store
         this.service = service
         this.viewers = viewers
         this.corporate = corporate
+        this.streams = streams
     }
     static MessagingModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks, parts: SecurityParts, notificationsModule: NotificationsModule) = MessagingModule.installWith(platform, shared, parts, notificationsModule, MessagingSeamSet(platform))
     static MessagingModule installWith(platform: Platform, shared: SharedServices, parts: SecurityParts, notificationsModule: NotificationsModule, seams: MessagingSeamSet) {
         var store = MessagingStore(platform.db)
         var viewers = ConversationViewers()
-        var service = MessagingService(platform.db, store, notificationsModule.notifications, parts.userLimiter, parts.timingGuard, seams.agePolicy, shared.sanctionGate, seams.connections, shared.blockedUsers, seams.corporate, seams.coins, viewers)
+        var streams = MessageStreams.fromConfig(platform.cfg)
+        var service = MessagingService(platform.db, store, notificationsModule.notifications, parts.userLimiter, parts.timingGuard, seams.agePolicy, shared.sanctionGate, seams.connections, shared.blockedUsers, seams.corporate, seams.coins, viewers, streams)
         shared.jobs.fixedDelay("conversation-viewers-expiry", 60000L, 60000L, () -> viewers.dropExpired())
+        // Before the routes: the runtime takes the first route that matches, and /conversations/:conversationId would
+        // swallow /conversations/stream.
+        platform.server.sse("/conversations/stream", MessageStreamSource(), streams.hub)
         MessagingRoutes.register(platform.server, service, seams.corporate, shared.blockedUsers, shared.idempotency)
         E2eKeyRoutes.register(platform.server, service, store)
-        return MessagingModule(store, service, viewers, seams.corporate)
+        return MessagingModule(store, service, viewers, seams.corporate, streams)
     }
 }
