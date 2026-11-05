@@ -1,0 +1,46 @@
+package mentoring
+
+import coin.*
+import kernel.*
+import kernel.db.*
+import profile.*
+
+// Composition of the mentoring domain. AppWiring installs it after the coin module (escrow) and the profile module.
+// Config: REDE_MENTORING_JITSI_BASE_URL (default https://meet.jit.si), REDE_MENTORING_JITSI_API_BASE (default
+// https://api.jitsi.net, dial-in numbers), REDE_MENTORING_SESSION_COMPLETION_{INITIAL_,}DELAY_MS (300000 / 120000).
+class MentoringModule {
+    MentoringService service
+    MentoringStore store
+    public constructor(service: MentoringService, store: MentoringStore) {
+        this.service = service
+        this.store = store
+    }
+    static MentoringModule install(platform: Platform, shared: SharedServices, coin: CoinModule, profiles: ProfileModule) {
+        var cfg = platform.cfg
+        var rooms = MentoringRooms(cfg.getStr("REDE_MENTORING_JITSI_BASE_URL", MentoringRooms.defaultBaseUrl()))
+        var gateway = JitsiDialInClient(cfg.getStr("REDE_MENTORING_JITSI_API_BASE", JitsiDialInClient.defaultApiBase()))
+        return MentoringModule.installWith(platform, shared, coin.service, profiles.directory, rooms, gateway)
+    }
+    static MentoringModule installWith(platform: Platform, shared: SharedServices, coins: CoinService, profiles: ProfileDirectory, rooms: MentoringRooms, gateway: MentoringDialInGateway) {
+        var store = MentoringStore(platform.db)
+        var service = MentoringService(platform.db, store, coins, profiles, rooms, gateway)
+        MentoringRoutes.register(platform.server, service, shared.idempotency)
+        var cfg = platform.cfg
+        // A session whose slot ended is completed by the clock (no money moves); the escrow is released after the
+        // contest window. Both rules also run on read.
+        shared.jobs.fixedDelay("mentoring-complete-finished", cfg.getLong("REDE_MENTORING_SESSION_COMPLETION_INITIAL_DELAY_MS", 120000L), cfg.getLong("REDE_MENTORING_SESSION_COMPLETION_DELAY_MS", 300000L), () -> service.completeFinishedSessions())
+        shared.jobs.fixedDelay("mentoring-settle-expired", 600000L, 3600000L, () -> service.settleExpiredSessions())
+        return MentoringModule(service, store)
+    }
+}
+
+// The reputation component of the profile that counts completed sessions as a mentee (profile seam
+// ProfileForeignCounts.mentoringAsMentee). Every other count keeps reading as before.
+class MentoringProfileCounts extends ProfileForeignCounts {
+    MentoringStore mentoring
+    public constructor(database: Db) {
+        super(database)
+        this.mentoring = MentoringStore(database)
+    }
+    Int mentoringAsMentee(userId: String) = ProfileForeignCounts.n(mentoring.countCompletedAsMentee(userId))
+}

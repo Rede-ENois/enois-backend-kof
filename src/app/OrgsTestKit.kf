@@ -1,0 +1,103 @@
+package app
+
+import java.util.HashMap
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import profile.*
+
+// Fixtures of the orgs suites (corporate, companies, mentoring, freelances, events): one app per test file booted
+// with the exact production wiring (AppWiring.install), so a test also proves the wiring and the seams other
+// domains hold for these domains. No background job runs (the outbox worker is stopped), and no test reaches the
+// network.
+//
+//   var app = OrgsTestKit.app()
+//   var ana = OrgsTestKit.login("orgs_ana")            // verified adult with a live session
+//   Check.status(ana.get("/me/business-profile"), 200)
+//   ... last test of the file: OrgsTestKit.finish()
+class OrgsTestKit {
+    static TestApp? orgsKitApp = null
+    static SharedServices? orgsKitShared = null
+    static TestApp app() = OrgsTestKit.bootWith(new HashMap<String, String>())
+    // Boots once per test file; the overrides of the first call win.
+    static TestApp bootWith(overrides: Map<String,String>) {
+        var cur = OrgsTestKit.orgsKitApp
+        if (cur != null) {
+            return cur
+        }
+        var merged = new HashMap<String, String>()
+        merged.put("REDE_SECURITY_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+        merged.put("REDE_ORIGINS_ENFORCE", "false")
+        merged.put("REDE_JOBS_IMPORT_EXTERNAL_REFRESH_ENABLED", "false")
+        merged.put("REDE_JOBS_IMPORT_JOBRADAR_ENABLED", "false")
+        merged.put("REDE_JOBS_IMPORT_OPEN_APIS_ENABLED", "false")
+        merged.put("REDE_CACHE_JOBS_LIST_TTL", "0ms")
+        merged.put("REDE_CACHE_EVENTS_LIST_TTL", "0ms")
+        merged.put("REDE_CACHE_COMMUNITIES_LIST_TTL", "0ms")
+        for (var k in overrides.keys()) {
+            merged.put(k, overrides.getOrDefault(k, ""))
+        }
+        SecurityClock.reset()
+        var created = TestApp.bootWith("orgs", merged, (p: Platform) -> {
+    OrgsTestKit.orgsKitShared = AppWiring.install(p)
+    var shared = OrgsTestKit.orgsKitShared
+    if (shared != null) {
+        shared.stop()
+    }
+})
+        // The outbox worker and the sweeps would keep the test process alive: tests drive them by hand.
+        OrgsTestKit.orgsKitApp = created
+        return created
+    }
+    static Db db() = OrgsTestKit.app().db()
+    // A verified adult (birth date declared) with a live one-hour session; id, username and name are the id.
+    static ProfileCaller login(id: String) {
+        var caller = ProfileTestApp.login(OrgsTestKit.app(), id)
+        OrgsTestKit.db().execute("update users set birth_date = ? where id = ? and birth_date is null", DbParams().bindDate("1990-05-10").bindStr(id))
+        // Past the "new account" window the publishing guards apply to.
+        OrgsTestKit.db().execute("update users set created_at = ? where id = ?", DbParams().bindInstant(Time.plusSeconds(Time.nowIso(), -604800L)).bindStr(id))
+        return caller
+    }
+    static ProfileCaller anonymous() = ProfileTestApp.anonymous(OrgsTestKit.app())
+    static String str(res: TestResponse, path: String) {
+        var v = res.jsonStr(path)
+        if (v == null) {
+            throw "missing json " + path + " in " + res.body
+        }
+        return v
+    }
+    // A professional identity switched on through the HTTP flow (draft with a headline, then activated).
+    static ProfileCaller activateProfessional(id: String) {
+        var caller = OrgsTestKit.login(id)
+        var created = caller.post("/me/business-profile", "{\"username\":\"pro." + id + "\",\"name\":\"Perfil " + id + "\"}")
+        if (created.status != 200) {
+            throw "business profile not created: " + created.body
+        }
+        caller.patch("/me/business-profile", "{\"headline\":\"Profissional\"}")
+        var active = caller.post("/me/business-profile/activate", "")
+        if (active.status != 200) {
+            throw "business profile not activated: " + active.body
+        }
+        return caller
+    }
+    // Seeds a job row directly (the POST needs reputation and a value the tests do not care about).
+    static insertJob(id: String, title: String, company: String, postedBy: String, postedAt: String) {
+        var store = OrgsTestKit.db()
+        store.execute("delete from jobs where id = ?", DbParams().bindStr(id))
+        store.execute("insert into jobs (id, title, company, location, type, level, salary, currency, posted_by, posted_at, updated_at, community_agreed_at) values (?, ?, ?, \'Remoto\', \'CLT\', \'PLENO\', null, \'BRL\', ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(title).bindStr(company).bindStr(postedBy).bindInstant(postedAt).bindInstant(postedAt).bindInstant(postedAt))
+    }
+    // An external job of an aggregator, straight in the table.
+    static insertExternalJob(id: String, title: String, company: String, url: String, importedAt: String) {
+        var store = OrgsTestKit.db()
+        store.execute("delete from external_jobs where id = ?", DbParams().bindStr(id))
+        store.execute("insert into external_jobs (id, platform, external_id, title, company, location, salary, currency, url, imported_at, last_checked_at, external_status) values (?, \'Plataforma Teste\', ?, ?, ?, \'Remoto\', null, \'BRL\', ?, ?, ?, \'FOUND\')", DbParams().bindStr(id).bindStr(id + "-externo").bindStr(title).bindStr(company).bindStr(url).bindInstant(importedAt).bindInstant(importedAt))
+    }
+    // Last test of a file.
+    static finish() {
+        var shared = OrgsTestKit.orgsKitShared
+        if (shared != null) {
+            shared.stop()
+        }
+    }
+}

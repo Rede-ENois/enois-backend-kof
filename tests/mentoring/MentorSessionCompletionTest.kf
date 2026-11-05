@@ -1,0 +1,127 @@
+import app.*
+import kernel.db.*
+import coin.*
+import kernel.testkit.*
+import mentoring.*
+import profile.*
+
+// Port of MentorSessionCompletionTests: a session whose slot ended is not "scheduled": reading the agenda and the
+// worker complete it, and the escrow money follows its own rule (mentor confirmation, cancellation or the contest
+// window).
+Long clockPrice() = 100L * CoinService.scale()
+
+TestResponse clockInbox(owner: ProfileCaller, mentorId: String) {
+    var res = owner.get("/mentors/" + mentorId + "/sessions")
+    Check.status(res, 200)
+    return res
+}
+
+test "a session whose time ended is completed and leaves the upcoming list" {
+    var owner = MentoringTestKit.login("mentor-clock-owner")
+    var mentee = MentoringTestKit.login("mentor-clock-mentee")
+    var mentorId = MentoringTestKit.createPlainMentor(owner)
+    // A one hour slot that already ended (started two hours ago) and a future one as control.
+    var endedSlot = MentoringTestKit.createSlot(owner, mentorId, MentoringTestKit.after(-7200L))
+    var futureSlot = MentoringTestKit.createSlot(owner, mentorId, MentoringTestKit.after(86400L))
+    var ended = MentoringTestKit.bookOk(mentee, mentorId, endedSlot)
+    var upcoming = MentoringTestKit.bookOk(mentee, mentorId, futureSlot)
+    // The mentor's agenda: the one that ended is completed; the future one stays scheduled.
+    var inbox = clockInbox(owner, mentorId)
+    Check.eqStr("ended is completed", "COMPLETED", MentoringTestKit.fieldOf(inbox, "", ended, "status"))
+    Check.isTrue("ended keeps its start", MentoringTestKit.fieldOf(inbox, "", ended, "startsAt").length() > 0)
+    Check.eqStr("future is scheduled", "SCHEDULED", MentoringTestKit.fieldOf(inbox, "", upcoming, "status"))
+    // The booking side sees the same ("upcoming x history" of the screen).
+    var mine = mentee.get("/mentors/sessions/mine")
+    Check.status(mine, 200)
+    Check.eqStr("mine ended", "COMPLETED", MentoringTestKit.fieldOf(mine, "", ended, "status"))
+    Check.eqStr("mine future", "SCHEDULED", MentoringTestKit.fieldOf(mine, "", upcoming, "status"))
+    // Really completed for the catalogue too: the mentor's counter went up.
+    var shown = OrgsTestKit.anonymous().get("/mentors/" + mentorId)
+    Check.status(shown, 200)
+    Check.eqStr("sessions counter", "1", shown.json("sessions"))
+    // Reading again does not count it twice.
+    clockInbox(owner, mentorId)
+    Check.eqStr("counted once", "1", OrgsTestKit.anonymous().get("/mentors/" + mentorId).json("sessions"))
+}
+
+test "the worker completes finished sessions without moving money" {
+    var owner = MentoringTestKit.login("mentor-clock-worker-owner")
+    var mentee = MentoringTestKit.login("mentor-clock-worker-mentee")
+    var mentorId = MentoringTestKit.createPricedMentor(owner, clockPrice())
+    // Ended a minute ago: past the slot but still inside the contest window.
+    var slotId = MentoringTestKit.createSlot(owner, mentorId, MentoringTestKit.after(-3660L))
+    MentoringTestKit.fund("mentor-clock-worker-mentee", 200L * CoinService.scale(), "test-mentoria-relogio-worker")
+    var sessionId = MentoringTestKit.bookOk(mentee, mentorId, slotId)
+    var ownerBefore = MentoringTestKit.balance("mentor-clock-worker-owner")
+    var menteeBefore = MentoringTestKit.balance("mentor-clock-worker-mentee")
+    // Nobody opened the agenda: the worker alone completes the expired session.
+    MentoringTestKit.service().completeFinishedSessions()
+    Check.eqStr("completed", "COMPLETED", MentoringTestKit.fieldOf(clockInbox(owner, mentorId), "", sessionId, "status"))
+    // Completing by the clock pays nobody: the escrow waits for the contest window.
+    Check.eqStr("owner balance", "" + ownerBefore, "" + MentoringTestKit.balance("mentor-clock-worker-owner"))
+    Check.eqStr("mentee balance", "" + menteeBefore, "" + MentoringTestKit.balance("mentor-clock-worker-mentee"))
+}
+
+test "a paid session completed by the clock still settles once after the grace window" {
+    var owner = MentoringTestKit.login("mentor-clock-settle-owner")
+    var mentee = MentoringTestKit.login("mentor-clock-settle-mentee")
+    var mentorId = MentoringTestKit.createPricedMentor(owner, clockPrice())
+    // Eight days ago: the seven day contest window counted from the end of the slot already passed.
+    var slotId = MentoringTestKit.createSlot(owner, mentorId, MentoringTestKit.after(-8L * 86400L))
+    MentoringTestKit.fund("mentor-clock-settle-mentee", 200L * CoinService.scale(), "test-mentoria-relogio-settle")
+    var ownerBefore = MentoringTestKit.balance("mentor-clock-settle-owner")
+    var menteeBefore = MentoringTestKit.balance("mentor-clock-settle-mentee")
+    var sessionId = MentoringTestKit.bookOk(mentee, mentorId, slotId)
+    var service = MentoringTestKit.service()
+    // The clock completes first (paying nothing) and the settlement worker resolves the money afterwards.
+    service.completeFinishedSessions()
+    Check.eqStr("not paid by the clock", "" + ownerBefore, "" + MentoringTestKit.balance("mentor-clock-settle-owner"))
+    service.settleExpiredSessions()
+    var net = 90L * CoinService.scale()
+    Check.eqStr("paid after the window", "" + (ownerBefore + net), "" + MentoringTestKit.balance("mentor-clock-settle-owner"))
+    Check.eqStr("mentee paid the price", "" + (menteeBefore - clockPrice()), "" + MentoringTestKit.balance("mentor-clock-settle-mentee"))
+    // A second round does not pay the same value again.
+    service.settleExpiredSessions()
+    Check.eqStr("paid once", "" + (ownerBefore + net), "" + MentoringTestKit.balance("mentor-clock-settle-owner"))
+    Check.eqStr("completed", "COMPLETED", MentoringTestKit.fieldOf(clockInbox(owner, mentorId), "", sessionId, "status"))
+    Check.eqStr("counted once", "1", OrgsTestKit.anonymous().get("/mentors/" + mentorId).json("sessions"))
+}
+
+test "a session completed by the mentor is not settled again by the worker" {
+    var owner = MentoringTestKit.login("mentor-clock-manual-owner")
+    var mentee = MentoringTestKit.login("mentor-clock-manual-mentee")
+    var mentorId = MentoringTestKit.createPricedMentor(owner, clockPrice())
+    var slotId = MentoringTestKit.createSlot(owner, mentorId, MentoringTestKit.after(-8L * 86400L))
+    MentoringTestKit.fund("mentor-clock-manual-mentee", 200L * CoinService.scale(), "test-mentoria-relogio-manual")
+    var ownerBefore = MentoringTestKit.balance("mentor-clock-manual-owner")
+    var sessionId = MentoringTestKit.bookOk(mentee, mentorId, slotId)
+    var done = MentoringTestKit.complete(owner, mentorId, sessionId)
+    Check.status(done, 200)
+    Check.jsonEq(done, "status", "COMPLETED")
+    var net = 90L * CoinService.scale()
+    Check.eqStr("paid on confirmation", "" + (ownerBefore + net), "" + MentoringTestKit.balance("mentor-clock-manual-owner"))
+    // The value already left the escrow on confirmation: the automatic release does not pay again.
+    MentoringTestKit.service().settleExpiredSessions()
+    Check.eqStr("not paid twice", "" + (ownerBefore + net), "" + MentoringTestKit.balance("mentor-clock-manual-owner"))
+}
+
+test "the escrow of a session whose mentor profile vanished goes back to the mentee" {
+    var owner = MentoringTestKit.login("mentor-clock-orphan-owner")
+    var mentee = MentoringTestKit.login("mentor-clock-orphan-mentee")
+    var mentorId = MentoringTestKit.createPricedMentor(owner, clockPrice())
+    var slotId = MentoringTestKit.createSlot(owner, mentorId, MentoringTestKit.after(-8L * 86400L))
+    MentoringTestKit.fund("mentor-clock-orphan-mentee", 200L * CoinService.scale(), "test-mentoria-orphan")
+    var menteeBefore = MentoringTestKit.balance("mentor-clock-orphan-mentee")
+    MentoringTestKit.bookOk(mentee, mentorId, slotId)
+    // The profile vanishes (the schema FKs keep Java from deleting it with an agenda: drop them for the case).
+    var database = MentoringTestKit.database()
+    database.execute("set referential_integrity false", DbParams())
+    database.execute("delete from mentors where id = ?", DbParams().bindStr(mentorId))
+    database.execute("set referential_integrity true", DbParams())
+    MentoringTestKit.service().settleExpiredSessions()
+    Check.eqStr("mentee got it back", "" + menteeBefore, "" + MentoringTestKit.balance("mentor-clock-orphan-mentee"))
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}

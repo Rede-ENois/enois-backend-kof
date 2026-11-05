@@ -1,0 +1,252 @@
+package mentoring
+
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+import kernel.time.*
+import kernel.url.*
+
+// HTTP adapter of MentoringContractController (`/mentors`): paths, status codes, JSON and error codes as the Java
+// service. The catalogue and the slots are public; everything else needs a session. Writes honour Idempotency-Key.
+class MentoringRoutes {
+    static register(server: HttpServer, service: MentoringService, idem: Idempotency) {
+        // Literal paths first: the router answers by registration order.
+        server.get("/mentors/sessions/mine", () -> MentoringRoutes.mySessions(service))
+        server.get("/mentors", () -> MentoringRoutes.list(service))
+        server.get("/mentors/:mentorId", () -> MentoringRoutes.one(service))
+        server.get("/mentors/:mentorId/slots", () -> MentoringRoutes.slots(service))
+        server.post("/mentors", () -> MentoringRoutes.create(service, idem))
+        server.patch("/mentors/:mentorId", () -> MentoringRoutes.update(service, idem))
+        server.delete("/mentors/:mentorId", () -> MentoringRoutes.remove(service, idem))
+        server.post("/mentors/:mentorId/slots", () -> MentoringRoutes.createSlot(service, idem))
+        server.delete("/mentors/:mentorId/slots/:slotId", () -> MentoringRoutes.deleteSlot(service))
+        server.post("/mentors/:mentorId/sessions", () -> MentoringRoutes.book(service, idem))
+        server.get("/mentors/:mentorId/sessions", () -> MentoringRoutes.inbox(service))
+        server.get("/mentors/:mentorId/availability", () -> MentoringRoutes.availability(service))
+        server.put("/mentors/:mentorId/availability", () -> MentoringRoutes.saveAvailability(service, idem))
+        server.post("/mentors/:mentorId/sessions/:sessionId/complete", () -> MentoringRoutes.complete(service, idem))
+        server.post("/mentors/:mentorId/sessions/:sessionId/cancel", () -> MentoringRoutes.cancel(service, idem))
+        server.get("/mentors/:mentorId/room", () -> MentoringRoutes.room(service))
+        server.get("/mentors/:mentorId/sessions/:sessionId/dial-in", () -> MentoringRoutes.dialIn(service))
+    }
+    static String hashOf(text: String) = Idempotency.hash(text)
+    // CursorCodec.decode: absent -> null, malformed -> 400 INVALID_CURSOR.
+    static String? cursor() {
+        var raw = Req.queryStr("cursor", "")
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        try {
+            var ignored = Time.toMillis(raw.trim())
+        } catch (String e) {
+            throw Errors.api(400, "INVALID_CURSOR", "Cursor invalido.")
+        }
+        return raw.trim()
+    }
+    // ---- public reads
+    static String list(service: MentoringService) {
+        var before = MentoringRoutes.cursor()
+        var limit = Req.queryInt("limit", 20)
+        // PageRequest.of(0, limit) refuses a size below one (400 BAD_REQUEST).
+        if (limit < 1) {
+            throw Errors.badRequest()
+        }
+        var mentors = service.list(Req.queryParam("expertise"), Req.queryParam("query"), before, limit)
+        var next = Nulls.str()
+        if (mentors.size() == limit) {
+            next = mentors.get(mentors.size() - 1).createdAt
+        }
+        return json.encode(MentoringMentorPage(MentoringViews.mentors(service, mentors), next))
+    }
+    static String one(service: MentoringService) {
+        var mentor = service.getById(Req.pathParam("mentorId"))
+        return json.encode(MentoringViews.mentors(service, listOf(mentor)).get(0))
+    }
+    static String slots(service: MentoringService) {
+        var items = listOf<MentoringSlotView>()
+        for (var s in service.getSlots(Req.pathParam("mentorId"))) {
+            items.add(MentoringViews.slot(s))
+        }
+        return json.encode(MentoringSlotPage(items, null))
+    }
+    // ---- bodies
+    static MentoringMentorBody mentorBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<MentoringMentorBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static MentoringSlotBody slotBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<MentoringSlotBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static MentoringSessionBody sessionBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<MentoringSessionBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static MentoringAvailabilityBody availabilityBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<MentoringAvailabilityBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    // The expertise list is mandatory (Java answered 500 on a null list; the porting rule is 400).
+    static List<String> expertiseOf(b: MentoringMentorBody) {
+        var list = b.expertise
+        if (list == null) {
+            throw Errors.badRequest()
+        }
+        return list
+    }
+    // An instant of the request: a missing or malformed value is a 400 (HttpMessageNotReadable / not null column).
+    static String instantOf(raw: String?) {
+        if (raw == null) {
+            throw Errors.badRequest()
+        }
+        var out = ""
+        try {
+            out = Time.plusSeconds(raw, 0L)
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        return out
+    }
+    // ---- idempotent writes
+    static String create(service: MentoringService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var b = MentoringRoutes.mentorBody()
+        var hash = MentoringRoutes.hashOf(json.encode(b))
+        return idem.handle(userId, "POST", "/api/mentors", hash, 201, () -> {
+    var m = service.create(userId, MentoringRoutes.expertiseOf(b), b.price, b.banner, b.meetingUrl, b.sparksPrice, MentoringRoomMode.fromRequest(b.roomMode), b.jitsiRoom)
+    return json.encode(MentoringViews.mentors(service, listOf(m)).get(0))
+})
+    }
+    static String update(service: MentoringService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var mentorId = Req.pathParam("mentorId")
+        var b = MentoringRoutes.mentorBody()
+        var hash = MentoringRoutes.hashOf("mentorId=" + mentorId + "&" + json.encode(b))
+        return idem.handle(userId, "PATCH", "/api/mentors/{mentorId}", hash, 200, () -> {
+    var m = service.update(mentorId, MentoringRoutes.expertiseOf(b), b.price, b.banner, b.meetingUrl, b.sparksPrice, MentoringRoomMode.fromRequest(b.roomMode), b.jitsiRoom, userId)
+    return json.encode(MentoringViews.mentors(service, listOf(m)).get(0))
+})
+    }
+    static String remove(service: MentoringService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var mentorId = Req.pathParam("mentorId")
+        return idem.handle(userId, "DELETE", "/api/mentors/{mentorId}", MentoringRoutes.hashOf("mentorId=" + mentorId), 200, () -> {
+    service.delete(mentorId, userId)
+    return json.encode(MentoringStatusView(mentorId, "DELETED"))
+})
+    }
+    static String createSlot(service: MentoringService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var mentorId = Req.pathParam("mentorId")
+        var b = MentoringRoutes.slotBody()
+        var hash = MentoringRoutes.hashOf("mentorId=" + mentorId + "&" + json.encode(b))
+        return idem.handle(userId, "POST", "/api/mentors/{mentorId}/slots", hash, 201, () -> {
+    var slot = service.createSlot(mentorId, userId, MentoringRoutes.instantOf(b.startsAt), MentoringRoutes.instantOf(b.endsAt))
+    return json.encode(MentoringViews.slot(slot))
+})
+    }
+    static String book(service: MentoringService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var mentorId = Req.pathParam("mentorId")
+        var b = MentoringRoutes.sessionBody()
+        var hash = MentoringRoutes.hashOf("mentorId=" + mentorId + "&" + json.encode(b))
+        return idem.handle(userId, "POST", "/api/mentors/{mentorId}/sessions", hash, 201, () -> {
+    var session = service.scheduleSession(mentorId, userId, b.slotId, b.message)
+    return json.encode(MentoringStatusView(session.id, "SCHEDULED"))
+})
+    }
+    static String saveAvailability(service: MentoringService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var mentorId = Req.pathParam("mentorId")
+        var b = MentoringRoutes.availabilityBody()
+        var hash = MentoringRoutes.hashOf("mentorId=" + mentorId + "&" + json.encode(b))
+        return idem.handle(userId, "PUT", "/api/mentors/{mentorId}/availability", hash, 200, () -> {
+    var saved = service.saveAvailability(mentorId, userId, MentoringRoutes.rulesOf(b))
+    return json.encode(MentoringViews.availability(saved))
+})
+    }
+    static List<MentoringRule> rulesOf(b: MentoringAvailabilityBody) {
+        var out = listOf<MentoringRule>()
+        var items = b.items
+        if (items == null) {
+            return out
+        }
+        for (var item in items) {
+            var day = 0
+            var d = item.dayOfWeek
+            if (d != null) {
+                day = d
+            }
+            var times = listOf<String>()
+            var t = item.times
+            if (t != null) {
+                times = t
+            }
+            out.add(MentoringRule(day, times))
+        }
+        return out
+    }
+    static String complete(service: MentoringService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var mentorId = Req.pathParam("mentorId")
+        var sessionId = Req.pathParam("sessionId")
+        return idem.handle(userId, "POST", "/api/mentors/{mentorId}/sessions/{sessionId}/complete", MentoringRoutes.hashOf("mentorId=" + mentorId + "&sessionId=" + sessionId), 200, () -> {
+    service.completeSession(mentorId, sessionId, userId)
+    return json.encode(MentoringStatusView(sessionId, "COMPLETED"))
+})
+    }
+    static String cancel(service: MentoringService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var mentorId = Req.pathParam("mentorId")
+        var sessionId = Req.pathParam("sessionId")
+        return idem.handle(userId, "POST", "/api/mentors/{mentorId}/sessions/{sessionId}/cancel", MentoringRoutes.hashOf("mentorId=" + mentorId + "&sessionId=" + sessionId), 200, () -> {
+    service.cancelSession(mentorId, sessionId, userId)
+    return json.encode(MentoringStatusView(sessionId, "CANCELLED"))
+})
+    }
+    // ---- session-scoped reads
+    static String deleteSlot(service: MentoringService) {
+        var userId = Auth.requireUser()
+        service.deleteSlot(Req.pathParam("mentorId"), Req.pathParam("slotId"), userId)
+        return status(204, "")
+    }
+    static String inbox(service: MentoringService) {
+        var userId = Auth.requireUser()
+        return json.encode(MentoringViews.inbox(service, Req.pathParam("mentorId"), userId))
+    }
+    static String availability(service: MentoringService) {
+        var userId = Auth.requireUser()
+        return json.encode(MentoringViews.availability(service.availabilitiesOf(Req.pathParam("mentorId"), userId)))
+    }
+    static String mySessions(service: MentoringService) {
+        var userId = Auth.requireUser()
+        return json.encode(MentoringViews.mine(service, userId))
+    }
+    static String room(service: MentoringService) {
+        var userId = Auth.requireUser()
+        var mentor = service.requireOwner(Req.pathParam("mentorId"), userId)
+        return json.encode(MentoringRoomView(mentor.roomMode, service.mentorRoomUrl(mentor), mentor.meetingUrl, mentor.jitsiRoom))
+    }
+    static String dialIn(service: MentoringService) {
+        var userId = Auth.requireUser()
+        var d = service.dialInOf(Req.pathParam("sessionId"), userId)
+        return json.encode(MentoringDialInView(d.conference, d.pin, d.numbers))
+    }
+}

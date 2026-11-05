@@ -1,0 +1,184 @@
+package events
+
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+import kernel.url.*
+
+// HTTP adapter of EventContractController: the eight routes under /events. Reads are public (the viewer is only
+// used for `attending` and `canManageRecurrence`); every write needs a session and an Idempotency-Key, and the
+// request bodies go through the safe-link check before they are parsed.
+class EventsRoutes {
+    EventsService service
+    EventsRecurrenceService recurrence
+    Idempotency idem
+    AdminGuard admin
+    public constructor(service: EventsService, recurrence: EventsRecurrenceService, idem: Idempotency, admin: AdminGuard) {
+        this.service = service
+        this.recurrence = recurrence
+        this.idem = idem
+        this.admin = admin
+    }
+    register(server: HttpServer) {
+        var self = this
+        server.get("/events", () -> self.list())
+        server.post("/events", () -> self.create())
+        server.get("/events/:eventId", () -> self.detail())
+        server.patch("/events/:eventId", () -> self.update())
+        server.delete("/events/:eventId", () -> self.remove())
+        server.patch("/events/:eventId/recurrence", () -> self.changeRecurrence())
+        server.post("/events/:eventId/attendees", () -> self.attend())
+        server.delete("/events/:eventId/attendees", () -> self.cancel())
+    }
+    // CursorCodec.decode: absent -> null, malformed -> 400 INVALID_CURSOR.
+    static String? cursor() {
+        var raw = Req.queryStr("cursor", "")
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        try {
+            var ignored = Time.toMillis(raw.trim())
+        } catch (String e) {
+            throw Errors.api(400, "INVALID_CURSOR", "Cursor invalido.")
+        }
+        return raw.trim()
+    }
+    // `viewer` null = anonymous. Only the owner manages the series; the owner's id never leaves in the answer.
+    EventView view(e: EventRecord, attending: Bool, viewer: String?, counted: Int) {
+        // After the sanitisation the attendances are gone: the stored number carries the total.
+        var attendees = counted
+        var kept = e.finalAttendeesCount
+        if (kept != null) {
+            attendees = kept
+        }
+        var manage = false
+        if (viewer != null) {
+            manage = e.createdBy == viewer
+        }
+        return EventView(e.id, e.title, e.date, e.time, e.format, e.host, attendees, e.cover, e.streamUrl, e.location, service.hasEnded(e), attending, e.recurrence, e.seriesId, recurrence.nextOccurrenceDate(e), manage, e.city, e.state)
+    }
+    EventView viewOf(e: EventRecord, attending: Bool, viewer: String?) = this.view(e, attending, viewer, service.countAttendees(e.id))
+    String list() {
+        var limit = EventsService.clamp(Req.queryInt("limit", 20))
+        var page = service.list(Req.queryParam("format"), Req.queryParam("city"), Req.queryParam("state"), EventsRoutes.cursor(), limit, Req.queryBool("includePast", false), Req.queryBool("recurring", false))
+        var viewer = Auth.viewerIdOrNull()
+        var ids = listOf<String>()
+        for (var e in page.items()) {
+            ids.add(e.id)
+        }
+        var attending = listOf<String>()
+        if (viewer != null) {
+            attending = service.attendingEventIds(viewer, ids)
+        }
+        // Attendance of the page in one query: a count per card was an N+1.
+        var counts = service.countAttendeesByEventIds(ids)
+        var items = listOf<EventView>()
+        for (var e in page.items()) {
+            items.add(this.view(e, attending.contains(e.id), viewer, counts.getOrDefault(e.id, 0)))
+        }
+        // The cursor comes from the page the database returned: hiding an expired event cannot end the pagination.
+        String? next = Nulls.str()
+        if (page.fetched() == limit) {
+            next = page.lastCreatedAt()
+        }
+        return json.encode(EventPageView(items, next))
+    }
+    String detail() {
+        var e = service.getById(Req.pathParam("eventId"))
+        var viewer = Auth.viewerIdOrNull()
+        var attending = false
+        if (viewer != null) {
+            var ids = listOf<String>()
+            ids.add(e.id)
+            attending = service.attendingEventIds(viewer, ids).contains(e.id)
+        }
+        return json.encode(this.viewOf(e, attending, viewer))
+    }
+    EventCreateBody createBody() {
+        try {
+            return json.decode<EventCreateBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    EventUpdateBody updateBody() {
+        try {
+            return json.decode<EventUpdateBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    EventRecurrenceBody recurrenceBody() {
+        try {
+            return json.decode<EventRecurrenceBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    String create() {
+        var userId = Auth.requireUser()
+        SafeLinks.checkRequest()
+        var body = this.createBody()
+        var self = this
+        return idem.handle(userId, "POST", "/api/events", Idempotency.hash(json.encode(body)), 201, () -> {
+    var e = self.service.create(body.title, body.date, body.time, body.format, body.host, body.cover, body.streamUrl, body.location, body.recurrence, body.city, body.state, userId)
+    return json.encode(self.viewOf(e, false, userId))
+})
+    }
+    // Edits the ritual: only its creator; the recurrence has its own endpoint.
+    String update() {
+        var userId = Auth.requireUser()
+        SafeLinks.checkRequest()
+        var eventId = Req.pathParam("eventId")
+        var body = this.updateBody()
+        var self = this
+        return idem.handle(userId, "PATCH", "/api/events/{eventId}", Idempotency.hash(eventId + "|" + json.encode(body)), 200, () -> {
+    var e = self.service.update(eventId, body.title, body.date, body.time, body.format, body.host, body.cover, body.streamUrl, body.location, body.city, body.state, userId)
+    return json.encode(self.viewOf(e, false, userId))
+})
+    }
+    // Turns the recurrence on, changes it or turns it off (creator only). NONE ends the series.
+    String changeRecurrence() {
+        var userId = Auth.requireUser()
+        SafeLinks.checkRequest()
+        var eventId = Req.pathParam("eventId")
+        var body = this.recurrenceBody()
+        var self = this
+        return idem.handle(userId, "PATCH", "/api/events/{eventId}/recurrence", Idempotency.hash(eventId + "|" + body.recurrence), 200, () -> {
+    var e = self.service.changeRecurrence(eventId, body.recurrence, userId)
+    return json.encode(self.viewOf(e, false, userId))
+})
+    }
+    // The creator deletes their own; an admin deletes any.
+    String remove() {
+        var userId = Auth.requireUser()
+        var eventId = Req.pathParam("eventId")
+        var asAdmin = admin.isAdmin(userId)
+        var self = this
+        return idem.handle(userId, "DELETE", "/api/events/{eventId}", Idempotency.hash(eventId), 200, () -> {
+    self.service.delete(eventId, userId, asAdmin)
+    return json.encode(EventStatusView(eventId, "DELETED"))
+})
+    }
+    String attend() {
+        var userId = Auth.requireUser()
+        var eventId = Req.pathParam("eventId")
+        var self = this
+        return idem.handle(userId, "POST", "/api/events/{eventId}/attendees", Idempotency.hash(eventId), 200, () -> {
+    self.service.attend(eventId, userId)
+    return json.encode(EventStatusView(eventId, "ATTENDING"))
+})
+    }
+    String cancel() {
+        var userId = Auth.requireUser()
+        var eventId = Req.pathParam("eventId")
+        var self = this
+        return idem.handle(userId, "DELETE", "/api/events/{eventId}/attendees", Idempotency.hash(eventId), 200, () -> {
+    self.service.cancelAttendance(eventId, userId)
+    return json.encode(EventStatusView(eventId, "NOT_ATTENDING"))
+})
+    }
+}

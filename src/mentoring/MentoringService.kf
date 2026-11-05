@@ -1,0 +1,706 @@
+package mentoring
+
+import coin.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.text.*
+import kernel.time.*
+import profile.*
+
+// Use cases of the mentoring domain (MentorService). Money goes through the coin service: booking a paid session
+// moves the price into the escrow, the mentor's confirmation releases it (minus the platform fee), a cancellation
+// returns it whole, and a job releases it after the contest window. Every write runs in one transaction.
+class MentoringService {
+    Db database
+    MentoringStore store
+    CoinService coins
+    ProfileDirectory profiles
+    MentoringRooms rooms
+    MentoringDialInGateway dialIn
+    public constructor(database: Db, store: MentoringStore, coins: CoinService, profiles: ProfileDirectory, rooms: MentoringRooms, dialIn: MentoringDialInGateway) {
+        this.database = database
+        this.store = store
+        this.coins = coins
+        this.profiles = profiles
+        this.rooms = rooms
+        this.dialIn = dialIn
+    }
+    // The agenda is chosen in Sao Paulo, how the screen shows it and how the mentor thinks.
+    static String agendaZone() = "America/Sao_Paulo"
+    // Window in which the slots are generated from the weekly rules.
+    static Int generationDays() = 28
+    // Floor and ceiling of a session price in sparks (the ceiling keeps absurd ads out of the catalogue).
+    static Long minSparksPrice() = 50L * CoinService.scale()
+    static Long maxSparksPrice() = 10000L * CoinService.scale()
+    // After the end of the slot the mentee has this window to complain; then the escrow releases itself.
+    static Long settlementGraceSeconds() = 604800L
+    // A paid session whose slot vanished from the agenda releases this long after the booking.
+    static Long orphanSettlementSeconds() = 1814400L
+    static String escrowRef(sessionId: String) = "mentoria:" + sessionId
+    // ---- mentors
+    MentoringMentor create(userId: String, expertise: List<String>, price: String?, banner: String?, meetingUrl: String?, sparksPrice: Long?, roomMode: String?, jitsiRoom: String?) {
+        var self = this
+        var box = listOf<MentoringMentor>()
+        database.transaction(() -> {
+    box.add(self.createInTx(userId, expertise, price, banner, meetingUrl, sparksPrice, roomMode, jitsiRoom))
+})
+        return box.get(0)
+    }
+    MentoringMentor createInTx(userId: String, expertise: List<String>, price: String?, banner: String?, meetingUrl: String?, sparksPrice: Long?, roomMode: String?, jitsiRoom: String?) {
+        if (store.findMentorByUser(userId) != null) {
+            throw Errors.api(409, "ALREADY_MENTOR", "Voce ja esta cadastrado como mentor.")
+        }
+        var candidateUrl = this.sanitizeMeetingUrl(meetingUrl)
+        var mode = this.validatedRoomMode(roomMode, candidateUrl)
+        var cleanUrl = Nulls.str()
+        if (mode == MentoringRoomMode.custom()) {
+            cleanUrl = candidateUrl
+        }
+        var priceChecked = this.validatedSparksPrice(sparksPrice)
+        var room = rooms.sanitizeRoom(jitsiRoom)
+        var now = Time.nowIso()
+        var mentor = MentoringMentor(Ids.prefixed("mentor_"), userId, expertise, 0.0, 0, price, banner, cleanUrl, priceChecked, mode, room, now, now)
+        store.insertMentor(mentor)
+        return mentor
+    }
+    MentoringMentor update(mentorId: String, expertise: List<String>, price: String?, banner: String?, meetingUrl: String?, sparksPrice: Long?, roomMode: String?, jitsiRoom: String?, userId: String) {
+        var self = this
+        var box = listOf<MentoringMentor>()
+        database.transaction(() -> {
+    box.add(self.updateInTx(mentorId, expertise, price, banner, meetingUrl, sparksPrice, roomMode, jitsiRoom, userId))
+})
+        return box.get(0)
+    }
+    MentoringMentor updateInTx(mentorId: String, expertise: List<String>, price: String?, banner: String?, meetingUrl: String?, sparksPrice: Long?, roomMode: String?, jitsiRoom: String?, userId: String) {
+        var mentor = this.requireOwner(mentorId, userId)
+        var urlProvided = meetingUrl != null
+        var current = Nulls.str()
+        if (meetingUrl != null) {
+            current = meetingUrl
+        }
+        else {
+            current = mentor.meetingUrl
+        }
+        var candidateUrl = this.sanitizeMeetingUrl(current)
+        var mode = ""
+        if (roomMode != null) {
+            mode = this.validatedRoomMode(roomMode, candidateUrl)
+        }
+        else {
+            if (!urlProvided) {
+                // The screen sent neither mode nor link: the mentor keeps the room they had.
+                mode = mentor.roomMode
+            }
+            else {
+                if (candidateUrl == null) {
+                    // An empty link: the external room leaves the profile and the session goes back to Jitsi.
+                    mode = MentoringRoomMode.jitsiSession()
+                }
+                else {
+                    mode = this.validatedRoomMode(mentor.roomMode, candidateUrl)
+                }
+            }
+        }
+        // An external link only holds for the mentor's own room: going back to Jitsi drops the old one.
+        var cleanUrl = Nulls.str()
+        if (mode == MentoringRoomMode.custom()) {
+            cleanUrl = candidateUrl
+        }
+        // Permanent room: keeps the existing one; a new name only when the mentor asked for one now.
+        var room = mentor.jitsiRoom
+        if (roomMode != null) {
+            if (roomMode == MentoringRoomMode.jitsiPermanent()) {
+                var wanted = jitsiRoom
+                if (wanted == null) {
+                    wanted = mentor.jitsiRoom
+                }
+                room = rooms.sanitizeRoom(wanted)
+            }
+        }
+        var priceChecked = this.validatedSparksPrice(sparksPrice)
+        var updated = MentoringMentor(mentor.id, mentor.userId, expertise, mentor.rating, mentor.sessionsCount, price, banner, cleanUrl, priceChecked, mode, room, mentor.createdAt, Time.nowIso())
+        store.updateMentor(updated)
+        return updated
+    }
+    // A coherent mode: an own room needs a link; Jitsi needs nothing. Without a mode, a configured link keeps the
+    // own room (the backfill rule of the migration) and no link means the Jitsi room per session.
+    String validatedRoomMode(requested: String?, meetingUrl: String?) {
+        var mode = MentoringRoomMode.jitsiSession()
+        if (requested != null) {
+            mode = requested
+        }
+        else {
+            if (meetingUrl != null) {
+                if (meetingUrl.trim().length() > 0) {
+                    mode = MentoringRoomMode.custom()
+                }
+            }
+        }
+        if (mode == MentoringRoomMode.custom()) {
+            if (meetingUrl == null) {
+                throw Errors.api(400, "MEETING_URL_REQUIRED", "Para usar uma sala propria, informe o link da sala.")
+            }
+            if (meetingUrl.trim().length() == 0) {
+                throw Errors.api(400, "MEETING_URL_REQUIRED", "Para usar uma sala propria, informe o link da sala.")
+            }
+        }
+        return mode
+    }
+    // Price of a session in sparks: null is "not accepted" (a free mentoring).
+    Long? validatedSparksPrice(sparksPrice: Long?) {
+        if (sparksPrice == null) {
+            return null
+        }
+        // A narrowed Long? returned as is emits Long.valueOf(Long): copy it into a plain Long first.
+        var amount = 0L
+        amount = sparksPrice
+        if (amount < MentoringService.minSparksPrice()) {
+            throw Errors.api(400, "SPARKS_PRICE_TOO_LOW", "O preço mínimo de uma sessão é " + MentoringService.minSparksPrice() / CoinService.scale() + " faíscas.")
+        }
+        if (amount > MentoringService.maxSparksPrice()) {
+            throw Errors.api(400, "SPARKS_PRICE_TOO_HIGH", "O preço máximo de uma sessão é " + MentoringService.maxSparksPrice() / CoinService.scale() + " faíscas.")
+        }
+        return amount
+    }
+    // External room (Meet, Jitsi...): optional; when it comes it must be an https link of at most 500.
+    String? sanitizeMeetingUrl(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        var url = raw.trim()
+        if (!url.startsWith("https://")) {
+            throw Errors.api(400, "INVALID_MEETING_URL", "Informe um link https valido de ate 500 caracteres.")
+        }
+        if (url.length() > 500) {
+            throw Errors.api(400, "INVALID_MEETING_URL", "Informe um link https valido de ate 500 caracteres.")
+        }
+        return url
+    }
+    MentoringMentor requireMentor(mentorId: String) {
+        var mentor = store.findMentor(mentorId)
+        if (mentor == null) {
+            throw Errors.api(404, "MENTOR_NOT_FOUND", "Mentor nao encontrado.")
+        }
+        return mentor
+    }
+    MentoringMentor requireOwner(mentorId: String, userId: String) {
+        var mentor = this.requireMentor(mentorId)
+        if (mentor.userId != userId) {
+            throw Errors.api(403, "FORBIDDEN", "Voce nao e o dono deste perfil de mentor.")
+        }
+        return mentor
+    }
+    delete(mentorId: String, userId: String) {
+        var self = this
+        database.transaction(() -> {
+    var mentor = self.requireOwner(mentorId, userId)
+    self.store.deleteMentor(mentor.id)
+})
+    }
+    List<MentoringMentor> list(expertise: String?, query: String?, before: String?, limit: Int) = store.findMentors(expertise, query, before, limit)
+    MentoringMentor getById(id: String) = this.requireMentor(id)
+    List<MentoringSlot> getSlots(mentorId: String) = store.findSlotsByMentor(mentorId)
+    MentoringSlot? slotOf(slotId: String) = store.findSlot(slotId)
+    // A mentor profile without an exception: old sessions survive a deleted profile.
+    MentoringMentor? mentorOrNull(mentorId: String) = store.findMentor(mentorId)
+    // The next free slot (ISO-8601) of each mentor, one query for the whole page.
+    Map<String,String> nextSlots(mentors: List<MentoringMentor>) {
+        var ids = listOf<String>()
+        for (var m in mentors) {
+            ids.add(m.id)
+        }
+        return store.nextSlots(ids, Time.nowIso())
+    }
+    // ---- agenda
+    MentoringSlot createSlot(mentorId: String, userId: String, startsAt: String, endsAt: String) {
+        var mentor = this.requireOwner(mentorId, userId)
+        var slot = MentoringSlot(Ids.prefixed("slot_"), mentor.id, startsAt, endsAt, true)
+        store.insertSlot(slot)
+        return slot
+    }
+    // Removes a published slot; owner only. A booked slot cannot vanish.
+    deleteSlot(mentorId: String, slotId: String, userId: String) {
+        var mentor = this.requireOwner(mentorId, userId)
+        var slot = store.findSlot(slotId)
+        if (slot == null) {
+            throw Errors.api(404, "SLOT_NOT_FOUND", "Horario nao encontrado.")
+        }
+        // The slot must belong to the mentor of the URL, or the owner of one mentor erased the slot of another.
+        if (slot.mentorId != mentor.id) {
+            throw Errors.api(404, "SLOT_NOT_FOUND", "Horario nao encontrado.")
+        }
+        if (!slot.available) {
+            throw Errors.api(409, "SLOT_BOOKED", "Este horario ja foi reservado.")
+        }
+        store.deleteSlot(slotId)
+    }
+    MentoringSession scheduleSession(mentorId: String, menteeId: String, slotId: String?, message: String?) {
+        var self = this
+        var box = listOf<MentoringSession>()
+        database.transaction(() -> {
+    box.add(self.scheduleInTx(mentorId, menteeId, slotId, message))
+})
+        return box.get(0)
+    }
+    MentoringSession scheduleInTx(mentorId: String, menteeId: String, slotId: String?, message: String?) {
+        var mentor = this.requireMentor(mentorId)
+        if (slotId == null) {
+            throw Errors.api(404, "SLOT_NOT_FOUND", "Horario nao encontrado.")
+        }
+        var slot = store.findSlot(slotId)
+        if (slot == null) {
+            throw Errors.api(404, "SLOT_NOT_FOUND", "Horario nao encontrado.")
+        }
+        if (slot.mentorId != mentor.id) {
+            throw Errors.api(404, "SLOT_NOT_FOUND", "Horario nao encontrado.")
+        }
+        if (!slot.available) {
+            throw Errors.api(409, "SLOT_UNAVAILABLE", "Horario nao esta mais disponivel.")
+        }
+        if (mentor.userId == menteeId) {
+            throw Errors.api(400, "CANNOT_BOOK_OWN", "Voce nao pode agendar uma sessao com voce mesmo.")
+        }
+        // Atomic: of two people booking the same hour, one wins and the other is told it is gone.
+        if (!store.bookSlot(slotId)) {
+            throw Errors.api(409, "SLOT_UNAVAILABLE", "Horario nao esta mais disponivel.")
+        }
+        var id = Ids.prefixed("mentor_session_")
+        // The room is resolved now and frozen in the session: changing the profile room later moves nothing.
+        var roomUrl = rooms.sessionRoom(mentor, id)
+        // Paid session: the mentee's sparks go to the escrow NOW. Without balance the whole booking fails and the
+        // slot stays free (the transaction rolls back).
+        var price = mentor.sparksPrice
+        var session = MentoringSession(id, mentorId, menteeId, slotId, message, "SCHEDULED", price, mentor.roomMode, roomUrl, null, Time.nowIso())
+        if (session.paid()) {
+            coins.ensureGenesisFor(menteeId)
+            coins.escrowHold(menteeId, MentoringService.priceOf(session), MentoringService.escrowRef(id), "Mentoria: " + String.join(", ", mentor.expertise))
+        }
+        store.insertSession(session)
+        return session
+    }
+    static Long priceOf(session: MentoringSession) {
+        var p = session.priceSparks
+        if (p == null) {
+            return 0L
+        }
+        var amount = 0L
+        amount = p
+        return amount
+    }
+    // ---- reading sessions
+    // The mentor's inbox (owner only), with the clock applied.
+    List<MentoringSession> sessionsOf(mentorId: String, userId: String) {
+        this.requireOwner(mentorId, userId)
+        return this.withTheClock(store.findSessionsByMentor(mentorId))
+    }
+    List<MentoringAvailability> availabilitiesOf(mentorId: String, userId: String) {
+        this.requireOwner(mentorId, userId)
+        return store.findAvailabilities(mentorId)
+    }
+    // Sessions I booked as a mentee.
+    List<MentoringSession> sessionsByMentee(menteeId: String) = this.withTheClock(store.findSessionsByMentee(menteeId))
+    // Applies the clock: a session whose slot ended is not "scheduled" anymore, it is completed on read, so it leaves
+    // the agenda and goes to the history of both sides. Only the state changes here; the escrow money waits for the
+    // contest window (or the mentor's confirmation).
+    List<MentoringSession> withTheClock(sessions: List<MentoringSession>) {
+        var now = Time.nowIso()
+        var slotIds = listOf<String>()
+        for (var s in sessions) {
+            var sid = s.slotId
+            if (sid != null) {
+                if (s.scheduled()) {
+                    slotIds.add(sid)
+                }
+            }
+        }
+        var slots = store.findSlotsByIds(slotIds)
+        var out = listOf<MentoringSession>()
+        for (var s in sessions) {
+            var handled = false
+            var sid = s.slotId
+            if (sid != null) {
+                if (MentoringService.finished(s, slots.get(sid), now)) {
+                    out.add(this.finish(s, now))
+                    handled = true
+                }
+            }
+            if (!handled) {
+                out.add(s)
+            }
+        }
+        return out
+    }
+    // Did the slot of the session end? The end counts; a session without slot never ends by the clock.
+    static Bool finished(session: MentoringSession, slot: MentoringSlot?, now: String) {
+        if (!session.scheduled()) {
+            return false
+        }
+        if (slot == null) {
+            return false
+        }
+        return Time.toMillis(slot.endsAt) <= Time.toMillis(now)
+    }
+    MentoringSlot? slotOfSession(session: MentoringSession) {
+        var sid = session.slotId
+        if (sid == null) {
+            return null
+        }
+        return store.findSlot(sid)
+    }
+    // Completes the session in its own transaction and returns the stored version. It re-reads first: between the
+    // list and here another person may have confirmed or cancelled. A failure never breaks the read.
+    MentoringSession finish(candidate: MentoringSession, now: String) {
+        var self = this
+        var done = listOf<MentoringSession>()
+        try {
+            database.requiresNew(() -> {
+    self.finishInTx(candidate.id, now, done)
+})
+        } catch (String e) {
+            return candidate
+        }
+        if (done.size() > 0) {
+            return done.get(0)
+        }
+        return candidate
+    }
+    finishInTx(sessionId: String, now: String, done: List<MentoringSession>) {
+        var session = store.findSession(sessionId)
+        if (session == null) {
+            return
+        }
+        if (!MentoringService.finished(session, this.slotOfSession(session), now)) {
+            return
+        }
+        // The claim: only the request that still finds it SCHEDULED completes it and counts it for the mentor.
+        if (!store.completeByClock(sessionId)) {
+            return
+        }
+        if (store.findMentor(session.mentorId) != null) {
+            store.countSessionCompleted(session.mentorId, now)
+        }
+        done.add(MentoringService.withStatus(session, "COMPLETED"))
+    }
+    static MentoringSession withStatus(s: MentoringSession, status: String) = MentoringSession(s.id, s.mentorId, s.menteeId, s.slotId, s.message, status, s.priceSparks, s.roomMode, s.roomUrl, s.settledAt, s.createdAt)
+    // The worker applies the same rule as the read, without touching the escrow.
+    completeFinishedSessions() {
+        var now = Time.nowIso()
+        for (var candidate in store.findScheduledSessions()) {
+            if (MentoringService.finished(candidate, this.slotOfSession(candidate), now)) {
+                var ignored = this.finish(candidate, now)
+            }
+        }
+    }
+    // ---- rooms
+    // The room of a session. An old session (booked before the feature) has no link stored: it is derived from the
+    // profile at read time, writing nothing.
+    String? roomUrlOf(session: MentoringSession, mentor: MentoringMentor?) {
+        var stored = session.roomUrl
+        if (stored != null) {
+            if (stored.trim().length() > 0) {
+                return stored
+            }
+        }
+        if (mentor == null) {
+            return null
+        }
+        return rooms.sessionRoom(mentor, session.id)
+    }
+    // The session seen by who takes part (the mentor owner or the mentee); anyone else gets 403.
+    MentoringSession sessionForParticipant(sessionId: String, userId: String) {
+        var session = store.findSession(sessionId)
+        if (session == null) {
+            throw Errors.api(404, "SESSION_NOT_FOUND", "Sessao nao encontrada.")
+        }
+        if (session.menteeId != userId) {
+            var mentor = store.findMentor(session.mentorId)
+            if (mentor == null) {
+                throw Errors.api(403, "FORBIDDEN", "Voce nao participa desta sessao.")
+            }
+            if (mentor.userId != userId) {
+                throw Errors.api(403, "FORBIDDEN", "Voce nao participa desta sessao.")
+            }
+        }
+        return session
+    }
+    // The room the next session will use, for the mentor's panel. JITSI_SESSION has no link yet: it is born at booking.
+    String? mentorRoomUrl(mentor: MentoringMentor) {
+        if (mentor.roomMode == MentoringRoomMode.jitsiPermanent()) {
+            return rooms.jitsiUrl(rooms.permanentRoom(mentor))
+        }
+        if (mentor.roomMode == MentoringRoomMode.custom()) {
+            return mentor.meetingUrl
+        }
+        return null
+    }
+    // How to join by phone (public Jitsi API); empty when unavailable.
+    MentoringDialIn dialInOf(sessionId: String, userId: String) {
+        var session = this.sessionForParticipant(sessionId, userId)
+        if (!rooms.isJitsi(session.roomMode)) {
+            throw Errors.api(400, "NOT_A_JITSI_ROOM", "Esta sessao usa uma sala externa; pergunte ao mentor como entrar.")
+        }
+        var mentor = store.findMentor(session.mentorId)
+        var roomUrl = this.roomUrlOf(session, mentor)
+        if (roomUrl == null) {
+            throw Errors.api(404, "ROOM_NOT_FOUND", "Sessao nao encontrada.")
+        }
+        var conference = rooms.conferenceName(roomUrl)
+        return MentoringDialIn(conference, dialIn.conferencePin(conference), dialIn.phoneNumbers(conference))
+    }
+    // ---- money
+    MentoringSession requireSession(mentor: MentoringMentor, sessionId: String) {
+        var session = store.findSession(sessionId)
+        if (session == null) {
+            throw Errors.api(404, "SESSION_NOT_FOUND", "Sessao nao encontrada.")
+        }
+        if (session.mentorId != mentor.id) {
+            throw Errors.api(404, "SESSION_NOT_FOUND", "Sessao nao encontrada.")
+        }
+        return session
+    }
+    requireScheduled(session: MentoringSession) {
+        if (!session.scheduled()) {
+            throw Errors.api(409, "SESSION_NOT_SCHEDULED", "Esta sessao ja foi encerrada.")
+        }
+    }
+    // The mentor confirms the session happened: the escrow releases the price to them minus the platform fee.
+    completeSession(mentorId: String, sessionId: String, userId: String) {
+        var self = this
+        database.transaction(() -> {
+    self.completeInTx(mentorId, sessionId, userId)
+})
+    }
+    completeInTx(mentorId: String, sessionId: String, userId: String) {
+        var mentor = this.requireOwner(mentorId, userId)
+        var session = this.requireSession(mentor, sessionId)
+        this.requireScheduled(session)
+        var now = Time.nowIso()
+        if (!store.completeAndSettle(sessionId, now)) {
+            throw Errors.api(409, "SESSION_NOT_SCHEDULED", "Esta sessao ja foi encerrada.")
+        }
+        if (session.paid()) {
+            coins.escrowRelease(mentor.userId, MentoringService.priceOf(session), MentoringService.escrowRef(session.id), "Mentoria concluida")
+        }
+        store.countSessionCompleted(mentor.id, now)
+    }
+    // Cancellation: the escrow returns IN FULL to who paid. The mentor cancels until the completion; the mentee only
+    // before the slot starts. A slot still in the future goes back to the agenda.
+    cancelSession(mentorId: String, sessionId: String, userId: String) {
+        var self = this
+        database.transaction(() -> {
+    self.cancelInTx(mentorId, sessionId, userId)
+})
+    }
+    cancelInTx(mentorId: String, sessionId: String, userId: String) {
+        var mentor = this.requireMentor(mentorId)
+        var session = this.requireSession(mentor, sessionId)
+        var isMentor = mentor.userId == userId
+        if (!isMentor && session.menteeId != userId) {
+            throw Errors.api(403, "FORBIDDEN", "Voce nao participa desta sessao.")
+        }
+        this.requireScheduled(session)
+        var slot = this.slotOfSession(session)
+        var now = Time.nowIso()
+        if (slot != null) {
+            if (!isMentor && Time.toMillis(slot.startsAt) <= Time.toMillis(now)) {
+                throw Errors.api(409, "SESSION_ALREADY_STARTED", "A sessao ja comecou; quem cancela depois disso e o mentor.")
+            }
+        }
+        if (!store.cancelAndSettle(sessionId, now)) {
+            throw Errors.api(409, "SESSION_NOT_SCHEDULED", "Esta sessao ja foi encerrada.")
+        }
+        if (session.paid()) {
+            coins.escrowRefund(session.menteeId, MentoringService.priceOf(session), MentoringService.escrowRef(session.id), "Mentoria cancelada")
+        }
+        if (slot != null) {
+            if (!slot.available && Time.toMillis(slot.startsAt) > Time.toMillis(now)) {
+                store.releaseSlot(slot.id)
+            }
+        }
+    }
+    // The escrow cannot stay stuck: past the contest window the value falls to the mentor, with the fee, even
+    // without their confirmation. Each session in its own transaction so a failure does not block the others.
+    settleExpiredSessions() {
+        var self = this
+        var now = Time.nowIso()
+        for (var candidate in store.findUnsettledPaidSessions()) {
+            if (this.settleable(candidate, now)) {
+                try {
+                    database.requiresNew(() -> {
+    self.settleInTx(candidate.id, now)
+})
+                } catch (String e) {
+                    // The next round tries again; nothing here may take the worker down.
+                    continue
+                }
+            }
+        }
+    }
+    Bool settleable(session: MentoringSession, now: String) {
+        if (!session.paid()) {
+            return false
+        }
+        if (session.slotId == null) {
+            return false
+        }
+        var slot = this.slotOfSession(session)
+        if (slot != null) {
+            return Time.toMillis(Time.plusSeconds(slot.endsAt, MentoringService.settlementGraceSeconds())) < Time.toMillis(now)
+        }
+        // The slot vanished from the agenda (old data): release by the age of the booking.
+        return Time.toMillis(Time.plusSeconds(session.createdAt, MentoringService.orphanSettlementSeconds())) < Time.toMillis(now)
+    }
+    settleInTx(sessionId: String, now: String) {
+        var session = store.findSession(sessionId)
+        if (session == null) {
+            return
+        }
+        if (session.settledAt != null) {
+            return
+        }
+        if (session.status == "CANCELLED") {
+            return
+        }
+        if (!this.settleable(session, now)) {
+            return
+        }
+        var wasScheduled = session.scheduled()
+        // The claim: the money is released once, whoever gets here first.
+        if (!store.settleHeld(sessionId, now)) {
+            return
+        }
+        var mentor = store.findMentor(session.mentorId)
+        if (mentor == null) {
+            // Mentor profile deleted along the way: nobody to receive, so the mentee gets it back.
+            coins.escrowRefund(session.menteeId, MentoringService.priceOf(session), MentoringService.escrowRef(session.id), "Mentoria encerrada")
+            return
+        }
+        coins.escrowRelease(mentor.userId, MentoringService.priceOf(session), MentoringService.escrowRef(session.id), "Mentoria concluida (liberacao automatica)")
+        if (wasScheduled) {
+            store.countSessionCompleted(mentor.id, now)
+        }
+    }
+    // ---- weekly availability
+    // Replaces the weekly availability and reconciles the published slots: generates the missing ones for the next
+    // 28 days and withdraws the free future slots that match no rule anymore. A booked slot is never touched.
+    List<MentoringAvailability> saveAvailability(mentorId: String, userId: String, rules: List<MentoringRule>) {
+        var self = this
+        var box = listOf<MentoringAvailability>()
+        database.transaction(() -> {
+    for (var a in self.saveInTx(mentorId, userId, rules)) {
+        box.add(a)
+    }
+})
+        return box
+    }
+    List<MentoringAvailability> saveInTx(mentorId: String, userId: String, rules: List<MentoringRule>) {
+        var mentor = this.requireOwner(mentorId, userId)
+        var cleaned = this.validateRules(mentor.id, rules)
+        store.deleteAvailabilities(mentor.id)
+        for (var rule in cleaned) {
+            store.insertAvailability(rule)
+        }
+        var now = Time.nowIso()
+        var nowMs = Time.toMillis(now)
+        var wanted = listOf<String>()
+        var today = ZoneDates.dayOf(now, MentoringService.agendaZone())
+        var day = 0
+        while (day < MentoringService.generationDays()) {
+            var date = ZoneDates.plusDays(today, day)
+            var weekday = ZoneDates.dayOfWeek(date)
+            for (var rule in cleaned) {
+                if (rule.dayOfWeek == weekday) {
+                    var startsAt = ZoneDates.localToInstant(date + "T" + rule.timeOfDay, MentoringService.agendaZone())
+                    if (Time.toMillis(startsAt) > nowMs && !wanted.contains(startsAt)) {
+                        wanted.add(startsAt)
+                    }
+                }
+            }
+            day = day + 1
+        }
+        var existing = listOf<String>()
+        for (var slot in store.findSlotsByMentor(mentor.id)) {
+            existing.add(slot.startsAt)
+            var stale = slot.available && Time.toMillis(slot.startsAt) > nowMs && !wanted.contains(slot.startsAt)
+            if (stale) {
+                store.deleteSlot(slot.id)
+            }
+        }
+        for (var startsAt in wanted) {
+            if (!existing.contains(startsAt)) {
+                store.insertSlot(MentoringSlot(Ids.prefixed("slot_"), mentor.id, startsAt, Time.plusSeconds(startsAt, 3600L), true))
+            }
+        }
+        return store.findAvailabilities(mentor.id)
+    }
+    // Day 1..7, at most 12 times a day, each "HH:mm"; duplicates collapse; sorted by day then time.
+    List<MentoringAvailability> validateRules(mentorId: String, rules: List<MentoringRule>) {
+        var result = listOf<MentoringAvailability>()
+        var seen = listOf<String>()
+        for (var rule in rules) {
+            if (rule.dayOfWeek < 1 || rule.dayOfWeek > 7) {
+                throw Errors.api(400, "INVALID_DAY_OF_WEEK", "Dia da semana deve estar entre 1 (segunda) e 7 (domingo).")
+            }
+            if (rule.times.size() > 12) {
+                throw Errors.api(400, "TOO_MANY_TIMES", "No maximo 12 horarios por dia.")
+            }
+            for (var raw in rule.times) {
+                var time = raw.trim()
+                if (!MentoringService.validTime(time)) {
+                    throw Errors.api(400, "INVALID_TIME", "Horario invalido; use o formato HH:mm.")
+                }
+                var key = rule.dayOfWeek + "-" + time
+                if (!seen.contains(key)) {
+                    seen.add(key)
+                    result.add(MentoringAvailability(Ids.prefixed("avail_"), mentorId, rule.dayOfWeek, time))
+                }
+            }
+        }
+        return MentoringService.sortRules(result)
+    }
+    // LocalTime.parse of a five character text: HH:mm with hour 00..23 and minute 00..59.
+    static Bool validTime(time: String) {
+        if (time.length() != 5) {
+            return false
+        }
+        if (time.substring(2, 3) != ":") {
+            return false
+        }
+        var hh = time.substring(0, 2)
+        var mm = time.substring(3, 5)
+        if (!Dates.digits(hh) || !Dates.digits(mm)) {
+            return false
+        }
+        return hh.toInt() <= 23 && mm.toInt() <= 59
+    }
+    // Stable insertion sort: day, then time.
+    static List<MentoringAvailability> sortRules(rules: List<MentoringAvailability>) {
+        var out = listOf<MentoringAvailability>()
+        for (var r in rules) {
+            var next = listOf<MentoringAvailability>()
+            var placed = false
+            for (var e in out) {
+                if (!placed && MentoringService.after(e, r)) {
+                    next.add(r)
+                    placed = true
+                }
+                next.add(e)
+            }
+            if (!placed) {
+                next.add(r)
+            }
+            out = next
+        }
+        return out
+    }
+    static Bool after(a: MentoringAvailability, b: MentoringAvailability) {
+        if (a.dayOfWeek != b.dayOfWeek) {
+            return a.dayOfWeek > b.dayOfWeek
+        }
+        return a.timeOfDay.compareTo(b.timeOfDay) > 0
+    }
+}

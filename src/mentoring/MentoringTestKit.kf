@@ -1,0 +1,113 @@
+package mentoring
+
+import app.*
+import coin.*
+import java.util.HashMap
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import profile.*
+
+// Fixtures of the mentoring suites: the exact production wiring (OrgsTestKit), the Jitsi API pointed at a closed
+// loopback port (no network: dial-in answers an empty list, as the Java suite did without network), and a service
+// built over the same database to drive the workers the way Java called `MentorService` directly.
+//
+//   var mentor = MentoringTestKit.login("mt-owner")
+//   var mentorId = MentoringTestKit.createMentor(mentor, "{\"expertise\":[\"Java\"],\"price\":\"Gratuito\"}")
+class MentoringTestKit {
+    static CoinService? coinHandle = null
+    static TestApp app() {
+        var overrides = new HashMap<String, String>()
+        overrides.put("REDE_MENTORING_JITSI_API_BASE", "http://127.0.0.1:1")
+        return OrgsTestKit.bootWith(overrides)
+    }
+    static ProfileCaller login(id: String) {
+        var booted = MentoringTestKit.app()
+        return OrgsTestKit.login(id)
+    }
+    static Db database() = MentoringTestKit.app().db()
+    static CoinService coins() {
+        var cur = MentoringTestKit.coinHandle
+        if (cur != null) {
+            return cur
+        }
+        var database = MentoringTestKit.database()
+        var shared = OrgsTestKit.orgsKitShared
+        if (shared == null) {
+            throw "MentoringTestKit: boot the app first"
+        }
+        var ledger = CoinStore(database)
+        var made = CoinService(database, ledger, CoinRateService(ledger), shared.cipher, ActionThrottle(), TransferDedupe(10L), 10, 60)
+        MentoringTestKit.coinHandle = made
+        return made
+    }
+    static MentoringService service() = MentoringService(MentoringTestKit.database(), MentoringStore(MentoringTestKit.database()), MentoringTestKit.coins(), ProfileDirectory(MentoringTestKit.database()), MentoringRooms(MentoringRooms.defaultBaseUrl()), MentoringDialInGateway())
+    // Gives the account `amount` sparks on top of the airdrop (made first, so a balance read afterwards is only
+    // what the test moves).
+    static fund(userId: String, amount: Long, prefix: String) {
+        MentoringTestKit.coins().reward(userId, amount, prefix + "-" + userId, "Saldo de teste")
+        MentoringTestKit.coins().ensureGenesisFor(userId)
+    }
+    static Long balance(userId: String) = MentoringTestKit.coins().balance(userId)
+    static String after(seconds: Long) = Time.plusSeconds(Time.nowIso(), seconds)
+    // POST /mentors with a JSON body; the id of the new mentor.
+    static String createMentor(owner: ProfileCaller, bodyJson: String) {
+        var res = owner.post("/mentors", bodyJson)
+        Check.status(res, 201)
+        return OrgsTestKit.str(res, "id")
+    }
+    static String createPlainMentor(owner: ProfileCaller) = MentoringTestKit.createMentor(owner, "{\"expertise\":[\"Java\"],\"price\":\"Gratuito\"}")
+    static TestResponse postMentor(owner: ProfileCaller, sparksPrice: String) = owner.post("/mentors", "{\"expertise\":[\"Java\"],\"price\":\"Gratuito\",\"sparksPrice\":" + sparksPrice + "}")
+    static String createPricedMentor(owner: ProfileCaller, sparksPrice: Long) {
+        var res = MentoringTestKit.postMentor(owner, "" + sparksPrice)
+        Check.status(res, 201)
+        return OrgsTestKit.str(res, "id")
+    }
+    // A one hour slot starting at `startsAt`; the slot id.
+    static String createSlot(owner: ProfileCaller, mentorId: String, startsAt: String) {
+        var res = owner.post("/mentors/" + mentorId + "/slots", "{\"startsAt\":\"" + startsAt + "\",\"endsAt\":\"" + Time.plusSeconds(startsAt, 3600L) + "\"}")
+        Check.status(res, 201)
+        return OrgsTestKit.str(res, "id")
+    }
+    // A slot tomorrow (one hour).
+    static String futureSlot(owner: ProfileCaller, mentorId: String) = MentoringTestKit.createSlot(owner, mentorId, MentoringTestKit.after(86400L))
+    static TestResponse book(mentee: ProfileCaller, mentorId: String, slotId: String, message: String) = mentee.post("/mentors/" + mentorId + "/sessions", "{\"slotId\":\"" + slotId + "\",\"message\":\"" + message + "\"}")
+    // Books and returns the session id (201 expected).
+    static String bookOk(mentee: ProfileCaller, mentorId: String, slotId: String) {
+        var res = MentoringTestKit.book(mentee, mentorId, slotId, "quero aprender")
+        Check.status(res, 201)
+        return OrgsTestKit.str(res, "id")
+    }
+    static TestResponse complete(who: ProfileCaller, mentorId: String, sessionId: String) = who.post("/mentors/" + mentorId + "/sessions/" + sessionId + "/complete", "")
+    static TestResponse cancel(who: ProfileCaller, mentorId: String, sessionId: String) = who.post("/mentors/" + mentorId + "/sessions/" + sessionId + "/cancel", "")
+    static String itemPath(prefix: String, i: Int) {
+        if (prefix.length() == 0) {
+            return "" + i
+        }
+        return prefix + "." + i
+    }
+    // Position of the element with this id in the array at `prefix`, or -1.
+    static Int indexOf(res: TestResponse, prefix: String, id: String) {
+        var n = res.jsonSize(prefix)
+        var i = 0
+        while (i < n) {
+            if (res.json(MentoringTestKit.itemPath(prefix, i) + ".id") == id) {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+    // A field of the element with this id (fails when the element is not there).
+    static String fieldOf(res: TestResponse, prefix: String, id: String, field: String) {
+        var at = MentoringTestKit.indexOf(res, prefix, id)
+        if (at < 0) {
+            throw "FAIL " + id + " is not in " + res.body
+        }
+        return res.json(MentoringTestKit.itemPath(prefix, at) + "." + field)
+    }
+    static Bool contains(res: TestResponse, prefix: String, id: String) = MentoringTestKit.indexOf(res, prefix, id) >= 0
+    static String uuid8() = Time.nowMillis() + ""
+}

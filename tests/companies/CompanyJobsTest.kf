@@ -1,0 +1,35 @@
+import app.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import profile.*
+
+// The two assertions JobCompanyPageTests (jobs) could not make before the companies port: a job posted for a page
+// shows on `GET /empresa/{slug}` (jobs of the page, stats.openJobs) and in `GET /empresas/diretorio` (openJobs), and
+// the followers of the page are told with the PROFESSIONAL context.
+test "aJobPostedForThePageShowsOnItsPageAndInTheDirectory" {
+    var owner = OrgsTestKit.login("cjobs_owner")
+    var guest = OrgsTestKit.anonymous()
+    var uid = "cj0b5a77"
+    var page = owner.post("/empresas", "{\"name\":\"Jobs Page " + uid + "\",\"description\":\"Pagina de teste.\"}")
+    Check.status(page, 200)
+    var companyId = OrgsTestKit.str(page, "id")
+    var slug = OrgsTestKit.str(page, "slug")
+    // The posting itself (reputation gate, eligibility) is covered by the jobs suites; here the row a posting for the
+    // page leaves is seeded: linked to the page and OPEN.
+    var jobId = "job_cjobs_" + uid
+    OrgsTestKit.insertJob(jobId, "Vaga da pagina " + uid, "Acme", "cjobs_owner", Time.nowIso())
+    OrgsTestKit.db().execute("update jobs set company_id = ?, status = \'OPEN\' where id = ?", DbParams().bindStr(companyId).bindStr(jobId))
+    var detail = guest.get("/empresa/" + slug)
+    Check.status(detail, 200)
+    Check.jsonEq(detail, "jobs.0.id", jobId)
+    Check.jsonEq(detail, "jobs.0.title", "Vaga da pagina " + uid)
+    Check.jsonEq(detail, "jobs.0.type", "CLT")
+    Check.isTrue("createdAt", detail.jsonStr("jobs.0.createdAt") != null)
+    Check.jsonEq(detail, "stats.openJobs", "1")
+    var dir = guest.get("/empresas/diretorio?query=" + uid)
+    Check.status(dir, 200)
+    Check.jsonEq(dir, "0.slug", slug)
+    Check.jsonEq(dir, "0.openJobs", "1")
+    OrgsTestKit.finish()
+}

@@ -1,0 +1,109 @@
+package freelances
+
+import kernel.error.*
+import kernel.text.*
+import kernel.time.*
+
+// A one-off job with a closed scope: a value range, a deadline and what will be delivered (Freelance).
+// status: OPEN, CLOSED. paymentMethod: CASH (R$) or FAISCAS (platform sparks, the default).
+// Dates travel as `yyyy-MM-dd` and instants as ISO-8601 text.
+record Freelance(String id, String userId, String title, String scope, Int budgetMin, Int budgetMax, String deadline, String paymentMethod, String status, String createdAt, String updatedAt) {
+    Bool open() = status == "OPEN"
+    Bool ownedBy(viewerId: String) = userId == viewerId
+}
+
+// JSON of one freelance in the lists and after a write (FreelanceView). `username` is null when the account is gone.
+record FreelanceView(String id, String userId, String? username, String title, String scope, Int budgetMin, Int budgetMax, String deadline, String paymentMethod, String status, String createdAt, Bool owned)
+
+// GET /freelances: one page and the offset of the next one (null on the last page).
+record FreelancePageView(List<FreelanceView> items, String? nextCursor)
+
+// DELETE /freelances/{id} (DELETED) and POST /freelances/{id}/close (CLOSED).
+record FreelanceStatusView(String id, String status)
+
+// POST /freelances/{id}/proposals: the professional conversation to open.
+record FreelanceProposalView(String conversationId)
+
+// Request bodies. A missing number reads as 0 and a missing text as null, like the Java records.
+record FreelanceBody(String? title, String? scope, Int? budgetMin, Int? budgetMax, String? deadline, String? paymentMethod)
+
+record FreelanceProposalBody(String? message)
+
+// Pure rules of the domain; every code and pt-BR message is the Java one.
+class FreelanceRules {
+    static Int perHour() = 10
+    static Int titleMax() = 200
+    static Int scopeMax() = 4000
+    static Int proposalMax() = 2000
+    static String orEmpty(value: String?) {
+        if (value == null) {
+            return ""
+        }
+        return value
+    }
+    static Int orZero(value: Int?) {
+        if (value == null) {
+            return 0
+        }
+        return value
+    }
+    static Int clamp(value: Int, low: Int, high: Int) {
+        if (value < low) {
+            return low
+        }
+        if (value > high) {
+            return high
+        }
+        return value
+    }
+    // Title, scope and budget range of a create or an edit (the column ceilings come before the minimum scope).
+    static validateContent(title: String, scope: String, budgetMin: Int, budgetMax: Int) {
+        if (title.trim().length() < 3) {
+            throw Errors.api(400, "INVALID_TITLE", "Título do freela precisa de pelo menos 3 caracteres.")
+        }
+        TextFieldLimit.check("FREELANCE_FIELD_TOO_LONG", "titulo", title, FreelanceRules.titleMax())
+        TextFieldLimit.check("FREELANCE_FIELD_TOO_LONG", "escopo", scope, FreelanceRules.scopeMax())
+        if (scope.trim().length() < 20) {
+            throw Errors.api(400, "INVALID_SCOPE", "Descreva o escopo fechado em pelo menos 20 caracteres.")
+        }
+        if (budgetMin <= 0 || budgetMax < budgetMin) {
+            throw Errors.api(400, "INVALID_BUDGET", "Informe uma faixa de valor válida.")
+        }
+    }
+    // The deadline as `yyyy-MM-dd`: a real date, today or later (UTC, the clock of the Java service).
+    static String validateDeadline(deadline: String) {
+        var raw = deadline.trim()
+        if (!Dates.valid(raw)) {
+            throw Errors.api(400, "INVALID_DEADLINE", "Informe uma data de prazo válida.")
+        }
+        if (raw.compareTo(Time.todayIso()) < 0) {
+            throw Errors.api(400, "INVALID_DEADLINE", "O prazo precisa ser hoje ou no futuro.")
+        }
+        return raw
+    }
+    // CASH or FAISCAS (any case); no value keeps the spark circuit of the freelances that already existed.
+    static String parsePaymentMethod(raw: String) {
+        var value = raw.trim().toUpperCase()
+        if (value.length() == 0) {
+            return "FAISCAS"
+        }
+        if (value == "CASH" || value == "FAISCAS") {
+            return value
+        }
+        throw Errors.api(400, "INVALID_PAYMENT_METHOD", "Escolha o pagamento em dinheiro ou em faíscas.")
+    }
+    // The search box has no boolean syntax: `%` and `_` are dropped so the term is plain text; blank means no filter.
+    static String searchTerm(query: String?) {
+        if (query == null) {
+            return ""
+        }
+        return query.trim().replace("%", "").replace("_", "").trim()
+    }
+    static FreelanceView view(f: Freelance, username: String?, viewerId: String?) {
+        var owned = false
+        if (viewerId != null) {
+            owned = f.ownedBy(viewerId)
+        }
+        return FreelanceView(f.id(), f.userId(), username, f.title(), f.scope(), f.budgetMin(), f.budgetMax(), f.deadline(), f.paymentMethod(), f.status(), f.createdAt(), owned)
+    }
+}

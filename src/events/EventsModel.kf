@@ -1,0 +1,153 @@
+package events
+
+import kernel.text.*
+import kernel.time.*
+
+// An event of the platform (Event + EventJpaEntity). Dates and times are free text in the schema: the rules below
+// read ISO and dd/MM/yyyy; `recurrence` is NONE, WEEKLY, BIWEEKLY or MONTHLY (strings: enums do not cross packages).
+// `city`, `state` and `cityKey` are all set or all null (the structured place of an in-person meetup).
+record EventRecord(String id, String title, String date, String time, String format, String host, String? cover, String? streamUrl, String? location, String? city, String? state, String? cityKey, String createdBy, String createdAt, String updatedAt, String? sanitizedAt, Int? finalAttendeesCount, String recurrence, String? seriesId)
+
+// EventContractController.EventView: what the front renders in the list and the detail.
+record EventView(String id, String title, String date, String time, String format, String host, Int attendees, String? cover, String? streamUrl, String? location, Bool expired, Bool attending, String recurrence, String? seriesId, String? nextOccurrenceDate, Bool canManageRecurrence, String? city, String? state)
+
+record EventPageView(List<EventView> items, String? nextCursor)
+
+// StatusResponse of the command endpoints.
+record EventStatusView(String id, String status)
+
+// The page as it came out of the cache: the events to show plus how the database page ended (the cursor comes from
+// the page the database returned, never from the filtered one).
+record EventListPage(List<EventRecord> items, Int fetched, String? lastCreatedAt)
+
+record EventCreateBody(String? title, String? date, String? time, String? format, String? host, String? cover, String? streamUrl, String? location, String? recurrence, String? city, String? state)
+
+record EventUpdateBody(String? title, String? date, String? time, String? format, String? host, String? cover, String? streamUrl, String? location, String? city, String? state)
+
+record EventRecurrenceBody(String? recurrence)
+
+record EventSanitizationResult(Int sanitized, Int purged)
+
+// Pure rules of the event domain: what a date is, when an event is over, when a schedule is absurd and how a series
+// repeats. Everything works on ISO text and epoch millis, so it is testable with an explicit clock.
+class EventRules {
+    static Long maxAheadMillis() = 157680000000L
+    static Long maxBehindMillis() = 63072000000L
+    static Long sanitizeGraceMillis() = 86400000L
+    static Long retentionMillis() = 31536000000L
+    // ISO (what the app sends) or dd/MM/yyyy as an ISO date; null when the free-text date cannot be read. A
+    // calendar day that does not exist (31/02) is not a date: it never becomes an event on another day.
+    static String? parseDate(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        var value = raw.trim()
+        if (value.length() == 0) {
+            return null
+        }
+        if (Dates.valid(value)) {
+            return value
+        }
+        if (Regexes.matches("\\d{2}/\\d{2}/\\d{4}", value)) {
+            var iso = value.substring(6, 10) + "-" + value.substring(3, 5) + "-" + value.substring(0, 2)
+            if (Dates.valid(iso)) {
+                return iso
+            }
+        }
+        return null
+    }
+    // HH:mm or HH:mm:ss(.fraction) as HH:mm:ss(.fraction); null when it is not a time.
+    static String? parseTime(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        var value = raw.trim()
+        if (value.length() == 0) {
+            return null
+        }
+        if (value.length() == 5) {
+            value = value + ":00"
+        }
+        if (Regexes.matches("([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(\\.\\d{1,9})?", value)) {
+            return value
+        }
+        return null
+    }
+    // The time is readable: a ritual needs a fixed time, not only a day.
+    static Bool hasScheduledTime(time: String?) = EventRules.parseTime(time) != null
+    // End of the event in UTC: the time of the day, or 23:59:59 without one. Null without a readable date.
+    static String? expiresAt(date: String?, time: String?) {
+        var day = EventRules.parseDate(date)
+        if (day == null) {
+            return null
+        }
+        var timeOfDay = EventRules.parseTime(time)
+        if (timeOfDay == null) {
+            return day + "T23:59:59Z"
+        }
+        return day + "T" + timeOfDay + "Z"
+    }
+    // The date is outside what can be scheduled: five years ahead, two behind. An unreadable date is "no date"
+    // (never expires), except a "year" of five digits or more: that is the impossible date that really happened
+    // (220122-12-12), which would otherwise stay on top of the list for ever.
+    static Bool hasAbsurdSchedule(date: String?, nowMillis: Long) {
+        var day = EventRules.parseDate(date)
+        if (day == null) {
+            var text = ""
+            if (date != null) {
+                text = date
+            }
+            return Regexes.matches("(?s).*\\d{5,}.*", text)
+        }
+        var dayStart = Time.toMillis(day + "T00:00:00Z")
+        return dayStart > nowMillis + EventRules.maxAheadMillis() || dayStart < nowMillis - EventRules.maxBehindMillis()
+    }
+    // The event is over (plus the grace). No readable date: never over. An absurd date counts as over, so the
+    // system cleans it up by itself.
+    static Bool isExpired(date: String?, time: String?, nowMillis: Long, graceMillis: Long) {
+        if (EventRules.hasAbsurdSchedule(date, nowMillis)) {
+            return true
+        }
+        var endsAt = EventRules.expiresAt(date, time)
+        if (endsAt == null) {
+            return false
+        }
+        return nowMillis > Time.toMillis(endsAt) + graceMillis
+    }
+    static Bool validRecurrence(value: String) = value == "NONE" || value == "WEEKLY" || value == "BIWEEKLY" || value == "MONTHLY"
+    static String pad(n: Int, width: Int) {
+        var text = "" + n
+        while (text.length() < width) {
+            text = "0" + text
+        }
+        return text
+    }
+    static Int monthIndex(day: String) = day.substring(0, 4).toInt() * 12 + day.substring(5, 7).toInt() - 1
+    // `anchor` plus `months`, clamped to the last day of a shorter month.
+    static String addMonths(anchor: String, months: Int) {
+        var total = EventRules.monthIndex(anchor) + months
+        var year = total / 12
+        var month = total % 12 + 1
+        var day = anchor.substring(8, 10).toInt()
+        var last = Dates.daysIn(year, month)
+        if (day > last) {
+            day = last
+        }
+        return EventRules.pad(year, 4) + "-" + EventRules.pad(month, 2) + "-" + EventRules.pad(day, 2)
+    }
+    // Date of the occurrence after `current`. Monthly counts from the series anchor (its first occurrence) so the
+    // day of the month does not drift: a ritual on the 31st falls on the last day of shorter months and goes back
+    // to the 31st after them.
+    static String nextDate(recurrence: String, anchor: String, current: String) {
+        if (recurrence == "WEEKLY") {
+            return ZoneDates.plusDays(current, 7)
+        }
+        if (recurrence == "BIWEEKLY") {
+            return ZoneDates.plusDays(current, 14)
+        }
+        if (recurrence == "MONTHLY") {
+            return EventRules.addMonths(anchor, EventRules.monthIndex(current) - EventRules.monthIndex(anchor) + 1)
+        }
+        throw "A one-off event has no next occurrence"
+    }
+}

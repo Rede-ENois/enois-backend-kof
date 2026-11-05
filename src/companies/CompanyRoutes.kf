@@ -1,0 +1,355 @@
+package companies
+
+import corporate.*
+import jobs.*
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import profile.*
+
+// HTTP adapter of CompanyController: public reads (page detail with its open microprojects, directory) and the
+// operations of the team (create/edit a page, members, publish a microproject, pick a candidate, complete).
+// Authorisation by role in the backend, always.
+class CompanyRoutes {
+    CompanyService companies
+    MicroProjectService microProjects
+    CompanyDirectoryService directory
+    JobCompanyDirectory jobsDirectory
+    CorporateService corporate
+    ProfileDirectory profiles
+    public constructor(companies: CompanyService, microProjects: MicroProjectService, directory: CompanyDirectoryService, jobsDirectory: JobCompanyDirectory, corporate: CorporateService, profiles: ProfileDirectory) {
+        this.companies = companies
+        this.microProjects = microProjects
+        this.directory = directory
+        this.jobsDirectory = jobsDirectory
+        this.corporate = corporate
+        this.profiles = profiles
+    }
+    register(server: HttpServer) {
+        var self = this
+        // Literal paths before the parameterised ones.
+        server.get("/empresas", () -> self.list())
+        server.get("/empresas/diretorio", () -> self.directoryList())
+        server.get("/empresas/setores", () -> json.encode(self.companies.sectors()))
+        server.get("/empresas/mine", () -> self.mine())
+        server.post("/empresas", () -> self.create())
+        server.patch("/empresas/:companyId", () -> self.update())
+        server.post("/empresas/:companyId/follow", () -> self.follow(true))
+        server.delete("/empresas/:companyId/follow", () -> self.follow(false))
+        server.get("/empresas/:companyId/members", () -> self.members())
+        server.post("/empresas/:companyId/members", () -> self.addMember())
+        server.post("/empresas/:companyId/microprojetos", () -> self.publishProject())
+        server.get("/empresa/:slug", () -> self.bySlug())
+        server.get("/microprojetos", () -> self.openProjects())
+        server.get("/microprojetos/:projectId", () -> self.project())
+        server.put("/microprojetos/:projectId", () -> self.editProject())
+        server.delete("/microprojetos/:projectId", () -> self.removeProject())
+        server.post("/microprojetos/:projectId/proposals", () -> self.propose())
+        server.post("/microprojetos/:projectId/proposals/:proposalId/select", () -> self.selectProposal())
+        server.post("/microprojetos/:projectId/complete", () -> self.complete())
+    }
+    // Ceiling of the public lists: without it a huge `limit` brought the whole table without a session.
+    static Int publicListLimit(limit: Int) {
+        if (limit < 1) {
+            return 1
+        }
+        if (limit > 100) {
+            return 100
+        }
+        return limit
+    }
+    static CompanySummaryView summary(c: Company) = CompanySummaryView(c.id, c.slug, c.name, c.description, c.sector, c.location, c.logo, c.cover)
+    static List<CompanySummaryView> summaries(list: List<Company>) {
+        var out = listOf<CompanySummaryView>()
+        for (var c in list) {
+            out.add(CompanyRoutes.summary(c))
+        }
+        return out
+    }
+    // Same bar as the service (EDITOR and up): a recruiter is on the team but does not pick proposals.
+    static Bool seesProposals(role: String?) {
+        if (role == null) {
+            return false
+        }
+        return role == "OWNER" || role == "ADMIN" || role == "EDITOR"
+    }
+    static MicroProjectView projectView(p: MicroProject, myProposal: String?, proposalCount: Int?) = MicroProjectView(p.id, p.companyId, p.title, p.problem, p.scope, p.deliverables, p.acceptanceCriteria, p.budget, p.deadline, p.status, p.createdAt, myProposal, proposalCount)
+    String list() = json.encode(CompanyRoutes.summaries(companies.listAll(CompanyRoutes.publicListLimit(Req.queryInt("limit", 30)))))
+    // Pages, then names that only exist on internal or external jobs; most opportunities first.
+    String directoryList() {
+        var limit = Req.queryInt("limit", 60)
+        if (limit < 1) {
+            limit = 1
+        }
+        if (limit > 200) {
+            limit = 200
+        }
+        return json.encode(directory.directory(Req.queryParam("query"), Req.queryParam("sector"), limit))
+    }
+    String mine() {
+        var userId = Auth.requireUser()
+        return json.encode(CompanyRoutes.summaries(companies.memberOf(userId)))
+    }
+    String follow(on: Bool) {
+        var userId = Auth.requireUser()
+        var count = companies.setFollowing(Req.pathParam("companyId"), userId, on)
+        return json.encode(CompanyFollowView(on, count))
+    }
+    String create() {
+        var userId = Auth.requireUser()
+        var created = companies.create(userId, CompanyRoutes.createBody())
+        return json.encode(CompanyCreatedView(created.id, created.slug, created.name))
+    }
+    String update() {
+        var userId = Auth.requireUser()
+        var updated = companies.update(Req.pathParam("companyId"), userId, CompanyRoutes.updateBody())
+        return json.encode(CompanyRoutes.summary(updated))
+    }
+    // The ACTIVE professional identity when there is one, the social profile otherwise.
+    Map<String,CompanyPersonView> peopleOf(userIds: List<String>) {
+        Map<String,CompanyPersonView> people = mapOf()
+        var active = corporate.activeByUserIds(userIds)
+        var social = listOf<String>()
+        for (var id in userIds) {
+            var p = active.get(id)
+            if (p != null) {
+                people.put(id, CompanyPersonView(p.userId, p.username, p.name, p.headline, p.avatar, "CORPORATE", "/profissional/" + p.username))
+            }
+            else {
+                if (!social.contains(id)) {
+                    social.add(id)
+                }
+            }
+        }
+        if (social.size() > 0) {
+            for (var s in profiles.findAllByIds(social)) {
+                people.put(s.id, CompanyPersonView(s.id, s.username, s.name, s.headline, s.avatar, "SOCIAL", "/perfil/" + s.username))
+            }
+        }
+        return people
+    }
+    String members() {
+        var userId = Auth.requireUser()
+        var list = companies.members(Req.pathParam("companyId"), userId)
+        var ids = listOf<String>()
+        for (var m in list) {
+            ids.add(m.userId)
+        }
+        var people = this.peopleOf(ids)
+        var out = listOf<CompanyMemberView>()
+        for (var m in list) {
+            out.add(CompanyMemberView(m.userId, m.role, m.createdAt, people.get(m.userId)))
+        }
+        return json.encode(out)
+    }
+    String addMember() {
+        var userId = Auth.requireUser()
+        var companyId = Req.pathParam("companyId")
+        var b = CompanyRoutes.memberBody()
+        var company = companies.company(companyId)
+        companies.requireRole(company, userId, "ADMIN")
+        var role = "EDITOR"
+        var asked = b.role()
+        if (asked != null) {
+            role = asked
+        }
+        var target = b.userId()
+        if (target == null) {
+            throw Errors.conflict()
+        }
+        var member = companies.addMember(companyId, target, role)
+        var people = this.peopleOf(listOf(member.userId))
+        return json.encode(CompanyMemberView(member.userId, member.role, member.createdAt, people.get(member.userId)))
+    }
+    String bySlug() {
+        var company = companies.bySlug(Req.pathParam("slug"))
+        var viewer = Auth.viewerIdOrNull()
+        var role = Nulls.str()
+        Map<String,String> mine = mapOf()
+        if (viewer != null) {
+            role = companies.roleOf(company.id, viewer)
+            // Where the viewer stands on each project (a sent proposal): the newest proposal wins.
+            for (var p in microProjects.proposalsOf(viewer)) {
+                if (mine.get(p.projectId) == null) {
+                    mine.put(p.projectId, p.status)
+                }
+            }
+        }
+        var team = CompanyRoutes.seesProposals(role)
+        var projects = listOf<MicroProjectView>()
+        for (var p in microProjects.byCompany(company.id)) {
+            var count = Nulls.integer()
+            if (team && viewer != null) {
+                count = microProjects.proposals(p.id, viewer).size()
+            }
+            projects.add(CompanyRoutes.projectView(p, mine.get(p.id), count))
+        }
+        var jobs = listOf<CompanyPageJobView>()
+        for (var j in jobsDirectory.openJobsOf(company.id, 20)) {
+            jobs.add(CompanyPageJobView(j.id, j.title, j.location, j.type, j.level, j.postedAt))
+        }
+        var openJobs = jobsDirectory.openJobsByCompanyIds(listOf(company.id)).getOrDefault(company.id, 0L)
+        var stats = CompanyStatsView(microProjects.countByStatus(company.id, "OPEN"), microProjects.countByStatus(company.id, "COMPLETED"), openJobs, companies.followerCount(company.id))
+        return json.encode(CompanyDetailView(company.id, company.slug, company.name, company.description, company.sector, company.size, company.location, company.website, company.logo, company.cover, role, projects, jobs, stats, companies.isFollowing(company.id, viewer), this.reviews(company.id), this.canPropose(viewer, role)))
+    }
+    // What the viewer can do on the page's microprojects.
+    String canPropose(viewerId: String?, role: String?) {
+        if (viewerId == null) {
+            return "SIGN_IN"
+        }
+        if (role != null) {
+            return "TEAM"
+        }
+        if (corporate.activeByUserIds(listOf(viewerId)).get(viewerId) != null) {
+            return "OK"
+        }
+        return "PROFESSIONAL_REQUIRED"
+    }
+    List<CompanyReviewView> reviews(companyId: String) {
+        var out = listOf<CompanyReviewView>()
+        var latest = microProjects.latestReviews(companyId)
+        if (latest.size() == 0) {
+            return out
+        }
+        var ids = listOf<String>()
+        for (var r in latest) {
+            ids.add(r.userId)
+        }
+        var people = this.peopleOf(ids)
+        for (var r in latest) {
+            out.add(CompanyReviewView(r.projectId, microProjects.project(r.projectId).title, r.rating, r.text, r.createdAt, people.get(r.userId)))
+        }
+        return out
+    }
+    String openProjects() {
+        var out = listOf<MicroProjectView>()
+        for (var p in microProjects.openProjects(CompanyRoutes.publicListLimit(Req.queryInt("limit", 30)))) {
+            out.add(CompanyRoutes.projectView(p, null, null))
+        }
+        return json.encode(out)
+    }
+    String project() {
+        var viewer = Auth.viewerIdOrNull()
+        var project = microProjects.project(Req.pathParam("projectId"))
+        if (project.status == "CANCELLED") {
+            throw Errors.api(404, "PROJECT_NOT_FOUND", "Microprojeto nao encontrado.")
+        }
+        // Proposals are for whoever manages the page; anyone else reads the project alone.
+        var team = false
+        if (viewer != null) {
+            team = CompanyRoutes.seesProposals(companies.roleOf(project.companyId, viewer))
+        }
+        var proposals = listOf<MicroProjectProposal>()
+        if (team && viewer != null) {
+            proposals = microProjects.proposals(project.id, viewer)
+        }
+        var ids = listOf<String>()
+        for (var p in proposals) {
+            ids.add(p.userId)
+        }
+        var people = this.peopleOf(ids)
+        var views = listOf<MicroProjectProposalView>()
+        for (var p in proposals) {
+            views.add(MicroProjectProposalView(p.id, p.userId, p.message, p.status, p.proposedAt, people.get(p.userId), p.conversationId))
+        }
+        var count = Nulls.integer()
+        if (team) {
+            count = proposals.size()
+        }
+        return json.encode(MicroProjectDetailView(CompanyRoutes.projectView(project, null, count), views))
+    }
+    String publishProject() {
+        var userId = Auth.requireUser()
+        var created = microProjects.publish(Req.pathParam("companyId"), userId, CompanyRoutes.projectBody())
+        return json.encode(MicroProjectIdStatus(created.id, created.status))
+    }
+    String editProject() {
+        var userId = Auth.requireUser()
+        var edited = microProjects.edit(Req.pathParam("projectId"), userId, CompanyRoutes.projectBody())
+        return json.encode(MicroProjectIdStatus(edited.id, edited.status))
+    }
+    String removeProject() {
+        var userId = Auth.requireUser()
+        var removed = microProjects.remove(Req.pathParam("projectId"), userId)
+        return json.encode(MicroProjectIdStatus(removed.id, removed.status))
+    }
+    String propose() {
+        var userId = Auth.requireUser()
+        var b = CompanyRoutes.proposeBody()
+        var proposal = microProjects.propose(Req.pathParam("projectId"), userId, b.message())
+        return json.encode(MicroProjectProposalCreated(proposal.id, proposal.status, proposal.conversationId))
+    }
+    String selectProposal() {
+        var userId = Auth.requireUser()
+        var selected = microProjects.selectProposal(Req.pathParam("projectId"), Req.pathParam("proposalId"), userId)
+        return json.encode(MicroProjectStatusView(selected.status))
+    }
+    String complete() {
+        var userId = Auth.requireUser()
+        var rating = Nulls.integer()
+        var text = Nulls.str()
+        if (Req.bodyText().trim().length() > 0) {
+            var b = CompanyRoutes.completeBody()
+            rating = b.rating()
+            text = b.text()
+        }
+        var completed = microProjects.complete(Req.pathParam("projectId"), userId, rating, text)
+        return json.encode(MicroProjectStatusView(completed.status))
+    }
+    static CompanyCreateBody createBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<CompanyCreateBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static CompanyUpdateBody updateBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<CompanyUpdateBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    // The role is an enum in Java: an unknown name fails the JSON read (400).
+    static CompanyAddMemberBody memberBody() {
+        SafeLinks.checkRequest()
+        try {
+            var b = json.decode<CompanyAddMemberBody>(Req.bodyText())
+            var role = b.role()
+            if (role != null) {
+                if (role != "OWNER" && role != "ADMIN" && role != "EDITOR" && role != "RECRUITER") {
+                    throw "BAD_ROLE"
+                }
+            }
+            return b
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static MicroProjectBody projectBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<MicroProjectBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static MicroProjectProposeBody proposeBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<MicroProjectProposeBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static MicroProjectCompleteBody completeBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<MicroProjectCompleteBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

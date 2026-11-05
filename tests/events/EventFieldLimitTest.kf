@@ -1,0 +1,63 @@
+import app.*
+import kernel.testkit.*
+
+// Port of the event case of TextFieldLimitTests (eventoComTituloLongoRecusaDizendoOCampo) plus the other four
+// ceilings of the same check: a field over its column size answers 400 naming the field and the number, never the
+// generic 409.
+String efieldLong(n: Int) = strings.repeat("T", n)
+
+test "eventoComTituloLongoRecusaDizendoOCampo" {
+    var dono = OrgsTestKit.login("tfl_evento")
+    var res = dono.post("/events", "{\"title\":\"" + efieldLong(300) + "\",\"date\":\"2030-01-02\",\"time\":\"19:00\"}")
+    Check.apiError(res, 400, "EVENT_FIELD_TOO_LONG")
+    var message = res.jsonStr("message")
+    if (message == null) {
+        throw "missing message"
+    }
+    Check.isTrue("names the field", message.contains("titulo"))
+    Check.isTrue("names the ceiling", message.contains("255"))
+    Check.eqStr("full message", "O campo titulo aceita no máximo 255 caracteres.", message)
+}
+
+test "everyEventFieldHasItsCeiling" {
+    var dono = OrgsTestKit.login("tfl_evento_fields")
+    var head = "\"date\":\"2030-01-02\",\"time\":\"19:00\""
+    var location = dono.post("/events", "{\"title\":\"t\"," + head + ",\"format\":\"ONLINE\",\"host\":\"h\",\"location\":\"" + efieldLong(256) + "\"}")
+    Check.apiError(location, 400, "EVENT_FIELD_TOO_LONG")
+    Check.isTrue("local", location.body.contains("local"))
+    var host = dono.post("/events", "{\"title\":\"t\"," + head + ",\"format\":\"ONLINE\",\"host\":\"" + efieldLong(256) + "\"}")
+    Check.apiError(host, 400, "EVENT_FIELD_TOO_LONG")
+    Check.isTrue("host", host.body.contains("host"))
+    var format = dono.post("/events", "{\"title\":\"t\"," + head + ",\"format\":\"" + efieldLong(33) + "\",\"host\":\"h\"}")
+    Check.apiError(format, 400, "EVENT_FIELD_TOO_LONG")
+    Check.isTrue("formato", format.body.contains("formato"))
+    var stream = dono.post("/events", "{\"title\":\"t\"," + head + ",\"format\":\"ONLINE\",\"host\":\"h\",\"streamUrl\":\"https://x.test/" + efieldLong(500) + "\"}")
+    Check.apiError(stream, 400, "EVENT_FIELD_TOO_LONG")
+    Check.isTrue("transmissao", stream.body.contains("transmissao"))
+    // At the ceiling it passes.
+    var exact = dono.post("/events", "{\"title\":\"" + efieldLong(255) + "\"," + head + ",\"format\":\"ONLINE\",\"host\":\"h\"}")
+    Check.status(exact, 201)
+    // A missing required column is what the database refused in the Java service: 409.
+    Check.apiError(dono.post("/events", "{\"title\":\"sem host\"," + head + ",\"format\":\"ONLINE\"}"), 409, "CONFLICT")
+}
+
+test "streamLinksAndBodiesGoThroughTheLinkRules" {
+    var dono = OrgsTestKit.login("tfl_evento_links")
+    var head = "\"date\":\"2030-01-02\",\"time\":\"19:00\",\"format\":\"ONLINE\",\"host\":\"h\""
+    var ok = dono.post("/events", "{\"title\":\"Com link\"," + head + ",\"streamUrl\":\"  https://meet.test/sala  \"}")
+    Check.status(ok, 201)
+    Check.jsonEq(ok, "streamUrl", "https://meet.test/sala")
+    Check.apiError(dono.post("/events", "{\"title\":\"Link ruim\"," + head + ",\"streamUrl\":\"javascript:alert(1)\"}"), 400, "INVALID_STREAM_URL")
+    Check.apiError(dono.post("/events", "{\"title\":\"Link http\"," + head + ",\"streamUrl\":\"http://meet.test/sala\"}"), 400, "INVALID_STREAM_URL")
+    // A Markdown link with a script scheme in any text field is refused before the event is read.
+    Check.apiError(dono.post("/events", "{\"title\":\"[clique](javascript:alert(1))\"," + head + "}"), 400, "UNSAFE_LINK")
+    // A blank stream is no stream.
+    var blank = dono.post("/events", "{\"title\":\"Sem link\"," + head + ",\"streamUrl\":\"   \"}")
+    Check.status(blank, 201)
+    Check.isTrue("no stream", blank.jsonIsNull("streamUrl"))
+    Check.apiError(dono.post("/events", "not json"), 400, "BAD_REQUEST")
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}

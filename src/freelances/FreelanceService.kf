@@ -1,0 +1,154 @@
+package freelances
+
+import age.*
+import corporate.*
+import kernel.blocks.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+import messaging.*
+import profile.*
+
+// Freelance: closed scope + value range + deadline (FreelanceService). The callers are the owners of every
+// guard: the age gate, the corporate identity and the block list come from their modules.
+class FreelanceService {
+    Db database
+    FreelanceStore freelances
+    ProfileDirectory profiles
+    ActionThrottle throttle
+    AgeGate ageGate
+    CorporateService corporate
+    MessagingService messaging
+    BlockedUsers blockedUsers
+    public constructor(database: Db, freelances: FreelanceStore, profiles: ProfileDirectory, throttle: ActionThrottle, ageGate: AgeGate, corporate: CorporateService, messaging: MessagingService, blockedUsers: BlockedUsers) {
+        this.database = database
+        this.freelances = freelances
+        this.profiles = profiles
+        this.throttle = throttle
+        this.ageGate = ageGate
+        this.corporate = corporate
+        this.messaging = messaging
+        this.blockedUsers = blockedUsers
+    }
+    Freelance create(userId: String, body: FreelanceBody) {
+        ageGate.requireCanWrite(userId)
+        throttle.requireAllowed("freelance", userId, FreelanceRules.perHour(), 3600000L)
+        var title = FreelanceRules.orEmpty(body.title())
+        var scope = FreelanceRules.orEmpty(body.scope())
+        var min = FreelanceRules.orZero(body.budgetMin())
+        var max = FreelanceRules.orZero(body.budgetMax())
+        FreelanceRules.validateContent(title, scope, min, max)
+        var deadline = FreelanceRules.validateDeadline(FreelanceRules.orEmpty(body.deadline()))
+        var payment = FreelanceRules.parsePaymentMethod(FreelanceRules.orEmpty(body.paymentMethod()))
+        var now = Time.nowIso()
+        var f = Freelance(Ids.prefixed("free_"), userId, title.trim(), scope.trim(), min, max, deadline, payment, "OPEN", now, now)
+        freelances.insert(f)
+        return f
+    }
+    // The owner's edit: same contract as the creation, without going through the creation throttle again.
+    Freelance update(id: String, userId: String, body: FreelanceBody) {
+        var f = this.owned(id, userId)
+        if (!f.open()) {
+            throw Errors.api(409, "FREELANCE_CLOSED", "Este freela já está encerrado.")
+        }
+        var title = FreelanceRules.orEmpty(body.title())
+        var scope = FreelanceRules.orEmpty(body.scope())
+        var min = FreelanceRules.orZero(body.budgetMin())
+        var max = FreelanceRules.orZero(body.budgetMax())
+        FreelanceRules.validateContent(title, scope, min, max)
+        var deadline = FreelanceRules.validateDeadline(FreelanceRules.orEmpty(body.deadline()))
+        var payment = FreelanceRules.parsePaymentMethod(FreelanceRules.orEmpty(body.paymentMethod()))
+        var now = Time.nowIso()
+        if (!freelances.updateContentIfOpen(id, title.trim(), scope.trim(), min, max, deadline, payment, now)) {
+            throw Errors.api(409, "FREELANCE_CLOSED", "Este freela já está encerrado.")
+        }
+        return Freelance(f.id(), f.userId(), title.trim(), scope.trim(), min, max, deadline, payment, f.status(), f.createdAt(), now)
+    }
+    // The owner deletes: the freelance leaves the list and "my freelances" altogether.
+    delete(id: String, userId: String) {
+        this.owned(id, userId)
+        freelances.delete(id)
+    }
+    Freelance close(id: String, userId: String) {
+        var f = this.owned(id, userId)
+        if (!f.open()) {
+            throw Errors.api(409, "ALREADY_CLOSED", "Este freela já está encerrado.")
+        }
+        var now = Time.nowIso()
+        if (!freelances.closeIfOpen(id, now)) {
+            throw Errors.api(409, "ALREADY_CLOSED", "Este freela já está encerrado.")
+        }
+        return Freelance(f.id(), f.userId(), f.title(), f.scope(), f.budgetMin(), f.budgetMax(), f.deadline(), f.paymentMethod(), "CLOSED", f.createdAt(), now)
+    }
+    // A proposal leaves the PROFESSIONAL identity of the proposer (resolved by the session) into the FREELANCE
+    // conversation, in the professional inbox. Answers the conversation id for the app to open.
+    String propose(freelanceId: String, userId: String, message: String?) {
+        var self = this
+        return database.txStr(() -> self.proposeInTransaction(freelanceId, userId, message))
+    }
+    String proposeInTransaction(freelanceId: String, userId: String, message: String?) {
+        var f = this.find(freelanceId)
+        if (!f.open()) {
+            throw Errors.api(409, "FREELANCE_CLOSED", "Este freela já está encerrado.")
+        }
+        if (f.ownedBy(userId)) {
+            throw Errors.api(400, "CANNOT_PROPOSE_OWN_FREELANCE", "Você não pode enviar proposta para o seu freela.")
+        }
+        var text = FreelanceRules.orEmpty(message).trim()
+        if (text.length() == 0) {
+            throw Errors.api(400, "EMPTY_PROPOSAL", "Escreva a sua proposta.")
+        }
+        TextFieldLimit.check("FREELANCE_FIELD_TOO_LONG", "proposta", text, FreelanceRules.proposalMax())
+        corporate.requireActive(userId)
+        if (blockedUsers.hiddenIdsFor(userId).contains(f.userId())) {
+            throw Errors.api(403, "USER_BLOCKED", "Não é possível conversar com este usuário.")
+        }
+        var conversationId = messaging.freelanceConversationBetween(userId, f.userId(), f.title())
+        messaging.sendMessage(conversationId, userId, "Proposta para o freela \"" + f.title() + "\"\n\n" + text, null, false, null)
+        return conversationId
+    }
+    // Open freelances, newest first, optionally narrowed by a search term (title and scope).
+    List<Freelance> list(query: String?, limit: Int, offset: Int) = freelances.findOpen(FreelanceRules.searchTerm(query), FreelanceRules.clamp(limit, 1, 60), FreelanceRules.clamp(offset, 0, 2147483647))
+    List<Freelance> mine(userId: String) = freelances.findByUser(userId)
+    // id -> username for a whole list in one query.
+    Map<String,String> usernamesOf(list: List<Freelance>) {
+        var ids = listOf<String>()
+        for (var f in list) {
+            if (!ids.contains(f.userId())) {
+                ids.add(f.userId())
+            }
+        }
+        var names = new java.util.HashMap<String, String>()
+        if (ids.size() == 0) {
+            return names
+        }
+        for (var p in profiles.findAllByIds(ids)) {
+            names.put(p.id, p.username)
+        }
+        return names
+    }
+    String? usernameOf(userId: String) {
+        var p = profiles.findById(userId)
+        if (p == null) {
+            return null
+        }
+        return p.username
+    }
+    Freelance find(id: String) {
+        var found = freelances.findById(id)
+        if (found == null) {
+            throw Errors.api(404, "FREELANCE_NOT_FOUND", "Freela não encontrado.")
+        }
+        return found
+    }
+    Freelance owned(id: String, userId: String) {
+        var f = this.find(id)
+        if (!f.ownedBy(userId)) {
+            throw Errors.api(403, "NOT_OWNER", "Este freela não é seu.")
+        }
+        return f
+    }
+}

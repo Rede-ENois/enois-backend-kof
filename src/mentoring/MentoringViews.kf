@@ -1,0 +1,198 @@
+package mentoring
+
+import profile.*
+
+// Builds the JSON views of MentoringContractController: the public showcase, the mentor's inbox and the sessions
+// I booked. Profiles, slots and mentors are loaded once per list, never once per row.
+class MentoringViews {
+    static MentoringMentorView mentor(m: MentoringMentor, nextSlot: String?) = MentoringMentorView(m.id, m.userId, m.expertise, m.rating, m.sessionsCount, m.price, m.banner, m.sparksPrice, m.roomMode, nextSlot)
+    static MentoringSlotView slot(s: MentoringSlot) = MentoringSlotView(s.id, s.startsAt, s.endsAt, s.available)
+    static List<MentoringMentorView> mentors(service: MentoringService, list: List<MentoringMentor>) {
+        var next = service.nextSlots(list)
+        var out = listOf<MentoringMentorView>()
+        for (var m in list) {
+            out.add(MentoringViews.mentor(m, next.get(m.id)))
+        }
+        return out
+    }
+    static Map<String,ProfileRecord> profilesOf(service: MentoringService, ids: List<String>) {
+        Map<String,ProfileRecord> out = mapOf()
+        if (ids.size() == 0) {
+            return out
+        }
+        for (var p in service.profiles.findAllByIds(ids)) {
+            out.put(p.id, p)
+        }
+        return out
+    }
+    // The inbox of a mentor (owner only): who booked, when and the note; newest slot first, no slot last.
+    static List<MentoringMenteeSessionView> inbox(service: MentoringService, mentorId: String, userId: String) {
+        var sessions = service.sessionsOf(mentorId, userId)
+        var menteeIds = listOf<String>()
+        for (var s in sessions) {
+            if (!menteeIds.contains(s.menteeId)) {
+                menteeIds.add(s.menteeId)
+            }
+        }
+        var mentees = MentoringViews.profilesOf(service, menteeIds)
+        Map<String,MentoringSlot> slots = mapOf()
+        for (var slot in service.getSlots(mentorId)) {
+            slots.put(slot.id, slot)
+        }
+        var mentor = service.getById(mentorId)
+        var views = listOf<MentoringMenteeSessionView>()
+        for (var s in sessions) {
+            var slotRow = MentoringNull.slot()
+            var sid = s.slotId
+            if (sid != null) {
+                slotRow = slots.get(sid)
+            }
+            var mentee = mentees.get(s.menteeId)
+            views.add(MentoringViews.menteeView(s, slotRow, mentee, service.roomUrlOf(s, mentor)))
+        }
+        return MentoringViews.sortInbox(views)
+    }
+    static MentoringMenteeSessionView menteeView(s: MentoringSession, slot: MentoringSlot?, mentee: ProfileRecord?, roomUrl: String?) {
+        var username = MentoringNull.text()
+        var name = MentoringNull.text()
+        var avatar = MentoringNull.text()
+        if (mentee != null) {
+            username = mentee.username
+            name = mentee.name
+            avatar = mentee.avatar
+        }
+        var startsAt = MentoringNull.text()
+        var endsAt = MentoringNull.text()
+        if (slot != null) {
+            startsAt = slot.startsAt
+            endsAt = slot.endsAt
+        }
+        return MentoringMenteeSessionView(s.id, s.menteeId, username, name, avatar, s.slotId, startsAt, endsAt, s.message, s.status, s.priceSparks, roomUrl, s.roomMode, s.createdAt)
+    }
+    // Newest slot first; sessions without a slot go last; ties keep their order (stable insertion).
+    static List<MentoringMenteeSessionView> sortInbox(views: List<MentoringMenteeSessionView>) {
+        var out = listOf<MentoringMenteeSessionView>()
+        for (var v in views) {
+            var next = listOf<MentoringMenteeSessionView>()
+            var placed = false
+            for (var e in out) {
+                if (!placed && MentoringViews.comesAfter(e, v)) {
+                    next.add(v)
+                    placed = true
+                }
+                next.add(e)
+            }
+            if (!placed) {
+                next.add(v)
+            }
+            out = next
+        }
+        return out
+    }
+    // True when `e` must sit after `v`.
+    static Bool comesAfter(e: MentoringMenteeSessionView, v: MentoringMenteeSessionView) {
+        var a = e.startsAt
+        var b = v.startsAt
+        if (b == null) {
+            return false
+        }
+        if (a == null) {
+            return true
+        }
+        return a.compareTo(b) < 0
+    }
+    // Sessions I booked, with the mentor profile, the slot and the room.
+    static List<MentoringMySessionView> mine(service: MentoringService, userId: String) {
+        var sessions = service.sessionsByMentee(userId)
+        Map<String,MentoringMentor> mentors = mapOf()
+        for (var s in sessions) {
+            if (!mentors.containsKey(s.mentorId)) {
+                var m = service.mentorOrNull(s.mentorId)
+                if (m != null) {
+                    mentors.put(s.mentorId, m)
+                }
+            }
+        }
+        var ownerIds = listOf<String>()
+        for (var key in mentors.keys()) {
+            var m = mentors.get(key)
+            if (m != null) {
+                if (!ownerIds.contains(m.userId)) {
+                    ownerIds.add(m.userId)
+                }
+            }
+        }
+        var owners = MentoringViews.profilesOf(service, ownerIds)
+        Map<String,MentoringSlot> slots = mapOf()
+        for (var s in sessions) {
+            var sid = s.slotId
+            if (sid != null) {
+                if (!slots.containsKey(sid)) {
+                    var slot = service.slotOf(sid)
+                    if (slot != null) {
+                        slots.put(sid, slot)
+                    }
+                }
+            }
+        }
+        var views = listOf<MentoringMySessionView>()
+        for (var s in sessions) {
+            var mentor = mentors.get(s.mentorId)
+            var owner = MentoringNull.profile()
+            if (mentor != null) {
+                owner = owners.get(mentor.userId)
+            }
+            var slotRow = MentoringNull.slot()
+            var sid = s.slotId
+            if (sid != null) {
+                slotRow = slots.get(sid)
+            }
+            views.add(MentoringViews.mineView(s, mentor, owner, slotRow, service.roomUrlOf(s, mentor)))
+        }
+        return views
+    }
+    static MentoringMySessionView mineView(s: MentoringSession, mentor: MentoringMentor?, owner: ProfileRecord?, slot: MentoringSlot?, roomUrl: String?) {
+        var username = MentoringNull.text()
+        var name = MentoringNull.text()
+        var avatar = MentoringNull.text()
+        if (owner != null) {
+            username = owner.username
+            name = owner.name
+            avatar = owner.avatar
+        }
+        var startsAt = MentoringNull.text()
+        var endsAt = MentoringNull.text()
+        if (slot != null) {
+            startsAt = slot.startsAt
+            endsAt = slot.endsAt
+        }
+        return MentoringMySessionView(s.id, s.mentorId, username, name, avatar, startsAt, endsAt, s.message, s.status, s.priceSparks, roomUrl, s.roomMode, s.createdAt)
+    }
+    // Rules grouped by weekday, ascending (the store already orders by day then time).
+    static List<MentoringAvailabilityView> availability(rules: List<MentoringAvailability>) {
+        var out = listOf<MentoringAvailabilityView>()
+        var day = 0
+        var times = listOf<String>()
+        for (var r in rules) {
+            if (r.dayOfWeek != day) {
+                if (day != 0) {
+                    out.add(MentoringAvailabilityView(day, times))
+                }
+                day = r.dayOfWeek
+                times = listOf<String>()
+            }
+            times.add(r.timeOfDay)
+        }
+        if (day != 0) {
+            out.add(MentoringAvailabilityView(day, times))
+        }
+        return out
+    }
+}
+
+// Typed nulls: a local cannot start as `null` (SEM048), it starts from a call.
+class MentoringNull {
+    static String? text() = null
+    static MentoringSlot? slot() = null
+    static ProfileRecord? profile() = null
+}

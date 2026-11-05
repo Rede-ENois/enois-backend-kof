@@ -1,0 +1,112 @@
+package mentoring
+
+// The mentoring domain (Java package `mentoring`): a person publishes a mentor profile and an agenda, other people
+// book a slot, pay in sparks held in escrow, and the room of the session is a Jitsi link or the mentor's own room.
+// Instants travel as ISO-8601 UTC strings (the `Instant.toString()` of Java).
+// A mentor profile (Mentor). `roomMode` is one of MentoringRoomMode; `meetingUrl` only exists for CUSTOM rooms,
+// `jitsiRoom` is the slug of the permanent Jitsi room.
+record MentoringMentor(String id, String userId, List<String> expertise, Double rating, Int sessionsCount, String? price, String? banner, String? meetingUrl, Long? sparksPrice, String roomMode, String? jitsiRoom, String createdAt, String updatedAt) {
+    Bool acceptsSparks() {
+        var p = sparksPrice
+        if (p == null) {
+            return false
+        }
+        var amount = 0L
+        amount = p
+        return amount > 0L
+    }
+}
+
+// One published hour of the agenda (MentorSlot).
+record MentoringSlot(String id, String mentorId, String startsAt, String endsAt, Bool available)
+
+// A booking (MentorSession). `status` is SCHEDULED, COMPLETED or CANCELLED. `priceSparks` is what the escrow
+// holds (null for a free session). `roomUrl` is resolved at booking time and frozen. `settledAt` is when the money
+// left the escrow (paid to the mentor or returned): null while it is still held.
+record MentoringSession(String id, String mentorId, String menteeId, String? slotId, String? message, String status, Long? priceSparks, String roomMode, String? roomUrl, String? settledAt, String createdAt) {
+    Bool paid() {
+        var p = priceSparks
+        if (p == null) {
+            return false
+        }
+        var amount = 0L
+        amount = p
+        return amount > 0L
+    }
+    Bool scheduled() = status == "SCHEDULED"
+}
+
+// A weekly availability rule (MentorAvailability): day 1 = Monday .. 7 = Sunday, time "HH:mm".
+record MentoringAvailability(String id, String mentorId, Int dayOfWeek, String timeOfDay)
+
+// The weekly rule as it arrives from the request (MentorService.AvailabilityRule).
+record MentoringRule(Int dayOfWeek, List<String> times)
+
+// How the room of a session is chosen (RoomMode). JITSI_SESSION is the default: one Jitsi room per session.
+class MentoringRoomMode {
+    static String jitsiSession() = "JITSI_SESSION"
+    static String jitsiPermanent() = "JITSI_PERMANENT"
+    static String custom() = "CUSTOM"
+    // The mode as stored: an unknown value (old row, manual write) goes back to the default.
+    static String fromStored(raw: String?) {
+        if (raw == null) {
+            return MentoringRoomMode.jitsiSession()
+        }
+        var text = raw.trim()
+        if (text.length() == 0) {
+            return MentoringRoomMode.jitsiSession()
+        }
+        if (text.toLowerCase() == "jitsi_permanent") {
+            return MentoringRoomMode.jitsiPermanent()
+        }
+        if (text.toLowerCase() == "custom") {
+            return MentoringRoomMode.custom()
+        }
+        return MentoringRoomMode.jitsiSession()
+    }
+    // A mode sent by the screen: absent or blank stays null (the service deduces it from the link).
+    static String? fromRequest(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        return MentoringRoomMode.fromStored(raw)
+    }
+}
+
+// How a request reaches the service: the DTO records of MentoringContractController.
+record MentoringMentorBody(List<String>? expertise, String? price, String? banner, String? meetingUrl, Long? sparksPrice, String? roomMode, String? jitsiRoom)
+
+record MentoringSlotBody(String? startsAt, String? endsAt)
+
+record MentoringSessionBody(String? slotId, String? message)
+
+record MentoringAvailabilityItem(Int? dayOfWeek, List<String>? times)
+
+record MentoringAvailabilityBody(List<MentoringAvailabilityItem>? items)
+
+// JSON of the endpoints. The public view never carries the room link: only the owner reads it (GET /{id}/room).
+record MentoringMentorView(String id, String userId, List<String> expertise, Double rating, Int sessions, String? price, String? banner, Long? sparksPrice, String roomMode, String? nextSlot)
+
+record MentoringSlotView(String id, String startsAt, String endsAt, Bool available)
+
+record MentoringMentorPage(List<MentoringMentorView> items, String? nextCursor)
+
+record MentoringSlotPage(List<MentoringSlotView> items, String? nextCursor)
+
+record MentoringStatusView(String id, String status)
+
+record MentoringAvailabilityView(Int dayOfWeek, List<String> times)
+
+record MentoringMenteeSessionView(String id, String menteeId, String? menteeUsername, String? menteeName, String? menteeAvatar, String? slotId, String? startsAt, String? endsAt, String? message, String status, Long? priceSparks, String? roomUrl, String roomMode, String createdAt)
+
+record MentoringMySessionView(String id, String mentorId, String? mentorUsername, String? mentorName, String? mentorAvatar, String? startsAt, String? endsAt, String? message, String status, Long? priceSparks, String? roomUrl, String roomMode, String createdAt)
+
+record MentoringRoomView(String roomMode, String? roomUrl, String? meetingUrl, String? jitsiRoom)
+
+record MentoringDialInView(String conference, String? pin, List<String> numbers)
+
+// What the dial-in lookup answers inside the service (SessionDialIn).
+record MentoringDialIn(String conference, String? pin, List<String> numbers)

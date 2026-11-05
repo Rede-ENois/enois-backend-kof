@@ -1,0 +1,108 @@
+import app.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import mentoring.*
+import profile.*
+
+// Port of the /mentors half of CatalogSearchTests (the catalogue endpoint of this domain; the /blogs half is in
+// tests/blog): search by name, @ and expertise, cursor and expertise filters, and LIKE wildcards as literal text.
+String catalogTag(prefix: String) = prefix + Time.nowMillis()
+
+seedCatalogMentor(id: String, userId: String, expertise: List<String>, createdAt: String, rating: Double) {
+    MentoringStore(MentoringTestKit.database()).insertMentor(MentoringMentor(id, userId, expertise, rating, 0, "Gratuito", null, null, null, "JITSI_SESSION", null, createdAt, createdAt))
+}
+
+List<String> catalogIds(res: TestResponse) {
+    var out = listOf<String>()
+    var i = 0
+    while (i < res.jsonSize("items")) {
+        out.add(res.json("items." + i + ".id"))
+        i = i + 1
+    }
+    return out
+}
+
+TestResponse catalogGet(path: String) {
+    var res = OrgsTestKit.anonymous().get(path)
+    Check.status(res, 200)
+    return res
+}
+
+test "mentors search names usernames and expertise and keep cursor and expertise filters" {
+    var tag = catalogTag("mentor")
+    MentoringTestKit.login(tag + "named")
+    MentoringTestKit.login("catalog_second_" + tag)
+    MentoringTestKit.login("catalog_other_" + tag)
+    var now = Time.nowIso()
+    var firstId = "mentor_" + tag + "a"
+    var secondId = "mentor_" + tag + "b"
+    seedCatalogMentor(firstId, tag + "named", listOf("Java"), Time.plusSeconds(now, -3L), 0.0)
+    seedCatalogMentor(secondId, "catalog_second_" + tag, listOf(tag, "React"), Time.plusSeconds(now, -2L), 0.0)
+    seedCatalogMentor("mentor_" + tag + "c", "catalog_other_" + tag, listOf("Outra area"), now, 0.0)
+    var byName = catalogGet("/mentors?query=" + tag + "named&limit=20")
+    Check.eqStr("by name", firstId, byName.json("items.0.id"))
+    var byUsername = catalogGet("/mentors?query=" + tag + "named".toUpperCase() + "&limit=20")
+    Check.isTrue("by username", catalogIds(byUsername).contains(firstId))
+    var byExpertise = catalogGet("/mentors?query=rEaCt&limit=200")
+    Check.isTrue("by expertise", catalogIds(byExpertise).contains(secondId))
+    var firstPage = catalogGet("/mentors?query=" + tag + "&limit=1")
+    Check.eqStr("newest first", "mentor_" + tag + "c", firstPage.json("items.0.id"))
+    var cursor = firstPage.json("nextCursor")
+    Check.isTrue("a full page has a cursor", cursor.length() > 0)
+    var nextPage = catalogGet("/mentors?query=" + tag + "&limit=1&cursor=" + cursor)
+    Check.eqStr("second page", secondId, nextPage.json("items.0.id"))
+    var combined = catalogGet("/mentors?query=" + tag + "&expertise=Java")
+    var ids = catalogIds(combined)
+    Check.eqInt("combined filter", 1, ids.size())
+    Check.eqStr("combined filter id", firstId, ids.get(0))
+    Check.isTrue("a short page has no cursor", combined.jsonIsNull("nextCursor"))
+    Check.eqInt("missing", 0, catalogGet("/mentors?query=" + tag + "missing&limit=20").jsonSize("items"))
+    var blank = catalogIds(catalogGet("/mentors?query=%20&limit=200"))
+    Check.isTrue("blank query lists everything (first)", blank.contains(firstId))
+    Check.isTrue("blank query lists everything (second)", blank.contains(secondId))
+}
+
+test "wildcard characters are literal for the mentors catalogue" {
+    var tag = catalogTag("literal")
+    MentoringTestKit.login(tag)
+    var literal = tag + "%_!"
+    seedCatalogMentor("mentor_" + tag, tag, listOf(literal), Time.nowIso(), 0.0)
+    var byQuery = catalogIds(catalogGet("/mentors?query=%25_!&limit=200"))
+    Check.eqInt("only the literal match by query", 1, byQuery.size())
+    Check.eqStr("literal by query", "mentor_" + tag, byQuery.get(0))
+    var byExpertise = catalogIds(catalogGet("/mentors?expertise=" + tag + "%25_!"))
+    Check.eqInt("only the literal match by expertise", 1, byExpertise.size())
+    Check.eqStr("literal by expertise", "mentor_" + tag, byExpertise.get(0))
+}
+
+test "an expertise-only search ranks by rating and a mentor shows its next free slot" {
+    var tag = catalogTag("rank")
+    MentoringTestKit.login(tag + "-low")
+    MentoringTestKit.login(tag + "-high")
+    var now = Time.nowIso()
+    seedCatalogMentor("mentor_" + tag + "_low", tag + "-low", listOf(tag), Time.plusSeconds(now, -1L), 1.0)
+    seedCatalogMentor("mentor_" + tag + "_high", tag + "-high", listOf(tag), Time.plusSeconds(now, -5L), 4.5)
+    var ids = catalogIds(catalogGet("/mentors?expertise=" + tag))
+    Check.eqInt("two mentors", 2, ids.size())
+    Check.eqStr("best rated first", "mentor_" + tag + "_high", ids.get(0))
+    var owner = MentoringTestKit.login(tag + "-owner")
+    var mentorId = MentoringTestKit.createPlainMentor(owner)
+    Check.isTrue("no slot, no next slot", catalogGet("/mentors/" + mentorId).jsonIsNull("nextSlot"))
+    var later = MentoringTestKit.after(2L * 86400L)
+    var sooner = MentoringTestKit.after(86400L)
+    MentoringTestKit.createSlot(owner, mentorId, later)
+    var soonId = MentoringTestKit.createSlot(owner, mentorId, sooner)
+    MentoringTestKit.createSlot(owner, mentorId, MentoringTestKit.after(-3600L))
+    Check.eqStr("next slot is the nearest free future one", sooner, catalogGet("/mentors/" + mentorId).json("nextSlot"))
+    var mentee = MentoringTestKit.login(tag + "-mentee")
+    MentoringTestKit.bookOk(mentee, mentorId, soonId)
+    Check.eqStr("the booked one is skipped", later, catalogGet("/mentors/" + mentorId).json("nextSlot"))
+    var listed = catalogGet("/mentors?query=" + tag + "-owner")
+    Check.eqStr("the list carries it too", later, listed.json("items.0.nextSlot"))
+    Check.apiError(OrgsTestKit.anonymous().get("/mentors/mentor_nope"), 404, "MENTOR_NOT_FOUND")
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}

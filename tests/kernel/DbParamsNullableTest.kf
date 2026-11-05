@@ -1,0 +1,21 @@
+import kernel.db.*
+
+// A narrowed Long?/Int? bound as is used to emit Long.valueOf(Long) / Integer.valueOf(Integer) (NoSuchMethodError,
+// KOF_GAPS G348): the nullable binders copy the value into a plain number first.
+Long? someLong() = 60000L
+
+Int? someInt() = 7
+
+test "a present nullable Long and Int bind their value" {
+    var database = Db.connect("jdbc:h2:mem:dbnullablebinds;MODE=MySQL;DB_CLOSE_DELAY=-1", "sa", "", 5, 1)
+    database.execute("create table t (id bigint primary key, n bigint null, b int null)", DbParams())
+    database.execute("insert into t (id, n, b) values (?, ?, ?)", DbParams().bindLong(1L).bindLongOrNull(someLong()).bindIntOrNull(someInt()))
+    var r = database.queryOne("select n, b from t where id = ?", DbParams().bindLong(1L))
+    assert(r.getLong("n") == 60000L)
+    assert(r.getInt("b") == 7)
+    database.execute("insert into t (id, n, b) values (?, ?, ?)", DbParams().bindLong(2L).bindLongOrNull(null).bindIntOrNull(null))
+    var empty = database.queryOne("select n, b from t where id = ?", DbParams().bindLong(2L))
+    assert(empty.isNull("n"))
+    assert(empty.isNull("b"))
+    database.close()
+}

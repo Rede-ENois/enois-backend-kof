@@ -1,0 +1,77 @@
+package freelances
+
+import kernel.db.*
+import kernel.text.*
+
+// Plain SQL on `freelances` (V144, V151). The state changes are atomic claims on `status`, so two requests
+// racing (edit against close, close against close) cannot both win.
+class FreelanceStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, user_id, title, scope, budget_min, budget_max, deadline, payment_method, status, created_at, updated_at"
+    static Freelance freelanceOf(r: DbRow) = Freelance(r.getStr("id"), r.getStr("user_id"), r.getStr("title"), r.getStr("scope"), r.getInt("budget_min"), r.getInt("budget_max"), r.getDate("deadline"), r.getStr("payment_method"), r.getStr("status"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    static List<Freelance> freelances(rows: List<DbRow>) {
+        var out = listOf<Freelance>()
+        for (var r in rows) {
+            out.add(FreelanceStore.freelanceOf(r))
+        }
+        return out
+    }
+    insert(f: Freelance) {
+        var p = DbParams()
+        p.bindStr(f.id())
+        p.bindStr(f.userId())
+        p.bindStr(f.title())
+        p.bindStr(f.scope())
+        p.bindInt(f.budgetMin())
+        p.bindInt(f.budgetMax())
+        p.bindDate(f.deadline())
+        p.bindStr(f.paymentMethod())
+        p.bindStr(f.status())
+        p.bindInstant(f.createdAt())
+        p.bindInstant(f.updatedAt())
+        store.execute("insert into freelances (" + FreelanceStore.columns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", p)
+    }
+    Freelance? findById(id: String) {
+        var row = store.queryOptional("select " + FreelanceStore.columns() + " from freelances where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return FreelanceStore.freelanceOf(row)
+    }
+    // Open freelances, newest first; a non-blank `term` searches title and scope (case-insensitive, literal text).
+    List<Freelance> findOpen(term: String, limit: Int, offset: Int) {
+        var p = DbParams()
+        var sql = "select " + FreelanceStore.columns() + " from freelances where status = \'OPEN\'"
+        var pattern = LikePattern.contains(term)
+        if (pattern != null) {
+            sql = sql + " and (lower(title) like ? escape \'!\' or lower(scope) like ? escape \'!\')"
+            p.bindStr(pattern)
+            p.bindStr(pattern)
+        }
+        p.bindInt(limit)
+        p.bindInt(offset)
+        return FreelanceStore.freelances(store.queryList(sql + " order by created_at desc limit ? offset ?", p))
+    }
+    List<Freelance> findByUser(userId: String) = FreelanceStore.freelances(store.queryList("select " + FreelanceStore.columns() + " from freelances where user_id = ? order by created_at desc", DbParams().bindStr(userId)))
+    // The owner's edit of an OPEN freelance: identity, status and creation date stay. False when it is no longer OPEN.
+    Bool updateContentIfOpen(id: String, title: String, scope: String, budgetMin: Int, budgetMax: Int, deadline: String, paymentMethod: String, now: String) {
+        var p = DbParams()
+        p.bindStr(title)
+        p.bindStr(scope)
+        p.bindInt(budgetMin)
+        p.bindInt(budgetMax)
+        p.bindDate(deadline)
+        p.bindStr(paymentMethod)
+        p.bindInstant(now)
+        p.bindStr(id)
+        return store.execute("update freelances set title = ?, scope = ?, budget_min = ?, budget_max = ?, deadline = ?, payment_method = ?, updated_at = ? where id = ? and status = \'OPEN\'", p) == 1
+    }
+    // OPEN to CLOSED, once. False when someone closed it first.
+    Bool closeIfOpen(id: String, now: String) = store.execute("update freelances set status = \'CLOSED\', updated_at = ? where id = ? and status = \'OPEN\'", DbParams().bindInstant(now).bindStr(id)) == 1
+    delete(id: String) {
+        store.execute("delete from freelances where id = ?", DbParams().bindStr(id))
+    }
+}

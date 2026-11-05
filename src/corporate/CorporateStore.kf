@@ -1,0 +1,65 @@
+package corporate
+
+import kernel.db.*
+import kernel.error.*
+
+// SQL of `corporate_profiles` (CorporateProfilePersistenceAdapter). The @ is unique in the database
+// (uk_corporate_profiles_username): a constraint violation on a write is a 409 USERNAME_TAKEN only when another
+// account really holds that @, any other refused value stays the generic 409 CONFLICT.
+class CorporateStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "user_id, username, name, headline, bio, avatar, banner, banner_html, location, industry, external_links, status, created_at, updated_at"
+    static CorporateProfile profile(r: DbRow) = CorporateProfile(r.getStr("user_id"), r.getStr("username"), r.getStr("name"), r.getStrOrNull("headline"), r.getStrOrNull("bio"), r.getStrOrNull("avatar"), r.getStrOrNull("banner"), r.getStrOrNull("banner_html"), r.getStrOrNull("location"), r.getStrOrNull("industry"), r.getStrOrNull("external_links"), r.getStr("status"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    CorporateProfile? findByUserId(userId: String) {
+        var row = store.queryOptional("select " + CorporateStore.columns() + " from corporate_profiles where user_id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return CorporateStore.profile(row)
+    }
+    CorporateProfile? findByUsername(username: String) {
+        var row = store.queryOptional("select " + CorporateStore.columns() + " from corporate_profiles where username = ?", DbParams().bindStr(username))
+        if (row == null) {
+            return null
+        }
+        return CorporateStore.profile(row)
+    }
+    List<CorporateProfile> findByUserIds(userIds: List<String>) {
+        var out = listOf<CorporateProfile>()
+        if (userIds.size() == 0) {
+            return out
+        }
+        var params = DbParams()
+        var marks = listOf<String>()
+        for (var id in userIds) {
+            params.bindStr(id)
+            marks.add("?")
+        }
+        for (var r in store.queryList("select " + CorporateStore.columns() + " from corporate_profiles where user_id in (" + String.join(",", marks) + ")", params)) {
+            out.add(CorporateStore.profile(r))
+        }
+        return out
+    }
+    Bool existsByUsername(username: String) = store.queryLong("select count(*) from corporate_profiles where username = ?", DbParams().bindStr(username)) > 0L
+    // Insert when the account has no row, update otherwise (the JPA merge of the Java adapter).
+    CorporateProfile save(p: CorporateProfile) {
+        try {
+            if (this.findByUserId(p.userId) == null) {
+                store.execute("insert into corporate_profiles (" + CorporateStore.columns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(p.userId).bindStr(p.username).bindStr(p.name).bindStrOrNull(p.headline).bindStrOrNull(p.bio).bindStrOrNull(p.avatar).bindStrOrNull(p.banner).bindStrOrNull(p.bannerHtml).bindStrOrNull(p.location).bindStrOrNull(p.industry).bindStrOrNull(p.externalLinks).bindStr(p.status).bindInstant(p.createdAt).bindInstant(p.updatedAt))
+            }
+            else {
+                store.execute("update corporate_profiles set username = ?, name = ?, headline = ?, bio = ?, avatar = ?, banner = ?, banner_html = ?, location = ?, industry = ?, external_links = ?, status = ?, updated_at = ? where user_id = ?", DbParams().bindStr(p.username).bindStr(p.name).bindStrOrNull(p.headline).bindStrOrNull(p.bio).bindStrOrNull(p.avatar).bindStrOrNull(p.banner).bindStrOrNull(p.bannerHtml).bindStrOrNull(p.location).bindStrOrNull(p.industry).bindStrOrNull(p.externalLinks).bindStr(p.status).bindInstant(p.updatedAt).bindStr(p.userId))
+            }
+        } catch (String e) {
+            if (Errors.hasCode(e, "CONFLICT") && this.usernameHeldByAnother(p)) {
+                throw Errors.api(409, "USERNAME_TAKEN", "Esse usuário profissional já está em uso. Escolha outro.")
+            }
+            throw e
+        }
+        return p
+    }
+    Bool usernameHeldByAnother(p: CorporateProfile) = store.queryLong("select count(*) from corporate_profiles where username = ? and user_id <> ?", DbParams().bindStr(p.username).bindStr(p.userId)) > 0L
+}

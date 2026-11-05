@@ -1,0 +1,98 @@
+import app.*
+import kernel.testkit.*
+import profile.*
+
+// Port of CorporateIdentitySecurityTests: the identity is resolved from the session, never from the payload; a
+// draft or disabled profile has no page and cannot publish BUSINESS; the account values are not duplicated.
+csCreateAndActivate(who: ProfileCaller, username: String, name: String) {
+    Check.status(who.post("/me/business-profile", "{\"username\":\"" + username + "\",\"name\":\"" + name + "\"}"), 200)
+    Check.status(who.patch("/me/business-profile", "{\"headline\":\"Headline " + name + "\"}"), 200)
+    Check.status(who.post("/me/business-profile/activate", ""), 200)
+}
+
+String csBusinessBody(content: String) = "{\"topic\":\"TECNOLOGIA\",\"type\":\"BUSINESS\",\"content\":\"" + content + "\",\"tags\":[],\"mediaIds\":[]}"
+
+String csPublish(who: ProfileCaller, content: String) {
+    var res = who.post("/feed/posts", csBusinessBody(content))
+    Check.status(res, 201)
+    return OrgsTestKit.str(res, "id")
+}
+
+test "businessProfileEndpointsRequireASession" {
+    var guest = OrgsTestKit.anonymous()
+    Check.apiError(guest.get("/me/business-profile"), 401, "UNAUTHENTICATED")
+    Check.status(guest.post("/me/business-profile", "{\"username\":\"sem.sessao\",\"name\":\"Sem Sessão\"}"), 401)
+    Check.status(guest.post("/me/business-profile/activate", ""), 401)
+}
+
+test "aProfileOfOneAccountDoesNotPublishForAnother" {
+    var owner = OrgsTestKit.login("corpsec_owner")
+    var stranger = OrgsTestKit.login("corpsec_stranger")
+    csCreateAndActivate(owner, "corpsec.owner", "Owner Profissional")
+    // No field of the payload can point at somebody else's profile.
+    Check.apiError(stranger.post("/feed/posts", "{\"topic\":\"TECNOLOGIA\",\"type\":\"BUSINESS\",\"content\":\"tentativa de publicar como outro\",\"tags\":[],\"mediaIds\":[],\"username\":\"corpsec.owner\",\"authorUsername\":\"corpsec.owner\"}"), 403, "NO_ACTIVE_CORPORATE_PROFILE")
+    // And the other account's @ stays reserved.
+    Check.apiError(stranger.post("/me/business-profile", "{\"username\":\"corpsec.owner\",\"name\":\"Clone\"}"), 409, "USERNAME_TAKEN")
+}
+
+test "onlyTheOwnerActsOnABusinessPost" {
+    var owner = OrgsTestKit.login("corpsec_post_owner")
+    var stranger = OrgsTestKit.login("corpsec_post_stranger")
+    csCreateAndActivate(owner, "corpsec.posts", "Dona do Post")
+    var postId = csPublish(owner, "Post corporativo de teste.")
+    Check.apiError(stranger.patch("/feed/posts/" + postId, "{\"type\":\"BUSINESS\",\"content\":\"tentativa de edição alheia\",\"tags\":[]}"), 403, "POST_OWNER_MISMATCH")
+    Check.apiError(stranger.delete("/feed/posts/" + postId), 403, "POST_OWNER_MISMATCH")
+    var still = OrgsTestKit.anonymous().get("/feed/posts/" + postId)
+    Check.status(still, 200)
+    Check.jsonEq(still, "id", postId)
+}
+
+test "draftProfileHasNoPublicPageAndCannotPublish" {
+    var who = OrgsTestKit.login("corpsec_draft")
+    var guest = OrgsTestKit.anonymous()
+    Check.status(who.post("/me/business-profile", "{\"username\":\"corpsec.draft\",\"name\":\"Em Construção\"}"), 200)
+    Check.apiError(guest.get("/corporate/corpsec.draft/posts"), 404, "PROFILE_NOT_FOUND")
+    Check.apiError(guest.get("/corporate/corpsec.draft"), 404, "PROFILE_NOT_FOUND")
+    Check.apiError(who.post("/feed/posts", csBusinessBody("rascunho publicando")), 403, "NO_ACTIVE_CORPORATE_PROFILE")
+}
+
+test "deactivatedProfileStopsPublishingButKeepsPosts" {
+    var who = OrgsTestKit.login("corpsec_deact")
+    csCreateAndActivate(who, "corpsec.deact", "Desativada")
+    var postId = csPublish(who, "Post antes de desativar.")
+    Check.status(who.post("/me/business-profile/deactivate", ""), 200)
+    Check.apiError(who.post("/feed/posts", csBusinessBody("tentativa pos-desativar")), 403, "NO_ACTIVE_CORPORATE_PROFILE")
+    var still = OrgsTestKit.anonymous().get("/feed/posts/" + postId)
+    Check.status(still, 200)
+    Check.jsonEq(still, "id", postId)
+}
+
+test "sharedAccountValuesAreNotDuplicatedByTheCorporateIdentity" {
+    var who = OrgsTestKit.login("corpsec_shared")
+    var before = who.get("/me")
+    Check.status(before, 200)
+    var reputation = before.json("reputation")
+    var followers = before.json("followersCount")
+    var connections = before.json("connectionsCount")
+    csCreateAndActivate(who, "corpsec.shared", "Mesma Conta")
+    var after = who.get("/me")
+    Check.status(after, 200)
+    Check.jsonEq(after, "reputation", reputation)
+    Check.jsonEq(after, "followersCount", followers)
+    Check.jsonEq(after, "connectionsCount", connections)
+    var page = OrgsTestKit.anonymous().get("/corporate/corpsec.shared")
+    Check.status(page, 200)
+    Check.jsonEq(page, "username", "corpsec.shared")
+    Check.isTrue("no reputation", !page.jsonHas("reputation"))
+    Check.isTrue("no followersCount", !page.jsonHas("followersCount"))
+    Check.isTrue("no connectionsCount", !page.jsonHas("connectionsCount"))
+    Check.isTrue("no email", !page.jsonHas("email"))
+    Check.isTrue("identityVerified", page.json("identityVerified") == "true" || page.json("identityVerified") == "false")
+    Check.isTrue("memberSince", page.jsonStr("memberSince") != null)
+    Check.isTrue("skills", page.body.contains("\"skills\":["))
+    Check.isTrue("experiences", page.body.contains("\"experiences\":["))
+    Check.isTrue("educations", page.body.contains("\"educations\":["))
+    Check.isTrue("certifications", page.body.contains("\"certifications\":["))
+    Check.isTrue("no socialUsername", !page.jsonHas("socialUsername"))
+    OrgsTestKit.finish()
+}
