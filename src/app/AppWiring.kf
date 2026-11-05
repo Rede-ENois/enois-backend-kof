@@ -41,6 +41,7 @@ import cosmetics.*
 import marketplace.*
 import services.*
 import corporate.*
+import events.*
 
 // The production composition: every domain module installed on a created platform, in dependency order.
 // Main.kf and tests/integration/BootRoutesTest.kf both call it, so a test boots the exact production wiring.
@@ -64,7 +65,11 @@ class AppWiring {
         // eligibility rule of identity reads the live reputation of the profile domain.
         // The cosmetics core (catalog + badge ownership) comes first: profile asks it who owns an emblem.
         var cosmeticsCore = CosmeticsCore.create(platform)
-        var profiles = ProfileModule.installWith(platform, shared, ProfileNotifier(platform.db), cosmeticsCore.badges, ProfileParentalLinks(platform.db), ProfileForeignCounts(platform.db), PreferencesThemeGallery(platform.db))
+        // The events store comes first: profile (attendance total of the reputation) and notifications (the event a notice
+        // points at) read it through EventsForeignCounts and EventsNotificationPlaces; EventsModule installs later.
+        var eventsStore = EventsStore(platform.db)
+        // TODO(orgs merge): another port also subclasses ProfileForeignCounts (mentoring); chain them so both counts are overridden.
+        var profiles = ProfileModule.installWith(platform, shared, ProfileNotifier(platform.db), cosmeticsCore.badges, ProfileParentalLinks(platform.db), EventsForeignCounts(platform.db, eventsStore), PreferencesThemeGallery(platform.db))
         // corporate (professional identity): after profile, before the domains that read it (feed, messaging, jobs).
         var corporate = CorporateModule.install(platform, profiles)
         var jobSeams = JobSeamSet(platform, profiles)
@@ -81,9 +86,12 @@ class AppWiring {
         var coinCore = CoinCore.create(platform, shared, parts)
         var notificationSeams = NotificationsSeams(platform)
         notificationSeams.coins = CoinNotificationCoins(coinCore.service)
+        notificationSeams.placeReader = EventsNotificationPlaces(platform.db, eventsStore)
         var notificationsModule = NotificationsModule.installWith(platform, shared, notificationSeams)
         var coinModule = CoinModule.install(platform, shared, parts, coinCore, profiles, notificationsModule)
         CosmeticsModule.install(platform, cosmeticsCore, coinModule, profiles)
+        // events: attendance, rituals (recurrence job) and the sanitisation job; writes notifications, reads identity.
+        EventsModule.install(platform, shared, parts, identity, notificationsModule, eventsStore)
         PushModule.install(platform, shared, hooks, parts, notificationsModule)
         var messagingSeams = MessagingSeamSet(platform)
         messagingSeams.corporate = CorporateMessagingBridge(platform.db, corporate.service)
