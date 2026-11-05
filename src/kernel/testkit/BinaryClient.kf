@@ -67,6 +67,14 @@ class BinaryClient {
     }
     BinaryResponse get(path: String, headers: List<String>) = send("GET", path, headers, "".getBytes())
     BinaryResponse put(path: String, headers: List<String>, body: Byte[]) = send("PUT", path, headers, body)
+    // A multipart POST: `body` is finished and sent with its Content-Type.
+    BinaryResponse postMultipart(path: String, headers: List<String>, body: MultipartBody) {
+        var all = listOf<String>("Content-Type: " + body.contentType())
+        for (var h in headers) {
+            all.add(h)
+        }
+        return send("POST", path, all, body.finish())
+    }
     // Splits at the first blank line (searched on bytes: the body may hold anything).
     static BinaryResponse parse(raw: Byte[]) {
         var end = -1
@@ -95,5 +103,36 @@ class BinaryClient {
             n = n + 1
         }
         return response
+    }
+}
+
+// A multipart/form-data body for tests (the real clients send these; the lane's parser reads them).
+class MultipartBody {
+    String boundary
+    ByteSink sink = ByteSink()
+    public constructor(boundary: String) {
+        this.boundary = boundary
+    }
+    static MultipartBody create() = MultipartBody("----kof-test-boundary")
+    // The Content-Type header value.
+    String contentType() = "multipart/form-data; boundary=" + boundary
+    MultipartBody addFile(name: String, filename: String, type: String, data: Byte[]) {
+        sink.addAscii("--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + name + "\"; filename=\"" + filename + "\"\r\nContent-Type: " + type + "\r\n\r\n")
+        sink.addAll(data)
+        sink.addAscii("\r\n")
+        return this
+    }
+    MultipartBody addText(name: String, value: String) {
+        sink.addAscii("--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + name + "\"\r\n\r\n")
+        sink.addAll(value.getBytes())
+        sink.addAscii("\r\n")
+        return this
+    }
+    // The body with its closing delimiter.
+    Byte[] finish() {
+        var closed = ByteSink()
+        closed.addAll(sink.toBytes())
+        closed.addAscii("--" + boundary + "--\r\n")
+        return closed.toBytes()
     }
 }

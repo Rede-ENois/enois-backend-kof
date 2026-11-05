@@ -4,8 +4,10 @@ import java.io.BufferedInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.lang.Throwable
 import java.net.ServerSocket
 import java.net.Socket
+import java.time.Instant
 import kernel.bytes.*
 import kernel.error.*
 import kernel.files.*
@@ -39,7 +41,9 @@ class FrontReply {
 // connection to the web runtime listening on an internal port, byte for byte, except:
 //   - `PUT` under a claimed prefix with a Content-Length: the body is read from the client into a temp
 //     file AFTER the route authorised it (two internal calls, tickets in BinaryLane);
-//   - `GET` under a claimed prefix: when the route answers `X-Kernel-Stream`, the registered stream is
+//   - `POST` of a claimed route (method + exact path, BinaryLane.claimRoute): the multipart body is parsed while it
+//     streams in, after the route authorised it, and the route gets the parsed form (BinaryUploads);
+//   - `GET` under a claimed prefix or of a claimed route: when the route answers `X-Kernel-Stream`, the registered stream is
 //     sent as the body.
 // The client address travels as `X-Kernel-Peer`; headers named `X-Kernel-*` and `Expect` from the client
 // are dropped, so the lane cannot be driven from outside. The internal port must not be published.
@@ -93,6 +97,10 @@ class BinaryFront {
             log.debug("front_connection_failed")
         } catch (String e) {
             log.warn("front_connection_error " + e)
+        } catch (Throwable e) {
+            // Whatever else a handler throws must still end the connection: a silent virtual thread leaves the
+            // client waiting for an answer that never comes.
+            log.warn("front_connection_crashed " + e.toString())
         }
         try {
             client.close()
@@ -115,6 +123,8 @@ class BinaryFront {
         var kept = listOf<String>()
         var declared = -1L
         var expect = false
+        var contentType = ""
+        var chunked = false
         var i = 1
         while (i < lines.length) {
             var line = lines[i]
@@ -135,22 +145,36 @@ class BinaryFront {
                             if (name == "content-length") {
                                 declared = BinaryFront.parseLength(value)
                             }
+                            if (name == "content-type") {
+                                contentType = value
+                            }
+                            if (name == "transfer-encoding") {
+                                chunked = true
+                            }
                             kept.add(line)
                         }
             }
             i = i + 1
         }
         var peer = BinaryFront.peerOf(client)
-        if (method == "PUT" && BinaryLane.owns(path) && declared > 0L) {
-            this.upload(client, input, out, lines[0], kept, peer, declared, expect)
+        var routeMax = -1L
+        if (method == "POST") {
+            routeMax = BinaryLane.routeMax(method, path)
+        }
+        if (routeMax >= 0L) {
+            this.multipart(client, input, out, lines[0], kept, peer, declared, expect, chunked, contentType, routeMax)
         }
         else 
-            if (method == "GET" && BinaryLane.owns(path)) {
-                this.download(out, lines[0], kept, peer)
+            if (method == "PUT" && BinaryLane.owns(path) && declared > 0L) {
+                this.upload(client, input, out, lines[0], kept, peer, declared, expect)
             }
-            else {
-                this.forward(client, input, out, lines[0], kept, peer)
-            }
+            else 
+                if (method == "GET" && (BinaryLane.owns(path) || BinaryLane.routeMax("GET", path) >= 0L)) {
+                    this.download(out, lines[0], kept, peer)
+                }
+                else {
+                    this.forward(client, input, out, lines[0], kept, peer)
+                }
     }
     static Long parseLength(value: String) {
         try {
@@ -257,6 +281,117 @@ class BinaryFront {
         BinaryLane.discard(ticket)
         out.write(second.raw, 0, second.raw.length)
         out.flush()
+    }
+    // ---------------------------------------------------------------- multipart upload (POST)
+    // A claimed multipart POST (BinaryLane.claimRoute): checked against the claim without reading the body, authorised by
+    // the route (a body that nobody authorised is never read), then parsed while it streams in. Every refusal after
+    // the authorisation is answered here with the same JSON error shape as the routes.
+    multipart(client: Socket, input: BufferedInputStream, out: OutputStream, requestLine: String, kept: List<String>, peer: String, declared: Long, expect: Bool, chunked: Bool, contentType: String, maxRequest: Long) {
+        var boundary = MultipartParser.boundaryOf(contentType)
+        if (chunked) {
+            BinaryFront.respondError(out, 411, "LENGTH_REQUIRED", "Informe o tamanho do corpo da requisicao.")
+            return
+        }
+        if (declared > maxRequest) {
+            BinaryFront.respondError(out, 413, "FILE_TOO_LARGE", "O arquivo enviado passa do limite permitido.")
+            // Read a bounded part of the refused body, or closing would reset the connection under the answer.
+            BinaryFront.linger(input, declared, 16777216L)
+            return
+        }
+        if (boundary.length() == 0 && declared > 0L) {
+            // Not multipart: the route answers (filters, then 401 or 415); the body is at most `maxRequest` bytes.
+            this.forward(client, input, out, requestLine, kept, peer)
+            return
+        }
+        var withoutLength = listOf<String>()
+        for (var line in kept) {
+            if (!line.toLowerCase().startsWith("content-length:")) {
+                withoutLength.add(line)
+            }
+        }
+        withoutLength.add("Content-Length: 0")
+        if (declared <= 0L || boundary.length() == 0) {
+            // No body to read: the route answers (the filters, 401 for an anonymous caller, then 415 or 400 FILE_REQUIRED).
+            var plain = this.exchange(BinaryFront.headText(requestLine, withoutLength, listOf<String>(), peer))
+            out.write(plain.raw, 0, plain.raw.length)
+            out.flush()
+            return
+        }
+        var first = this.exchange(BinaryFront.headText(requestLine, withoutLength, listOf("X-Kernel-Binary: authorize", "X-Kernel-Declared-Length: " + declared), peer))
+        var ticket = first.headerOf("x-kernel-accept")
+        if (first.status != 202 || ticket.length() == 0) {
+            out.write(first.raw, 0, first.raw.length)
+            out.flush()
+            if (!expect) {
+                BinaryFront.linger(input, declared, 1048576L)
+            }
+            return
+        }
+        if (expect) {
+            var go = "HTTP/1.1 100 Continue\r\n\r\n".getBytes()
+            out.write(go, 0, go.length)
+            out.flush()
+        }
+        var parser = MultipartParser(input, declared, boundary, maxRequest)
+        var failure = ""
+        try {
+            parser.run()
+        } catch (String e) {
+            failure = e
+        }
+        if (failure.length() > 0) {
+            parser.form.discard()
+            BinaryLane.discard(ticket)
+            if (failure == "MULTIPART_TOO_LARGE") {
+                BinaryFront.respondError(out, 413, "FILE_TOO_LARGE", "O arquivo enviado passa do limite permitido.")
+            }
+            else 
+                if (failure == "MULTIPART_MALFORMED") {
+                    BinaryFront.respondError(out, 400, "MALFORMED_MULTIPART", "Corpo multipart invalido.")
+                }
+                else {
+                    BinaryFront.respondError(out, 400, "UPLOAD_FAILED", "Nao foi possivel ler o arquivo enviado.")
+                }
+            // Read what is left of a small remainder so closing does not reset the connection under the answer.
+            try {
+                parser.drain()
+            } catch (String e) {
+            }
+            return
+        }
+        parser.drain()
+        BinaryLane.attachForm(ticket, parser.form)
+        var second = this.exchange(BinaryFront.headText(requestLine, withoutLength, listOf("X-Kernel-Binary: commit", "X-Kernel-Ticket: " + ticket, "X-Kernel-Declared-Length: " + declared), peer))
+        BinaryLane.discard(ticket)
+        out.write(second.raw, 0, second.raw.length)
+        out.flush()
+    }
+    // Reads and drops up to `cap` bytes of the body of a refused request.
+    static linger(input: InputStream, declared: Long, cap: Long) {
+        var left = declared
+        if (left > cap) {
+            left = cap
+        }
+        var buffer = new Byte[65536]
+        try {
+            while (left > 0L) {
+                var want = 65536
+                if (left < 65536L) {
+                    want = left as Int
+                }
+                var n = input.read(buffer, 0, want)
+                if (n < 0) {
+                    left = 0L
+                }
+                else {
+                    left = left - n
+                }
+            }
+        } catch (IOException e) {
+        }
+    }
+    static respondError(out: OutputStream, status: Int, code: String, message: String) {
+        BinaryFront.respond(out, status, "{\"code\":\"" + code + "\",\"message\":\"" + message + "\",\"timestamp\":\"" + Instant.now().toString() + "\"}")
     }
     // One internal request without body; the whole answer is read (the runtime closes after it).
     FrontReply exchange(head: String) {

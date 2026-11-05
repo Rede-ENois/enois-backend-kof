@@ -1,0 +1,244 @@
+import kernel.*
+import kernel.bytes.*
+import kernel.error.*
+import kernel.files.*
+import kernel.http.*
+import kernel.testkit.*
+
+// The method + path claims and the multipart parser of the binary lane. Claims are process-wide (like the prefix
+// claims) and a test file is one process: this file claims `/lane/up` (cap 400 KB) and `/lane/item/:id` (cap 1 KB).
+record LaneEcho(String parts)
+
+class LaneSeen {
+    static List<String> laneSeenPaths = listOf<String>()
+    static String laneSeenKey = ""
+}
+
+// What the handler saw: name|filename|type|size|sum-of-bytes (file) or name|text (text), one part per `;`.
+String laneEcho(key: String) {
+    var user = Req.headerOrNull("x-test-user")
+    if (user == null) {
+        throw Errors.api(401, "UNAUTHORIZED", "Sessao invalida.")
+    }
+    var form = BinaryUploads.receive(user, key)
+    if (form == null) {
+        return BinaryUploads.authorized()
+    }
+    LaneSeen.laneSeenKey = key
+    var text = ""
+    for (var part in form.parts) {
+        if (part.path.length() == 0) {
+            text = text + part.name + "|" + part.text + ";"
+        }
+        else {
+            LaneSeen.laneSeenPaths.add(part.path)
+            var data = TempFiles.readAll(part.path)
+            var sum = 0L
+            var i = 0
+            while (i < data.length) {
+                sum = sum + Bytes.at(data, i)
+                i = i + 1
+            }
+            text = text + part.name + "|" + part.filename + "|" + part.contentType + "|" + part.size + "|" + sum + ";"
+        }
+    }
+    return json.encode(LaneEcho(text))
+}
+
+class LaneHolder {
+    static TestApp? laneApp = null
+    static TestApp get() {
+        var cur = LaneHolder.laneApp
+        if (cur != null) {
+            return cur
+        }
+        var created = TestApp.bootWire("multipartlane", (p: Platform) -> LaneHolder.wire(p))
+        LaneHolder.laneApp = created
+        return created
+    }
+    static wire(p: Platform) {
+        BinaryLane.claimRoute("POST", "/lane/up", 400000L)
+        BinaryLane.claimRoute("POST", "/lane/item/:id", 1024L)
+        p.server.post("/lane/up", () -> laneEcho("POST /lane/up"))
+        p.server.post("/lane/item/:id", () -> laneEcho("POST /lane/item/" + Req.pathParam("id")))
+        p.server.post("/lane/up/other", () -> "{\"route\":\"post-other\"}")
+        p.server.put("/lane/up", () -> "{\"route\":\"put\"}")
+        p.server.get("/lane/up", () -> "{\"route\":\"get\"}")
+    }
+}
+
+BinaryClient laneClient() = BinaryClient(LaneHolder.get().port)
+
+List<String> asUser() = listOf("X-Test-User: u1")
+
+Byte[] allBytes(n: Int) {
+    var sink = ByteSink()
+    var i = 0
+    while (i < n) {
+        sink.addByte(i * 7 + 3)
+        i = i + 1
+    }
+    return sink.toBytes()
+}
+
+Long sumOf(data: Byte[]) {
+    var sum = 0L
+    var i = 0
+    while (i < data.length) {
+        sum = sum + Bytes.at(data, i)
+        i = i + 1
+    }
+    return sum
+}
+
+test "a claim matches by method and exact path with param segments" {
+    LaneHolder.get()
+    Check.isTrue("exact", BinaryLane.routeMax("POST", "/lane/up") == 400000L)
+    Check.isTrue("v1 alias", BinaryLane.routeMax("POST", "/v1/lane/up") == 400000L)
+    Check.isTrue("param segment", BinaryLane.routeMax("POST", "/lane/item/abc") == 1024L)
+    Check.isTrue("other method", BinaryLane.routeMax("PUT", "/lane/up") == -1L)
+    Check.isTrue("get", BinaryLane.routeMax("GET", "/lane/up") == -1L)
+    Check.isTrue("child path", BinaryLane.routeMax("POST", "/lane/up/other") == -1L)
+    Check.isTrue("parent path", BinaryLane.routeMax("POST", "/lane") == -1L)
+    Check.isTrue("trailing slash", BinaryLane.routeMax("POST", "/lane/up/") == -1L)
+    Check.isTrue("empty param", BinaryLane.routeMax("POST", "/lane/item/") == -1L)
+    Check.isTrue("deeper than the param", BinaryLane.routeMax("POST", "/lane/item/a/b") == -1L)
+    Check.isTrue("a route claim is not a prefix claim", !BinaryLane.owns("/lane/up"))
+}
+
+test "a multipart body reaches the route as a parsed form and its temp files are removed" {
+    var data = allBytes(2000)
+    var body = MultipartBody.create().addText("kind", "cv").addFile("file", "a b.zip", "application/zip", data).addText("note", "olá")
+    var before = TempProbe.count("multipart-")
+    var res = laneClient().postMultipart("/lane/up", asUser(), body)
+    Check.eqInt("status", 200, res.status)
+    var parts = res.json("parts")
+    Check.eqStr("parts", "kind|cv;file|a b.zip|application/zip|2000|" + sumOf(data) + ";note|olá;", parts)
+    Check.eqInt("temp files back to what they were", before, TempProbe.count("multipart-"))
+    for (var path in LaneSeen.laneSeenPaths) {
+        Check.isTrue("file deleted " + path, !TempFiles.exists(path))
+    }
+    Check.eqInt("no ticket left", 0, BinaryLane.pendingTickets())
+}
+
+test "binary content with CRLF, dashes and a boundary lookalike survives and a body above the window is streamed" {
+    var tricky = "x\r\n--not-the-boundary\r\n--".getBytes()
+    var big = allBytes(300000)
+    var body = MultipartBody.create().addFile("small", "t.bin", "application/octet-stream", tricky).addFile("big", "big.bin", "application/octet-stream", big)
+    var res = laneClient().postMultipart("/lane/up", asUser(), body)
+    Check.eqInt("status", 200, res.status)
+    Check.eqStr("parts", "small|t.bin|application/octet-stream|" + tricky.length + "|" + sumOf(tricky) + ";big|big.bin|application/octet-stream|300000|" + sumOf(big) + ";", res.json("parts"))
+}
+
+test "the path of a claimed route with a param is part of the ticket and the alias works" {
+    var body = MultipartBody.create().addFile("file", "p.txt", "text/plain", "hello".getBytes())
+    var res = laneClient().postMultipart("/v1/lane/item/77", asUser(), body)
+    Check.eqInt("status", 200, res.status)
+    Check.eqStr("key", "POST /lane/item/77", LaneSeen.laneSeenKey)
+}
+
+test "neighbours of a claimed route keep going to the web runtime" {
+    var put = laneClient().put("/lane/up", listOf("Content-Type: text/plain"), "abc".getBytes())
+    Check.eqStr("put", "put", put.json("route"))
+    var get = laneClient().get("/lane/up", listOf<String>())
+    Check.eqStr("get", "get", get.json("route"))
+    var other = laneClient().send("POST", "/lane/up/other", listOf("Content-Type: application/json"), "{}".getBytes())
+    Check.eqStr("post on a child path", "post-other", other.json("route"))
+}
+
+test "an anonymous caller is refused before the body is read and nothing is spooled" {
+    var before = TempProbe.count("multipart-")
+    var body = MultipartBody.create().addFile("file", "a.bin", "application/octet-stream", allBytes(100000))
+    var res = laneClient().postMultipart("/lane/up", listOf<String>(), body)
+    Check.eqInt("status", 401, res.status)
+    Check.eqStr("code", "UNAUTHORIZED", res.json("code"))
+    Check.eqInt("temp files", before, TempProbe.count("multipart-"))
+    Check.eqInt("no ticket", 0, BinaryLane.pendingTickets())
+}
+
+test "a body above the claimed cap answers 413 FILE_TOO_LARGE" {
+    var body = MultipartBody.create().addFile("file", "big.bin", "application/octet-stream", allBytes(401000))
+    var res = laneClient().postMultipart("/lane/up", asUser(), body)
+    Check.eqInt("status", 413, res.status)
+    Check.eqStr("code", "FILE_TOO_LARGE", res.json("code"))
+    var small = MultipartBody.create().addFile("file", "big.bin", "application/octet-stream", allBytes(2000))
+    var item = laneClient().postMultipart("/lane/item/1", asUser(), small)
+    Check.eqInt("per-claim cap", 413, item.status)
+}
+
+test "a chunked body is refused with 411" {
+    var res = laneClient().send("POST", "/lane/up", listOf("Content-Type: " + MultipartBody.create().contentType(), "Transfer-Encoding: chunked"), "".getBytes())
+    Check.eqInt("status", 411, res.status)
+    Check.eqStr("code", "LENGTH_REQUIRED", res.json("code"))
+}
+
+test "a body that is not multipart is answered by the route with 415" {
+    var res = laneClient().send("POST", "/lane/up", listOf("Content-Type: application/json", "X-Test-User: u1"), "{\"a\":1}".getBytes())
+    Check.eqInt("status", 415, res.status)
+    Check.eqStr("code", "UNSUPPORTED_MEDIA_TYPE", res.json("code"))
+}
+
+test "an empty body is answered by the route with 400 FILE_REQUIRED" {
+    var res = laneClient().send("POST", "/lane/up", listOf("Content-Type: " + MultipartBody.create().contentType(), "X-Test-User: u1"), "".getBytes())
+    Check.eqInt("status", 400, res.status)
+    Check.eqStr("code", "FILE_REQUIRED", res.json("code"))
+}
+
+test "a form without the expected part still reaches the route" {
+    var body = MultipartBody.create().addText("only", "text")
+    var res = laneClient().postMultipart("/lane/up", asUser(), body)
+    Check.eqInt("status", 200, res.status)
+    Check.eqStr("parts", "only|text;", res.json("parts"))
+}
+
+test "malformed multipart bodies answer 400 and leave no temp file" {
+    var before = TempProbe.count("multipart-")
+    var type = "Content-Type: " + MultipartBody.create().contentType()
+    // no closing delimiter after the file
+    var open = MultipartBody.create().addFile("file", "a.bin", "application/octet-stream", allBytes(500))
+    var truncated = laneClient().send("POST", "/lane/up", listOf(type, "X-Test-User: u1"), open.sink.toBytes())
+    Check.eqInt("truncated", 400, truncated.status)
+    Check.eqStr("truncated code", "MALFORMED_MULTIPART", truncated.json("code"))
+    // garbage with no delimiter at all
+    var garbage = laneClient().send("POST", "/lane/up", listOf(type, "X-Test-User: u1"), "this is not multipart".getBytes())
+    Check.eqInt("garbage", 400, garbage.status)
+    // a part without a name
+    var anonymous = MultipartBody.create()
+    anonymous.sink.addAscii("--" + anonymous.boundary + "\r\nContent-Disposition: form-data\r\n\r\nx\r\n")
+    var noName = laneClient().send("POST", "/lane/up", listOf(type, "X-Test-User: u1"), anonymous.finish())
+    Check.eqInt("no name", 400, noName.status)
+    // a text part above 64 KB
+    var huge = MultipartBody.create().addText("t", strings.repeat("x", 70000))
+    var tooBig = laneClient().send("POST", "/lane/up", listOf(type, "X-Test-User: u1"), huge.finish())
+    Check.eqInt("text part cap", 400, tooBig.status)
+    // part headers that never end
+    var endless = MultipartBody.create()
+    endless.sink.addAscii("--" + endless.boundary + "\r\nX-Junk: " + strings.repeat("j", 20000) + "\r\n")
+    var headers = laneClient().send("POST", "/lane/up", listOf(type, "X-Test-User: u1"), endless.finish())
+    Check.eqInt("header cap", 400, headers.status)
+    // the first file part is on disk when the second part breaks the body
+    var broken = MultipartBody.create().addFile("file", "a.bin", "application/octet-stream", allBytes(500))
+    broken.sink.addAscii("--" + broken.boundary + "\r\nContent-Disposition: form-data; name=\"f2\"; filename=\"b.bin\"\r\n\r\nnever closed")
+    var half = laneClient().send("POST", "/lane/up", listOf(type, "X-Test-User: u1"), broken.sink.toBytes())
+    Check.eqInt("broken second part", 400, half.status)
+    Check.eqInt("temp files back to what they were", before, TempProbe.count("multipart-"))
+    Check.eqInt("no ticket left", 0, BinaryLane.pendingTickets())
+}
+
+test "the parser reads the boundary and the parameters of the part headers" {
+    Check.eqStr("quoted", "abc", MultipartParser.boundaryOf("multipart/form-data; boundary=\"abc\""))
+    Check.eqStr("token", "abc", MultipartParser.boundaryOf("Multipart/Form-Data;boundary=abc; charset=utf-8"))
+    Check.eqStr("not multipart", "", MultipartParser.boundaryOf("application/json; boundary=abc"))
+    Check.eqStr("no boundary", "", MultipartParser.boundaryOf("multipart/form-data"))
+    var header = "form-data; name=\"file\"; filename=\"..\\\\evil/../a.zip\""
+    Check.eqStr("name is not filename", "file", MultipartParser.param(header, "name") as String)
+    Check.eqStr("base name", "a.zip", MultipartParser.baseName(MultipartParser.param(header, "filename") as String))
+    Check.isTrue("absent", MultipartParser.param("form-data; name=\"x\"", "filename") == null)
+}
+
+test "a stack without claimed routes is not fronted" {
+    // The claims of this file are process-wide: the lane is on, and plain routes still answer through the front.
+    Check.isTrue("enabled", BinaryLane.enabled())
+    Check.status(LaneHolder.get().client.get("/health"), 200)
+    LaneHolder.get().stop()
+}

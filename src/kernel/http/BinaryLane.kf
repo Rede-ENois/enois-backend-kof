@@ -19,6 +19,9 @@ import kernel.time.*
 //            with `X-Kernel-Accept: <ticket>`. The front then reads N bytes from the client into a temp file,
 //            calls the route again with `X-Kernel-Binary: commit` and `X-Kernel-Ticket`, and the handler
 //            takes the file with `BinaryLane.bodyPath(ticket, user, key)` and answers the client.
+//   multipart POST (claimRoute) the same two calls, but the front parses the multipart/form-data body itself while it
+//            streams it (MultipartParser: every file part to its own temp file, text parts as strings) and the
+//            handler takes the parsed form with `BinaryUploads.receive`; see BinaryUploads.
 //   download the handler registers the stream (`BinaryLane.stream(body, length)`) and answers with
 //            `X-Kernel-Stream: <token>`; the front streams the bytes with the status and headers it got.
 //
@@ -30,6 +33,8 @@ class BinaryLane {
     static Map<String,String> binaryTicketLength = new ConcurrentHashMap<String, String>()
     static Map<String,String> binaryTicketPath = new ConcurrentHashMap<String, String>()
     static Map<String,String> binaryTicketExpiry = new ConcurrentHashMap<String, String>()
+    static Map<String,MultipartForm> binaryTicketForm = new ConcurrentHashMap<String, MultipartForm>()
+    static Map<String,String> binaryRouteClaims = new ConcurrentHashMap<String, String>()
     static Map<String,ByteStream> binaryStreamBody = new ConcurrentHashMap<String, ByteStream>()
     static Map<String,String> binaryStreamLength = new ConcurrentHashMap<String, String>()
     static Map<String,String> binaryStreamExpiry = new ConcurrentHashMap<String, String>()
@@ -39,7 +44,60 @@ class BinaryLane {
             binaryLanePrefixes.add(prefix)
         }
     }
-    static Bool enabled() = binaryLanePrefixes.size() > 0
+    // Claims one GET route (`/pages/:postId/og.png`) whose handler answers bytes with `X-Kernel-Stream`; its neighbours
+    // (`/pages/:postId`) stay ordinary routes.
+    static claimDownload(pattern: String) {
+        BinaryLane.claimRoute("GET", pattern, 0L)
+    }
+    // Claims one multipart POST route by method and exact path pattern (`/me/import/resume/prefill/:jobId`, a
+    // `:param` segment matches any one segment). Unlike a prefix claim, neighbours of the path (other methods, other
+    // paths below it) keep going to the web runtime. `maxBytes` (POST) caps the whole request body (Content-Length) and
+    // each file part; the front answers 413 FILE_TOO_LARGE above it.
+    static claimRoute(method: String, pattern: String, maxBytes: Long) {
+        binaryRouteClaims.put(method + " " + pattern, "" + maxBytes)
+    }
+    static Bool enabled() = binaryLanePrefixes.size() > 0 || binaryRouteClaims.size() > 0
+    // The body cap of the route claim that matches `method` and `path` (raw, `/v1` alias allowed), -1 when none.
+    static Long routeMax(method: String, path: String) {
+        var bare = path
+        if (bare.startsWith("/v1/")) {
+            bare = bare.substring(3)
+        }
+        if (bare.length() > 1 && bare.endsWith("/")) {
+            // `split` drops trailing empty segments: `/a/b/` would match `/a/b`.
+            return -1L
+        }
+        var segments = bare.split("/")
+        for (var claim in binaryRouteClaims.keys()) {
+            var space = claim.indexOf(" ")
+            if (claim.substring(0, space) == method && BinaryLane.matches(claim.substring(space + 1).split("/"), segments)) {
+                var max = binaryRouteClaims.get(claim)
+                if (max != null) {
+                    return max.toLong()
+                }
+            }
+        }
+        return -1L
+    }
+    static Bool matches(pattern: String[], segments: String[]) {
+        if (pattern.length != segments.length) {
+            return false
+        }
+        var i = 0
+        while (i < pattern.length) {
+            if (pattern[i].startsWith(":")) {
+                if (segments[i].length() == 0) {
+                    return false
+                }
+            }
+            else 
+                if (pattern[i] != segments[i]) {
+                    return false
+                }
+            i = i + 1
+        }
+        return true
+    }
     // Whether `path` (raw, `/v1` alias allowed) is under a claimed prefix.
     static Bool owns(path: String) {
         var bare = path
@@ -68,6 +126,19 @@ class BinaryLane {
     static attach(ticket: String, path: String) {
         binaryTicketPath.put(ticket, path)
     }
+    // The front stores the parsed multipart form (its file parts are temp files) here.
+    static attachForm(ticket: String, form: MultipartForm) {
+        binaryTicketForm.put(ticket, form)
+    }
+    // The parsed form of a received multipart body, for the user and key that were authorised (null otherwise).
+    static MultipartForm? form(ticket: String, user: String, key: String) {
+        var owner = binaryTicketUser.get(ticket)
+        var target = binaryTicketKey.get(ticket)
+        if (owner == null || target == null || owner != user || target != key) {
+            return null
+        }
+        return binaryTicketForm.get(ticket)
+    }
     // The temp file of a received body, once, for the user and key that were authorised ("" otherwise).
     static String bodyPath(ticket: String, user: String, key: String) {
         var owner = binaryTicketUser.get(ticket)
@@ -93,6 +164,11 @@ class BinaryLane {
         if (path != null) {
             TempFiles.delete(path)
         }
+        var form = binaryTicketForm.get(ticket)
+        if (form != null) {
+            form.discard()
+        }
+        binaryTicketForm.remove(ticket)
         binaryTicketUser.remove(ticket)
         binaryTicketKey.remove(ticket)
         binaryTicketLength.remove(ticket)

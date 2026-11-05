@@ -826,7 +826,9 @@ discarded: exit code, `-1` when missing or timed out (and killed).
 
 `Images` (kernel.image): `dimensions(data, exifOrientation): ImageSize?` reads the header only, `rotateJpeg(data,
 orientation)` applies EXIF orientations 2 to 8 to the pixels (16 megapixel cap), `sample/halves` build test
-fixtures. `Gate` is a lock (`enter()` / `leave()`), `Permits(max)` a non-waiting semaphore (`tryAcquire`, `release`).
+fixtures. `PageCards.render(html, author, fontPath): Byte[]` (kernel.image) draws the 1200x630 share card of a page with
+Java2D (text from jsoup, the bundled `resources/fonts/LiberationSans-Bold.ttf`, headless, a font-less fallback);
+the feed caches it as base64 in the `pagePreviewCards` TtlCache and streams it through the lane. `Gate` is a lock (`enter()` / `leave()`), `Permits(max)` a non-waiting semaphore (`tryAcquire`, `release`).
 
 ## kernel.storage: S3 without the SDK
 
@@ -848,20 +850,63 @@ AWS Signature V4, path-style or virtual-hosted, verified against the AWS documen
 ## kernel.http: the binary lane
 
 ```kotlin
-BinaryLane.claim("/storage/")                // in the module install: this prefix (and /v1/...) goes through the lane
-// upload handler (PUT)
+BinaryLane.claim("/storage/")                // in the module install: this PREFIX (and /v1/...) goes through the lane (PUT upload, GET stream)
+BinaryLane.claimRoute("POST", "/me/import/resume/prefill/:jobId", 16777216L)   // ONE method + exact path (`:param` = one segment), multipart POST
+BinaryLane.claimDownload("/pages/:postId/og.png")                             // ONE GET path whose handler answers bytes
+// raw upload handler (PUT, prefix claim)
 var phase = Req.headerOrNull("x-kernel-binary")          // "authorize" | "commit"
 ResponseHeaders.set("X-Kernel-Accept", BinaryLane.accept(userId, key, declaredLength)); return Http.respond(202, "{}")
 var path = BinaryLane.bodyPath(ticket, userId, key)      // commit: the temp file holding the body
+// multipart handler (POST, route claim)
+var userId = Auth.requireUser()                           // every check BEFORE the body is read
+var form = BinaryUploads.receive(userId, "POST /me/import/resume")   // null in the authorize phase
+if (form == null) { return BinaryUploads.authorized() }   // 202 + ticket
+var file = form.file("file")                              // MultipartPart: name, filename, contentType, path (temp file), size
+var note = form.text("note")                              // String? of a text part
 // download handler (GET)
 ResponseHeaders.set("X-Kernel-Stream", BinaryLane.stream(byteStream, length)); return Http.respond(200, "")
 ```
 
-With a claimed prefix `Platform.start`/`startAsync` run the web runtime on a loopback port and serve the public
+With any claim `Platform.start`/`startAsync` run the web runtime on a loopback port and serve the public
 port with `BinaryFront` (every other request is forwarded byte for byte, `X-Kernel-Peer` carries the client
 address and `Req.peerAddress()` honours it only from a loopback peer; client-sent `X-Kernel-*` and `Expect` are
-dropped). `REDE_BINARY_MAX_BODY_BYTES` (default 545259520) caps one upload. Why and what it costs: `docs/PORTING_STATUS.md`
-(media) and G161. Tests use `BinaryClient(app.port)` (`get`, `put`, `send` with `Byte[]` bodies, `BinaryResponse.body`).
+dropped). `REDE_BINARY_MAX_BODY_BYTES` (default 545259520) caps one raw upload. Why and what it costs: `docs/PORTING_STATUS.md`
+(media) and G161. Tests use `BinaryClient(app.port)` (`get`, `put`, `send`, `postMultipart` with `MultipartBody`,
+`Byte[]` bodies, `BinaryResponse.body`) and `TempProbe.count(prefix)` to prove no temp file is left behind.
+
+### Method + path claims
+
+A prefix claim (`claim`) pulls everything below the prefix into the lane, which is right for `/storage/` and wrong
+for an endpoint that shares its path with ordinary routes. A route claim (`claimRoute`, `claimDownload`) matches
+`method + exact path` after the `/v1` alias is stripped: segments are compared one by one, a `:param` segment
+matches any non-empty segment, a trailing slash or an extra segment does not match. Everything else (other
+methods on the same path, children, parents) keeps going to the web runtime untouched. A route claim never makes
+`BinaryLane.owns(path)` true, so it adds no PUT/GET prefix behaviour. The handler is registered with the
+normal `server.post(...)` / `server.get(...)` and keeps the whole filter chain (origin, CSRF, rate limits, auth).
+
+### Multipart POST: the sequence
+
+1. The front reads only the head. A claimed POST with `Transfer-Encoding` answers `411 LENGTH_REQUIRED`; a
+   `Content-Length` above the claim cap answers `413 FILE_TOO_LARGE` (after reading up to 16 MB of the refused body
+   so closing does not reset the answer); no multipart `Content-Type`, or no body, goes to the route as an
+   ordinary request (filters, then `401`/`415`/`400 FILE_REQUIRED` from `BinaryUploads.receive`).
+2. Authorize: the route is called with `Content-Length: 0`, `X-Kernel-Binary: authorize` and the declared length.
+   The handler runs its checks (a session, the job exists, ...) and answers `202` with a ticket
+   (`BinaryUploads.receive` + `authorized`). **A body nobody authorised is never read.** Any other answer is relayed.
+3. The front reads the body through `MultipartParser` (RFC 7578): a 64 KB window, the delimiter searched on bytes,
+   every file part streamed to its own temp file, text parts (64 KB max each) kept as strings, at most 16 parts,
+   part headers at most 8 KB. Failures: `413 FILE_TOO_LARGE` (a file part over the cap), `400 MALFORMED_MULTIPART`
+   (truncated body, no delimiter, a part without a name, an oversized text part or header), `400 UPLOAD_FAILED` (disk
+   or stream). Each is answered by the front with the JSON error shape and the temp files already written are
+   deleted.
+4. Commit: the route is called again with `X-Kernel-Binary: commit` and the ticket; `receive` hands over the parsed
+   form (ticket, user and key must match the authorization) and the handler answers the client.
+5. The lane discards the ticket after the answer (success, failure or exception): the temp files of the form are
+   deleted. A ticket nobody claims expires after two minutes and is swept (files deleted).
+
+One upload costs two filter-chain passes (authorize and commit), so a per-IP rate limit counts it twice. The key
+passed to `receive` (`"POST " + path` with the real param values) is the ticket scope.
+
 ## kernel.push (web push adapter)
 
 `kernel.push.WebPushAdapter` is the only file that imports the web-push library (jars in `kofdeps`:
@@ -922,12 +967,13 @@ doing it" form used by the emotes refresh (call `leave()` after a true).
 
 ### BinaryFront: design, cost and the rule about its port
 
-Active only when a module called `BinaryLane.claim(prefix)` before `Platform.start`. With no claimed prefix
+Active only when a module called `BinaryLane.claim(prefix)`, `claimRoute` or `claimDownload` before `Platform.start`. With no claimed prefix
 `Platform` runs the web runtime directly on the public port (no front, no extra hop; asserted by
 `tests/kernel/BinaryLaneTest.kf`). With a claim, the web runtime listens on a loopback port chosen at boot and the
 front owns the public one: every request is parsed up to its head and piped byte for byte, except `PUT` and `GET`
 under a claimed prefix (two internal calls for an upload, a stream swap for a download). Cost: one loopback hop per
-request, one temp file per upload (`java.io.tmpdir`), and a thread per connection.
+request, one temp file per upload (`java.io.tmpdir`), and a thread per connection. A connection whose handler crashes
+is logged (`front_connection_crashed`) and closed, never left open.
 
 **The internal port must never be published or routed to** (docker `ports:`, a Traefik/Cloudflare route, a
 firewall rule): it trusts `X-Kernel-Peer`, `X-Kernel-Binary` and ticket headers that only the front sets. The front
