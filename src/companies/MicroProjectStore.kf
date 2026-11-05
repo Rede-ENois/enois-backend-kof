@@ -1,0 +1,102 @@
+package companies
+
+import kernel.db.*
+
+// SQL of `micro_projects`, `micro_project_proposals` and `micro_project_reviews` (MicroProjectPersistenceAdapter).
+class MicroProjectStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, company_id, created_by, title, problem, scope, deliverables, acceptance_criteria, budget, deadline, status, selected_proposal_id, created_at, updated_at"
+    static String proposalColumns() = "id, project_id, user_id, message, status, proposed_at, decided_at, conversation_id"
+    static MicroProject project(r: DbRow) = MicroProject(r.getStr("id"), r.getStr("company_id"), r.getStr("created_by"), r.getStr("title"), r.getStr("problem"), r.getStrOrNull("scope"), r.getStrOrNull("deliverables"), r.getStrOrNull("acceptance_criteria"), r.getStrOrNull("budget"), r.getDateOrNull("deadline"), r.getStr("status"), r.getStrOrNull("selected_proposal_id"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    static MicroProjectProposal proposal(r: DbRow) = MicroProjectProposal(r.getStr("id"), r.getStr("project_id"), r.getStr("user_id"), r.getStr("message"), r.getStr("status"), r.getInstant("proposed_at"), r.getInstantOrNull("decided_at"), r.getStrOrNull("conversation_id"))
+    static MicroProjectReview review(r: DbRow) = MicroProjectReview(r.getStr("project_id"), r.getStr("company_id"), r.getStr("user_id"), r.getInt("rating"), r.getStrOrNull("text"), r.getInstant("created_at"))
+    static List<MicroProject> projects(rows: List<DbRow>) {
+        var out = listOf<MicroProject>()
+        for (var r in rows) {
+            out.add(MicroProjectStore.project(r))
+        }
+        return out
+    }
+    static List<MicroProjectProposal> proposals(rows: List<DbRow>) {
+        var out = listOf<MicroProjectProposal>()
+        for (var r in rows) {
+            out.add(MicroProjectStore.proposal(r))
+        }
+        return out
+    }
+    save(p: MicroProject) {
+        var exists = store.queryLong("select count(*) from micro_projects where id = ?", DbParams().bindStr(p.id)) > 0L
+        if (exists) {
+            store.execute("update micro_projects set title = ?, problem = ?, scope = ?, deliverables = ?, acceptance_criteria = ?, budget = ?, deadline = ?, status = ?, selected_proposal_id = ?, updated_at = ? where id = ?", DbParams().bindStr(p.title).bindStr(p.problem).bindStrOrNull(p.scope).bindStrOrNull(p.deliverables).bindStrOrNull(p.acceptanceCriteria).bindStrOrNull(p.budget).bindDateOrNull(p.deadline).bindStr(p.status).bindStrOrNull(p.selectedProposalId).bindInstant(p.updatedAt).bindStr(p.id))
+        }
+        else {
+            store.execute("insert into micro_projects (" + MicroProjectStore.columns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(p.id).bindStr(p.companyId).bindStr(p.createdBy).bindStr(p.title).bindStr(p.problem).bindStrOrNull(p.scope).bindStrOrNull(p.deliverables).bindStrOrNull(p.acceptanceCriteria).bindStrOrNull(p.budget).bindDateOrNull(p.deadline).bindStr(p.status).bindStrOrNull(p.selectedProposalId).bindInstant(p.createdAt).bindInstant(p.updatedAt))
+        }
+    }
+    MicroProject? findById(id: String) {
+        var r = store.queryOptional("select " + MicroProjectStore.columns() + " from micro_projects where id = ?", DbParams().bindStr(id))
+        if (r == null) {
+            return null
+        }
+        return MicroProjectStore.project(r)
+    }
+    MicroProject? findByIdForUpdate(id: String) {
+        var r = store.queryOptional("select " + MicroProjectStore.columns() + " from micro_projects where id = ? for update", DbParams().bindStr(id))
+        if (r == null) {
+            return null
+        }
+        return MicroProjectStore.project(r)
+    }
+    // Showcase: open projects, newest first.
+    List<MicroProject> findOpen(limit: Int) = MicroProjectStore.projects(store.queryList("select " + MicroProjectStore.columns() + " from micro_projects where status = \'OPEN\' order by created_at desc limit ?", DbParams().bindInt(limit)))
+    // Every project of a company but the cancelled ones, at most 50 (dashboard and public page).
+    List<MicroProject> findByCompany(companyId: String) = MicroProjectStore.projects(store.queryList("select " + MicroProjectStore.columns() + " from micro_projects where company_id = ? and status <> \'CANCELLED\' order by created_at desc limit 50", DbParams().bindStr(companyId)))
+    saveProposal(p: MicroProjectProposal) {
+        var exists = store.queryLong("select count(*) from micro_project_proposals where id = ?", DbParams().bindStr(p.id)) > 0L
+        if (exists) {
+            store.execute("update micro_project_proposals set message = ?, status = ?, decided_at = ?, conversation_id = ? where id = ?", DbParams().bindStr(p.message).bindStr(p.status).bindInstantOrNull(p.decidedAt).bindStrOrNull(p.conversationId).bindStr(p.id))
+        }
+        else {
+            store.execute("insert into micro_project_proposals (" + MicroProjectStore.proposalColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(p.id).bindStr(p.projectId).bindStr(p.userId).bindStr(p.message).bindStr(p.status).bindInstant(p.proposedAt).bindInstantOrNull(p.decidedAt).bindStrOrNull(p.conversationId))
+        }
+    }
+    MicroProjectProposal? findProposalById(id: String) {
+        var r = store.queryOptional("select " + MicroProjectStore.proposalColumns() + " from micro_project_proposals where id = ?", DbParams().bindStr(id))
+        if (r == null) {
+            return null
+        }
+        return MicroProjectStore.proposal(r)
+    }
+    // Locks the proposal rows of the project, true when there is any (an edit must not race a proposal).
+    Bool hasProposalsForUpdate(projectId: String) = store.queryList("select id from micro_project_proposals where project_id = ? for update", DbParams().bindStr(projectId)).size() > 0
+    Bool existsProposalByUser(projectId: String, userId: String) = store.queryLong("select count(*) from micro_project_proposals where project_id = ? and user_id = ?", DbParams().bindStr(projectId).bindStr(userId)) > 0L
+    List<MicroProjectProposal> proposalsOfProject(projectId: String) = MicroProjectStore.proposals(store.queryList("select " + MicroProjectStore.proposalColumns() + " from micro_project_proposals where project_id = ? order by proposed_at asc", DbParams().bindStr(projectId)))
+    // The newest 20 proposals a person sent.
+    List<MicroProjectProposal> proposalsOfUser(userId: String) = MicroProjectStore.proposals(store.queryList("select " + MicroProjectStore.proposalColumns() + " from micro_project_proposals where user_id = ? order by proposed_at desc limit 20", DbParams().bindStr(userId)))
+    Long countByCompanyAndStatus(companyId: String, status: String) = store.queryLong("select count(*) from micro_projects where company_id = ? and status = ?", DbParams().bindStr(companyId).bindStr(status))
+    // Open microprojects per company, in one grouped read.
+    Map<String,Long> openCountsByCompany(companyIds: List<String>) {
+        Map<String,Long> out = mapOf()
+        if (companyIds.size() == 0) {
+            return out
+        }
+        for (var r in store.queryList("select company_id, count(*) as total from micro_projects where status = \'OPEN\' and company_id in (" + CompanyStore.marks(companyIds.size()) + ") group by company_id", CompanyStore.binds(companyIds))) {
+            out.put(r.getStr("company_id"), r.getLong("total"))
+        }
+        return out
+    }
+    saveReview(r: MicroProjectReview) {
+        store.execute("insert into micro_project_reviews (project_id, company_id, user_id, rating, text, created_at) values (?, ?, ?, ?, ?, ?)", DbParams().bindStr(r.projectId).bindStr(r.companyId).bindStr(r.userId).bindInt(r.rating).bindStrOrNull(r.text).bindInstant(r.createdAt))
+    }
+    // The latest six reviews of a company, newest first.
+    List<MicroProjectReview> latestReviews(companyId: String) {
+        var out = listOf<MicroProjectReview>()
+        for (var r in store.queryList("select project_id, company_id, user_id, rating, text, created_at from micro_project_reviews where company_id = ? order by created_at desc limit 6", DbParams().bindStr(companyId))) {
+            out.add(MicroProjectStore.review(r))
+        }
+        return out
+    }
+}

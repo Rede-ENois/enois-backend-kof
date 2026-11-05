@@ -1,0 +1,83 @@
+import app.*
+import kernel.testkit.*
+import profile.*
+
+// Port of MicroProjectEditTests: editing and removing a microproject (team roles, validation, visibility after the
+// removal) and the contract guard (an open project with proposals, and accepted work, are neither edited nor removed).
+String mpFields(title: String, problem: String, deliverables: String, criteria: String, budget: String) = "{\"title\":\"" + title + "\",\"problem\":\"" + problem + "\",\"deliverables\":\"" + deliverables + "\",\"acceptanceCriteria\":\"" + criteria + "\",\"budget\":\"" + budget + "\"}"
+
+test "editingRemovingAndAuthorization" {
+    var owner = OrgsTestKit.login("mpedit_owner")
+    var editor = OrgsTestKit.login("mpedit_editor")
+    var outsider = OrgsTestKit.login("mpedit_outsider")
+    var recruiter = OrgsTestKit.login("mpedit_recruiter")
+    var guest = OrgsTestKit.anonymous()
+    var company = owner.post("/empresas", "{\"name\":\"Empresa Editar mpedit1\",\"description\":\"Pagina de teste.\"}")
+    Check.status(company, 200)
+    var companyId = OrgsTestKit.str(company, "id")
+    var slug = OrgsTestKit.str(company, "slug")
+    Check.status(owner.post("/empresas/" + companyId + "/members", "{\"userId\":\"mpedit_editor\",\"role\":\"EDITOR\"}"), 200)
+    Check.status(owner.post("/empresas/" + companyId + "/members", "{\"userId\":\"mpedit_recruiter\",\"role\":\"RECRUITER\"}"), 200)
+    var fields = mpFields("Microprojeto original", "Um problema suficientemente longo para o teste de projeto.", "Entrega original", "Criterio original", "100")
+    var created = owner.post("/empresas/" + companyId + "/microprojetos", fields)
+    Check.status(created, 200)
+    var id = OrgsTestKit.str(created, "id")
+    var path = "/microprojetos/" + id
+    var updated = mpFields("Microprojeto corrigido", "Outro problema suficientemente longo para o teste de projeto.", "Entrega corrigida", "Criterio corrigido", "200")
+    // Outside the page and a recruiter (below EDITOR) cannot edit or remove; a visitor is not signed in.
+    Check.status(outsider.put(path, updated), 403)
+    Check.status(outsider.delete(path), 403)
+    Check.status(recruiter.put(path, updated), 403)
+    Check.status(recruiter.delete(path), 403)
+    Check.status(guest.put(path, updated), 401)
+    Check.status(guest.delete(path), 401)
+    // Validation: a short title, a budget over the column ceiling.
+    Check.status(editor.put(path, "{\"title\":\"Curto\"}"), 400)
+    Check.status(editor.put(path, mpFields("Microprojeto corrigido", "Outro problema suficientemente longo para o teste de projeto.", "Entrega corrigida", "Criterio corrigido", strings.repeat("x", 161))), 400)
+    Check.status(editor.put(path, updated), 200)
+    var read = guest.get(path)
+    Check.status(read, 200)
+    Check.jsonEq(read, "project.title", "Microprojeto corrigido")
+    Check.jsonEq(read, "project.deliverables", "Entrega corrigida")
+    Check.jsonEq(read, "project.problem", "Outro problema suficientemente longo para o teste de projeto.")
+    Check.jsonEq(read, "project.acceptanceCriteria", "Criterio corrigido")
+    Check.jsonEq(read, "project.budget", "200")
+    var removed = owner.delete(path)
+    Check.status(removed, 200)
+    Check.jsonEq(removed, "status", "CANCELLED")
+    Check.status(guest.get(path), 404)
+    var open = guest.get("/microprojetos?limit=100")
+    Check.status(open, 200)
+    Check.isTrue("removed project is not listed", !open.body.contains("\"id\":\"" + id + "\""))
+    var page = guest.get("/empresa/" + slug)
+    Check.eqInt("no projects on the page", 0, page.jsonSize("projects"))
+    Check.jsonEq(page, "stats.openProjects", "0")
+    Check.status(owner.delete(path), 409)
+}
+
+test "proposalsAndAcceptedWorkProtectTheContract" {
+    var owner = OrgsTestKit.login("mpedit_flow_owner")
+    var professional = OrgsTestKit.activateProfessional("mpedit_flow_pro")
+    var company = owner.post("/empresas", "{\"name\":\"Empresa Contrato mpedit2\",\"description\":\"Pagina de teste.\"}")
+    Check.status(company, 200)
+    var fields = mpFields("Projeto com candidato", "Um problema suficientemente longo para o teste de projeto.", "Entrega", "Criterio", "100")
+    var result = owner.post("/empresas/" + OrgsTestKit.str(company, "id") + "/microprojetos", fields)
+    Check.status(result, 200)
+    var path = "/microprojetos/" + OrgsTestKit.str(result, "id")
+    var proposal = professional.post(path + "/proposals", "{\"message\":\"Entrego em tres dias, ja fiz landing pages de campanha antes.\"}")
+    Check.status(proposal, 200)
+    var proposalId = OrgsTestKit.str(proposal, "id")
+    var phase = 0
+    while (phase < 3) {
+        Check.status(owner.put(path, fields), 409)
+        Check.status(owner.delete(path), 409)
+        if (phase == 0) {
+            Check.status(owner.post(path + "/proposals/" + proposalId + "/select", ""), 200)
+        }
+        if (phase == 1) {
+            Check.status(owner.post(path + "/complete", ""), 200)
+        }
+        phase = phase + 1
+    }
+    OrgsTestKit.finish()
+}

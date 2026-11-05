@@ -1,0 +1,62 @@
+import app.*
+import kernel.db.*
+import kernel.files.*
+import kernel.testkit.*
+
+// Port of LinkSchemeAllowlistTests.companyWebsiteRejectsScriptSchemes: the website of a page refuses every disguised
+// script scheme (400 INVALID_URL), keeps a plain https one, and the V180 migration neutralises the rows stored before
+// the allowlist (replayed here over a planted row).
+List<String> lsDisguised() = listOf("javascript:alert(1)", "  JaVaScRiPt:alert(1)", "java\tscript:alert(1)", "java\nscript:alert(1)", "\u0001javascript:alert(1)", "java​script:alert(1)", "java\\script:alert(1)", "vbscript:msgbox(1)", "data:text/html,<script>alert(1)</script>")
+
+// The migration statements: comment lines dropped, split at the semicolons.
+List<String> lsMigration() {
+    var text = UploadFiles.readText("resources/db/migration/V180__neutralize_unsafe_link_schemes.sql")
+    var clean = ""
+    for (var line in text.split("\n")) {
+        if (!line.trim().startsWith("--")) {
+            clean = clean + line + "\n"
+        }
+    }
+    var out = listOf<String>()
+    for (var statement in clean.split(";")) {
+        if (statement.trim().length() > 0) {
+            out.add(statement.trim())
+        }
+    }
+    return out
+}
+
+String? lsWebsiteAfterMigration(companyId: String, website: String) {
+    var store = OrgsTestKit.db()
+    store.execute("update companies set website = ? where id = ?", DbParams().bindStr(website).bindStr(companyId))
+    for (var statement in lsMigration()) {
+        store.execute(statement, DbParams())
+    }
+    return store.queryOne("select website from companies where id = ?", DbParams().bindStr(companyId)).getStrOrNull("website")
+}
+
+test "companyWebsiteRejectsScriptSchemes" {
+    var owner = OrgsTestKit.login("linkscheme_owner")
+    var created = owner.post("/empresas", "{\"name\":\"Link Scheme Ltda\",\"description\":\"Empresa de teste.\",\"sector\":\"Tecnologia\",\"size\":\"1-10\",\"location\":\"Remoto\"}")
+    Check.status(created, 200)
+    var companyId = OrgsTestKit.str(created, "id")
+    for (var website in lsDisguised()) {
+        Check.apiError(owner.patch("/empresas/" + companyId, "{\"name\":\"Link Scheme Ltda\",\"website\":" + json.encode(website) + "}"), 400, "INVALID_URL")
+    }
+    Check.status(owner.patch("/empresas/" + companyId, "{\"name\":\"Link Scheme Ltda\",\"website\":\"https://linkscheme.test\"}"), 200)
+    Check.jsonEq(OrgsTestKit.anonymous().get("/empresa/" + OrgsTestKit.str(created, "slug")), "website", "https://linkscheme.test")
+    // Rows stored before the allowlist are neutralised by the migration (re-run here on a planted row).
+    for (var unsafe in lsDisguised()) {
+        if (unsafe.contains("​") || unsafe.contains("\\")) {
+            continue
+        }
+        Check.isTrue("neutralised " + unsafe, lsWebsiteAfterMigration(companyId, unsafe) == null)
+    }
+    for (var unsafe in listOf("javascript:1/alert(1)//", "javascript:1?alert(1):0", "\u0001 javascript:alert(1)", "FILE:///etc/passwd", "  \u001f\tvbscript:x")) {
+        Check.isTrue("neutralised " + unsafe, lsWebsiteAfterMigration(companyId, unsafe) == null)
+    }
+    // Scheme-less values, host:port and allowed schemes stay.
+    for (var kept in listOf("meusite.com", "meusite.com:8080", "meusite.com:8080/a", "localhost:3000", "www.site.com/a:b", "HTTPS://X.TEST", "mailto:a@b.test", "Data e hora", "https://x.test/?q=javascript:1")) {
+        Check.eqStr("kept " + kept, kept, lsWebsiteAfterMigration(companyId, kept) as String)
+    }
+}

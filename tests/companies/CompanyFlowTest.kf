@@ -1,0 +1,102 @@
+import app.*
+import kernel.testkit.*
+import profile.*
+
+// Port of CompanyFlowTests: the whole life of a company page with microprojects (page, project with deliverables
+// and acceptance criteria, application, selection, completion), the owner role that cannot be granted, what each
+// viewer sees and the accent-keeping slug.
+String cfProjectBody(title: String, problem: String, deliverables: String, criteria: String) = "{\"title\":\"" + title + "\",\"problem\":\"" + problem + "\",\"deliverables\":\"" + deliverables + "\",\"acceptanceCriteria\":\"" + criteria + "\"}"
+
+String cfCreatePage(owner: ProfileCaller, body: String) {
+    var res = owner.post("/empresas", body)
+    Check.status(res, 200)
+    return OrgsTestKit.str(res, "id")
+}
+
+test "companyMicroProjectFlowEndToEnd" {
+    var owner = OrgsTestKit.login("cflow_owner")
+    var pro = OrgsTestKit.activateProfessional("cflow_pro")
+    var created = owner.post("/empresas", "{\"name\":\"Estudio Game Dev\",\"description\":\"Estudio de jogos indie.\",\"sector\":\"Tecnologia\",\"size\":\"1-10\",\"location\":\"Remoto\"}")
+    Check.status(created, 200)
+    Check.jsonEq(created, "slug", "estudio-game-dev")
+    var companyId = OrgsTestKit.str(created, "id")
+    // Missing deliverables / criteria: refused.
+    Check.status(owner.post("/empresas/" + companyId + "/microprojetos", "{\"title\":\"Prototipo de menu\",\"problem\":\"problema curto demais\"}"), 400)
+    var project = owner.post("/empresas/" + companyId + "/microprojetos", "{\"title\":\"Prototipo de menu principal em Unity\",\"problem\":\"O menu atual traveta em mobile e precisamos de um prototipo navegavel com foco em gamepad.\",\"scope\":\"Somente a cena de menu; gameplay fora do escopo.\",\"deliverables\":\"Cena Unity navegavel\\nBuild WebGL\",\"acceptanceCriteria\":\"Navega com gamepad sem travar; roda em WebGL 60fps\",\"budget\":\"R$ 2.500\",\"deadline\":\"2026-12-31\"}")
+    Check.status(project, 200)
+    Check.jsonEq(project, "status", "OPEN")
+    var projectId = OrgsTestKit.str(project, "id")
+    var open = OrgsTestKit.anonymous().get("/microprojetos?limit=100")
+    Check.status(open, 200)
+    Check.isTrue("listed as OPEN", open.body.contains("\"id\":\"" + projectId + "\""))
+    var proposal = pro.post("/microprojetos/" + projectId + "/proposals", "{\"message\":\"Faco isso em uma semana; ja entreguei menus com gamepad em dois jogos.\"}")
+    Check.status(proposal, 200)
+    var proposalId = OrgsTestKit.str(proposal, "id")
+    // The owner does not apply to the project of their own page.
+    Check.status(owner.post("/microprojetos/" + projectId + "/proposals", "{\"message\":\"candidatura do proprio dono\"}"), 403)
+    var detail = owner.get("/microprojetos/" + projectId)
+    Check.status(detail, 200)
+    Check.jsonEq(detail, "proposals.0.status", "SENT")
+    var selected = owner.post("/microprojetos/" + projectId + "/proposals/" + proposalId + "/select", "")
+    Check.status(selected, 200)
+    Check.jsonEq(selected, "status", "IN_PROGRESS")
+    var completed = owner.post("/microprojetos/" + projectId + "/complete", "")
+    Check.status(completed, 200)
+    Check.jsonEq(completed, "status", "COMPLETED")
+    var page = OrgsTestKit.anonymous().get("/empresa/estudio-game-dev")
+    Check.status(page, 200)
+    Check.jsonEq(page, "name", "Estudio Game Dev")
+    Check.jsonEq(page, "projects.0.status", "COMPLETED")
+}
+
+test "ownerRoleCannotBeGrantedToAMember" {
+    var owner = OrgsTestKit.login("cflow_role_owner")
+    var other = OrgsTestKit.login("cflow_role_other")
+    var companyId = cfCreatePage(owner, "{\"name\":\"Empresa Papeis cflowrole\",\"description\":\"Pagina para testar papeis.\",\"sector\":\"Tecnologia\",\"size\":\"1-10\",\"location\":\"Remoto\"}")
+    Check.apiError(owner.post("/empresas/" + companyId + "/members", "{\"userId\":\"cflow_role_other\",\"role\":\"OWNER\"}"), 400, "INVALID_ROLE")
+    Check.status(owner.post("/empresas/" + companyId + "/members", "{\"userId\":\"cflow_role_other\",\"role\":\"SUPERUSER\"}"), 400)
+}
+
+test "eachViewerSeesWhereTheyStand" {
+    var owner = OrgsTestKit.login("cflow_view_owner")
+    var editor = OrgsTestKit.login("cflow_view_editor")
+    var pro = OrgsTestKit.activateProfessional("cflow_view_pro")
+    var outsider = OrgsTestKit.login("cflow_view_out")
+    var created = owner.post("/empresas", "{\"name\":\"Empresa Visao cflowview\",\"description\":\"Pagina de teste.\"}")
+    Check.status(created, 200)
+    var companyId = OrgsTestKit.str(created, "id")
+    var slug = OrgsTestKit.str(created, "slug")
+    var member = owner.post("/empresas/" + companyId + "/members", "{\"userId\":\"cflow_view_editor\",\"role\":\"EDITOR\"}")
+    Check.status(member, 200)
+    Check.jsonEq(member, "person.id", "cflow_view_editor")
+    var project = owner.post("/empresas/" + companyId + "/microprojetos", cfProjectBody("Landing page da campanha", "Precisamos de uma landing page simples para a campanha de fim de ano.", "Pagina publicada", "Carrega em menos de 2s"))
+    Check.status(project, 200)
+    var projectId = OrgsTestKit.str(project, "id")
+    Check.status(pro.post("/microprojetos/" + projectId + "/proposals", "{\"message\":\"Entrego em tres dias, ja fiz landing pages de campanha antes.\"}"), 200)
+    // Who sent a proposal sees it on the card; the team sees the count and who sent it.
+    var asPro = pro.get("/empresa/" + slug)
+    Check.jsonEq(asPro, "projects.0.myProposal", "SENT")
+    Check.isTrue("no count for the proposer", asPro.jsonIsNull("projects.0.proposalCount"))
+    Check.jsonEq(owner.get("/empresa/" + slug), "projects.0.proposalCount", "1")
+    Check.jsonEq(owner.get("/microprojetos/" + projectId), "proposals.0.person.id", "cflow_view_pro")
+    // Someone signed in but outside the company reads the project, without the proposals.
+    var asOutsider = outsider.get("/microprojetos/" + projectId)
+    Check.status(asOutsider, 200)
+    Check.eqInt("no proposals", 0, asOutsider.jsonSize("proposals"))
+    // A member who is not the owner finds the page among their own; the team stays internal.
+    var mine = editor.get("/empresas/mine")
+    Check.isTrue("page among the editor\'s own", mine.body.contains("\"id\":\"" + companyId + "\""))
+    Check.status(outsider.get("/empresas/" + companyId + "/members"), 403)
+    var team = editor.get("/empresas/" + companyId + "/members")
+    Check.status(team, 200)
+    Check.isTrue("owner listed with a username", team.body.contains("\"userId\":\"cflow_view_owner\""))
+    Check.isTrue("person of the owner", team.body.contains("\"person\":{\"id\":\"cflow_view_owner\",\"username\":\"cflow_view_owner\""))
+}
+
+test "theAddressKeepsTheLettersOfAnAccentedName" {
+    var owner = OrgsTestKit.login("cflow_slug_owner")
+    var res = owner.post("/empresas", "{\"name\":\"Estúdio Ação abc123\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "slug", "estudio-acao-abc123")
+    OrgsTestKit.finish()
+}

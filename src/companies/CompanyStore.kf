@@ -1,0 +1,146 @@
+package companies
+
+import kernel.db.*
+
+// SQL of `companies`, `company_memberships` and `company_follows` (CompanyPersistenceAdapter).
+class CompanyStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, slug, name, description, sector, size, location, website, logo, cover, owner_user_id, status, created_at, updated_at"
+    static Company company(r: DbRow) = Company(r.getStr("id"), r.getStr("slug"), r.getStr("name"), r.getStrOrNull("description"), r.getStrOrNull("sector"), r.getStrOrNull("size"), r.getStrOrNull("location"), r.getStrOrNull("website"), r.getStrOrNull("logo"), r.getStrOrNull("cover"), r.getStr("owner_user_id"), r.getStr("status"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    static CompanyMember member(r: DbRow) = CompanyMember(r.getStr("id"), r.getStr("company_id"), r.getStr("user_id"), r.getStr("role"), r.getInstant("created_at"))
+    static String marks(n: Int) {
+        var parts = listOf<String>()
+        var i = 0
+        while (i < n) {
+            parts.add("?")
+            i = i + 1
+        }
+        return String.join(",", parts)
+    }
+    static DbParams binds(ids: List<String>) {
+        var p = DbParams()
+        for (var id in ids) {
+            p.bindStr(id)
+        }
+        return p
+    }
+    static List<Company> companies(rows: List<DbRow>) {
+        var out = listOf<Company>()
+        for (var r in rows) {
+            out.add(CompanyStore.company(r))
+        }
+        return out
+    }
+    // Insert or update by id (the JPA save).
+    save(c: Company) {
+        var exists = store.queryLong("select count(*) from companies where id = ?", DbParams().bindStr(c.id)) > 0L
+        if (exists) {
+            store.execute("update companies set slug = ?, name = ?, description = ?, sector = ?, size = ?, location = ?, website = ?, logo = ?, cover = ?, owner_user_id = ?, status = ?, updated_at = ? where id = ?", DbParams().bindStr(c.slug).bindStr(c.name).bindStrOrNull(c.description).bindStrOrNull(c.sector).bindStrOrNull(c.size).bindStrOrNull(c.location).bindStrOrNull(c.website).bindStrOrNull(c.logo).bindStrOrNull(c.cover).bindStr(c.ownerUserId).bindStr(c.status).bindInstant(c.updatedAt).bindStr(c.id))
+        }
+        else {
+            store.execute("insert into companies (" + CompanyStore.columns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(c.id).bindStr(c.slug).bindStr(c.name).bindStrOrNull(c.description).bindStrOrNull(c.sector).bindStrOrNull(c.size).bindStrOrNull(c.location).bindStrOrNull(c.website).bindStrOrNull(c.logo).bindStrOrNull(c.cover).bindStr(c.ownerUserId).bindStr(c.status).bindInstant(c.createdAt).bindInstant(c.updatedAt))
+        }
+    }
+    Company? findById(id: String) {
+        var r = store.queryOptional("select " + CompanyStore.columns() + " from companies where id = ?", DbParams().bindStr(id))
+        if (r == null) {
+            return null
+        }
+        return CompanyStore.company(r)
+    }
+    Company? findBySlug(slug: String) {
+        var r = store.queryOptional("select " + CompanyStore.columns() + " from companies where slug = ?", DbParams().bindStr(slug))
+        if (r == null) {
+            return null
+        }
+        return CompanyStore.company(r)
+    }
+    // Pages the user is part of, in any role (the owner is a member too), newest first.
+    List<Company> findByMember(userId: String, limit: Int) = CompanyStore.companies(store.queryList("select " + CompanyStore.columns() + " from companies where id in (select company_id from company_memberships where user_id = ?) order by created_at desc limit ?", DbParams().bindStr(userId).bindInt(limit)))
+    Bool existsBySlug(slug: String) = store.queryLong("select count(*) from companies where slug = ?", DbParams().bindStr(slug)) > 0L
+    List<Company> listAll(limit: Int) = CompanyStore.companies(store.queryList("select " + CompanyStore.columns() + " from companies order by created_at desc limit ?", DbParams().bindInt(limit)))
+    List<Company> findByIds(ids: List<String>) {
+        if (ids.size() == 0) {
+            return listOf<Company>()
+        }
+        return CompanyStore.companies(store.queryList("select " + CompanyStore.columns() + " from companies where id in (" + CompanyStore.marks(ids.size()) + ")", CompanyStore.binds(ids)))
+    }
+    // Active pages whose name contains `needle` (already lower case, no % or _) and whose sector is `sectorKey`.
+    List<Company> findActive(needle: String?, sectorKey: String?, limit: Int) {
+        var sql = "select " + CompanyStore.columns() + " from companies where status = \'ACTIVE\'"
+        var params = DbParams()
+        if (needle != null) {
+            sql = sql + " and lower(name) like ?"
+            params.bindStr("%" + needle + "%")
+        }
+        if (sectorKey != null) {
+            sql = sql + " and lower(sector) = ?"
+            params.bindStr(sectorKey)
+        }
+        sql = sql + " order by created_at desc limit ?"
+        params.bindInt(limit)
+        return CompanyStore.companies(store.queryList(sql, params))
+    }
+    List<String> activeNames() {
+        var out = listOf<String>()
+        for (var r in store.queryList("select name from companies where status = \'ACTIVE\'", DbParams())) {
+            out.add(r.getStr("name"))
+        }
+        return out
+    }
+    List<String> activeSectors() {
+        var out = listOf<String>()
+        for (var r in store.queryList("select distinct sector from companies where status = \'ACTIVE\' and sector is not null and sector <> \'\' order by sector", DbParams())) {
+            out.add(r.getStr("sector"))
+        }
+        return out
+    }
+    saveMember(m: CompanyMember) {
+        store.execute("insert into company_memberships (id, company_id, user_id, role, created_at) values (?, ?, ?, ?, ?)", DbParams().bindStr(m.id).bindStr(m.companyId).bindStr(m.userId).bindStr(m.role).bindInstant(m.createdAt))
+    }
+    CompanyMember? findMember(companyId: String, userId: String) {
+        var r = store.queryOptional("select id, company_id, user_id, role, created_at from company_memberships where company_id = ? and user_id = ?", DbParams().bindStr(companyId).bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        return CompanyStore.member(r)
+    }
+    List<CompanyMember> membersOf(companyId: String) {
+        var out = listOf<CompanyMember>()
+        for (var r in store.queryList("select id, company_id, user_id, role, created_at from company_memberships where company_id = ? order by created_at asc", DbParams().bindStr(companyId))) {
+            out.add(CompanyStore.member(r))
+        }
+        return out
+    }
+    // Idempotent: following twice keeps one row.
+    follow(companyId: String, userId: String, at: String) {
+        if (!this.isFollowing(companyId, userId)) {
+            store.execute("insert into company_follows (company_id, user_id, created_at) values (?, ?, ?)", DbParams().bindStr(companyId).bindStr(userId).bindInstant(at))
+        }
+    }
+    unfollow(companyId: String, userId: String) {
+        store.execute("delete from company_follows where company_id = ? and user_id = ?", DbParams().bindStr(companyId).bindStr(userId))
+    }
+    Bool isFollowing(companyId: String, userId: String) = store.queryLong("select count(*) from company_follows where company_id = ? and user_id = ?", DbParams().bindStr(companyId).bindStr(userId)) > 0L
+    Long followerCount(companyId: String) = store.queryLong("select count(*) from company_follows where company_id = ?", DbParams().bindStr(companyId))
+    Map<String,Long> followerCounts(companyIds: List<String>) {
+        Map<String,Long> out = mapOf()
+        if (companyIds.size() == 0) {
+            return out
+        }
+        for (var r in store.queryList("select company_id, count(*) as total from company_follows where company_id in (" + CompanyStore.marks(companyIds.size()) + ") group by company_id", CompanyStore.binds(companyIds))) {
+            out.put(r.getStr("company_id"), r.getLong("total"))
+        }
+        return out
+    }
+    List<String> followerIds(companyId: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select user_id from company_follows where company_id = ?", DbParams().bindStr(companyId))) {
+            out.add(r.getStr("user_id"))
+        }
+        return out
+    }
+}

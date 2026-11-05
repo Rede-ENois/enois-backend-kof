@@ -41,12 +41,12 @@ class OrgsTestKit {
         SecurityClock.reset()
         var created = TestApp.bootWith("orgs", merged, (p: Platform) -> {
     OrgsTestKit.orgsKitShared = AppWiring.install(p)
-    // The outbox worker and the sweeps would keep the test process alive: tests drive them by hand.
     var shared = OrgsTestKit.orgsKitShared
     if (shared != null) {
         shared.stop()
     }
 })
+        // The outbox worker and the sweeps would keep the test process alive: tests drive them by hand.
         OrgsTestKit.orgsKitApp = created
         return created
     }
@@ -66,6 +66,32 @@ class OrgsTestKit {
             throw "missing json " + path + " in " + res.body
         }
         return v
+    }
+    // A professional identity switched on through the HTTP flow (draft with a headline, then activated).
+    static ProfileCaller activateProfessional(id: String) {
+        var caller = OrgsTestKit.login(id)
+        var created = caller.post("/me/business-profile", "{\"username\":\"pro." + id + "\",\"name\":\"Perfil " + id + "\"}")
+        if (created.status != 200) {
+            throw "business profile not created: " + created.body
+        }
+        caller.patch("/me/business-profile", "{\"headline\":\"Profissional\"}")
+        var active = caller.post("/me/business-profile/activate", "")
+        if (active.status != 200) {
+            throw "business profile not activated: " + active.body
+        }
+        return caller
+    }
+    // Seeds a job row directly (the POST needs reputation and a value the tests do not care about).
+    static insertJob(id: String, title: String, company: String, postedBy: String, postedAt: String) {
+        var store = OrgsTestKit.db()
+        store.execute("delete from jobs where id = ?", DbParams().bindStr(id))
+        store.execute("insert into jobs (id, title, company, location, type, level, salary, currency, posted_by, posted_at, updated_at, community_agreed_at) values (?, ?, ?, \'Remoto\', \'CLT\', \'PLENO\', null, \'BRL\', ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(title).bindStr(company).bindStr(postedBy).bindInstant(postedAt).bindInstant(postedAt).bindInstant(postedAt))
+    }
+    // An external job of an aggregator, straight in the table.
+    static insertExternalJob(id: String, title: String, company: String, url: String, importedAt: String) {
+        var store = OrgsTestKit.db()
+        store.execute("delete from external_jobs where id = ?", DbParams().bindStr(id))
+        store.execute("insert into external_jobs (id, platform, external_id, title, company, location, salary, currency, url, imported_at, last_checked_at, external_status) values (?, \'Plataforma Teste\', ?, ?, ?, \'Remoto\', null, \'BRL\', ?, ?, ?, \'FOUND\')", DbParams().bindStr(id).bindStr(id + "-externo").bindStr(title).bindStr(company).bindStr(url).bindInstant(importedAt).bindInstant(importedAt))
     }
     // Last test of a file.
     static finish() {

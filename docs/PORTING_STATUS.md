@@ -844,6 +844,7 @@ Slug `orgs`, branch `port/orgs`, gap range G340 to G359. Test fixtures: `app.Org
 
 | Domain | Endpoints ported/total | Kof tests | Java tests ported/total |
 |---|---|---|---|
+| companies (`src/companies`, includes the microprojects) | 19/19 (`/empresas`, `/empresas/diretorio`, `/setores`, `/mine`, `PATCH /empresas/{id}`, `follow` POST/DELETE, `members` GET/POST, `POST .../microprojetos`, `GET /empresa/{slug}`, `GET /microprojetos`, `GET|PUT|DELETE /microprojetos/{id}`, `proposals`, `.../select`, `.../complete`) | `tests/companies/*` (16) | 12/12 methods + the 2 assertions `JobCompanyPageTests` left for this port + the company cases of `TextFieldLimitTests` and `LinkSchemeAllowlistTests` |
 | corporate (`src/corporate`) | 10/10 (`GET|POST|PATCH /me/business-profile`, `POST .../name`, `.../username`, `GET .../import-preview`, `POST .../import`, `.../activate`, `.../deactivate`, `GET /corporate/{username}`) | `tests/corporate/*` (33, 3 of them cover the bridges) | 31/31 methods |
 
 ### corporate notes
@@ -860,3 +861,18 @@ Slug `orgs`, branch `port/orgs`, gap range G340 to G359. Test fixtures: `app.Org
 | `JobCorporate` (jobs) | `CorporateJobsBridge` in `JobSeamSet.corporate` |
 
 `NotificationActors` and `FeedAuthors.corporateByIds` still read `corporate_profiles` read-only with the same columns (same answers; not swapped).
+
+### companies notes
+
+- The Java `companies` package also holds the microprojects marketplace; both are ported (`CompanyService`, `MicroProjectService`, `CompanyDirectoryService`). The directory reads open jobs and external job names from `jobs.JobCompanyDirectory`.
+- The `COMPANY_NEW_OPPORTUNITY` follower notice, the microproject notices (`MICROPROJETO`) and the moderation notice go through `Notifications.create`; the proposal opens a `FREELANCE` conversation through `MessagingService.freelanceConversationBetween` and posts the message; the completion bonus (+200 sparks, 3 a month, per project) goes through `CoinService.reward` and never fails the acceptance.
+- Moderation is not ported: `CompanyService.closeByModeration`, `contentOf` and `ownerOf` are the three methods the Java `CompanyModerationAdapter` (`CompanyReportReader`, `CompanyRemovalPort`) calls; the moderation port subclasses its own seams over them. `CompanyReportTests` belong to moderation.
+- `MicroProjectEditTests`/`CompanyFlowTests`/`CompanyPagesTests` run over the production wiring; `JobCompanyPageTests` post their rows with the seeded table (a real `POST /jobs` needs the live reputation of the profile domain, which the production wiring computes), so `CompanyJobsTest` seeds the open job linked to the page.
+- The V180 neutralisation of `companies.website` and the V219 backfill are replayed over planted rows (`CompanyLinkSchemeTest`, `CompanyPagesTest`).
+- A `listAll` public list applies its limit before dropping closed pages (as Java); the `PATCH` keeps blank texts as sent and `null` keeps the stored value (`Company.update`).
+
+### Seams replaced by the companies port
+
+| Seam | Now |
+|---|---|
+| `JobCompanies` (jobs) | `CompanyJobsBridge` in `JobSeamSet.companies` over `CompanyService` (page, role, recruiter gate, slugs, followers) |
