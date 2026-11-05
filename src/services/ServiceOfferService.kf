@@ -1,0 +1,244 @@
+package services
+
+import coin.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.text.*
+import profile.*
+
+// The community services directory. Same mechanics as the games: the person submits, the moderation publishes or
+// rejects, the owner edits and resubmits. The link is optional and checked by ServiceLinkGuard (https, public host,
+// no credentials in the URL). approve/reject/suspend/pending belong to the moderation domain (not ported): it calls
+// them, and the tests call them directly.
+class ServiceOfferService {
+    Db database
+    ServicesStore store
+    ProfileDirectory profiles
+    ServiceLinkGuard linkGuard
+    public constructor(database: Db, store: ServicesStore, profiles: ProfileDirectory, linkGuard: ServiceLinkGuard) {
+        this.database = database
+        this.store = store
+        this.profiles = profiles
+        this.linkGuard = linkGuard
+    }
+    static Int maxTitle() = 120
+    // The ceiling is the COLUMN's (service_offers.description is 4000 in V106; the product caps it at 2000).
+    static Int maxDescription() = 2000
+    static Int maxLink() = 500
+    ServiceOffer submit(userId: String, body: ServiceOfferBody) {
+        var category = this.parseCategory(body.category())
+        var title = this.requireTitle(body.title())
+        var description = this.requireDescription(body.description())
+        var link = this.validateLink(body.link())
+        var slug = this.uniqueSlug(userId, ServiceOfferService.slugFrom(title))
+        var now = EconomyClock.nowIso()
+        var offer = ServiceOffer(Ids.prefixed("service_"), userId, slug, title, description, link, category, "SUBMITTED", null, null, now, now)
+        store.insertOffer(offer)
+        return offer
+    }
+    ServiceOffer edit(serviceId: String, userId: String, body: ServiceOfferBody) {
+        var offer = this.owned(serviceId, userId)
+        var category = this.parseCategory(body.category())
+        var link = this.validateLink(body.link())
+        var title = this.requireTitle(body.title())
+        var description = this.requireDescription(body.description())
+        var edited = ServiceOffer(offer.id(), offer.userId(), offer.slug(), title, description, link, category, offer.status(), offer.reviewedBy(), offer.reviewNote(), offer.createdAt(), EconomyClock.nowIso())
+        store.updateOffer(edited)
+        return edited
+    }
+    delete(serviceId: String, userId: String) {
+        var offer = this.owned(serviceId, userId)
+        store.deleteOffer(offer.id())
+    }
+    // Public catalog: only the published, with an optional category and search.
+    List<ServiceOffer> catalog(category: String?, query: String?, limit: Int) {
+        var size = limit
+        if (size > 100) {
+            size = 100
+        }
+        if (size < 1) {
+            size = 1
+        }
+        var out = listOf<ServiceOffer>()
+        for (var offer in store.findOffersByStatus("PUBLISHED")) {
+            if (out.size() >= size) {
+                return out
+            }
+            if (Texts.hasText(category)) {
+                if (offer.category() != this.parseCategory(category)) {
+                    continue
+                }
+            }
+            if (!this.matches(offer, query)) {
+                continue
+            }
+            out.add(offer)
+        }
+        return out
+    }
+    // The owner opens their own service in any state; everybody else, only the published one.
+    ServiceOffer? byUserAndSlug(username: String, slug: String, viewerId: String?) {
+        var profile = profiles.findByUsername(username)
+        if (profile == null) {
+            throw Errors.api(404, "SERVICE_NOT_FOUND", "Serviço não encontrado.")
+        }
+        var offer = store.findOfferByUserAndSlug(profile.id, slug)
+        if (offer == null) {
+            return null
+        }
+        if (offer.status() == "PUBLISHED") {
+            return offer
+        }
+        if (viewerId != null) {
+            if (offer.userId() == viewerId) {
+                return offer
+            }
+        }
+        return null
+    }
+    List<ServiceOffer> mine(userId: String) = store.findOffersByUser(userId)
+    List<ServiceOffer> pending(limit: Int) {
+        var size = limit
+        if (size > 100) {
+            size = 100
+        }
+        if (size < 1) {
+            size = 1
+        }
+        var out = listOf<ServiceOffer>()
+        for (var offer in store.findOffersByStatus("SUBMITTED")) {
+            if (out.size() < size) {
+                out.add(offer)
+            }
+        }
+        return out
+    }
+    ServiceOffer approve(serviceId: String, reviewerId: String, note: String?) = this.review(serviceId, "PUBLISHED", reviewerId, ServiceOfferService.cleanNote(note))
+    ServiceOffer reject(serviceId: String, reviewerId: String, note: String?) {
+        var offer = this.byId(serviceId)
+        if (!Texts.hasText(note)) {
+            throw Errors.api(400, "REASON_REQUIRED", "Diga ao prestador o motivo da recusa.")
+        }
+        return this.transition(offer, "REJECTED", reviewerId, ServiceOfferService.cleanNote(note))
+    }
+    // The moderation taking it down: it leaves the catalog, the record stays (suspending is not deleting).
+    ServiceOffer suspend(serviceId: String, reviewerId: String, note: String?) = this.review(serviceId, "SUSPENDED", reviewerId, ServiceOfferService.cleanNote(note))
+    ServiceOffer review(serviceId: String, status: String, reviewerId: String, note: String?) = this.transition(this.byId(serviceId), status, reviewerId, note)
+    ServiceOffer transition(offer: ServiceOffer, status: String, reviewerId: String, note: String?) {
+        var changed = ServiceOffer(offer.id(), offer.userId(), offer.slug(), offer.title(), offer.description(), offer.link(), offer.category(), status, reviewerId, note, offer.createdAt(), EconomyClock.nowIso())
+        store.updateOffer(changed)
+        return changed
+    }
+    static String? cleanNote(note: String?) {
+        if (Texts.hasText(note)) {
+            return ServicesService.text(note)
+        }
+        return null
+    }
+    ServiceOffer resubmit(serviceId: String, userId: String) {
+        var offer = this.owned(serviceId, userId)
+        if (offer.status() != "REJECTED") {
+            throw Errors.api(409, "NOT_REJECTED", "Somente serviço recusado pode ser reenviado.")
+        }
+        var again = ServiceOffer(offer.id(), offer.userId(), offer.slug(), offer.title(), offer.description(), offer.link(), offer.category(), "SUBMITTED", offer.reviewedBy(), offer.reviewNote(), offer.createdAt(), EconomyClock.nowIso())
+        store.updateOffer(again)
+        return again
+    }
+    // The same conflict of interest as the games: whoever moderates does not approve their own service.
+    requireNotOwnSubmission(serviceId: String, reviewerId: String) {
+        if (this.byId(serviceId).userId() == reviewerId) {
+            throw Errors.api(403, "OWN_SUBMISSION", "Quem modera não aprova o próprio serviço.")
+        }
+    }
+    ServiceOffer byId(serviceId: String) {
+        var offer = store.findOffer(serviceId)
+        if (offer == null) {
+            throw Errors.api(404, "SERVICE_NOT_FOUND", "Serviço não encontrado.")
+        }
+        return offer
+    }
+    ServiceOffer owned(serviceId: String, userId: String) {
+        var offer = this.byId(serviceId)
+        if (offer.userId() != userId) {
+            throw Errors.api(403, "NOT_AUTHORIZED", "Somente o prestador pode fazer isso.")
+        }
+        return offer
+    }
+    // The public address of the service uses the profile username (the provider's @).
+    String? usernameOf(offer: ServiceOffer) {
+        var p = profiles.findById(offer.userId())
+        if (p == null) {
+            return null
+        }
+        return p.username
+    }
+    Bool matches(offer: ServiceOffer, query: String?) {
+        if (!Texts.hasText(query)) {
+            return true
+        }
+        var needle = ServicesService.text(query).toLowerCase()
+        return offer.title().toLowerCase().contains(needle) || offer.description().toLowerCase().contains(needle)
+    }
+    String requireTitle(title: String?) {
+        if (title == null) {
+            throw Errors.api(400, "INVALID_TITLE", "O título precisa de pelo menos 3 caracteres.")
+        }
+        var t = title.trim()
+        if (t.length() < 3) {
+            throw Errors.api(400, "INVALID_TITLE", "O título precisa de pelo menos 3 caracteres.")
+        }
+        if (t.length() > ServiceOfferService.maxTitle()) {
+            throw Errors.api(400, "INVALID_TITLE", "O título passou do limite de 120 caracteres.")
+        }
+        return t
+    }
+    String requireDescription(description: String?) {
+        if (description == null) {
+            throw Errors.api(400, "INVALID_DESCRIPTION", "Descreva o serviço em pelo menos 10 caracteres.")
+        }
+        var d = description.trim()
+        if (d.length() < 10) {
+            throw Errors.api(400, "INVALID_DESCRIPTION", "Descreva o serviço em pelo menos 10 caracteres.")
+        }
+        if (d.length() > ServiceOfferService.maxDescription()) {
+            throw Errors.api(400, "INVALID_DESCRIPTION", "A descrição passou do limite de 2.000 caracteres.")
+        }
+        return d
+    }
+    String? validateLink(link: String?) {
+        if (!Texts.hasText(link)) {
+            return null
+        }
+        var safe = linkGuard.validate(link)
+        if (safe.length() > ServiceOfferService.maxLink()) {
+            throw Errors.api(400, "INVALID_LINK", "O link passou do limite de 500 caracteres.")
+        }
+        return safe
+    }
+    String parseCategory(category: String?) {
+        var wanted = ""
+        if (category != null) {
+            wanted = category.trim().toUpperCase()
+        }
+        if (!ServiceCategories.all().contains(wanted)) {
+            throw Errors.api(400, "INVALID_CATEGORY", "Escolha uma categoria válida.")
+        }
+        return wanted
+    }
+    // Same rule as the games: an accent becomes the letter and what is not [a-z0-9] becomes a hyphen.
+    static String slugFrom(value: String) = Texts.stripAccents(value).toLowerCase().replaceAll("[^a-z0-9]+", "-").replaceAll("(^-|-$)", "")
+    String uniqueSlug(userId: String, base: String) {
+        var slug = "servico"
+        if (base.length() > 0) {
+            slug = base
+        }
+        var candidate = slug
+        var n = 2
+        while (store.findOfferByUserAndSlug(userId, candidate) != null) {
+            candidate = slug + "-" + n
+            n = n + 1
+        }
+        return candidate
+    }
+}

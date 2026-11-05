@@ -1,0 +1,488 @@
+package services
+
+import coin.*
+import kernel.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+import messaging.*
+import profile.*
+
+// Freelance services: offer (Fiverr) and request (demand), paid in sparks with ESCROW. The contract is born HELD
+// (the sparks retained), the seller delivers and the buyer accepts (releases, minus the 10% fee) or refuses
+// (100% back). Anti-noise: deliverables are mandatory and an account has at most 5 open offers.
+class ServicesService {
+    Db database
+    ServicesStore store
+    CoinService coins
+    ProfileDirectory profiles
+    MessagingService messaging
+    SuspiciousText suspiciousText
+    public constructor(database: Db, store: ServicesStore, coins: CoinService, profiles: ProfileDirectory, messaging: MessagingService, suspiciousText: SuspiciousText) {
+        this.database = database
+        this.store = store
+        this.coins = coins
+        this.profiles = profiles
+        this.messaging = messaging
+        this.suspiciousText = suspiciousText
+    }
+    static Int maxOpenListings() = 5
+    static String escrowRef(c: ServiceContract) = "svc:" + c.id()
+    // One lookup per provider, not one per service: the catalog shows dozens of offers.
+    Map<String,ServiceSeller> sellersOf(listings: List<ServiceListing>) {
+        var ids = listOf<String>()
+        for (var l in listings) {
+            if (!ids.contains(l.sellerId())) {
+                ids.add(l.sellerId())
+            }
+        }
+        var byId = new HashMap<String, ProfileRecord>()
+        for (var p in profiles.findAllByIds(ids)) {
+            byId.put(p.id, p)
+        }
+        var out = new HashMap<String, ServiceSeller>()
+        for (var id in ids) {
+            var p = byId.get(id)
+            if (p == null) {
+                out.put(id, ServiceSeller(null, null, null))
+            }
+            else {
+                out.put(id, ServiceSeller(p.name, p.avatar, ProfileDirectory.nameStyle(p)))
+            }
+        }
+        return out
+    }
+    // --- validation shared by the listing and the request ---
+    static validateCommon(category: String?, title: String?, description: String?, deliverables: String?, price: Long) {
+        if (!Texts.hasText(category)) {
+            throw Errors.api(400, "CATEGORY_REQUIRED", "A categoria é obrigatória.")
+        }
+        if (title == null) {
+            throw Errors.api(400, "TITLE_REQUIRED", "O título precisa de pelo menos 5 caracteres.")
+        }
+        if (title.trim().length() < 5) {
+            throw Errors.api(400, "TITLE_REQUIRED", "O título precisa de pelo menos 5 caracteres.")
+        }
+        if (description == null) {
+            throw Errors.api(400, "DESCRIPTION_REQUIRED", "A descrição precisa de pelo menos 20 caracteres.")
+        }
+        if (description.trim().length() < 20) {
+            throw Errors.api(400, "DESCRIPTION_REQUIRED", "A descrição precisa de pelo menos 20 caracteres.")
+        }
+        if (!Texts.hasText(deliverables)) {
+            throw Errors.api(400, "DELIVERABLES_REQUIRED", "Os entregáveis são obrigatórios — o contrato de escopo existe antes de começar.")
+        }
+        if (price <= 0L) {
+            throw Errors.api(400, "INVALID_PRICE", "O preço precisa ser positivo.")
+        }
+        // The ceilings are the columns': the database would refuse with "Data too long" and the person would get a
+        // 409 without knowing which field.
+        TextFieldLimit.check("SERVICE_FIELD_TOO_LONG", "categoria", category, 40)
+        TextFieldLimit.check("SERVICE_FIELD_TOO_LONG", "titulo", title, 160)
+        TextFieldLimit.check("SERVICE_FIELD_TOO_LONG", "descricao", description, 2000)
+        TextFieldLimit.check("SERVICE_FIELD_TOO_LONG", "entregaveis", deliverables, 1000)
+    }
+    ServiceListing newListing(sellerId: String, body: ServiceListingBody, now: String) {
+        var price = ServicesService.number(body.price())
+        ServicesService.validateCommon(body.category(), body.title(), body.description(), body.deliverables(), price)
+        var currency = "FAISCA"
+        var rawCurrency = body.currency()
+        if (rawCurrency != null) {
+            currency = rawCurrency.trim().toUpperCase()
+        }
+        if (currency != "FAISCA" && currency != "BRL") {
+            throw Errors.api(400, "INVALID_CURRENCY", "Moeda precisa ser FAISCA ou BRL.")
+        }
+        var days = 0
+        var rawDays = body.deliveryDays()
+        if (rawDays != null) {
+            days = rawDays
+        }
+        if (days <= 0 || days > 365) {
+            throw Errors.api(400, "INVALID_DELIVERY", "O prazo de entrega precisa de 1 a 365 dias.")
+        }
+        return ServiceListing(Ids.prefixed("sl_"), sellerId, ServicesService.text(body.category()), ServicesService.text(body.title()), ServicesService.text(body.description()), ServicesService.text(body.deliverables()), price, currency, days, "ACTIVE", now, now)
+    }
+    static Long number(v: Long?) {
+        if (v == null) {
+            return 0L
+        }
+        return v
+    }
+    static String text(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v.trim()
+    }
+    // --- offer (the professional publishes) ---
+    ServiceListing publishListing(sellerId: String, body: ServiceListingBody) {
+        var self = this
+        var box = listOf<ServiceListing>()
+        database.transaction(() -> {
+    box.add(self.publishInTx(sellerId, body))
+})
+        return box.get(0)
+    }
+    ServiceListing publishInTx(sellerId: String, body: ServiceListingBody) {
+        store.lockSeller(sellerId)
+        if (store.countOpenListingsBySeller(sellerId) >= ServicesService.maxOpenListings() as Long) {
+            throw Errors.api(403, "TOO_MANY_OPEN_SERVICES", "Você já tem " + ServicesService.maxOpenListings() + " serviços abertos — conclua ou remova um antes.")
+        }
+        var listing = this.newListing(sellerId, body, EconomyClock.nowIso())
+        store.insertListing(listing)
+        return listing
+    }
+    // The provider's edit. The price is refused while a contract is open: the buyer hired what was published and the
+    // escrowed sparks are that price's.
+    ServiceListing editListing(listingId: String, sellerId: String, body: ServiceListingBody) {
+        var self = this
+        var box = listOf<ServiceListing>()
+        database.transaction(() -> {
+    box.add(self.editInTx(listingId, sellerId, body))
+})
+        return box.get(0)
+    }
+    ServiceListing editInTx(listingId: String, sellerId: String, body: ServiceListingBody) {
+        var listing = this.ownedListing(listingId, sellerId)
+        if (listing.status() != "ACTIVE") {
+            throw Errors.api(409, "SERVICE_NOT_ACTIVE", "Este serviço não está mais aberto.")
+        }
+        if (ServicesService.number(body.price()) != listing.price() && store.hasOpenContractForListing(listingId)) {
+            throw Errors.api(409, "SERVICE_HAS_OPEN_CONTRACTS", "Há um contrato em andamento com este preço — finalize antes de mudar o serviço.")
+        }
+        var now = EconomyClock.nowIso()
+        var edited = this.newListing(sellerId, body, now)
+        var saved = ServiceListing(listing.id(), listing.sellerId(), edited.category(), edited.title(), edited.description(), edited.deliverables(), edited.price(), edited.currency(), edited.deliveryDays(), listing.status(), listing.createdAt(), now)
+        store.updateListingContent(saved)
+        return saved
+    }
+    // Unpublishes the provider's service. The contracts that exist keep going: they hold the copy of what was hired.
+    ServiceListing removeListing(listingId: String, sellerId: String) {
+        var listing = this.ownedListing(listingId, sellerId)
+        if (listing.status() == "REMOVED") {
+            return listing
+        }
+        var now = EconomyClock.nowIso()
+        store.removeListing(listingId, now)
+        return ServiceListing(listing.id(), listing.sellerId(), listing.category(), listing.title(), listing.description(), listing.deliverables(), listing.price(), listing.currency(), listing.deliveryDays(), "REMOVED", listing.createdAt(), now)
+    }
+    // Opens (or reuses) the service conversation between who hires and who provides. The first message is the hiring
+    // request, and it gives the conversation its subject.
+    ServiceChatView openChat(listingId: String, hirerId: String, request: String?) {
+        var self = this
+        var box = listOf<ServiceChatView>()
+        database.transaction(() -> {
+    box.add(self.openChatInTx(listingId, hirerId, request))
+})
+        return box.get(0)
+    }
+    ServiceChatView openChatInTx(listingId: String, hirerId: String, request: String?) {
+        var listing = this.listing(listingId)
+        if (listing.status() != "ACTIVE") {
+            throw Errors.api(409, "SERVICE_NOT_ACTIVE", "Este serviço não está mais aberto.")
+        }
+        if (listing.sellerId() == hirerId) {
+            throw Errors.api(400, "OWN_SERVICE", "Não dá para contratar o seu próprio serviço.")
+        }
+        var subject = listing.category() + " · " + listing.title()
+        var conversationId = messaging.serviceConversationBetween(hirerId, listing.sellerId(), subject)
+        var text = "Olá! Quero contratar o serviço " + listing.title() + " (" + listing.category() + ")."
+        if (Texts.hasText(request)) {
+            text = ServicesService.text(request)
+        }
+        messaging.sendMessage(conversationId, hirerId, text, null, false, null)
+        return ServiceChatView(conversationId, subject, listing.id(), listing.sellerId())
+    }
+    ServiceContract buyListing(listingId: String, buyerId: String) {
+        var self = this
+        var box = listOf<ServiceContract>()
+        database.transaction(() -> {
+    box.add(self.buyInTx(listingId, buyerId))
+})
+        return box.get(0)
+    }
+    ServiceContract buyInTx(listingId: String, buyerId: String) {
+        var listing = this.listing(listingId)
+        if (listing.status() != "ACTIVE") {
+            throw Errors.api(409, "SERVICE_NOT_ACTIVE", "Este serviço não está mais aberto.")
+        }
+        if (listing.sellerId() == buyerId) {
+            throw Errors.api(400, "OWN_SERVICE", "Não dá para contratar o seu próprio serviço.")
+        }
+        if (listing.currency().toUpperCase() == "BRL") {
+            // Reais never enter the sparks ledger: the payment is agreed directly with the professional.
+            throw Errors.api(409, "DIRECT_PAYMENT_REQUIRED", "Este serviço é cobrado em reais. Fale com o profissional para combinar o pagamento.")
+        }
+        var contract = ServiceContract(Ids.prefixed("sc_"), listing.id(), null, buyerId, listing.sellerId(), listing.price(), "HELD", null, EconomyClock.nowIso(), null)
+        store.insertContract(contract)
+        coins.escrowHold(buyerId, listing.price(), ServicesService.escrowRef(contract), "Contratação de serviço: " + listing.title())
+        return contract
+    }
+    ServiceContract deliver(contractId: String, sellerId: String, note: String?) {
+        var self = this
+        var box = listOf<ServiceContract>()
+        database.transaction(() -> {
+    box.add(self.deliverInTx(contractId, sellerId, note))
+})
+        return box.get(0)
+    }
+    ServiceContract deliverInTx(contractId: String, sellerId: String, note: String?) {
+        var contract = this.contractForUpdate(contractId)
+        if (contract.sellerId() != sellerId) {
+            throw Errors.api(403, "NOT_THE_SELLER", "Só quem executa entrega o serviço.")
+        }
+        if (contract.escrowState() != "HELD") {
+            throw Errors.api(409, "CONTRACT_NOT_HELD", "Este contrato já foi decidido.")
+        }
+        if (!Texts.hasText(note)) {
+            throw Errors.api(400, "DELIVERABLE_REQUIRED", "A entrega precisa do que foi feito.")
+        }
+        TextFieldLimit.check("SERVICE_FIELD_TOO_LONG", "entrega", note, 1000)
+        store.setDeliverable(contractId, ServicesService.text(note))
+        return this.contract(contractId)
+    }
+    // The buyer accepts the delivery: the escrow goes to the seller (minus 10% fee).
+    ServiceContract accept(contractId: String, buyerId: String) = this.decide(contractId, buyerId, true)
+    // The buyer refuses: 100% back.
+    ServiceContract refund(contractId: String, buyerId: String) = this.decide(contractId, buyerId, false)
+    ServiceContract decide(contractId: String, buyerId: String, release: Bool) {
+        var self = this
+        var box = listOf<ServiceContract>()
+        database.transaction(() -> {
+    box.add(self.decideInTx(contractId, buyerId, release))
+})
+        return box.get(0)
+    }
+    ServiceContract decideInTx(contractId: String, buyerId: String, release: Bool) {
+        var contract = this.contractForUpdate(contractId)
+        if (contract.buyerId() != buyerId) {
+            if (release) {
+                throw Errors.api(403, "NOT_THE_BUYER", "Só quem contratou aceita a entrega.")
+            }
+            throw Errors.api(403, "NOT_THE_BUYER", "Só quem contratou recusa a entrega.")
+        }
+        if (contract.escrowState() != "HELD") {
+            throw Errors.api(409, "CONTRACT_NOT_HELD", "Este contrato já foi decidido.")
+        }
+        var now = EconomyClock.nowIso()
+        var state = "REFUNDED"
+        if (release) {
+            state = "RELEASED"
+            coins.escrowRelease(contract.sellerId(), contract.price(), ServicesService.escrowRef(contract), "Serviço concluído (escrow liberado)")
+        }
+        else {
+            coins.escrowRefund(contract.buyerId(), contract.price(), ServicesService.escrowRef(contract), "Reembolso de serviço")
+        }
+        if (!store.decideContract(contractId, state, now)) {
+            throw Errors.api(409, "CONTRACT_NOT_HELD", "Este contrato já foi decidido.")
+        }
+        return this.contract(contractId)
+    }
+    // --- request (the demand publishes) ---
+    ServiceRequest createRequest(requesterId: String, body: ServiceRequestBody) {
+        var min = ServicesService.number(body.budgetMin())
+        var max = ServicesService.number(body.budgetMax())
+        var biggest = min
+        if (max > min) {
+            biggest = max
+        }
+        ServicesService.validateCommon(body.category(), body.title(), body.description(), body.deliverables(), biggest)
+        if (min <= 0L || max < min) {
+            throw Errors.api(400, "INVALID_BUDGET", "O orçamento precisa ser uma faixa válida (mínimo ≤ máximo, ambos positivos).")
+        }
+        var now = EconomyClock.nowIso()
+        var request = ServiceRequest(Ids.prefixed("sr_"), requesterId, ServicesService.text(body.category()), ServicesService.text(body.title()), ServicesService.text(body.description()), ServicesService.text(body.deliverables()), min, max, body.deadline(), "OPEN", now, now)
+        store.insertRequest(request)
+        return request
+    }
+    ServiceProposal propose(requestId: String, userId: String, body: ServiceProposeBody) {
+        var request = this.request(requestId)
+        if (request.status() != "OPEN") {
+            throw Errors.api(409, "REQUEST_NOT_OPEN", "Este pedido não está mais aberto a propostas.")
+        }
+        if (request.requesterId() == userId) {
+            throw Errors.api(400, "OWN_REQUEST", "Não dá para propor no seu próprio pedido.")
+        }
+        var price = ServicesService.number(body.price())
+        if (price < request.budgetMin() || price > request.budgetMax()) {
+            throw Errors.api(400, "PRICE_OUT_OF_BUDGET", "O preço da proposta precisa estar dentro da faixa (" + request.budgetMin() + "–" + request.budgetMax() + ").")
+        }
+        var message = body.message()
+        if (message == null) {
+            throw Errors.api(400, "PROPOSAL_MESSAGE_REQUIRED", "A proposta precisa de uma mensagem (mínimo 10 caracteres).")
+        }
+        if (message.trim().length() < 10) {
+            throw Errors.api(400, "PROPOSAL_MESSAGE_REQUIRED", "A proposta precisa de uma mensagem (mínimo 10 caracteres).")
+        }
+        TextFieldLimit.check("SERVICE_FIELD_TOO_LONG", "mensagem", message, 1000)
+        var proposal = ServiceProposal(Ids.prefixed("sp_"), requestId, userId, message.trim(), price, "SENT", EconomyClock.nowIso())
+        store.insertProposal(proposal)
+        return proposal
+    }
+    // The requester picks a proposal: the escrow is born held and the request closes.
+    ServiceContract choose(requestId: String, requesterId: String, proposalId: String?) {
+        var self = this
+        var box = listOf<ServiceContract>()
+        database.transaction(() -> {
+    box.add(self.chooseInTx(requestId, requesterId, proposalId))
+})
+        return box.get(0)
+    }
+    ServiceContract chooseInTx(requestId: String, requesterId: String, proposalId: String?) {
+        var request = this.request(requestId)
+        if (request.requesterId() != requesterId) {
+            throw Errors.api(403, "NOT_THE_REQUESTER", "Só quem pediu escolhe a proposta.")
+        }
+        if (request.status() != "OPEN") {
+            throw Errors.api(409, "REQUEST_NOT_OPEN", "Este pedido já fechou.")
+        }
+        var wanted = ""
+        if (proposalId != null) {
+            wanted = proposalId
+        }
+        var proposal = store.findProposal(wanted)
+        if (proposal == null) {
+            throw Errors.api(404, "PROPOSAL_NOT_FOUND", "Proposta não encontrada.")
+        }
+        if (proposal.requestId() != requestId) {
+            throw Errors.api(400, "PROPOSAL_MISMATCH", "Essa proposta não é deste pedido.")
+        }
+        var now = EconomyClock.nowIso()
+        var contract = ServiceContract(Ids.prefixed("sc_"), null, request.id(), requesterId, proposal.userId(), proposal.price(), "HELD", null, now, null)
+        // Atomic claim first: of two choices at once, one passes and the other rolls back before any money moves.
+        if (!store.closeRequestAsChosen(request.id(), now)) {
+            throw Errors.api(409, "REQUEST_NOT_OPEN", "Este pedido já fechou.")
+        }
+        store.insertContract(contract)
+        coins.escrowHold(requesterId, proposal.price(), ServicesService.escrowRef(contract), "Serviço contratado: " + request.title())
+        store.markProposalChosen(proposal.id())
+        return contract
+    }
+    // --- catalogs ---
+    List<ServiceListing> listingCatalog(limit: Int, query: String?, category: String?) {
+        var out = listOf<ServiceListing>()
+        var cap = ServicesService.cap(limit)
+        for (var l in store.findActiveListings(ServicesService.window(limit))) {
+            if (out.size() >= cap) {
+                return out
+            }
+            // Content with the attack pattern does not show in the public catalog.
+            if (suspiciousText.matches1(l.title()) || suspiciousText.matches1(l.description()) || suspiciousText.matches1(l.deliverables())) {
+                continue
+            }
+            if (!ServicesService.matches(query, l.title(), l.description(), l.deliverables())) {
+                continue
+            }
+            if (!ServicesService.matchesCategory(category, l.category())) {
+                continue
+            }
+            out.add(l)
+        }
+        return out
+    }
+    List<ServiceListing> listingsBySeller(sellerId: String) = store.findListingsBySeller(sellerId)
+    List<ServiceRequest> requestCatalog(limit: Int, query: String?, category: String?) {
+        var out = listOf<ServiceRequest>()
+        var cap = ServicesService.cap(limit)
+        for (var r in store.findOpenRequests(ServicesService.window(limit))) {
+            if (out.size() >= cap) {
+                return out
+            }
+            if (suspiciousText.matches1(r.title()) || suspiciousText.matches1(r.description()) || suspiciousText.matches1(r.deliverables())) {
+                continue
+            }
+            if (!ServicesService.matches(query, r.title(), r.description(), r.deliverables())) {
+                continue
+            }
+            if (!ServicesService.matchesCategory(category, r.category())) {
+                continue
+            }
+            out.add(r)
+        }
+        return out
+    }
+    // The response is capped at 60; the window filtered in memory is 4x the limit, at most 200.
+    static Int cap(limit: Int) {
+        var size = limit
+        if (size < 1) {
+            size = 1
+        }
+        if (size > 60) {
+            size = 60
+        }
+        return size
+    }
+    static Int window(limit: Int) {
+        var size = limit
+        if (size < 1) {
+            size = 1
+        }
+        size = size * 4
+        if (size > 200) {
+            size = 200
+        }
+        return size
+    }
+    static Bool matches(query: String?, a: String, b: String, c: String) {
+        if (!Texts.hasText(query)) {
+            return true
+        }
+        var term = ServicesService.text(query).toLowerCase()
+        return a.toLowerCase().contains(term) || b.toLowerCase().contains(term) || c.toLowerCase().contains(term)
+    }
+    static Bool matchesCategory(category: String?, value: String) {
+        if (!Texts.hasText(category)) {
+            return true
+        }
+        return value.toLowerCase() == ServicesService.text(category).toLowerCase()
+    }
+    List<ServiceProposal> proposalsFor(requestId: String, requesterId: String) {
+        var request = this.request(requestId)
+        if (request.requesterId() != requesterId) {
+            throw Errors.api(403, "NOT_THE_REQUESTER", "Só quem pediu vê as propostas.")
+        }
+        return store.findProposalsByRequest(requestId)
+    }
+    List<ServiceContract> contractsByBuyer(buyerId: String) = store.findContractsByBuyer(buyerId)
+    List<ServiceContract> contractsBySeller(sellerId: String) = store.findContractsBySeller(sellerId)
+    ServiceListing listing(id: String) {
+        var l = store.findListing(id)
+        if (l == null) {
+            throw Errors.api(404, "SERVICE_NOT_FOUND", "Serviço não encontrado.")
+        }
+        return l
+    }
+    // The service, requiring the caller to be who published it: edit and remove belong to the owner.
+    ServiceListing ownedListing(id: String, sellerId: String) {
+        var l = this.listing(id)
+        if (l.sellerId() != sellerId) {
+            throw Errors.api(403, "NOT_THE_SELLER", "Só quem publica o serviço pode alterá-lo.")
+        }
+        return l
+    }
+    ServiceRequest request(id: String) {
+        var r = store.findRequest(id)
+        if (r == null) {
+            throw Errors.api(404, "REQUEST_NOT_FOUND", "Pedido não encontrado.")
+        }
+        return r
+    }
+    ServiceContract contract(id: String) {
+        var c = store.findContract(id)
+        if (c == null) {
+            throw Errors.api(404, "CONTRACT_NOT_FOUND", "Contrato não encontrado.")
+        }
+        return c
+    }
+    ServiceContract contractForUpdate(id: String) {
+        var c = store.findContractForUpdate(id)
+        if (c == null) {
+            throw Errors.api(404, "CONTRACT_NOT_FOUND", "Contrato não encontrado.")
+        }
+        return c
+    }
+}

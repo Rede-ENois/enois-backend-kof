@@ -1,0 +1,156 @@
+package services
+
+import kernel.db.*
+
+// Plain SQL on service_listings, service_requests, service_proposals, service_contracts (V74, V152) and
+// service_offers (V106).
+class ServicesStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String listingColumns() = "id, seller_id, category, title, description, deliverables, price, currency, delivery_days, status, created_at, updated_at"
+    static String requestColumns() = "id, requester_id, category, title, description, deliverables, budget_min, budget_max, deadline, status, created_at, updated_at"
+    static String proposalColumns() = "id, request_id, user_id, message, price, status, created_at"
+    static String contractColumns() = "id, listing_id, request_id, buyer_id, seller_id, price, escrow_state, deliverable_note, created_at, accepted_at"
+    static String offerColumns() = "id, user_id, slug, title, description, link, category, status, reviewed_by, review_note, created_at, updated_at"
+    static ServiceListing listingOf(r: DbRow) = ServiceListing(r.getStr("id"), r.getStr("seller_id"), r.getStr("category"), r.getStr("title"), r.getStr("description"), r.getStr("deliverables"), r.getLong("price"), r.getStr("currency"), r.getInt("delivery_days"), r.getStr("status"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    static ServiceRequest requestOf(r: DbRow) = ServiceRequest(r.getStr("id"), r.getStr("requester_id"), r.getStr("category"), r.getStr("title"), r.getStr("description"), r.getStr("deliverables"), r.getLong("budget_min"), r.getLong("budget_max"), r.getInstantOrNull("deadline"), r.getStr("status"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    static ServiceProposal proposalOf(r: DbRow) = ServiceProposal(r.getStr("id"), r.getStr("request_id"), r.getStr("user_id"), r.getStr("message"), r.getLong("price"), r.getStr("status"), r.getInstant("created_at"))
+    static ServiceContract contractOf(r: DbRow) = ServiceContract(r.getStr("id"), r.getStrOrNull("listing_id"), r.getStrOrNull("request_id"), r.getStr("buyer_id"), r.getStr("seller_id"), r.getLong("price"), r.getStr("escrow_state"), r.getStrOrNull("deliverable_note"), r.getInstant("created_at"), r.getInstantOrNull("accepted_at"))
+    static ServiceOffer offerOf(r: DbRow) = ServiceOffer(r.getStr("id"), r.getStr("user_id"), r.getStr("slug"), r.getStr("title"), r.getStr("description"), r.getStrOrNull("link"), r.getStr("category"), r.getStr("status"), r.getStrOrNull("reviewed_by"), r.getStrOrNull("review_note"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    insertListing(l: ServiceListing) {
+        store.execute("insert into service_listings (" + ServicesStore.listingColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(l.id()).bindStr(l.sellerId()).bindStr(l.category()).bindStr(l.title()).bindStr(l.description()).bindStr(l.deliverables()).bindLong(l.price()).bindStr(l.currency()).bindInt(l.deliveryDays()).bindStr(l.status()).bindInstant(l.createdAt()).bindInstant(l.updatedAt()))
+    }
+    // The owner's edit: identity, status and creation date stay.
+    updateListingContent(l: ServiceListing) {
+        store.execute("update service_listings set category = ?, title = ?, description = ?, deliverables = ?, price = ?, currency = ?, delivery_days = ?, updated_at = ? where id = ?", DbParams().bindStr(l.category()).bindStr(l.title()).bindStr(l.description()).bindStr(l.deliverables()).bindLong(l.price()).bindStr(l.currency()).bindInt(l.deliveryDays()).bindInstant(l.updatedAt()).bindStr(l.id()))
+    }
+    removeListing(id: String, now: String) {
+        store.execute("update service_listings set status = \'REMOVED\', updated_at = ? where id = ?", DbParams().bindInstant(now).bindStr(id))
+    }
+    ServiceListing? findListing(id: String) {
+        var row = store.queryOptional("select " + ServicesStore.listingColumns() + " from service_listings where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return ServicesStore.listingOf(row)
+    }
+    // The owner's row is locked: publishing counts the open offers of the account, and two at once must not pass the cap.
+    lockSeller(sellerId: String) {
+        store.queryList("select id from users where id = ? for update", DbParams().bindStr(sellerId))
+    }
+    List<ServiceListing> listings(sql: String, params: DbParams) {
+        var out = listOf<ServiceListing>()
+        for (var r in store.queryList(sql, params)) {
+            out.add(ServicesStore.listingOf(r))
+        }
+        return out
+    }
+    List<ServiceListing> findActiveListings(limit: Int) = this.listings("select " + ServicesStore.listingColumns() + " from service_listings where status = \'ACTIVE\' order by created_at desc limit ?", DbParams().bindInt(limit))
+    List<ServiceListing> findListingsBySeller(sellerId: String) = this.listings("select " + ServicesStore.listingColumns() + " from service_listings where seller_id = ? order by created_at desc", DbParams().bindStr(sellerId))
+    Long countOpenListingsBySeller(sellerId: String) = store.queryLong("select count(*) from service_listings where seller_id = ? and status = \'ACTIVE\'", DbParams().bindStr(sellerId))
+    insertRequest(r: ServiceRequest) {
+        store.execute("insert into service_requests (" + ServicesStore.requestColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(r.id()).bindStr(r.requesterId()).bindStr(r.category()).bindStr(r.title()).bindStr(r.description()).bindStr(r.deliverables()).bindLong(r.budgetMin()).bindLong(r.budgetMax()).bindInstantOrNull(r.deadline()).bindStr(r.status()).bindInstant(r.createdAt()).bindInstant(r.updatedAt()))
+    }
+    // Atomic claim: only an OPEN request is chosen, once.
+    Bool closeRequestAsChosen(id: String, now: String) = store.execute("update service_requests set status = \'CHOSEN\', updated_at = ? where id = ? and status = \'OPEN\'", DbParams().bindInstant(now).bindStr(id)) == 1
+    ServiceRequest? findRequest(id: String) {
+        var row = store.queryOptional("select " + ServicesStore.requestColumns() + " from service_requests where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return ServicesStore.requestOf(row)
+    }
+    List<ServiceRequest> findOpenRequests(limit: Int) {
+        var out = listOf<ServiceRequest>()
+        for (var r in store.queryList("select " + ServicesStore.requestColumns() + " from service_requests where status = \'OPEN\' order by created_at desc limit ?", DbParams().bindInt(limit))) {
+            out.add(ServicesStore.requestOf(r))
+        }
+        return out
+    }
+    insertProposal(p: ServiceProposal) {
+        store.execute("insert into service_proposals (" + ServicesStore.proposalColumns() + ") values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(p.id()).bindStr(p.requestId()).bindStr(p.userId()).bindStr(p.message()).bindLong(p.price()).bindStr(p.status()).bindInstant(p.createdAt()))
+    }
+    markProposalChosen(id: String) {
+        store.execute("update service_proposals set status = \'CHOSEN\' where id = ?", DbParams().bindStr(id))
+    }
+    ServiceProposal? findProposal(id: String) {
+        var row = store.queryOptional("select " + ServicesStore.proposalColumns() + " from service_proposals where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return ServicesStore.proposalOf(row)
+    }
+    List<ServiceProposal> findProposalsByRequest(requestId: String) {
+        var out = listOf<ServiceProposal>()
+        for (var r in store.queryList("select " + ServicesStore.proposalColumns() + " from service_proposals where request_id = ? order by created_at asc", DbParams().bindStr(requestId))) {
+            out.add(ServicesStore.proposalOf(r))
+        }
+        return out
+    }
+    insertContract(c: ServiceContract) {
+        store.execute("insert into service_contracts (" + ServicesStore.contractColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(c.id()).bindStrOrNull(c.listingId()).bindStrOrNull(c.requestId()).bindStr(c.buyerId()).bindStr(c.sellerId()).bindLong(c.price()).bindStr(c.escrowState()).bindStrOrNull(c.deliverableNote()).bindInstant(c.createdAt()).bindInstantOrNull(c.acceptedAt()))
+    }
+    // The delivery note only lands on a HELD contract.
+    Bool setDeliverable(id: String, note: String) = store.execute("update service_contracts set deliverable_note = ? where id = ? and escrow_state = \'HELD\'", DbParams().bindStr(note).bindStr(id)) == 1
+    // The decision: only a HELD contract moves, so two decisions never both land.
+    Bool decideContract(id: String, state: String, now: String) = store.execute("update service_contracts set escrow_state = ?, accepted_at = ? where id = ? and escrow_state = \'HELD\'", DbParams().bindStr(state).bindInstant(now).bindStr(id)) == 1
+    ServiceContract? findContract(id: String) {
+        var row = store.queryOptional("select " + ServicesStore.contractColumns() + " from service_contracts where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return ServicesStore.contractOf(row)
+    }
+    ServiceContract? findContractForUpdate(id: String) {
+        var row = store.queryOptional("select " + ServicesStore.contractColumns() + " from service_contracts where id = ? for update", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return ServicesStore.contractOf(row)
+    }
+    List<ServiceContract> contracts(sql: String, params: DbParams) {
+        var out = listOf<ServiceContract>()
+        for (var r in store.queryList(sql, params)) {
+            out.add(ServicesStore.contractOf(r))
+        }
+        return out
+    }
+    List<ServiceContract> findContractsByBuyer(buyerId: String) = this.contracts("select " + ServicesStore.contractColumns() + " from service_contracts where buyer_id = ? order by created_at desc", DbParams().bindStr(buyerId))
+    List<ServiceContract> findContractsBySeller(sellerId: String) = this.contracts("select " + ServicesStore.contractColumns() + " from service_contracts where seller_id = ? order by created_at desc", DbParams().bindStr(sellerId))
+    Bool hasOpenContractForListing(listingId: String) = store.queryLong("select count(*) from service_contracts where listing_id = ? and escrow_state = \'HELD\'", DbParams().bindStr(listingId)) > 0L
+    // service_offers (the community directory)
+    insertOffer(o: ServiceOffer) {
+        store.execute("insert into service_offers (" + ServicesStore.offerColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(o.id()).bindStr(o.userId()).bindStr(o.slug()).bindStr(o.title()).bindStr(o.description()).bindStrOrNull(o.link()).bindStr(o.category()).bindStr(o.status()).bindStrOrNull(o.reviewedBy()).bindStrOrNull(o.reviewNote()).bindInstant(o.createdAt()).bindInstant(o.updatedAt()))
+    }
+    updateOffer(o: ServiceOffer) {
+        store.execute("update service_offers set title = ?, description = ?, link = ?, category = ?, status = ?, reviewed_by = ?, review_note = ?, updated_at = ? where id = ?", DbParams().bindStr(o.title()).bindStr(o.description()).bindStrOrNull(o.link()).bindStr(o.category()).bindStr(o.status()).bindStrOrNull(o.reviewedBy()).bindStrOrNull(o.reviewNote()).bindInstant(o.updatedAt()).bindStr(o.id()))
+    }
+    deleteOffer(id: String) {
+        store.execute("delete from service_offers where id = ?", DbParams().bindStr(id))
+    }
+    ServiceOffer? findOffer(id: String) {
+        var row = store.queryOptional("select " + ServicesStore.offerColumns() + " from service_offers where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return ServicesStore.offerOf(row)
+    }
+    ServiceOffer? findOfferByUserAndSlug(userId: String, slug: String) {
+        var row = store.queryOptional("select " + ServicesStore.offerColumns() + " from service_offers where user_id = ? and slug = ?", DbParams().bindStr(userId).bindStr(slug))
+        if (row == null) {
+            return null
+        }
+        return ServicesStore.offerOf(row)
+    }
+    List<ServiceOffer> offers(sql: String, params: DbParams) {
+        var out = listOf<ServiceOffer>()
+        for (var r in store.queryList(sql, params)) {
+            out.add(ServicesStore.offerOf(r))
+        }
+        return out
+    }
+    List<ServiceOffer> findOffersByStatus(status: String) = this.offers("select " + ServicesStore.offerColumns() + " from service_offers where status = ? order by created_at desc", DbParams().bindStr(status))
+    List<ServiceOffer> findOffersByUser(userId: String) = this.offers("select " + ServicesStore.offerColumns() + " from service_offers where user_id = ? order by updated_at desc", DbParams().bindStr(userId))
+}
