@@ -1,0 +1,201 @@
+import app.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Rules of the freelances domain that the Java suites do not assert one by one: the session guard, the view, every
+// validation code, the lifecycle errors, the paging cursor, the creation throttle, the age gate, the proposal guards
+// and the link check of the request body.
+String frBody(title: String, scope: String, min: Int, max: Int, deadline: String) = FreelanceTestKit.body(title, scope, min, max, deadline, null)
+
+test "writesNeedASessionAndTheListIsPublic" {
+    var guest = OrgsTestKit.anonymous()
+    Check.apiError(guest.get("/me/freelances"), 401, "UNAUTHENTICATED")
+    Check.status(guest.post("/freelances", frBody("Sem sessao", FreelanceTestKit.validScope(), 10, 20, FreelanceTestKit.day(2))), 401)
+    Check.status(guest.patch("/freelances/x", frBody("Sem sessao", FreelanceTestKit.validScope(), 10, 20, FreelanceTestKit.day(2))), 401)
+    Check.status(guest.delete("/freelances/x"), 401)
+    Check.status(guest.post("/freelances/x/close", ""), 401)
+    Check.status(guest.post("/freelances/x/proposals", "{\"message\":\"oi\"}"), 401)
+    var list = guest.get("/freelances")
+    Check.status(list, 200)
+    Check.isTrue("the page has items", list.jsonHas("items"))
+    Check.isTrue("the page has nextCursor", list.body.contains("\"nextCursor\""))
+}
+
+test "viewCarriesTheOwnerAndTheOwnedFlag" {
+    var owner = OrgsTestKit.login("frl_view_owner")
+    var other = OrgsTestKit.login("frl_view_other")
+    var deadline = FreelanceTestKit.day(9)
+    var created = owner.post("/freelances", "{\"title\":\"  Painel de vendas  \",\"scope\":\"  " + FreelanceTestKit.validScope() + "  \",\"budgetMin\":300,\"budgetMax\":900,\"deadline\":\"" + deadline + "\",\"paymentMethod\":\"cash\"}")
+    Check.status(created, 200)
+    var id = OrgsTestKit.str(created, "id")
+    Check.isTrue("id prefix", id.startsWith("free_"))
+    Check.jsonEq(created, "userId", "frl_view_owner")
+    Check.jsonEq(created, "username", "frl_view_owner")
+    Check.jsonEq(created, "title", "Painel de vendas")
+    Check.jsonEq(created, "scope", FreelanceTestKit.validScope())
+    Check.jsonEq(created, "deadline", deadline)
+    Check.jsonEq(created, "paymentMethod", "CASH")
+    Check.jsonEq(created, "status", "OPEN")
+    Check.jsonEq(created, "owned", "true")
+    Check.isTrue("createdAt", OrgsTestKit.str(created, "createdAt").endsWith("Z"))
+    var seenByOwner = owner.get("/freelances")
+    Check.jsonEq(seenByOwner, "items." + FreelanceTestKit.indexOf(seenByOwner, "items", "id", id) + ".owned", "true")
+    var seenByOther = other.get("/freelances")
+    Check.jsonEq(seenByOther, "items." + FreelanceTestKit.indexOf(seenByOther, "items", "id", id) + ".owned", "false")
+    var seenByGuest = OrgsTestKit.anonymous().get("/freelances")
+    Check.jsonEq(seenByGuest, "items." + FreelanceTestKit.indexOf(seenByGuest, "items", "id", id) + ".owned", "false")
+}
+
+// The creation throttle (10 an hour) counts refused attempts too, so the validations are split over accounts.
+test "contentValidationsHaveTheirCodes" {
+    var who = OrgsTestKit.login("frl_rules_valid")
+    var scope = FreelanceTestKit.validScope()
+    var ok = FreelanceTestKit.day(3)
+    Check.apiError(who.post("/freelances", frBody("ab", scope, 10, 20, ok)), 400, "INVALID_TITLE")
+    Check.apiError(who.post("/freelances", frBody("   ", scope, 10, 20, ok)), 400, "INVALID_TITLE")
+    Check.apiError(who.post("/freelances", frBody("Titulo valido", "curto demais", 10, 20, ok)), 400, "INVALID_SCOPE")
+    Check.apiError(who.post("/freelances", frBody("Titulo valido", strings.repeat("e", 4001), 10, 20, ok)), 400, "FREELANCE_FIELD_TOO_LONG")
+    Check.apiError(who.post("/freelances", frBody("Titulo valido", scope, 0, 20, ok)), 400, "INVALID_BUDGET")
+    Check.apiError(who.post("/freelances", frBody("Titulo valido", scope, 30, 20, ok)), 400, "INVALID_BUDGET")
+    // A missing number reads as 0 (the Java record), so the range is invalid.
+    Check.apiError(who.post("/freelances", "{\"title\":\"Titulo valido\",\"scope\":\"" + scope + "\",\"deadline\":\"" + ok + "\"}"), 400, "INVALID_BUDGET")
+}
+
+test "deadlineAndBodyValidationsHaveTheirCodes" {
+    var who = OrgsTestKit.login("frl_rules_deadline")
+    var scope = FreelanceTestKit.validScope()
+    Check.apiError(who.post("/freelances", frBody("Titulo valido", scope, 10, 20, "amanha")), 400, "INVALID_DEADLINE")
+    Check.apiError(who.post("/freelances", frBody("Titulo valido", scope, 10, 20, "2026-02-30")), 400, "INVALID_DEADLINE")
+    Check.apiError(who.post("/freelances", frBody("Titulo valido", scope, 10, 20, "")), 400, "INVALID_DEADLINE")
+    var past = who.post("/freelances", frBody("Titulo valido", scope, 10, 20, FreelanceTestKit.day(-1)))
+    Check.apiError(past, 400, "INVALID_DEADLINE")
+    Check.jsonEq(past, "message", "O prazo precisa ser hoje ou no futuro.")
+    // Today is allowed; a malformed body is a plain 400.
+    Check.status(who.post("/freelances", frBody("Titulo valido", scope, 10, 20, FreelanceTestKit.day(0))), 200)
+    Check.apiError(who.post("/freelances", "not json"), 400, "BAD_REQUEST")
+    Check.apiError(who.post("/freelances", ""), 400, "BAD_REQUEST")
+}
+
+test "lifecycleErrors" {
+    var owner = OrgsTestKit.login("frl_rules_life")
+    var other = OrgsTestKit.login("frl_rules_life2")
+    var edit = frBody("Titulo valido", FreelanceTestKit.validScope(), 10, 20, FreelanceTestKit.day(3))
+    Check.apiError(owner.patch("/freelances/free_nope", edit), 404, "FREELANCE_NOT_FOUND")
+    Check.apiError(owner.delete("/freelances/free_nope"), 404, "FREELANCE_NOT_FOUND")
+    Check.apiError(owner.post("/freelances/free_nope/close", ""), 404, "FREELANCE_NOT_FOUND")
+    Check.apiError(owner.post("/freelances/free_nope/proposals", "{\"message\":\"oi\"}"), 404, "FREELANCE_NOT_FOUND")
+    var id = FreelanceTestKit.create(owner, "Ciclo de vida")
+    Check.apiError(other.post("/freelances/" + id + "/close", ""), 403, "NOT_OWNER")
+    Check.status(owner.post("/freelances/" + id + "/close", ""), 200)
+    Check.apiError(owner.post("/freelances/" + id + "/close", ""), 409, "ALREADY_CLOSED")
+    // A closed freelance takes no proposal and the owner can still delete it.
+    Check.apiError(other.post("/freelances/" + id + "/proposals", "{\"message\":\"oi\"}"), 409, "FREELANCE_CLOSED")
+    Check.status(owner.delete("/freelances/" + id), 200)
+    Check.apiError(owner.delete("/freelances/" + id), 404, "FREELANCE_NOT_FOUND")
+    // An edit keeps the creation date and the status.
+    var kept = FreelanceTestKit.create(owner, "Para editar")
+    var before = owner.get("/me/freelances")
+    var at = FreelanceTestKit.indexOf(before, "", "id", kept)
+    var createdAt = OrgsTestKit.str(before, "" + at + ".createdAt")
+    var edited = owner.patch("/freelances/" + kept, edit)
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "createdAt", createdAt)
+    Check.jsonEq(edited, "status", "OPEN")
+    Check.jsonEq(edited, "title", "Titulo valido")
+    Check.jsonEq(edited, "userId", "frl_rules_life")
+}
+
+test "cursorPagesThroughTheOpenList" {
+    var who = OrgsTestKit.login("frl_rules_page")
+    FreelanceTestKit.create(who, "Pagina um")
+    FreelanceTestKit.create(who, "Pagina dois")
+    FreelanceTestKit.create(who, "Pagina tres")
+    var first = who.get("/freelances?limit=1")
+    Check.status(first, 200)
+    Check.eqInt("one item", 1, first.jsonSize("items"))
+    Check.jsonEq(first, "nextCursor", "1")
+    var second = who.get("/freelances?limit=1&cursor=1")
+    Check.status(second, 200)
+    Check.eqInt("one item", 1, second.jsonSize("items"))
+    Check.jsonEq(second, "nextCursor", "2")
+    Check.isTrue("another freelance", OrgsTestKit.str(first, "items.0.id") != OrgsTestKit.str(second, "items.0.id"))
+    // A malformed cursor is the first page; the limit is clamped to 1..60.
+    var broken = who.get("/freelances?limit=1&cursor=abc")
+    Check.jsonEq(broken, "items.0.id", OrgsTestKit.str(first, "items.0.id"))
+    var clamped = who.get("/freelances?limit=0")
+    Check.eqInt("limit 0 is 1", 1, clamped.jsonSize("items"))
+    Check.apiError(who.get("/freelances?limit=abc"), 400, "BAD_REQUEST")
+}
+
+test "searchTreatsPercentAndUnderscoreAsPlainText" {
+    var who = OrgsTestKit.login("frl_rules_like")
+    Check.status(who.post("/freelances", frBody("Migracao 100 por cento", FreelanceTestKit.validScope(), 10, 20, FreelanceTestKit.day(3))), 200)
+    Check.status(who.post("/freelances", frBody("Outro trabalho qualquer", "Descricao sem relacao com a busca feita pelo teste.", 10, 20, FreelanceTestKit.day(3))), 200)
+    // `%` is dropped: "100%" searches for "100", it is not a wildcard.
+    var hit = who.get("/freelances?q=100%25")
+    Check.isTrue("found by the digits", FreelanceTestKit.has(hit, "items", "title", "Migracao 100 por cento"))
+    Check.isTrue("the other one is not", !FreelanceTestKit.has(hit, "items", "title", "Outro trabalho qualquer"))
+    // The search reads the scope too and ignores case.
+    var inScope = who.get("/freelances?q=RELACAO%20COM%20A%20BUSCA")
+    Check.isTrue("found by the scope", FreelanceTestKit.has(inScope, "items", "title", "Outro trabalho qualquer"))
+    // A term that is only wildcards is blank: no filter.
+    var all = who.get("/freelances?q=%25_%25")
+    Check.isTrue("no filter keeps both", FreelanceTestKit.has(all, "items", "title", "Migracao 100 por cento") && FreelanceTestKit.has(all, "items", "title", "Outro trabalho qualquer"))
+}
+
+test "creationIsThrottledToTenAnHour" {
+    var who = OrgsTestKit.login("frl_rules_throttle")
+    var i = 0
+    while (i < 10) {
+        Check.status(who.post("/freelances", frBody("Trabalho " + i, FreelanceTestKit.validScope(), 10, 20, FreelanceTestKit.day(3))), 200)
+        i = i + 1
+    }
+    Check.apiError(who.post("/freelances", frBody("Trabalho onze", FreelanceTestKit.validScope(), 10, 20, FreelanceTestKit.day(3))), 429, "ACTION_THROTTLED")
+    // The edit does not go through the creation throttle.
+    var mine = who.get("/me/freelances")
+    Check.status(who.patch("/freelances/" + OrgsTestKit.str(mine, "0.id"), frBody("Editado", FreelanceTestKit.validScope(), 10, 20, FreelanceTestKit.day(3))), 200)
+}
+
+test "anAccountWithoutBirthDateCannotPublish" {
+    var who = OrgsTestKit.login("frl_rules_age")
+    OrgsTestKit.db().execute("update users set birth_date = null where id = ?", DbParams().bindStr("frl_rules_age"))
+    Check.apiError(who.post("/freelances", frBody("Sem data", FreelanceTestKit.validScope(), 10, 20, FreelanceTestKit.day(3))), 403, "BIRTH_DATE_REQUIRED")
+}
+
+test "unsafeLinksInTheBodyAreRefused" {
+    var who = OrgsTestKit.login("frl_rules_link")
+    var res = who.post("/freelances", frBody("Com link", "Veja o [briefing](javascript:alert(1)) antes de comecar o trabalho.", 10, 20, FreelanceTestKit.day(3)))
+    Check.apiError(res, 400, "UNSAFE_LINK")
+    var id = FreelanceTestKit.create(who, "Com link bom")
+    Check.apiError(who.patch("/freelances/" + id, frBody("Com link", "Veja o [briefing](javascript:alert(1)) antes de comecar o trabalho.", 10, 20, FreelanceTestKit.day(3))), 400, "UNSAFE_LINK")
+    Check.apiError(who.post("/freelances/" + id + "/proposals", "{\"message\":\"[x](data:text/html,oi)\"}"), 400, "UNSAFE_LINK")
+    Check.status(who.post("/freelances", frBody("Com link https", "Veja o [briefing](https://exemplo.com.br/briefing) antes de comecar.", 10, 20, FreelanceTestKit.day(3))), 200)
+}
+
+test "proposalGuards" {
+    var poster = OrgsTestKit.login("frl_rules_prop_poster")
+    var pro = OrgsTestKit.login("frl_rules_prop_pro")
+    var id = FreelanceTestKit.create(poster, "Recebe propostas")
+    // The message is checked before the professional identity.
+    Check.apiError(pro.post("/freelances/" + id + "/proposals", "{\"message\":\"   \"}"), 400, "EMPTY_PROPOSAL")
+    Check.apiError(pro.post("/freelances/" + id + "/proposals", "{}"), 400, "EMPTY_PROPOSAL")
+    Check.apiError(pro.post("/freelances/" + id + "/proposals", "null"), 400, "EMPTY_PROPOSAL")
+    Check.apiError(pro.post("/freelances/" + id + "/proposals", ""), 400, "BAD_REQUEST")
+    var tooLong = pro.post("/freelances/" + id + "/proposals", "{\"message\":\"" + strings.repeat("p", 2001) + "\"}")
+    Check.apiError(tooLong, 400, "FREELANCE_FIELD_TOO_LONG")
+    Check.isTrue("names the field", OrgsTestKit.str(tooLong, "message").contains("proposta"))
+    Check.apiError(pro.post("/freelances/" + id + "/proposals", "{\"message\":\"Posso fazer.\"}"), 403, "NO_ACTIVE_CORPORATE_PROFILE")
+    FreelanceTestKit.activateProfessional(pro, "frl_rules_prop_pro")
+    // The poster blocked the proposer: nothing is sent.
+    Check.status(poster.post("/network/blocks/frl_rules_prop_pro", ""), 201)
+    Check.apiError(pro.post("/freelances/" + id + "/proposals", "{\"message\":\"Posso fazer.\"}"), 403, "USER_BLOCKED")
+    // The message of the conversation names the freelance.
+    var other = OrgsTestKit.login("frl_rules_prop_other")
+    FreelanceTestKit.activateProfessional(other, "frl_rules_prop_other")
+    var sent = other.post("/freelances/" + id + "/proposals", "{\"message\":\"  Posso fazer.  \"}")
+    Check.status(sent, 200)
+    var messages = poster.get("/conversations/" + OrgsTestKit.str(sent, "conversationId") + "/messages")
+    Check.status(messages, 200)
+    Check.isTrue("the proposal text", messages.body.contains("Proposta para o freela \\\"Recebe propostas\\\"\\n\\nPosso fazer."))
+    OrgsTestKit.finish()
+}

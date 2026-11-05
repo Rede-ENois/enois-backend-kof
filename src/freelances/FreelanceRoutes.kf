@@ -1,0 +1,106 @@
+package freelances
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+
+// HTTP adapter of FreelanceController: the public list, "my freelances", create, edit, delete, close and the
+// professional proposal. Every id and identity comes from the session, never from the payload.
+class FreelanceRoutes {
+    static register(server: HttpServer, service: FreelanceService) {
+        server.get("/freelances", () -> FreelanceRoutes.list(service))
+        server.get("/me/freelances", () -> FreelanceRoutes.mine(service))
+        server.post("/freelances", () -> FreelanceRoutes.create(service))
+        server.patch("/freelances/:id", () -> FreelanceRoutes.update(service))
+        server.delete("/freelances/:id", () -> FreelanceRoutes.delete(service))
+        server.post("/freelances/:id/close", () -> FreelanceRoutes.close(service))
+        server.post("/freelances/:id/proposals", () -> FreelanceRoutes.propose(service))
+    }
+    static String list(service: FreelanceService) {
+        var size = FreelanceRules.clamp(Req.queryInt("limit", 24), 1, 60)
+        var offset = FreelanceRoutes.parseCursor(Req.queryStr("cursor", ""))
+        var items = FreelanceRoutes.views(service, service.list(Req.queryParam("q"), size, offset), Auth.viewerIdOrNull())
+        return json.encode(FreelancePageView(items, FreelanceRoutes.nextCursor(items.size() == size, offset + size)))
+    }
+    static String mine(service: FreelanceService) {
+        var userId = Auth.requireUser()
+        return json.encode(FreelanceRoutes.views(service, service.mine(userId), userId))
+    }
+    static String create(service: FreelanceService) {
+        var userId = Auth.requireUser()
+        var body = FreelanceRoutes.freelanceBody()
+        var f = service.create(userId, body)
+        return json.encode(FreelanceRules.view(f, service.usernameOf(userId), userId))
+    }
+    static String update(service: FreelanceService) {
+        var userId = Auth.requireUser()
+        var body = FreelanceRoutes.freelanceBody()
+        var f = service.update(Req.pathParam("id"), userId, body)
+        return json.encode(FreelanceRules.view(f, service.usernameOf(userId), userId))
+    }
+    static String delete(service: FreelanceService) {
+        var userId = Auth.requireUser()
+        var id = Req.pathParam("id")
+        service.delete(id, userId)
+        return json.encode(FreelanceStatusView(id, "DELETED"))
+    }
+    static String close(service: FreelanceService) {
+        var userId = Auth.requireUser()
+        var f = service.close(Req.pathParam("id"), userId)
+        return json.encode(FreelanceStatusView(f.id(), f.status()))
+    }
+    static String propose(service: FreelanceService) {
+        var userId = Auth.requireUser()
+        var message = FreelanceRoutes.proposalMessage()
+        return json.encode(FreelanceProposalView(service.propose(Req.pathParam("id"), userId, message)))
+    }
+    // One query for the usernames of the whole list.
+    static List<FreelanceView> views(service: FreelanceService, list: List<Freelance>, viewerId: String?) {
+        var names = service.usernamesOf(list)
+        var out = listOf<FreelanceView>()
+        for (var f in list) {
+            out.add(FreelanceRules.view(f, names.get(f.userId()), viewerId))
+        }
+        return out
+    }
+    static String? nextCursor(full: Bool, next: Int) {
+        if (!full) {
+            return null
+        }
+        return "" + next
+    }
+    // Offset cursor: blank or malformed means the first page.
+    static Int parseCursor(cursor: String) {
+        if (cursor.trim().length() == 0) {
+            return 0
+        }
+        try {
+            return FreelanceRules.clamp(cursor.trim().toInt(), 0, 2147483647)
+        } catch (String e) {
+            return 0
+        }
+    }
+    // The body is required (400 without one, like @RequestBody); every text goes through the link check first.
+    static FreelanceBody freelanceBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<FreelanceBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    // A missing body is 400; a JSON `null` body reaches the service as an empty proposal.
+    static String? proposalMessage() {
+        SafeLinks.checkRequest()
+        var raw = Req.bodyText().trim()
+        if (raw == "null") {
+            return null
+        }
+        try {
+            return json.decode<FreelanceProposalBody>(raw).message()
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

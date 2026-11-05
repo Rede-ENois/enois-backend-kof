@@ -1,0 +1,47 @@
+package app
+
+import freelances.*
+import kernel.testkit.*
+import kernel.time.*
+import profile.*
+
+// Fixtures of the freelances suites, on top of OrgsTestKit (the production wiring, one app per test file).
+class FreelanceTestKit {
+    // `yyyy-MM-dd` of today plus `days`.
+    static String day(days: Int) = Time.plusSeconds(Time.nowIso(), days * 86400L).substring(0, 10)
+    // Request body of a create or an edit (payment null = the field is sent as null).
+    static String body(title: String, scope: String, budgetMin: Int, budgetMax: Int, deadline: String, payment: String?) = json.encode(FreelanceBody(title, scope, budgetMin, budgetMax, deadline, payment))
+    static String validScope() = "Escopo longo o bastante para passar da validacao de vinte caracteres."
+    // Publishes a valid freelance and answers its id.
+    static String create(who: ProfileCaller, title: String) {
+        var res = who.post("/freelances", FreelanceTestKit.body(title, FreelanceTestKit.validScope(), 1000, 2000, FreelanceTestKit.day(7), null))
+        Check.status(res, 200)
+        return OrgsTestKit.str(res, "id")
+    }
+    // Creates and activates the professional profile of the account; answers its @.
+    static String activateProfessional(who: ProfileCaller, userId: String) {
+        var username = "pro." + userId.replace("_", ".")
+        Check.status(who.post("/me/business-profile", "{\"username\":\"" + username + "\",\"name\":\"Perfil Profissional\"}"), 200)
+        Check.status(who.patch("/me/business-profile", "{\"headline\":\"Pessoa desenvolvedora\"}"), 200)
+        Check.status(who.post("/me/business-profile/activate", ""), 200)
+        return username
+    }
+    // Position of the element whose `field` equals `value` in the array at `path`, -1 when absent.
+    static Int indexOf(res: TestResponse, path: String, field: String, value: String) {
+        var n = res.jsonSize(path)
+        var prefix = path + "."
+        if (path.length() == 0) {
+            prefix = ""
+        }
+        var i = 0
+        while (i < n) {
+            var found = res.jsonStr(prefix + i + "." + field)
+            if (found != null && found == value) {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+    static Bool has(res: TestResponse, path: String, field: String, value: String) = FreelanceTestKit.indexOf(res, path, field, value) >= 0
+}
