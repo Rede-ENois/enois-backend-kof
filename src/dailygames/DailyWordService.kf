@@ -1,0 +1,171 @@
+package dailygames
+
+import games.*
+import kernel.db.*
+import kernel.error.*
+import kernel.security.*
+import kernel.time.*
+
+record DailyWordGuess(String word, List<String> marks)
+
+// `date` is the calendar day (`yyyy-MM-dd`); `streak` counts consecutive finished days.
+record DailyWordState(String date, String status, List<DailyWordGuess> guesses, Int streak)
+
+record DailyWordEntry(String username, String name, Int attempts, String completedAt)
+
+record DailyWordRanking(List<DailyWordEntry> items)
+
+record DailyWordGuessBody(String? guess, String? requestId)
+
+// Wordle-style daily word: six tries, resumable on the previous day. The answer never leaves the server.
+// Port of DailyWordService.
+class DailyWordService {
+    Db database
+    DailyGamesClock clock
+    GamesCoins coins
+    Set<String> allowed
+    List<String> answers
+    public constructor(database: Db, clock: DailyGamesClock, coins: GamesCoins, allowed: Set<String>) {
+        this.database = database
+        this.clock = clock
+        this.coins = coins
+        this.allowed = allowed
+        this.answers = DailyWordService.answerList()
+    }
+    // An intentionally small starter set; expand only from a reviewed, licensed source.
+    static List<String> answerList() = listOf("AMIGO", "AMORA", "AREIA", "BARCO", "BEIJO", "BICHO", "BOLSA", "BRISA", "CAMPO", "CANTO", "CARRO", "CASAS", "CHUVA", "CINZA", "COBRA", "CORDA", "CORPO", "DANCA", "DEDOS", "FESTA", "FRUTA", "GATOS", "GRAMA", "GRUPO", "LAGOA", "LIVRO", "LUZES", "MAGIA", "MUNDO", "NOITE", "NUVEM", "OLHAR", "ONDAS", "OUVIR", "PEDRA", "PEIXE", "PLANO", "PONTE", "PORTA", "PRAIA", "QUERO", "RISCO", "RITMO", "ROCHA", "SONHO", "TARDE", "TERRA", "TIGRE", "VENTO")
+    // The guess vocabulary: the file of accepted words plus every possible answer.
+    static Set<String> vocabulary(dir: String) {
+        var words = setOf<String>()
+        var text = File(dir + "/palpites-pt-br.txt").readText()
+        if (text == null) {
+            throw "CONFIG_MISSING: " + dir + "/palpites-pt-br.txt is missing"
+        }
+        for (var line in text.split("\n")) {
+            var word = line
+            if (word.endsWith("\r")) {
+                word = word.substring(0, word.length() - 1)
+            }
+            words.add(word)
+        }
+        for (var answer in DailyWordService.answerList()) {
+            words.add(answer)
+        }
+        return words
+    }
+    DailyWordState state(userId: String, date: String?) = this.stateFor(DailyRules.requestedDay(clock, date), userId)
+    DailyWordState stateFor(day: String, userId: String) {
+        var status = "NOT_STARTED"
+        var found = database.queryOptional("select status from daily_word_sessions where challenge_date = ? and user_id = ?", DbParams().bindDate(day).bindStr(userId))
+        if (found != null) {
+            status = found.getStr("status")
+        }
+        var guesses = listOf<DailyWordGuess>()
+        for (var row in database.queryList("select guess, marks from daily_word_guesses where challenge_date = ? and user_id = ? order by attempt_no", DbParams().bindDate(day).bindStr(userId))) {
+            var marks = listOf<String>()
+            for (var mark in row.getStr("marks").split(",")) {
+                marks.add(mark)
+            }
+            guesses.add(DailyWordGuess(row.getStr("guess"), marks))
+        }
+        var dates = database.queryList("select challenge_date from daily_word_sessions where user_id = ? and status in (\'WON\',\'LOST\') and challenge_date <= ? order by challenge_date desc", DbParams().bindStr(userId).bindDate(day))
+        var streak = 0
+        var expected = day
+        if (dates.size() > 0) {
+            if (dates.get(0).getDate("challenge_date") != day) {
+                expected = ZoneDates.plusDays(day, -1)
+            }
+        }
+        var i = 0
+        while (i < dates.size()) {
+            if (dates.get(i).getDate("challenge_date") != expected) {
+                i = dates.size()
+            }
+            else {
+                streak = streak + 1
+                expected = ZoneDates.plusDays(expected, -1)
+                i = i + 1
+            }
+        }
+        return DailyWordState(day, status, guesses, streak)
+    }
+    DailyWordState start(userId: String) {
+        var day = clock.today()
+        var self = this
+        database.transaction(() -> {
+    self.database.execute("insert into daily_word_challenges (challenge_date, answer) values (?, ?) on duplicate key update challenge_date = challenge_date", DbParams().bindDate(day).bindStr(self.answers.get(Tokens.randomInt(self.answers.size()))))
+    self.database.execute("insert into daily_word_sessions (challenge_date, user_id, status, started_at) values (?, ?, \'IN_PROGRESS\', ?) on duplicate key update user_id = user_id", DbParams().bindDate(day).bindStr(userId).bindInstant(self.clock.nowIso()))
+})
+        return this.stateFor(day, userId)
+    }
+    DailyWordState guess(userId: String, rawGuess: String?, requestId: String?, requestedDate: String?) {
+        var guess = WordRules.normalize(rawGuess)
+        if (!allowed.contains(guess)) {
+            throw Errors.api(400, "INVALID_GUESS", "Palavra fora do vocabulario disponivel.")
+        }
+        if (!DailyRules.validRequestId(requestId)) {
+            throw Errors.api(400, "INVALID_REQUEST_ID", "Identificador de tentativa invalido.")
+        }
+        var day = DailyRules.requestedDay(clock, requestedDate)
+        var self = this
+        var finished = false
+        database.transaction(() -> {
+    finished = self.guessInTransaction(userId, guess, requestId as String, day)
+})
+        // Finishing the daily game counts as today's presence (streak), after the commit.
+        if (finished) {
+            coins.recordPresence(userId)
+        }
+        return this.stateFor(day, userId)
+    }
+    // The guess under the row lock; true when it ended the match.
+    Bool guessInTransaction(userId: String, guess: String, requestId: String, day: String) {
+        var sessions = database.queryList("select status from daily_word_sessions where challenge_date = ? and user_id = ? for update", DbParams().bindDate(day).bindStr(userId))
+        if (sessions.size() == 0) {
+            throw Errors.api(409, "GAME_NOT_STARTED", "Inicie o desafio primeiro.")
+        }
+        var status = sessions.get(0).getStr("status")
+        var previous = database.queryList("select guess from daily_word_guesses where challenge_date = ? and user_id = ? and request_id = ?", DbParams().bindDate(day).bindStr(userId).bindStr(requestId))
+        if (previous.size() > 0) {
+            if (previous.get(0).getStr("guess") != guess) {
+                throw Errors.api(409, "IDEMPOTENCY_CONFLICT", "Identificador ja usado com outro palpite.")
+            }
+            return false
+        }
+        if (status != "IN_PROGRESS") {
+            throw Errors.api(409, "GAME_FINISHED", "Desafio do dia encerrado.")
+        }
+        if (database.queryLong("select count(*) from daily_word_guesses where challenge_date = ? and user_id = ? and guess = ?", DbParams().bindDate(day).bindStr(userId).bindStr(guess)) > 0L) {
+            throw Errors.api(409, "GUESS_ALREADY_USED", "Voce ja usou essa palavra hoje; ela nao consome nova tentativa.")
+        }
+        var answer = database.queryOne("select answer from daily_word_challenges where challenge_date = ?", DbParams().bindDate(day)).getStr("answer")
+        var attempt = database.queryLong("select count(*) from daily_word_guesses where challenge_date = ? and user_id = ?", DbParams().bindDate(day).bindStr(userId)).toInt() + 1
+        var marks = WordRules.joinMarks(WordRules.evaluate(answer, guess))
+        database.execute("insert into daily_word_guesses (challenge_date, user_id, attempt_no, request_id, guess, marks) values (?, ?, ?, ?, ?, ?)", DbParams().bindDate(day).bindStr(userId).bindInt(attempt).bindStr(requestId).bindStr(guess).bindStr(marks))
+        if (guess == answer || attempt == 6) {
+            var result = "LOST"
+            if (guess == answer) {
+                result = "WON"
+            }
+            database.execute("update daily_word_sessions set status = ?, completed_at = ? where challenge_date = ? and user_id = ?", DbParams().bindStr(result).bindInstant(clock.nowIso()).bindDate(day).bindStr(userId))
+            return true
+        }
+        return false
+    }
+    // Today's winners: fewest attempts, then who finished first, then username (top 100).
+    DailyWordRanking leaderboard() {
+        var items = listOf<DailyWordEntry>()
+        for (var row in database.queryList("select u.username, u.name, count(g.attempt_no) as attempts, s.completed_at from daily_word_sessions s join users u on u.id = s.user_id join daily_word_guesses g on g.challenge_date = s.challenge_date and g.user_id = s.user_id where s.challenge_date = ? and s.status = \'WON\' group by u.username, u.name, s.completed_at order by attempts asc, s.completed_at asc, u.username asc limit 100", DbParams().bindDate(clock.today()))) {
+            items.add(DailyWordEntry(row.getStr("username"), row.getStr("name"), row.getInt("attempts"), row.getInstant("completed_at")))
+        }
+        return DailyWordRanking(items)
+    }
+    // Accounts in the order of the day's scoreboard, without the cap of 100 and without who missed: the prize queue.
+    List<String> payoutOrder(day: String) {
+        var out = listOf<String>()
+        for (var row in database.queryList("select s.user_id from daily_word_sessions s join users u on u.id = s.user_id join daily_word_guesses g on g.challenge_date = s.challenge_date and g.user_id = s.user_id where s.challenge_date = ? and s.status = \'WON\' group by s.user_id, u.username order by count(g.attempt_no) asc, min(s.completed_at) asc, u.username asc", DbParams().bindDate(day))) {
+            out.add(row.getStr("user_id"))
+        }
+        return out
+    }
+}

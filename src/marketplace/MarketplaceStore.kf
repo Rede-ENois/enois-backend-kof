@@ -1,0 +1,105 @@
+package marketplace
+
+import kernel.db.*
+
+// Plain SQL on marketplace_listings, marketplace_purchases and marketplace_items (V73, V143). The `forUpdate`
+// reads take the row lock the Java adapter took with PESSIMISTIC_WRITE: they only mean something inside a
+// transaction.
+class MarketplaceStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String listingColumns() = "id, seller_id, item_kind, item_id, title, description, price, status, created_at, updated_at"
+    static String purchaseColumns() = "id, listing_id, buyer_id, seller_id, price, state, created_at, decided_at"
+    static String itemColumns() = "id, seller_id, kind, title, description, content, created_at"
+    static MarketplaceListing listingOf(r: DbRow) = MarketplaceListing(r.getStr("id"), r.getStr("seller_id"), r.getStr("item_kind"), r.getStr("item_id"), r.getStr("title"), r.getStrOrNull("description"), r.getLong("price"), r.getStr("status"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    static MarketplacePurchase purchaseOf(r: DbRow) = MarketplacePurchase(r.getStr("id"), r.getStr("listing_id"), r.getStr("buyer_id"), r.getStr("seller_id"), r.getLong("price"), r.getStr("state"), r.getInstant("created_at"), r.getInstantOrNull("decided_at"))
+    static MarketplaceItem itemOf(r: DbRow) = MarketplaceItem(r.getStr("id"), r.getStr("seller_id"), r.getStr("kind"), r.getStr("title"), r.getStrOrNull("description"), r.getStrOrNull("content"), r.getInstant("created_at"))
+    insertListing(l: MarketplaceListing) {
+        store.execute("insert into marketplace_listings (" + MarketplaceStore.listingColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(l.id()).bindStr(l.sellerId()).bindStr(l.itemKind()).bindStr(l.itemId()).bindStr(l.title()).bindStrOrNull(l.description()).bindLong(l.price()).bindStr(l.status()).bindInstant(l.createdAt()).bindInstant(l.updatedAt()))
+    }
+    // Moves a listing to another status. The unique index (item_kind, item_id, status) refuses a second row of the
+    // same item in the same status: that conflict is the 409 of the caller.
+    setListingStatus(id: String, status: String, now: String) {
+        store.execute("update marketplace_listings set status = ?, updated_at = ? where id = ?", DbParams().bindStr(status).bindInstant(now).bindStr(id))
+    }
+    deleteListing(id: String) {
+        store.execute("delete from marketplace_listings where id = ?", DbParams().bindStr(id))
+    }
+    MarketplaceListing? findListing(id: String) {
+        var row = store.queryOptional("select " + MarketplaceStore.listingColumns() + " from marketplace_listings where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return MarketplaceStore.listingOf(row)
+    }
+    MarketplaceListing? findListingForUpdate(id: String) {
+        var row = store.queryOptional("select " + MarketplaceStore.listingColumns() + " from marketplace_listings where id = ? for update", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return MarketplaceStore.listingOf(row)
+    }
+    MarketplaceListing? findActiveByItem(itemKind: String, itemId: String) {
+        var row = store.queryOptional("select " + MarketplaceStore.listingColumns() + " from marketplace_listings where item_kind = ? and item_id = ? and status = \'ACTIVE\' limit 1", DbParams().bindStr(itemKind).bindStr(itemId))
+        if (row == null) {
+            return null
+        }
+        return MarketplaceStore.listingOf(row)
+    }
+    List<MarketplaceListing> listings(sql: String, params: DbParams) {
+        var out = listOf<MarketplaceListing>()
+        for (var r in store.queryList(sql, params)) {
+            out.add(MarketplaceStore.listingOf(r))
+        }
+        return out
+    }
+    List<MarketplaceListing> findActive(limit: Int) = this.listings("select " + MarketplaceStore.listingColumns() + " from marketplace_listings where status = \'ACTIVE\' order by created_at desc limit ?", DbParams().bindInt(limit))
+    List<MarketplaceListing> findAll(limit: Int) = this.listings("select " + MarketplaceStore.listingColumns() + " from marketplace_listings order by created_at desc limit ?", DbParams().bindInt(limit))
+    List<MarketplaceListing> findBySeller(sellerId: String) = this.listings("select " + MarketplaceStore.listingColumns() + " from marketplace_listings where seller_id = ? order by created_at desc", DbParams().bindStr(sellerId))
+    insertPurchase(p: MarketplacePurchase) {
+        store.execute("insert into marketplace_purchases (" + MarketplaceStore.purchaseColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(p.id()).bindStr(p.listingId()).bindStr(p.buyerId()).bindStr(p.sellerId()).bindLong(p.price()).bindStr(p.state()).bindInstant(p.createdAt()).bindInstantOrNull(p.decidedAt()))
+    }
+    // The decision itself: only a HELD purchase moves, so two decisions never both land.
+    Bool decide(id: String, state: String, now: String) = store.execute("update marketplace_purchases set state = ?, decided_at = ? where id = ? and state = \'HELD\'", DbParams().bindStr(state).bindInstant(now).bindStr(id)) == 1
+    MarketplacePurchase? findPurchase(id: String) {
+        var row = store.queryOptional("select " + MarketplaceStore.purchaseColumns() + " from marketplace_purchases where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return MarketplaceStore.purchaseOf(row)
+    }
+    MarketplacePurchase? findPurchaseForUpdate(id: String) {
+        var row = store.queryOptional("select " + MarketplaceStore.purchaseColumns() + " from marketplace_purchases where id = ? for update", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return MarketplaceStore.purchaseOf(row)
+    }
+    List<MarketplacePurchase> purchases(sql: String, params: DbParams) {
+        var out = listOf<MarketplacePurchase>()
+        for (var r in store.queryList(sql, params)) {
+            out.add(MarketplaceStore.purchaseOf(r))
+        }
+        return out
+    }
+    List<MarketplacePurchase> findPurchasesByBuyer(buyerId: String) = this.purchases("select " + MarketplaceStore.purchaseColumns() + " from marketplace_purchases where buyer_id = ? order by created_at desc", DbParams().bindStr(buyerId))
+    List<MarketplacePurchase> findSalesBySeller(sellerId: String) = this.purchases("select " + MarketplaceStore.purchaseColumns() + " from marketplace_purchases where seller_id = ? order by created_at desc", DbParams().bindStr(sellerId))
+    List<MarketplacePurchase> findHeldByListing(listingId: String) = this.purchases("select " + MarketplaceStore.purchaseColumns() + " from marketplace_purchases where listing_id = ? and state = \'HELD\'", DbParams().bindStr(listingId))
+    // HELD purchases older than the decision window (ids first: the worker decides each one in its own transaction).
+    List<MarketplacePurchase> findHeldBefore(before: String, limit: Int) = this.purchases("select " + MarketplaceStore.purchaseColumns() + " from marketplace_purchases where state = \'HELD\' and created_at < ? order by created_at limit ?", DbParams().bindInstant(before).bindInt(limit))
+    // Ownership: a purchase that was not refunded, of any listing of the same item (the importer can list the same
+    // item again under another listing id).
+    Bool hasPurchaseForItem(buyerId: String, itemKind: String, itemId: String) = store.queryLong("select count(*) from marketplace_purchases p join marketplace_listings l on l.id = p.listing_id where p.buyer_id = ? and p.state <> \'REFUNDED\' and l.item_kind = ? and l.item_id = ?", DbParams().bindStr(buyerId).bindStr(itemKind).bindStr(itemId)) > 0L
+    insertItem(i: MarketplaceItem) {
+        store.execute("insert into marketplace_items (" + MarketplaceStore.itemColumns() + ") values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(i.id()).bindStr(i.sellerId()).bindStr(i.kind()).bindStr(i.title()).bindStrOrNull(i.description()).bindStrOrNull(i.content()).bindInstant(i.createdAt()))
+    }
+    MarketplaceItem? findItem(id: String) {
+        var row = store.queryOptional("select " + MarketplaceStore.itemColumns() + " from marketplace_items where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return MarketplaceStore.itemOf(row)
+    }
+}

@@ -4,6 +4,7 @@
 |---|---|---|---|
 | shared/web + shared/security (request pipeline) + `apiv1` origin gate | `GET/POST /admin/panic` 2/2 (the `/v1` index and `/developers/origins` CRUD belong to `apiv1`) | 87 / 100 Java tests (149 Kof tests in `tests/security/`) | G28 to G35 |
 | notifications, push, messaging, calls (slug `messaging`) | notifications 8/8, push 3/3, messaging 24/24 (`GET /conversations/stream` answers but cannot stream, G201), calls 13/13 | 117 / 122 Java tests (notifications 34/34, push 21/21, messaging 51/55, calls 11/12; 127 Kof tests in `tests/notifications`, `tests/push`, `tests/messaging`, `tests/calls`, `tests/kernel/WebPushAdapterTest.kf`) | G200 to G212 |
+| games, dailygames (slug `games`) | games 42/42, dailygames 13/13 | 41 / 41 Java tests (games 28/28, dailygames 13/13; the `null` event list assertion of `BlocksEngineTest` has no Kof counterpart; 52 Kof tests in `tests/games`, `tests/dailygames`, `tests/kernel/GamesAdaptersTest.kf`) | G260 to G265 |
 
 ## Request pipeline (`kernel.security`)
 
@@ -273,22 +274,23 @@ PROJECTS, NEWS, TUTORIALS, OPPORTUNITIES, REVIEWS, FUN; date-window pagination a
 `POST|GET|DELETE /feed/scheduled` with `feed-scheduled-publish` (3 attempts, batches of 20), post seals
 (`/feed/posts/seals`, `/{postId}/seals`, `/{postId}/seals/people`), `GET /feed/corporate`,
 `GET /corporate/{u}/posts`, post notes (`/feed/posts/{id}/notes`, `GET|PATCH /admin/notes`), accepted answers,
-`GET /pages/{postId}` (HTML with the CSP headers) and `GET /pages/{postId}/og.png`.
+`GET /pages/{postId}` (HTML with the CSP headers) and `GET /pages/{postId}/og.png` (the share card, drawn by `kernel.image.PageCards`
+with Java2D and the bundled Liberation font, cached in `pagePreviewCards`, streamed through a GET route claim of the binary lane).
 Jobs on `kernel.jobs` (`REDE_FEED_WORKERS_ENABLED`, default true): `feed-moment-expiry`, `feed-scheduled-publish`.
 Moderation use cases are exposed on `FeedModule.moderation` (`removeAsModerator`, `quarantine`, `release`,
 `removeCommentAsModerator`, `purgeAllByAuthor`); the purge also clears `post_reposts`, `poll_votes`, `poll_options` and
 `comment_media`, which the Java list missed.
 
 Deliberate differences:
-- `GET /pages/{postId}/og.png` answers 404 for non-pages and 501 `PAGE_CARD_UNAVAILABLE` for pages: the Kof handler
-  writes a String as UTF-8, so no binary body can be served (G145).
+- `GET /pages/{postId}/og.png` leaves the runtime as a stream (`X-Kernel-Stream`, `BinaryLane.claimDownload`), because a
+  handler writes a String as UTF-8 (G145): `GET /pages/{postId}` stays an ordinary route. The gradient is painted pixel by pixel
+  (`GradientPaint` takes floats, see KOF_GAPS), so the PNG is not byte-identical to the Java one.
 - `FeedDistributionService` and the in-memory feed cache are not ported: in Java `fromCache` is dead code and the cache
   is write-only, so nothing reads it.
 - `GET /feed/posts/seals` is registered before `/feed/posts/:postId` because routes match in registration order (G147).
 - Counters move with atomic `update ... set n = n + 1`.
 
-Tests not ported (9 of 170, with reason): the two PagePreviewCard tests and the og image test (binary body, G145);
-the actor-style notification test (notifications port); the BanCleanupService test (moderation port); the coin-ledger
+Tests not ported (6 of 170, with reason): the actor-style notification test (notifications port); the BanCleanupService test (moderation port); the coin-ledger
 reaction test (coins port; `FeedRecordingCoins` records the answer reward instead); the media-embedding Mockito `verify`
 test (media port); two identity-presentation tests that need the full profile cosmetics wiring.
 Test wiring: `feed.FeedTestSupport` (limits relaxed, duplicate filters off, outbox worker parked with
@@ -685,23 +687,33 @@ Slug `jobs`, branch `port/jobs`. Modules installed in `Main.kf`: `ProfileModule`
 | Domain | Endpoints ported/total | Kof tests | Java tests ported/total |
 |---|---|---|---|
 | jobs (`src/jobs`) | 20/20 | `tests/jobs/*` (108, 17 files; includes the eligibility policy, `OpenJobApiSource` over a stub transport, `UrlCanonical`, `HtmlEntities`, `Db.requiresNew`) | 94/94 methods (one loses two assertions, see below) |
-| importlinkedin (`src/importlinkedin`) | 4/6 (`POST /texto`, `GET /contatos/resumo`, `PUT /contatos/auto-convite`, `GET /contatos`); `POST /me/import/linkedin` and `POST /me/import/linkedin/contatos` wait for the binary lane | `tests/importlinkedin/*` | 18/20 (the two `LinkedinImportUploadLimitTests` are transport tests, they wait for the lane) |
-| importresume (`src/importresume`) | 0/2 over HTTP: `POST /me/import/resume` and `POST /me/import/resume/prefill/{jobId}` are multipart uploads, so they wait for the binary lane; the services behind them (`ResumeImportService.parse/extractText/prefill`, `ResumePrefillService`) are complete and tested on the uploaded temp file | `tests/importresume/ResumeImportServiceTest` | 9/9 |
+| importlinkedin (`src/importlinkedin`) | 6/6 (the two uploads `POST /me/import/linkedin` and `/contatos` go through the binary lane) | `tests/importlinkedin/*` (+ `LinkedinUploadRoutesTest`) | 20/20 (`LinkedinImportUploadLimitTests` ported over the lane) |
+| importresume (`src/importresume`) | 2/2 (`POST /me/import/resume` and `POST /me/import/resume/prefill/{jobId}`, multipart through the binary lane) | `tests/importresume/ResumeImportServiceTest`, `ResumeUploadRoutesTest` | 9/9 |
 
-### What wait for the binary lane
+### The four uploads on the binary lane
 
-`src/kernel/http/BinaryLane.kf` and `BinaryFront.kf` are on `main` and merged here, but they do not fit these four endpoints yet, so the routes are NOT registered (an unregistered route answers `200` with an empty body, so the front would see a silent success). Measured in `BinaryFront.kf`: the upload branch is `method == "PUT"` only (the download branch `GET`), the claim is a path PREFIX (`BinaryLane.owns` uses `startsWith`) and the body that reaches the route is the raw request body in a temp file. The four endpoints are `POST` `multipart/form-data`, and their prefixes share paths with ordinary routes (`PUT /me/import/linkedin/contatos/auto-convite`, `GET .../contatos`, `POST .../texto`), which a prefix claim would pull into the upload dance. What the lane needs for them (a kernel change owned by the media/lane work, not done here to avoid redesigning another agent's file):
+The four endpoints are `POST multipart/form-data` and share path prefixes with ordinary routes, so they are claimed by
+METHOD and exact path (`BinaryLane.claimRoute`, `docs/KERNEL.md`, "Method + path claims"); `PUT .../contatos/auto-convite`,
+`GET .../contatos`, `POST .../texto` stay ordinary routes and are exercised by `LinkedinUploadRoutesTest`. Each handler
+authenticates before the body is read (`Auth.requireUser`, then `BinaryUploads.receive`), the front streams the body
+through `MultipartParser` into temp files and the lane deletes them after the answer.
 
-1. `POST` accepted in the upload branch next to `PUT`, with claims matched by method and exact path (or a claim list of `(method, path)`).
-2. A multipart step that extracts the `file` part of the temp file (boundary from `Content-Type`) into its own temp file.
-
-Everything behind the upload is done and tested with files on disk, which is what step 2 would hand over (`UploadFiles`, a temp path); wiring each route is then a few lines:
-
-- `POST /me/import/linkedin` -> `LinkedinImportService.parseArchive(path)` (413 `IMPORT_TOO_LARGE` zip-bomb guard, `REDE_IMPORT_LINKEDIN_MAX_UNCOMPRESSED_BYTES`, 5 MB `FILE_TOO_LARGE`).
-- `POST /me/import/linkedin/contatos` -> `LinkedinImportService.parseContacts(path)` then `LinkedinContactInviteService.importContacts(userId, contacts)`.
-- `POST /me/import/resume` -> `ResumeImportService.parse(path, originalName, contentType)`.
-- `POST /me/import/resume/prefill/{jobId}` -> `ResumePrefillService.prefill(userId, jobId, ResumeImportService.extractText(path, name, type))`.
-- The Java `LinkedinImportUploadLimitTests` (a 3 MB zip reaches the controller, an 8.45 MB one gets 413 `FILE_TOO_LARGE` over a real socket) belong with the lane wiring; a module that claims a prefix must also stop the platform at the end of its suite (see `tests/media/MediaContractTest`).
+- `POST /me/import/linkedin` -> `LinkedinImportService.parseArchive(file)`; `POST /me/import/linkedin/contatos` ->
+  `parseContacts(file)` then `LinkedinContactInviteService.importContacts`; `POST /me/import/resume` ->
+  `ResumeImportService.parse(file, name, type)`; `POST /me/import/resume/prefill/{jobId}` ->
+  `ResumePrefillService.prefill(user, jobId, extractText(file, name, type))`.
+- Limits: `REDE_IMPORT_UPLOAD_MAX_BYTES` (default 16 MB) caps the request and its file part (`413 FILE_TOO_LARGE` from the
+  front). Spring allowed 520 MB and the services then refused above 5 MB (LinkedIn) / 10 MB (resume) with a `400
+  FILE_TOO_LARGE`: here a file between 16 MB and 520 MB answers 413 instead of 400, with the same code, and 520 MB never
+  reaches the disk of an authenticated user. The 5 MB / 10 MB service rules are unchanged (`400 FILE_TOO_LARGE`).
+- Differences from Spring: a missing `file` part is `400 FILE_REQUIRED` (Spring answered 500 through the generic handler),
+  a body that is not multipart is `415 UNSUPPORTED_MEDIA_TYPE`, a chunked body is `411 LENGTH_REQUIRED`, a broken multipart
+  body is `400 MALFORMED_MULTIPART`. One upload goes through the filter chain twice (authorize and commit).
+- The Java `LinkedinImportUploadLimitTests` run in `LinkedinUploadRoutesTest` over a real socket with the 8 MB cap of the Java
+  test profile (`ImportTestKit` sets `REDE_IMPORT_UPLOAD_MAX_BYTES=8388608`): the 3 MB zip reaches the route (401 without
+  a session), the 8.45 MB one gets `413 FILE_TOO_LARGE`, with and without a session. In Spring the limit was checked before
+  authentication; here too (the declared length), while the file itself is only read after the session is accepted.
+- Lane gaps found: G300 to G303 (`docs/KOF_GAPS.md`).
 
 ### Seams replaced by real module APIs
 
@@ -728,3 +740,100 @@ Everything behind the upload is done and tested with files on disk, which is wha
 - The Java Mockito tests (`JobServiceTests`, `ExternalJobSubmissionServiceTests`, `ExternalJobRefreshSchedulerTest`) run the real services over H2; "never saved / never delivered" is read from the tables and the captured mailer.
 - The Java `ExternalJobImportServiceTests`, `GlobalDedupeTests` and `CommunitySubmissionImportGuardTests` registered stub `JobImportSource` beans; here `JobTestSource` instances are set before the app of the file boots.
 - Gaps found: G280 to G284 (`docs/KOF_GAPS.md`).
+## games and dailygames
+
+Ported: the store catalogue (submit, review, publish, edit, slug change, suspend, favorites, trending, stats,
+analytics, boost), developer pages and follows, reviews, ratings and comments, collections, the identity token
+that games use to talk to the platform (`POST /games/:gameId/identity`, validated once by `POST /games/tokens/validate`), the spend confirmation, the share to
+the feed, the URL guard, and the three daily games (words, maze, blocks) with the prize settlement. Every code
+and pt-BR message is the Java one. The daily maze and blocks are generated from `java.util.Random` through
+`kernel.text.JavaRandom`, so the same stored seed gives the same maze, the same bag of pieces and the same replay:
+`tests/dailygames/DailyMazeTest.kf` and `DailyBlocksEngineTest.kf` compare against values produced by running the
+Java `MazeRules` and `BlocksEngine`.
+
+The cron `DailyGameRewardsScheduler` runs on `kernel.jobs` (`daily-game-rewards`, 00:20 America/Sao_Paulo, look-back
+7 days).
+
+### Seams owned by this slice (pending-port)
+
+| Seam | Owner to come | Default |
+|---|---|---|
+| `GamesCoins` | coin | runs the ledger SQL the Java `CoinService` runs for `grant` (hash-chained entry, optimistic balance update, treasury `coin_tesouraria`, rate from `coin_rate_history`, encrypted message, idempotent by `kind:ref`); `recordPresence` is a no-op (the streak belongs to coin) |
+| `GamesFeed` (`publishShare`) | feed | age gate and sanction gate through the real modules, then inserts the INSIGHT post with its tags and media; it omits the feed side effects (mentions, fan-out, counters) |
+| `GamesHosts` (`classify`) | none | real DNS classification; tests override it with a DNS-free stub (names are public, literal IPs are classified for real) |
+
+Profile, notifications, age and sanctions are called through their real module APIs (`ProfileDirectory`,
+`Notifications`, `AgeGate`, `SanctionGate`), not through seams.
+
+### Decisions and deliberate differences
+
+- **followers of a developer**: `followersOf` returns the follower ids (`follower_id`); the Java query selected the followed id, so the new-update notification reached the developer instead of the followers.
+- **play counter** is incremented atomically in SQL (`plays = plays + 1`), not read-modify-write.
+- **identity token** is claimed with one atomic `UPDATE ... WHERE used_at IS NULL`, so two parallel validations cannot both succeed.
+- **blocks window**: the 409 `GAME_FINISHED` past 600 s is thrown inside the transaction like Java, so the TIMED_OUT mark it tried to write is rolled back; the state still reports TIMED_OUT by replay.
+- **coin default** skips a credit whose idempotency key already exists instead of failing.
+- **tests**: wallets are seeded with a `coin_accounts` row (the Java airdrop belongs to coin); settlement rows are read from `coin_entries`.
+- **`BlocksEngineTest`**: Java also passes a `null` event list; Kof lists are never null, the other five assertions are kept. Golden tests (bag sequences, scripted replays WON and LOST) were added.
+- **router order**: literal routes are registered before the `:slug` ones, because the Kof router takes the first registered match (Spring prefers the literal one by itself).
+
+### Kernel files added by this slice
+
+`kernel/text/JavaRandom.kf`, `kernel/time/IsoWeeks.kf`, `kernel/url/HostAddresses.kf`, `kernel/url/UrlParts.kf`
+(documented in `docs/KERNEL.md`), proven by `tests/kernel/GamesAdaptersTest.kf`. `src/Main.kf` wires `GamesModule` and
+`DailyGamesModule` and keeps the `ProfileModule` result.
+
+## economy (coin, cosmetics, marketplace, services)
+
+Slug `economy`, branch `port/economy`, gap numbers G240 to G248. Modules: `CoinCore.create(platform, shared, parts)` before notifications, then `CoinModule.install(...)` after it (the disputes notify); `CosmeticsCore.create(platform)` before profile (its badge ownership replaces a profile seam), then `CosmeticsModule.install(...)`; `MarketplaceModule.install(...)` and `ServicesModule.install(...)` last. All wired in `Main.kf` (the boot was smoke tested with `scripts/kof-run`: it reaches "listening").
+
+| Domain | Endpoints ported/total | Kof tests (`tests/<domain>`) | Java tests ported/total |
+|---|---|---|---|
+| coin (`src/coin`) | 16/16 | 63 tests in 10 files: `CoinFlowTest`, `CoinExtractTest`, `CoinTransferGuardTest`, `CoinDisputeFlowTest`, `CoinEconomyServiceTest`, `CoinEconomyCalculatorTest`, `CoinEconomyEndpointTest`, `CoinStreakTest`, `CoinStreakPresenceTest`, `CoinBridgesTest` | 62/62 behaviours (the parameterised and the date-window Java tests are merged: 62 Java methods become 59 Kof tests, plus 4 new: bridges and the failing-presence case) |
+| cosmetics (`src/cosmetics`) | 22/22 | 67 tests in 8 files | 59/59 methods (8 new tests for paths the Java tests never reached) |
+| marketplace (`src/marketplace`) | 11/11 | 16 tests in 4 files | 15/15 (+1 new: sanitize) |
+| services (`src/services`) | 21/21 (14 in `/servicos`, 7 in `/services`) | 12 tests in 2 files | 12/12 |
+
+Total: 70 of 70 endpoints, 148 of 151 Java behaviours ported as 158 Kof tests; the 3 left are `CoinTestSupportTests` (below).
+
+### coin
+
+- The ledger is the truth: kinds are strings, `grant` checks the balance (400 `INSUFFICIENT_SPARKS`), chains the hash `sha256(prev|account|amount|kind|ref|idem)`, and the balance moves with the same atomic statement as Java (`update coin_accounts set balance = ?, version = version + 1 where account_id = ? and version = ?`, else 409 `COIN_CONCURRENCY`). The idempotency key is `kind:ref`, unique per account.
+- Jobs on `kernel.jobs`: ledger reconcile `0 17 4 * * *` (UTC, like the JVM zone of Java), economy recalculation `0 10 */3 * * *` and monthly round `0 40 3 1 * *`, both in `COIN_ECONOMY_ZONE` (America/Sao_Paulo). All three are overridable with the Java env names (`COIN_ECONOMY_*`, `-` disables a cron).
+- Economy defaults come from `application.properties` (scarcity weight 0.5), not from `docs/COIN_ECONOMY.md` (1.5): same as the Java runtime. One publication per period (24 h by default), the monthly round recalculates from zero.
+- Transfers: dedupe window `REDE_COIN_TRANSFER_DEDUPE_SECONDS` (10), throttles `REDE_COIN_TRANSFER_PER_MINUTE` (10) and `REDE_COIN_TRANSFER_PER_HOUR` (60), new-account cap 500 sparks per UTC day (403 `NEW_ACCOUNT_LIMIT`).
+- Presence (`CoinService.recordPresence`) runs after the commit of the caller's transaction, in its own, and never throws into the action.
+- Fixed while testing: the elapsed fraction of the economy period divided by the period in milliseconds and then by 1000 again (the ported test `after a whole period the step is full again` caught it).
+
+#### Seams replaced in other domains (Main.kf)
+
+| Seam | Replaced by |
+|---|---|
+| `CommunityCoins`, `GroupCoins`, `BlogCoins`, `MessagingCoins` (`recordPresence`) | `CoinCommunityCoins`, `CoinGroupCoins`, `CoinBlogCoins`, `CoinMessagingCoins` (`src/coin/CoinBridges.kf`), tested in `CoinBridgesTest` |
+| `NotificationCoins` (`hasReward`, `reward`: the apology) | `CoinNotificationCoins` |
+| `ProfileBadgeOwnership` | `CosmeticsBadgeOwnership` (an `emblema-*` badge needs ownership and a catalog BADGE id; the old default accepted any owned `emblema-` id) |
+
+#### Seams owned
+
+| Seam | Owner | Default |
+|---|---|---|
+| `CoinDisputeModeration` (`report`, `applyForReport`, `restrictUser`) | moderation | writes `reports` (throttle `report`, 409 `ALREADY_REPORTED`) and `user_sanctions` directly with the Java rule (a USER report of a scam restricts the receiver) |
+| `CosmeticsContributors.isVerified` | contributions | reads `user_seals` (ACTIVE) and `github_identities` |
+| `ServiceLinkGuard` | games (`GameUrlGuard`) | the same rule (https only, no credentials, public host, codes `INVALID_GAME_URL`) |
+
+### Deliberate differences from the Java services
+
+- Coin: a duplicate idempotency key propagates 409 and rolls the transaction back (Java found the existing entry); the dispute decision is an atomic claim (`where state = 'OPEN'`, else 409 `DISPUTE_ALREADY_DECIDED`; Java never checked the state, so a decided dispute could be decided again); request bodies that Java answered with 500 (null pointer) answer 400 `BAD_REQUEST`.
+- Escrow refund reuses the release reference (`ESCROW_RELEASE` kind), so release and refund exclude each other in the ledger itself.
+- Cosmetics: submit of a community cosmetic is an atomic claim (`where status = 'DRAFT'`), an edit only applies while DRAFT or REJECTED, the report counter is `reported = reported + 1` in SQL, a concurrent second look purchase is 409 by the ledger key (the wallet is charged once either way). `PUT /me/status` answers the profile view through `ProfileViews.publicView`. Profile slots are written group by group through `ProfileSlots` (a look change never rewrites a neighbour field; an equipped seasonal name style clears font and color).
+- Marketplace: confirm and refund are atomic claims (`update ... where state = 'HELD'`, 409 `PURCHASE_NOT_HELD`) on top of the `for update` row locks. The Spring rollback test with a spy became a CHECK constraint that makes the REFUNDED write fail once (same observable: money and state roll back, the retry works). Jobs: `marketplace-release-expired` (hourly), `marketplace-sanitize` and `marketplace-gallery-import` (initial 90 s, hourly).
+- Services: accepting, refunding and choosing a proposal are atomic claims on the state, and accept/refund check HELD before moving money; publishing an offer locks the seller's `users` row so the 5 open offers cap holds under concurrency; delivery note and proposal message get 1000 characters with `SERVICE_FIELD_TOO_LONG`. An unresolvable host and a private host share one message in the link guard, and the tolerant re-encoding of links with special characters is not ported. The chat opens a real SERVICE conversation through `MessagingService` and needs the sender to have a birth date (the messaging age rule).
+
+### Java tests not ported (3 of 151)
+
+- `CoinTestSupportTests` (3): test of `retryOnCoinConcurrency`, a helper that exists only because all Java test classes share one H2 and one treasury row. Each Kof test file boots its own database.
+- Moderation endpoints used by the services tests (`/moderation/services/*`) belong to the moderation domain: the tests drive `ServiceOfferService.approve/reject/suspend`, the methods that domain will call. Moderation of community cosmetics (PENDING_MODERATION to PUBLISHED) is moved by SQL in the tests.
+- The feed projections checked by two cosmetics tests (frame and name style on a post/comment) and the `/feed/posts` calls of the streak tests: the feed is not ported, so the streak tests call `CoinService.recordPresenceNow`, the exact call the feed makes.
+
+### Kernel files added or changed by this slice
+
+`kernel/jobs/ProcessLock.kf` (new: the `synchronized` of Java), `kernel/time/ZoneDates.kf` (`localToInstant`, `dayOfWeek`, `weekStart`), both with tests in `tests/kernel`. Config: `COSMETICS_CATALOG` (default `resources/cosmetics/catalog.json`; the deploy must ship the file next to `resources/templates`), `REDE_COSMETICS_EVENTS_{DUEL,HUNT}_{STARTS,ENDS}_AT`, `REDE_MARKETPLACE_*`, `COIN_ECONOMY_*`. Test support in `src/economy/` (`EconomyTestKit`, `CosmeticsTestKit`, `MarketTestKit`, `ServicesTestKit`). Gaps found: G240 to G248 in `KOF_GAPS.md`.

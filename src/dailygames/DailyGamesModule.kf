@@ -1,0 +1,49 @@
+package dailygames
+
+import games.*
+import kernel.*
+import kernel.log.*
+import kernel.security.*
+import notifications.*
+
+// Composition of the daily games (words, maze, blocks) and the settlement job. Main.kf calls install once,
+// after GamesModule (it shares the faisca seam `GamesCoins`):
+//
+//   DailyGamesModule.install(platform, shared, notificationsModule, gamesModule.coins)
+//
+// The prize job (`DailyGameRewardsScheduler`) runs on kernel.jobs at 00:20 America/Sao_Paulo and sweeps the
+// last 7 days, so days that closed while the application was down are paid on the next run.
+class DailyGamesModule {
+    DailyWordService word
+    DailyMazeService maze
+    DailyBlocksService blocks
+    DailyGameRewards rewards
+    public constructor(word: DailyWordService, maze: DailyMazeService, blocks: DailyBlocksService, rewards: DailyGameRewards) {
+        this.word = word
+        this.maze = maze
+        this.blocks = blocks
+        this.rewards = rewards
+    }
+    static Int lookbackDays() = 7
+    static String settlementCron() = "0 20 0 * * *"
+    static DailyGamesModule install(platform: Platform, shared: SharedServices, notifications: NotificationsModule, coins: GamesCoins) = DailyGamesModule.installWith(platform, shared, notifications.notifications, coins, DailyGamesClock(), platform.cfg.getStr("DAILYGAMES_RESOURCES_DIR", "resources/dailygames"))
+    static DailyGamesModule installWith(platform: Platform, shared: SharedServices, notifications: Notifications, coins: GamesCoins, clock: DailyGamesClock, resourcesDir: String) {
+        var word = DailyWordService(platform.db, clock, coins, DailyWordService.vocabulary(resourcesDir))
+        var maze = DailyMazeService(platform.db, clock, coins)
+        var blocks = DailyBlocksService(platform.db, clock, coins)
+        var rewards = DailyGameRewards(platform.db, clock, coins, notifications, word, maze, blocks)
+        DailyGamesRoutes.register(platform.server, word, maze, blocks)
+        DailyGamesModule.schedule(shared, rewards)
+        return DailyGamesModule(word, maze, blocks, rewards)
+    }
+    // DailyGameRewardsScheduler.payClosedDays: once a day at 00:20 in Brasilia.
+    static schedule(shared: SharedServices, rewards: DailyGameRewards) {
+        var log = Log("dailygames.rewards")
+        shared.jobs.cron("daily-game-rewards", DailyGamesModule.settlementCron(), "America/Sao_Paulo", () -> {
+    var paid = rewards.settleClosedDays(DailyGamesModule.lookbackDays())
+    if (paid > 0) {
+        log.infoWith("daily_game_rewards_paid", mapOf("count", "" + paid))
+    }
+})
+    }
+}

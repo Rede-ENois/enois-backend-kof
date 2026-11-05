@@ -1,0 +1,136 @@
+import economy.*
+import kernel.*
+import kernel.testkit.*
+import profile.*
+import services.*
+
+// Port of ServicesFlowTests: the freelance escrow (offer, hire, deliver, accept, refund), the cash service that never
+// touches the ledger, requests with proposals, the provider card with the service chat, and the owner's edit/remove.
+TestApp sfApp() = ServicesTestKit.app("servicesflow")
+
+String sfBody(category: String, title: String, description: String, deliverables: String, price: Long, currency: String?, days: Int) = json.encode(ServiceListingBody(category, title, description, deliverables, price, currency, days))
+
+String sfPublish(who: ProfileCaller, body: String) {
+    var res = who.post("/servicos/ofertas", body)
+    Check.status(res, 200)
+    return ServicesTestKit.str(res, "id")
+}
+
+test "listing, contract, deliver and accept" {
+    var app = sfApp()
+    var seller = ServicesTestKit.login(app, "svc-seller")
+    var buyer = ServicesTestKit.login(app, "svc-buyer")
+    Check.status(seller.get("/carteira"), 200)
+    Check.status(buyer.get("/carteira"), 200)
+    var listingId = sfPublish(seller, sfBody("design", "Logo simples para o seu time", "Faço um logo limpo com duas rodadas de ajuste, formato pronto para uso.", "SVG + PNG em três tamanhos", 30000L, null, 5))
+    Check.status(seller.post("/servicos/ofertas/" + listingId + "/contratar", ""), 400)
+    var contract = buyer.post("/servicos/ofertas/" + listingId + "/contratar", "")
+    Check.status(contract, 200)
+    Check.jsonEq(contract, "state", "HELD")
+    var contractId = ServicesTestKit.str(contract, "contractId")
+    Check.eqStr("escrow held", "75000", "" + ServicesTestKit.balance(buyer))
+    Check.status(seller.post("/servicos/contratos/" + contractId + "/entregar", json.encode(ServiceDeliverBody("SVG e PNG entregues no link X"))), 200)
+    var accepted = buyer.post("/servicos/contratos/" + contractId + "/aceitar", "")
+    Check.status(accepted, 200)
+    Check.jsonEq(accepted, "state", "RELEASED")
+    Check.eqStr("seller gets 90%", "132000", "" + ServicesTestKit.balance(seller))
+}
+
+test "a cash service stays out of the ledger and has no fee" {
+    var app = sfApp()
+    var seller = ServicesTestKit.login(app, "svc-cash-seller")
+    var buyer = ServicesTestKit.login(app, "svc-cash-buyer")
+    Check.eqStr("airdrop and presence", "105000", "" + ServicesTestKit.balance(buyer))
+    var listingId = sfPublish(seller, sfBody("design", "Identidade visual completa", "Marca, tipografia e manual de aplicação com duas rodadas de ajuste.", "PDF do manual + arquivos editáveis", 150000L, "BRL", 10))
+    var catalog = ServicesTestKit.anonymous(app).get("/servicos")
+    Check.status(catalog, 200)
+    Check.isTrue("the offer is in the catalog in reais", catalog.body.contains("\"id\":\"" + listingId + "\"") && catalog.body.contains("\"currency\":\"BRL\""))
+    Check.apiError(buyer.post("/servicos/ofertas/" + listingId + "/contratar", ""), 409, "DIRECT_PAYMENT_REQUIRED")
+    Check.eqStr("buyer untouched", "105000", "" + ServicesTestKit.balance(buyer))
+    Check.eqStr("seller untouched", "105000", "" + ServicesTestKit.balance(seller))
+}
+
+test "request, proposals, choose, refund and mandatory deliverables" {
+    var app = sfApp()
+    var requester = ServicesTestKit.login(app, "svc-requester")
+    var pro = ServicesTestKit.login(app, "svc-pro")
+    Check.status(requester.get("/carteira"), 200)
+    Check.status(pro.get("/carteira"), 200)
+    // without deliverables the request does not even open
+    Check.status(requester.post("/servicos/pedidos", json.encode(ServiceRequestBody("código", "Página para a minha comunidade", "Uma página institucional simples com formulário de contato funcional.", null, 40L, 80L, null))), 400)
+    var created = requester.post("/servicos/pedidos", json.encode(ServiceRequestBody("código", "Página para a minha comunidade", "Uma página institucional simples com formulário de contato funcional.", "HTML + CSS publicados", 40000L, 80000L, null)))
+    Check.status(created, 200)
+    var requestId = ServicesTestKit.str(created, "id")
+    Check.status(pro.post("/servicos/pedidos/" + requestId + "/propostas", json.encode(ServiceProposeBody("Faço isso rapidinho para você.", 200000L))), 400)
+    var proposal = pro.post("/servicos/pedidos/" + requestId + "/propostas", json.encode(ServiceProposeBody("Entrego em uma semana, com revisão.", 50000L)))
+    Check.status(proposal, 200)
+    var proposalId = ServicesTestKit.str(proposal, "id")
+    var chosen = requester.post("/servicos/pedidos/" + requestId + "/escolher", json.encode(ServiceChooseBody(proposalId)))
+    Check.status(chosen, 200)
+    Check.jsonEq(chosen, "state", "HELD")
+    Check.eqStr("escrow held", "55000", "" + ServicesTestKit.balance(requester))
+    var mine = requester.get("/servicos/minhas")
+    Check.status(mine, 200)
+    var contractId = ServicesTestKit.str(mine, "contratosComoComprador.0.id")
+    var refunded = requester.post("/servicos/contratos/" + contractId + "/reembolso", "")
+    Check.status(refunded, 200)
+    Check.jsonEq(refunded, "state", "REFUNDED")
+    Check.eqStr("refund returns 100%", "105000", "" + ServicesTestKit.balance(requester))
+}
+
+test "the service shows who provides it and opens the chat with a subject" {
+    var app = sfApp()
+    var seller = ServicesTestKit.loginAdult(app, "chat-seller")
+    var buyer = ServicesTestKit.loginAdult(app, "chat-buyer")
+    var listingId = sfPublish(seller, sfBody("Design", "Identidade visual do time", "Logo, paleta e manual curto para o time.", "Logo + paleta", 79000L, "BRL", 4))
+    var catalog = ServicesTestKit.anonymous(app).get("/servicos")
+    Check.status(catalog, 200)
+    Check.isTrue("the provider name travels", catalog.body.contains("\"sellerName\":\"chat-seller\""))
+    var chat = buyer.post("/servicos/ofertas/" + listingId + "/chat", json.encode(ServiceChatBody("Quero esse logo para a minha equipe.")))
+    Check.status(chat, 200)
+    Check.jsonEq(chat, "assunto", "Design · Identidade visual do time")
+    var conversationId = ServicesTestKit.str(chat, "conversationId")
+    var inbox = seller.get("/conversations")
+    Check.status(inbox, 200)
+    Check.isTrue("the provider has the conversation, of kind SERVICE", inbox.body.contains(conversationId) && inbox.body.contains("\"kind\":\"SERVICE\""))
+    var again = buyer.post("/servicos/ofertas/" + listingId + "/chat", json.encode(ServiceChatBody("Só confirmando.")))
+    Check.status(again, 200)
+    Check.jsonEq(again, "conversationId", conversationId)
+}
+
+test "the seller does not open a chat with themselves" {
+    var app = sfApp()
+    var seller = ServicesTestKit.loginAdult(app, "chat-proprio")
+    var listingId = sfPublish(seller, sfBody("Design", "Servico do proprio dono", "Um servico de teste do proprio dono, para ver o portao.", "Entrega em um dia util", 10000L, null, 2))
+    Check.status(seller.post("/servicos/ofertas/" + listingId + "/chat", json.encode(ServiceChatBody("oi"))), 400)
+}
+
+test "the provider edits and removes their own service" {
+    var app = sfApp()
+    var seller = ServicesTestKit.login(app, "edit-seller")
+    var other = ServicesTestKit.login(app, "edit-outro")
+    var buyer = ServicesTestKit.login(app, "edit-buyer")
+    Check.status(buyer.get("/carteira"), 200)
+    var listingId = sfPublish(seller, sfBody("Design", "Logo para o seu time", "Um logo limpo com duas rodadas de ajuste e arquivos prontos.", "SVG + PNG", 30000L, null, 5))
+    Check.apiError(other.put("/servicos/ofertas/" + listingId, sfBody("Design", "Titulo trocado por outra pessoa", "Descricao longa o bastante para passar da validacao minima.", "Nada", 1000L, null, 1)), 403, "NOT_THE_SELLER")
+    Check.apiError(other.delete("/servicos/ofertas/" + listingId), 403, "NOT_THE_SELLER")
+    var edited = seller.put("/servicos/ofertas/" + listingId, sfBody("Design", "Logo e paleta para o seu time", "Um logo limpo com duas rodadas de ajuste e a paleta do time.", "SVG + PNG + paleta", 30000L, null, 7))
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "status", "ACTIVE")
+    var catalog = ServicesTestKit.anonymous(app).get("/servicos")
+    Check.isTrue("the catalog shows the new content", catalog.body.contains("Logo e paleta para o seu time") && catalog.body.contains("\"deliveryDays\":7"))
+    // the edit validates like the creation: text above the column ceiling is refused naming the field
+    Check.apiError(seller.put("/servicos/ofertas/" + listingId, sfBody("Design", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "Descricao longa o bastante para passar da validacao minima.", "SVG", 30000L, null, 5)), 400, "SERVICE_FIELD_TOO_LONG")
+    // with an open contract the price does not change
+    Check.status(buyer.post("/servicos/ofertas/" + listingId + "/contratar", ""), 200)
+    Check.apiError(seller.put("/servicos/ofertas/" + listingId, sfBody("Design", "Logo e paleta para o seu time", "Um logo limpo com duas rodadas de ajuste e a paleta do time.", "SVG + PNG + paleta", 90000L, null, 7)), 409, "SERVICE_HAS_OPEN_CONTRACTS")
+    // removing: it leaves the catalog, the open contract stays in the buyer's panel
+    var removed = seller.delete("/servicos/ofertas/" + listingId)
+    Check.status(removed, 200)
+    Check.jsonEq(removed, "status", "REMOVED")
+    var after = ServicesTestKit.anonymous(app).get("/servicos")
+    Check.isTrue("gone from the catalog", !after.body.contains("\"id\":\"" + listingId + "\""))
+    var mine = buyer.get("/servicos/minhas")
+    Check.isTrue("the contract stays", mine.body.contains("\"listingId\":\"" + listingId + "\""))
+    ServicesTestKit.finish()
+}

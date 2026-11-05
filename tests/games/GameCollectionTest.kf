@@ -1,0 +1,42 @@
+import games.*
+import kernel.testkit.*
+
+// Port of GameCollectionTests (G3): themed collections curated by the administration; the public catalogue
+// reads them with the games RESOLVED (published only), and hiding takes one off the air.
+test "create, read and hide a collection" {
+    var admin = GamesTestKit.loginAdmin("gcol-admin")
+    var creator = GamesTestKit.login("gcol-creator")
+    var game1 = GamesTestKit.publish(creator, admin, "Jogo Coleção A", "https://creator.itch.io/coleta")
+    var game2 = GamesTestKit.publish(creator, admin, "Jogo Coleção B", "https://creator.itch.io/coletb")
+    // Not an admin: no creation.
+    Check.apiError(GamesTestKit.send("POST", "/games/colecoes", GamesTestKit.auth(creator), "{\"title\":\"Coleção da comunidade\",\"gameIds\":[\"" + game1 + "\"]}"), 403, "FORBIDDEN")
+    // Creates the collection with both games.
+    var created = GamesTestKit.send("POST", "/games/colecoes", GamesTestKit.auth(admin), "{\"title\":\"Pixel quentinho\",\"description\":\"Jogos curados da semana\",\"gameIds\":[\"" + game1 + "\",\"" + game2 + "\"]}")
+    Check.status(created, 200)
+    var collectionId = created.json("id")
+    Check.jsonEq(created, "status", "PUBLISHED")
+    // The public read brings the games RESOLVED (titles, not only ids).
+    var catalogue = GamesTestKit.get("/games/colecoes?limit=20", listOf<String>())
+    Check.status(catalogue, 200)
+    var at = GamesTestKit.indexOf(catalogue, "", "id", collectionId)
+    Check.isTrue("the collection is listed", at >= 0)
+    Check.jsonEq(catalogue, at + ".title", "Pixel quentinho")
+    Check.isTrue("games resolved", catalogue.body.contains("Jogo Coleção A") && catalogue.body.contains("Jogo Coleção B"))
+    Check.eqInt("two games", 2, catalogue.jsonSize(at + ".jogos"))
+    // A suspended game leaves the collection list (without the collection being touched).
+    Check.status(GamesTestKit.send("POST", "/admin/games/" + game2 + "/suspend", GamesTestKit.auth(admin), "{}"), 200)
+    var trimmed = GamesTestKit.get("/games/colecoes?limit=20", listOf<String>())
+    Check.eqInt("one game left", 1, trimmed.jsonSize(GamesTestKit.indexOf(trimmed, "", "id", collectionId) + ".jogos"))
+    // A collection with no game does not exist; a short title neither.
+    Check.apiError(GamesTestKit.send("POST", "/games/colecoes", GamesTestKit.auth(admin), "{\"title\":\"Coleção vazia\",\"gameIds\":[]}"), 400, "GAMES_REQUIRED")
+    Check.apiError(GamesTestKit.send("POST", "/games/colecoes", GamesTestKit.auth(admin), "{\"title\":\"Oi\",\"gameIds\":[\"" + game1 + "\"]}"), 400, "TITLE_REQUIRED")
+    // Hiding takes it off the air, and only whoever curated it can.
+    var otherAdmin = GamesTestKit.loginAdmin("gcol-admin2")
+    Check.apiError(GamesTestKit.send("POST", "/games/colecoes/" + collectionId + "/esconder", GamesTestKit.auth(otherAdmin), ""), 403, "NOT_THE_CURATOR")
+    Check.apiError(GamesTestKit.send("POST", "/games/colecoes/nao-existe/esconder", GamesTestKit.auth(admin), ""), 404, "COLLECTION_NOT_FOUND")
+    var hidden = GamesTestKit.send("POST", "/games/colecoes/" + collectionId + "/esconder", GamesTestKit.auth(admin), "")
+    Check.status(hidden, 200)
+    Check.jsonEq(hidden, "status", "HIDDEN")
+    Check.eqInt("not listed", -1, GamesTestKit.indexOf(GamesTestKit.get("/games/colecoes?limit=20", listOf<String>()), "", "id", collectionId))
+    GamesTestKit.finish()
+}

@@ -1,0 +1,47 @@
+import cosmetics.*
+import economy.*
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import profile.*
+
+// The cosmetics side of ProfileBadgeOwnership (the Java CosmeticsService implemented OfficialBadgeReader): the profile
+// shows an `emblema-*` badge only when the person owns it AND the id is a BADGE of the catalog. The default seam of the
+// profile domain could not read the catalog, so any owned `emblema-` id passed.
+TestApp badgeApp() = CosmeticsTestKit.app("badgeownership", mapOf<String, String>())
+
+test "an official badge needs ownership" {
+    var app = badgeApp()
+    var user = CosmeticsTestKit.wallet(app, "badge-owner-plain")
+    Check.apiError(user.put("/me/badges", "{\"badges\":[\"emblema-cachimbo\"]}"), 403, "NOT_OWNED")
+    Check.status(user.post("/loja/emblema-cachimbo/comprar", ""), 200)
+    var shown = user.put("/me/badges", "{\"badges\":[\"emblema-cachimbo\"]}")
+    Check.status(shown, 200)
+    Check.jsonEq(shown, "badges.0", "emblema-cachimbo")
+}
+
+test "an owned id that is not a catalog badge is refused" {
+    var app = badgeApp()
+    var user = CosmeticsTestKit.wallet(app, "badge-owner-forged")
+    // A grant row for an id the catalog does not know: owned in the tables, but not an official badge.
+    app.db().execute("insert into cosmetic_grants (user_id, item_id, source, created_at) values (?, ?, ?, current_timestamp)", DbParams().bindStr("badge-owner-forged").bindStr("emblema-inexistente").bindStr("test"))
+    Check.isTrue("the default seam would let it pass", ProfileBadgeOwnership(app.db()).ownsAllOfficial("badge-owner-forged", listOf("emblema-inexistente")))
+    Check.isTrue("the cosmetics seam refuses it", !CosmeticsTestKit.stack().core.badges.ownsAllOfficial("badge-owner-forged", listOf("emblema-inexistente")))
+    Check.apiError(user.put("/me/badges", "{\"badges\":[\"emblema-inexistente\"]}"), 403, "NOT_OWNED")
+    // A catalog piece that is not a badge keeps its own slot rules
+    Check.isTrue("a theme is not an emblema", CosmeticsTestKit.stack().core.badges.ownsAllOfficial("badge-owner-forged", listOf("tema-papel")))
+}
+
+test "badges that are not official are not checked and an event grant counts as ownership" {
+    var app = badgeApp()
+    var user = CosmeticsTestKit.wallet(app, "badge-owner-grant")
+    var plain = user.put("/me/badges", "{\"badges\":[\"https://cdn.test/meu-emblema.png\",\"outro\"]}")
+    Check.status(plain, 200)
+    Check.eqInt("two badges", 2, plain.jsonSize("badges"))
+    // The event reward: a grant row owns the badge like a purchase does.
+    CosmeticsTestKit.stack().core.store.grant("badge-owner-grant", "emblema-time-saci", "evento:saci-halloween", "2026-11-01T02:30:00Z")
+    var granted = user.put("/me/badges", "{\"badges\":[\"emblema-time-saci\"]}")
+    Check.status(granted, 200)
+    Check.jsonEq(granted, "badges.0", "emblema-time-saci")
+    CosmeticsTestKit.finish()
+}

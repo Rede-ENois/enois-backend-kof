@@ -1,0 +1,183 @@
+import cosmetics.*
+import economy.*
+import kernel.*
+import kernel.testkit.*
+import profile.*
+
+// Port of LookEquipFlowTests: wear and take off a ready-made look through the shop card. Neither touches who does not
+// own every piece.
+TestApp lookApp() = CosmeticsTestKit.app("lookequip", mapOf<String, String>())
+
+// The look with this title in the collections list of the viewer, as JSON text (looks carry the viewer state).
+String? lookJson(user: ProfileCaller, title: String) {
+    var res = user.get("/loja/colecoes")
+    Check.status(res, 200)
+    var collections = res.jsonSize("")
+    var c = 0
+    while (c < collections) {
+        var looks = res.jsonSize("" + c + ".looks")
+        var l = 0
+        while (l < looks) {
+            if (res.jsonStr("" + c + ".looks." + l + ".title") == title) {
+                return JsonPath.raw(res.body, "" + c + ".looks." + l)
+            }
+            l = l + 1
+        }
+        c = c + 1
+    }
+    return null
+}
+
+String lookFlag(user: ProfileCaller, title: String, field: String) {
+    var look = lookJson(user, title)
+    if (look == null) {
+        throw "FAIL look not in the shop: " + title
+    }
+    var value = JsonPath.str(look, field)
+    if (value == null) {
+        throw "FAIL look flag " + field + " is absent for " + title
+    }
+    return value
+}
+
+wear(user: ProfileCaller, lookId: String) {
+    var res = user.post("/loja/looks/" + lookId + "/equipar", "")
+    Check.status(res, 200)
+    Check.jsonEq(res, "id", lookId)
+    Check.jsonEq(res, "equipped", "true")
+}
+
+takeOff(user: ProfileCaller, lookId: String) {
+    var res = user.post("/loja/looks/" + lookId + "/desequipar", "")
+    Check.status(res, 200)
+    Check.jsonEq(res, "id", lookId)
+    Check.jsonEq(res, "equipped", "false")
+}
+
+test "a look is marked owned and equipped only for who has every piece" {
+    var app = lookApp()
+    var owner = CosmeticsTestKit.wallet(app, "look-equip-flags")
+    // Before buying: not yours, not worn.
+    Check.eqStr("owned before", "false", lookFlag(owner, "Papel", "owned"))
+    Check.eqStr("equipped before", "false", lookFlag(owner, "Papel", "equipped"))
+    Check.status(owner.post("/loja/looks/look-papel/comprar", ""), 200)
+    // Bought, the look comes worn, and the card says so.
+    Check.eqStr("owned after", "true", lookFlag(owner, "Papel", "owned"))
+    Check.eqStr("equipped after", "true", lookFlag(owner, "Papel", "equipped"))
+    // The same look for another viewer: owned/equipped belong to who asks, not to the catalog.
+    var other = CosmeticsTestKit.wallet(app, "look-equip-other")
+    Check.eqStr("other owned", "false", lookFlag(other, "Papel", "owned"))
+    Check.eqStr("other equipped", "false", lookFlag(other, "Papel", "equipped"))
+    // Without a session there is nothing to mark: the fields are not sent.
+    var guest = ProfileTestApp.anonymous(app).get("/loja/colecoes")
+    Check.status(guest, 200)
+    Check.isTrue("a guest look has no owned", !guest.jsonHas("0.looks.0.owned"))
+    Check.isTrue("a guest look has no equipped", !guest.jsonHas("0.looks.0.equipped"))
+}
+
+test "clicking an owned look takes it off and puts it back" {
+    var app = lookApp()
+    var owner = CosmeticsTestKit.wallet(app, "look-equip-toggle")
+    Check.status(owner.post("/loja/looks/look-manha-de-domingo/comprar", ""), 200)
+    // First click on the card (already worn by the purchase): takes it off.
+    takeOff(owner, "look-manha-de-domingo")
+    var bare = owner.get("/me")
+    Check.isTrue("cardTheme cleared", bare.jsonIsNull("cardTheme"))
+    Check.isTrue("avatarFrame cleared", bare.jsonIsNull("avatarFrame"))
+    Check.isTrue("nameTheme cleared", bare.jsonIsNull("nameTheme"))
+    Check.isTrue("profileEffect cleared", bare.jsonIsNull("profileEffect"))
+    Check.isTrue("nameplate cleared", bare.jsonIsNull("nameplate"))
+    Check.isTrue("statusText cleared", bare.jsonIsNull("statusText"))
+    Check.isTrue("statusIcon cleared", bare.jsonIsNull("statusIcon"))
+    Check.eqInt("no badges", 0, bare.jsonSize("badges"))
+    Check.eqStr("owned but off", "true", lookFlag(owner, "Manhã de domingo", "owned"))
+    Check.eqStr("not worn", "false", lookFlag(owner, "Manhã de domingo", "equipped"))
+    // Second click: wears it again, every piece and the look status.
+    wear(owner, "look-manha-de-domingo")
+    var worn = owner.get("/me")
+    Check.jsonEq(worn, "cardTheme", "tema-papel")
+    Check.jsonEq(worn, "avatarFrame", "moldura-coral")
+    Check.jsonEq(worn, "nameTheme", "nome-papel")
+    Check.jsonEq(worn, "profileEffect", "efeito-estrelas")
+    Check.jsonEq(worn, "nameplate", "placa-papel")
+    Check.jsonEq(worn, "statusText", "Café, jornal e nada marcado")
+    Check.jsonEq(worn, "statusIcon", "sol")
+    Check.eqInt("two badges", 2, worn.jsonSize("badges"))
+    Check.jsonEq(worn, "badges.0", "emblema-papel")
+    Check.jsonEq(worn, "badges.1", "emblema-estrela-calma")
+    Check.eqStr("worn again", "true", lookFlag(owner, "Manhã de domingo", "equipped"))
+}
+
+test "wearing the same look twice keeps the profile as it is" {
+    var app = lookApp()
+    var owner = CosmeticsTestKit.wallet(app, "look-equip-idempotent")
+    Check.status(owner.post("/loja/looks/look-papel/comprar", ""), 200)
+    var first = owner.get("/me")
+    wear(owner, "look-papel")
+    wear(owner, "look-papel")
+    var after = owner.get("/me")
+    // updatedAt is not part of the own view: the whole body is the same
+    Check.eqStr("profile unchanged", first.body, after.body)
+}
+
+test "taking off a look leaves what was chosen after it alone" {
+    var app = lookApp()
+    var owner = CosmeticsTestKit.wallet(app, "look-equip-after")
+    Check.status(owner.post("/loja/looks/look-papel/comprar", ""), 200)
+    // Swapped the frame (the "Papel" look wears the amber one) and wrote another note afterwards.
+    Check.status(owner.post("/loja/moldura-violeta/comprar", ""), 200)
+    Check.status(owner.post("/loja/moldura-violeta/equipar", ""), 200)
+    Check.status(owner.put("/me/status", "{\"text\":\"Recado novo\",\"icon\":\"cafe\"}"), 200)
+    takeOff(owner, "look-papel")
+    var me = owner.get("/me")
+    // The look left the slots that were still its...
+    Check.isTrue("cardTheme cleared", me.jsonIsNull("cardTheme"))
+    Check.isTrue("nameTheme cleared", me.jsonIsNull("nameTheme"))
+    Check.isTrue("nameplate cleared", me.jsonIsNull("nameplate"))
+    Check.eqInt("no badges", 0, me.jsonSize("badges"))
+    // ...and what came afterwards stays where it is.
+    Check.jsonEq(me, "avatarFrame", "moldura-violeta")
+    Check.jsonEq(me, "statusText", "Recado novo")
+    Check.jsonEq(me, "statusIcon", "cafe")
+}
+
+test "a look with a piece missing is not worn and costs nothing" {
+    var app = lookApp()
+    var buyer = CosmeticsTestKit.wallet(app, "look-equip-partial")
+    // One piece of the Saci look is not the look: the rest is missing.
+    Check.status(buyer.post("/loja/moldura-saci-completo/comprar", ""), 200)
+    Check.apiError(buyer.post("/loja/looks/look-saci/equipar", ""), 403, "NOT_OWNED")
+    // Nothing of the look was worn, and only the bought piece left the wallet.
+    var me = buyer.get("/me")
+    Check.isTrue("cardTheme empty", me.jsonIsNull("cardTheme"))
+    Check.isTrue("avatarFrame empty", me.jsonIsNull("avatarFrame"))
+    Check.eqStr("not owned", "false", lookFlag(buyer, "Saci-pererê", "owned"))
+    Check.eqStr("balance", "" + (105000 - 8000), "" + CosmeticsTestKit.balance(buyer))
+}
+
+test "a look outside the season can still be worn by its owner" {
+    var app = lookApp()
+    var owner = CosmeticsTestKit.wallet(app, "look-equip-out-of-season")
+    // Buys the Saci look in season...
+    Check.status(owner.post("/loja/looks/look-saci/comprar", ""), 200)
+    takeOff(owner, "look-saci")
+    // ...and the season passes: the look is no longer in the shop, but the pieces bought stay.
+    // 2026-11-04T02:30Z is 2026-11-03 23:30 in Sao Paulo: one day after the end of the window (11-02).
+    CosmeticsTestKit.clockAt("2026-11-04T02:30:00Z")
+    var shop = ProfileTestApp.anonymous(app).get("/loja/colecoes")
+    Check.status(shop, 200)
+    Check.isTrue("the look left the shop", !shop.body.contains("Saci-pererê"))
+    wear(owner, "look-saci")
+    Check.jsonEq(owner.get("/me"), "cardTheme", "tema-saci")
+}
+
+test "an unknown look and no session are refused" {
+    var app = lookApp()
+    CosmeticsTestKit.clockAt(CosmeticsTestKit.duelDay())
+    Check.status(ProfileTestApp.anonymous(app).post("/loja/looks/look-nada/equipar", ""), 401)
+    Check.status(ProfileCaller(app, "look-equip-invalid").post("/loja/looks/look-papel/equipar", ""), 401)
+    var user = CosmeticsTestKit.wallet(app, "look-equip-missing")
+    Check.apiError(user.post("/loja/looks/look-nada/equipar", ""), 404, "ITEM_NOT_FOUND")
+    Check.apiError(user.post("/loja/looks/look-nada/desequipar", ""), 404, "ITEM_NOT_FOUND")
+    CosmeticsTestKit.finish()
+}

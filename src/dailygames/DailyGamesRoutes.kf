@@ -1,0 +1,68 @@
+package dailygames
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.time.*
+import kernel.url.*
+
+// HTTP adapter of the daily games: /daily-games/words, /maze, /blocks and /rewards/prizes. All three games
+// share one shape: today (GET, `?date=` to resume yesterday), start, the play endpoint and the leaderboard.
+class DailyGamesRoutes {
+    static register(server: HttpServer, word: DailyWordService, maze: DailyMazeService, blocks: DailyBlocksService) {
+        server.get("/daily-games/words/today", () -> json.encode(word.state(Auth.requireUser(), DailyGamesRoutes.dateParam())))
+        server.post("/daily-games/words/today/start", () -> json.encode(word.start(Auth.requireUser())))
+        server.post("/daily-games/words/today/guesses", () -> DailyGamesRoutes.guess(word))
+        server.get("/daily-games/words/leaderboard", () -> json.encode(word.leaderboard()))
+        server.get("/daily-games/maze/today", () -> json.encode(maze.state(Auth.requireUser(), DailyGamesRoutes.dateParam())))
+        server.post("/daily-games/maze/today/start", () -> json.encode(maze.start(Auth.requireUser())))
+        server.post("/daily-games/maze/today/moves", () -> DailyGamesRoutes.move(maze))
+        server.get("/daily-games/maze/leaderboard", () -> json.encode(maze.leaderboard()))
+        server.get("/daily-games/blocks/today", () -> json.encode(blocks.state(Auth.requireUser(), DailyGamesRoutes.dateParam())))
+        server.post("/daily-games/blocks/today/start", () -> json.encode(blocks.start(Auth.requireUser())))
+        server.post("/daily-games/blocks/today/actions", () -> DailyGamesRoutes.action(blocks))
+        server.get("/daily-games/blocks/leaderboard", () -> json.encode(blocks.leaderboard()))
+        server.get("/daily-games/rewards/prizes", () -> json.encode(DailyPrizeTable(DailyGameRewards.tiers())))
+    }
+    // `?date=yyyy-MM-dd`: absent or empty is today; malformed is 400.
+    static String? dateParam() = Dates.body(Req.queryStr("date", ""))
+    static String guess(word: DailyWordService) {
+        var userId = Auth.requireUser()
+        var form = DailyGamesRoutes.guessBody()
+        return json.encode(word.guess(userId, form.guess(), form.requestId(), DailyGamesRoutes.dateParam()))
+    }
+    static String move(maze: DailyMazeService) {
+        var userId = Auth.requireUser()
+        var form = DailyGamesRoutes.moveBody()
+        return json.encode(maze.move(userId, form.direction(), form.requestId(), DailyGamesRoutes.dateParam()))
+    }
+    static String action(blocks: DailyBlocksService) {
+        var userId = Auth.requireUser()
+        var form = DailyGamesRoutes.actionBody()
+        return json.encode(blocks.action(userId, form.action(), form.requestId(), DailyGamesRoutes.dateParam()))
+    }
+    static DailyWordGuessBody guessBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<DailyWordGuessBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static DailyMazeMoveBody moveBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<DailyMazeMoveBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static DailyBlocksActionBody actionBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<DailyBlocksActionBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

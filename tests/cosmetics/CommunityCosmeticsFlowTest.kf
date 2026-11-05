@@ -1,0 +1,190 @@
+import cosmetics.*
+import economy.*
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import profile.*
+
+// Port of CommunityCosmeticsFlowTests (plus the update, report and contributor tag paths the Java tests did not reach).
+TestApp communityApp() = CosmeticsTestKit.app("communitycosmetics", mapOf<String, String>())
+
+String paletteManifest() = "{\"version\":1,\"kind\":\"PALETTE\",\"colors\":{\"primary\":\"#ff7a18\",\"accent\":\"#ff4fa3\"}}"
+
+String effectManifest(effectType: String) = "{\"version\":1,\"kind\":\"EFFECT\",\"effect\":{\"type\":\"" + effectType + "\"}}"
+
+String borderManifest() = "{\"version\":1,\"kind\":\"PROFILE_BORDER\",\"layers\":[{\"type\":\"ring\",\"color\":\"#ff7a18\"}]}"
+
+// The JSON body of a new draft; `manifest` is embedded as an escaped string.
+String draftBody(kind: String, name: String, manifest: String, rights: String) = "{\"kind\":\"" + kind + "\",\"name\":\"" + name + "\",\"description\":\"Paleta quente\",\"manifestJson\":" + json.encode(manifest) + ",\"license\":\"ORIGINAL\",\"rightsConfirmed\":" + rights + "}"
+
+String createDraft(user: ProfileCaller, name: String, kind: String, manifest: String) {
+    var res = user.post("/cosmetics/drafts", draftBody(kind, name, manifest, "true"))
+    Check.status(res, 200)
+    return CosmeticsTestKit.text(res, "id")
+}
+
+test "a creator saves a draft and submits it for moderation but a pending item is not public" {
+    var app = communityApp()
+    var creator = ProfileTestApp.login(app, "community-cosmetic-creator")
+    var created = creator.post("/cosmetics/drafts", draftBody("PALETTE", "Aurora Laranja", paletteManifest(), "true"))
+    Check.status(created, 200)
+    Check.jsonEq(created, "status", "DRAFT")
+    Check.jsonEq(created, "kind", "PALETTE")
+    Check.jsonEq(created, "version", "1")
+    Check.jsonEq(created, "reported", "0")
+    var id = CosmeticsTestKit.text(created, "id")
+    Check.isTrue("an id", id.startsWith("pcos_"))
+    var mine = creator.get("/cosmetics/mine")
+    Check.status(mine, 200)
+    Check.jsonEq(mine, "0.id", id)
+    var submitted = creator.post("/cosmetics/" + id + "/submit", "")
+    Check.status(submitted, 200)
+    Check.jsonEq(submitted, "status", "PENDING_MODERATION")
+    var catalog = ProfileTestApp.anonymous(app).get("/cosmetics/catalog")
+    Check.status(catalog, 200)
+    Check.isTrue("not in the public catalog", !catalog.body.contains(id))
+    Check.apiError(ProfileTestApp.anonymous(app).get("/cosmetics/" + id), 404, "COSMETIC_NOT_FOUND")
+    // Submitting twice: only a draft can be sent
+    Check.apiError(creator.post("/cosmetics/" + id + "/submit", ""), 409, "COSMETIC_NOT_EDITABLE")
+}
+
+test "the manifest is declarative and the rights confirmation is required" {
+    var app = communityApp()
+    var creator = ProfileTestApp.login(app, "community-cosmetic-validation")
+    Check.apiError(creator.post("/cosmetics/drafts", draftBody("EFFECT", "Efeito Inseguro", effectManifest("url(evil)"), "true")), 400, "INVALID_COSMETIC_MANIFEST")
+    Check.apiError(creator.post("/cosmetics/drafts", draftBody("EFFECT", "Efeito Sem Licença", effectManifest("GLOW"), "false")), 400, "RIGHTS_CONFIRMATION_REQUIRED")
+}
+
+test "every manifest rule answers its own refusal" {
+    var app = communityApp()
+    var creator = ProfileTestApp.login(app, "community-cosmetic-manifests")
+    var bad = listOf("{\"version\":2,\"kind\":\"PALETTE\",\"colors\":{\"a\":\"#000000\",\"b\":\"#ffffff\"}}", "{\"version\":1,\"kind\":\"EFFECT\",\"colors\":{\"a\":\"#000000\",\"b\":\"#ffffff\"}}", "{\"version\":1,\"kind\":\"PALETTE\",\"colors\":{\"a\":\"#000000\"}}", "{\"version\":1,\"kind\":\"PALETTE\",\"colors\":{\"a\":\"#000000\",\"b\":\"red\"}}", "{\"version\":1,\"kind\":\"PALETTE\",\"colors\":{\"a\":\"#000000\",\"b\":\"#ffffff\"},\"extra\":1}", "[1,2]", "{not json", "{\"version\":1,\"kind\":\"PALETTE\",\"colors\":{\"a\":\"#000000\",\"b\":\"#ffffff\"},\"x\":\"<script>\"}")
+    for (var manifest in bad) {
+        Check.apiError(creator.post("/cosmetics/drafts", draftBody("PALETTE", "Paleta ruim", manifest, "true")), 400, "INVALID_COSMETIC_MANIFEST")
+    }
+    Check.apiError(creator.post("/cosmetics/drafts", draftBody("EFFECT", "Efeito sem tipo", "{\"version\":1,\"kind\":\"EFFECT\",\"effect\":{}}", "true")), 400, "INVALID_COSMETIC_MANIFEST")
+    Check.apiError(creator.post("/cosmetics/drafts", draftBody("PROFILE_BORDER", "Borda vazia", "{\"version\":1,\"kind\":\"PROFILE_BORDER\",\"layers\":[]}", "true")), 400, "INVALID_COSMETIC_MANIFEST")
+    Check.apiError(creator.post("/cosmetics/drafts", draftBody("PROFILE_BORDER", "Borda torta", "{\"version\":1,\"kind\":\"PROFILE_BORDER\",\"layers\":[1]}", "true")), 400, "INVALID_COSMETIC_MANIFEST")
+    Check.apiError(creator.post("/cosmetics/drafts", draftBody("BUNDLE", "Pacote vazio", "{\"version\":1,\"kind\":\"BUNDLE\",\"cosmeticIds\":[]}", "true")), 400, "INVALID_COSMETIC_MANIFEST")
+    Check.apiError(creator.post("/cosmetics/drafts", draftBody("BUNDLE", "Pacote torto", "{\"version\":1,\"kind\":\"BUNDLE\",\"cosmeticIds\":[\" \"]}", "true")), 400, "INVALID_COSMETIC_MANIFEST")
+    Check.apiError(creator.post("/cosmetics/drafts", draftBody("FONT", "Fonte sem familia", "{\"version\":1,\"kind\":\"FONT\"}", "true")), 400, "INVALID_COSMETIC_MANIFEST")
+    // The valid ones of each kind
+    Check.status(creator.post("/cosmetics/drafts", draftBody("FONT", "Fonte boa", "{\"version\":1,\"kind\":\"FONT\",\"family\":\"Ação Display\",\"fallback\":\"serif\"}", "true")), 200)
+    Check.status(creator.post("/cosmetics/drafts", draftBody("BUNDLE", "Pacote bom", "{\"version\":1,\"kind\":\"BUNDLE\",\"cosmeticIds\":[\"a\",\"b\"]}", "true")), 200)
+    Check.apiError(creator.post("/cosmetics/drafts", draftBody("NOPE", "Tipo ruim", paletteManifest(), "true")), 400, "INVALID_COSMETIC_KIND")
+    Check.apiError(creator.post("/cosmetics/drafts", "{\"name\":\"Sem tipo\"}"), 400, "INVALID_COSMETIC_KIND")
+    Check.apiError(creator.post("/cosmetics/drafts", draftBody("PALETTE", "ab", paletteManifest(), "true")), 400, "INVALID_COSMETIC_NAME")
+}
+
+test "only the creator can edit and anonymous people can browse the public catalog" {
+    var app = communityApp()
+    var creator = ProfileTestApp.login(app, "community-cosmetic-owner")
+    var stranger = ProfileTestApp.login(app, "community-cosmetic-stranger")
+    var id = createDraft(creator, "Borda Solar", "PROFILE_BORDER", borderManifest())
+    Check.apiError(stranger.patch("/cosmetics/" + id, "{\"name\":\"Sequestrada\"}"), 403, "NOT_AUTHORIZED")
+    Check.status(ProfileTestApp.anonymous(app).get("/cosmetics/catalog?kind=PROFILE_BORDER"), 200)
+    Check.apiError(ProfileTestApp.anonymous(app).get("/cosmetics/catalog?kind=NOPE"), 400, "INVALID_COSMETIC_KIND")
+    Check.status(ProfileTestApp.anonymous(app).post("/cosmetics/drafts", draftBody("PALETTE", "Anonima", paletteManifest(), "true")), 401)
+}
+
+test "the creator edits a draft, a rejected one goes back to draft and a submitted one is locked" {
+    var app = communityApp()
+    var creator = ProfileTestApp.login(app, "community-cosmetic-editor")
+    var id = createDraft(creator, "Paleta Editavel", "PALETTE", paletteManifest())
+    var edited = creator.patch("/cosmetics/" + id, "{\"name\":\"Paleta Editada\",\"description\":\"\",\"license\":\"open_source\"}")
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "name", "Paleta Editada")
+    Check.jsonEq(edited, "license", "OPEN_SOURCE")
+    Check.jsonEq(edited, "version", "2")
+    Check.eqStr("an empty description reads as empty text", "", CosmeticsTestKit.text(edited, "description"))
+    Check.apiError(creator.patch("/cosmetics/" + id, "{\"name\":\"x\"}"), 400, "INVALID_COSMETIC_NAME")
+    Check.apiError(creator.patch("/cosmetics/" + id, "{\"license\":\"MIT\"}"), 400, "INVALID_COSMETIC_LICENSE")
+    Check.apiError(creator.patch("/cosmetics/" + id, "{\"rightsConfirmed\":false}"), 400, "RIGHTS_CONFIRMATION_REQUIRED")
+    Check.apiError(creator.patch("/cosmetics/" + id, "{\"manifestJson\":\"{}\"}"), 400, "INVALID_COSMETIC_MANIFEST")
+    Check.apiError(creator.patch("/cosmetics/nao-existe", "{\"name\":\"Qualquer\"}"), 404, "COSMETIC_NOT_FOUND")
+    // Rejected by moderation: editing returns it to DRAFT
+    app.db().execute("update profile_cosmetics set status = \'REJECTED\' where id = ?", DbParams().bindStr(id))
+    var back = creator.patch("/cosmetics/" + id, "{\"name\":\"Paleta Revisada\"}")
+    Check.status(back, 200)
+    Check.jsonEq(back, "status", "DRAFT")
+    Check.jsonEq(back, "version", "3")
+    Check.status(creator.post("/cosmetics/" + id + "/submit", ""), 200)
+    Check.apiError(creator.patch("/cosmetics/" + id, "{\"name\":\"Tarde demais\"}"), 409, "COSMETIC_NOT_EDITABLE")
+}
+
+test "a published cosmetic is public and can be reported" {
+    var app = communityApp()
+    var creator = ProfileTestApp.login(app, "community-cosmetic-published")
+    var reader = ProfileTestApp.login(app, "community-cosmetic-reader")
+    var id = createDraft(creator, "Efeito Brilho", "EFFECT", effectManifest("GLOW"))
+    app.db().execute("update profile_cosmetics set status = \'PUBLISHED\' where id = ?", DbParams().bindStr(id))
+    var guest = ProfileTestApp.anonymous(app)
+    var one = guest.get("/cosmetics/" + id)
+    Check.status(one, 200)
+    Check.jsonEq(one, "status", "PUBLISHED")
+    Check.isTrue("listed", guest.get("/cosmetics/catalog?kind=EFFECT").body.contains(id))
+    Check.isTrue("another kind does not list it", !guest.get("/cosmetics/catalog?kind=FONT").body.contains(id))
+    Check.status(guest.post("/cosmetics/" + id + "/report", ""), 401)
+    var reported = reader.post("/cosmetics/" + id + "/report", "")
+    Check.status(reported, 200)
+    Check.jsonEq(reported, "status", "REPORTED")
+    Check.status(reader.post("/cosmetics/" + id + "/report", ""), 200)
+    Check.jsonEq(guest.get("/cosmetics/" + id), "reported", "2")
+    Check.apiError(reader.post("/cosmetics/nao-existe/report", ""), 404, "COSMETIC_NOT_FOUND")
+}
+
+test "the owner persists a validated profile name style and the profile API returns it" {
+    var app = communityApp()
+    var owner = ProfileTestApp.login(app, "community-name-style-owner")
+    var res = owner.put("/cosmetics/profile/name-style", "{\"theme\":\"NEON\",\"font\":\"DISPLAY\",\"color\":\"#FF4FA3\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "theme", "NEON")
+    Check.jsonEq(res, "font", "DISPLAY")
+    Check.jsonEq(res, "color", "#ff4fa3")
+    var me = owner.get("/me")
+    Check.jsonEq(me, "nameTheme", "NEON")
+    Check.jsonEq(me, "nameFont", "DISPLAY")
+    Check.jsonEq(me, "nameColor", "#ff4fa3")
+    Check.apiError(owner.put("/cosmetics/profile/name-style", "{\"font\":\"url(evil)\",\"color\":\"red\"}"), 400, "INVALID_NAME_FONT")
+    Check.apiError(owner.put("/cosmetics/profile/name-style", "{\"color\":\"red\"}"), 400, "INVALID_NAME_COLOR")
+    Check.apiError(owner.put("/cosmetics/profile/name-style", "{\"theme\":\"rainbow\"}"), 400, "INVALID_NAME_THEME")
+    // No theme at all is the DEFAULT preset
+    var plain = owner.put("/cosmetics/profile/name-style", "{}")
+    Check.status(plain, 200)
+    Check.jsonEq(plain, "theme", "DEFAULT")
+}
+
+test "the new name themes and fonts are accepted" {
+    var app = communityApp()
+    var owner = ProfileTestApp.login(app, "community-name-style-new")
+    for (var theme in listOf("RETRO", "OCEAN", "SUNSET", "MATRIX", "GOLD", "ICE")) {
+        var res = owner.put("/cosmetics/profile/name-style", "{\"theme\":\"" + theme + "\",\"font\":\"CURSIVE\",\"color\":\"#0ea5e9\"}")
+        Check.status(res, 200)
+        Check.jsonEq(res, "theme", theme)
+    }
+    for (var font in listOf("CURSIVE", "CONDENSED", "COMIC", "SLAB")) {
+        var res = owner.put("/cosmetics/profile/name-style", "{\"theme\":\"OCEAN\",\"font\":\"" + font + "\",\"color\":\"#0ea5e9\"}")
+        Check.status(res, 200)
+        Check.jsonEq(res, "font", font)
+    }
+}
+
+test "only a verified contributor picks the contributor tag color" {
+    var app = communityApp()
+    var plain = ProfileTestApp.login(app, "community-tag-plain")
+    Check.apiError(plain.put("/cosmetics/profile/contributor-tag", "{\"color\":\"#112233\"}"), 403, "CONTRIBUTOR_NOT_VERIFIED")
+    var verified = ProfileTestApp.login(app, "community-tag-verified")
+    // A seal alone is not enough: the GitHub account must be linked too.
+    app.db().execute("insert into user_seals (id, user_id, seal_type, category, status, granted_at, evidence_count) values (?, ?, \'CONTRIBUTOR\', \'CODE\', \'ACTIVE\', current_timestamp, 1)", DbParams().bindStr("seal-community-tag").bindStr("community-tag-verified"))
+    Check.apiError(verified.put("/cosmetics/profile/contributor-tag", "{\"color\":\"#112233\"}"), 403, "CONTRIBUTOR_NOT_VERIFIED")
+    app.db().execute("insert into github_identities (id, user_id, github_user_id, github_login, linked_at) values (?, ?, ?, ?, current_timestamp)", DbParams().bindStr("gh-community-tag").bindStr("community-tag-verified").bindStr("990011").bindStr("verified-dev"))
+    var set = verified.put("/cosmetics/profile/contributor-tag", "{\"color\":\"#AABBCC\"}")
+    Check.status(set, 200)
+    Check.jsonEq(set, "color", "#aabbcc")
+    Check.jsonEq(verified.get("/me"), "contributorTagColor", "#aabbcc")
+    Check.apiError(verified.put("/cosmetics/profile/contributor-tag", "{\"color\":\"blue\"}"), 400, "INVALID_CONTRIBUTOR_TAG_COLOR")
+    var cleared = verified.put("/cosmetics/profile/contributor-tag", "{\"color\":\"\"}")
+    Check.status(cleared, 200)
+    Check.isTrue("back to the default", cleared.jsonIsNull("color"))
+    CosmeticsTestKit.finish()
+}

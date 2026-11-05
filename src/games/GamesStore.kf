@@ -1,0 +1,415 @@
+package games
+
+import kernel.db.*
+import kernel.text.*
+import kernel.time.*
+
+// SQL over the games tables (the persistence adapters of the Java domain). Same tables and columns as
+// V70, V75, V79, V80, V85, V104 and V115.
+class GamesStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String gameColumns() = "id, user_id, slug, title, description, cover, url, tags, status, reviewed_by, review_note, short_description, genres, languages, controls, requirements, content_warnings, stage, distribution, price_coins, aspect, version, website_url, support_url, media_ids, icon, banner, banner_html, plays, boost_until, published_at, suspended_at, submitted_at, reviewed_at, created_at, updated_at"
+    static GameRecord gameOf(r: DbRow) = GameRecord(r.getStr("id"), r.getStr("user_id"), r.getStr("slug"), r.getStr("title"), r.getStrOrNull("description"), r.getStrOrNull("cover"), r.getStr("url"), r.getStrOrNull("tags"), r.getStr("status"), r.getStrOrNull("reviewed_by"), r.getStrOrNull("review_note"), r.getStrOrNull("short_description"), r.getStrOrNull("genres"), r.getStrOrNull("languages"), r.getStrOrNull("controls"), r.getStrOrNull("requirements"), r.getStrOrNull("content_warnings"), r.getStr("stage"), r.getStr("distribution"), r.getInt("price_coins"), r.getStr("aspect"), r.getStrOrNull("version"), r.getStrOrNull("website_url"), r.getStrOrNull("support_url"), r.getStrOrNull("media_ids"), r.getStrOrNull("icon"), r.getStrOrNull("banner"), r.getStrOrNull("banner_html"), r.getInt("plays"), r.getInstantOrNull("boost_until"), r.getInstantOrNull("published_at"), r.getInstantOrNull("suspended_at"), r.getInstant("submitted_at"), r.getInstantOrNull("reviewed_at"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    // A loop, not `.map(lambda)`: a lambda returning a packaged record fails at runtime (NoClassDefFoundError).
+    List<GameRecord> games(sql: String, params: DbParams) {
+        var out = listOf<GameRecord>()
+        for (var row in store.queryList(sql, params)) {
+            out.add(GamesStore.gameOf(row))
+        }
+        return out
+    }
+    GameRecord? findById(id: String) {
+        var rows = this.games("select " + GamesStore.gameColumns() + " from games where id = ?", DbParams().bindStr(id))
+        if (rows.size() == 0) {
+            return null
+        }
+        return rows.get(0)
+    }
+    GameRecord? findByUserAndSlug(userId: String, slug: String) {
+        var rows = this.games("select " + GamesStore.gameColumns() + " from games where user_id = ? and slug = ?", DbParams().bindStr(userId).bindStr(slug))
+        if (rows.size() == 0) {
+            return null
+        }
+        return rows.get(0)
+    }
+    Bool existsByUserAndSlug(userId: String, slug: String) = store.queryLong("select count(*) from games where user_id = ? and slug = ?", DbParams().bindStr(userId).bindStr(slug)) > 0L
+    List<GameRecord> findByUser(userId: String) = this.games("select " + GamesStore.gameColumns() + " from games where user_id = ? order by updated_at desc", DbParams().bindStr(userId))
+    List<GameRecord> findByUserAndStatus(userId: String, status: String, limit: Int) = this.games("select " + GamesStore.gameColumns() + " from games where user_id = ? and status = ? order by submitted_at desc limit ?", DbParams().bindStr(userId).bindStr(status).bindInt(GameRules.clamp(limit, 1, 2147483647)))
+    List<GameRecord> findByStatus(status: String, limit: Int) = this.games("select " + GamesStore.gameColumns() + " from games where status = ? order by submitted_at desc limit ?", DbParams().bindStr(status).bindInt(GameRules.clamp(limit, 1, 2147483647)))
+    insert(g: GameRecord) {
+        var chained = DbParams()
+        chained.bindStr(g.id())
+        chained.bindStr(g.userId())
+        chained.bindStr(g.slug())
+        chained.bindStr(g.title())
+        chained.bindStrOrNull(g.description())
+        chained.bindStrOrNull(g.cover())
+        chained.bindStr(g.url())
+        chained.bindStrOrNull(g.tags())
+        chained.bindStr(g.status())
+        chained.bindStrOrNull(g.reviewedBy())
+        chained.bindStrOrNull(g.reviewNote())
+        chained.bindStrOrNull(g.shortDescription())
+        chained.bindStrOrNull(g.genres())
+        chained.bindStrOrNull(g.languages())
+        chained.bindStrOrNull(g.controls())
+        chained.bindStrOrNull(g.requirements())
+        chained.bindStrOrNull(g.contentWarnings())
+        chained.bindStr(g.stage())
+        chained.bindStr(g.distribution())
+        chained.bindInt(g.priceCoins())
+        chained.bindStr(g.aspect())
+        chained.bindStrOrNull(g.version())
+        chained.bindStrOrNull(g.websiteUrl())
+        chained.bindStrOrNull(g.supportUrl())
+        chained.bindStrOrNull(g.mediaIds())
+        chained.bindStrOrNull(g.icon())
+        chained.bindStrOrNull(g.banner())
+        chained.bindStrOrNull(g.bannerHtml())
+        chained.bindInt(g.plays())
+        chained.bindInstantOrNull(g.boostUntil())
+        chained.bindInstantOrNull(g.publishedAt())
+        chained.bindInstantOrNull(g.suspendedAt())
+        chained.bindInstant(g.submittedAt())
+        chained.bindInstantOrNull(g.reviewedAt())
+        chained.bindInstant(g.createdAt())
+        chained.bindInstant(g.updatedAt())
+        store.execute("insert into games (" + GamesStore.gameColumns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", chained)
+    }
+    // Game.edit: the sheet is replaced as a whole; the slug only when a new one is given. Lifecycle and
+    // moderation fields stay.
+    update(id: String, title: String, description: String?, cover: String?, url: String, tags: String?, details: GameDetailsInput, newSlug: String?, now: String) {
+        var slugSql = ""
+        var params = DbParams()
+        params.bindStr(title)
+        params.bindStrOrNull(description)
+        params.bindStrOrNull(cover)
+        params.bindStr(url)
+        params.bindStrOrNull(tags)
+        params.bindStrOrNull(details.shortDescription())
+        params.bindStrOrNull(details.genres())
+        params.bindStrOrNull(details.languages())
+        params.bindStrOrNull(details.controls())
+        params.bindStrOrNull(details.requirements())
+        params.bindStrOrNull(details.contentWarnings())
+        params.bindStr(details.stage())
+        params.bindStr(details.distribution())
+        params.bindInt(details.priceCoins())
+        params.bindStr(details.aspect())
+        params.bindStrOrNull(details.version())
+        params.bindStrOrNull(details.websiteUrl())
+        params.bindStrOrNull(details.supportUrl())
+        params.bindStrOrNull(details.mediaIds())
+        params.bindStrOrNull(details.icon())
+        params.bindStrOrNull(details.banner())
+        params.bindStrOrNull(details.bannerHtml())
+        params.bindInstant(now)
+        if (newSlug != null) {
+            slugSql = ", slug = ?"
+            params = params.bindStr(newSlug)
+        }
+        store.execute("update games set title = ?, description = ?, cover = ?, url = ?, tags = ?, short_description = ?, genres = ?, languages = ?, controls = ?, requirements = ?, content_warnings = ?, stage = ?, distribution = ?, price_coins = ?, aspect = ?, version = ?, website_url = ?, support_url = ?, media_ids = ?, icon = ?, banner = ?, banner_html = ?, updated_at = ?" + slugSql + " where id = ?", params.bindStr(id))
+    }
+    // Game.approve: publishes; published_at keeps the first publication date.
+    approve(id: String, reviewerId: String, note: String?, now: String) {
+        store.execute("update games set status = \'PUBLISHED\', reviewed_by = ?, review_note = ?, reviewed_at = ?, updated_at = ?, published_at = coalesce(published_at, ?), suspended_at = null where id = ?", DbParams().bindStr(reviewerId).bindStrOrNull(note).bindInstant(now).bindInstant(now).bindInstant(now).bindStr(id))
+    }
+    reject(id: String, reviewerId: String, note: String, now: String) {
+        store.execute("update games set status = \'REJECTED\', reviewed_by = ?, review_note = ?, reviewed_at = ?, updated_at = ? where id = ?", DbParams().bindStr(reviewerId).bindStr(note).bindInstant(now).bindInstant(now).bindStr(id))
+    }
+    resubmit(id: String, now: String) {
+        store.execute("update games set status = \'SUBMITTED\', reviewed_by = null, review_note = null, submitted_at = ?, reviewed_at = null, updated_at = ? where id = ?", DbParams().bindInstant(now).bindInstant(now).bindStr(id))
+    }
+    suspend(id: String, reviewerId: String, note: String?, now: String) {
+        store.execute("update games set status = \'SUSPENDED\', reviewed_by = ?, review_note = ?, reviewed_at = ?, updated_at = ?, suspended_at = ? where id = ?", DbParams().bindStr(reviewerId).bindStrOrNull(note).bindInstant(now).bindInstant(now).bindInstant(now).bindStr(id))
+    }
+    // Game.restoreFromSuspension: back to PUBLISHED, the review note stays.
+    unsuspend(id: String, reviewerId: String, now: String) {
+        store.execute("update games set status = \'PUBLISHED\', reviewed_by = ?, reviewed_at = ?, updated_at = ?, suspended_at = null where id = ?", DbParams().bindStr(reviewerId).bindInstant(now).bindInstant(now).bindStr(id))
+    }
+    // Game.countPlay as one atomic increment (the Java read-modify-write lost plays under concurrency).
+    Int countPlay(id: String) {
+        store.execute("update games set plays = plays + 1 where id = ?", DbParams().bindStr(id))
+        return store.queryOne("select plays from games where id = ?", DbParams().bindStr(id)).getInt("plays")
+    }
+    // Game.boost: the new stamp (the service never moves it backwards).
+    boost(id: String, until: String, now: String) {
+        store.execute("update games set boost_until = ?, updated_at = ? where id = ?", DbParams().bindInstant(until).bindInstant(now).bindStr(id))
+    }
+    delete(id: String) {
+        store.execute("delete from games where id = ?", DbParams().bindStr(id))
+    }
+    // Public catalogue: published only, each filter applies only when given, paid boost first, then the
+    // closed order. One extra row answers "is there a next page" (Spring's Slice).
+    GameSearchResult search(query: String?, genre: String?, tag: String?, stage: String?, distribution: String?, order: String, size: Int, offset: Int) {
+        var sql = "select " + GamesStore.gameColumns() + " from games where status = \'PUBLISHED\'"
+        var params = DbParams()
+        if (query != null) {
+            sql = sql + " and (lower(title) like ? escape \'!\' or lower(coalesce(description, \'\')) like ? escape \'!\' or lower(coalesce(tags, \'\')) like ? escape \'!\')"
+            params = params.bindStr(query).bindStr(query).bindStr(query)
+        }
+        if (genre != null) {
+            sql = sql + " and lower(coalesce(genres, \'\')) like ? escape \'!\'"
+            params = params.bindStr(genre)
+        }
+        if (tag != null) {
+            sql = sql + " and lower(coalesce(tags, \'\')) like ? escape \'!\'"
+            params = params.bindStr(tag)
+        }
+        if (stage != null) {
+            sql = sql + " and stage = ?"
+            params = params.bindStr(stage)
+        }
+        if (distribution != null) {
+            sql = sql + " and distribution = ?"
+            params = params.bindStr(distribution)
+        }
+        sql = sql + " order by boost_until desc"
+        if (order == "plays") {
+            sql = sql + ", plays desc, published_at desc"
+        }
+        else {
+            if (order == "title") {
+                sql = sql + ", title asc"
+            }
+            else {
+                sql = sql + ", published_at desc, plays desc"
+            }
+        }
+        sql = sql + ", id asc limit ? offset ?"
+        var rows = this.games(sql, params.bindInt(size + 1).bindInt(offset))
+        var items = listOf<GameRecord>()
+        var i = 0
+        while (i < rows.size() && i < size) {
+            items.add(rows.get(i))
+            i = i + 1
+        }
+        return GameSearchResult(items, rows.size() > size)
+    }
+    // ---- events ----
+    recordEvent(id: String, gameId: String, kind: String, userId: String?, now: String) {
+        store.execute("insert into game_events (id, game_id, kind, user_id, created_at) values (?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(gameId).bindStr(kind).bindStrOrNull(userId).bindInstant(now))
+    }
+    Long countEventsSince(gameId: String, kind: String, userId: String, since: String) = store.queryLong("select count(*) from game_events where game_id = ? and kind = ? and user_id = ? and created_at > ?", DbParams().bindStr(gameId).bindStr(kind).bindStr(userId).bindInstant(since))
+    // Estimated distinct players: someone with a session counts once, an anonymous event counts by itself.
+    Long distinctPlayers(gameId: String) = store.queryLong("select count(distinct coalesce(user_id, id)) from game_events where game_id = ? and kind = \'PLAY_START\'", DbParams().bindStr(gameId))
+    // Events after an instant, oldest first (the panel series is aggregated in memory).
+    List<DbRow> eventsSince(gameId: String, from: String, limit: Int) = store.queryList("select kind, user_id, id, created_at from game_events where game_id = ? and created_at > ? order by created_at asc limit ?", DbParams().bindStr(gameId).bindInstant(from).bindInt(limit))
+    List<GameTally> mostPlayedSince(kind: String, since: String, limit: Int) {
+        var out = listOf<GameTally>()
+        for (var row in store.queryList("select game_id, count(id) as plays, count(distinct coalesce(user_id, id)) as players from game_events where kind = ? and created_at >= ? group by game_id order by count(id) desc, game_id asc limit ?", DbParams().bindStr(kind).bindInstant(since).bindInt(limit))) {
+            out.add(GameTally(row.getStr("game_id"), row.getLong("plays"), row.getLong("players")))
+        }
+        return out
+    }
+    deleteEvents(gameId: String) {
+        store.execute("delete from game_events where game_id = ?", DbParams().bindStr(gameId))
+    }
+    // ---- favorites ----
+    Bool favoriteExists(userId: String, gameId: String) = store.queryLong("select count(*) from game_favorites where user_id = ? and game_id = ?", DbParams().bindStr(userId).bindStr(gameId)) > 0L
+    insertFavorite(id: String, userId: String, gameId: String, now: String) {
+        store.execute("insert into game_favorites (id, user_id, game_id, created_at) values (?, ?, ?, ?)", DbParams().bindStr(id).bindStr(userId).bindStr(gameId).bindInstant(now))
+    }
+    deleteFavorite(userId: String, gameId: String) {
+        store.execute("delete from game_favorites where user_id = ? and game_id = ?", DbParams().bindStr(userId).bindStr(gameId))
+    }
+    Long countFavorites(gameId: String) = store.queryLong("select count(*) from game_favorites where game_id = ?", DbParams().bindStr(gameId))
+    List<String> favoriteGameIds(userId: String, limit: Int) {
+        var out = listOf<String>()
+        for (var row in store.queryList("select game_id from game_favorites where user_id = ? order by created_at desc limit ?", DbParams().bindStr(userId).bindInt(limit))) {
+            out.add(row.getStr("game_id"))
+        }
+        return out
+    }
+    deleteFavorites(gameId: String) {
+        store.execute("delete from game_favorites where game_id = ?", DbParams().bindStr(gameId))
+    }
+    // ---- updates (devlog) ----
+    insertUpdate(u: GameUpdateRecord) {
+        store.execute("insert into game_updates (id, game_id, user_id, title, body, version, created_at) values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(u.id()).bindStr(u.gameId()).bindStr(u.userId()).bindStr(u.title()).bindStrOrNull(u.body()).bindStrOrNull(u.version()).bindInstant(u.createdAt()))
+    }
+    List<GameUpdateRecord> updatesOf(gameId: String, limit: Int) {
+        var out = listOf<GameUpdateRecord>()
+        for (var row in store.queryList("select id, game_id, user_id, title, body, version, created_at from game_updates where game_id = ? order by created_at desc limit ?", DbParams().bindStr(gameId).bindInt(limit))) {
+            out.add(GameUpdateRecord(row.getStr("id"), row.getStr("game_id"), row.getStr("user_id"), row.getStr("title"), row.getStrOrNull("body"), row.getStrOrNull("version"), row.getInstant("created_at")))
+        }
+        return out
+    }
+    Long countUpdates(gameId: String) = store.queryLong("select count(*) from game_updates where game_id = ?", DbParams().bindStr(gameId))
+    deleteUpdates(gameId: String) {
+        store.execute("delete from game_updates where game_id = ?", DbParams().bindStr(gameId))
+    }
+    // ---- developer follows ----
+    Bool followExists(followerId: String, developerId: String) = store.queryLong("select count(*) from developer_follows where follower_id = ? and developer_user_id = ?", DbParams().bindStr(followerId).bindStr(developerId)) > 0L
+    insertFollow(id: String, followerId: String, developerId: String, now: String) {
+        store.execute("insert into developer_follows (id, follower_id, developer_user_id, created_at) values (?, ?, ?, ?)", DbParams().bindStr(id).bindStr(followerId).bindStr(developerId).bindInstant(now))
+    }
+    deleteFollow(followerId: String, developerId: String) {
+        store.execute("delete from developer_follows where follower_id = ? and developer_user_id = ?", DbParams().bindStr(followerId).bindStr(developerId))
+    }
+    Long countFollowers(developerId: String) = store.queryLong("select count(*) from developer_follows where developer_user_id = ?", DbParams().bindStr(developerId))
+    // The accounts that follow a developer. The Java adapter mapped the DEVELOPER id here by mistake (so
+    // the notice to followers never reached anyone); this returns the follower ids it was written for.
+    List<String> followersOf(developerId: String) {
+        var out = listOf<String>()
+        for (var row in store.queryList("select follower_id from developer_follows where developer_user_id = ?", DbParams().bindStr(developerId))) {
+            out.add(row.getStr("follower_id"))
+        }
+        return out
+    }
+    // ---- developer profiles ----
+    DeveloperRecord? findDeveloper(userId: String) {
+        var row = store.queryOptional("select user_id, display_name, headline, bio, links, avatar, cover, updated_at from developer_profiles where user_id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return DeveloperRecord(row.getStr("user_id"), row.getStrOrNull("display_name"), row.getStrOrNull("headline"), row.getStrOrNull("bio"), row.getStrOrNull("links"), row.getStrOrNull("avatar"), row.getStrOrNull("cover"), row.getInstant("updated_at"))
+    }
+    // JPA merge: insert the row the first time, update every column afterwards.
+    saveDeveloper(d: DeveloperRecord) {
+        var exists = store.queryLong("select count(*) from developer_profiles where user_id = ?", DbParams().bindStr(d.userId())) > 0L
+        if (exists) {
+            store.execute("update developer_profiles set display_name = ?, headline = ?, bio = ?, links = ?, avatar = ?, cover = ?, updated_at = ? where user_id = ?", DbParams().bindStrOrNull(d.displayName()).bindStrOrNull(d.headline()).bindStrOrNull(d.bio()).bindStrOrNull(d.links()).bindStrOrNull(d.avatar()).bindStrOrNull(d.cover()).bindInstant(d.updatedAt()).bindStr(d.userId()))
+            return
+        }
+        store.execute("insert into developer_profiles (user_id, display_name, headline, bio, links, avatar, cover, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(d.userId()).bindStrOrNull(d.displayName()).bindStrOrNull(d.headline()).bindStrOrNull(d.bio()).bindStrOrNull(d.links()).bindStrOrNull(d.avatar()).bindStrOrNull(d.cover()).bindInstant(d.updatedAt()))
+    }
+    // ---- reviews and comments ----
+    GameReviewRecord? findReview(gameId: String, userId: String) {
+        var row = store.queryOptional("select id, game_id, user_id, rating, body, created_at, updated_at from game_reviews where game_id = ? and user_id = ?", DbParams().bindStr(gameId).bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return GamesStore.reviewOf(row)
+    }
+    static GameReviewRecord reviewOf(row: DbRow) = GameReviewRecord(row.getStr("id"), row.getStr("game_id"), row.getStr("user_id"), row.getInt("rating"), row.getStrOrNull("body"), row.getInstant("created_at"), row.getInstant("updated_at"))
+    List<GameReviewRecord> reviewsOf(gameId: String, limit: Int) {
+        var out = listOf<GameReviewRecord>()
+        for (var row in store.queryList("select id, game_id, user_id, rating, body, created_at, updated_at from game_reviews where game_id = ? order by created_at desc limit ?", DbParams().bindStr(gameId).bindInt(limit))) {
+            out.add(GamesStore.reviewOf(row))
+        }
+        return out
+    }
+    insertReview(r: GameReviewRecord) {
+        store.execute("insert into game_reviews (id, game_id, user_id, rating, body, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(r.id()).bindStr(r.gameId()).bindStr(r.userId()).bindInt(r.rating()).bindStrOrNull(r.body()).bindInstant(r.createdAt()).bindInstant(r.updatedAt()))
+    }
+    updateReview(id: String, rating: Int, body: String?, now: String) {
+        store.execute("update game_reviews set rating = ?, body = ?, updated_at = ? where id = ?", DbParams().bindInt(rating).bindStrOrNull(body).bindInstant(now).bindStr(id))
+    }
+    deleteReview(id: String) {
+        store.execute("delete from game_reviews where id = ?", DbParams().bindStr(id))
+    }
+    Long countReviews(gameId: String) = store.queryLong("select count(*) from game_reviews where game_id = ?", DbParams().bindStr(gameId))
+    Double averageRating(gameId: String) {
+        var row = store.queryOne("select avg(rating) as average from game_reviews where game_id = ?", DbParams().bindStr(gameId))
+        var text = row.getStrOrNull("average")
+        if (text == null) {
+            return 0.0
+        }
+        return text.trim().toDouble()
+    }
+    // id -> (average, count) of the cards of a page, one query for the whole list.
+    List<DbRow> reviewStats(gameIds: List<String>) {
+        if (gameIds.size() == 0) {
+            return listOf<DbRow>()
+        }
+        return store.queryList("select game_id, avg(rating) as average, count(id) as total from game_reviews where game_id in (" + GamesStore.marks(gameIds.size()) + ") group by game_id", GamesStore.binds(gameIds))
+    }
+    List<DbRow> commentCounts(gameIds: List<String>) {
+        if (gameIds.size() == 0) {
+            return listOf<DbRow>()
+        }
+        return store.queryList("select game_id, count(id) as total from game_comments where game_id in (" + GamesStore.marks(gameIds.size()) + ") group by game_id", GamesStore.binds(gameIds))
+    }
+    GameCommentRecord? findComment(id: String) {
+        var row = store.queryOptional("select id, game_id, user_id, body, created_at from game_comments where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return GamesStore.commentOf(row)
+    }
+    static GameCommentRecord commentOf(row: DbRow) = GameCommentRecord(row.getStr("id"), row.getStr("game_id"), row.getStr("user_id"), row.getStr("body"), row.getInstant("created_at"))
+    List<GameCommentRecord> commentsOf(gameId: String, limit: Int) {
+        var out = listOf<GameCommentRecord>()
+        for (var row in store.queryList("select id, game_id, user_id, body, created_at from game_comments where game_id = ? order by created_at desc limit ?", DbParams().bindStr(gameId).bindInt(limit))) {
+            out.add(GamesStore.commentOf(row))
+        }
+        return out
+    }
+    insertComment(c: GameCommentRecord) {
+        store.execute("insert into game_comments (id, game_id, user_id, body, created_at) values (?, ?, ?, ?, ?)", DbParams().bindStr(c.id()).bindStr(c.gameId()).bindStr(c.userId()).bindStr(c.body()).bindInstant(c.createdAt()))
+    }
+    deleteComment(id: String) {
+        store.execute("delete from game_comments where id = ?", DbParams().bindStr(id))
+    }
+    Long countComments(gameId: String) = store.queryLong("select count(*) from game_comments where game_id = ?", DbParams().bindStr(gameId))
+    // ---- collections ----
+    GameCollectionRecord? findCollection(id: String) {
+        var row = store.queryOptional("select id, curator_id, title, description, game_ids, status, created_at, updated_at from game_collections where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return GamesStore.collectionOf(row)
+    }
+    static GameCollectionRecord collectionOf(row: DbRow) = GameCollectionRecord(row.getStr("id"), row.getStr("curator_id"), row.getStr("title"), row.getStrOrNull("description"), GameRules.splitCsv(row.getStrOrNull("game_ids")), row.getStr("status"), row.getInstant("created_at"), row.getInstant("updated_at"))
+    List<GameCollectionRecord> publishedCollections(limit: Int) {
+        var out = listOf<GameCollectionRecord>()
+        for (var row in store.queryList("select id, curator_id, title, description, game_ids, status, created_at, updated_at from game_collections where status = \'PUBLISHED\' order by created_at desc limit ?", DbParams().bindInt(limit))) {
+            out.add(GamesStore.collectionOf(row))
+        }
+        return out
+    }
+    insertCollection(c: GameCollectionRecord) {
+        store.execute("insert into game_collections (id, curator_id, title, description, game_ids, status, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(c.id()).bindStr(c.curatorId()).bindStr(c.title()).bindStrOrNull(c.description()).bindStr(GamesStore.joinCsv(c.gameIds())).bindStr(c.status()).bindInstant(c.createdAt()).bindInstant(c.updatedAt()))
+    }
+    hideCollection(id: String, now: String) {
+        store.execute("update game_collections set status = \'HIDDEN\', updated_at = ? where id = ?", DbParams().bindInstant(now).bindStr(id))
+    }
+    // ---- identity tokens ----
+    insertToken(id: String, gameId: String, userId: String, tokenHash: String, playerRef: String, expiresAt: String, now: String) {
+        store.execute("insert into game_tokens (id, game_id, user_id, token_hash, player_ref, expires_at, used_at, created_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(gameId).bindStr(userId).bindStr(tokenHash).bindStr(playerRef).bindInstant(expiresAt).bindInstantOrNull(Nulls.str()).bindInstant(now))
+    }
+    DbRow? findToken(hash: String) = store.queryOptional("select id, game_id, player_ref, expires_at, used_at from game_tokens where token_hash = ?", DbParams().bindStr(hash))
+    // Single use, claimed atomically: false when somebody consumed it first.
+    Bool consumeToken(id: String, now: String) = store.execute("update game_tokens set used_at = ? where id = ? and used_at is null", DbParams().bindInstant(now).bindStr(id)) > 0
+    deleteTokens(gameId: String) {
+        store.execute("delete from game_tokens where game_id = ?", DbParams().bindStr(gameId))
+    }
+    static String marks(n: Int) {
+        var out = ""
+        var i = 0
+        while (i < n) {
+            if (i > 0) {
+                out = out + ", "
+            }
+            out = out + "?"
+            i = i + 1
+        }
+        return out
+    }
+    static DbParams binds(ids: List<String>) {
+        var params = DbParams()
+        for (var id in ids) {
+            params = params.bindStr(id)
+        }
+        return params
+    }
+    static String joinCsv(parts: List<String>) {
+        var out = ""
+        var i = 0
+        while (i < parts.size()) {
+            if (i > 0) {
+                out = out + ","
+            }
+            out = out + parts.get(i)
+            i = i + 1
+        }
+        return out
+    }
+}
+
+// One page of the catalogue search.
+record GameSearchResult(List<GameRecord> items, Bool hasMore)

@@ -1,0 +1,38 @@
+import coin.*
+import economy.*
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import marketplace.*
+import themes.*
+
+// Not in the Java suite (the worker had no test): the admin cleanup removes a probe listing refunding its escrow,
+// imports the published gallery themes at the price floor and is closed to non-admins.
+test "the sanitize endpoint removes probe listings with a refund and imports gallery themes" {
+    var app = MarketTestKit.app("marketsanitize")
+    var admin = MarketTestKit.loginAdmin(app, "mkt-san-admin")
+    var plain = MarketTestKit.login(app, "mkt-san-plain")
+    var author = MarketTestKit.login(app, "mkt-san-author")
+    var buyer = MarketTestKit.login(app, "mkt-san-buyer")
+    Check.apiError(plain.post("/admin/marketplace/sanitize", ""), 403, "FORBIDDEN")
+    // a probe listing with a held purchase
+    var svc = MarketTestKit.stack().market.service
+    var probe = svc.publish("mkt-san-author", "THEME", "theme-probe-escrow", "Probe Escrow", null, MarketplaceService.minPrice())
+    MarketTestKit.fund("mkt-san-buyer", CoinService.fais(100L), "mkt-san-fund")
+    var before = MarketTestKit.balance(buyer)
+    var purchase = svc.buy(probe.id(), "mkt-san-buyer")
+    Check.eqStr("escrow took the price", "" + (before - probe.price()), "" + MarketTestKit.balance(buyer))
+    // a real published theme that the importer must list
+    var body = json.encode(ThemeRequest("Tema Importado", "d", MarketTestKit.themePackage("#f5e6c8", "#3a2a10"), "light"))
+    var theme = author.post("/temas/galeria", body)
+    Check.status(theme, 200)
+    var themeId = MarketTestKit.str(theme, "id")
+    var res = admin.post("/admin/marketplace/sanitize", "")
+    Check.status(res, 200)
+    Check.isTrue("at least the probe fell", res.jsonStr("removed") != "0")
+    Check.eqStr("the purchase was refunded", "REFUNDED", svc.purchase(purchase.id()).state())
+    Check.eqStr("buyer got the sparks back", "" + before, "" + MarketTestKit.balance(buyer))
+    Check.eqStr("the probe listing is gone", "0", "" + app.db().queryLong("select count(*) from marketplace_listings where id = ?", DbParams().bindStr(probe.id())))
+    Check.eqStr("the gallery theme is on sale at the floor", "" + MarketplaceService.minPrice(), "" + app.db().queryLong("select price from marketplace_listings where item_id = ? and status = \'ACTIVE\'", DbParams().bindStr(themeId)))
+    MarketTestKit.finish()
+}

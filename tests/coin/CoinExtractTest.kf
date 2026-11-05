@@ -1,0 +1,149 @@
+import coin.*
+import economy.*
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import profile.*
+
+// Port of CoinExtractTests: paging without skips or repeats, Sao Paulo day boundaries, explicit validation errors,
+// the extract never creates an account, and transfer message/ref stay available for contestation.
+TestApp ceApp() = EconomyTestKit.app("coinextract", mapOf<String, String>())
+
+ceAdd(app: TestApp, owner: String, ref: String, createdAt: String) {
+    app.db().execute("insert into coin_entries (id, account_id, amount, kind, ref_id, message, idempotency_key, prev_hash, hash, created_at) values (?, ?, 0, \'ADJUSTMENT\', ?, null, ?, ?, ?, ?)", DbParams().bindStr("extract-fixture-" + ref).bindStr(owner).bindStr(ref).bindStr("extract-fixture-" + ref).bindStr(strings.repeat("0", 64)).bindStr(strings.repeat("0", 64)).bindInstant(createdAt))
+}
+
+ProfileCaller ceOwner() {
+    var app = ceApp()
+    var owner = EconomyTestKit.login(app, "wallet-extract-owner")
+    var opened = owner.get("/carteira")
+    Check.status(opened, 200)
+    if (app.db().queryLong("select count(*) from coin_entries where id = ?", DbParams().bindStr("extract-fixture-before")) == 0L) {
+        ceAdd(app, "wallet-extract-owner", "before", "2020-01-15T02:59:59Z")
+        ceAdd(app, "wallet-extract-owner", "start", "2020-01-15T03:00:00Z")
+        ceAdd(app, "wallet-extract-owner", "tie-a", "2020-01-15T15:00:00Z")
+        ceAdd(app, "wallet-extract-owner", "tie-b", "2020-01-15T15:00:00Z")
+        ceAdd(app, "wallet-extract-owner", "end", "2020-01-16T02:59:59.999Z")
+        ceAdd(app, "wallet-extract-owner", "after", "2020-01-16T03:00:00Z")
+    }
+    return owner
+}
+
+String ceRefs(res: TestResponse) {
+    Check.status(res, 200)
+    var out = ""
+    var i = 0
+    while (res.jsonHas("entries." + i + ".refId")) {
+        out = out + res.jsonStr("entries." + i + ".refId") + ","
+        i = i + 1
+    }
+    return out
+}
+
+test "consecutive pages never skip or repeat and a full last page has no next" {
+    var owner = ceOwner()
+    var all = ""
+    for (var page in listOf(0, 1, 2)) {
+        var res = owner.get("/carteira/extrato?page=" + page + "&size=2&to=2020-01-16")
+        Check.status(res, 200)
+        Check.jsonEq(res, "page", "" + page)
+        Check.jsonEq(res, "size", "2")
+        var expectNext = "false"
+        if (page < 2) {
+            expectNext = "true"
+        }
+        Check.jsonEq(res, "hasNext", expectNext)
+        all = all + ceRefs(res)
+    }
+    Check.eqStr("order", "after,end,tie-b,tie-a,start,before,", all)
+}
+
+test "inclusive dates follow the Sao Paulo day shown in the app" {
+    var owner = ceOwner()
+    Check.eqStr("day", "end,tie-b,tie-a,start,", ceRefs(owner.get("/carteira/extrato?from=2020-01-15&to=2020-01-15")))
+}
+
+test "initial date alone and final date alone are applied" {
+    var owner = ceOwner()
+    var from = ceRefs(owner.get("/carteira/extrato?from=2020-01-16"))
+    Check.isTrue("after present", from.contains("after,"))
+    Check.isTrue("before absent", !from.contains("before") && !from.contains("start") && !from.contains("tie-") && !from.contains("end,"))
+    Check.eqStr("to", "before,", ceRefs(owner.get("/carteira/extrato?to=2020-01-14")))
+}
+
+test "empty and past the last page return no next" {
+    var owner = ceOwner()
+    var past = owner.get("/carteira/extrato?to=2020-01-16&size=2&page=3")
+    Check.status(past, 200)
+    Check.eqStr("empty", "", ceRefs(past))
+    Check.jsonEq(past, "hasNext", "false")
+    var none = owner.get("/carteira/extrato?from=2019-01-01&to=2019-01-31")
+    Check.eqStr("empty range", "", ceRefs(none))
+    Check.jsonEq(none, "hasNext", "false")
+}
+
+test "the extract does not create an account nor read another one" {
+    var app = ceApp()
+    var reader = EconomyTestKit.login(app, "wallet-extract-reader")
+    var before = app.db().queryLong("select count(*) from coin_accounts where account_id = ?", DbParams().bindStr("wallet-extract-reader"))
+    Check.eqStr("no account before", "0", "" + before)
+    Check.eqStr("empty", "", ceRefs(reader.get("/carteira/extrato")))
+    var after = app.db().queryLong("select count(*) from coin_accounts where account_id = ?", DbParams().bindStr("wallet-extract-reader"))
+    Check.eqStr("no account after", "0", "" + after)
+}
+
+test "reading the extract preserves the wallet contract and balance" {
+    var owner = ceOwner()
+    var before = owner.get("/carteira")
+    Check.status(owner.get("/carteira/extrato"), 200)
+    var after = owner.get("/carteira")
+    for (var field in listOf("balance", "chave", "escala", "cotacaoBrlCents")) {
+        Check.eqStr(field, "" + before.jsonStr(field), "" + after.jsonStr(field))
+    }
+    Check.isTrue("entries array", after.body.contains("\"entries\":["))
+}
+
+test "transfer message and reference remain available for contestation" {
+    var app = ceApp()
+    var sender = EconomyTestKit.login(app, "wallet-extract-sender")
+    var receiver = EconomyTestKit.login(app, "wallet-extract-receiver")
+    Check.status(sender.get("/carteira"), 200)
+    Check.status(receiver.get("/carteira"), 200)
+    var sent = sender.callKey("POST", "/carteira/transferencias", "extract-transfer-1", json.encode(CoinTransferBody("wallet-extract-receiver", 1000 as Long, "Transferência de demonstração")))
+    Check.status(sent, 200)
+    var ref = EconomyTestKit.str(sent, "refId")
+    var extract = sender.get("/carteira/extrato")
+    Check.status(extract, 200)
+    var found = false
+    var i = 0
+    while (extract.jsonHas("entries." + i + ".kind")) {
+        if (extract.jsonStr("entries." + i + ".kind") == "TRANSFER_OUT") {
+            Check.jsonEq(extract, "entries." + i + ".message", "Transferência de demonstração")
+            Check.jsonEq(extract, "entries." + i + ".refId", ref)
+            found = true
+        }
+        i = i + 1
+    }
+    Check.isTrue("TRANSFER_OUT present", found)
+}
+
+test "an invalid date is an explicit error" {
+    var owner = ceOwner()
+    for (var date in listOf("invalid", "2020-02-30", "2020-13-01", "0000-01-01", "2020-1-1", "")) {
+        Check.apiError(owner.get("/carteira/extrato?from=" + date), 400, "INVALID_EXTRACT_DATE")
+    }
+    Check.apiError(owner.get("/carteira/extrato?from=2020-01-16&to=2020-01-15"), 400, "INVALID_EXTRACT_DATE")
+}
+
+test "an invalid page is rejected instead of changing the requested page" {
+    var owner = ceOwner()
+    for (var q in listOf("page=-1&size=20", "page=10001&size=20", "page=0&size=0", "page=0&size=-1", "page=0&size=101")) {
+        Check.apiError(owner.get("/carteira/extrato?" + q), 400, "INVALID_EXTRACT_PAGE")
+    }
+}
+
+test "authentication is required" {
+    var app = ceApp()
+    Check.status(ProfileTestApp.anonymous(app).get("/carteira/extrato"), 401)
+    EconomyTestKit.finish()
+}

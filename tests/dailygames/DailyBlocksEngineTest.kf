@@ -1,0 +1,150 @@
+import dailygames.*
+
+// Port of BlocksEngineTest plus golden values computed by running the Java BlocksEngine / MazeRules (same
+// java.util.Random sequence and bag shuffle): the seeds must draw the same pieces and the same replays.
+List<BlocksEvent> engineScript(text: String) {
+    var out = listOf<BlocksEvent>()
+    for (var item in text.split(",")) {
+        if (item.length() > 0) {
+            var parts = item.split(":")
+            out.add(BlocksEvent(parts[0].toInt(), parts[1]))
+        }
+    }
+    return out
+}
+
+String engineJoin(rows: List<String>) {
+    var out = ""
+    var i = 0
+    while (i < rows.size()) {
+        if (i > 0) {
+            out = out + "|"
+        }
+        out = out + rows.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+Bool engineRejects(seed: Long, target: Int, events: List<BlocksEvent>, elapsed: Int) {
+    try {
+        BlocksEngine.replay(seed, target, events, elapsed)
+    } catch (String e) {
+        return e.startsWith("ILLEGAL_ARGUMENT")
+    }
+    return false
+}
+
+String engineText(list: List<Int>) {
+    var out = ""
+    for (var n in list) {
+        out = out + n + ","
+    }
+    return out
+}
+
+test "gravity advances without input and is deterministic" {
+    var initial = BlocksEngine.replay(42L, 10, listOf<BlocksEvent>(), 0)
+    var moved = BlocksEngine.replay(42L, 10, listOf<BlocksEvent>(), 5)
+    assert(moved.activeCells().get(0).y() == initial.activeCells().get(0).y() + 1)
+    var again = BlocksEngine.replay(42L, 10, listOf<BlocksEvent>(), 5)
+    assert(engineJoin(again.board()) == engineJoin(moved.board()))
+    assert(again.activeCells().get(0).y() == moved.activeCells().get(0).y())
+    assert(again.activeCells().get(3).x() == moved.activeCells().get(3).x())
+    assert(moved.activeCells().size() == 4)
+    assert(moved.nextCells().size() == 4)
+    assert(moved.rulesVersion() == 2)
+}
+
+test "hard drops eventually lose and validate" {
+    var events = listOf<BlocksEvent>()
+    var result = BlocksEngine.replay(9L, 100, events, 0)
+    while (result.status() == "PLAYING" && events.size() < 30) {
+        events.add(BlocksEvent(events.size() + 1, "HARD_DROP"))
+        result = BlocksEngine.replay(9L, 100, events, events.size())
+    }
+    assert(result.status() == "LOST")
+    assert(result.activeCells().size() == 0)
+    var validated = BlocksEngine.validateCompleted(9L, 100, events, events.size())
+    assert(validated.status() == result.status())
+    assert(validated.score() == result.score())
+    assert(engineJoin(validated.board()) == engineJoin(result.board()))
+    events.add(BlocksEvent(events.size() + 1, "WAIT"))
+    var afterEnd = BlocksEngine.replay(9L, 100, events, events.size())
+    assert(afterEnd.status() == "LOST")
+    assert(engineJoin(afterEnd.board()) == engineJoin(result.board()))
+    assert(afterEnd.score() == result.score())
+}
+
+// Java also passes a null event list (IllegalArgumentException); Kof lists are never null, so that one
+// assertion has no counterpart. The other five are kept.
+test "rejects incomplete and invalid time or event order" {
+    assert(!engineRejects(1L, 10, listOf<BlocksEvent>(), 5))
+    var incomplete = false
+    try {
+        BlocksEngine.validateCompleted(1L, 10, listOf<BlocksEvent>(), 0)
+    } catch (String e) {
+        incomplete = e.startsWith("ILLEGAL_ARGUMENT")
+    }
+    assert(incomplete)
+    assert(engineRejects(1L, 0, listOf<BlocksEvent>(), 0))
+    assert(engineRejects(1L, 1, listOf<BlocksEvent>(), 6001))
+    var event = BlocksEvent(1, "LEFT")
+    assert(engineRejects(1L, 1, listOf(event, event), 1))
+    assert(engineRejects(1L, 1, listOf(event), 0))
+}
+
+test "blocked movement does not leave the board" {
+    var events = listOf<BlocksEvent>()
+    var i = 1
+    while (i <= 15) {
+        events.add(BlocksEvent(i, "LEFT"))
+        i = i + 1
+    }
+    var result = BlocksEngine.replay(22L, 10, events, 15)
+    for (var cell in result.activeCells()) {
+        assert(cell.x() >= 0 && cell.x() <= 9)
+    }
+}
+
+test "the bag sequence of a seed is the Java one" {
+    assert(engineText(BlocksEngine.pieceSequence(42L, 21, 0)) == "1,3,5,0,4,6,2,1,2,4,0,5,3,6,0,6,1,2,5,4,3,")
+    assert(engineText(BlocksEngine.pieceSequence(9L, 10, 5)) == "1,6,1,0,3,5,2,4,6,4,")
+    assert(engineText(BlocksEngine.pieceSequence(-1234567890123L, 14, 0)) == "5,3,2,0,1,4,6,1,2,6,5,3,4,0,")
+    assert(BlocksEngine.pieceSequence(42L, 100, 0).size() == 100)
+}
+
+test "a mixed script replays to the same board as Java" {
+    var script = engineScript("3:ROTATE,5:SOFT_DROP,9:ROTATE,13:ROTATE,17:WAIT,19:SOFT_DROP,21:WAIT,24:RIGHT,26:SOFT_DROP,29:LEFT,33:WAIT,37:RIGHT,38:LEFT,42:SOFT_DROP,45:SOFT_DROP,48:HARD_DROP,52:RIGHT,53:ROTATE,55:WAIT,57:SOFT_DROP,61:LEFT,64:SOFT_DROP,66:SOFT_DROP,70:WAIT,74:ROTATE,77:WAIT,79:WAIT,80:ROTATE,81:HARD_DROP,84:LEFT,85:HARD_DROP,88:ROTATE,92:LEFT,96:RIGHT,98:WAIT,102:SOFT_DROP,106:HARD_DROP,109:HARD_DROP,112:HARD_DROP,116:WAIT,119:LEFT,123:WAIT,127:SOFT_DROP,131:LEFT,135:SOFT_DROP,139:RIGHT,141:HARD_DROP,145:WAIT,146:RIGHT,149:HARD_DROP,152:WAIT,154:WAIT,158:SOFT_DROP,162:WAIT,166:ROTATE,169:HARD_DROP,170:SOFT_DROP,171:LEFT,172:HARD_DROP,175:RIGHT")
+    var result = BlocksEngine.replay(7L, 100, script, 178)
+    assert(result.status() == "LOST")
+    assert(result.score() == 0)
+    assert(result.lines() == 0)
+    assert(result.actions() == 60)
+    assert(result.elapsedTicks() == 169)
+    assert(result.piecesSpawned() == 12)
+    assert(engineJoin(result.board()) == "..........|...#......|..##......|...#......|...####...|......#...|...####...|..####....|..####....|...###....|...##.....|..###.....|..##......|...#......|..####....|...#......|...##.....|...##.....|...##.....|...#......")
+}
+
+// A greedy player (computed on the Java engine) that clears a line: pins the row compaction and the score.
+test "clearing a line scores 100 and wins at the target, like Java" {
+    var all = "1:ROTATE,2:LEFT,3:LEFT,4:LEFT,5:LEFT,6:LEFT,7:HARD_DROP,8:LEFT,9:HARD_DROP,10:RIGHT,11:RIGHT,12:HARD_DROP,13:HARD_DROP,14:ROTATE,15:LEFT,16:LEFT,17:LEFT,18:LEFT,19:LEFT,20:HARD_DROP,21:HARD_DROP,22:RIGHT,23:RIGHT,24:RIGHT,25:RIGHT,26:HARD_DROP,27:HARD_DROP,28:RIGHT,29:RIGHT,30:RIGHT,31:HARD_DROP,32:ROTATE,33:RIGHT,34:RIGHT,35:RIGHT,36:RIGHT,37:HARD_DROP,38:ROTATE,39:RIGHT,40:HARD_DROP,41:RIGHT,42:RIGHT,43:HARD_DROP,44:ROTATE,45:RIGHT,46:RIGHT,47:RIGHT,48:HARD_DROP,49:ROTATE,50:LEFT,51:LEFT,52:LEFT,53:LEFT,54:LEFT,55:HARD_DROP,56:ROTATE,57:RIGHT,58:RIGHT,59:RIGHT,60:HARD_DROP,61:ROTATE,62:LEFT,63:LEFT,64:LEFT,65:LEFT,66:LEFT,67:HARD_DROP,68:ROTATE,69:RIGHT,70:RIGHT,71:RIGHT,72:HARD_DROP,73:ROTATE,74:LEFT,75:HARD_DROP,76:ROTATE,77:LEFT,78:HARD_DROP,79:RIGHT,80:RIGHT,81:RIGHT,82:RIGHT,83:HARD_DROP,"
+    var script = engineScript(all)
+    var won = BlocksEngine.replay(5L, 1, script, 83)
+    assert(won.status() == "WON")
+    assert(won.score() == 100)
+    assert(won.lines() == 1)
+    assert(won.actions() == 83)
+    assert(won.piecesSpawned() == 20)
+    assert(won.activeCells().size() == 0)
+    assert(engineJoin(won.board()) == "..........|..........|..........|..........|..........|..........|..........|#....#....|#....#....|#....##...|#.....#...|#..#.##...|#..#.##...|##.######.|##.#####..|##.##.##..|########..|#########.|##.###.##.|.###.#####")
+    var afterWin = BlocksEngine.replay(5L, 1, script, 90)
+    assert(afterWin.status() == "WON")
+    assert(afterWin.elapsedTicks() == 83)
+    // Same script with a far target: the match goes on and is lost with the same single line.
+    var more = engineScript(all + "84:RIGHT,85:RIGHT,86:RIGHT,87:RIGHT,88:HARD_DROP,89:RIGHT,90:RIGHT,91:RIGHT,92:RIGHT,93:RIGHT,94:HARD_DROP,95:ROTATE,96:RIGHT,97:RIGHT,98:RIGHT,99:RIGHT,100:HARD_DROP,101:ROTATE,102:RIGHT,103:RIGHT,104:RIGHT,105:HARD_DROP,106:RIGHT,107:RIGHT,108:RIGHT,109:HARD_DROP,110:ROTATE,111:LEFT,112:LEFT,113:LEFT,114:LEFT,115:LEFT,116:HARD_DROP,117:ROTATE,118:ROTATE,119:ROTATE,120:RIGHT,121:RIGHT,122:RIGHT,123:RIGHT,124:HARD_DROP,125:ROTATE,126:RIGHT,127:HARD_DROP,128:ROTATE,129:RIGHT,130:HARD_DROP,131:ROTATE,132:RIGHT,133:HARD_DROP,134:RIGHT,135:RIGHT,136:HARD_DROP,137:HARD_DROP")
+    var lost = BlocksEngine.replay(5L, 3, more, 137)
+    assert(lost.status() == "LOST")
+    assert(lost.score() == 100)
+    assert(lost.lines() == 1)
+}

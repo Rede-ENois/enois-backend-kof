@@ -1,0 +1,67 @@
+package games
+
+import kernel.error.*
+import kernel.id.*
+import kernel.security.*
+import kernel.time.*
+
+// The identity of the player INSIDE the game: never the Énóis session. The game runs in an iframe of another
+// origin and NEVER receives the session token. When the person plays, the platform issues an opaque token
+// (random, stored only as a HASH, 15 minutes, SINGLE use) that the game exchanges on its own server for the
+// identity, and a stable pseudonym (playerRef) with which the game creates its own account. Spending faisca
+// does not authenticate here: the game only ASKS and the person confirms on the platform. Port of
+// GameIdentityService.
+record GameIssuedToken(String token, String expiresAt)
+
+record GamePlayerIdentity(String gameId, String playerRef)
+
+class GamesIdentity {
+    GamesStore games
+    public constructor(games: GamesStore) {
+        this.games = games
+    }
+    // How long the game has to exchange the token on its server.
+    static Long tokenTtlSeconds() = 900L
+    // Issues the token for ONE match (published games only; an Énóis session is required).
+    GameIssuedToken mint(userId: String, gameId: String) {
+        var found = games.findById(gameId)
+        if (found == null) {
+            throw Errors.api(404, "GAME_NOT_FOUND", "Jogo não encontrado.")
+        }
+        if (found.status() != GameStatus.published()) {
+            throw Errors.api(409, "GAME_NOT_PUBLISHED", "Só jogo publicado identifica jogador.")
+        }
+        // 256 random bits as 64 hex characters.
+        var token = Hashes.sha256Hex(Tokens.random(32))
+        var now = Time.nowIso()
+        var expires = Time.plusSeconds(now, GamesIdentity.tokenTtlSeconds())
+        games.insertToken(Ids.prefixed("gtok_"), gameId, userId, Hashes.sha256Hex(token), this.playerRef(userId, gameId), expires, now)
+        return GameIssuedToken(token, expires)
+    }
+    // Validation on the GAME's side (its server): token -> pseudonymous identity. Single use: the same token
+    // does not work twice, an expired one neither.
+    GamePlayerIdentity validate(token: String?) {
+        if (!GameRules.hasText(token)) {
+            throw Errors.api(400, "TOKEN_REQUIRED", "Informe o token da identidade.")
+        }
+        var found = games.findToken(Hashes.sha256Hex(GameRules.trimText(token)))
+        if (found == null) {
+            throw Errors.api(404, "TOKEN_INVALID", "Token inválido.")
+        }
+        var now = Time.nowIso()
+        if (found.getStrOrNull("used_at") != null) {
+            throw Errors.api(409, "TOKEN_ALREADY_USED", "Este token já foi trocado.")
+        }
+        if (Time.toMillis(found.getInstant("expires_at")) <= Time.toMillis(now)) {
+            throw Errors.api(410, "TOKEN_EXPIRED", "Token expirado — peça outro na plataforma.")
+        }
+        // Claimed atomically: two simultaneous exchanges of the same token cannot both win.
+        if (!games.consumeToken(found.getStr("id"), now)) {
+            throw Errors.api(409, "TOKEN_ALREADY_USED", "Este token já foi trocado.")
+        }
+        return GamePlayerIdentity(found.getStr("game_id"), found.getStr("player_ref"))
+    }
+    // The pseudonym of the player in THAT game: stable (same person, same ref) and unrelated to the Énóis id
+    // in any visible way.
+    String playerRef(userId: String, gameId: String) = "plr_" + Hashes.sha256Hex("game-player:" + userId + ":" + gameId).substring(0, 32)
+}

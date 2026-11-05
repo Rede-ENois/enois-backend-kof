@@ -1,0 +1,101 @@
+package economy
+
+import ops.*
+import coin.*
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import messaging.*
+import notifications.*
+import profile.*
+import services.*
+
+// The link guard of the suites: a suite has no network, so a host "resolves" to a public address unless its name says
+// it is internal. Everything else (https only, no credentials, local names) is the real guard.
+class StubLinkGuard extends ServiceLinkGuard {
+    public constructor() {
+        super()
+    }
+    Bool resolvesPublic(host: String) = !host.contains("private")
+}
+
+class ServicesStack {
+    ProfileModule profiles
+    CoinModule coin
+    MessagingModule messaging
+    ServicesModule services
+    SharedServices shared
+    public constructor(profiles: ProfileModule, coin: CoinModule, messaging: MessagingModule, services: ServicesModule, shared: SharedServices) {
+        this.profiles = profiles
+        this.coin = coin
+        this.messaging = messaging
+        this.services = services
+        this.shared = shared
+    }
+}
+
+// Test support of the services domain: profile, notifications, coin, messaging and services over the same request
+// pipeline as Main.kf (the chat opens a real conversation).
+class ServicesTestKit {
+    static ServicesStack? servicesStackHandle = null
+    static TestApp? servicesAppHandle = null
+    static TestApp app(name: String) {
+        var cur = ServicesTestKit.servicesAppHandle
+        if (cur != null) {
+            return cur
+        }
+        var created = DomainTestKit.boot(name, new HashMap<String, String>(), (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+    ServicesTestKit.wire(p, s, parts)
+})
+        ServicesTestKit.servicesAppHandle = created
+        return created
+    }
+    static wire(p: Platform, shared: SharedServices, parts: SecurityParts) {
+        var hooks = SecurityHooks.defaults(p.db)
+        var profiles = ProfileModule.install(p, shared, hooks)
+        var core = CoinCore.create(p, shared, parts)
+        var seams = NotificationsSeams(p, MailTestKit.capturing(p))
+        seams.coins = CoinNotificationCoins(core.service)
+        var notifications = NotificationsModule.installWith(p, shared, seams)
+        var coin = CoinModule.install(p, shared, parts, core, profiles, notifications)
+        var messaging = MessagingModule.install(p, shared, hooks, parts, notifications)
+        var services = ServicesModule.installWith(p, shared, coin, profiles, messaging, StubLinkGuard())
+        ServicesTestKit.servicesStackHandle = ServicesStack(profiles, coin, messaging, services, shared)
+    }
+    static ServicesStack stack() {
+        var s = ServicesTestKit.servicesStackHandle
+        if (s == null) {
+            throw "ServicesTestKit: boot the app first"
+        }
+        return s
+    }
+    static ProfileCaller login(app: TestApp, id: String) = ProfileTestApp.login(app, id)
+    // An adult account: messaging needs a birth date.
+    static ProfileCaller loginAdult(app: TestApp, id: String) {
+        var caller = ProfileTestApp.login(app, id)
+        app.db().execute("update users set birth_date = ? where id = ?", DbParams().bindDate("1990-01-01").bindStr(id))
+        return caller
+    }
+    static ProfileCaller anonymous(app: TestApp) = ProfileTestApp.anonymous(app)
+    static ProfileCaller loginAdmin(app: TestApp, id: String) {
+        var caller = ProfileTestApp.login(app, id)
+        app.db().execute("update users set is_admin = ? where id = ?", DbParams().bindBool(true).bindStr(id))
+        return caller
+    }
+    static finish() {
+        ServicesTestKit.stack().shared.stop()
+    }
+    static String str(res: TestResponse, path: String) {
+        var v = res.jsonStr(path)
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    static Long balance(who: ProfileCaller) {
+        var res = who.get("/carteira")
+        Check.status(res, 200)
+        return ServicesTestKit.str(res, "balance").toLong()
+    }
+}

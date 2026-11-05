@@ -1,0 +1,146 @@
+package economy
+
+import ops.*
+import coin.*
+import cosmetics.*
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import notifications.*
+import profile.*
+
+// What a test of the cosmetics domain reads from the booted app.
+class CosmeticsStack {
+    ProfileModule profiles
+    CoinModule coin
+    CosmeticsCore core
+    CosmeticsModule cosmetics
+    SharedServices shared
+    public constructor(profiles: ProfileModule, coin: CoinModule, core: CosmeticsCore, cosmetics: CosmeticsModule, shared: SharedServices) {
+        this.profiles = profiles
+        this.coin = coin
+        this.core = core
+        this.cosmetics = cosmetics
+        this.shared = shared
+    }
+}
+
+// Test support of the cosmetics domain: profile (with the cosmetics badge ownership seam), notifications, coin and
+// cosmetics, wired like Main.kf. The clock starts on the duel day (2026-10-31, 23:30 in Sao Paulo), when the Saci and
+// Halloween collections are on sale and both events are open: `CosmeticsTestKit.duelDay()`.
+//
+//   var app = CosmeticsTestKit.app("shopflow", mapOf<String, String>())
+//   var me = CosmeticsTestKit.wallet(app, "shop-buyer")      // account whose wallet is open: 105.000 thousandths
+class CosmeticsTestKit {
+    static TestApp? cosmeticsPinned = null
+    static CosmeticsStack? cosmeticsStackHandle = null
+    static String duelDay() = "2026-11-01T02:30:00Z"
+    // Just past the end of both events (a session opened at the start still lives, 60 minutes).
+    static String afterEvents() = "2026-11-01T03:00:30Z"
+    static TestApp app(name: String, overrides: Map<String,String>) {
+        var cur = CosmeticsTestKit.cosmeticsPinned
+        if (cur != null) {
+            return cur
+        }
+        EconomyClock.fix(CosmeticsTestKit.duelDay())
+        var created = DomainTestKit.boot(name, overrides, (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+    CosmeticsTestKit.wire(p, s, parts)
+})
+        CosmeticsTestKit.cosmeticsPinned = created
+        return created
+    }
+    static wire(p: Platform, shared: SharedServices, parts: SecurityParts) {
+        var cosmeticsCore = CosmeticsCore.create(p)
+        var profiles = ProfileModule.installWith(p, shared, ProfileNotifier(p.db), cosmeticsCore.badges, ProfileParentalLinks(p.db), ProfileForeignCounts(p.db), PreferencesThemeGallery(p.db))
+        var coreCoin = CoinCore.create(p, shared, parts)
+        var seams = NotificationsSeams(p, MailTestKit.capturing(p))
+        seams.coins = CoinNotificationCoins(coreCoin.service)
+        var notifications = NotificationsModule.installWith(p, shared, seams)
+        var coin = CoinModule.install(p, shared, parts, coreCoin, profiles, notifications)
+        var cosmetics = CosmeticsModule.install(p, cosmeticsCore, coin, profiles)
+        CosmeticsTestKit.cosmeticsStackHandle = CosmeticsStack(profiles, coin, cosmeticsCore, cosmetics, shared)
+    }
+    static CosmeticsStack stack() {
+        var s = CosmeticsTestKit.cosmeticsStackHandle
+        if (s == null) {
+            throw "CosmeticsTestKit: boot the app first"
+        }
+        return s
+    }
+    static CosmeticsService shop() = CosmeticsTestKit.stack().cosmetics.shop
+    // Pins the clock (ISO instant) of the economy domains.
+    static clockAt(iso: String) {
+        EconomyClock.fix(iso)
+    }
+    // Last test of a file: back to the real clock and stop the background jobs.
+    static finish() {
+        EconomyClock.unfix()
+        CosmeticsTestKit.stack().shared.stop()
+    }
+    // A verified account with a live session whose wallet is open (100 sparks of genesis + 5 of presence = 105.000).
+    static ProfileCaller wallet(app: TestApp, id: String) {
+        var caller = ProfileTestApp.login(app, id)
+        var opened = caller.get("/carteira")
+        Check.status(opened, 200)
+        Check.jsonEq(opened, "balance", "105000")
+        return caller
+    }
+    static Long balance(caller: ProfileCaller) {
+        var res = caller.get("/carteira")
+        Check.status(res, 200)
+        return CosmeticsTestKit.text(res, "balance").toLong()
+    }
+    // The string at a JSON path, "" when absent or null.
+    static String text(res: TestResponse, path: String) {
+        var v = res.jsonStr(path)
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    // Position of the row with this `id` in a list response (the root array), or -1.
+    static Int rowIndex(res: TestResponse, id: String) {
+        var n = res.jsonSize("")
+        var i = 0
+        while (i < n) {
+            if (res.jsonStr("" + i + ".id") == id) {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+    // A field of the row with this id; throws when the row is missing.
+    static String rowStr(res: TestResponse, id: String, field: String) {
+        var i = CosmeticsTestKit.rowIndex(res, id)
+        if (i < 0) {
+            throw "FAIL no row with id " + id
+        }
+        var v = res.jsonStr("" + i + "." + field)
+        if (v == null) {
+            throw "FAIL " + id + "." + field + " is absent or null"
+        }
+        return v
+    }
+    static Bool rowIsNull(res: TestResponse, id: String, field: String) {
+        var i = CosmeticsTestKit.rowIndex(res, id)
+        if (i < 0) {
+            throw "FAIL no row with id " + id
+        }
+        return res.jsonIsNull("" + i + "." + field)
+    }
+    // How many rows have `field` equal to `value`.
+    static Int countWhere(res: TestResponse, field: String, value: String) {
+        var n = res.jsonSize("")
+        var count = 0
+        var i = 0
+        while (i < n) {
+            if (res.jsonStr("" + i + "." + field) == value) {
+                count = count + 1
+            }
+            i = i + 1
+        }
+        return count
+    }
+}

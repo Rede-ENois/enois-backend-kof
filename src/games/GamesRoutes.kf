@@ -1,0 +1,505 @@
+package games
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+import kernel.url.*
+import profile.*
+
+// HTTP adapter of the games domain: GameController, GamePlatformController, GameSocialController and
+// GameRatingsController. Routes are matched in registration order (the runtime has no "most specific
+// wins"), so the literal addresses are registered BEFORE `/games/:username` and `/games/:username/:gameSlug`,
+// the way Spring resolves `/games/hoje` and `/games/colecoes` ahead of `{username}`.
+class GamesRoutes {
+    static register(server: HttpServer, games: GamesService, catalog: GamesCatalog, library: GamesLibrary, social: GamesSocial, developers: GamesDeveloper, identities: GamesIdentity, profiles: ProfileDirectory) {
+        // ---- GET (literals first) ----
+        server.get("/games", () -> GamesRoutes.catalog(games, catalog, library, profiles))
+        server.get("/games/hoje", () -> GamesRoutes.trendingToday(catalog, profiles))
+        server.get("/games/colecoes", () -> GamesRoutes.collections(games))
+        server.get("/games/ratings", () -> GamesRoutes.ratings(social))
+        server.get("/games/library", () -> GamesRoutes.library(games, library, catalog, profiles))
+        server.get("/games/profile/mine", () -> GamesRoutes.myDeveloperPage(developers))
+        server.get("/games/:gameId/reviews", () -> GamesRoutes.reviews(social))
+        server.get("/games/:gameId/comments", () -> GamesRoutes.comments(social))
+        server.get("/games/:gameId/stats", () -> json.encode(catalog.stats(Req.pathParam("gameId"))))
+        server.get("/games/:gameId/analytics", () -> GamesRoutes.analytics(catalog))
+        server.get("/games/:gameId/updates", () -> GamesRoutes.updates(games))
+        server.get("/games/:username/profile", () -> GamesRoutes.developerPage(developers))
+        server.get("/games/:username", () -> GamesRoutes.byUser(games, library, catalog, profiles))
+        server.get("/games/:username/:gameSlug", () -> GamesRoutes.bySlug(games, library, catalog, profiles))
+        server.get("/me/games", () -> GamesRoutes.myGames(games, profiles))
+        server.get("/admin/games", () -> GamesRoutes.pending(games, profiles))
+        // ---- POST ----
+        server.post("/games", () -> GamesRoutes.submit(games))
+        server.post("/games/tokens/validate", () -> GamesRoutes.validateToken(identities))
+        server.post("/games/colecoes", () -> GamesRoutes.createCollection(games))
+        server.post("/games/colecoes/:collectionId/esconder", () -> GamesRoutes.hideCollection(games))
+        server.post("/games/:gameId/identity", () -> GamesRoutes.identity(identities))
+        server.post("/games/:gameId/despesas", () -> GamesRoutes.spend(games))
+        server.post("/games/:gameId/compartilhar", () -> GamesRoutes.share(games))
+        server.post("/games/:gameId/boost", () -> GamesRoutes.boost(games))
+        server.post("/games/:gameId/resubmit", () -> GamesRoutes.resubmit(games))
+        server.post("/games/:gameId/favorite", () -> GamesRoutes.favorite(library, catalog))
+        server.post("/games/:gameId/play", () -> GamesRoutes.play(catalog))
+        server.post("/games/:gameId/updates", () -> GamesRoutes.publishUpdate(games))
+        server.post("/games/:gameId/reviews", () -> GamesRoutes.review(social))
+        server.post("/games/:gameId/comments", () -> GamesRoutes.comment(social))
+        server.post("/games/:username/follow", () -> GamesRoutes.follow(developers))
+        server.post("/admin/games/:gameId/approve", () -> GamesRoutes.approve(games))
+        server.post("/admin/games/:gameId/reject", () -> GamesRoutes.reject(games))
+        server.post("/admin/games/:gameId/suspend", () -> GamesRoutes.suspend(games))
+        server.post("/admin/games/:gameId/unsuspend", () -> GamesRoutes.unsuspend(games))
+        // ---- PUT / PATCH / DELETE ----
+        server.put("/games/profile", () -> GamesRoutes.saveProfile(developers))
+        server.patch("/games/:gameId", () -> GamesRoutes.edit(games))
+        server.delete("/games/:gameId", () -> GamesRoutes.remove(games))
+        server.delete("/games/:username/follow", () -> GamesRoutes.unfollow(developers))
+        server.delete("/games/:gameId/favorite", () -> GamesRoutes.unfavorite(library, catalog))
+        server.delete("/games/:gameId/reviews/mine", () -> GamesRoutes.deleteReview(social))
+        server.delete("/games/:gameId/comments/:commentId", () -> GamesRoutes.deleteComment(social))
+    }
+    // ---- reading ----
+    static String catalog(games: GamesService, catalog: GamesCatalog, library: GamesLibrary, profiles: ProfileDirectory) {
+        var stage = GameCriteria.stageOrNull(Req.queryStr("stage", ""))
+        var distribution = GameCriteria.distributionOrNull(Req.queryStr("distribution", ""))
+        var criteria = GameCriteria.of(Req.queryStr("query", ""), Req.queryStr("genre", ""), Req.queryStr("tag", ""), stage, distribution, Req.queryStr("order", ""))
+        var limit = GamesRoutes.optionalInt("limit")
+        var page = catalog.search(criteria, limit, Req.queryStr("cursor", ""))
+        // With a session the catalogue marks what is MINE (`owned`): what makes the store card offer "Edit".
+        var viewer = Auth.viewerIdOrNull()
+        return json.encode(GamePageView(GamesRoutes.views(profiles, page.items(), viewer), page.nextCursor()))
+    }
+    // An optional integer query parameter: absent or empty is null, malformed is 400.
+    static Int? optionalInt(name: String) {
+        if (Req.queryStr(name, "").trim().length() == 0) {
+            return null
+        }
+        return Req.queryInt(name, 0)
+    }
+    static String trendingToday(catalog: GamesCatalog, profiles: ProfileDirectory) {
+        var ranked = catalog.trendingToday(Req.queryInt("limit", 6))
+        var names = GamesRoutes.usernames(profiles, GamesRoutes.owners(GamesRoutes.gamesOf(ranked)))
+        var out = listOf<GameTrendingView>()
+        for (var item in ranked) {
+            var game = item.game()
+            out.add(GameTrendingView(game.id(), names.get(game.userId()), game.slug(), game.title(), game.cover(), game.icon(), game.url(), item.plays(), item.players()))
+        }
+        return json.encode(out)
+    }
+    static List<GameRecord> gamesOf(ranked: List<GameTrending>) {
+        var out = listOf<GameRecord>()
+        for (var item in ranked) {
+            out.add(item.game())
+        }
+        return out
+    }
+    static String byUser(games: GamesService, library: GamesLibrary, catalog: GamesCatalog, profiles: ProfileDirectory) {
+        var viewer = Auth.viewerIdOrNull()
+        return json.encode(GamesRoutes.views(profiles, games.publishedByUser(Req.pathParam("username")), viewer))
+    }
+    static String bySlug(games: GamesService, library: GamesLibrary, catalog: GamesCatalog, profiles: ProfileDirectory) {
+        // With a session the owner opens their own game in any state (draft, rejected, suspended).
+        var viewer = Auth.viewerIdOrNull()
+        var game = games.byUserAndSlug(Req.pathParam("username"), Req.pathParam("gameSlug"), viewer)
+        return json.encode(GamesRoutes.viewWithFavorites(profiles, catalog, library, game, viewer))
+    }
+    // The DETAIL view is the only one that shows favorites, so only here the extra queries are worth it.
+    static GameView viewWithFavorites(profiles: ProfileDirectory, catalog: GamesCatalog, library: GamesLibrary, game: GameRecord, viewer: String?) {
+        var favorites = catalog.stats(game.id()).favorites() as Int
+        return GameRules.view(game, GamesRoutes.usernameOf(profiles, game.userId()), favorites, library.has(viewer, game.id()), viewer)
+    }
+    static String? usernameOf(profiles: ProfileDirectory, userId: String) {
+        var found = profiles.findById(userId)
+        if (found == null) {
+            return null
+        }
+        return found.username()
+    }
+    // id -> username for a whole list in one batch (no N+1).
+    static Map<String,String> usernames(profiles: ProfileDirectory, userIds: List<String>) {
+        var names = mapOf<String, String>()
+        for (var profile in profiles.findAllByIds(userIds)) {
+            names.put(profile.id(), profile.username())
+        }
+        return names
+    }
+    static List<String> owners(list: List<GameRecord>) {
+        var ids = listOf<String>()
+        for (var game in list) {
+            if (!ids.contains(game.userId())) {
+                ids.add(game.userId())
+            }
+        }
+        return ids
+    }
+    // The public address of a game is /games/{username}/{slug}: the username comes from the profile.
+    static List<GameView> views(profiles: ProfileDirectory, list: List<GameRecord>, viewer: String?) {
+        var names = GamesRoutes.usernames(profiles, GamesRoutes.owners(list))
+        var out = listOf<GameView>()
+        for (var game in list) {
+            out.add(GameRules.view(game, names.get(game.userId()), 0, false, viewer))
+        }
+        return out
+    }
+    static String myGames(games: GamesService, profiles: ProfileDirectory) {
+        var userId = Auth.requireUser()
+        // `owned = true` on all of them: it is the list of MY games (the front uses it for "Edit").
+        return json.encode(GamesRoutes.views(profiles, games.ownedBy(userId), userId))
+    }
+    static String pending(games: GamesService, profiles: ProfileDirectory) {
+        Auth.requireAdmin()
+        // The review queue: who decides is not the owner, so `owned` stays out on purpose.
+        return json.encode(GamesRoutes.views(profiles, games.pending(Req.queryInt("limit", 30)), null))
+    }
+    static String collections(games: GamesService) = json.encode(games.collections(Req.queryInt("limit", 20)))
+    // Rating summary in batch for the catalogue cards (one request per page). `ids` may repeat or carry commas.
+    static String ratings(social: GamesSocial) {
+        var raw = Req.queryAll("ids")
+        if (raw.size() == 0) {
+            throw Errors.badRequest()
+        }
+        var ids = listOf<String>()
+        for (var value in raw) {
+            for (var part in value.split(",")) {
+                var id = part.trim()
+                if (id.length() > 0 && !ids.contains(id) && ids.size() < 50) {
+                    ids.add(id)
+                }
+            }
+        }
+        var out = "{"
+        var first = true
+        for (var entry in social.ratings(ids)) {
+            if (!first) {
+                out = out + ","
+            }
+            first = false
+            out = out + json.encode(entry.id()) + ":" + json.encode(entry.summary())
+        }
+        return out + "}"
+    }
+    static String reviews(social: GamesSocial) = json.encode(social.reviews(Req.pathParam("gameId"), Req.queryInt("limit", 30)))
+    static String comments(social: GamesSocial) = json.encode(social.comments(Req.pathParam("gameId"), Req.queryInt("limit", 50)))
+    static String analytics(catalog: GamesCatalog) {
+        var userId = Auth.requireUser()
+        return json.encode(catalog.analytics(Req.pathParam("gameId"), userId, Req.queryInt("days", 30)))
+    }
+    static String updates(games: GamesService) {
+        var out = listOf<GameUpdateView>()
+        for (var update in games.updatesOf(Req.pathParam("gameId"), GameRules.clamp(Req.queryInt("limit", 20), 1, 50))) {
+            out.add(GameUpdateView(update.id(), update.gameId(), update.title(), update.body(), update.version(), update.createdAt()))
+        }
+        return json.encode(out)
+    }
+    // ---- creator page ----
+    static String developerPage(developers: GamesDeveloper) {
+        var viewer = Auth.viewerIdOrNull()
+        return json.encode(GamesDeveloper.view(developers.page(Req.pathParam("username"), viewer)))
+    }
+    // The own creator page, without depending on the handle: the panel fills the form from here.
+    static String myDeveloperPage(developers: GamesDeveloper) {
+        var userId = Auth.requireUser()
+        return json.encode(GamesDeveloper.view(developers.page(GamesRoutes.usernameOrThrow(developers, userId), userId)))
+    }
+    static String usernameOrThrow(developers: GamesDeveloper, userId: String) {
+        var found = developers.profiles.findById(userId)
+        if (found == null) {
+            throw Errors.api(404, "PROFILE_NOT_FOUND", "Perfil não encontrado.")
+        }
+        return found.username()
+    }
+    static String saveProfile(developers: GamesDeveloper) {
+        var userId = Auth.requireUser()
+        var form = GamesRoutes.developerBody()
+        developers.save(userId, form.displayName(), form.headline(), form.bio(), form.links(), form.avatar(), form.cover())
+        return json.encode(GamesDeveloper.view(developers.page(GamesRoutes.usernameOrThrow(developers, userId), userId)))
+    }
+    // Following is a toggle: following again stops following.
+    static String follow(developers: GamesDeveloper) {
+        var userId = Auth.requireUser()
+        var developerId = developers.page(Req.pathParam("username"), null).user().id()
+        return json.encode(GameFollowView(developers.toggleFollow(userId, developerId)))
+    }
+    static String unfollow(developers: GamesDeveloper) {
+        var userId = Auth.requireUser()
+        var developerId = developers.page(Req.pathParam("username"), null).user().id()
+        if (developers.toggleFollow(userId, developerId)) {
+            // It was not following: the toggle followed instead of undoing, so undo it.
+            developers.toggleFollow(userId, developerId)
+        }
+        return json.encode(GameFollowView(false))
+    }
+    // ---- library ----
+    static String library(games: GamesService, library: GamesLibrary, catalog: GamesCatalog, profiles: ProfileDirectory) {
+        var userId = Auth.requireUser()
+        var out = listOf<GameView>()
+        for (var game in library.library(userId)) {
+            out.add(GamesRoutes.viewWithFavorites(profiles, catalog, library, game, userId))
+        }
+        return json.encode(out)
+    }
+    static String favorite(library: GamesLibrary, catalog: GamesCatalog) {
+        var userId = Auth.requireUser()
+        var gameId = Req.pathParam("gameId")
+        var favorited = library.toggle(userId, gameId)
+        return json.encode(GameFavoriteView(favorited, catalog.stats(gameId).favorites()))
+    }
+    static String unfavorite(library: GamesLibrary, catalog: GamesCatalog) {
+        var userId = Auth.requireUser()
+        var gameId = Req.pathParam("gameId")
+        if (library.has(userId, gameId)) {
+            library.toggle(userId, gameId)
+        }
+        return json.encode(GameFavoriteView(false, catalog.stats(gameId).favorites()))
+    }
+    // ---- playing ----
+    // Somebody started playing: the server counts the session (this is where "popularity" comes from).
+    static String play(catalog: GamesCatalog) {
+        var viewer = Auth.viewerIdOrNull()
+        return json.encode(GamePlaysView(catalog.startPlay(Req.pathParam("gameId"), viewer)))
+    }
+    static String publishUpdate(games: GamesService) {
+        var userId = Auth.requireUser()
+        var form = GamesRoutes.updateBody()
+        var update = games.publishUpdate(Req.pathParam("gameId"), userId, form.title(), form.body(), form.version())
+        return json.encode(GameUpdateView(update.id(), update.gameId(), update.title(), update.body(), update.version(), update.createdAt()))
+    }
+    // ---- creator ----
+    static String submit(games: GamesService) {
+        var userId = Auth.requireUser()
+        var form = GamesRoutes.submitBody()
+        var created = games.submit(userId, form.slug(), form.title(), form.description(), form.cover(), form.url(), form.tags())
+        return json.encode(GameSubmittedView(created.id(), created.slug(), created.status()))
+    }
+    // The owner edit. The form is parsed (stage, distribution, aspect, links) BEFORE the ownership check, as
+    // the Java controller built the details while evaluating the call arguments.
+    static String edit(games: GamesService) {
+        var userId = Auth.requireUser()
+        var form = GamesRoutes.editBody()
+        var details = GamesRoutes.detailsOf(form)
+        var edited = games.edit(Req.pathParam("gameId"), userId, form.title(), form.description(), form.cover(), form.url(), form.tags(), details, form.slug())
+        return json.encode(GameSubmittedView(edited.id(), edited.slug(), edited.status()))
+    }
+    static GameDetailsInput detailsOf(form: GameEditBody) {
+        var stage = "RELEASED"
+        var rawStage = form.stage()
+        if (rawStage != null) {
+            stage = GameCriteria.stage(rawStage)
+        }
+        var distribution = "FREE"
+        var rawDistribution = form.distribution()
+        if (rawDistribution != null) {
+            distribution = GameCriteria.distribution(rawDistribution)
+        }
+        var price = 0
+        var rawPrice = form.priceCoins()
+        if (rawPrice != null) {
+            price = GameRules.clamp(rawPrice, 0, 2147483647)
+        }
+        var aspect = "WIDESCREEN"
+        var rawAspect = form.aspect()
+        if (rawAspect != null) {
+            aspect = GameCriteria.aspect(rawAspect)
+        }
+        var website = SafeUrl.requireHttpUrl(form.websiteUrl(), "site")
+        var support = SafeUrl.requireHttpUrl(form.supportUrl(), "suporte")
+        var media = Nulls.str()
+        var rawMedia = form.mediaIds()
+        if (rawMedia != null) {
+            media = GamesStore.joinCsv(rawMedia)
+        }
+        return GameDetailsInput(form.shortDescription(), form.genres(), form.languages(), form.controls(), form.requirements(), form.contentWarnings(), stage, distribution, price, aspect, form.version(), website, support, media, GameRules.trimOrNull(form.icon()), GameRules.trimOrNull(form.banner()), GameRules.trimOrNull(form.bannerHtml()))
+    }
+    // The game leaves the store (owner only): record, updates, favorites and history go with it.
+    static String remove(games: GamesService) {
+        var userId = Auth.requireUser()
+        var id = Req.pathParam("gameId")
+        games.remove(id, userId)
+        return json.encode(GameStatusView(id, "DELETED"))
+    }
+    static String resubmit(games: GamesService) {
+        var userId = Auth.requireUser()
+        return GamesRoutes.statusBody(games.resubmit(Req.pathParam("gameId"), userId))
+    }
+    // The identity of the game: the opaque token (15 min, single use) + the stable pseudonym. Session required.
+    static String identity(identities: GamesIdentity) {
+        var userId = Auth.requireUser()
+        var gameId = Req.pathParam("gameId")
+        var issued = identities.mint(userId, gameId)
+        return json.encode(GameIdentityView(issued.token(), issued.expiresAt(), identities.playerRef(userId, gameId)))
+    }
+    // The GAME's server exchanges the token for the pseudonymous identity (single use). Public.
+    static String validateToken(identities: GamesIdentity) {
+        var form = GamesRoutes.tokenBody()
+        var found = identities.validate(form.token())
+        return json.encode(GameValidatedView(found.gameId(), found.playerRef()))
+    }
+    // Spending faisca inside the game: the game ASKS, the person CONFIRMS on the platform and this endpoint
+    // (the player's session) debits. The game never authenticates.
+    static String spend(games: GamesService) {
+        var userId = Auth.requireUser()
+        var form = GamesRoutes.spendBody()
+        games.spendInGame(userId, Req.pathParam("gameId"), form.amount(), form.motivo(), form.requestId())
+        return json.encode(GameSpendView("DEBITED", form.requestId() as String))
+    }
+    static String share(games: GamesService) {
+        var userId = Auth.requireUser()
+        var form = GamesRoutes.shareBody()
+        return json.encode(GameSharedView(games.compartilhar(userId, Req.pathParam("gameId"), form.texto(), form.mediaIds()), "SHARED"))
+    }
+    // Paid boost (G2): the creator boosts their own game for 7 days (5 faiscas).
+    static String boost(games: GamesService) {
+        var userId = Auth.requireUser()
+        var boosted = games.boost(Req.pathParam("gameId"), userId)
+        return json.encode(GameBoostView(boosted.id(), GameRules.isFuture(boosted.boostUntil(), Time.nowIso())))
+    }
+    static String createCollection(games: GamesService) {
+        var userId = Auth.requireAdmin()
+        var form = GamesRoutes.collectionBody()
+        var created = games.createCollection(userId, form.title(), form.description(), form.gameIds())
+        return json.encode(GameStatusView(created.id(), created.status()))
+    }
+    static String hideCollection(games: GamesService) {
+        var userId = Auth.requireAdmin()
+        var hidden = games.hideCollection(Req.pathParam("collectionId"), userId)
+        return json.encode(GameStatusView(hidden.id(), hidden.status()))
+    }
+    // ---- reviews and comments ----
+    static String review(social: GamesSocial) {
+        var userId = Auth.requireUser()
+        var form = GamesRoutes.ratingBody()
+        var rating = 0
+        var given = form.rating()
+        if (given != null) {
+            rating = given
+        }
+        return json.encode(social.review(Req.pathParam("gameId"), userId, rating, form.body()))
+    }
+    static String deleteReview(social: GamesSocial) {
+        var userId = Auth.requireUser()
+        social.deleteReview(Req.pathParam("gameId"), userId)
+        return status(204, "")
+    }
+    static String comment(social: GamesSocial) {
+        var userId = Auth.requireUser()
+        var form = GamesRoutes.commentBody()
+        return json.encode(social.comment(Req.pathParam("gameId"), userId, form.body()))
+    }
+    static String deleteComment(social: GamesSocial) {
+        var userId = Auth.requireUser()
+        social.deleteComment(Req.pathParam("gameId"), Req.pathParam("commentId"), userId)
+        return status(204, "")
+    }
+    // ---- moderation ----
+    static String approve(games: GamesService) {
+        var userId = Auth.requireAdmin()
+        return GamesRoutes.statusBody(games.approve(Req.pathParam("gameId"), userId, GamesRoutes.optionalNote()))
+    }
+    static String reject(games: GamesService) {
+        var userId = Auth.requireAdmin()
+        return GamesRoutes.statusBody(games.reject(Req.pathParam("gameId"), userId, GamesRoutes.optionalNote()))
+    }
+    static String suspend(games: GamesService) {
+        var userId = Auth.requireAdmin()
+        return GamesRoutes.statusBody(games.suspend(Req.pathParam("gameId"), userId, GamesRoutes.optionalNote()))
+    }
+    static String unsuspend(games: GamesService) {
+        var userId = Auth.requireAdmin()
+        return GamesRoutes.statusBody(games.unsuspend(Req.pathParam("gameId"), userId))
+    }
+    static GameCollectionBody collectionBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<GameCollectionBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static GameCommentBody commentBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<GameCommentBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static GameDeveloperBody developerBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<GameDeveloperBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static GameEditBody editBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<GameEditBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static GameRatingBody ratingBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<GameRatingBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static GameShareBody shareBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<GameShareBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static GameSpendBody spendBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<GameSpendBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static GameSubmitBody submitBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<GameSubmitBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static GameTokenBody tokenBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<GameTokenBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static GameUpdateBody updateBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<GameUpdateBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String statusBody(game: GameRecord) = json.encode(GameStatusView(game.id(), game.status()))
+    // `@RequestBody(required = false)`: no body means no note.
+    static String? optionalNote() {
+        if (Req.bodyText().trim().length() == 0) {
+            return null
+        }
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<GameReviewNoteBody>(Req.bodyText()).note()
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

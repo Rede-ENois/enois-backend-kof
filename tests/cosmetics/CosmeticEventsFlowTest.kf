@@ -1,0 +1,128 @@
+import cosmetics.*
+import economy.*
+import kernel.*
+import kernel.testkit.*
+import profile.*
+
+// Port of CosmeticEventsFlowTests: the free events of 2026-10-31, the Saci x Halloween duel and the Saci hunt.
+TestApp eventsApp() {
+    var app = CosmeticsTestKit.app("cosmeticevents", mapOf<String, String>())
+    CosmeticsTestKit.clockAt(CosmeticsTestKit.duelDay())
+    return app
+}
+
+TestResponse choose(user: ProfileCaller, choice: String) = user.post("/eventos/saci-halloween/escolha", "{\"choice\":\"" + choice + "\"}")
+
+Long votes(res: TestResponse, team: String) = CosmeticsTestKit.text(res, "counts." + team).toLong()
+
+Bool owns(userId: String, itemId: String) = CosmeticsTestKit.shop().owns(userId, itemId)
+
+test "the duel takes one choice per person and grants the team badge" {
+    var app = eventsApp()
+    var guest = ProfileTestApp.anonymous(app)
+    var open = guest.get("/eventos/saci-halloween")
+    Check.status(open, 200)
+    Check.jsonEq(open, "active", "true")
+    Check.jsonEq(open, "startsAt", "2026-10-31T03:00:00Z")
+    Check.jsonEq(open, "endsAt", "2026-11-01T02:59:59Z")
+    Check.isTrue("saci count", open.jsonStr("counts.saci") != null)
+    Check.isTrue("halloween count", open.jsonStr("counts.halloween") != null)
+    Check.isTrue("no choice yet", open.jsonStr("myChoice") == null)
+    Check.isTrue("no winner yet", open.jsonStr("winner") == null)
+    var fan = ProfileTestApp.login(app, "duel-saci-fan")
+    var before = votes(guest.get("/eventos/saci-halloween"), "saci")
+    var chosen = choose(fan, "saci")
+    Check.status(chosen, 200)
+    Check.jsonEq(chosen, "myChoice", "saci")
+    Check.eqStr("one more saci vote", "" + (before + 1L), "" + votes(chosen, "saci"))
+    Check.isTrue("owns the saci badge", owns("duel-saci-fan", "emblema-time-saci"))
+    Check.isTrue("does not own the halloween badge", !owns("duel-saci-fan", "emblema-time-halloween"))
+    Check.apiError(choose(fan, "halloween"), 409, "ALREADY_CHOSEN")
+    Check.jsonEq(fan.get("/eventos/saci-halloween"), "myChoice", "saci")
+    var invalid = ProfileTestApp.login(app, "duel-invalid")
+    Check.apiError(choose(invalid, "curupira"), 400, "INVALID_CHOICE")
+    Check.apiError(invalid.post("/eventos/saci-halloween/escolha", "{}"), 400, "INVALID_CHOICE")
+    Check.status(ProfileTestApp.anonymous(app).post("/eventos/saci-halloween/escolha", "{\"choice\":\"saci\"}"), 401)
+    // The team badge is owned like any badge: it shows in the shop and can be equipped.
+    Check.status(fan.post("/loja/emblema-time-saci/equipar", ""), 200)
+}
+
+test "after the end the duel is closed and the winning team gets the victory badge" {
+    var app = eventsApp()
+    var guest = ProfileTestApp.anonymous(app)
+    var saci = ProfileTestApp.login(app, "duel-winner-saci")
+    var saci2 = ProfileTestApp.login(app, "duel-winner-saci2")
+    var halloween = ProfileTestApp.login(app, "duel-winner-halloween")
+    Check.status(choose(saci, "saci"), 200)
+    Check.status(choose(saci2, "saci"), 200)
+    Check.status(choose(halloween, "halloween"), 200)
+    CosmeticsTestKit.clockAt(CosmeticsTestKit.afterEvents())
+    var late = ProfileTestApp.login(app, "duel-late")
+    Check.apiError(choose(late, "halloween"), 409, "EVENT_CLOSED")
+    var duel = guest.get("/eventos/saci-halloween")
+    Check.status(duel, 200)
+    Check.jsonEq(duel, "active", "false")
+    var saciVotes = votes(duel, "saci")
+    var halloweenVotes = votes(duel, "halloween")
+    var winner = duel.jsonStr("winner")
+    if (saciVotes == halloweenVotes) {
+        Check.isTrue("a tie has no single winner", winner == null)
+    }
+    else 
+        if (saciVotes > halloweenVotes) {
+            Check.eqStr("winner", "saci", "" + winner)
+        }
+        else {
+            Check.eqStr("winner", "halloween", "" + winner)
+        }
+    Check.isTrue("saci victory badge", owns("duel-winner-saci", "emblema-vitoria-saci") == (saciVotes >= halloweenVotes))
+    Check.isTrue("halloween victory badge", owns("duel-winner-halloween", "emblema-vitoria-halloween") == (halloweenVotes >= saciVotes))
+    Check.isTrue("no cross badge", !owns("duel-winner-saci", "emblema-vitoria-halloween"))
+    // Reading again is idempotent.
+    Check.status(guest.get("/eventos/saci-halloween"), 200)
+    Check.isTrue("saci2 victory badge", owns("duel-winner-saci2", "emblema-vitoria-saci") == (saciVotes >= halloweenVotes))
+}
+
+test "the hunt counts spots once and the seventh grants the badge" {
+    var app = eventsApp()
+    var hunter = ProfileTestApp.login(app, "hunt-hunter")
+    var start = hunter.get("/eventos/caca-saci")
+    Check.status(start, 200)
+    Check.jsonEq(start, "active", "true")
+    Check.jsonEq(start, "spots", "7")
+    Check.eqInt("nothing found", 0, start.jsonSize("found"))
+    Check.jsonEq(start, "completed", "false")
+    for (var spot in listOf("feed", "vagas", "comunidades", "blog", "carteira", "mensagens")) {
+        var res = hunter.post("/eventos/caca-saci/achados/" + spot, "")
+        Check.status(res, 200)
+        Check.jsonEq(res, "completed", "false")
+    }
+    var again = hunter.post("/eventos/caca-saci/achados/feed", "")
+    Check.status(again, 200)
+    Check.eqInt("a repeat changes nothing", 6, again.jsonSize("found"))
+    Check.apiError(hunter.post("/eventos/caca-saci/achados/porao", ""), 404, "SPOT_NOT_FOUND")
+    Check.isTrue("not yet", !owns("hunt-hunter", "emblema-achei-saci"))
+    var last = hunter.post("/eventos/caca-saci/achados/perfil", "")
+    Check.status(last, 200)
+    Check.eqInt("seven found", 7, last.jsonSize("found"))
+    Check.jsonEq(last, "found.6", "perfil")
+    Check.jsonEq(last, "completed", "true")
+    Check.isTrue("the hunt badge", owns("hunt-hunter", "emblema-achei-saci"))
+    Check.apiError(hunter.post("/loja/emblema-achei-saci/comprar", ""), 403, "NOT_FOR_SALE")
+    // A guest sees no progress.
+    Check.eqInt("guest found", 0, ProfileTestApp.anonymous(app).get("/eventos/caca-saci").jsonSize("found"))
+    CosmeticsTestKit.clockAt(CosmeticsTestKit.afterEvents())
+    Check.apiError(hunter.post("/eventos/caca-saci/achados/feed", ""), 409, "EVENT_CLOSED")
+}
+
+test "two clicks at once on the same team keep one choice" {
+    var app = eventsApp()
+    var user = ProfileTestApp.login(app, "duel-double-click")
+    var first = choose(user, "halloween")
+    var second = choose(user, "saci")
+    Check.status(first, 200)
+    Check.apiError(second, 409, "ALREADY_CHOSEN")
+    Check.jsonEq(user.get("/eventos/saci-halloween"), "myChoice", "halloween")
+    Check.isTrue("one team badge", owns("duel-double-click", "emblema-time-halloween") && !owns("duel-double-click", "emblema-time-saci"))
+    CosmeticsTestKit.finish()
+}

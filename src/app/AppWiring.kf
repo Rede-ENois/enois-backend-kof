@@ -34,6 +34,12 @@ import media.*
 import jobs.*
 import importlinkedin.*
 import importresume.*
+import games.*
+import dailygames.*
+import coin.*
+import cosmetics.*
+import marketplace.*
+import services.*
 
 // The production composition: every domain module installed on a created platform, in dependency order.
 // Main.kf and tests/integration/BootRoutesTest.kf both call it, so a test boots the exact production wiring.
@@ -58,7 +64,9 @@ class AppWiring {
         // docs/PORTING_STATUS.md.
         // profile, network, preferences, presence (seams: ProfileModule.installWith). Before identity: the job
         // eligibility rule of identity reads the live reputation of the profile domain.
-        var profiles = ProfileModule.install(platform, shared, hooks)
+        // The cosmetics core (catalog + badge ownership) comes first: profile asks it who owns an emblem.
+        var cosmeticsCore = CosmeticsCore.create(platform)
+        var profiles = ProfileModule.installWith(platform, shared, ProfileNotifier(platform.db), cosmeticsCore.badges, ProfileParentalLinks(platform.db), ProfileForeignCounts(platform.db), PreferencesThemeGallery(platform.db))
         var jobSeams = JobSeamSet(platform, profiles)
         var identitySeams = IdentitySeams.defaults(platform, mail)
         identitySeams.reputations = JobsIdentityReputation(jobSeams.reputation)
@@ -67,20 +75,33 @@ class AppWiring {
         OnboardingModule.install(platform, age.policy)
         FeedModule.install(platform, shared, hooks)
         // Domains (one block each, ordered by dependency): notifications is the sink the others write to.
-        var notificationsModule = NotificationsModule.install(platform, shared, hooks, parts, mail)
+        // economy (coin): the ledger service is built first because the domains below call it (presence, rewards);
+        // the routes, the disputes and the jobs come after notifications (CoinModule.install).
+        var coinCore = CoinCore.create(platform, shared, parts)
+        var notificationSeams = NotificationsSeams(platform, mail)
+        notificationSeams.coins = CoinNotificationCoins(coinCore.service)
+        var notificationsModule = NotificationsModule.installWith(platform, shared, notificationSeams)
+        var coinModule = CoinModule.install(platform, shared, parts, coinCore, profiles, notificationsModule)
+        CosmeticsModule.install(platform, cosmeticsCore, coinModule, profiles)
         PushModule.install(platform, shared, hooks, parts, notificationsModule)
-        var messagingModule = MessagingModule.install(platform, shared, hooks, parts, notificationsModule)
+        var messagingSeams = MessagingSeamSet(platform)
+        messagingSeams.coins = CoinMessagingCoins(coinCore.service)
+        var messagingModule = MessagingModule.installWith(platform, shared, parts, notificationsModule, messagingSeams)
         CallsModule.install(platform, shared, hooks, parts, notificationsModule, messagingModule)
         // Groups notices go through the Notifications API (push + preferences): see GroupNotificationsBridge.
-        GroupsModule.installWith(platform, shared, GroupProfileLookup(platform.db), GroupAgeGate(platform.db), GroupMediaLookup(platform.db), GroupNotificationsBridge(platform.db, notificationsModule.notifications), GroupCoins())
+        GroupsModule.installWith(platform, shared, GroupProfileLookup(platform.db), GroupAgeGate(platform.db), GroupMediaLookup(platform.db), GroupNotificationsBridge(platform.db, notificationsModule.notifications), CoinGroupCoins(coinCore.service))
         // Jobs: postings, applications (delivery by message and email), company directory, external listings and
         // their refresh job. Seams: JobSeamSet (reputation, companies, corporate, source transport).
         var jobs = JobsModule.installWith(platform, shared, parts, profiles, notificationsModule, messagingModule, identity.mailer, jobSeams)
         // LinkedIn import (profile text, contacts and their automatic invites) and resume import (prefill of an
-        // application). The file uploads of both wait for POST multipart support in the binary lane.
+        // application). The four file uploads are multipart POSTs claimed in the binary lane.
         var linkedinImport = LinkedinImportModule.install(platform, shared, profiles)
-        ImportResumeModule.install(jobs, linkedinImport)
-        CommunitiesModule.install(platform, shared, hooks)
+        ImportResumeModule.install(platform, jobs, linkedinImport)
+        // Games: the aggregator (profile, notifications and age gate through their APIs; coin and feed through
+        // the seams GamesCoins and GamesFeed) and the daily games with their 00:20 prize job.
+        var gamesModule = GamesModule.install(platform, shared, hooks, profiles, notificationsModule, age.gate)
+        DailyGamesModule.install(platform, shared, notificationsModule, gamesModule.coins)
+        CommunitiesModule.installWith(platform, shared, hooks, CommunityProfileLookup(platform.db), CommunityFeedLookup(platform.db), CoinCommunityCoins(coinCore.service))
         CommunityProjectsModule.install(platform, shared, hooks)
         StudyPairsModule.install(platform, shared, hooks)
         GifsModule.install(platform, shared, hooks)
@@ -92,10 +113,13 @@ class AppWiring {
         NoticeModule.install(platform, shared, hooks)
         ReleaseNoteModule.install(platform, shared, hooks)
         SearchModule.install(platform, shared, hooks)
-        ThemeModule.install(platform, shared, hooks)
+        var themeModule = ThemeModule.install(platform, shared, hooks)
         ProjectsModule.install(platform, shared, hooks)
         SuggestionsModule.install(platform, shared, hooks)
-        BlogModule.install(platform, shared, hooks, mail)
+        BlogModule.withSeams(platform, shared, BlogProfiles(platform.db), BlogFeedPointers(), BlogNotifier(), CoinBlogCoins(coinCore.service), BlogEmailSender(mail))
+        // economy: the marketplace (escrow, workers) and the services directory/contracts sit on the coin service.
+        MarketplaceModule.install(platform, shared, coinModule, profiles, themeModule)
+        ServicesModule.install(platform, shared, coinModule, profiles, messagingModule)
         return shared
     }
 }

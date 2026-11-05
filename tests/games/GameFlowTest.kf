@@ -1,0 +1,93 @@
+import games.*
+import kernel.testkit.*
+
+// Port of GameFlowTests: submit -> review queue -> publish or reject, and who sees what meanwhile.
+String gflowBody(title: String, url: String) = "{\"title\":\"" + title + "\",\"url\":\"" + url + "\"}"
+
+test "submit, review and publish flow" {
+    var creator = GamesTestKit.login("gflow-creator")
+    var admin = GamesTestKit.loginAdmin("gflow-admin")
+    // An http link is refused.
+    Check.apiError(GamesTestKit.send("POST", "/games", GamesTestKit.auth(creator), gflowBody("Kawaii Survivors", "http://meusite.com/kawaii")), 400, "INVALID_GAME_URL")
+    // A valid submission is SUBMITTED.
+    var submitted = GamesTestKit.send("POST", "/games", GamesTestKit.auth(creator), "{\"title\":\"Kawaii Survivors\",\"url\":\"https://aminadojava.itch.io/kawaii-survivors\",\"description\":\"Survivor fofo com pixel art.\",\"tags\":\"arcade,pixel\"}")
+    Check.status(submitted, 200)
+    Check.jsonEq(submitted, "status", "SUBMITTED")
+    Check.jsonEq(submitted, "slug", "kawaii-survivors")
+    var gameId = submitted.json("id")
+    // The public catalogue does NOT show it yet (not published).
+    var before = GamesTestKit.get("/games?limit=48", listOf<String>())
+    Check.status(before, 200)
+    Check.eqInt("not in the catalogue", -1, GamesTestKit.indexOf(before, "items", "id", gameId))
+    // The creator sees their own game in any state.
+    var mine = GamesTestKit.get("/me/games", GamesTestKit.auth(creator))
+    Check.status(mine, 200)
+    var at = GamesTestKit.indexOf(mine, "", "id", gameId)
+    Check.isTrue("owned game listed", at >= 0)
+    Check.jsonEq(mine, at + ".status", "SUBMITTED")
+    Check.jsonEq(mine, at + ".owned", "true")
+    // Moderation approves.
+    var approved = GamesTestKit.send("POST", "/admin/games/" + gameId + "/approve", GamesTestKit.auth(admin), "{\"note\":\"carrega e roda\"}")
+    Check.status(approved, 200)
+    Check.jsonEq(approved, "status", "PUBLISHED")
+    Check.jsonEq(approved, "id", gameId)
+    // Now it shows in the catalogue and on the creator page.
+    var after = GamesTestKit.get("/games?limit=48", listOf<String>())
+    var inCatalogue = GamesTestKit.indexOf(after, "items", "id", gameId)
+    Check.isTrue("in the catalogue", inCatalogue >= 0)
+    Check.jsonEq(after, "items." + inCatalogue + ".status", "PUBLISHED")
+    var page = GamesTestKit.get("/games/gflow-creator", listOf<String>())
+    Check.status(page, 200)
+    var onPage = GamesTestKit.indexOf(page, "", "id", gameId)
+    Check.isTrue("on the creator list", onPage >= 0)
+    Check.jsonEq(page, onPage + ".url", "https://aminadojava.itch.io/kawaii-survivors")
+    // Approving twice is 409.
+    Check.apiError(GamesTestKit.send("POST", "/admin/games/" + gameId + "/approve", GamesTestKit.auth(admin), "{}"), 409, "NOT_SUBMITTED")
+}
+
+test "reject requires a note and the creator sees the reason" {
+    var creator = GamesTestKit.login("gflow-creator2")
+    var admin = GamesTestKit.loginAdmin("gflow-admin")
+    var gameId = GamesTestKit.submit(creator, "Jogo Incompleto", "https://meusite.com/jogo-incompleto")
+    // A rejection with no reason refuses the rejection itself: no body and an empty body.
+    Check.status(GamesTestKit.send("POST", "/admin/games/" + gameId + "/reject", listOf("X-Session-Token: " + admin), ""), 400)
+    Check.apiError(GamesTestKit.send("POST", "/admin/games/" + gameId + "/reject", GamesTestKit.auth(admin), "{}"), 400, "REVIEW_NOTE_REQUIRED")
+    var rejected = GamesTestKit.send("POST", "/admin/games/" + gameId + "/reject", GamesTestKit.auth(admin), "{\"note\":\"O link não abre o jogo.\"}")
+    Check.status(rejected, 200)
+    Check.jsonEq(rejected, "status", "REJECTED")
+    // The creator sees the reason on their own game.
+    var mine = GamesTestKit.get("/me/games", GamesTestKit.auth(creator))
+    var at = GamesTestKit.indexOf(mine, "", "id", gameId)
+    Check.isTrue("listed", at >= 0)
+    Check.jsonEq(mine, at + ".reviewNote", "O link não abre o jogo.")
+    // A rejected game goes back to the queue through resubmit, only for its owner.
+    Check.apiError(GamesTestKit.send("POST", "/games/" + gameId + "/resubmit", GamesTestKit.auth(admin), ""), 403, "NOT_AUTHORIZED")
+    var again = GamesTestKit.send("POST", "/games/" + gameId + "/resubmit", GamesTestKit.auth(creator), "")
+    Check.status(again, 200)
+    Check.jsonEq(again, "status", "SUBMITTED")
+    Check.apiError(GamesTestKit.send("POST", "/games/" + gameId + "/resubmit", GamesTestKit.auth(creator), ""), 409, "NOT_REJECTED")
+}
+
+test "anonymous can browse the catalogue but not submit" {
+    Check.status(GamesTestKit.get("/games?limit=5", listOf<String>()), 200)
+    Check.apiError(GamesTestKit.anonymous("POST", "/games", "{\"title\":\"Anônimo\",\"url\":\"https://x.com\"}"), 401, "UNAUTHENTICATED")
+}
+
+// An EMPTY creator page is not developer presence: the owner sees their own page (the panel route) but
+// nobody else does, and saving in blank does not open the page to others.
+test "an empty developer page is only visible to its owner" {
+    var owner = GamesTestKit.login("gflow-empty-dev")
+    var other = GamesTestKit.login("gflow-other-viewer")
+    Check.status(GamesTestKit.get("/games/gflow-empty-dev/profile", GamesTestKit.auth(owner)), 200)
+    Check.apiError(GamesTestKit.get("/games/gflow-empty-dev/profile", GamesTestKit.auth(other)), 404, "DEVELOPER_NOT_FOUND")
+    Check.apiError(GamesTestKit.get("/games/gflow-empty-dev/profile", listOf<String>()), 404, "DEVELOPER_NOT_FOUND")
+    // Saving in blank creates the row but does not count as content.
+    Check.status(GamesTestKit.send("PUT", "/games/profile", GamesTestKit.auth(owner), "{}"), 200)
+    Check.apiError(GamesTestKit.get("/games/gflow-empty-dev/profile", GamesTestKit.auth(other)), 404, "DEVELOPER_NOT_FOUND")
+    // With content the page exists for everybody.
+    Check.status(GamesTestKit.send("PUT", "/games/profile", GamesTestKit.auth(owner), "{\"displayName\":\"Estúdio Kawaii\"}"), 200)
+    var visible = GamesTestKit.get("/games/gflow-empty-dev/profile", GamesTestKit.auth(other))
+    Check.status(visible, 200)
+    Check.jsonEq(visible, "displayName", "Estúdio Kawaii")
+    GamesTestKit.finish()
+}

@@ -1,0 +1,50 @@
+package games
+
+import age.*
+import kernel.*
+import kernel.security.*
+import notifications.*
+import profile.*
+
+// Composition of the games domain (Énóis Games: the aggregator, the creator page, the library, the devlog,
+// reviews, collections, the game identity). Main.kf calls install once, after the profile, age and
+// notifications modules:
+//
+//   var games = GamesModule.install(platform, shared, hooks, profileModule, notificationsModule, age.gate)
+//
+// Called through their real APIs: ProfileDirectory (names, handles, avatars, badges), Notifications (the
+// follower notices) and AgeGate. Seams still pending (`installWith` takes the owner's subclass): GamesCoins
+// (coin), GamesFeed (feed), GamesHosts (DNS of the address guard).
+class GamesModule {
+    GamesService games
+    GamesCatalog catalog
+    GamesLibrary library
+    GamesSocial social
+    GamesDeveloper developers
+    GamesIdentity identities
+    GamesStore store
+    GamesCoins coins
+    public constructor(games: GamesService, catalog: GamesCatalog, library: GamesLibrary, social: GamesSocial, developers: GamesDeveloper, identities: GamesIdentity, store: GamesStore, coins: GamesCoins) {
+        this.games = games
+        this.catalog = catalog
+        this.library = library
+        this.social = social
+        this.developers = developers
+        this.identities = identities
+        this.store = store
+        this.coins = coins
+    }
+    static GamesModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks, profile: ProfileModule, notifications: NotificationsModule, ageGate: AgeGate) = GamesModule.installFull(platform, profile, notifications, GamesCoins(platform.db, shared.cipher), GamesFeed(platform.db, ageGate, shared.sanctionGate), GamesHosts())
+    static GamesModule installFull(platform: Platform, profile: ProfileModule, notifications: NotificationsModule, coins: GamesCoins, feed: GamesFeed, hosts: GamesHosts) = GamesModule.installWith(platform, profile.directory, notifications.notifications, coins, feed, hosts)
+    static GamesModule installWith(platform: Platform, directory: ProfileDirectory, notifications: Notifications, coins: GamesCoins, feed: GamesFeed, hosts: GamesHosts) {
+        var store = GamesStore(platform.db)
+        var games = GamesService(platform.db, store, GameUrlGuard(hosts), directory, notifications, coins, feed)
+        var catalog = GamesCatalog(store)
+        var library = GamesLibrary(store)
+        var social = GamesSocial(store, directory)
+        var developers = GamesDeveloper(store, directory)
+        var identities = GamesIdentity(store)
+        GamesRoutes.register(platform.server, games, catalog, library, social, developers, identities, directory)
+        return GamesModule(games, catalog, library, social, developers, identities, store, coins)
+    }
+}

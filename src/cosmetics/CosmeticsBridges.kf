@@ -1,0 +1,60 @@
+package cosmetics
+
+import coin.*
+import java.util.HashSet
+import kernel.db.*
+import profile.*
+
+// Official badges (`emblema-*` catalog ids): a person shows only the ones they own, and only if the id is a BADGE of the
+// catalog. Replaces the default seam of the profile domain (which cannot read the catalog, so any owned `emblema-` id
+// passed). Main.kf passes it to ProfileModule.installWith.
+class CosmeticsBadgeOwnership extends ProfileBadgeOwnership {
+    CosmeticCatalog catalog
+    CosmeticsStore cosmetics
+    public constructor(db: Db, catalog: CosmeticCatalog, cosmetics: CosmeticsStore) {
+        super(db)
+        this.catalog = catalog
+        this.cosmetics = cosmetics
+    }
+    Bool ownsAllOfficial(userId: String, badges: List<String>) {
+        var official = listOf<String>()
+        for (var b in badges) {
+            if (b.startsWith("emblema-")) {
+                official.add(b)
+            }
+        }
+        if (official.size() == 0) {
+            return true
+        }
+        var owned = cosmetics.ownedItemIds(userId)
+        for (var id in official) {
+            var item = catalog.item(id)
+            if (item == null) {
+                return false
+            }
+            if (item.kind() != "BADGE") {
+                return false
+            }
+            if (!owned.contains(id)) {
+                return false
+            }
+        }
+        return true
+    }
+}
+
+// Who has a contribution verified by GitHub (an active seal plus a linked GitHub account): the only people who may
+// choose the color of the "Contribuinte" tag. pending-port: contributions. The default reads the seal and identity
+// tables like VerifiedContributorReaderAdapter; the contributions domain extends it and overrides isVerified.
+class CosmeticsContributors {
+    Db store
+    public constructor(db: Db) {
+        this.store = db
+    }
+    Bool isVerified(userId: String) {
+        if (store.queryLong("select count(*) from user_seals where user_id = ? and status = \'ACTIVE\'", DbParams().bindStr(userId)) == 0L) {
+            return false
+        }
+        return store.queryLong("select count(*) from github_identities where user_id = ?", DbParams().bindStr(userId)) > 0L
+    }
+}

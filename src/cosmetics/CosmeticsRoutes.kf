@@ -1,0 +1,247 @@
+package cosmetics
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.text.*
+import kernel.url.*
+import profile.*
+
+// HTTP adapter of the cosmetics domain: the shop (CosmeticsController), the free events (CosmeticEventsController) and
+// the community cosmetics (CommunityCosmeticsController). The reads that are public take the session only when there is
+// one: a token that does not resolve is a 401, never an anonymous read.
+class CosmeticsRoutes {
+    static register(server: HttpServer, shop: CosmeticsService, events: CosmeticEventService, community: CommunityCosmeticsService) {
+        server.get("/loja", () -> CosmeticsRoutes.shopList(shop))
+        server.get("/loja/colecoes", () -> CosmeticsRoutes.collections(shop))
+        server.post("/loja/:itemId/comprar", () -> CosmeticsRoutes.buy(shop))
+        server.post("/loja/looks/:lookId/comprar", () -> CosmeticsRoutes.buyLook(shop))
+        server.post("/loja/looks/:lookId/equipar", () -> CosmeticsRoutes.equipLook(shop))
+        server.post("/loja/looks/:lookId/desequipar", () -> CosmeticsRoutes.unequipLook(shop))
+        server.post("/loja/:itemId/equipar", () -> CosmeticsRoutes.equip(shop))
+        server.post("/loja/:itemId/desequipar", () -> CosmeticsRoutes.unequip(shop))
+        server.put("/me/status", () -> CosmeticsRoutes.updateStatus(shop))
+        server.get("/eventos/saci-halloween", () -> json.encode(events.duel(CosmeticsRoutes.viewer())))
+        server.post("/eventos/saci-halloween/escolha", () -> CosmeticsRoutes.choose(events))
+        server.get("/eventos/caca-saci", () -> json.encode(events.hunt(CosmeticsRoutes.viewer())))
+        server.post("/eventos/caca-saci/achados/:spot", () -> json.encode(events.find(Auth.requireUser(), Req.pathParam("spot"))))
+        server.get("/cosmetics/catalog", () -> CosmeticsRoutes.communityCatalog(community))
+        server.get("/cosmetics/mine", () -> CosmeticsRoutes.mine(community))
+        server.post("/cosmetics/drafts", () -> CosmeticsRoutes.createDraft(community))
+        server.put("/cosmetics/profile/name-style", () -> CosmeticsRoutes.nameStyle(community))
+        server.put("/cosmetics/profile/contributor-tag", () -> CosmeticsRoutes.contributorTag(community))
+        server.get("/cosmetics/:id", () -> json.encode(CosmeticsRoutes.view(community.getPublished(Req.pathParam("id")))))
+        server.patch("/cosmetics/:id", () -> CosmeticsRoutes.updateCommunity(community))
+        server.post("/cosmetics/:id/submit", () -> CosmeticsRoutes.submit(community))
+        server.post("/cosmetics/:id/report", () -> CosmeticsRoutes.report(community))
+    }
+    // The viewer of a public read: none without a session token, the user when there is one (an invalid one is a 401).
+    static String? viewer() {
+        var token = Auth.sessionToken()
+        if (token == null) {
+            return null
+        }
+        return Auth.requireUser()
+    }
+    // ---- shop
+    static String shopList(shop: CosmeticsService) {
+        var me = CosmeticsRoutes.viewer()
+        var order = Req.queryStr("order", "oldest")
+        var guests = listOf<ShopItemGuestView>()
+        var viewers = listOf<ShopItemView>()
+        for (var row in shop.onSaleNow(me, order)) {
+            var item = row.item()
+            if (row.viewer()) {
+                viewers.add(ShopItemView(item.id(), item.kind(), item.collection(), item.name(), item.description(), item.priceMf(), item.cssRing(), item.releaseOrder(), row.available(), item.purchasable(), row.owned(), row.equipped()))
+            }
+            else {
+                guests.add(ShopItemGuestView(item.id(), item.kind(), item.collection(), item.name(), item.description(), item.priceMf(), item.cssRing(), item.releaseOrder(), row.available(), item.purchasable()))
+            }
+        }
+        if (me == null) {
+            return json.encode(guests)
+        }
+        return json.encode(viewers)
+    }
+    static String collections(shop: CosmeticsService) {
+        var me = CosmeticsRoutes.viewer()
+        var guests = listOf<CollectionGuestView>()
+        var viewers = listOf<CollectionView>()
+        for (var row in shop.collectionsInSeason(me)) {
+            var c = row.collection()
+            var windows = listOf<ShopWindowView>()
+            for (var w in c.windows) {
+                windows.add(ShopWindowView(w.startText(), w.endText()))
+            }
+            var guestLooks = listOf<LookGuestView>()
+            var viewerLooks = listOf<LookView>()
+            for (var l in row.looks()) {
+                var look = l.look()
+                if (l.viewer()) {
+                    viewerLooks.add(LookView(look.id(), look.title(), look.items(), look.statusIcon(), look.statusText(), l.owned(), l.equipped()))
+                }
+                else {
+                    guestLooks.add(LookGuestView(look.id(), look.title(), look.items(), look.statusIcon(), look.statusText()))
+                }
+            }
+            if (me == null) {
+                guests.add(CollectionGuestView(c.id, c.name, row.available(), windows, guestLooks))
+            }
+            else {
+                viewers.add(CollectionView(c.id, c.name, row.available(), windows, viewerLooks))
+            }
+        }
+        if (me == null) {
+            return json.encode(guests)
+        }
+        return json.encode(viewers)
+    }
+    static String buy(shop: CosmeticsService) {
+        var userId = Auth.requireUser()
+        var item = shop.buy(userId, Req.pathParam("itemId"))
+        return json.encode(OwnedView(item.id(), true))
+    }
+    // Buys the missing pieces of a look (25% cheaper) and wears the whole look.
+    static String buyLook(shop: CosmeticsService) {
+        var userId = Auth.requireUser()
+        return json.encode(shop.buyLook(userId, Req.pathParam("lookId")))
+    }
+    static String equipLook(shop: CosmeticsService) {
+        var userId = Auth.requireUser()
+        var lookId = Req.pathParam("lookId")
+        shop.equipLook(userId, lookId)
+        return json.encode(EquippedView(lookId, true))
+    }
+    static String unequipLook(shop: CosmeticsService) {
+        var userId = Auth.requireUser()
+        var lookId = Req.pathParam("lookId")
+        shop.unequipLook(userId, lookId)
+        return json.encode(EquippedView(lookId, false))
+    }
+    static String equip(shop: CosmeticsService) {
+        var userId = Auth.requireUser()
+        var itemId = Req.pathParam("itemId")
+        shop.equip(userId, itemId)
+        return json.encode(EquippedView(itemId, itemId != "none"))
+    }
+    static String unequip(shop: CosmeticsService) {
+        var userId = Auth.requireUser()
+        var itemId = Req.pathParam("itemId")
+        shop.unequip(userId, itemId)
+        return json.encode(EquippedView(itemId, false))
+    }
+    static StatusBody statusBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<StatusBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    // The profile note: short text and a badge icon the person has (or a free one).
+    static String updateStatus(shop: CosmeticsService) {
+        var userId = Auth.requireUser()
+        var body = CosmeticsRoutes.statusBody()
+        return json.encode(ProfileViews.publicView(shop.updateStatus(userId, body.text(), body.icon()), null, null, false))
+    }
+    // ---- events
+    static ChoiceBody choiceBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ChoiceBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String choose(events: CosmeticEventService) {
+        var userId = Auth.requireUser()
+        var body = CosmeticsRoutes.choiceBody()
+        return json.encode(events.choose(userId, body.choice()))
+    }
+    // ---- community cosmetics
+    static CommunityCosmeticView view(c: CommunityCosmetic) {
+        var description = ""
+        var given = c.description()
+        if (given != null) {
+            description = given
+        }
+        return CommunityCosmeticView(c.id(), c.creatorId(), c.kind(), c.name(), description, c.manifestJson(), c.license(), c.status(), c.version(), c.reported(), c.createdAt(), c.updatedAt())
+    }
+    static String views(list: List<CommunityCosmetic>) {
+        var out = listOf<CommunityCosmeticView>()
+        for (var c in list) {
+            out.add(CosmeticsRoutes.view(c))
+        }
+        return json.encode(out)
+    }
+    static String communityCatalog(community: CommunityCosmeticsService) = CosmeticsRoutes.views(community.catalog(Req.queryInt("limit", 60), Req.queryParam("kind")))
+    static String mine(community: CommunityCosmeticsService) {
+        var userId = Auth.requireUser()
+        return CosmeticsRoutes.views(community.mine(userId))
+    }
+    static CreateCosmeticBody createBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<CreateCosmeticBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static UpdateCosmeticBody updateBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<UpdateCosmeticBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static NameStyleBody nameStyleBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<NameStyleBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ContributorTagBody tagBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ContributorTagBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String createDraft(community: CommunityCosmeticsService) {
+        var userId = Auth.requireUser()
+        var body = CosmeticsRoutes.createBody()
+        return json.encode(CosmeticsRoutes.view(community.createDraft(userId, body.kind(), body.name(), body.description(), body.manifestJson(), body.license(), body.rightsConfirmed())))
+    }
+    static String updateCommunity(community: CommunityCosmeticsService) {
+        var userId = Auth.requireUser()
+        var id = Req.pathParam("id")
+        var body = CosmeticsRoutes.updateBody()
+        return json.encode(CosmeticsRoutes.view(community.update(id, userId, body.name(), body.description(), body.manifestJson(), body.license(), body.rightsConfirmed())))
+    }
+    static String submit(community: CommunityCosmeticsService) {
+        var userId = Auth.requireUser()
+        var submitted = community.submit(Req.pathParam("id"), userId)
+        return json.encode(CommunityCosmeticSubmitted(submitted.id(), submitted.status()))
+    }
+    static String report(community: CommunityCosmeticsService) {
+        Auth.requireUser()
+        community.report(Req.pathParam("id"))
+        return json.encode(CommunityCosmeticReported("REPORTED"))
+    }
+    static String nameStyle(community: CommunityCosmeticsService) {
+        var userId = Auth.requireUser()
+        var body = CosmeticsRoutes.nameStyleBody()
+        var p = community.updateNameStyle(userId, body.theme(), body.font(), body.color())
+        return json.encode(NameStyleView(p.nameTheme, p.nameFont, p.nameColor))
+    }
+    static String contributorTag(community: CommunityCosmeticsService) {
+        var userId = Auth.requireUser()
+        var body = CosmeticsRoutes.tagBody()
+        var p = community.updateContributorTagColor(userId, body.color())
+        return json.encode(ContributorTagView(p.contributorTagColor))
+    }
+}

@@ -1,0 +1,107 @@
+import coin.*
+import kernel.*
+import kernel.testkit.*
+
+// Port of CoinEconomyCalculatorTests (pure math, default parameters).
+CoinMetrics m(escrow: Long, p2p: Long, inflow: Long, issuance: Long, circulation: Long, treasury: Long) = CoinMetrics(escrow, p2p, inflow, issuance, circulation, treasury)
+
+test "a stalled economy drops one step" {
+    var p = CoinEconomyCalculator.defaults()
+    var result = CoinEconomyCalculator.evaluate(20000L, m(0L, 0L, 0L, 0L, 1000000L, 1000000L), p)
+    Check.eqStr("index", "0.0", "" + result.index())
+    Check.eqStr("suggestedMicros", "19800", "" + result.suggestedMicros())
+}
+
+test "at the floor the price does not drop further" {
+    var p = CoinEconomyCalculator.defaults()
+    var result = CoinEconomyCalculator.evaluate(1000L, m(0L, 0L, 0L, 10000000L, 1000000L, 1000000L), p)
+    Check.eqStr("suggestedMicros", "1000", "" + result.suggestedMicros())
+}
+
+test "usage above the target rises one step at most" {
+    var p = CoinEconomyCalculator.defaults()
+    var result = CoinEconomyCalculator.evaluate(10000L, m(200000L, 0L, 0L, 0L, 1000000L, 1000000L), p)
+    Check.eqStr("suggestedMicros", "10100", "" + result.suggestedMicros())
+}
+
+test "treasury inflow counts as turnover" {
+    var p = CoinEconomyCalculator.defaults()
+    var result = CoinEconomyCalculator.evaluate(20000L, m(0L, 0L, 50000L, 0L, 1000000L, 1000000L), p)
+    Check.eqStr("suggestedMicros", "20200", "" + result.suggestedMicros())
+}
+
+test "high issuance dilutes" {
+    var p = CoinEconomyCalculator.defaults()
+    var result = CoinEconomyCalculator.evaluate(20000L, m(50000L, 0L, 0L, 1000000L, 1000000L, 1000000L), p)
+    Check.eqStr("suggestedMicros", "19800", "" + result.suggestedMicros())
+}
+
+test "dust between accounts does not blow the calculation" {
+    var p = CoinEconomyCalculator.defaults()
+    var result = CoinEconomyCalculator.evaluate(10000L, m(10000000L, 0L, 0L, 0L, 1000000L, 1000000L), p)
+    Check.eqStr("effectiveUsage", "1000000", "" + result.effectiveUsage())
+    Check.eqStr("suggestedMicros", "10100", "" + result.suggestedMicros())
+}
+
+test "no circulation does not re-evaluate" {
+    var p = CoinEconomyCalculator.defaults()
+    var result = CoinEconomyCalculator.evaluate(12345L, m(500000L, 0L, 0L, 0L, 0L, 2000000L), p)
+    Check.eqStr("suggestedMicros", "12345", "" + result.suggestedMicros())
+}
+
+test "the full calculation does not depend on the last value" {
+    var p = CoinEconomyCalculator.defaults()
+    var result = CoinEconomyCalculator.absoluteEvaluate(10000L, m(200000L, 0L, 0L, 0L, 1000000L, 1000000L), p)
+    Check.eqStr("suggestedMicros", "50000", "" + result.suggestedMicros())
+}
+
+test "the full calculation ignores the maximum step" {
+    var p = CoinEconomyCalculator.defaults()
+    var result = CoinEconomyCalculator.absoluteEvaluate(50000L, m(200000L, 0L, 0L, 0L, 1000000L, 1000000L), p)
+    Check.eqStr("suggestedMicros", "250000", "" + result.suggestedMicros())
+}
+
+test "the full calculation respects the floor" {
+    var p = CoinEconomyCalculator.defaults()
+    var result = CoinEconomyCalculator.absoluteEvaluate(10000L, m(0L, 0L, 0L, 0L, 1000000L, 2000000L), p)
+    Check.eqStr("suggestedMicros", "1000", "" + result.suggestedMicros())
+}
+
+test "the scarcer treasury raises the value for the same turnover" {
+    var p = CoinEconomyCalculator.defaults()
+    var full = CoinEconomyCalculator.evaluate(10000L, m(50000L, 0L, 0L, 0L, 1000000L, 1500000L), p)
+    var empty = CoinEconomyCalculator.evaluate(10000L, m(50000L, 0L, 0L, 0L, 1000000L, 500000L), p)
+    Check.isTrue("scarcity", empty.scarcity() > full.scarcity())
+    Check.isTrue("index", empty.index() > full.index())
+}
+
+test "usage above the target raises the index above one" {
+    var p = CoinEconomyCalculator.defaults()
+    var result = CoinEconomyCalculator.evaluate(10000L, m(200000L, 0L, 0L, 0L, 1000000L, 1000000L), p)
+    Check.isTrue("index", result.index() > 1.0)
+    var inflow = CoinEconomyCalculator.evaluate(20000L, m(0L, 0L, 50000L, 0L, 1000000L, 1000000L), p)
+    Check.isTrue("inflow index", inflow.index() > 1.0)
+    var diluted = CoinEconomyCalculator.evaluate(20000L, m(50000L, 0L, 0L, 1000000L, 1000000L, 1000000L), p)
+    Check.isTrue("diluted index", diluted.index() < 1.0)
+}
+
+test "P2P weighs less than consumption" {
+    var p = CoinEconomyCalculator.defaults()
+    var p2pOnly = CoinEconomyCalculator.evaluate(10000L, m(0L, 200000L, 0L, 0L, 1000000L, 1000000L), p)
+    var escrowOnly = CoinEconomyCalculator.evaluate(10000L, m(200000L, 0L, 0L, 0L, 1000000L, 1000000L), p)
+    Check.isTrue("index", p2pOnly.index() < escrowOnly.index())
+}
+
+test "the price ceiling is respected" {
+    var ceiling = CoinEconomyCalculator.params(30, 0.05, 0.5, 1.0, 0.5, 0.25, 0.01, 1000L, 999900L)
+    var result = CoinEconomyCalculator.evaluate(999900L, m(10000000L, 0L, 0L, 0L, 1000000L, 1000000L), ceiling)
+    Check.eqStr("ceiling", "999900", "" + result.suggestedMicros())
+}
+
+test "the full calculation is repeatable with the same metrics and anchor" {
+    var p = CoinEconomyCalculator.defaults()
+    var metrics = m(200000L, 0L, 0L, 0L, 1000000L, 1000000L)
+    var first = CoinEconomyCalculator.absoluteEvaluate(10000L, metrics, p)
+    var second = CoinEconomyCalculator.absoluteEvaluate(10000L, metrics, p)
+    Check.eqStr("same", "" + first.suggestedMicros(), "" + second.suggestedMicros())
+}

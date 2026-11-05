@@ -1,0 +1,59 @@
+import importlinkedin.*
+import jobs.*
+import kernel.files.*
+import kernel.testkit.*
+
+// HTTP tests of the two resume upload endpoints (multipart POSTs through the binary lane).
+String resumeText() = "Ana Souza\nEngenheira de Software\n\nSobre\nEngenheira com 5 anos de experiencia em Java e Spring.\n\nExperiencia\nEngenheira de Software\nEnois\njan de 2021 - o momento\nSao Paulo, Brasil\nAPIs em Java com Spring Boot.\n\nHabilidades\nJava, Spring, PostgreSQL\nana@mail.com\nhttps://www.linkedin.com/in/ana\n"
+
+test "aTextResumeBecomesAPortraitOverHttp" {
+    var user = ImportTestKit.login("rs_text")
+    var res = ImportTestKit.upload("/me/import/resume", user, MultipartBody.create().addFile("file", "curriculo.txt", "text/plain", resumeText().getBytes()))
+    Check.eqInt("status", 200, res.status)
+    Check.eqStr("name", "Ana Souza", res.json("profile.name"))
+    Check.eqStr("company", "Enois", res.json("experiences.0.company"))
+}
+
+test "aPdfResumeIsReadAfterTheUpload" {
+    var user = ImportTestKit.login("rs_pdf")
+    var pdf = PdfFixtures.write(listOf("Ana Souza", "Engenheira de Software", "Experiencia", "Engenheira de Software", "Enois", "jan de 2021 - o momento", "Habilidades", "Java, Spring"))
+    var res = ImportTestKit.upload("/me/import/resume", user, MultipartBody.create().addFile("file", "cv.pdf", "application/pdf", TempFiles.readAll(pdf)))
+    Check.eqInt("status", 200, res.status)
+    Check.eqStr("name", "Ana Souza", res.json("profile.name"))
+}
+
+test "theResumeEndpointRefusesWhatTheServiceRefuses" {
+    var user = ImportTestKit.login("rs_refuse")
+    var docx = ImportTestKit.upload("/me/import/resume", user, MultipartBody.create().addFile("file", "cv.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "PK".getBytes()))
+    Check.eqInt("docx", 400, docx.status)
+    Check.eqStr("docx code", "UNSUPPORTED_FORMAT", docx.json("code"))
+    var none = ImportTestKit.upload("/me/import/resume", user, MultipartBody.create().addText("file", "not a file part"))
+    Check.eqInt("no file part", 400, none.status)
+    Check.eqStr("no file code", "FILE_REQUIRED", none.json("code"))
+    var anonymous = ImportTestKit.upload("/me/import/resume", null, MultipartBody.create().addFile("file", "cv.txt", "text/plain", resumeText().getBytes()))
+    Check.eqInt("anonymous", 401, anonymous.status)
+    var json = BinaryClient(ImportTestKit.app().port).send("POST", "/me/import/resume", listOf("Content-Type: application/json", "X-Session-Token: " + ImportTestKit.token(user)), "{}".getBytes())
+    Check.eqInt("not multipart", 415, json.status)
+}
+
+test "thePrefillEndpointFillsTheJobFormFromTheResume" {
+    var owner = ImportTestKit.login("rs_owner")
+    var candidate = ImportTestKit.login("rs_candidate")
+    var job = ImportTestKit.jobs().service.create("Dev Java", "Enois", null, "Remoto", "CLT", "PLENO", null, "BRL", "1500", null, "MONTH", "Vaga backend Java.", listOf("Java"), listOf(JobFieldInput("LinkedIn", "LINK", false)), owner, true, null)
+    var body = MultipartBody.create().addFile("file", "curriculo.txt", "text/plain", resumeText().getBytes())
+    var res = ImportTestKit.upload("/me/import/resume/prefill/" + job.id, candidate, body)
+    Check.eqInt("status", 200, res.status)
+    Check.eqStr("job id", job.id, res.json("jobId"))
+    Check.eqStr("title", "Dev Java", res.json("jobTitle"))
+    Check.isTrue("linkedin", res.json("fields.0.suggestedValue").contains("linkedin.com"))
+    // The job rules still apply to the upload.
+    var own = ImportTestKit.upload("/me/import/resume/prefill/" + job.id, owner, MultipartBody.create().addFile("file", "curriculo.txt", "text/plain", resumeText().getBytes()))
+    Check.eqInt("own job", 400, own.status)
+    Check.eqStr("own job code", "CANNOT_APPLY_TO_OWN_JOB", own.json("code"))
+    var missing = ImportTestKit.upload("/me/import/resume/prefill/nope", candidate, MultipartBody.create().addFile("file", "curriculo.txt", "text/plain", resumeText().getBytes()))
+    Check.eqInt("missing job", 404, missing.status)
+    Check.eqStr("missing code", "JOB_NOT_FOUND", missing.json("code"))
+    var anonymous = ImportTestKit.upload("/me/import/resume/prefill/" + job.id, null, MultipartBody.create().addFile("file", "curriculo.txt", "text/plain", resumeText().getBytes()))
+    Check.eqInt("anonymous", 401, anonymous.status)
+    ImportTestKit.finish()
+}

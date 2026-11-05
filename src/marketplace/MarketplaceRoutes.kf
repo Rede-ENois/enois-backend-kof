@@ -1,0 +1,151 @@
+package marketplace
+
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+import profile.*
+import themes.*
+
+// HTTP adapter of the marketplace (MarketplaceController): list a theme or a content item, buy with escrow, confirm
+// (releases to the seller minus 10%) or ask for a refund (100% back, inside 7 days).
+class MarketplaceRoutes {
+    static register(server: HttpServer, marketplace: MarketplaceService, gallery: ThemeService, sanitizer: MarketplaceSanitizer, directory: ProfileDirectory, idem: Idempotency) {
+        server.post("/admin/marketplace/sanitize", () -> MarketplaceRoutes.sanitize(marketplace, sanitizer))
+        server.get("/marketplace", () -> MarketplaceRoutes.catalog(marketplace, directory))
+        server.post("/marketplace/items", () -> MarketplaceRoutes.publishItem(marketplace))
+        server.get("/marketplace/purchases/:purchaseId/content", () -> MarketplaceRoutes.content(marketplace))
+        server.get("/marketplace/mine", () -> MarketplaceRoutes.mine(marketplace, directory))
+        server.get("/marketplace/compras", () -> MarketplaceRoutes.purchases(marketplace))
+        server.get("/marketplace/vendas", () -> MarketplaceRoutes.sales(marketplace))
+        server.post("/marketplace", () -> MarketplaceRoutes.publish(marketplace, gallery))
+        server.post("/marketplace/:listingId/buy", () -> MarketplaceRoutes.buy(marketplace, idem))
+        server.post("/marketplace/purchases/:purchaseId/confirm", () -> MarketplaceRoutes.decide(marketplace, idem, true))
+        server.post("/marketplace/purchases/:purchaseId/refund", () -> MarketplaceRoutes.decide(marketplace, idem, false))
+    }
+    // Cleanup on demand (admin): how many listings fell.
+    static String sanitize(marketplace: MarketplaceService, sanitizer: MarketplaceSanitizer) {
+        Auth.requireAdmin()
+        var removed = sanitizer.sanitizeNow()
+        return json.encode(MarketplaceSanitizeView(removed, marketplace.catalog(60).size()))
+    }
+    static String catalog(marketplace: MarketplaceService, directory: ProfileDirectory) = json.encode(MarketplaceViews.listings(marketplace.catalogFiltered(Req.queryInt("limit", 60), Req.queryParam("q"), Req.queryParam("kind")), directory))
+    static String mine(marketplace: MarketplaceService, directory: ProfileDirectory) {
+        var userId = Auth.requireUser()
+        return json.encode(MarketplaceViews.listings(marketplace.mine(userId), directory))
+    }
+    static String purchases(marketplace: MarketplaceService) {
+        var userId = Auth.requireUser()
+        var out = listOf<MarketplacePurchaseView>()
+        for (var d in marketplace.purchasesDetailed(userId)) {
+            out.add(MarketplaceViews.purchase(d.purchase(), d.kind(), d.title(), d.itemId()))
+        }
+        return json.encode(out)
+    }
+    static String sales(marketplace: MarketplaceService) {
+        var userId = Auth.requireUser()
+        var out = listOf<MarketplacePurchaseView>()
+        for (var p in marketplace.salesBySeller(userId)) {
+            out.add(MarketplaceViews.purchase(p, null, null, null))
+        }
+        return json.encode(out)
+    }
+    static String content(marketplace: MarketplaceService) {
+        var userId = Auth.requireUser()
+        var purchased = marketplace.contentForPurchase(Req.pathParam("purchaseId"), userId)
+        var body = ""
+        var text = purchased.content()
+        if (text != null) {
+            body = text
+        }
+        return json.encode(MarketplaceContentView(purchased.kind(), purchased.title(), purchased.itemId(), body))
+    }
+    static Long priceOf(price: Long?) {
+        if (price == null) {
+            return 0L
+        }
+        return price
+    }
+    static String publishItem(marketplace: MarketplaceService) {
+        var userId = Auth.requireUser()
+        SafeLinks.checkRequest()
+        var request = MarketplaceRoutes.itemBody()
+        var listing = marketplace.publishItem(userId, request.kind(), request.title(), request.description(), request.content(), MarketplaceRoutes.priceOf(request.price()))
+        return json.encode(MarketplaceListedView(listing.id(), listing.status()))
+    }
+    static String publish(marketplace: MarketplaceService, gallery: ThemeService) {
+        var userId = Auth.requireUser()
+        SafeLinks.checkRequest()
+        var request = MarketplaceRoutes.publishBody()
+        var kind = MarketplaceRoutes.strictKind(request.itemKind())
+        if (kind != "THEME") {
+            throw Errors.api(400, "INVALID_ITEM_KIND", "Por enquanto só temas estão à venda.")
+        }
+        var itemId = request.itemId()
+        var themeId = ""
+        if (itemId != null) {
+            themeId = itemId
+        }
+        var theme = gallery.get(themeId)
+        if (userId != theme.authorId()) {
+            throw Errors.api(403, "NOT_THE_AUTHOR", "Só quem publicou o tema pode listá-lo.")
+        }
+        var title = request.title()
+        if (title == null) {
+            title = theme.name()
+        }
+        var listing = marketplace.publish(userId, request.itemKind(), themeId, title, request.description(), MarketplaceRoutes.priceOf(request.price()))
+        return json.encode(MarketplaceListedView(listing.id(), listing.status()))
+    }
+    // Controller-side parse: an unknown kind is the plain 400 of an IllegalArgumentException.
+    static String strictKind(raw: String?) {
+        if (raw == null) {
+            return "THEME"
+        }
+        var kind = raw.trim().toUpperCase()
+        if (!MarketplaceKinds.all().contains(kind)) {
+            throw Errors.badRequest()
+        }
+        return kind
+    }
+    static String buy(marketplace: MarketplaceService, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var listingId = Req.pathParam("listingId")
+        return idem.handle(userId, "POST", "/marketplace/" + listingId + "/buy", Idempotency.hash("{}"), 200, () -> MarketplaceRoutes.buyBody(marketplace, listingId, userId))
+    }
+    static String buyBody(marketplace: MarketplaceService, listingId: String, userId: String) {
+        var purchase = marketplace.buy(listingId, userId)
+        return json.encode(MarketplaceBoughtView(purchase.id(), purchase.state(), purchase.price()))
+    }
+    static String decide(marketplace: MarketplaceService, idem: Idempotency, confirm: Bool) {
+        var userId = Auth.requireUser()
+        var purchaseId = Req.pathParam("purchaseId")
+        var verb = "refund"
+        if (confirm) {
+            verb = "confirm"
+        }
+        return idem.handle(userId, "POST", "/marketplace/purchases/" + purchaseId + "/" + verb, Idempotency.hash("{}"), 200, () -> MarketplaceRoutes.decideBody(marketplace, purchaseId, userId, confirm))
+    }
+    static String decideBody(marketplace: MarketplaceService, purchaseId: String, userId: String, confirm: Bool) {
+        if (confirm) {
+            var confirmed = marketplace.confirm(purchaseId, userId)
+            return json.encode(MarketplacePurchaseStateView(confirmed.id(), confirmed.state()))
+        }
+        var refunded = marketplace.refund(purchaseId, userId)
+        return json.encode(MarketplacePurchaseStateView(refunded.id(), refunded.state()))
+    }
+    static MarketplacePublishRequest publishBody() {
+        try {
+            return json.decode<MarketplacePublishRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static MarketplaceItemRequest itemBody() {
+        try {
+            return json.decode<MarketplaceItemRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

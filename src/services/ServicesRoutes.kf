@@ -1,0 +1,229 @@
+package services
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.text.*
+
+// HTTP adapter of /servicos (ServicesController): catalog of offers and open requests, offers (publish, edit,
+// remove, hire, chat), requests (publish, proposals, choose) and contracts (the escrow panel: deliver, accept,
+// refund).
+class ServicesRoutes {
+    static register(server: HttpServer, services: ServicesService) {
+        server.get("/servicos", () -> ServicesRoutes.catalog(services))
+        server.get("/servicos/minhas", () -> ServicesRoutes.mine(services))
+        server.post("/servicos/ofertas", () -> ServicesRoutes.publishListing(services))
+        server.put("/servicos/ofertas/:listingId", () -> ServicesRoutes.editListing(services))
+        server.delete("/servicos/ofertas/:listingId", () -> ServicesRoutes.removeListing(services))
+        server.post("/servicos/ofertas/:listingId/contratar", () -> ServicesRoutes.buyListing(services))
+        server.post("/servicos/ofertas/:listingId/chat", () -> ServicesRoutes.openChat(services))
+        server.post("/servicos/pedidos", () -> ServicesRoutes.createRequest(services))
+        server.post("/servicos/pedidos/:requestId/propostas", () -> ServicesRoutes.propose(services))
+        server.get("/servicos/pedidos/:requestId/propostas", () -> ServicesRoutes.proposals(services))
+        server.post("/servicos/pedidos/:requestId/escolher", () -> ServicesRoutes.choose(services))
+        server.post("/servicos/contratos/:contractId/entregar", () -> ServicesRoutes.deliver(services))
+        server.post("/servicos/contratos/:contractId/aceitar", () -> ServicesRoutes.decide(services, true))
+        server.post("/servicos/contratos/:contractId/reembolso", () -> ServicesRoutes.decide(services, false))
+    }
+    static String catalog(services: ServicesService) {
+        var offers = services.listingCatalog(Req.queryInt("listings", 40), Req.queryParam("q"), Req.queryParam("category"))
+        var sellers = services.sellersOf(offers)
+        var requests = listOf<ServiceRequestView>()
+        for (var r in services.requestCatalog(Req.queryInt("requests", 40), Req.queryParam("q"), Req.queryParam("category"))) {
+            requests.add(ServicesViews.request(r))
+        }
+        return json.encode(ServiceCatalogView(ServicesViews.listings(offers, sellers), requests))
+    }
+    static String mine(services: ServicesService) {
+        var userId = Auth.requireUser()
+        var offers = services.listingsBySeller(userId)
+        var sellers = services.sellersOf(offers)
+        return json.encode(ServiceMineView(ServicesViews.listings(offers, sellers), ServicesViews.contracts(services.contractsByBuyer(userId)), ServicesViews.contracts(services.contractsBySeller(userId))))
+    }
+    static String publishListing(services: ServicesService) {
+        var userId = Auth.requireUser()
+        var listing = services.publishListing(userId, ServicesRoutes.listingBody())
+        return json.encode(ServiceIdStatus(listing.id(), listing.status()))
+    }
+    // The provider edits their own service (the price locks while a contract is open).
+    static String editListing(services: ServicesService) {
+        var userId = Auth.requireUser()
+        var listing = services.editListing(Req.pathParam("listingId"), userId, ServicesRoutes.listingBody())
+        return json.encode(ServiceIdStatus(listing.id(), listing.status()))
+    }
+    static String removeListing(services: ServicesService) {
+        var userId = Auth.requireUser()
+        var listing = services.removeListing(Req.pathParam("listingId"), userId)
+        return json.encode(ServiceIdStatus(listing.id(), listing.status()))
+    }
+    static String buyListing(services: ServicesService) {
+        var userId = Auth.requireUser()
+        var contract = services.buyListing(Req.pathParam("listingId"), userId)
+        return json.encode(ServiceContractState(contract.id(), contract.escrowState()))
+    }
+    // The card's button: opens the service conversation with the provider. The body is optional.
+    static String openChat(services: ServicesService) {
+        var userId = Auth.requireUser()
+        var listingId = Req.pathParam("listingId")
+        if (Req.bodyText().trim().length() == 0) {
+            return json.encode(services.openChat(listingId, userId, null))
+        }
+        SafeLinks.checkRequest()
+        return json.encode(services.openChat(listingId, userId, ServicesRoutes.chatBody().message()))
+    }
+    static String createRequest(services: ServicesService) {
+        var userId = Auth.requireUser()
+        var request = services.createRequest(userId, ServicesRoutes.requestBody())
+        return json.encode(ServiceIdStatus(request.id(), request.status()))
+    }
+    static String propose(services: ServicesService) {
+        var userId = Auth.requireUser()
+        var proposal = services.propose(Req.pathParam("requestId"), userId, ServicesRoutes.proposeBody())
+        return json.encode(ServiceIdStatus(proposal.id(), proposal.status()))
+    }
+    static String proposals(services: ServicesService) {
+        var userId = Auth.requireUser()
+        var out = listOf<ServiceProposalView>()
+        for (var p in services.proposalsFor(Req.pathParam("requestId"), userId)) {
+            out.add(ServicesViews.proposal(p))
+        }
+        return json.encode(out)
+    }
+    static String choose(services: ServicesService) {
+        var userId = Auth.requireUser()
+        var body = ServicesRoutes.chooseBody()
+        var contract = services.choose(Req.pathParam("requestId"), userId, body.proposalId())
+        return json.encode(ServiceContractState(contract.id(), contract.escrowState()))
+    }
+    static String deliver(services: ServicesService) {
+        var userId = Auth.requireUser()
+        var body = ServicesRoutes.deliverBody()
+        var contract = services.deliver(Req.pathParam("contractId"), userId, body.note())
+        return json.encode(ServiceContractState(contract.id(), contract.escrowState()))
+    }
+    static String decide(services: ServicesService, accept: Bool) {
+        var userId = Auth.requireUser()
+        var contractId = Req.pathParam("contractId")
+        if (accept) {
+            var accepted = services.accept(contractId, userId)
+            return json.encode(ServiceContractState(accepted.id(), accepted.escrowState()))
+        }
+        var refunded = services.refund(contractId, userId)
+        return json.encode(ServiceContractState(refunded.id(), refunded.escrowState()))
+    }
+    static ServiceListingBody listingBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ServiceListingBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ServiceRequestBody requestBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ServiceRequestBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ServiceProposeBody proposeBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ServiceProposeBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ServiceChooseBody chooseBody() {
+        try {
+            return json.decode<ServiceChooseBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ServiceDeliverBody deliverBody() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ServiceDeliverBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static ServiceChatBody chatBody() {
+        try {
+            return json.decode<ServiceChatBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}
+
+// HTTP adapter of /services (ServiceOfferController): the community directory.
+class ServiceOfferRoutes {
+    static register(server: HttpServer, offers: ServiceOfferService) {
+        server.get("/services", () -> ServiceOfferRoutes.catalog(offers))
+        // The literal path before the two-variable one, as Spring prefers it.
+        server.get("/services/mine", () -> ServiceOfferRoutes.mine(offers))
+        server.get("/services/:username/:serviceSlug", () -> ServiceOfferRoutes.bySlug(offers))
+        server.post("/services", () -> ServiceOfferRoutes.submit(offers))
+        server.patch("/services/:serviceId", () -> ServiceOfferRoutes.edit(offers))
+        server.delete("/services/:serviceId", () -> ServiceOfferRoutes.remove(offers))
+        server.post("/services/:serviceId/resubmit", () -> ServiceOfferRoutes.resubmit(offers))
+    }
+    // The visitor reads; a session that does not resolve reads as a visitor too (the Java viewerIdOrNull).
+    static String? viewerIdOrNull() = Auth.viewerIdOrNull()
+    static String catalog(offers: ServiceOfferService) {
+        var viewerId = ServiceOfferRoutes.viewerIdOrNull()
+        var out = listOf<ServiceOfferView>()
+        for (var o in offers.catalog(Req.queryParam("category"), Req.queryParam("q"), Req.queryInt("limit", 30))) {
+            out.add(ServicesViews.offer(o, offers.usernameOf(o), viewerId))
+        }
+        return json.encode(out)
+    }
+    static String bySlug(offers: ServiceOfferService) {
+        var viewerId = ServiceOfferRoutes.viewerIdOrNull()
+        var username = Req.pathParam("username")
+        var offer = offers.byUserAndSlug(username, Req.pathParam("serviceSlug"), viewerId)
+        if (offer == null) {
+            throw Errors.api(404, "SERVICE_NOT_FOUND", "Serviço não encontrado.")
+        }
+        return json.encode(ServicesViews.offer(offer, username, viewerId))
+    }
+    static String mine(offers: ServiceOfferService) {
+        var userId = Auth.requireUser()
+        var out = listOf<ServiceOfferView>()
+        for (var o in offers.mine(userId)) {
+            out.add(ServicesViews.offer(o, offers.usernameOf(o), userId))
+        }
+        return json.encode(out)
+    }
+    static String submit(offers: ServiceOfferService) {
+        var userId = Auth.requireUser()
+        var created = offers.submit(userId, ServiceOfferRoutes.body())
+        return json.encode(ServiceOfferCreated(created.id(), created.slug(), created.status()))
+    }
+    static String edit(offers: ServiceOfferService) {
+        var userId = Auth.requireUser()
+        var edited = offers.edit(Req.pathParam("serviceId"), userId, ServiceOfferRoutes.body())
+        return json.encode(ServiceOfferCreated(edited.id(), edited.slug(), edited.status()))
+    }
+    static String remove(offers: ServiceOfferService) {
+        var userId = Auth.requireUser()
+        offers.delete(Req.pathParam("serviceId"), userId)
+        return json.encode(ServiceDeleted(true))
+    }
+    static String resubmit(offers: ServiceOfferService) {
+        var userId = Auth.requireUser()
+        var again = offers.resubmit(Req.pathParam("serviceId"), userId)
+        return json.encode(ServiceOfferResubmitted(again.id(), again.status()))
+    }
+    static ServiceOfferBody body() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ServiceOfferBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

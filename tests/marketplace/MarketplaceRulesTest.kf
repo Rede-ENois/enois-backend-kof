@@ -1,0 +1,155 @@
+import coin.*
+import economy.*
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import marketplace.*
+import profile.*
+import themes.*
+
+// Port of MarketplaceRulesTests: price floor, the publisher's name in the catalog, the idempotent migration of the
+// gallery themes, ownership across listings of the same item, legacy SOLD listings and the auto-release.
+TestApp mrApp() = MarketTestKit.app("marketrules")
+
+MarketplaceService mrService() = MarketTestKit.stack().market.service
+
+String mrTheme(who: ProfileCaller, name: String) {
+    var body = json.encode(ThemeRequest(name, "Tema de teste", MarketTestKit.themePackage("#f5e6c8", "#3a2a10"), "light"))
+    var res = who.post("/temas/galeria", body)
+    Check.status(res, 200)
+    return MarketTestKit.str(res, "id")
+}
+
+MarketplaceListing mrListing(seller: String, themeId: String, title: String) = mrService().publish(seller, "THEME", themeId, title, null, MarketplaceService.minPrice())
+
+mrSetListingStatus(id: String, status: String) {
+    mrApp().db().execute("update marketplace_listings set status = ? where id = ?", DbParams().bindStr(status).bindStr(id))
+}
+
+Long mrCount(sql: String, a: String) = mrApp().db().queryLong(sql, DbParams().bindStr(a))
+
+test "price floor and the seller name in the catalog" {
+    var app = mrApp()
+    var owner = MarketTestKit.login(app, "mkt-rules-owner")
+    var themeId = mrTheme(owner, "Tema do dono")
+    Check.apiError(owner.post("/marketplace", json.encode(MarketplacePublishRequest("THEME", themeId, "Tema do dono", null, CoinService.fais(49L)))), 400, "PRICE_TOO_LOW")
+    Check.status(owner.post("/marketplace", json.encode(MarketplacePublishRequest("THEME", themeId, "Tema do dono", null, CoinService.fais(50L)))), 200)
+    var catalog = MarketTestKit.anonymous(app).get("/marketplace")
+    Check.status(catalog, 200)
+    Check.isTrue("seller username", catalog.body.contains("\"sellerUsername\":\"mkt-rules-owner\""))
+    Check.isTrue("seller name", catalog.body.contains("\"sellerName\":\"mkt-rules-owner\""))
+    Check.isTrue("the theme item", catalog.body.contains("\"itemId\":\"" + themeId + "\""))
+}
+
+test "ensureListed is idempotent for the gallery migration" {
+    var svc = mrService()
+    var first = svc.ensureListed("user-migracao", "THEME", "theme_migracao_teste", "Tema migrado", null, MarketplaceService.minPrice())
+    Check.isTrue("first call lists", first != null)
+    var second = svc.ensureListed("user-migracao", "THEME", "theme_migracao_teste", "Tema migrado", null, MarketplaceService.minPrice())
+    Check.isTrue("second call does nothing", second == null)
+}
+
+// A purchase (held or released) is recognised when the importer lists the same item again under another listing id.
+mrRejectRepeatPurchase(suffix: String, confirm: Bool) {
+    var app = mrApp()
+    var seller = MarketTestKit.login(app, "mkt-owned-seller-" + suffix)
+    var buyer = MarketTestKit.login(app, "mkt-owned-buyer-" + suffix)
+    var themeId = mrTheme(seller, "Tema comprado " + suffix)
+    var svc = mrService()
+    var listing = mrListing("mkt-owned-seller-" + suffix, themeId, "Tema comprado")
+    MarketTestKit.fund("mkt-owned-buyer-" + suffix, CoinService.fais(120L), "mkt-owned-" + suffix)
+    var purchase = svc.buy(listing.id(), "mkt-owned-buyer-" + suffix)
+    // record from before the fix: the listing became SOLD and the importer recreated it
+    mrSetListingStatus(listing.id(), "SOLD")
+    if (confirm) {
+        svc.confirm(purchase.id(), "mkt-owned-buyer-" + suffix)
+    }
+    var relisted = svc.ensureListed("mkt-owned-seller-" + suffix, "THEME", themeId, "Tema comprado", null, MarketplaceService.minPrice())
+    Check.isTrue("relisted under another id", relisted != null)
+    if (relisted != null) {
+        Check.isTrue("a new listing id", relisted.id() != listing.id())
+        var balance = MarketTestKit.balance(buyer)
+        Check.apiError(buyer.post("/marketplace/" + relisted.id() + "/buy", ""), 409, "ITEM_ALREADY_OWNED")
+        Check.eqStr("buyer is not charged", "" + balance, "" + MarketTestKit.balance(buyer))
+        Check.eqStr("still one purchase", "1", "" + mrCount("select count(*) from marketplace_purchases where buyer_id = ?", "mkt-owned-buyer-" + suffix))
+    }
+}
+
+test "a held purchase is recognised when the item is listed again" {
+    mrRejectRepeatPurchase("held", false)
+}
+
+test "a completed purchase is recognised when the item is listed again" {
+    mrRejectRepeatPurchase("released", true)
+}
+
+test "a refunded purchase does not count as ownership" {
+    var app = mrApp()
+    var seller = MarketTestKit.login(app, "mkt-owned-refund-seller")
+    MarketTestKit.login(app, "mkt-owned-refund-buyer")
+    var themeId = mrTheme(seller, "Tema devolvido")
+    var svc = mrService()
+    var store = MarketplaceStore(app.db())
+    var listing = mrListing("mkt-owned-refund-seller", themeId, "Tema devolvido")
+    MarketTestKit.fund("mkt-owned-refund-buyer", CoinService.fais(60L), "mkt-owned-refund")
+    var purchase = svc.buy(listing.id(), "mkt-owned-refund-buyer")
+    Check.isTrue("held counts", store.hasPurchaseForItem("mkt-owned-refund-buyer", "THEME", themeId))
+    svc.refund(purchase.id(), "mkt-owned-refund-buyer")
+    Check.isTrue("refunded does not count", !store.hasPurchaseForItem("mkt-owned-refund-buyer", "THEME", themeId))
+    Check.isTrue("the seller never bought", !store.hasPurchaseForItem("mkt-owned-refund-seller", "THEME", themeId))
+    var found = false
+    for (var l in svc.catalogFiltered(100, "Tema devolvido", "THEME")) {
+        if (l.id() == listing.id()) {
+            found = true
+        }
+    }
+    Check.isTrue("still in the catalog", found)
+    var again = svc.buy(listing.id(), "mkt-owned-refund-buyer")
+    Check.isTrue("a new purchase", again.id() != purchase.id())
+    Check.isTrue("owns again", store.hasPurchaseForItem("mkt-owned-refund-buyer", "THEME", themeId))
+}
+
+test "a refund reopens a legacy sold listing immediately" {
+    var app = mrApp()
+    var seller = MarketTestKit.login(app, "mkt-legacy-refund-seller")
+    MarketTestKit.login(app, "mkt-legacy-refund-buyer")
+    var themeId = mrTheme(seller, "Tema legado devolvido")
+    var svc = mrService()
+    var listing = mrListing("mkt-legacy-refund-seller", themeId, "Tema legado devolvido")
+    MarketTestKit.fund("mkt-legacy-refund-buyer", CoinService.fais(60L), "mkt-legacy-refund")
+    var purchase = svc.buy(listing.id(), "mkt-legacy-refund-buyer")
+    mrSetListingStatus(listing.id(), "SOLD")
+    svc.refund(purchase.id(), "mkt-legacy-refund-buyer")
+    var reopened = MarketplaceStore(app.db()).findListing(listing.id())
+    Check.isTrue("listing exists", reopened != null)
+    if (reopened != null) {
+        Check.eqStr("listing is active again", "ACTIVE", reopened.status())
+    }
+    Check.isTrue("buys again", svc.buy(listing.id(), "mkt-legacy-refund-buyer").id() != purchase.id())
+}
+
+test "an unconfirmed purchase releases once after the decision window" {
+    var app = mrApp()
+    var seller = MarketTestKit.login(app, "mkt-expiry-seller")
+    var buyer = MarketTestKit.login(app, "mkt-expiry-buyer")
+    var themeId = mrTheme(seller, "Tema sem confirmacao")
+    var svc = mrService()
+    var listing = mrListing("mkt-expiry-seller", themeId, "Tema sem confirmacao")
+    MarketTestKit.fund("mkt-expiry-buyer", CoinService.fais(60L), "mkt-expiry-balance")
+    var purchase = svc.buy(listing.id(), "mkt-expiry-buyer")
+    var buyerBalance = MarketTestKit.balance(buyer)
+    var sellerBalance = MarketTestKit.balance(seller)
+    Check.isTrue("the escrow took the price", buyerBalance < CoinService.fais(165L))
+    var eightDaysAgo = Time.fromMillis(Time.nowMillis() - 8L * 24L * 3600000L)
+    app.db().execute("update marketplace_purchases set created_at = ? where id = ?", DbParams().bindInstant(eightDaysAgo).bindStr(purchase.id()))
+    svc.releaseExpired()
+    var after = svc.purchase(purchase.id())
+    Check.eqStr("released", "RELEASED", after.state())
+    Check.eqStr("buyer unchanged", "" + buyerBalance, "" + MarketTestKit.balance(buyer))
+    Check.eqStr("seller got 90%", "" + (sellerBalance + CoinService.fais(45L)), "" + MarketTestKit.balance(seller))
+    svc.releaseExpired()
+    Check.eqStr("a second round pays nothing", "" + (sellerBalance + CoinService.fais(45L)), "" + MarketTestKit.balance(seller))
+    Check.apiError(buyer.post("/marketplace/purchases/" + purchase.id() + "/refund", ""), 409, "PURCHASE_NOT_HELD")
+    MarketTestKit.finish()
+}

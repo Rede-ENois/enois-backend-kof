@@ -1,0 +1,112 @@
+import dailygames.*
+import games.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Port of DailyMazeServiceTest and the maze half of DailyGamePayoutTest. The generated mazes are compared with
+// what the Java MazeRules produced for the same seeds (same java.util.Random sequence).
+String mazeText(maze: List<Int>) {
+    var out = ""
+    for (var cell in maze) {
+        out = out + cell + ","
+    }
+    return out
+}
+
+Bool mazeRejects(maze: List<Int>, position: Int, direction: String) {
+    try {
+        MazeRules.move(maze, position, direction)
+    } catch (String e) {
+        return e.startsWith("ILLEGAL_ARGUMENT")
+    }
+    return false
+}
+
+test "the generated maze is the Java one, connected, and moves are validated" {
+    var maze = MazeRules.generate(20L)
+    assert(mazeText(maze) == "4,2,14,12,2,10,14,10,12,5,6,9,3,10,12,3,8,5,3,9,6,8,6,9,6,12,5,6,12,7,12,3,12,5,5,5,1,3,9,5,6,9,5,3,13,6,10,10,13,5,6,11,12,5,5,6,12,5,5,3,8,5,5,5,5,5,1,3,10,12,5,5,3,9,3,10,10,10,11,9,1,")
+    assert(mazeText(MazeRules.generate(20L)) == mazeText(maze))
+    assert(mazeText(MazeRules.generate(12345L)) == "2,12,6,10,10,10,10,10,12,4,3,9,2,14,10,12,6,9,7,10,10,14,9,6,9,5,4,3,8,6,9,2,9,6,9,5,6,10,9,6,12,6,9,6,9,7,10,12,5,3,9,2,11,12,3,12,5,5,6,10,10,12,5,4,5,3,9,5,6,12,5,5,3,11,10,10,9,1,3,11,9,")
+    // Breadth-first from the first cell reaches every one of the 81 cells.
+    var reached = listOf<Bool>()
+    var i = 0
+    while (i < 81) {
+        reached.add(i == 0)
+        i = i + 1
+    }
+    var queue = listOf(0)
+    var head = 0
+    var names = listOf("UP", "RIGHT", "DOWN", "LEFT")
+    while (head < queue.size()) {
+        var cell = queue.get(head)
+        head = head + 1
+        var d = 0
+        while (d < 4) {
+            if (MazeRules.open(maze.get(cell), d)) {
+                var next = MazeRules.move(maze, cell, names.get(d))
+                if (!reached.get(next)) {
+                    reached.set(next, true)
+                    queue.add(next)
+                }
+            }
+            d = d + 1
+        }
+    }
+    assert(queue.size() == 81)
+    assert(mazeRejects(maze, 0, "UP"))
+    assert(mazeRejects(maze, 0, "SIDEWAYS"))
+}
+
+test "the challenge is shared and invalid moves are refused" {
+    GamesTestClock.pin("2026-10-18T12:00:00Z")
+    var a = GamesTestKit.login("dmz-a")
+    var b = GamesTestKit.login("dmz-b")
+    var state = GamesTestKit.get("/daily-games/maze/today", GamesTestKit.auth(a))
+    Check.jsonEq(state, "status", "NOT_STARTED")
+    assert(state.jsonIsNull("passages"))
+    Check.apiError(GamesTestKit.send("POST", "/daily-games/maze/today/moves", GamesTestKit.auth(a), "{\"direction\":\"UP\",\"requestId\":\"request_0001\"}"), 409, "GAME_NOT_STARTED")
+    var first = GamesTestKit.send("POST", "/daily-games/maze/today/start", GamesTestKit.auth(a), "")
+    var second = GamesTestKit.send("POST", "/daily-games/maze/today/start", GamesTestKit.auth(b), "")
+    Check.status(first, 200)
+    Check.eqStr("same maze", first.json("passages"), second.json("passages"))
+    Check.eqInt("81 cells", 81, first.jsonSize("passages"))
+    // From the first cell UP is a wall.
+    Check.apiError(GamesTestKit.send("POST", "/daily-games/maze/today/moves", GamesTestKit.auth(a), "{\"direction\":\"UP\",\"requestId\":\"request_0001\"}"), 400, "INVALID_MOVE")
+    var right = first.json("passages.0").toInt() % 4 >= 2
+    var direction = "DOWN"
+    if (right) {
+        direction = "RIGHT"
+    }
+    var body = "{\"direction\":\"" + direction + "\",\"requestId\":\"request_0002\"}"
+    var moved = GamesTestKit.send("POST", "/daily-games/maze/today/moves", GamesTestKit.auth(a), body)
+    Check.status(moved, 200)
+    Check.jsonEq(moved, "moves", "1")
+    var again = GamesTestKit.send("POST", "/daily-games/maze/today/moves", GamesTestKit.auth(a), body)
+    Check.jsonEq(again, "position", moved.json("position"))
+    Check.jsonEq(again, "moves", "1")
+    Check.apiError(GamesTestKit.send("POST", "/daily-games/maze/today/moves", GamesTestKit.auth(a), "{\"direction\":\"UP\",\"requestId\":\"request_0002\"}"), 409, "IDEMPOTENCY_CONFLICT")
+    Check.apiError(GamesTestKit.send("POST", "/daily-games/maze/today/moves", GamesTestKit.auth(a), "{\"direction\":\"UP\",\"requestId\":\"x\"}"), 400, "INVALID_REQUEST_ID")
+    // The next day the previous challenge can still be resumed; two days back it cannot.
+    GamesTestClock.pin("2026-10-19T12:00:00Z")
+    var resumed = GamesTestKit.get("/daily-games/maze/today?date=2026-10-18", GamesTestKit.auth(a))
+    Check.jsonEq(resumed, "position", moved.json("position"))
+    Check.apiError(GamesTestKit.get("/daily-games/maze/today?date=2026-10-17", GamesTestKit.auth(a)), 400, "INVALID_CHALLENGE_DATE")
+    GamesTestClock.unpin()
+}
+
+test "maze payout ranks by time then moves and excludes the still lost" {
+    var db = GamesTestKit.db()
+    GamesTestKit.login("dmp-u1")
+    GamesTestKit.login("dmp-u2")
+    GamesTestKit.login("dmp-u3")
+    db.execute("insert into daily_maze_challenges (challenge_date, maze_seed) values (?, 12345)", DbParams().bindDate("2026-10-16"))
+    var t0 = "2026-10-16T12:00:00Z"
+    var t30 = "2026-10-16T12:00:30Z"
+    db.execute("insert into daily_maze_sessions values (?, ?, 63, 4, ?, ?)", DbParams().bindDate("2026-10-16").bindStr("dmp-u1").bindInstant(t0).bindInstant(t30))
+    db.execute("insert into daily_maze_sessions values (?, ?, 63, 6, ?, ?)", DbParams().bindDate("2026-10-16").bindStr("dmp-u2").bindInstant(t0).bindInstant(t30))
+    db.execute("insert into daily_maze_sessions values (?, ?, 10, 2, ?, null)", DbParams().bindDate("2026-10-16").bindStr("dmp-u3").bindInstant(t0))
+    var order = GamesTestKit.daily().maze.payoutOrder("2026-10-16")
+    Check.eqInt("two paid", 2, order.size())
+    Check.eqStr("first", "dmp-u1", order.get(0))
+    Check.eqStr("second", "dmp-u2", order.get(1))
+}
