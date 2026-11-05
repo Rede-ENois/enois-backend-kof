@@ -4,6 +4,7 @@ import feed.*
 import groups.*
 import identity.*
 import kernel.*
+import kernel.sanctions.*
 import kernel.security.*
 import notifications.*
 import ops.*
@@ -25,7 +26,10 @@ class ModerationModule {
     ModerationVerdicts verdicts
     ModerationSuspensions suspensions
     ModerationContentTargets contentTargets
-    public constructor(service: ModerationService, store: ModerationStore, targets: ModerationTargets, decisions: ModerationDecisions, sanctions: ModerationSanctionService, sanctionStore: ModerationSanctionStore, banCleanup: ModerationBanCleanup, quarantine: ModerationQuarantine, learning: ModerationLearning, verdicts: ModerationVerdicts, suspensions: ModerationSuspensions, contentTargets: ModerationContentTargets) {
+    ModerationPanel panel
+    ModerationProposals proposals
+    ModerationModeratorStore moderators
+    public constructor(service: ModerationService, store: ModerationStore, targets: ModerationTargets, decisions: ModerationDecisions, sanctions: ModerationSanctionService, sanctionStore: ModerationSanctionStore, banCleanup: ModerationBanCleanup, quarantine: ModerationQuarantine, learning: ModerationLearning, verdicts: ModerationVerdicts, suspensions: ModerationSuspensions, contentTargets: ModerationContentTargets, panel: ModerationPanel, proposals: ModerationProposals, moderators: ModerationModeratorStore) {
         this.service = service
         this.store = store
         this.targets = targets
@@ -38,6 +42,9 @@ class ModerationModule {
         this.verdicts = verdicts
         this.suspensions = suspensions
         this.contentTargets = contentTargets
+        this.panel = panel
+        this.proposals = proposals
+        this.moderators = moderators
     }
     static ModerationModule install(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications) = ModerationModule.installWith(platform, shared, parts, feed, groups, profiles, mail, notifications, ModerationReportEvents(), ModerationCompanies(platform.db), ModerationSanctionHooks())
     static ModerationModule installWith(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications, events: ModerationReportEvents, companies: ModerationCompanies, sanctionHooks: ModerationSanctionHooks) {
@@ -59,6 +66,11 @@ class ModerationModule {
         suspensions.schedule(shared.jobs, cfg)
         ModerationRoutes.register(platform.server, service, store, decisions, shared.idempotency)
         ModerationSanctionRoutes.register(platform.server, sanctions)
-        return ModerationModule(service, store, targets, decisions, sanctions, sanctionStore, banCleanup, quarantine, learning, verdicts, suspensions, contentTargets)
+        var moderators = ModerationModeratorStore(platform.db)
+        var gate = SanctionGateReader(platform.db)
+        var panel = ModerationPanel(platform.db, moderators, store, service, decisions, sanctions, sanctionStore, targets, notifications, profiles.directory, profiles.reputation, gate, feed.moderation, cfg.getInt("REDE_MODERATION_MODERATOR_MIN_REPUTATION", 200), cfg.getInt("REDE_MODERATION_VOTE_QUORUM", 3))
+        var proposals = ModerationProposals(platform.db, moderators, sanctions, notifications, profiles.directory, gate)
+        ModerationPanelRoutes.register(platform.server, panel, proposals, quarantine)
+        return ModerationModule(service, store, targets, decisions, sanctions, sanctionStore, banCleanup, quarantine, learning, verdicts, suspensions, contentTargets, panel, proposals, moderators)
     }
 }

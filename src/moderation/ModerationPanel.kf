@@ -1,0 +1,315 @@
+package moderation
+
+import identity.*
+import kernel.db.*
+import kernel.error.*
+import kernel.sanctions.*
+import kernel.security.*
+import kernel.time.*
+import notifications.*
+import profile.*
+
+// ModeratorService: applications, appointment, the report panel with its vote quorum, direct sanctions and the spam cleanup.
+class ModerationPanel {
+    Db database
+    ModerationModeratorStore moderators
+    ModerationStore reports
+    ModerationService reportService
+    ModerationDecisions decisions
+    ModerationSanctionService sanctions
+    ModerationSanctionStore sanctionStore
+    ModerationTargets targets
+    Notifications notifications
+    ProfileDirectory profiles
+    ProfileReputation reputation
+    SanctionGateReader gate
+    feed.FeedModeration feed
+    Int minReputation
+    Int voteQuorum
+    public constructor(database: Db, moderators: ModerationModeratorStore, reports: ModerationStore, reportService: ModerationService, decisions: ModerationDecisions, sanctions: ModerationSanctionService, sanctionStore: ModerationSanctionStore, targets: ModerationTargets, notifications: Notifications, profiles: ProfileDirectory, reputation: ProfileReputation, gate: SanctionGateReader, feed: feed.FeedModeration, minReputation: Int, voteQuorum: Int) {
+        this.database = database
+        this.moderators = moderators
+        this.reports = reports
+        this.reportService = reportService
+        this.decisions = decisions
+        this.sanctions = sanctions
+        this.sanctionStore = sanctionStore
+        this.targets = targets
+        this.notifications = notifications
+        this.profiles = profiles
+        this.reputation = reputation
+        this.gate = gate
+        this.feed = feed
+        this.minReputation = minReputation
+        this.voteQuorum = voteQuorum
+        if (voteQuorum < 1) {
+            this.voteQuorum = 1
+        }
+    }
+    ModerationApplicationView view(a: ModerationApplication) {
+        var p = profiles.findById(a.userId)
+        if (p == null) {
+            return ModerationApplicationView(a.id, a.userId, null, null, a.motivation, a.experience, a.availability, a.status, a.createdAt, a.reviewedBy, a.reviewedAt, a.reviewNote)
+        }
+        return ModerationApplicationView(a.id, a.userId, p.username, profiles.displayName(a.userId), a.motivation, a.experience, a.availability, a.status, a.createdAt, a.reviewedBy, a.reviewedAt, a.reviewNote)
+    }
+    List<ModerationApplicationView> views(rows: List<ModerationApplication>) {
+        var out = listOf<ModerationApplicationView>()
+        for (var a in rows) {
+            out.add(this.view(a))
+        }
+        return out
+    }
+    Bool isModerator(userId: String) = moderators.findApprovedByUser(userId) != null
+    // The user's state on the screen: credibility, eligibility, role and last application.
+    ModerationMeView me(userId: String, admin: Bool) {
+        var rep = reputation.reputationOf(userId)
+        var latest = moderators.findLatestByUser(userId)
+        var count = moderators.countByStatus("APPROVED")
+        var application = ModerationModeratorRules.noView()
+        if (latest != null) {
+            application = this.view(latest)
+        }
+        return ModerationMeView(rep, minReputation, rep >= minReputation, this.isModerator(userId), admin, count, ModerationModeratorRules.minModeratorsForSanction(), application)
+    }
+    ModerationApplicationView apply(userId: String, motivation: String?, experience: String?, availability: String?) {
+        var why = ModerationModeratorRules.trim(motivation)
+        if (why.length() < 20) {
+            throw Errors.api(400, "INVALID_MOTIVATION", "Conte em pelo menos 20 caracteres por que você quer moderar a comunidade.")
+        }
+        if (why.length() > 2000) {
+            throw Errors.api(400, "INVALID_MOTIVATION", "A motivação pode ter no máximo 2000 caracteres.")
+        }
+        if (this.isModerator(userId)) {
+            throw Errors.api(409, "ALREADY_MODERATOR", "Você já é moderador.")
+        }
+        if (moderators.existsPendingByUser(userId)) {
+            throw Errors.api(409, "APPLICATION_PENDING", "Sua candidatura já está em análise.")
+        }
+        if (reputation.reputationOf(userId) < minReputation) {
+            throw Errors.api(403, "LOW_REPUTATION", "Para se candidatar é preciso ter pelo menos " + minReputation + " de credibilidade.")
+        }
+        var application = ModerationApplication(ModerationModeratorRules.newId("mapp_"), userId, why, ModerationModeratorRules.trimOrNull(experience), ModerationModeratorRules.trimOrNull(availability), "PENDING", Time.nowIso(), null, null, null)
+        moderators.saveApplication(application)
+        notifications.create(userId, "MODERACAO", "sistema", "Candidatura recebida", "Recebemos sua candidatura a moderador. Avisamos aqui quando um administrador revisar.", "/moderador", "Acompanhar")
+        return this.view(application)
+    }
+    List<ModerationApplicationView> applicationsOfStatus(status: String, limit: Int) = this.views(moderators.findByStatus(status, limit))
+    ModerationApplicationView decideApplication(applicationId: String, reviewerId: String, approve: Bool, note: String?) {
+        var application = moderators.findApplication(applicationId)
+        if (application == null) {
+            throw Errors.api(404, "APPLICATION_NOT_FOUND", "Candidatura não encontrada.")
+        }
+        if (application.status != "PENDING") {
+            throw Errors.api(409, "APPLICATION_ALREADY_REVIEWED", "Esta candidatura já foi revisada.")
+        }
+        var clean = ModerationModeratorRules.trimOrNull(note)
+        var text = ""
+        if (clean != null) {
+            text = clean
+        }
+        if (!approve && text.length() < 5) {
+            throw Errors.api(400, "NOTE_REQUIRED", "Explique o motivo da recusa (pelo menos 5 caracteres).")
+        }
+        var status = "REJECTED"
+        if (approve) {
+            status = "APPROVED"
+        }
+        var decided = ModerationModeratorRules.decided(application, status, reviewerId, clean, Time.nowIso())
+        moderators.saveApplication(decided)
+        if (approve) {
+            notifications.create(application.userId, "MODERACAO", reviewerId, "Agora você é moderador", "Sua candidatura foi aprovada. O painel de moderação já está liberado.", "/moderador", "Abrir painel")
+        }
+        else {
+            var tail = "."
+            if (clean != null) {
+                tail = ": " + text
+            }
+            notifications.create(application.userId, "MODERACAO", reviewerId, "Candidatura a moderador recusada", "Sua candidatura foi recusada" + tail, "/moderador", "Abrir painel")
+        }
+        return this.view(decided)
+    }
+    ModerationApplicationView revoke(userId: String, reviewerId: String, note: String?) {
+        var approved = moderators.findApprovedByUser(userId)
+        if (approved == null) {
+            throw Errors.api(404, "NOT_MODERATOR", "Este usuário não é moderador.")
+        }
+        var revoked = ModerationModeratorRules.decided(approved, "REVOKED", reviewerId, ModerationModeratorRules.trimOrNull(note), Time.nowIso())
+        moderators.saveApplication(revoked)
+        notifications.create(userId, "MODERACAO", reviewerId, "Acesso de moderador revogado", "Seu acesso ao painel de moderação foi revogado por um administrador.", "/moderador", "Ver")
+        return this.view(revoked)
+    }
+    // Direct appointment by an admin: a pending application is approved, otherwise an already approved one is created.
+    ModerationApplicationView appoint(username: String?, adminId: String, note: String?) {
+        var target = profiles.findByUsername(ModerationModeratorRules.trim(username))
+        if (target == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuário não encontrado.")
+        }
+        if (this.isModerator(target.id)) {
+            throw Errors.api(409, "ALREADY_MODERATOR", "Este usuário já é moderador.")
+        }
+        var now = Time.nowIso()
+        var clean = ModerationModeratorRules.trimOrNull(note)
+        var latest = moderators.findLatestByUser(target.id)
+        var base = ModerationApplication(ModerationModeratorRules.newId("modapp_"), target.id, "Nomeação direta por administrador.", null, null, "PENDING", now, null, null, null)
+        if (latest != null && latest.status == "PENDING") {
+            base = latest
+        }
+        var approved = ModerationModeratorRules.decided(base, "APPROVED", adminId, clean, now)
+        moderators.saveApplication(approved)
+        notifications.create(target.id, "MODERACAO", adminId, "Agora você é moderador", "Você foi nomeado moderador por um administrador. O painel de moderação já está liberado.", "/moderador", "Abrir painel")
+        return this.view(approved)
+    }
+    List<ModerationApplicationView> approvedModerators(limit: Int) = this.views(moderators.findByStatus("APPROVED", limit))
+    static Int countVotes(votes: List<ModerationVote>, type: String) {
+        var n = 0
+        for (var v in votes) {
+            if (v.vote == type) {
+                n = n + 1
+            }
+        }
+        return n
+    }
+    // The report queue: content, author and the vote counts of each one. A banned author needs no vote (the periodic cleanup
+    // closes the report), so it leaves the panel.
+    List<ModerationPanelReport> panelReports(moderatorId: String, limit: Int) {
+        var out = listOf<ModerationPanelReport>()
+        for (var report in reports.findByStatus("PENDING", limit)) {
+            var review = reportService.review(report.id)
+            var authorId = review.authorId
+            if (authorId.length() > 0 && gate.banned(authorId)) {
+                continue
+            }
+            var all = moderators.votesOf(report.id)
+            var mine = moderators.findVote(report.id, moderatorId)
+            var myVote = ModerationModeratorRules.noString()
+            if (mine != null) {
+                myVote = mine.vote
+            }
+            var author = ModerationModeratorRules.noString()
+            var authorKey = ModerationModeratorRules.noString()
+            if (authorId.length() > 0) {
+                author = review.author
+                authorKey = authorId
+            }
+            var content = ModerationModeratorRules.noString()
+            if (review.content.length() > 0) {
+                content = review.content
+            }
+            out.add(ModerationPanelReport(report.id, report.targetType, report.targetId, report.reason, report.description, report.createdAt, review.reporter, authorKey, author, content, ModerationPanel.countVotes(all, "PUNISH"), ModerationPanel.countVotes(all, "DISMISS"), myVote, voteQuorum))
+        }
+        return out
+    }
+    ModerationVoteResult vote(reportId: String, moderatorId: String, type: String?, note: String?) {
+        if (type == null) {
+            throw Errors.api(400, "INVALID_VOTE", "Escolha punir ou descartar.")
+        }
+        String voteType = type
+        var report = reports.findById(reportId)
+        if (report == null) {
+            throw Errors.api(404, "REPORT_NOT_FOUND", "Denúncia não encontrada.")
+        }
+        if (report.status != "PENDING") {
+            throw Errors.api(409, "ALREADY_REVIEWED", "Esta denúncia já foi revisada.")
+        }
+        if (report.reporterId == moderatorId) {
+            throw Errors.api(403, "REPORT_IS_YOURS", "Você denunciou este conteúdo; outro moderador decide.")
+        }
+        var authorId = targets.authorOf(report.targetType, report.targetId)
+        if (authorId != null && authorId == moderatorId) {
+            throw Errors.api(403, "AUTHOR_CANNOT_VOTE", "Você é o autor do conteúdo denunciado.")
+        }
+        var clean = ModerationModeratorRules.trimOrNull(note)
+        var now = Time.nowIso()
+        var existing = moderators.findVote(reportId, moderatorId)
+        var saved = ModerationVote(ModerationModeratorRules.newId("mvote_"), reportId, moderatorId, voteType, clean, now, now)
+        if (existing != null) {
+            saved = ModerationVote(existing.id, reportId, moderatorId, voteType, clean, existing.createdAt, now)
+        }
+        moderators.saveVote(saved)
+        var all = moderators.votesOf(reportId)
+        var punish = ModerationPanel.countVotes(all, "PUNISH")
+        var dismiss = ModerationPanel.countVotes(all, "DISMISS")
+        var decision = "PENDING"
+        var message = "Voto registrado. A denúncia segue em análise."
+        if (punish >= voteQuorum && punish > dismiss) {
+            try {
+                decisions.penalize(reportId, moderatorId)
+                decision = "PENALIZED"
+                message = "Quórum atingido: autor restrito e conteúdo removido."
+            } catch (String failure) {
+                if (!Errors.hasCode(failure, "CANNOT_PENALIZE")) {
+                    throw failure
+                }
+                decision = "NEEDS_ADMIN"
+                message = "Quórum de punição atingido, mas este alvo precisa de decisão de um administrador."
+            }
+        }
+        else 
+            if (dismiss >= voteQuorum && dismiss > punish) {
+                decisions.dismiss(reportId, moderatorId, "Denúncia descartada por votação (" + punish + " a " + dismiss + ")")
+                decision = "DISMISSED"
+                message = "Quórum atingido: denúncia descartada."
+            }
+        var status = "PENDING"
+        var current = reports.findById(reportId)
+        if (current != null) {
+            status = current.status
+        }
+        return ModerationVoteResult(punish, dismiss, saved.vote, status, decision, message, voteQuorum)
+    }
+    // A direct punishment of any user by the panel. RESTRICTION blocks publishing; SUSPENDED and PERMABAN close the access (no
+    // appeal path in the panel for PERMABAN). Not a report: the reference is `admin:<id>` so the user's appeal works.
+    ModerationDirectSanction sanctionUser(adminId: String, username: String?, type: String?, reason: String?) {
+        if (type == null) {
+            throw Errors.api(400, "INVALID_SANCTION_TYPE", "Escolha restrição, banimento ou banimento permanente.")
+        }
+        String kind = type
+        var clean = ModerationModeratorRules.trim(reason)
+        if (clean.length() < 10) {
+            throw Errors.api(400, "REASON_REQUIRED", "Explique o motivo da punição (pelo menos 10 caracteres).")
+        }
+        var target = profiles.findByUsername(ModerationModeratorRules.trim(username))
+        if (target == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuário não encontrado.")
+        }
+        if (target.id == adminId) {
+            throw Errors.api(400, "CANNOT_SANCTION_SELF", "Você não pode punir a própria conta.")
+        }
+        var reference = "admin:" + adminId
+        var active = sanctionStore.findActiveByUser(target.id)
+        if (active != null && ModerationSanctions.isBlocked(active)) {
+            return ModerationDirectSanction(target.id, target.username, kind, "ALREADY_BANNED")
+        }
+        if (kind != "RESTRICTION") {
+            var sanction = ModerationSanctions.suspended(ModerationSanctions.newId(), target.id, reference, clean, Time.nowIso())
+            if (kind == "PERMABAN") {
+                sanction = ModerationSanctions.permaBan(ModerationSanctions.newId(), target.id, reference, clean, Time.nowIso())
+            }
+            if (active != null) {
+                sanction = ModerationSanctions.escalated(active, kind, clean)
+            }
+            sanctions.banAuthor(sanction, target.id, adminId)
+        }
+        else {
+            sanctions.restrictUser(target.id, reference, clean)
+        }
+        return ModerationDirectSanction(target.id, target.username, kind, "ACTIVE")
+    }
+    // Spam cleanup: DELETES from the database every post and comment of the user (not the soft delete of moderation).
+    ModerationSanitizeResult sanitizeUser(adminId: String, username: String?, reason: String?) {
+        var clean = ModerationModeratorRules.trim(reason)
+        if (clean.length() < 10) {
+            throw Errors.api(400, "REASON_REQUIRED", "Explique o motivo da sanitização (pelo menos 10 caracteres).")
+        }
+        var target = profiles.findByUsername(ModerationModeratorRules.trim(username))
+        if (target == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuário não encontrado.")
+        }
+        if (target.id == adminId) {
+            throw Errors.api(400, "CANNOT_SANITIZE_SELF", "Você não pode sanitizar a própria conta.")
+        }
+        var result = feed.purgeAllByAuthor(adminId, target.id, clean)
+        return ModerationSanitizeResult(target.id, target.username, result.posts(), result.comments(), result.otherRows())
+    }
+}
