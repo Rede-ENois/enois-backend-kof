@@ -1,0 +1,91 @@
+package app
+
+import java.util.HashMap
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import notifications.*
+
+// Test support for suites that boot the PRODUCTION wiring (AppWiring.installAll) and prove a behaviour comes from
+// the owner of a seam: one booted app per test file, limits relaxed so a suite can write freely.
+class WiredApp {
+    static TestApp? cachedApp = null
+    static AppWired? wiredHandle = null
+    static TestApp app() {
+        var cur = WiredApp.cachedApp
+        if (cur != null) {
+            return cur
+        }
+        var o = new HashMap<String, String>()
+        o.put("REDE_SECURITY_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+        o.put("REDE_OUTBOX_WORKER_DELAY_MS", "86400000")
+        o.put("REDE_ORIGINS_ENFORCE", "false")
+        o.put("REDE_SECURITY_NEW_ACCOUNT_COOLDOWN_SECONDS", "0")
+        o.put("REDE_RATE_POST_LIMIT", "1000")
+        o.put("REDE_RATE_COMMENT_LIMIT", "1000")
+        o.put("POST_USER_RATE_LIMIT", "100000")
+        o.put("GLOBAL_RATE_LIMIT_PER_MINUTE", "0")
+        o.put("REDE_SECURITY_DUPLICATE_POST_ENABLED", "false")
+        o.put("REDE_RATE_DUPLICATE_WINDOW_MINUTES", "0")
+        o.put("REDE_FEED_WORKERS_ENABLED", "false")
+        var created = TestApp.bootWith("wired", o, (p: Platform) -> {
+    WiredApp.wiredHandle = AppWiring.installAll(p)
+})
+        WiredApp.cachedApp = created
+        return created
+    }
+    static WiredNotificationLog? logHandle = null
+    // The notification recorder, attached to the production Notifications API on first use.
+    static WiredNotificationLog notificationLog() {
+        var l = WiredApp.logHandle
+        if (l == null) {
+            l = WiredNotificationLog()
+            WiredApp.wired().notifications.notifications.addListener(l)
+            WiredApp.logHandle = l
+        }
+        return l
+    }
+    static AppWired wired() {
+        WiredApp.app()
+        var w = WiredApp.wiredHandle
+        if (w == null) {
+            throw "app not wired"
+        }
+        return w
+    }
+    // Last test of a file: stops the background jobs so the process can end.
+    static finish() {
+        WiredApp.wired().shared.stop()
+    }
+    // A verified user with a live session; returns the token.
+    static String user(id: String) {
+        var db = WiredApp.app().db()
+        if (db.queryLong("select count(*) from users where id = ?", DbParams().bindStr(id)) == 0L) {
+            SecurityFixtures.login(db, id, "tok-" + id + "-1234567890")
+        }
+        return "tok-" + id + "-1234567890"
+    }
+    // An adult with a declared birth date (the age gate blocks every write without one).
+    static String adult(id: String) {
+        var token = WiredApp.user(id)
+        WiredApp.app().db().execute("update users set birth_date = ? where id = ?", DbParams().bindDate("1990-01-01").bindStr(id))
+        return token
+    }
+    static List<String> write(token: String, key: String) = listOf("X-Session-Token: " + token, "Idempotency-Key: " + key, "Content-Type: application/json")
+    static List<String> read(token: String) = listOf("X-Session-Token: " + token)
+    static TestResponse send(method: String, path: String, token: String, key: String, body: String) = WiredApp.app().client.send(method, path, WiredApp.write(token, key), "", body)
+    static TestResponse get(path: String, token: String) = WiredApp.app().client.getWith(path, WiredApp.read(token))
+}
+
+// Records every notification the Notifications API publishes (kind and user), the proof that a write went through
+// the owner and not through a table insert.
+class WiredNotificationLog extends NotificationListener {
+    List<String> events = listOf<String>()
+    public constructor() {
+        super()
+    }
+    onCreated(event: NotificationCreatedEvent) {
+        events.add(event.kind + ":" + event.userId)
+    }
+    Bool has(kind: String, userId: String) = events.contains(kind + ":" + userId)
+}

@@ -1,0 +1,31 @@
+import app.*
+import kernel.testkit.*
+
+// Production wiring (AppWiring): the domains that raise notifications write them through the Notifications API
+// (event published after commit, the listener of push), not through a plain insert into `notifications`.
+
+test "a connection request reaches the receiver through the Notifications API" {
+    var log = WiredApp.notificationLog()
+    var a = WiredApp.user("seam_notif_conn_a")
+    WiredApp.user("seam_notif_conn_b")
+    var res = WiredApp.send("POST", "/network/connections/seam_notif_conn_b", a, "seam-conn-1", "")
+    Check.status(res, 202)
+    Check.isTrue("event published for the receiver", log.has("CONNECTION_REQUEST", "seam_notif_conn_b"))
+    var b = WiredApp.user("seam_notif_conn_b")
+    var list = WiredApp.get("/notifications", b)
+    Check.status(list, 200)
+    Check.isTrue("listed", list.body.contains("CONNECTION_REQUEST"))
+}
+
+test "a mention in a post notifies the mentioned person through the Notifications API" {
+    var log = WiredApp.notificationLog()
+    var author = WiredApp.adult("seam_notif_mention_a")
+    WiredApp.user("seam_notif_mention_b")
+    var res = WiredApp.send("POST", "/feed/posts", author, "seam-mention-1", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Conversa sobre arquitetura de software com quem entende.\",\"tags\":[],\"mediaIds\":[],\"mentionedUserIds\":[\"seam_notif_mention_b\"]}")
+    Check.status(res, 201)
+    Check.isTrue("event published for the mentioned", log.has("MENTION", "seam_notif_mention_b"))
+}
+
+test "the stack is stopped at the end" {
+    WiredApp.finish()
+}

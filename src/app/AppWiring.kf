@@ -49,12 +49,28 @@ import companies.*
 import freelances.*
 import events.*
 import mentoring.*
+import network.*
+import preferences.*
 
 // The production composition: every domain module installed on a created platform, in dependency order.
 // Main.kf and tests/integration/BootRoutesTest.kf both call it, so a test boots the exact production wiring.
 // Returns the shared services so the caller can stop the background jobs (outbox worker, schedulers).
+// What the composition built and tests need to reach into: the shared services (to stop the jobs) and the modules
+// whose seams the wiring switched (tests listen to notifications, read the feed store...).
+class AppWired {
+    SharedServices shared
+    NotificationsModule notifications
+    FeedModule feed
+    public constructor(shared: SharedServices, notifications: NotificationsModule, feed: FeedModule) {
+        this.shared = shared
+        this.notifications = notifications
+        this.feed = feed
+    }
+}
+
 class AppWiring {
-    static SharedServices install(platform: Platform) {
+    static SharedServices install(platform: Platform) = AppWiring.installAll(platform).shared
+    static AppWired installAll(platform: Platform) {
         // Shared services (idempotency, outbox worker, audit, cipher, caches, sanction gate, risk engine, ...).
         var shared = SharedServices.create(platform)
         // The one mail service every sender shares (identity, age, jobs, notifications digest, blog newsletter):
@@ -78,41 +94,74 @@ class AppWiring {
         // The events store comes first: profile (attendance total of the reputation) and notifications (the event a notice
         // points at) read it through EventsForeignCounts and EventsNotificationPlaces; EventsModule installs later.
         var eventsStore = EventsStore(platform.db)
-        var profiles = ProfileModule.installWith(platform, shared, ProfileNotifier(platform.db), cosmeticsCore.badges, ProfileParentalLinks(platform.db), OrgsForeignCounts(platform.db, eventsStore), PreferencesThemeGallery(platform.db))
+        // Profile is installed before notifications (the actors read profiles): its notifier is bound right after.
+        var profileNotifier = ProfileNotificationsBridge(platform.db)
+        // The themes service comes first: preferences asks it whether a gallery theme is published.
+        var themeService = ThemeService(ThemeStore(platform.db))
+        var profiles = ProfileModule.installWith(platform, shared, profileNotifier, cosmeticsCore.badges, AgeProfileParentalLinks(platform.db, AgePolicyReader(AgeStore(platform.db))), OrgsForeignCounts(platform.db, eventsStore), ThemesPreferencesGallery(platform.db, themeService))
         // corporate (professional identity): after profile, before the domains that read it (feed, messaging, jobs).
         var corporate = CorporateModule.install(platform, profiles)
         // contributions: evidence, seals and the GitHub link. It comes before identity: the OAuth link of GitHub is
         // remembered by it (ContributionsOAuthLinks) and a verified contributor owns the cosmetic tag.
         var contributions = ContributionsModule.install(platform, shared, parts, profiles)
-        var jobSeams = JobSeamSet(platform, profiles)
-        jobSeams.corporate = CorporateJobsBridge(platform.db, corporate.service)
-        var identitySeams = IdentitySeams.defaults(platform, mail)
-        identitySeams.oauthLinks = ContributionsOAuthLinks(platform.db, contributions.identities, contributions.tokens, contributions.linkSync)
-        identitySeams.reputations = JobsIdentityReputation(jobSeams.reputation)
-        var identity = IdentityModule.installWith(platform, shared, hooks, parts, identitySeams)
-        var age = AgeModule.install(platform, identity.mailer)
-        OnboardingModule.install(platform, age.policy)
-        FeedModule.installWithCorporate(platform, shared, hooks, FeedCoins(), CorporateFeedBridge(platform.db, corporate.service))
         // Domains (one block each, ordered by dependency): notifications is the sink the others write to.
         // economy (coin): the ledger service is built first because the domains below call it (presence, rewards);
         // the routes, the disputes and the jobs come after notifications (CoinModule.install).
         var coinCore = CoinCore.create(platform, shared, parts)
         var notificationSeams = NotificationsSeams(platform, mail)
         notificationSeams.coins = CoinNotificationCoins(coinCore.service)
+        notificationSeams.actors = ProfileNotificationActors(platform.db, profiles.directory, corporate.service)
+        notificationSeams.sources = FeedNotificationSources(platform.db, FeedStore(platform.db))
+        notificationSeams.accounts = ProfileNotificationAccounts(platform.db, profiles.directory)
+        notificationSeams.digestAccounts = ProfileDigestAccounts(platform.db, profiles.directory)
+        notificationSeams.digestPersonalization = PreferencesDigestPersonalization(platform.db, profiles.preferences)
         notificationSeams.placeReader = EventsNotificationPlaces(platform.db, eventsStore)
         var notificationsModule = NotificationsModule.installWith(platform, shared, notificationSeams)
+        profileNotifier.api = notificationsModule.notifications
+        var jobSeams = JobSeamSet(platform, profiles)
+        jobSeams.corporate = CorporateJobsBridge(platform.db, corporate.service)
+        var identitySeams = IdentitySeams.defaults(platform, mail)
+        identitySeams.notifier = IdentityNotificationsBridge(notificationsModule.notifications)
+        identitySeams.oauthLinks = ContributionsOAuthLinks(platform.db, contributions.identities, contributions.tokens, contributions.linkSync)
+        identitySeams.reputations = JobsIdentityReputation(jobSeams.reputation)
+        var identity = IdentityModule.installWith(platform, shared, hooks, parts, identitySeams)
+        var age = AgeModule.install(platform, identity.mailer)
+        // media comes before the feed (post attachments) and the groups (topic attachments).
+        var media = MediaModule.install(platform, shared, hooks)
+        // The feed asks communities and blog through their stores (stateless readers over the same database): the
+        // communities module itself is installed after the feed because it serves the community feed.
+        var communityDirectory = CommunityDirectory(CommunityStore(platform.db))
+        var channelDirectory = CommunityChannelDirectory(CommunityChannelStore(platform.db))
+        var feedSeams = FeedSeams(platform.db)
+        feedSeams.authors = ProfileFeedAuthors(platform.db, profiles.directory, corporate.service, contributions.store)
+        feedSeams.media = MediaFeedBridge(platform.db, media.service)
+        feedSeams.communities = CommunityFeedCommunities(platform.db, communityDirectory, channelDirectory)
+        feedSeams.notifier = FeedNotificationsBridge(platform.db, notificationsModule.notifications)
+        feedSeams.ageGate = AgeFeedGate(age.gate)
+        feedSeams.coins = CoinFeedCoins(coinCore.service)
+        feedSeams.corporate = CorporateFeedBridge(platform.db, corporate.service)
+        feedSeams.graph = NetworkFeedGraph(platform.db, profiles.network)
+        feedSeams.blogs = BlogFeedBlogs(platform.db, BlogStore(platform.db))
+        feedSeams.prefs = PreferencesFeedReader(platform.db, profiles.preferences)
+        var feedModule = FeedModule.installSeams(platform, shared, hooks, feedSeams)
         var coinModule = CoinModule.install(platform, shared, parts, coinCore, profiles, notificationsModule)
         CosmeticsModule.installWith(platform, cosmeticsCore, coinModule, profiles, ContributionsCosmeticsContributors(platform.db, VerifiedContributors(contributions.store, profiles.directory)))
         // events: attendance, rituals (recurrence job) and the sanitisation job; writes notifications, reads identity.
         EventsModule.install(platform, shared, parts, identity, notificationsModule, eventsStore)
-        PushModule.install(platform, shared, hooks, parts, notificationsModule)
+        PushModule.withPresence(platform, notificationsModule, PresencePushBridge(platform.db, profiles.presence))
         var messagingSeams = MessagingSeamSet(platform)
+        messagingSeams.agePolicy = AgeMessagingPolicy(platform.db, age.policy, age.gate)
+        messagingSeams.connections = NetworkMessagingConnections(platform.db, profiles.network)
         messagingSeams.corporate = CorporateMessagingBridge(platform.db, corporate.service)
         messagingSeams.coins = CoinMessagingCoins(coinCore.service)
         var messagingModule = MessagingModule.installWith(platform, shared, parts, notificationsModule, messagingSeams)
-        CallsModule.install(platform, shared, hooks, parts, notificationsModule, messagingModule)
         // Groups notices go through the Notifications API (push + preferences): see GroupNotificationsBridge.
-        GroupsModule.installWith(platform, shared, GroupProfileLookup(platform.db), GroupAgeGate(platform.db), GroupMediaLookup(platform.db), GroupNotificationsBridge(platform.db, notificationsModule.notifications), CoinGroupCoins(coinCore.service))
+        var groupsModule = GroupsModule.installWith(platform, shared, ProfileGroupLookup(platform.db, profiles.directory), AgeGroupGate(platform.db, age.gate), MediaGroupLookup(platform.db, media.service), GroupNotificationsBridge(platform.db, notificationsModule.notifications), CoinGroupCoins(coinCore.service))
+        // calls: who may enter a group call comes from the groups service, the name from the profile directory.
+        var callSeams = CallsSeamSet(platform)
+        callSeams.groups = GroupsCallGroups(platform.db, groupsModule.groups)
+        callSeams.profiles = ProfileCallLookup(platform.db, profiles.directory)
+        CallsModule.installWith(platform, shared, parts, notificationsModule, messagingModule, callSeams)
         // Jobs: postings, applications (delivery by message and email), company directory, external listings and
         // their refresh job. Seams: JobSeamSet (reputation, companies, corporate, source transport).
         // companies: the page service comes first because the jobs seam JobCompanies is backed by it; the routes,
@@ -127,29 +176,30 @@ class AppWiring {
         ImportResumeModule.install(platform, jobs, linkedinImport)
         // Games: the aggregator (profile, notifications and age gate through their APIs; coin and feed through
         // the seams GamesCoins and GamesFeed) and the daily games with their 00:20 prize job.
-        var gamesModule = GamesModule.install(platform, shared, hooks, profiles, notificationsModule, age.gate)
+        var gamesModule = GamesModule.installFull(platform, profiles, notificationsModule, CoinGamesCoins(platform.db, shared.cipher, coinCore.service, coinCore.rates), FeedGamesFeed(platform.db, age.gate, shared.sanctionGate, feedModule.service), GamesHosts())
         DailyGamesModule.install(platform, shared, notificationsModule, gamesModule.coins)
-        CommunitiesModule.installWith(platform, shared, hooks, CommunityProfileLookup(platform.db), CommunityFeedLookup(platform.db), CoinCommunityCoins(coinCore.service))
-        CommunityProjectsModule.install(platform, shared, hooks)
-        StudyPairsModule.install(platform, shared, hooks)
+        var communitiesModule = CommunitiesModule.installWith(platform, shared, hooks, ProfileCommunityLookup(platform.db, profiles.directory), FeedCommunityLookup(platform.db, feedModule.reader, feedModule.service, feedModule.store), CoinCommunityCoins(coinCore.service))
+        // onboarding joins communities and groups and asks for connections through their services: after them.
+        OnboardingModule.installWith(platform, age.policy, AppOnboardingActions(platform.db, profiles.preferences, profiles.service, profiles.directory, communitiesModule.service, groupsModule.groups, profiles.network))
+        CommunityProjectsModule.installWith(platform, ProfileCommunityProjectLookup(platform.db, profiles.directory), CommunityProjectModerators(platform.db))
+        StudyPairsModule.installWith(platform, shared, ProfileStudyPairLookup(platform.db, profiles.directory), AgeStudyPairPolicy(platform.db, age.policy), PreferencesStudyPairs(platform.db, profiles.preferences), StudyPairNotificationsBridge(platform.db, notificationsModule.notifications))
         GifsModule.install(platform, shared, hooks)
-        LinkedInModule.install(platform, shared, hooks)
+        LinkedInModule.installWith(platform, shared, FeedLinkedInPosts(platform.db, feedModule.store), LinkedInHttpShareClient(LinkedInHttpShareClient.defaultEndpoint()), LinkedInClock())
         EmotesModule.install(platform, shared, hooks)
-        MediaModule.install(platform, shared, hooks)
         // Leaf domains: stats, search, themes, projects, notices, releasenotes, suggestions, blog.
         StatsModule.install(platform, shared, hooks)
         NoticeModule.install(platform, shared, hooks)
         ReleaseNoteModule.install(platform, shared, hooks)
         SearchModule.install(platform, shared, hooks)
-        var themeModule = ThemeModule.install(platform, shared, hooks)
-        var projectsModule = ProjectsModule.install(platform, shared, hooks)
+        var themeModule = ThemeModule.withService(platform, themeService)
+        var projectsModule = ProjectsModule.withProfiles(platform, ProfileProjectsLookup(platform.db, profiles.directory))
         // support (tickets, the GitHub mirror, the webhook): the person who answers comments with their own GitHub
         // identity (contributions). The suggestions reuse its GitHub token, so they come after it.
         var supportModule = SupportModule.install(platform, shared, profiles, notificationsModule, mail, SupportLinkedPeople(profiles.directory, contributions.identities, contributions.tokens))
         SuggestionsModule.withGateway(platform, SuggestionIssueClient.fromConfig(platform.cfg, SuggestionsSupportToken(platform.db, shared.cipher, supportModule.settings)))
         ContributorsModule.install(platform, parts, contributions, profiles)
         GithubProfileModule.install(platform, shared, contributions, profiles, projectsModule)
-        BlogModule.withSeams(platform, shared, BlogProfiles(platform.db), BlogFeedPointers(), BlogNotifier(), CoinBlogCoins(coinCore.service), BlogEmailSender(mail))
+        BlogModule.withSeams(platform, shared, ProfileBlogLookup(platform.db, profiles.directory), FeedBlogPointers(feedModule.service), BlogNotificationsBridge(notificationsModule.notifications), CoinBlogCoins(coinCore.service), BlogEmailSender(mail))
         // economy: the marketplace (escrow, workers) and the services directory/contracts sit on the coin service.
         MarketplaceModule.install(platform, shared, coinModule, profiles, themeModule)
         ServicesModule.install(platform, shared, coinModule, profiles, messagingModule)
@@ -158,6 +208,6 @@ class AppWiring {
         FreelancesModule.install(platform, shared, profiles, age.gate, corporate, messagingModule)
         // mentoring: agenda, bookings paid through the coin escrow, rooms. After coin and profile.
         MentoringModule.install(platform, shared, coinModule, profiles)
-        return shared
+        return AppWired(shared, notificationsModule, feedModule)
     }
 }
