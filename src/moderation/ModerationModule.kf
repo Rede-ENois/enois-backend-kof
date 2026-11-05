@@ -33,7 +33,14 @@ class ModerationModule {
     ModerationSignalWeights weights
     ModerationAi ai
     ModerationTriageJob triageJob
-    public constructor(service: ModerationService, store: ModerationStore, targets: ModerationTargets, decisions: ModerationDecisions, sanctions: ModerationSanctionService, sanctionStore: ModerationSanctionStore, banCleanup: ModerationBanCleanup, quarantine: ModerationQuarantine, learning: ModerationLearning, verdicts: ModerationVerdicts, suspensions: ModerationSuspensions, contentTargets: ModerationContentTargets, panel: ModerationPanel, proposals: ModerationProposals, moderators: ModerationModeratorStore, preTriage: ModerationPreTriageService, weights: ModerationSignalWeights, ai: ModerationAi, triageJob: ModerationTriageJob) {
+    ModerationIpBlocks ipBlocks
+    ModerationSuspiciousUserService suspects
+    ModerationBulkBan bulkBan
+    ModerationHoneypot honeypot
+    ModerationAutoBan autoBan
+    ModerationContentSweep contentSweep
+    ModerationCleanup cleanup
+    public constructor(service: ModerationService, store: ModerationStore, targets: ModerationTargets, decisions: ModerationDecisions, sanctions: ModerationSanctionService, sanctionStore: ModerationSanctionStore, banCleanup: ModerationBanCleanup, quarantine: ModerationQuarantine, learning: ModerationLearning, verdicts: ModerationVerdicts, suspensions: ModerationSuspensions, contentTargets: ModerationContentTargets, panel: ModerationPanel, proposals: ModerationProposals, moderators: ModerationModeratorStore, preTriage: ModerationPreTriageService, weights: ModerationSignalWeights, ai: ModerationAi, triageJob: ModerationTriageJob, ipBlocks: ModerationIpBlocks, suspects: ModerationSuspiciousUserService, bulkBan: ModerationBulkBan, honeypot: ModerationHoneypot, autoBan: ModerationAutoBan, contentSweep: ModerationContentSweep, cleanup: ModerationCleanup) {
         this.service = service
         this.store = store
         this.targets = targets
@@ -53,9 +60,18 @@ class ModerationModule {
         this.weights = weights
         this.ai = ai
         this.triageJob = triageJob
+        this.ipBlocks = ipBlocks
+        this.suspects = suspects
+        this.bulkBan = bulkBan
+        this.honeypot = honeypot
+        this.autoBan = autoBan
+        this.contentSweep = contentSweep
+        this.cleanup = cleanup
     }
-    static ModerationModule install(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications) = ModerationModule.installWith(platform, shared, parts, feed, groups, profiles, mail, notifications, ModerationReportEvents(), ModerationCompanies(platform.db), ModerationSanctionHooks(), ModerationLlmTransport(), ModerationImages())
-    static ModerationModule installWith(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications, events: ModerationReportEvents, companies: ModerationCompanies, sanctionHooks: ModerationSanctionHooks, llm: ModerationLlmTransport, images: ModerationImages) {
+    static ModerationModule install(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications) = ModerationModule.installWith(platform, shared, parts, feed, groups, profiles, mail, notifications, ModerationReportEvents(), ModerationCompanies(platform.db), ModerationSanctionHooks(), ModerationLlmTransport(), ModerationImages(), ModerationModule.honeypotFor(platform, parts), ModerationEarly())
+    // The HoneypotGuard the feed routes use. AppWiring builds it BEFORE the feed install and passes it to installWith.
+    static ModerationHoneypot honeypotFor(platform: Platform, parts: SecurityParts) = ModerationHoneypot(parts.admin, ModerationModeratorStore(platform.db), ModerationSanctionStore(platform.db), platform.cfg.getBool("REDE_SECURITY_HONEYPOT_AUTO_BAN", true))
+    static ModerationModule installWith(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications, events: ModerationReportEvents, companies: ModerationCompanies, sanctionHooks: ModerationSanctionHooks, llm: ModerationLlmTransport, images: ModerationImages, honeypot: ModerationHoneypot, early: ModerationEarly) {
         var cfg = platform.cfg
         var store = ModerationStore(platform.db)
         var targets = ModerationTargets(feed.moderation, groups.reports, companies)
@@ -85,6 +101,19 @@ class ModerationModule {
         var triageJob = ModerationTriageJob(ai, preTriage, verdicts, cfg.getBool("MODERATION_AI_TRIAGE_ENABLED", true), cfg.getBool("MODERATION_AI_AUTO_PENALTY", true))
         triageJob.schedule(shared.jobs)
         ModerationPanelRoutes.register(platform.server, panel, proposals, quarantine)
-        return ModerationModule(service, store, targets, decisions, sanctions, sanctionStore, banCleanup, quarantine, learning, verdicts, suspensions, contentTargets, panel, proposals, moderators, preTriage, weights, ai, triageJob)
+        honeypot.bind(sanctions)
+        early.bind(service)
+        var ipBlocks = ModerationIpBlocks(platform.db, profiles.directory)
+        var suspects = ModerationSuspiciousUserService(ModerationSuspectReader(platform.db), parts.admin, gate, cfg.getInt("REDE_SECURITY_SUSPICIOUS_DAYS", 90), cfg.getStr("REDE_SECURITY_SUSPICIOUS_NAME_PATTERNS", "probe"))
+        var bulkBan = ModerationBulkBan(panel, ipBlocks, cfg.getInt("REDE_MODERATION_BULK_BAN_MAX", 200), cfg.getBool("REDE_MODERATION_BULK_BAN_BLOCK_IPS", true), cfg.getInt("REDE_MODERATION_BULK_BAN_IPS_MIN_ACCOUNTS", 2))
+        var suspectReader = ModerationSuspectReader(platform.db)
+        var autoBan = ModerationAutoBan.fromConfig(cfg, suspects, panel, ipBlocks, suspectReader)
+        autoBan.schedule(shared.jobs, cfg)
+        var contentSweep = ModerationContentSweep(platform.db, contentTargets, panel, moderators, gate, parts.admin)
+        contentSweep.schedule(shared.jobs, cfg)
+        var cleanup = ModerationCleanup(store, service, gate)
+        cleanup.schedule(shared.jobs, cfg)
+        ModerationSecurityRoutes.register(platform.server, ipBlocks, suspects, bulkBan, store, feed.moderation, autoBan)
+        return ModerationModule(service, store, targets, decisions, sanctions, sanctionStore, banCleanup, quarantine, learning, verdicts, suspensions, contentTargets, panel, proposals, moderators, preTriage, weights, ai, triageJob, ipBlocks, suspects, bulkBan, honeypot, autoBan, contentSweep, cleanup)
     }
 }

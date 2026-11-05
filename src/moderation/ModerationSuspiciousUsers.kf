@@ -1,0 +1,210 @@
+package moderation
+
+import kernel.db.*
+import kernel.sanctions.*
+import kernel.security.*
+import kernel.time.*
+
+// A recent account with the objective signals that feed the suspicion score (SuspiciousUserReader.Candidate).
+record ModerationSuspectCandidate(String id, String username, String name, String? avatar, String? bio, String createdAt, String? emailVerifiedAt, Long postCount, Long commentCount, Long reportCount, Bool moderator)
+
+record ModerationSuspiciousUser(String username, String name, String createdAt, Bool emailVerified, Long posts, Long comments, Long reportsAgainst, Int riskScore, List<String> signals, Bool staff)
+
+record ModerationSuspiciousUsers(List<ModerationSuspiciousUser> items, Int total, String since, Int days)
+
+// JdbcSuspiciousUserReader: one aggregating query per call. The pattern clause is built from configuration only, never from
+// request text.
+class ModerationSuspectReader {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String select() = "select u.id, u.username, u.name, u.avatar, u.bio, u.created_at, u.email_verified_at, (select count(*) from posts p where p.author_id = u.id) as post_count, (select count(*) from comments c where c.author_id = u.id) as comment_count, (select count(*) from reports r where r.target_type = \'USER\' and r.target_id = u.id and r.status in (\'PENDING\', \'APPROVED\', \'AUTO_PENALIZED\')) as report_count, (select count(*) from moderator_applications m where m.user_id = u.id and m.status = \'APPROVED\') as moderator from users u where u.created_at >= ?"
+    static ModerationSuspectCandidate candidate(r: DbRow) = ModerationSuspectCandidate(r.getStr("id"), r.getStr("username"), r.getStr("name"), r.getStrOrNull("avatar"), r.getStrOrNull("bio"), r.getInstant("created_at"), r.getInstantOrNull("email_verified_at"), r.getLong("post_count"), r.getLong("comment_count"), r.getLong("report_count"), r.getLong("moderator") > 0L)
+    List<ModerationSuspectCandidate> findRecent(since: String, limit: Int) {
+        var out = listOf<ModerationSuspectCandidate>()
+        for (var r in store.queryList(ModerationSuspectReader.select() + " order by u.created_at desc limit ?", DbParams().bindInstant(since).bindInt(limit))) {
+            out.add(ModerationSuspectReader.candidate(r))
+        }
+        return out
+    }
+    // Accounts whose username OR name contains one of the patterns: the direct containment path, independent of the score.
+    List<ModerationSuspectCandidate> findMatching(patterns: List<String>, since: String, limit: Int) {
+        var out = listOf<ModerationSuspectCandidate>()
+        var clause = ""
+        var params = DbParams().bindInstant(since)
+        for (var p in patterns) {
+            if (p.trim().length() == 0) {
+                continue
+            }
+            if (clause.length() > 0) {
+                clause = clause + " or "
+            }
+            clause = clause + "lower(u.username) like ? or lower(u.name) like ?"
+            params = params.bindStr("%" + p.trim().toLowerCase() + "%").bindStr("%" + p.trim().toLowerCase() + "%")
+        }
+        if (clause.length() == 0) {
+            return out
+        }
+        params = params.bindInt(ModerationContentTargets.clampInt(limit, 1, 500))
+        for (var r in store.queryList(ModerationSuspectReader.select() + " and (" + clause + ") order by u.created_at desc limit ?", params)) {
+            out.add(ModerationSuspectReader.candidate(r))
+        }
+        return out
+    }
+}
+
+// SuspiciousUserService: ranks recent accounts by objective signals, never accusing anyone automatically; the result is a list
+// for human review and the bulk ban is a separate explicit action.
+class ModerationSuspiciousUserService {
+    ModerationSuspectReader reader
+    AdminGuard admins
+    SanctionGateReader gate
+    Int defaultDays
+    List<String> namePatterns
+    public constructor(reader: ModerationSuspectReader, admins: AdminGuard, gate: SanctionGateReader, defaultDays: Int, patternsCsv: String) {
+        this.reader = reader
+        this.admins = admins
+        this.gate = gate
+        this.defaultDays = ModerationContentTargets.clampInt(defaultDays, 1, 365)
+        this.namePatterns = ModerationSuspiciousUserService.patterns(patternsCsv)
+    }
+    static Int minScore() = 30
+    static Int maxCandidates() = 500
+    static Int maxResults() = 200
+    static List<String> patterns(csv: String) {
+        var out = listOf<String>()
+        for (var p in csv.split(",")) {
+            var t = p.trim().toLowerCase()
+            if (t.length() > 0) {
+                out.add(t)
+            }
+        }
+        return out
+    }
+    static String normalize(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v.trim().toLowerCase()
+    }
+    static Bool blank(v: String?) {
+        if (v == null) {
+            return true
+        }
+        return v.trim().length() == 0
+    }
+    ModerationSuspiciousUsers list(requestedLimit: Int, requestedDays: Int) {
+        var days = requestedDays
+        if (days <= 0) {
+            days = defaultDays
+        }
+        days = ModerationContentTargets.clampInt(days, 1, 365)
+        var limit = ModerationContentTargets.clampInt(requestedLimit, 1, ModerationSuspiciousUserService.maxResults())
+        var since = Time.plusSeconds(Time.nowIso(), -((days as Long) * 86400L))
+        var candidates = reader.findRecent(since, ModerationSuspiciousUserService.maxCandidates())
+        var names = mapOf<String, Int>()
+        for (var c in candidates) {
+            var key = ModerationSuspiciousUserService.normalize(c.name)
+            names.put(key, names.getOrDefault(key, 0) + 1)
+        }
+        var scored = listOf<ModerationSuspiciousUser>()
+        for (var c in candidates) {
+            // Whoever was already banned does not return to the triage queue.
+            if (gate.banned(c.id)) {
+                continue
+            }
+            // Staff accounts are listed (marked), never hidden: the automation does not punish the team, a human decides.
+            var staff = c.moderator || admins.isAdmin(c.id)
+            var item = this.score(c, names.getOrDefault(ModerationSuspiciousUserService.normalize(c.name), 0), staff)
+            if (item.riskScore >= ModerationSuspiciousUserService.minScore()) {
+                scored.add(item)
+            }
+        }
+        var ordered = ModerationSuspiciousUserService.byRiskDesc(scored)
+        var items = listOf<ModerationSuspiciousUser>()
+        for (var s in ordered) {
+            if (items.size() < limit) {
+                items.add(s)
+            }
+        }
+        return ModerationSuspiciousUsers(items, items.size(), since, days)
+    }
+    // Stable sort by risk, highest first: the candidates arrive newest first, so ties keep the newest first.
+    static List<ModerationSuspiciousUser> byRiskDesc(items: List<ModerationSuspiciousUser>) {
+        var out = listOf<ModerationSuspiciousUser>()
+        var taken = listOf<Bool>()
+        for (var item in items) {
+            taken.add(false)
+        }
+        var k = 0
+        while (k < items.size()) {
+            var best = -1
+            var i = 0
+            while (i < items.size()) {
+                if (!taken.get(i) && (best < 0 || items.get(i).riskScore > items.get(best).riskScore)) {
+                    best = i
+                }
+                i = i + 1
+            }
+            taken.set(best, true)
+            out.add(items.get(best))
+            k = k + 1
+        }
+        return out
+    }
+    Bool matchesPattern(c: ModerationSuspectCandidate) {
+        var typed = ModerationSuspiciousUserService.normalize(c.username) + " " + ModerationSuspiciousUserService.normalize(c.name)
+        for (var p in namePatterns) {
+            if (typed.contains(p)) {
+                return true
+            }
+        }
+        return false
+    }
+    static Bool isRecent(c: ModerationSuspectCandidate) = Time.toMillis(c.createdAt) > Time.nowMillis() - 7L * 86400000L
+    static Int reportWeight(count: Long) {
+        var weight = count * 15L
+        if (weight > 45L) {
+            weight = 45L
+        }
+        return weight as Int
+    }
+    ModerationSuspiciousUser score(c: ModerationSuspectCandidate, sameName: Int, staff: Bool) {
+        var signals = listOf<String>()
+        var risk = 0
+        if (staff) {
+            signals.add("EQUIPE")
+        }
+        if (matchesPattern(c)) {
+            risk = risk + 70
+            signals.add("NOME_SUSPEITO")
+        }
+        if (sameName >= 3) {
+            risk = risk + 35
+            signals.add("NOME_REPETIDO")
+        }
+        var verified = c.emailVerifiedAt != null
+        if (!verified) {
+            risk = risk + 15
+            signals.add("EMAIL_NAO_VERIFICADO")
+        }
+        if (c.postCount == 0L && c.commentCount == 0L) {
+            risk = risk + 10
+            signals.add("SEM_CONTEUDO")
+        }
+        if (ModerationSuspiciousUserService.blank(c.avatar) && ModerationSuspiciousUserService.blank(c.bio)) {
+            risk = risk + 5
+            signals.add("PERFIL_VAZIO")
+        }
+        if (ModerationSuspiciousUserService.isRecent(c)) {
+            risk = risk + 10
+            signals.add("CONTA_NOVA")
+        }
+        if (c.reportCount > 0L) {
+            risk = risk + ModerationSuspiciousUserService.reportWeight(c.reportCount)
+            signals.add("DENUNCIAS_CONTRA")
+        }
+        return ModerationSuspiciousUser(c.username, c.name, c.createdAt, verified, c.postCount, c.commentCount, c.reportCount, risk, signals, staff)
+    }
+}

@@ -1,0 +1,136 @@
+import kernel.db.*
+import kernel.testkit.*
+import moderation.*
+
+// Ports of BulkBanAndSuspiciousTests (3), BulkBanIpBlockTests and the IP block endpoints of ModeratorPermissionsTests.
+// The login side of the Java assertions (ACCOUNT_BANNED, IP_BLOCKED on /auth/login) is proved against the production
+// wiring in tests/integration (the identity domain is not part of this kit): here the sessions are revoked and the
+// block list row exists.
+appoint(admin: String, username: String) {
+    var res = ModerationTestKit.post(admin, "/admin/moderators", "{\"username\":\"" + username + "\",\"note\":\"Nomeado para o teste de banimento em lote.\"}")
+    Check.status(res, 200)
+}
+
+Bool queueHas(res: TestResponse, username: String) = res.body.contains("\"username\":\"" + username + "\"")
+
+test "an approved moderator sees the suspicious accounts and bans in bulk" {
+    var admin = ModerationTestKit.loginAdmin("bb_admin")
+    var moderator = ModerationTestKit.login("bb_moderator")
+    var target = ModerationTestKit.login("probe-mod-target")
+    var common = ModerationTestKit.login("bb_common")
+    Check.status(ModerationTestKit.get(common, "/moderation/users/suspicious"), 403)
+    appoint(admin, "bb_moderator")
+    var queue = ModerationTestKit.get(moderator, "/moderation/users/suspicious?days=1&limit=200")
+    Check.status(queue, 200)
+    Check.isTrue("the probe account is in the queue", queueHas(queue, "probe-mod-target"))
+    Check.isTrue("flagged by the name pattern", queue.body.contains("NOME_SUSPEITO"))
+    var ban = ModerationTestKit.post(moderator, "/moderation/users/bulk-ban", "{\"usernames\":[\"probe-mod-target\"],\"type\":\"BAN\",\"reason\":\"Cadastro em série identificado na triagem de contas.\"}")
+    Check.status(ban, 200)
+    Check.jsonEq(ban, "banned", "1")
+    Check.status(ModerationTestKit.get(target, "/moderation/me"), 401)
+    var after = ModerationTestKit.get(moderator, "/moderation/users/suspicious?days=1&limit=200")
+    Check.isTrue("a banned account leaves the queue", !queueHas(after, "probe-mod-target"))
+}
+
+test "bulk ban reports each account and a repeat is idempotent" {
+    var admin = ModerationTestKit.loginAdmin("bb2_admin")
+    var first = ModerationTestKit.login("probe-bulk-a")
+    var second = ModerationTestKit.login("probe-bulk-b")
+    var suspicious = ModerationTestKit.get(admin, "/moderation/users/suspicious?days=1&limit=200")
+    Check.status(suspicious, 200)
+    Check.isTrue("first listed", queueHas(suspicious, "probe-bulk-a"))
+    Check.isTrue("second listed", queueHas(suspicious, "probe-bulk-b"))
+    Check.status(ModerationTestKit.get(first, "/moderation/users/suspicious"), 403)
+    var body = "{\"usernames\":[\"probe-bulk-a\",\"probe-bulk-b\",\"bb2_admin\",\"nao-existe\"],\"type\":\"BAN\",\"reason\":\"Cadastros em série criados para sondar a plataforma.\"}"
+    var banned = ModerationTestKit.post(admin, "/moderation/users/bulk-ban", body)
+    Check.status(banned, 200)
+    Check.jsonEq(banned, "total", "4")
+    Check.jsonEq(banned, "banned", "2")
+    Check.jsonEq(banned, "failed", "2")
+    Check.isTrue("failed items are named", banned.body.contains("bb2_admin") && banned.body.contains("nao-existe") && banned.body.contains("FAILED"))
+    Check.status(ModerationTestKit.get(first, "/moderation/me"), 401)
+    Check.status(ModerationTestKit.get(second, "/moderation/me"), 401)
+    var again = ModerationTestKit.post(admin, "/moderation/users/bulk-ban", "{\"usernames\":[\"probe-bulk-a\",\"probe-bulk-b\"],\"type\":\"BAN\",\"reason\":\"Cadastros em série criados para sondar a plataforma.\"}")
+    Check.status(again, 200)
+    Check.jsonEq(again, "banned", "0")
+    Check.jsonEq(again, "alreadyBanned", "2")
+    var active = ModerationTestKit.db().queryLong("select count(*) from user_sanctions where user_id in (?, ?) and status = \'ACTIVE\'", DbParams().bindStr("probe-bulk-a").bindStr("probe-bulk-b"))
+    Check.eqInt("one active sanction per account", 2, active as Int)
+    var restriction = ModerationTestKit.post(admin, "/moderation/users/bulk-ban", "{\"usernames\":[\"x\"],\"type\":\"RESTRICTION\"}")
+    Check.apiError(restriction, 400, "INVALID_SANCTION_TYPE")
+    Check.apiError(ModerationTestKit.post(admin, "/moderation/users/bulk-ban", "{\"usernames\":[]}"), 400, "NO_USERS_SELECTED")
+}
+
+test "the repeated ip of a batch is blocked and listed, a single account's ip is not" {
+    var admin = ModerationTestKit.loginAdmin("bb3_admin")
+    ModerationTestKit.login("probe-ip-one")
+    ModerationTestKit.login("probe-ip-two")
+    ModerationTestKit.login("probe-ip-solo")
+    var store = ModerationTestKit.db()
+    store.execute("update auth_sessions set ip = ? where user_id in (?, ?)", DbParams().bindStr("203.0.113.7").bindStr("probe-ip-one").bindStr("probe-ip-two"))
+    store.execute("update auth_sessions set ip = ? where user_id = ?", DbParams().bindStr("203.0.113.99").bindStr("probe-ip-solo"))
+    var ips = ModerationTestKit.get(admin, "/admin/users/probe-ip-one/ips")
+    Check.status(ips, 200)
+    Check.jsonEq(ips, "0.ip", "203.0.113.7")
+    var ban = ModerationTestKit.post(admin, "/moderation/users/bulk-ban", "{\"usernames\":[\"probe-ip-one\",\"probe-ip-two\",\"probe-ip-solo\"],\"type\":\"BAN\",\"reason\":\"Cadastros em série na triagem de contas.\"}")
+    Check.status(ban, 200)
+    Check.jsonEq(ban, "banned", "3")
+    Check.isTrue("the repeated ip is reported", ban.body.contains("203.0.113.7"))
+    Check.isTrue("the lone ip is not", !ban.body.contains("203.0.113.99"))
+    var list = ModerationTestKit.get(admin, "/admin/blocked-ips")
+    Check.status(list, 200)
+    Check.isTrue("listed", list.body.contains("203.0.113.7") && list.body.contains("contas banidas em lote"))
+    var blocked = store.queryLong("select count(*) from blocked_ips where ip = ?", DbParams().bindStr("203.0.113.7"))
+    Check.eqInt("row in the block list", 1, blocked as Int)
+    var unblock = ModerationTestKit.post(admin, "/admin/blocked-ips/203.0.113.7/unblock", "")
+    Check.status(unblock, 200)
+    Check.jsonEq(unblock, "blocked", "false")
+    Check.eqInt("row removed", 0, store.queryLong("select count(*) from blocked_ips where ip = ?", DbParams().bindStr("203.0.113.7")) as Int)
+}
+
+test "blocking an ip validates the input and refuses a duplicate" {
+    var admin = ModerationTestKit.loginAdmin("bb4_admin")
+    var common = ModerationTestKit.login("bb4_common")
+    Check.status(ModerationTestKit.post(common, "/admin/blocked-ips", "{\"ip\":\"198.51.100.1\"}"), 403)
+    Check.status(ModerationTestKit.get(common, "/admin/blocked-ips"), 403)
+    Check.status(ModerationTestKit.get(common, "/admin/users/bb4_admin/ips"), 403)
+    Check.apiError(ModerationTestKit.post(admin, "/admin/blocked-ips", "{\"ip\":\"  \"}"), 400, "INVALID_IP")
+    Check.apiError(ModerationTestKit.post(admin, "/admin/blocked-ips", "{\"ip\":\"desconhecido\"}"), 400, "INVALID_IP")
+    Check.apiError(ModerationTestKit.post(admin, "/admin/blocked-ips", "{\"ip\":\"198.51.100.2\",\"reason\":\"abc\"}"), 400, "REASON_REQUIRED")
+    var ok = ModerationTestKit.post(admin, "/admin/blocked-ips", "{\"ip\":\" 198.51.100.2 \",\"reason\":\"Atacante recorrente\"}")
+    Check.status(ok, 200)
+    Check.jsonEq(ok, "ip", "198.51.100.2")
+    Check.jsonEq(ok, "createdBy", "bb4_admin")
+    Check.apiError(ModerationTestKit.post(admin, "/admin/blocked-ips", "{\"ip\":\"198.51.100.2\"}"), 409, "IP_ALREADY_BLOCKED")
+    Check.apiError(ModerationTestKit.get(admin, "/admin/users/nobody-here/ips"), 404, "USER_NOT_FOUND")
+    ModerationTestKit.post(admin, "/admin/blocked-ips/198.51.100.2/unblock", "")
+}
+
+test "a moderator sees and removes suspicious posts in bulk" {
+    var admin = ModerationTestKit.loginAdmin("bb5_admin")
+    var moderator = ModerationTestKit.login("bb5_moderator")
+    var author = ModerationTestKit.login("bb5_author")
+    var reporter = ModerationTestKit.login("bb5_reporter")
+    appoint(admin, "bb5_moderator")
+    Check.status(ModerationTestKit.get(moderator, "/moderation/posts/suspicious"), 200)
+    Check.status(ModerationTestKit.get(author, "/moderation/posts/suspicious"), 403)
+    var postId = ModerationTestKit.publish(author, "Post que sera removido em lote.")
+    var other = ModerationTestKit.publish(author, "Outro post que fica no ar.")
+    Check.status(ModerationTestKit.report(reporter, "POST", postId, "SPAM", "spam em serie"), 201)
+    ModerationTestKit.db().execute("update reports set pre_triage_score = 90, pre_triage = ?, pre_triaged_at = ? where target_id = ?", DbParams().bindStr("[\"LINK\"]").bindInstant("2026-01-01T00:00:00Z").bindStr(postId))
+    var queue = ModerationTestKit.get(moderator, "/moderation/posts/suspicious?minScore=50")
+    Check.status(queue, 200)
+    Check.jsonEq(queue, "0.postId", postId)
+    Check.jsonEq(queue, "0.score", "90")
+    Check.jsonEq(queue, "0.reason", "SPAM")
+    Check.apiError(ModerationTestKit.post(moderator, "/moderation/posts/bulk-delete", "{\"postIds\":[],\"reason\":\"Motivo de limpeza em lote.\"}"), 400, "NO_POSTS_SELECTED")
+    Check.apiError(ModerationTestKit.post(moderator, "/moderation/posts/bulk-delete", "{\"postIds\":[\"" + postId + "\"],\"reason\":\"curto\"}"), 400, "REASON_REQUIRED")
+    var del = ModerationTestKit.post(moderator, "/moderation/posts/bulk-delete", "{\"postIds\":[\"" + postId + "\",\"post-inexistente\"],\"reason\":\"Conteúdo removido na limpeza em lote do painel.\"}")
+    Check.status(del, 200)
+    Check.jsonEq(del, "total", "2")
+    Check.jsonEq(del, "items.0.status", "DELETED")
+    Check.jsonEq(del, "items.1.status", "DELETED")
+    Check.status(ModerationTestKit.get("", "/feed/posts/" + postId), 404)
+    Check.status(ModerationTestKit.get("", "/feed/posts/" + other), 200)
+    ModerationTestKit.finish()
+}

@@ -1,0 +1,82 @@
+import identity.*
+import kernel.db.*
+import kernel.testkit.*
+import moderation.*
+
+// Ports of HoneypotGuardTests (3, as HTTP behaviour of the feed's hidden `website` field, now answered by the moderation
+// HoneypotGuard) and SuspiciousSignupGuardBoundTests (the signup guard keeps its maps bounded).
+String postWith(userId: String, content: String, website: String) {
+    var res = ModerationTestKit.post(userId, "/feed/posts", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"" + content + "\",\"tags\":[],\"mediaIds\":[],\"website\":\"" + website + "\"}")
+    Check.status(res, 201)
+    return ModerationTestKit.str(res, "id")
+}
+
+Long stored(content: String) = ModerationTestKit.db().queryLong("select count(*) from posts where content = ?", DbParams().bindStr(content))
+
+Long activeSanctions(userId: String) = ModerationTestKit.db().queryLong("select count(*) from user_sanctions where user_id = ? and status = \'ACTIVE\'", DbParams().bindStr(userId))
+
+test "an empty hidden field does nothing" {
+    var user = ModerationTestKit.login("hp_human")
+    var id = postWith(user, "Post de uma pessoa de verdade.", "  ")
+    Check.eqInt("stored", 1, stored("Post de uma pessoa de verdade.") as Int)
+    Check.eqInt("not sanctioned", 0, activeSanctions(user) as Int)
+    Check.isTrue("a real id", id.length() > 0)
+}
+
+test "a filled trap bans the account, drops the content and answers a fake success" {
+    var bot = ModerationTestKit.login("hp_bot")
+    var id = postWith(bot, "Conteudo de um robo que nao pode ser gravado.", "https://bot.example")
+    Check.isTrue("fake id keeps the post_ prefix", id.startsWith("post_"))
+    Check.eqInt("never stored", 0, stored("Conteudo de um robo que nao pode ser gravado.") as Int)
+    Check.eqInt("one active sanction", 1, activeSanctions(bot) as Int)
+    var row = ModerationTestKit.db().queryOne("select type, report_id from user_sanctions where user_id = ?", DbParams().bindStr(bot))
+    Check.eqStr("banned", "BAN", row.getStr("type"))
+    Check.eqStr("reference", "AUTO:HONEYPOT:post", row.getStr("report_id"))
+    Check.status(ModerationTestKit.get(bot, "/moderation/me"), 401)
+    // A second hit does not add a second row.
+    var again = ModerationTestKit.login("hp_bot_comment")
+    var postId = ModerationTestKit.publish(again, "Post comentado por um robo.")
+    var res = ModerationTestKit.post(again, "/feed/posts/" + postId + "/comments", "{\"content\":\"comentario\",\"parentCommentId\":null,\"mediaIds\":[],\"mentionedUserIds\":[],\"website\":\"x\"}")
+    Check.status(res, 201)
+    Check.isTrue("fake comment id", ModerationTestKit.str(res, "id").startsWith("comment_"))
+    Check.eqInt("comment never stored", 0, ModerationTestKit.db().queryLong("select count(*) from comments where content = ?", DbParams().bindStr("comentario")) as Int)
+    Check.eqInt("comment bot banned", 1, activeSanctions(again) as Int)
+}
+
+test "staff and sanctioned accounts are rejected but never banned twice" {
+    var admin = ModerationTestKit.loginAdmin("hp_admin")
+    postWith(admin, "Conteudo do admin com campo invisivel.", "x")
+    Check.eqInt("admin not sanctioned", 0, activeSanctions(admin) as Int)
+    Check.eqInt("admin content dropped", 0, stored("Conteudo do admin com campo invisivel.") as Int)
+    var moderator = ModerationTestKit.login("hp_moderator")
+    Check.status(ModerationTestKit.post(admin, "/admin/moderators", "{\"username\":\"hp_moderator\",\"note\":\"Nomeado para o teste do honeypot.\"}"), 200)
+    postWith(moderator, "Conteudo do moderador com campo invisivel.", "x")
+    Check.eqInt("moderator not sanctioned", 0, activeSanctions(moderator) as Int)
+    var restricted = ModerationTestKit.login("hp_restricted")
+    var reporter = ModerationTestKit.login("hp_reporter")
+    ModerationTestKit.module().sanctions.restrictUser(restricted, "admin:hp_admin", "Restricao previa do teste.")
+    postWith(restricted, "Conteudo de quem ja tem sancao.", "x")
+    Check.eqInt("no second sanction", 1, activeSanctions(restricted) as Int)
+    Check.isTrue("reporter exists", reporter.length() > 0)
+}
+
+test "the signup guard keeps its maps bounded however many ips show up" {
+    var guard = IdentitySignupGuard(true, "probe", 10)
+    var ip = 0
+    while (ip < 100) {
+        var strike = 0
+        while (strike < 3) {
+            var refused = false
+            try {
+                guard.checkSignup("probe-x", "a@b.test", "198.51.100." + ip)
+            } catch (String e) {
+                refused = e.contains("SIGNUP_REFUSED")
+            }
+            Check.isTrue("refused", refused)
+            strike = strike + 1
+        }
+        Check.isTrue("bounded", guard.strikes.size() + guard.cooldownUntil.size() <= 20)
+        ip = ip + 1
+    }
+    ModerationTestKit.finish()
+}

@@ -1,0 +1,90 @@
+package moderation
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.time.*
+import profile.*
+
+record ModerationBlockedIpView(String id, String ip, String? reason, String? createdBy, String createdAt)
+
+record ModerationUserIpView(String ip, String? lastSeenAt)
+
+record ModerationBlockIpBody(String? ip, String? reason)
+
+record ModerationIpUnblocked(String ip, String blocked)
+
+// IP block list of the moderation team (IpBlockService, V131 `blocked_ips`): a blocked IP creates no account, logs nobody in
+// and gets no session (the identity domain reads the same table through IdentityIpBlocks). The panel lists the recent IPs
+// of a user (recorded on every session) so the moderator picks what to block.
+class ModerationIpBlocks {
+    Db store
+    ProfileDirectory profiles
+    public constructor(store: Db, profiles: ProfileDirectory) {
+        this.store = store
+        this.profiles = profiles
+    }
+    static String clean(ip: String?) {
+        if (ip == null) {
+            return ""
+        }
+        return ip.trim()
+    }
+    static ModerationBlockedIpView view(r: DbRow) = ModerationBlockedIpView(r.getStr("id"), r.getStr("ip"), r.getStrOrNull("reason"), r.getStrOrNull("created_by"), r.getInstant("created_at"))
+    ModerationBlockedIpView block(adminId: String, ip: String?, reason: String?) {
+        var cleanIp = ModerationIpBlocks.clean(ip)
+        if (cleanIp.length() == 0 || cleanIp.length() > 64 || cleanIp == "desconhecido") {
+            throw Errors.api(400, "INVALID_IP", "Informe um IP valido para bloquear.")
+        }
+        if (store.queryLong("select count(*) from blocked_ips where ip = ?", DbParams().bindStr(cleanIp)) > 0L) {
+            throw Errors.api(409, "IP_ALREADY_BLOCKED", "Este IP ja esta bloqueado.")
+        }
+        var why = ModerationModeratorRules.noString()
+        if (reason != null) {
+            if (reason.trim().length() > 0 && reason.trim().length() < 5) {
+                throw Errors.api(400, "REASON_REQUIRED", "Explique o motivo do bloqueio.")
+            }
+            why = reason.trim()
+        }
+        var id = Ids.prefixed("ipblk_")
+        var now = Time.nowIso()
+        store.execute("insert into blocked_ips (id, ip, reason, created_by, created_at) values (?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(cleanIp).bindStrOrNull(why).bindStr(adminId.trim()).bindInstant(now))
+        return ModerationBlockedIpView(id, cleanIp, why, adminId.trim(), now)
+    }
+    unblock(ip: String) {
+        store.execute("delete from blocked_ips where ip = ?", DbParams().bindStr(ModerationIpBlocks.clean(ip)))
+    }
+    List<ModerationBlockedIpView> list(limit: Int) {
+        var cap = limit
+        if (cap < 1) {
+            cap = 1
+        }
+        var out = listOf<ModerationBlockedIpView>()
+        for (var r in store.queryList("select id, ip, reason, created_by, created_at from blocked_ips order by created_at desc limit ?", DbParams().bindInt(cap))) {
+            out.add(ModerationIpBlocks.view(r))
+        }
+        return out
+    }
+    // The most recent session IPs of an account, newest first, without repeats or unknown addresses.
+    List<String> recentIps(userId: String, limit: Int) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select ip from auth_sessions where user_id = ? and ip is not null order by created_at desc limit ?", DbParams().bindStr(userId).bindInt(limit))) {
+            var ip = r.getStr("ip")
+            if (ip.trim().length() > 0 && ip != "desconhecido" && !out.contains(ip)) {
+                out.add(ip)
+            }
+        }
+        return out
+    }
+    List<ModerationUserIpView> ipsOfUser(username: String?) {
+        var target = profiles.findByUsername(ModerationIpBlocks.clean(username))
+        if (target == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        var out = listOf<ModerationUserIpView>()
+        for (var ip in recentIps(target.id, 20)) {
+            out.add(ModerationUserIpView(ip, null))
+        }
+        return out
+    }
+}

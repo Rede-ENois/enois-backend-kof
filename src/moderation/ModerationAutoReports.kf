@@ -1,0 +1,79 @@
+package moderation
+
+import kernel.db.*
+import kernel.log.*
+import kernel.risk.*
+import kernel.security.*
+
+// AutoReportListener: the security guards (user rate limiter, behavioural timing) and the risk engine open an automatic
+// report against an account; moderation turns it into a SYSTEM report (no per-account ceiling: the ceiling restrains people,
+// not the defense of the network) that follows the normal review flow. Best effort: a duplicate or any failure is swallowed,
+// the guard already did its job and the user's own action must never fail because of it.
+// Both seams are built before the moderation service exists (the request pipeline and the shared services come first), so
+// the service is bound afterwards (`bind`); a report raised before that is dropped.
+class ModerationAutoReports extends SecurityAutoReports {
+    Log log = Log("moderation.auto-report")
+    ModerationService? service = null
+    public constructor() {
+        super()
+    }
+    bind(target: ModerationService) {
+        this.service = target
+    }
+    report(userId: String, reason: String, description: String) {
+        var target = service
+        if (target == null) {
+            return
+        }
+        try {
+            target.systemReport("USER", userId, reason, description)
+            log.info("auto_report_created reason=" + reason)
+        } catch (String e) {
+            log.debug("auto_report_ignored")
+        }
+    }
+}
+
+// RiskEngine escalation: a critical assessment opens a USER/SPAM system report, like the Java AutoReportEvent listener.
+class ModerationRiskEscalation extends RiskEscalation {
+    Log reportLog = Log("moderation.risk-escalation")
+    ModerationService? service = null
+    public constructor() {
+        super()
+    }
+    bind(target: ModerationService) {
+        this.service = target
+    }
+    escalate(userId: String, description: String) {
+        var target = service
+        if (target == null) {
+            return
+        }
+        try {
+            target.systemReport("USER", userId, "SPAM", description)
+        } catch (String e) {
+            reportLog.debug("escalation_ignored")
+        }
+    }
+}
+
+// The moderation pieces the request pipeline and the shared services need BEFORE the module itself can be built: the moderator
+// check and the automatic reports go into `hooks` before Security.install, the risk escalation into SharedServices.createWith.
+// `bind` connects them to the report service once the module is installed.
+class ModerationEarly {
+    ModerationAutoReports reports
+    ModerationRiskEscalation escalation
+    public constructor() {
+        this.reports = ModerationAutoReports()
+        this.escalation = ModerationRiskEscalation()
+    }
+    // Replaces hooks.moderators and hooks.reports (call before Security.install).
+    wire(hooks: SecurityHooks, store: Db) {
+        hooks.moderators = ModerationSecurityModerators(store)
+        hooks.reports = reports
+    }
+    bind(service: ModerationService) {
+        reports.bind(service)
+        escalation.bind(service)
+    }
+}

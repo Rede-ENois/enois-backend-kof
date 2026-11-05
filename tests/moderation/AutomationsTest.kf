@@ -1,0 +1,72 @@
+import kernel.db.*
+import kernel.sanctions.*
+import kernel.testkit.*
+import kernel.time.*
+import moderation.*
+
+// Port of SuspiciousAutoBanTests (4) plus the report cleanup worker. The workers are called by hand (their schedules are not
+// what is under test) and the ACCOUNT_BANNED answer of /auth/login is proved through the sanction gate and the revoked
+// session (the identity domain is not part of this kit).
+Bool banned(userId: String) = SanctionGateReader(ModerationTestKit.db()).banned(userId)
+
+test "the attack pattern is purged even when the account looks like staff" {
+    var admin = ModerationTestKit.loginAdmin("ab_admin")
+    var target = ModerationTestKit.login("probe-purge-target")
+    Check.status(ModerationTestKit.post(admin, "/admin/moderators", "{\"username\":\"probe-purge-target\",\"note\":\"Nomeado no cenario de teste.\"}"), 200)
+    Check.isTrue("at least one purged", ModerationTestKit.module().autoBan.purgeAttackPatterns() >= 1)
+    Check.isTrue("banned", banned(target))
+    Check.status(ModerationTestKit.get(target, "/moderation/me"), 401)
+}
+
+test "a staff account carrying the attack signature is still punished by the sweep" {
+    var admin = ModerationTestKit.loginAdmin("ab_admin2")
+    var target = ModerationTestKit.login("probe-staff-target")
+    Check.status(ModerationTestKit.post(admin, "/admin/moderators", "{\"username\":\"probe-staff-target\",\"note\":\"Nomeado no cenario de teste.\"}"), 200)
+    ModerationTestKit.module().autoBan.sweep()
+    Check.isTrue("compromised staff account is banned", banned(target))
+}
+
+test "the automation ceiling is eighty and its status is for admins" {
+    var admin = ModerationTestKit.loginAdmin("ab_admin3")
+    var common = ModerationTestKit.login("ab_common")
+    Check.eqInt("ceiling", 80, ModerationTestKit.module().autoBan.status().riskCeiling)
+    Check.status(ModerationTestKit.get(common, "/admin/automod/status"), 403)
+    var status = ModerationTestKit.get(admin, "/admin/automod/status")
+    Check.status(status, 200)
+    Check.jsonEq(status, "riskCeiling", "80")
+    Check.jsonEq(status, "enabled", "true")
+}
+
+test "an account above the risk ceiling is banned and its content removed" {
+    var target = ModerationTestKit.login("probe-auto-target")
+    var postId = ModerationTestKit.publish(target, "Conteudo de conta em serie.")
+    var report = ModerationTestKit.module().autoBan.sweep()
+    Check.isTrue("banned at least one", report.banned >= 1)
+    Check.isTrue("sanctioned", banned(target))
+    Check.status(ModerationTestKit.get(target, "/moderation/me"), 401)
+    Check.status(ModerationTestKit.get("", "/feed/posts/" + postId), 404)
+    ModerationTestKit.module().autoBan.run()
+    Check.isTrue("status keeps the time of the last round", ModerationTestKit.module().autoBan.status().lastRunAt != null)
+}
+
+test "the cleanup worker closes reports against banned authors and removed targets" {
+    var author = ModerationTestKit.login("cl_author")
+    var reporter = ModerationTestKit.login("cl_reporter")
+    var other = ModerationTestKit.login("cl_other")
+    var bannedReport = ModerationTestKit.publishReported(author, reporter, "Post de quem sera banido depois.", "SPAM")
+    var goneReport = ModerationTestKit.publishReported(other, reporter, "Post que sera apagado do banco.", "SPAM")
+    var keptAuthor = ModerationTestKit.login("cl_kept")
+    var keptReport = ModerationTestKit.publishReported(keptAuthor, reporter, "Post que continua valendo.", "SPAM")
+    var module = ModerationTestKit.module()
+    module.sanctions.saved(ModerationSanctions.permaBan(ModerationSanctions.newId(), author, "admin:x", "Banido para o teste da limpeza.", Time.nowIso()))
+    var store = ModerationTestKit.db()
+    var goneTarget = store.queryOne("select target_id from reports where id = ?", DbParams().bindStr(goneReport)).getStr("target_id")
+    store.execute("delete from posts where id = ?", DbParams().bindStr(goneTarget))
+    Check.isTrue("two reports closed", module.cleanup.closeReportsAgainstBannedOrRemovedUsers() >= 2)
+    Check.eqStr("banned author", "DISMISSED", ModerationTestKit.reportStatus(bannedReport))
+    Check.eqStr("removed target", "DISMISSED", ModerationTestKit.reportStatus(goneReport))
+    Check.eqStr("a live report stays", "PENDING", ModerationTestKit.reportStatus(keptReport))
+    var note = store.queryOne("select resolution_note from reports where id = ?", DbParams().bindStr(bannedReport)).getStr("resolution_note")
+    Check.eqStr("note", "Autor banido — denúncia encerrada automaticamente", note)
+    ModerationTestKit.finish()
+}

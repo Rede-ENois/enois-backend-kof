@@ -60,19 +60,22 @@ class ModerationTestKit {
     }
     static wire(p: Platform) {
         var hooks = SecurityHooks.defaults(p.db)
-        hooks.moderators = ModerationSecurityModerators(p.db)
+        var early = ModerationEarly()
+        early.wire(hooks, p.db)
         var parts = Security.install(p, hooks)
-        var shared = SharedServices.create(p)
+        var shared = SharedServices.createWith(p, early.escalation)
         ModerationTestKit.cachedShared = shared
         var capture = MailCapture()
         ModerationTestKit.cachedMail = capture
         var mail = MailService(p.cfg, capture, EmailLogStore(p.db))
         var profiles = ProfileModule.install(p, shared, hooks)
+        var honeypot = ModerationModule.honeypotFor(p, parts)
+        FeedModule.feedHoneypotSlot = honeypot
         var feed = FeedModule.install(p, shared, hooks)
         ModerationTestKit.cachedFeed = feed
         var groups = GroupsModule.install(p, shared, hooks)
         var notifications = NotificationsModule.install(p, shared, hooks, parts, mail)
-        ModerationTestKit.cachedModule = ModerationModule.install(p, shared, parts, feed, groups, profiles, mail, notifications.notifications)
+        ModerationTestKit.cachedModule = ModerationModule.installWith(p, shared, parts, feed, groups, profiles, mail, notifications.notifications, ModerationReportEvents(), ModerationCompanies(p.db), ModerationSanctionHooks(), ModerationLlmTransport(), ModerationImages(), honeypot, early)
         // Jobs registered by the modules above would keep the test process alive: stopped after all installs.
         shared.stop()
     }

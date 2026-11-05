@@ -1,0 +1,56 @@
+package moderation
+
+import feed.*
+import kernel.log.*
+import kernel.security.*
+import kernel.time.*
+
+// HoneypotGuard behind the feed's FeedHoneypot seam: a field humans never see and never fill. A bot that fills it gets an
+// automatic ban; the caller answers a fake success so the bot learns nothing and the content is never stored. Admins and
+// approved moderators are ignored (assistive tools may fill hidden fields) and an account with an active sanction does not
+// get a second row.
+// The feed installs its routes before moderation exists, so the sanction service is bound afterwards (`bind`). Until then
+// the request is simply dropped (true), never stored.
+class ModerationHoneypot extends FeedHoneypot {
+    Log log = Log("moderation.honeypot")
+    AdminGuard admins
+    ModerationModeratorStore moderators
+    ModerationSanctionStore sanctionStore
+    ModerationSanctionService? sanctions = null
+    Bool autoBan
+    public constructor(admins: AdminGuard, moderators: ModerationModeratorStore, sanctionStore: ModerationSanctionStore, autoBan: Bool) {
+        super()
+        this.admins = admins
+        this.moderators = moderators
+        this.sanctionStore = sanctionStore
+        this.autoBan = autoBan
+    }
+    bind(service: ModerationSanctionService) {
+        this.sanctions = service
+    }
+    Bool triggered(userId: String, website: String?, surface: String) {
+        if (website == null) {
+            return false
+        }
+        if (website.trim().length() == 0) {
+            return false
+        }
+        log.warn("honeypot_triggered surface=" + surface + " user=" + userId + " autoBan=" + autoBan)
+        if (!autoBan) {
+            return true
+        }
+        if (admins.isAdmin(userId) || moderators.findApprovedByUser(userId) != null) {
+            return true
+        }
+        if (sanctionStore.findActiveByUser(userId) != null) {
+            return true
+        }
+        var service = sanctions
+        if (service == null) {
+            return true
+        }
+        var sanction = ModerationSanctions.restriction(ModerationSanctions.newId(), userId, "AUTO:HONEYPOT:" + surface, "Conta automatizada: preencheu um campo invisível de segurança (" + surface + ").", Time.nowIso())
+        service.banAuthor(sanction, userId, "honeypot")
+        return true
+    }
+}

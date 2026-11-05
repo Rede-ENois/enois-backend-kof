@@ -1,0 +1,124 @@
+package moderation
+
+import kernel.error.*
+
+record ModerationBulkBanBody(List<String>? usernames, String? type, String? reason)
+
+record ModerationBulkBanItem(String username, String status, String message)
+
+record ModerationBulkBanResult(Int total, Int banned, Int alreadyBanned, Int failed, List<ModerationBulkBanItem> items, List<String> blockedIps)
+
+// Bulk ban for serial accounts (BulkBanService). Partial on purpose: one invalid account does not cancel the others. Each item
+// goes through the SAME sanctionUser of the panel (no self punishment, no double sanction, sessions revoked); there is no
+// shortcut write into user_sanctions. The reason is optional here (a default trail is stored). The IP that the batch REPEATS
+// (2+ banned accounts from one address) joins the block list; a single account never blocks its IP (NAT, school, carrier).
+class ModerationBulkBan {
+    ModerationPanel panel
+    ModerationIpBlocks ipBlocks
+    Int maxBatch
+    Bool blockIps
+    Int ipsMinAccounts
+    public constructor(panel: ModerationPanel, ipBlocks: ModerationIpBlocks, maxBatch: Int, blockIps: Bool, ipsMinAccounts: Int) {
+        this.panel = panel
+        this.ipBlocks = ipBlocks
+        this.maxBatch = ModerationContentTargets.clampInt(maxBatch, 1, 200)
+        this.blockIps = blockIps
+        this.ipsMinAccounts = ModerationContentTargets.clampInt(ipsMinAccounts, 2, 50)
+    }
+    static String defaultReason() = "Conta suspeita banida em lote no painel de moderação (sem motivo digitado)."
+    ModerationBulkBanResult ban(adminId: String, usernames: List<String>?, type: String?, reason: String?) {
+        var kind = "BAN"
+        if (type != null) {
+            kind = type
+        }
+        if (kind == "RESTRICTION") {
+            throw Errors.api(400, "INVALID_SANCTION_TYPE", "O lote aceita banimento, não restrição.")
+        }
+        var cleanReason = ModerationBulkBan.defaultReason()
+        if (reason != null && reason.trim().length() > 0) {
+            cleanReason = reason.trim()
+        }
+        var names = ModerationBulkBan.namesOf(usernames)
+        if (names.size() == 0) {
+            throw Errors.api(400, "NO_USERS_SELECTED", "Selecione pelo menos uma conta.")
+        }
+        var chosen = listOf<String>()
+        for (var u in names) {
+            if (u != null && u.trim().length() > 0 && !chosen.contains(u.trim())) {
+                chosen.add(u.trim())
+            }
+        }
+        if (chosen.size() > maxBatch) {
+            throw Errors.api(400, "TOO_MANY_USERS", "O lote aceita no máximo " + maxBatch + " contas por vez.")
+        }
+        var items = listOf<ModerationBulkBanItem>()
+        var ipCounts = mapOf<String, Int>()
+        var banned = 0
+        var already = 0
+        var failed = 0
+        for (var username in chosen) {
+            try {
+                var result = panel.sanctionUser(adminId, username, kind, cleanReason)
+                if (result.status == "ALREADY_BANNED") {
+                    already = already + 1
+                    items.add(ModerationBulkBanItem(username, "ALREADY_BANNED", "Esta conta já estava banida."))
+                }
+                else {
+                    banned = banned + 1
+                    items.add(ModerationBulkBanItem(username, "BANNED", "Banida."))
+                    this.rememberIps(result.userId, ipCounts)
+                }
+            } catch (String e) {
+                failed = failed + 1
+                items.add(ModerationBulkBanItem(username, "FAILED", this.failureMessage(e)))
+            }
+        }
+        return ModerationBulkBanResult(chosen.size(), banned, already, failed, items, this.blockRepeatedIps(adminId, ipCounts))
+    }
+    static List<String> namesOf(usernames: List<String>?) {
+        var out = listOf<String>()
+        if (usernames != null) {
+            for (var u in usernames) {
+                out.add(u)
+            }
+        }
+        return out
+    }
+    String failureMessage(e: String) {
+        if (Errors.isApi(e)) {
+            return Errors.parse(e).message
+        }
+        return "Erro ao banir esta conta."
+    }
+    rememberIps(userId: String, ipCounts: Map<String,Int>) {
+        for (var ip in ipBlocks.recentIps(userId, 3)) {
+            var seen = ipCounts.get(ip)
+            var n = 1
+            if (seen != null) {
+                n = seen + 1
+            }
+            ipCounts.put(ip, n)
+        }
+    }
+    List<String> blockRepeatedIps(adminId: String, ipCounts: Map<String,Int>) {
+        var blocked = listOf<String>()
+        if (!blockIps) {
+            return blocked
+        }
+        for (var ip in ipCounts.keys()) {
+            var n = ipCounts.getOrDefault(ip, 0)
+            if (n < ipsMinAccounts) {
+                continue
+            }
+            try {
+                ipBlocks.block(adminId, ip, "" + n + " contas banidas em lote no painel de moderação.")
+                blocked.add(ip)
+            } catch (String e) {
+                if (Errors.isApi(e)) {
+                    blocked.add(ip)
+                }
+            }
+        }
+        return blocked
+    }
+}
