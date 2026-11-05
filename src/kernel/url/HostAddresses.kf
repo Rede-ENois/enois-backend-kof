@@ -1,0 +1,49 @@
+package kernel.url
+
+import java.io.IOException
+import java.net.InetAddress
+
+// What a host name resolves to, for guards that protect the READER (the browser of whoever opens a
+// link), not the server: nothing is fetched here. A host is refused when ANY address it resolves to is
+// loopback, any-local, link-local (cloud metadata lives there), site-local (10/8, 172.16/12, 192.168/16),
+// multicast, or IPv6 unique-local (fc00::/7). Same classification as the Java GameUrlGuard.
+//
+//   HostAddresses.classify("example.com")   // "OK" | "INTERNAL" | "UNRESOLVED"
+class HostAddresses {
+    static String ok() = "OK"
+    static String internal() = "INTERNAL"
+    static String unresolved() = "UNRESOLVED"
+    static String classify(host: String) {
+        var addresses = HostAddresses.resolve(host)
+        if (addresses == null) {
+            return HostAddresses.unresolved()
+        }
+        if (addresses.length == 0) {
+            return HostAddresses.unresolved()
+        }
+        var i = 0
+        while (i < addresses.length) {
+            if (HostAddresses.isInternal(addresses[i])) {
+                return HostAddresses.internal()
+            }
+            i = i + 1
+        }
+        return HostAddresses.ok()
+    }
+    static InetAddress[]? resolve(host: String) {
+        try {
+            return InetAddress.getAllByName(host)
+        } catch (IOException e) {
+            return null
+        } catch (String e) {
+            return null
+        }
+    }
+    static Bool isInternal(address: InetAddress) {
+        if (address.isLoopbackAddress() || address.isAnyLocalAddress() || address.isLinkLocalAddress() || address.isSiteLocalAddress() || address.isMulticastAddress()) {
+            return true
+        }
+        var bytes = address.getAddress()
+        return bytes.length == 16 && (bytes[0] as Int & 254) == 252
+    }
+}
