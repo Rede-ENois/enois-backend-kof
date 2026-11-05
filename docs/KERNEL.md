@@ -978,7 +978,7 @@ JavaRandom.secureLong()           // SecureRandom.nextLong, an unguessable chall
 IsoWeeks.key("2026-11-04")        // "2026-W45": ISO week, no zero padding (weekBasedYear + "-W" + week)
 
 HostAddresses.classify(host)      // "OK" | "INTERNAL" (loopback, any-local, link-local, site-local, multicast, fc00::/7) | "UNRESOLVED"
-UrlParser.parse(value)            // UrlParts(scheme, userInfo, host, text) or null; tolerates a space or a brace in the path
+UrlParser.parse(value)            // LinkParts(scheme, userInfo, host, text) or null; tolerates a space or a brace in the path
 ```
 
 `HostAddresses.classify` resolves names through DNS; games inject it as the `GamesHosts` seam so tests never
