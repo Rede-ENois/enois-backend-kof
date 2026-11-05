@@ -1,0 +1,49 @@
+import blog.*
+import coin.*
+import communities.*
+import economy.*
+import groups.*
+import kernel.*
+import kernel.testkit.*
+import messaging.*
+import notifications.*
+
+// The coin bridges that replace the no-op `*Coins` seams of the domains ported before the economy: each domain calls
+// recordPresence after a meaningful action, and the notifications seam asks the ledger for the apology reward.
+TestApp cbApp() = EconomyTestKit.app("coinbridges", mapOf<String, String>())
+
+test "every domain bridge records the daily presence in the ledger" {
+    var app = cbApp()
+    var service = EconomyTestKit.stack().coin.service
+    var today = EconomyClock.brazilDay()
+    var bridges = listOf<String>("community", "group", "blog", "messaging")
+    for (var kind in bridges) {
+        var userId = "bridge-" + kind
+        EconomyTestKit.login(app, userId)
+        if (kind == "community") {
+            CoinCommunityCoins(service).recordPresence(userId)
+        }
+        if (kind == "group") {
+            CoinGroupCoins(service).recordPresence(userId)
+        }
+        if (kind == "blog") {
+            CoinBlogCoins(service).recordPresence(userId)
+        }
+        if (kind == "messaging") {
+            CoinMessagingCoins(service).recordPresence(userId)
+        }
+        Check.isTrue(kind + " paid the presence", service.hasReward("presenca:" + userId + ":" + today))
+    }
+}
+
+test "the notifications bridge reads and pays rewards through the ledger" {
+    var app = cbApp()
+    var service = EconomyTestKit.stack().coin.service
+    EconomyTestKit.login(app, "bridge-apology")
+    var coins = CoinNotificationCoins(service)
+    Check.isTrue("not paid yet", !coins.hasReward("apology:bridge-apology"))
+    coins.reward("bridge-apology", 1000L, "apology:bridge-apology", "Pedido de desculpas")
+    Check.isTrue("paid", coins.hasReward("apology:bridge-apology"))
+    Check.isTrue("same ledger", service.hasReward("apology:bridge-apology"))
+    EconomyTestKit.finish()
+}
