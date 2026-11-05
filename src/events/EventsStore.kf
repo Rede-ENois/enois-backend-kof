@@ -1,0 +1,208 @@
+package events
+
+import kernel.db.*
+
+// SQL of `events`, `event_attendees` and `user_event_attendance_totals` (EventPersistenceAdapter and its Spring Data
+// repositories). Lists are newest first by created_at; the cursor is the created_at of the last row of the page.
+class EventsStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, title, date, time, format, host, cover, stream_url, location, city, state, city_key, created_by, created_at, updated_at, sanitized_at, final_attendees_count, recurrence, series_id"
+    static EventRecord event(r: DbRow) = EventRecord(r.getStr("id"), r.getStr("title"), r.getStr("date"), r.getStr("time"), r.getStr("format"), r.getStr("host"), r.getStrOrNull("cover"), r.getStrOrNull("stream_url"), r.getStrOrNull("location"), r.getStrOrNull("city"), r.getStrOrNull("state"), r.getStrOrNull("city_key"), r.getStr("created_by"), r.getInstant("created_at"), r.getInstant("updated_at"), r.getInstantOrNull("sanitized_at"), r.getIntOrNull("final_attendees_count"), r.getStr("recurrence"), r.getStrOrNull("series_id"))
+    static List<EventRecord> events(rows: List<DbRow>) {
+        var out = listOf<EventRecord>()
+        for (var r in rows) {
+            out.add(EventsStore.event(r))
+        }
+        return out
+    }
+    static String marks(n: Int) {
+        var out = listOf<String>()
+        var i = 0
+        while (i < n) {
+            out.add("?")
+            i = i + 1
+        }
+        return String.join(",", out)
+    }
+    EventRecord? findById(id: String) {
+        var row = store.queryOptional("select " + EventsStore.columns() + " from events where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return EventsStore.event(row)
+    }
+    // The three list shapes of the Java repository: by place (in-person events only, online never matches even with
+    // a stale city on the row), by format, and everything. `state` null = no place filter.
+    List<EventRecord> findAll(format: String?, state: String?, cityKey: String?, before: String?, recurringOnly: Bool, limit: Int) {
+        var sql = "select " + EventsStore.columns() + " from events where 1 = 1"
+        var p = DbParams()
+        if (state != null) {
+            sql = sql + " and state = ?"
+            p.bindStr(state)
+            if (cityKey != null) {
+                sql = sql + " and city_key = ?"
+                p.bindStr(cityKey)
+            }
+            sql = sql + " and upper(format) <> \'ONLINE\'"
+            if (format != null) {
+                sql = sql + " and format = ?"
+                p.bindStr(format)
+            }
+        }
+        else {
+            if (format != null) {
+                sql = sql + " and format = ?"
+                p.bindStr(format)
+            }
+        }
+        if (before != null) {
+            sql = sql + " and created_at < ?"
+            p.bindInstant(before)
+        }
+        if (recurringOnly) {
+            sql = sql + " and recurrence <> \'NONE\'"
+        }
+        sql = sql + " order by created_at desc limit ?"
+        p.bindInt(limit)
+        return EventsStore.events(store.queryList(sql, p))
+    }
+    List<EventRecord> findRecurring() = EventsStore.events(store.queryList("select " + EventsStore.columns() + " from events where recurrence <> \'NONE\'", DbParams()))
+    EventRecord? findLatestInSeries(seriesId: String) {
+        var row = store.queryOptional("select " + EventsStore.columns() + " from events where series_id = ? order by created_at desc limit 1", DbParams().bindStr(seriesId))
+        if (row == null) {
+            return null
+        }
+        return EventsStore.event(row)
+    }
+    Bool existsInSeries(seriesId: String, date: String) = store.queryLong("select count(*) from events where series_id = ? and date = ?", DbParams().bindStr(seriesId).bindStr(date)) > 0L
+    updateSeriesRecurrence(seriesId: String, recurrence: String) {
+        store.execute("update events set recurrence = ? where series_id = ?", DbParams().bindStr(recurrence).bindStr(seriesId))
+    }
+    // The JPA save: update the row when it exists, insert it otherwise. NOT NULL and unique violations (a missing
+    // host, the same date twice in a series) answer 409 CONFLICT through kernel.db, as the Java adapter did.
+    save(e: EventRecord) {
+        var p = DbParams()
+        p.bindStr(e.title)
+        p.bindStr(e.date)
+        p.bindStr(e.time)
+        p.bindStr(e.format)
+        p.bindStr(e.host)
+        p.bindStrOrNull(e.cover)
+        p.bindStrOrNull(e.streamUrl)
+        p.bindStrOrNull(e.location)
+        p.bindStrOrNull(e.city)
+        p.bindStrOrNull(e.state)
+        p.bindStrOrNull(e.cityKey)
+        p.bindInstant(e.updatedAt)
+        p.bindInstantOrNull(e.sanitizedAt)
+        p.bindIntOrNull(e.finalAttendeesCount)
+        p.bindStr(e.recurrence)
+        p.bindStrOrNull(e.seriesId)
+        p.bindStr(e.id)
+        var updated = store.execute("update events set title = ?, date = ?, time = ?, format = ?, host = ?, cover = ?, stream_url = ?, location = ?, city = ?, state = ?, city_key = ?, updated_at = ?, sanitized_at = ?, final_attendees_count = ?, recurrence = ?, series_id = ? where id = ?", p)
+        if (updated > 0) {
+            return
+        }
+        var q = DbParams()
+        q.bindStr(e.id)
+        q.bindStr(e.title)
+        q.bindStr(e.date)
+        q.bindStr(e.time)
+        q.bindStr(e.format)
+        q.bindStr(e.host)
+        q.bindStrOrNull(e.cover)
+        q.bindStrOrNull(e.streamUrl)
+        q.bindStrOrNull(e.location)
+        q.bindStrOrNull(e.city)
+        q.bindStrOrNull(e.state)
+        q.bindStrOrNull(e.cityKey)
+        q.bindStr(e.createdBy)
+        q.bindInstant(e.createdAt)
+        q.bindInstant(e.updatedAt)
+        q.bindInstantOrNull(e.sanitizedAt)
+        q.bindIntOrNull(e.finalAttendeesCount)
+        q.bindStr(e.recurrence)
+        q.bindStrOrNull(e.seriesId)
+        store.execute("insert into events (" + EventsStore.columns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", q)
+    }
+    deleteById(eventId: String) {
+        store.execute("delete from events where id = ?", DbParams().bindStr(eventId))
+    }
+    List<EventRecord> findNotSanitized() = EventsStore.events(store.queryList("select " + EventsStore.columns() + " from events where sanitized_at is null", DbParams()))
+    List<EventRecord> findSanitizedBefore(threshold: String) = EventsStore.events(store.queryList("select " + EventsStore.columns() + " from events where sanitized_at < ?", DbParams().bindInstant(threshold)))
+    // ---------------------------------------------------------------- attendance
+    saveAttendee(eventId: String, userId: String, respondedAt: String) {
+        store.execute("insert into event_attendees (event_id, user_id, responded_at) values (?, ?, ?)", DbParams().bindStr(eventId).bindStr(userId).bindInstant(respondedAt))
+    }
+    removeAttendee(eventId: String, userId: String) {
+        store.execute("delete from event_attendees where event_id = ? and user_id = ?", DbParams().bindStr(eventId).bindStr(userId))
+    }
+    Bool isAttending(eventId: String, userId: String) = store.queryLong("select count(*) from event_attendees where event_id = ? and user_id = ?", DbParams().bindStr(eventId).bindStr(userId)) > 0L
+    // Events among `eventIds` the user confirmed (one query for the page).
+    List<String> findAttendingEventIds(userId: String, eventIds: List<String>) {
+        var out = listOf<String>()
+        if (eventIds.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        p.bindStr(userId)
+        for (var id in eventIds) {
+            p.bindStr(id)
+        }
+        for (var r in store.queryList("select event_id from event_attendees where user_id = ? and event_id in (" + EventsStore.marks(eventIds.size()) + ")", p)) {
+            out.add(r.getStr("event_id"))
+        }
+        return out
+    }
+    deleteAttendees(eventId: String) {
+        store.execute("delete from event_attendees where event_id = ?", DbParams().bindStr(eventId))
+    }
+    List<String> findAttendeeIds(eventId: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select user_id from event_attendees where event_id = ?", DbParams().bindStr(eventId))) {
+            out.add(r.getStr("user_id"))
+        }
+        return out
+    }
+    Int countAttendees(eventId: String) = store.queryLong("select count(*) from event_attendees where event_id = ?", DbParams().bindStr(eventId)) as Int
+    // Attendance of the whole page in one query (a count per card was an N+1).
+    Map<String,Int> countAttendeesByEventIds(eventIds: List<String>) {
+        Map<String,Int> out = mapOf()
+        if (eventIds.size() == 0) {
+            return out
+        }
+        var p = DbParams()
+        for (var id in eventIds) {
+            p.bindStr(id)
+        }
+        for (var r in store.queryList("select event_id, count(*) as total from event_attendees where event_id in (" + EventsStore.marks(eventIds.size()) + ") group by event_id", p)) {
+            out.put(r.getStr("event_id"), r.getInt("total"))
+        }
+        return out
+    }
+    // The per-person COUNT survives the purge of the rows (no personal data): it keeps feeding the reputation.
+    addAttendanceToTotal(userId: String) {
+        var updated = store.execute("update user_event_attendance_totals set total = total + 1 where user_id = ?", DbParams().bindStr(userId))
+        if (updated == 0) {
+            store.execute("insert into user_event_attendance_totals (user_id, total) values (?, 1)", DbParams().bindStr(userId))
+        }
+    }
+    // ---------------------------------------------------------------- reads other domains consume
+    List<EventRecord> findByIds(ids: List<String>) {
+        if (ids.size() == 0) {
+            return listOf<EventRecord>()
+        }
+        var p = DbParams()
+        for (var id in ids) {
+            p.bindStr(id)
+        }
+        return EventsStore.events(store.queryList("select " + EventsStore.columns() + " from events where id in (" + EventsStore.marks(ids.size()) + ")", p))
+    }
+    // The events a person confirmed that were not sanitised yet.
+    List<EventRecord> findAttendedNotSanitized(userId: String) = EventsStore.events(store.queryList("select " + EventsStore.columns() + " from events where sanitized_at is null and id in (select event_id from event_attendees where user_id = ?)", DbParams().bindStr(userId)))
+    // Attendances still present plus the aggregate kept before the purge (reputation of the profile).
+    Int attendedTotal(userId: String) = store.queryLong("select (select count(*) from event_attendees where user_id = ?) + coalesce((select total from user_event_attendance_totals where user_id = ?), 0)", DbParams().bindStr(userId).bindStr(userId)) as Int
+}

@@ -1,0 +1,35 @@
+package events
+
+import identity.*
+import kernel.*
+import kernel.security.*
+import notifications.*
+
+// Composition of the events domain: routes, the recurrence scheduler and the sanitisation worker (both on
+// kernel.jobs). Env (Spring names as environment variables): REDE_CACHE_EVENTS_LIST_TTL, REDE_EVENTS_RECURRENCE_ENABLED
+// (true), REDE_EVENTS_RECURRENCE_CRON ("0 20 * * * *"), REDE_EVENTS_RECURRENCE_ZONE ("America/Sao_Paulo"),
+// REDE_EVENTS_SANITIZE_DELAY_MS (3600000).
+//
+// AppWiring builds the EventsStore first: profile (attendance total of the reputation) and notifications (the event
+// a notice points at) read it through EventsForeignCounts and EventsNotificationPlaces, before this module can be
+// installed (it writes notifications, so it comes after them).
+class EventsModule {
+    EventsService service
+    EventsRecurrenceService recurrence
+    EventsStore store
+    public constructor(service: EventsService, recurrence: EventsRecurrenceService, store: EventsStore) {
+        this.service = service
+        this.recurrence = recurrence
+        this.store = store
+    }
+    static EventsModule install(platform: Platform, shared: SharedServices, parts: SecurityParts, identity: IdentityModule, notificationsModule: NotificationsModule, store: EventsStore) = EventsModule.installWith(platform, shared, parts, identity, notificationsModule, store, EventsClock())
+    static EventsModule installWith(platform: Platform, shared: SharedServices, parts: SecurityParts, identity: IdentityModule, notificationsModule: NotificationsModule, store: EventsStore, clock: EventsClock) {
+        var cfg = platform.cfg
+        var service = EventsService(platform.db, store, shared.sanctionReader, shared.suspiciousText, clock, shared.caches.get("eventsList"))
+        var recurrence = EventsRecurrenceService(store, notificationsModule.notifications, identity.store, shared.sanctionReader, shared.suspiciousText, clock, cfg.getBool("REDE_EVENTS_RECURRENCE_ENABLED", true))
+        recurrence.schedule(shared.jobs, cfg)
+        EventSanitizationWorker(service).schedule(shared.jobs, cfg)
+        EventsRoutes(service, recurrence, shared.idempotency, parts.admin).register(platform.server)
+        return EventsModule(service, recurrence, store)
+    }
+}
