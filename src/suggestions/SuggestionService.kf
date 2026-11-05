@@ -1,0 +1,112 @@
+package suggestions
+
+import kernel.error.*
+import kernel.id.*
+import kernel.time.*
+
+// Community suggestions. They enter as pending; only a moderator approves, and only then does the text
+// become an issue in a public repository. The issue carries the title and the text of the suggestion and
+// nothing else: name, e-mail and id of the author stay out, by construction (issueBody).
+class SuggestionService {
+    SuggestionStore suggestions
+    SuggestionIssueGateway gateway
+    public constructor(suggestions: SuggestionStore, gateway: SuggestionIssueGateway) {
+        this.suggestions = suggestions
+        this.gateway = gateway
+    }
+    static Int maxTitle() = 120
+    static Int minTitle() = 5
+    static Int maxBody() = 4000
+    static Int minBody() = 20
+    static Int maxPerDay() = 5
+    // Breaks the mention (@person) so the public issue notifies nobody.
+    static String zeroWidthSpace() = "​"
+    SuggestionRecord submit(userId: String, target: String?, title: String?, body: String?) {
+        var cleanTitle = ""
+        if (title != null) {
+            cleanTitle = title.trim().replaceAll("\\s+", " ")
+        }
+        var cleanBody = ""
+        if (body != null) {
+            cleanBody = body.trim()
+        }
+        if (target == null) {
+            throw Errors.api(400, "INVALID_SUGGESTION", "Escolha onde a sugestão se aplica.")
+        }
+        if (cleanTitle.length() < SuggestionService.minTitle() || cleanTitle.length() > SuggestionService.maxTitle()) {
+            throw Errors.api(400, "INVALID_SUGGESTION", "O título deve ter entre 5 e 120 caracteres.")
+        }
+        if (cleanBody.length() < SuggestionService.minBody() || cleanBody.length() > SuggestionService.maxBody()) {
+            throw Errors.api(400, "INVALID_SUGGESTION", "Descreva a ideia com 20 a 4000 caracteres.")
+        }
+        var now = Time.nowIso()
+        if (suggestions.countByUserSince(userId, Time.plusSeconds(now, 0L - 86400L)) >= SuggestionService.maxPerDay() as Long) {
+            throw Errors.api(429, "TOO_MANY_SUGGESTIONS", "Você já enviou várias sugestões nas últimas 24h. Tente de novo amanhã.")
+        }
+        var created = SuggestionRecord(Ids.prefixed("sugg_"), userId, target, cleanTitle, cleanBody, "PENDING", now, null, null, null, null)
+        suggestions.insert(created)
+        return created
+    }
+    List<SuggestionRecord> list(status: String?, limit: Int) {
+        var size = 30
+        if (limit >= 1) {
+            size = limit
+            if (size > 100) {
+                size = 100
+            }
+        }
+        return suggestions.findFiltered(status, size)
+    }
+    List<SuggestionRecord> mine(userId: String, limit: Int) {
+        var size = 20
+        if (limit >= 1) {
+            size = limit
+            if (size > 100) {
+                size = 100
+            }
+        }
+        return suggestions.findByUserId(userId, size)
+    }
+    // Approves and publishes. The decision is claimed atomically BEFORE talking to GitHub, so two
+    // simultaneous approvals never open two issues; if GitHub fails the suggestion goes back to the queue.
+    SuggestionRecord approve(id: String, moderatorId: String) {
+        var suggestion = this.find(id)
+        if (!gateway.enabled(suggestion.target())) {
+            throw Errors.api(503, "SUGGESTIONS_GITHUB_DISABLED", "O repositório de destino desta sugestão ainda não foi configurado.")
+        }
+        if (!suggestions.transition(id, "PENDING", "PUBLISHED", moderatorId, Time.nowIso())) {
+            throw SuggestionService.alreadyReviewed()
+        }
+        var issue = gateway.createIssue(suggestion.target(), SuggestionService.issueTitle(suggestion), SuggestionService.issueBody(suggestion))
+        if (issue == null) {
+            suggestions.transition(id, "PUBLISHED", "PENDING", null, null)
+            throw Errors.api(502, "GITHUB_UNAVAILABLE", "Não foi possível abrir a issue agora. A sugestão continua pendente.")
+        }
+        suggestions.attachIssue(id, issue.number(), issue.url())
+        return this.find(id)
+    }
+    SuggestionRecord reject(id: String, moderatorId: String) {
+        this.find(id)
+        if (!suggestions.transition(id, "PENDING", "REJECTED", moderatorId, Time.nowIso())) {
+            throw SuggestionService.alreadyReviewed()
+        }
+        return this.find(id)
+    }
+    static String alreadyReviewed() = Errors.api(409, "SUGGESTION_ALREADY_REVIEWED", "Esta sugestão já foi analisada.")
+    SuggestionRecord find(id: String) {
+        var found = suggestions.findById(id)
+        if (found == null) {
+            throw Errors.api(404, "SUGGESTION_NOT_FOUND", "Sugestão não encontrada.")
+        }
+        return found
+    }
+    static String issueTitle(s: SuggestionRecord) = SuggestionService.neutralizeMentions(s.title())
+    // Only the text of the suggestion: the internal author, e-mail and id never get in here.
+    static String issueBody(s: SuggestionRecord) = SuggestionService.neutralizeMentions(s.body()) + "\n\n---\n_Sugestão enviada de forma anônima pela comunidade do Enois._"
+    static String neutralizeMentions(text: String) {
+        if (text.trim().length() == 0) {
+            return ""
+        }
+        return text.replace("@", "@" + SuggestionService.zeroWidthSpace())
+    }
+}

@@ -1,0 +1,362 @@
+import blog.*
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import leaves.*
+
+// Port of BlogFlowTests, BlogDirectoryTests, BlogFeedTests and the /blogs half of CatalogSearchTests (HTTP).
+// The feed and notifications domains are not ported yet: fakes subclass their seams and record what the blog
+// asked of them, which is the contract the blog owes those domains (a BLOG pointer per post, a NEW_BLOG_POST
+// notification per subscriber).
+class FakeBlogFeed extends BlogFeedPointers {
+    List<String> pointers = listOf<String>()
+    List<String> pointerAuthors = listOf<String>()
+    List<String> deleted = listOf<String>()
+    Int counter = 0
+    public constructor() {
+        super()
+    }
+    String publish(userId: String, title: String) {
+        counter = counter + 1
+        var id = "post_fake_" + userId + "_" + counter
+        pointers.add(id)
+        pointerAuthors.add(userId)
+        return id
+    }
+    delete(userId: String, postId: String, reason: String) {
+        deleted.add(postId)
+    }
+}
+
+class FakeBlogNotifier extends BlogNotifier {
+    List<String> receivers = listOf<String>()
+    List<String> hrefs = listOf<String>()
+    public constructor() {
+        super()
+    }
+    notifyNewPost(subscriberId: String, authorId: String, title: String, body: String, href: String) {
+        receivers.add(subscriberId)
+        hrefs.add(href)
+    }
+}
+
+class BlogHolder {
+    static TestApp? app = null
+    static FakeBlogFeed? feed = null
+    static FakeBlogNotifier? notifier = null
+}
+
+TestApp blogApp() {
+    var cur = BlogHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var feed = FakeBlogFeed()
+    var notifier = FakeBlogNotifier()
+    BlogHolder.feed = feed
+    BlogHolder.notifier = notifier
+    LeavesApp.blogFeedSlot = feed
+    LeavesApp.blogNotifierSlot = notifier
+    var created = LeavesApp.boot("blog", mapOf("REDE_SECURITY_ENCRYPTION_KEY", SecretCipher.generateKeyBase64()))
+    BlogHolder.app = created
+    return created
+}
+
+FakeBlogFeed fakeFeed() {
+    var f = BlogHolder.feed
+    if (f == null) {
+        throw "feed not booted"
+    }
+    return f
+}
+
+FakeBlogNotifier fakeNotifier() {
+    var n = BlogHolder.notifier
+    if (n == null) {
+        throw "notifier not booted"
+    }
+    return n
+}
+
+String orEmpty(v: String?) {
+    if (v == null) {
+        return ""
+    }
+    return v
+}
+
+List<String> asToken(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+
+List<String> asTokenKey(token: String, key: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json", "Idempotency-Key: " + key)
+
+String blogUser(app: TestApp, id: String) {
+    var token = "tok-" + id + "-1234567890"
+    if (app.db().queryLong("select count(*) from users where id = ?", DbParams().bindStr(id)) == 0L) {
+        SecurityFixtures.login(app.db(), id, token)
+    }
+    return token
+}
+
+String saveBlog(app: TestApp, token: String, id: String, title: String, description: String?) {
+    var payload = "{\"title\":" + json.encode(title) + ",\"themeHtml\":\"<div class=\\\"capa\\\">meu tema</div>\""
+    if (description != null) {
+        payload = payload + ",\"description\":" + json.encode(description)
+    }
+    payload = payload + "}"
+    var res = app.client.send("PUT", "/blogs/me", asTokenKey(token, "blog-save-" + id), "", payload)
+    Check.status(res, 200)
+    Check.eqInt("write answer carries no posts", 0, res.jsonSize("items"))
+    var slug = res.jsonStr("slug")
+    if (slug == null) {
+        throw "FAIL no slug"
+    }
+    return slug
+}
+
+String publishPost(app: TestApp, token: String, id: String, title: String, text: String, format: String, notify: Bool) {
+    var payload = "{\"title\":" + json.encode(title) + ",\"body\":" + json.encode(text) + ",\"format\":\"" + format + "\",\"notifySubscribers\":" + notify + "}"
+    var res = app.client.send("POST", "/blogs/me/posts", asTokenKey(token, "blog-post-" + title + "-" + id), "", payload)
+    Check.status(res, 201)
+    var postId = res.jsonStr("id")
+    if (postId == null) {
+        throw "FAIL no post id"
+    }
+    return postId
+}
+
+test "blog post reaches the pointer, the subscriber notification and only the owner edits" {
+    var app = blogApp()
+    var author = blogUser(app, "blog_author1")
+    var follower = blogUser(app, "blog_follower1")
+    var slug = saveBlog(app, author, "blog_author1", "Meu cantinho", "Portfolio e diario")
+    var postId = publishPost(app, author, "blog_author1", "Primeiro post", "# Titulo\n\nTexto com **negrito**.", "MARKDOWN", true)
+
+    // The page is public and shows the post (no session).
+    var page = app.client.get("/blogs/" + slug)
+    Check.status(page, 200)
+    Check.jsonEq(page, "title", "Meu cantinho")
+    Check.jsonEq(page, "items.0.title", "Primeiro post")
+    Check.jsonEq(page, "items.0.bodyFormat", "MARKDOWN")
+    Check.jsonEq(page, "subscribed", "false")
+    Check.jsonEq(page, "owner", "false")
+    // The post id IS the feed pointer id.
+    Check.isTrue("pointer minted for the post", fakeFeed().pointers.contains(postId))
+    // The owner sees owner=true.
+    var ownerPage = app.client.getWith("/blogs/" + slug, asToken(author))
+    Check.jsonEq(ownerPage, "owner", "true")
+
+    // Nobody subscribed yet: no notification.
+    Check.eqInt("no notification before subscribing", 0, fakeNotifier().receivers.size())
+    var sub = app.client.send("POST", "/blogs/" + slug + "/subscription", asToken(follower), "", "")
+    Check.status(sub, 200)
+    Check.jsonEq(sub, "id", slug)
+    Check.jsonEq(sub, "status", "SUBSCRIBED")
+    Check.jsonEq(app.client.getWith("/blogs/" + slug, asToken(follower)), "subscribed", "true")
+    // Subscribing twice is harmless.
+    Check.status(app.client.send("POST", "/blogs/" + slug + "/subscription", asToken(follower), "", ""), 200)
+    publishPost(app, author, "blog_author1", "Segundo post", "so para quem segue", "MARKDOWN", true)
+    Check.eqInt("one notification", 1, fakeNotifier().receivers.size())
+    Check.eqStr("the subscriber was notified", "blog_follower1", fakeNotifier().receivers.get(0))
+    Check.isTrue("notification links to the post under the username", fakeNotifier().hrefs.get(0).startsWith("/blog/blog_author1/"))
+
+    var unsub = app.client.send("DELETE", "/blogs/" + slug + "/subscription", asToken(follower), "", "")
+    Check.status(unsub, 200)
+    Check.jsonEq(unsub, "status", "NOT_SUBSCRIBED")
+    Check.jsonEq(app.client.getWith("/blogs/" + slug, asToken(follower)), "subscribed", "false")
+    // Subscribing to a blog that does not exist.
+    Check.apiError(app.client.send("POST", "/blogs/nao_existe_blog/subscription", asToken(follower), "", ""), 404, "BLOG_NOT_FOUND")
+}
+
+test "html body is sanitized and ownership is enforced" {
+    var app = blogApp()
+    var author = blogUser(app, "blog_author2")
+    var other = blogUser(app, "blog_other2")
+    var slug = saveBlog(app, author, "blog_author2", "Cantinho", null)
+    var postId = publishPost(app, author, "blog_author2", "Post com HTML", "<h1>Ola</h1><script>alert(1)</script><p onclick=\"x()\">corpo</p>", "HTML", false)
+
+    var page = app.client.get("/blogs/" + slug)
+    var body = page.jsonStr("items.0.body")
+    if (body == null) {
+        throw "FAIL no body"
+    }
+    Check.isTrue("keeps the heading", body.contains("<h1>Ola</h1>"))
+    Check.isTrue("keeps the text", body.contains("corpo"))
+    Check.isTrue("no script", !body.contains("<script"))
+    Check.isTrue("no handler", !body.contains("onclick"))
+
+    var edit = app.client.send("PATCH", "/blogs/me/posts/" + postId, asTokenKey(other, "blog-edit-other"), "", "{\"title\":\"invadido\",\"body\":\"x\",\"format\":\"MARKDOWN\"}")
+    Check.apiError(edit, 403, "NOT_BLOG_OWNER")
+    Check.jsonEq(edit, "message", "Este post nao e seu.")
+    Check.apiError(app.client.send("DELETE", "/blogs/me/posts/" + postId, asToken(other), "", ""), 403, "NOT_BLOG_OWNER")
+
+    var edited = app.client.send("PATCH", "/blogs/me/posts/" + postId, asTokenKey(author, "blog-edit-own"), "", "{\"title\":\"Titulo novo\",\"body\":\"texto novo\",\"format\":\"MARKDOWN\"}")
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "title", "Titulo novo")
+    Check.apiError(app.client.send("PATCH", "/blogs/me/posts/post_inexistente", asTokenKey(author, "blog-edit-miss"), "", "{\"title\":\"x\",\"body\":\"x\",\"format\":\"MARKDOWN\"}"), 404, "BLOG_POST_NOT_FOUND")
+
+    var del = app.client.send("DELETE", "/blogs/me/posts/" + postId, asToken(author), "", "")
+    Check.status(del, 200)
+    Check.jsonEq(del, "id", postId)
+    Check.jsonEq(del, "status", "DELETED")
+    Check.isTrue("pointer left the feed", fakeFeed().deleted.contains(postId))
+    Check.eqInt("blog has no posts", 0, app.client.get("/blogs/" + slug).jsonSize("items"))
+}
+
+test "publishing without a blog creates one with the username" {
+    var app = blogApp()
+    var author = blogUser(app, "blog_lazy1")
+    // No blog yet: 200 with an empty body.
+    var none = app.client.getWith("/blogs/me", asToken(author))
+    Check.status(none, 200)
+    Check.eqStr("empty body", "", none.body)
+
+    publishPost(app, author, "blog_lazy1", "Direto ao ponto", "texto simples", "MARKDOWN", false)
+    var mine = app.client.getWith("/blogs/me", asToken(author))
+    Check.status(mine, 200)
+    var slug = mine.jsonStr("slug")
+    if (slug == null) {
+        throw "FAIL no slug"
+    }
+    Check.eqStr("slug is the username", "blog_lazy1", slug)
+    Check.jsonEq(app.client.get("/blogs/" + slug), "items.0.title", "Direto ao ponto")
+}
+
+test "validation errors and idempotency keep the Java contract" {
+    var app = blogApp()
+    var author = blogUser(app, "blog_valid1")
+    saveBlog(app, author, "blog_valid1", "Cantinho valido", null)
+    Check.apiError(app.client.send("POST", "/blogs/me/posts", asTokenKey(author, "v1"), "", "{\"title\":\"  \",\"body\":\"x\",\"format\":\"MARKDOWN\"}"), 400, "INVALID_BLOG_TITLE")
+    Check.apiError(app.client.send("POST", "/blogs/me/posts", asTokenKey(author, "v2"), "", "{\"title\":\"Ok\",\"body\":\"  \",\"format\":\"MARKDOWN\"}"), 400, "INVALID_BLOG_BODY")
+    var tooLong = app.client.send("PUT", "/blogs/me", asTokenKey(author, "v3"), "", "{\"title\":" + json.encode(strings.repeat("a", 161)) + "}")
+    Check.apiError(tooLong, 400, "BLOG_FIELD_TOO_LONG")
+    Check.jsonEq(tooLong, "message", "O campo titulo aceita no maximo 160 caracteres.")
+    Check.status(app.client.send("POST", "/blogs/me/posts", asToken(author), "", "{\"title\":\"Ok\",\"body\":\"x\",\"format\":\"MARKDOWN\"}"), 400)
+    Check.status(app.client.send("POST", "/blogs/me/posts", asTokenKey(author, "v4"), "", "{\"title\":\"Ok\",\"body\":\"x\",\"format\":\"PDF\"}"), 400)
+    Check.status(app.client.send("PUT", "/blogs/me", listOf("Content-Type: application/json"), "", "{}"), 401)
+    // Same key, same payload: replayed, a single post.
+    var first = app.client.send("POST", "/blogs/me/posts", asTokenKey(author, "same-key"), "", "{\"title\":\"Uma vez\",\"body\":\"x\",\"format\":\"MARKDOWN\"}")
+    var again = app.client.send("POST", "/blogs/me/posts", asTokenKey(author, "same-key"), "", "{\"title\":\"Uma vez\",\"body\":\"x\",\"format\":\"MARKDOWN\"}")
+    Check.status(first, 201)
+    Check.status(again, 201)
+    Check.eqStr("replayed id", orEmpty(first.jsonStr("id")), orEmpty(again.jsonStr("id")))
+    Check.eqInt("single post", 1, app.client.get("/blogs/blog_valid1").jsonSize("items"))
+}
+
+test "directory counts posts and drops banned authors with bulk queries" {
+    var app = blogApp()
+    var writer = blogUser(app, "dir_writer")
+    var banned = blogUser(app, "dir_banned")
+    var writerSlug = saveBlog(app, writer, "dir_writer", "Blog com dois posts", "Diretorio")
+    publishPost(app, writer, "dir_writer", "Um", "Texto do post Um", "MARKDOWN", false)
+    publishPost(app, writer, "dir_writer", "Dois", "Texto do post Dois", "MARKDOWN", false)
+    var bannedSlug = saveBlog(app, banned, "dir_banned", "Blog de conta banida", "Diretorio")
+    app.db().execute("insert into user_sanctions (id, user_id, type, reason, status, created_at) values (?, ?, 'BAN', 'teste', 'ACTIVE', ?)", DbParams().bindStr("san-dir-banned").bindStr("dir_banned").bindInstant(Time.nowIso()))
+
+    var list = app.client.get("/blogs?limit=100")
+    Check.status(list, 200)
+    var seenWriter = false
+    var seenBanned = false
+    var i = 0
+    while (i < list.jsonSize("")) {
+        var slug = list.jsonStr(i + ".slug")
+        if (slug == writerSlug) {
+            seenWriter = true
+            Check.jsonEq(list, i + ".posts", "2")
+        }
+        if (slug == bannedSlug) {
+            seenBanned = true
+        }
+        i = i + 1
+    }
+    Check.isTrue("writer listed", seenWriter)
+    Check.isTrue("banned blog left the directory", !seenBanned)
+    // The banned account's page answers 404 too.
+    Check.apiError(app.client.get("/blogs/" + bannedSlug), 404, "BLOG_NOT_FOUND")
+}
+
+test "blogs search title and description before the limit and a blank query clears" {
+    var app = blogApp()
+    var tag = "catalog" + uuid.v4().substring(0, 8)
+    var a = blogUser(app, tag + "a")
+    var b = blogUser(app, tag + "b")
+    var c = blogUser(app, tag + "c")
+    saveBlog(app, a, tag + "a", "Diario " + tag, null)
+    saveBlog(app, b, tag + "b", "Outro diario", "Sobre " + tag)
+    saveBlog(app, c, tag + "c", "Sem correspondencia", null)
+    app.db().execute("update blogs set created_at = ? where slug = ?", DbParams().bindStr("2026-01-01T00:00:01Z").bindStr(tag + "a"))
+    app.db().execute("update blogs set created_at = ? where slug = ?", DbParams().bindStr("2026-01-01T00:00:02Z").bindStr(tag + "b"))
+    app.db().execute("update blogs set created_at = ? where slug = ?", DbParams().bindStr("2026-01-01T00:00:03Z").bindStr(tag + "c"))
+
+    var found = app.client.get("/blogs?query=%20%20" + tag.toUpperCase() + "%20%20&limit=50")
+    Check.status(found, 200)
+    Check.eqInt("two matches", 2, found.jsonSize(""))
+    Check.jsonEq(found, "0.slug", tag + "b")
+    Check.jsonEq(found, "1.slug", tag + "a")
+    Check.jsonEq(app.client.get("/blogs?query=" + tag + "&limit=1"), "0.slug", tag + "b")
+    Check.eqInt("no match", 0, app.client.get("/blogs?query=" + tag + "missing&limit=50").jsonSize(""))
+    var blank = app.client.get("/blogs?query=%20%20%20&limit=100")
+    Check.isTrue("blank query lists everything", blank.body.contains(tag + "a") && blank.body.contains(tag + "b") && blank.body.contains(tag + "c"))
+}
+
+test "wildcard characters are literal for the blogs search" {
+    var app = blogApp()
+    var tag = "literal" + uuid.v4().substring(0, 8)
+    var owner = blogUser(app, tag)
+    saveBlog(app, owner, tag, tag + "%_!", null)
+    var other = blogUser(app, tag + "x")
+    saveBlog(app, other, tag + "x", "outro " + tag, null)
+    var found = app.client.get("/blogs?query=%25_!&limit=100")
+    Check.status(found, 200)
+    Check.eqInt("only the literal match", 1, found.jsonSize(""))
+    Check.jsonEq(found, "0.slug", tag)
+}
+
+test "atom feed lists that blog only, as well formed text" {
+    var app = blogApp()
+    var author = blogUser(app, "blog_feed_author")
+    var other = blogUser(app, "blog_feed_other")
+    var slug = saveBlog(app, author, "blog_feed_author", "Diario & \"anotacoes\"", "Notas <rapidas>")
+    var otherSlug = saveBlog(app, other, "blog_feed_other", "Outro cantinho", null)
+    var postId = publishPost(app, author, "blog_feed_author", "Cafe & pao <com> manteiga", "<h1>Ola</h1><p>corpo do <b>post</b> com resumo</p>", "HTML", false)
+    publishPost(app, other, "blog_feed_other", "Post do outro blog", "nao pode aparecer no feed do primeiro", "MARKDOWN", false)
+
+    var res = app.client.get("/blogs/" + slug + "/feed.xml")
+    Check.status(res, 200)
+    var contentType = res.headerOf("Content-Type")
+    if (contentType == null) {
+        throw "FAIL no content type"
+    }
+    Check.isTrue("atom content type", contentType.startsWith("application/atom+xml"))
+    Check.eqStr("cache", "public, max-age=300", orEmpty(res.headerOf("Cache-Control")))
+    var xml = res.body
+    Check.isTrue("namespace", xml.contains("<feed xmlns=\"http://www.w3.org/2005/Atom\""))
+    Check.isTrue("title escaped", xml.contains("<title>Diario &amp; &quot;anotacoes&quot;</title>"))
+    Check.isTrue("subtitle escaped", xml.contains("<subtitle>Notas &lt;rapidas&gt;</subtitle>"))
+    Check.isTrue("entry title escaped", xml.contains("<title>Cafe &amp; pao &lt;com&gt; manteiga</title>"))
+    Check.isTrue("entry id", xml.contains("/blog/" + slug + "/" + postId + "</id>"))
+    Check.isTrue("plain text summary", xml.contains("<summary type=\"text\">Ola corpo do post com resumo</summary>"))
+    Check.eqInt("one entry", 1, xml.split("<entry>").length - 1)
+    Check.isTrue("other blog absent", !xml.contains("nao pode aparecer") && !xml.contains("/blog/" + otherSlug))
+}
+
+test "atom feed is public without posts, unknown blog is 404, control characters are dropped" {
+    var app = blogApp()
+    var author = blogUser(app, "blog_feed_empty")
+    var slug = saveBlog(app, author, "blog_feed_empty", "Ainda sem posts", null)
+    var res = app.client.get("/blogs/" + slug + "/feed.xml")
+    Check.status(res, 200)
+    Check.isTrue("no entry", !res.body.contains("<entry>"))
+    Check.isTrue("updated is present", res.body.contains("<updated>20"))
+    Check.apiError(app.client.get("/blogs/nao_existe_feed/feed.xml"), 404, "BLOG_NOT_FOUND")
+
+    var ctrl = blogUser(app, "blog_feed_ctrl")
+    var ctrlSlug = saveBlog(app, ctrl, "blog_feed_ctrl", "Cantinho", null)
+    publishPost(app, ctrl, "blog_feed_ctrl", "Titulo com controle \u0001 e emoji 😀", "corpo simples", "MARKDOWN", false)
+    var feed = app.client.get("/blogs/" + ctrlSlug + "/feed.xml")
+    Check.status(feed, 200)
+    Check.isTrue("control char dropped", !feed.body.contains("\u0001"))
+    Check.isTrue("emoji kept", feed.body.contains("😀"))
+    Check.isTrue("title survives", feed.body.contains("Titulo com controle  e emoji"))
+}

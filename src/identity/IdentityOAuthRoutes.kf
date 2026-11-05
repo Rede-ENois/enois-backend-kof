@@ -1,0 +1,171 @@
+package identity
+
+import kernel.config.*
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+
+// /auth/oauth/** (the OAuth part of AuthController). The callbacks are browser navigations: any failure becomes
+// a redirect to the app's callback screen with a readable code, never raw JSON (a person staring at a bare
+// error has no way out).
+class IdentityOAuthRoutes {
+    Config cfg
+    IdentityOAuth oauth
+    IdentityService service
+    IdentityOAuthConfig oauthConfig
+    SecurityParts parts
+    Bool googleLoginEnabled
+    public constructor(cfg: Config, oauth: IdentityOAuth, service: IdentityService, oauthConfig: IdentityOAuthConfig, parts: SecurityParts) {
+        this.cfg = cfg
+        this.oauth = oauth
+        this.service = service
+        this.oauthConfig = oauthConfig
+        this.parts = parts
+        this.googleLoginEnabled = cfg.getBool("REDE_OAUTH_GOOGLE_ENABLED", true)
+    }
+    register(server: HttpServer) {
+        var self = this
+        server.get("/auth/oauth/providers", () -> self.providers())
+        server.get("/auth/oauth/:provider/start", () -> self.start())
+        server.post("/auth/oauth/:provider/link", () -> self.link(false))
+        server.post("/auth/oauth/:provider/write-link", () -> self.link(true))
+        server.delete("/auth/oauth/:provider/link", () -> self.unlink())
+        server.get("/auth/oauth/:provider/callback", () -> self.callbackGet())
+        server.post("/auth/oauth/:provider/callback", () -> self.callbackPost())
+        server.post("/auth/oauth/:provider/token", () -> self.token())
+    }
+    String providerParam() {
+        var raw = Req.pathParam("provider")
+        var parsed = IdentityOAuth.parseProvider(raw)
+        if (parsed == null) {
+            throw Errors.api(400, "INVALID_OAUTH_PROVIDER", "Provedor OAuth invalido: " + raw)
+        }
+        return parsed
+    }
+    String requireUserId() = service.requireUserId(Auth.sessionToken())
+    String start() {
+        parts.namedLimiters.require("auth")
+        var provider = providerParam()
+        if (provider == "GOOGLE" && !googleLoginEnabled) {
+            throw Errors.api(403, "OAUTH_PROVIDER_DISABLED", "Login com Google indisponivel neste ambiente.")
+        }
+        return json.encode(oauth.start(provider, IdentityText.none(), false))
+    }
+    // Starts linking a provider to the signed-in account: the stored state points at the user, and the callback
+    // that uses it links instead of signing in. The write link asks GitHub for the write scope (moderation).
+    String link(write: Bool) {
+        parts.namedLimiters.require("auth")
+        var provider = providerParam()
+        var userId = requireUserId()
+        if (write) {
+            return json.encode(oauth.startLinkWithWrite(userId, provider))
+        }
+        return json.encode(oauth.startLink(userId, provider))
+    }
+    String providers() = json.encode(oauth.linkedProviders(requireUserId()))
+    String unlink() {
+        parts.namedLimiters.require("auth")
+        var provider = providerParam()
+        oauth.unlink(requireUserId(), provider)
+        return json.encode(IdentityStatusBody(Req.pathParam("provider"), "UNLINKED"))
+    }
+    String token() {
+        parts.namedLimiters.require("auth")
+        var provider = providerParam()
+        var body = IdentityOAuthTokenRequest(null, null)
+        try {
+            body = json.decode<IdentityOAuthTokenRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        // The `state` (from /start) ties the id_token to the request: without it the token could belong to another flow.
+        return finishOAuth(oauth.tokenLogin(provider, body.idToken, body.state))
+    }
+    String callbackGet() {
+        parts.namedLimiters.require("auth")
+        var provider = providerParam()
+        var error = Req.queryStr("error", "")
+        var code = Req.queryStr("code", "")
+        if (error.trim().length() > 0 || code.trim().length() == 0) {
+            return finishOAuthError(provider, error)
+        }
+        var failure = ""
+        try {
+            return finishOAuth(oauth.callback(provider, code, Req.queryStr("state", ""), IdentityText.none()))
+        } catch (String e) {
+            failure = e
+        }
+        if (Errors.isApi(failure)) {
+            return finishOAuthError(provider, Errors.parse(failure).code())
+        }
+        throw failure
+    }
+    // Apple posts the callback (response_mode=form_post) with code/state/user in the form body.
+    String callbackPost() {
+        parts.namedLimiters.require("auth")
+        var provider = providerParam()
+        var form = formParams(Req.bodyText())
+        var error = formValue(form, "error")
+        if (error.trim().length() > 0) {
+            return finishOAuthError(provider, error)
+        }
+        var code = formValue(form, "code")
+        var state = formValue(form, "state")
+        // We prefer the code: the exchange proves the token came to this client, and the id_token's nonce is
+        // checked against the state.
+        if (code.trim().length() > 0) {
+            return finishOAuth(oauth.callback(provider, code, state, formValue(form, "user")))
+        }
+        return finishOAuth(oauth.tokenLogin(provider, formValue(form, "id_token"), state))
+    }
+    // Form field or query parameter (Spring's @RequestParam reads both).
+    Map<String,String> formParams(text: String) {
+        var out = mapOf<String, String>()
+        for (var source in listOf(text, Req.rawQuery())) {
+            for (var pair in source.split("&")) {
+                var eq = pair.indexOf("=")
+                if (eq > 0) {
+                    var key = UrlCodec.decode(pair.substring(0, eq))
+                    if (out.get(key) == null) {
+                        out.put(key, UrlCodec.decode(pair.substring(eq + 1).replace("+", " ")))
+                    }
+                }
+            }
+        }
+        return out
+    }
+    String formValue(form: Map<String,String>, name: String) {
+        var v = form.get(name)
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    String redirect(location: String) {
+        ResponseHeaders.set("Location", location)
+        return status(302, "")
+    }
+    // With a frontend redirect URL the session rides on the 302 cookies (no credential in the URL, history, logs
+    // or Referer); without one the body answers like the session endpoints do.
+    String finishOAuth(issued: IdentityIssued) {
+        SessionCookies.issue(issued.token(), issued.expiresAt(), issued.refreshToken(), issued.refreshExpiresAt())
+        var url = oauthConfig.frontendRedirectUrl()
+        if (url.length() > 0) {
+            return redirect(url + "?status=ok")
+        }
+        return json.encode(IdentitySessionBody(issued.expiresAt(), issued.refreshExpiresAt(), issued.user()))
+    }
+    // Cancelling or failing at the provider returns to the app with a readable code, not a technical error.
+    String finishOAuthError(provider: String, error: String) {
+        var code = "OAUTH_FAILED"
+        if (error.trim().length() > 0) {
+            code = error.trim().toUpperCase()
+        }
+        var url = oauthConfig.frontendRedirectUrl()
+        if (url.length() > 0) {
+            return redirect(url + "?error=" + UrlCodec.encode(code) + "&provider=" + provider)
+        }
+        throw Errors.api(401, "OAUTH_" + code, "Nao foi possivel concluir o login com " + provider + ".")
+    }
+}

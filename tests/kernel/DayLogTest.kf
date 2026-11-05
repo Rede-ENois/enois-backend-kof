@@ -1,0 +1,92 @@
+import kernel.monitoring.*
+
+// The scanner reads newest day first, newest line first, across block boundaries and with UTF-8 intact.
+String dir(name: String) {
+    var d = "/tmp/kof-daylog-" + name + "-" + uuid.v4()
+    return d
+}
+
+test "append writes one line per call and scan returns the newest first" {
+    var log = DayLog(dir("a"), 7)
+    log.append("one")
+    log.append("two")
+    log.append("three")
+    var seen = listOf<String>()
+    log.scan((line: String) -> {
+        seen.add(line)
+        return true
+    })
+    assert(seen.size() == 3)
+    assert(seen.get(0) == "three")
+    assert(seen.get(2) == "one")
+}
+
+test "scan stops when the consumer says false" {
+    var log = DayLog(dir("b"), 7)
+    var i = 0
+    while (i < 20) {
+        log.append("line " + i)
+        i = i + 1
+    }
+    var seen = listOf<String>()
+    log.scan((line: String) -> {
+        seen.add(line)
+        return seen.size() < 5
+    })
+    assert(seen.size() == 5)
+    assert(seen.get(0) == "line 19")
+}
+
+test "lines cut by a block boundary and multibyte characters survive" {
+    var log = DayLog(dir("c"), 7)
+    var i = 0
+    // ~300 bytes per line, several blocks of 64 KiB.
+    while (i < 1000) {
+        log.append("{\"n\":" + i + ",\"t\":\"" + strings.repeat("ação ", 50) + "\"}")
+        i = i + 1
+    }
+    var count = 0
+    var expected = 999
+    var ordered = true
+    var intact = true
+    log.scan((line: String) -> {
+        if (!line.startsWith("{\"n\":" + expected + ",") || !line.contains("ação ação")) {
+            if (!line.startsWith("{\"n\":" + expected + ",")) {
+                ordered = false
+            }
+            else {
+                intact = false
+            }
+        }
+        expected = expected - 1
+        count = count + 1
+        return true
+    })
+    assert(count == 1000)
+    assert(ordered)
+    assert(intact)
+}
+
+test "rotate deletes the days past the retention and leaves a name outside the pattern" {
+    var folder = dir("d")
+    var log = DayLog(folder, 2)
+    log.append("today")
+    File(folder + "/events-2020-01-01.jsonl").writeText("old")
+    File(folder + "/events-2020-13-45.jsonl").writeText("not a date")
+    File(folder + "/events-latest.jsonl").writeText("foreign")
+    log.rotate()
+    var oldText = File(folder + "/events-2020-01-01.jsonl").readText()
+    assert(oldText == null)
+    var oddText = File(folder + "/events-2020-13-45.jsonl").readText()
+    assert(oddText != null)
+    var foreignText = File(folder + "/events-latest.jsonl").readText()
+    assert(foreignText != null)
+    var seen = listOf<String>()
+    log.scan((line: String) -> {
+        seen.add(line)
+        return true
+    })
+    // The malformed-date file is still a log file for the reader, read after today's.
+    assert(seen.get(0) == "today")
+    assert(seen.size() == 2)
+}

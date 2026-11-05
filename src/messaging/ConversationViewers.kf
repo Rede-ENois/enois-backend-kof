@@ -1,0 +1,56 @@
+package messaging
+
+import java.util.concurrent.ConcurrentHashMap
+import kernel.time.*
+
+// Who has which conversation on screen right now (ConversationViewers): a recipient who is looking at the
+// conversation gets no notification and no push. The client renews with POST /conversations/{id}/viewing
+// and leaves with DELETE; a mark expires on its own after 45 s. In memory, per pod.
+class ConversationViewers {
+    Map<String,Map<String,Long>> marks = new ConcurrentHashMap<String, Map<String,Long>>()
+    public constructor() {}
+    static Long ttlMillis() = 45000L
+    viewing(userId: String, conversationId: String) {
+        if (marks.get(userId) == null) {
+            marks.put(userId, new ConcurrentHashMap<String, Long>())
+        }
+        marksOf(userId).put(conversationId, Time.nowMillis() + ConversationViewers.ttlMillis())
+    }
+    Map<String,Long> marksOf(userId: String) {
+        var found = marks.get(userId)
+        if (found == null) {
+            return new ConcurrentHashMap<String, Long>()
+        }
+        return found
+    }
+    left(userId: String, conversationId: String) {
+        var mine = marks.get(userId)
+        if (mine != null) {
+            mine.remove(conversationId)
+        }
+    }
+    Bool isViewing(userId: String, conversationId: String) {
+        var mine = marks.get(userId)
+        if (mine == null) {
+            return false
+        }
+        var until = mine.get(conversationId)
+        return until != null && until > Time.nowMillis()
+    }
+    // @Scheduled(fixedDelay = 60s): forgets the marks that expired.
+    dropExpired() {
+        var now = Time.nowMillis()
+        for (var userId in marks.keys()) {
+            var mine = marks.get(userId)
+            if (mine == null) {
+                continue
+            }
+            for (var conversationId in mine.keys()) {
+                var until = mine.get(conversationId)
+                if (until == null || until <= now) {
+                    mine.remove(conversationId)
+                }
+            }
+        }
+    }
+}

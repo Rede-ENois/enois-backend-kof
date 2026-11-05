@@ -842,11 +842,7 @@ AWS Signature V4, path-style or virtual-hosted, verified against the AWS documen
 (`tests/media/S3RestTest.kf`). The SDK itself cannot be called from Kof (G160). `Uris` (kernel.url):
 `encodePathSegment`, `encodeAws`, `decode`, `base64`, `host`, `path`, `scheme`, `parses`.
 
-## kernel.http: HttpFetch and the binary lane
-
-`HttpFetch.probe(url, timeoutMs): FetchProbe(status, contentType)`, `HttpFetch.download(url, maxBytes): String`
-(a temp file path, no redirects, throws `download falhou: ...`), `HttpFetch.send(method, url, headers, body,
-timeoutMs): HttpReply(status, body)`.
+## kernel.http: the binary lane
 
 ```kotlin
 BinaryLane.claim("/storage/")                // in the module install: this prefix (and /v1/...) goes through the lane
@@ -863,6 +859,27 @@ port with `BinaryFront` (every other request is forwarded byte for byte, `X-Kern
 address and `Req.peerAddress()` honours it only from a loopback peer; client-sent `X-Kernel-*` and `Expect` are
 dropped). `REDE_BINARY_MAX_BODY_BYTES` (default 545259520) caps one upload. Why and what it costs: `docs/PORTING_STATUS.md`
 (media) and G161. Tests use `BinaryClient(app.port)` (`get`, `put`, `send` with `Byte[]` bodies, `BinaryResponse.body`).
+## kernel.push (web push adapter)
+
+`kernel.push.WebPushAdapter` is the only file that imports the web-push library (jars in `kofdeps`:
+`nl.martijndwars:web-push`, `org.bouncycastle:bcprov-jdk18on`, `org.bitbucket.b_c:jose4j`). The library overloads
+hit G2/G4/G21 style resolver bugs, so the objects are built by reflection and a plain Apache async client does the
+POST. Domains never see the library: `push.WebPushSender` is the caller.
+
+```
+var adapter = WebPushAdapter.create(vapidPublic, vapidPrivate, subject)   // null for blank or invalid keys
+var status = adapter.post(endpoint, p256dh, auth, payloadJson, ttlSeconds) // HTTP status, or -1; never throws
+adapter.lastFailure()                                                      // why the last -1 happened (log text, no keys)
+adapter.close()
+```
+
+- `create` returns `null` when a key is blank or not a valid P-256 key, so a missing configuration turns push off
+  instead of failing the boot.
+- `post` has 5 s to connect, 10 s per read and a 15 s overall limit; 404 and 410 mean the subscription is gone (the
+  caller deletes it).
+- `WebPushKeys.vapid()` and `WebPushKeys.device()` are fixed test-only key pairs (base64url) for suites that need a
+  real encryption round trip; tests of other domains stub the sender (`push.RecordingPushSender`).
+
 ### Profile slice support (`profile.ProfileTestApp`)
 
 `ProfileTestApp.boot(name, overrides)` boots the platform with the request pipeline, `SharedServices` and
@@ -870,19 +887,27 @@ dropped). `REDE_BINARY_MAX_BODY_BYTES` (default 545259520) caps one upload. Why 
 a verified account (once) with a live session and returns a `ProfileCaller` (token, JSON content type and a fresh
 `Idempotency-Key` on every write). `ProfileTestApp.finish()` must be the last test of every file: the shared
 jobs keep the test process alive otherwise (G124).
-## kernel.http.HttpFetch (the one outbound HTTP client) and kernel.concurrent.Gate
+## kernel.http.Outbound (the only outbound HTTP client) and kernel.concurrent.Gate
 
 ```kotlin
 import kernel.http.*
-var res = HttpFetch.getBytes(url, listOf("Accept: image/*"), 4000, 6000, 1048576)   // connect ms, read ms, max bytes
+var reply = Outbound.request("POST", url, listOf("Content-Type: application/json"), "{}", 15000)   // reply.status, reply.body; also postJson / postForm / get
+var posted = Outbound.attempt("POST", url, headers, "{}", 15000)    // same, but unreachable = status 0 and empty body instead of a throw
+var res = Outbound.getBytes(url, listOf("Accept: image/*"), 4000, 6000, 1048576)   // connect ms, read ms, max bytes
 res.status   res.contentType   res.body: Byte[]   res.size()   res.text()
-var posted = HttpFetch.send("POST", url, listOf("Content-Type: application/json"), "{}", 15000)   // posted.status (0 = unreachable), posted.body
+var probe = Outbound.probe(url, 10000)             // HEAD (ranged GET on 405), follows redirects: probe.status (0 = unreachable), probe.contentType
+var path = Outbound.download(url, maxBytes)        // temp file path, 200 only, no redirects, throws "download falhou: ..."
 ```
 
-Outbound calls for adapters that need what `kof.http` hides (status, content type, bytes, request headers: G15).
-Redirects are not followed by `getBytes`. An error status (4xx/5xx) returns its body; `getBytes` throws
-`OUTBOUND_FAILED: ...` on a network failure, `send` answers status 0. `getBytes` reads up to `maxBytes + 1` so the
-caller can detect "too large". `probe` and `download` (media workers) live in the same class.
+One class for every outgoing call (identity, suggestions, linkedin, media, emotes): do not add another client.
+It exists because `kof.http` hides the status, content type, bytes and request headers (G15). Failures to connect or
+read throw exactly `"OUTBOUND_FAILED"` (never the URL, address or a header, so a caller maps it to its own 503
+without leaking secrets); `attempt` and `probe` fold that into status 0. Redirects are not followed except by
+`probe`. An error status (4xx/5xx) returns its body; `getBytes` reads up to `maxBytes + 1` so the caller can detect
+"too large". Wrap it in an overridable class and stub that in tests (no network).
+
+`Uris` (kernel.url, percent-encoding with an explicit safe set, host/path parsing) and `UrlCodec` (form encoding,
+`+` for a space) do not overlap: use `UrlCodec` for query values and forms, `Uris` for URL paths and AWS signing.
 
 ```kotlin
 import kernel.concurrent.*
@@ -904,3 +929,26 @@ request, one temp file per upload (`java.io.tmpdir`), and a thread per connectio
 **The internal port must never be published or routed to** (docker `ports:`, a Traefik/Cloudflare route, a
 firewall rule): it trusts `X-Kernel-Peer`, `X-Kernel-Binary` and ticket headers that only the front sets. The front
 drops client-sent `X-Kernel-*` headers, and `Req.peerAddress()` honours `X-Kernel-Peer` only from a loopback peer.
+
+## Identity adapters (`Tokens`, `Jwt`, `Outbound`, `UrlCodec`)
+
+Java interop for the identity flows lives here; domain code only sees Strings.
+
+- `Tokens.random(size)` (base64url of SecureRandom bytes), `randomInt(bound)`, `hmacSha256Url(keyBase64, message)`,
+  `safeEquals(a, b)` (constant time), `base64Encode`, `base64UrlEncode`, `base64UrlDecode`, `validKey`.
+- `Jwt.verifyRs256(token, jwks)`: payload JSON or null (shape, algorithm, key, signature); issuer, audience, expiry and
+  nonce are the caller's. `Jwt.sign("RS256" | "ES256", pkcs8Base64OrPem, header, payload)`; `newRsaPair` and `newEcPair`
+  are test support. `Jwt.looksLikeJwt(value)` tells an id_token from an authorization code.
+- `Outbound`: see the kernel.http.Outbound section (the only outbound HTTP client).
+- `UrlCodec.encode(value)` / `decode(value)`: form url encoding, UTF-8.
+## Leaf-domain kernel additions
+
+- `Req.queryAll(name)`, `Req.queryParam(name)`, `Req.formDecode(raw)`; `queryStr/queryInt/queryLong/queryBool` read the raw query (`+` is a space, `%2B` a plus, repeated names supported).
+- `Regexes.matches(regex, text)`, `Texts.fromHex4`, `Numbers.round/round2/pow`, `Contrast.ratio/over/wholePart` (WCAG contrast with the integer-division message of the Java service).
+- `Outbound`: see the kernel.http.Outbound section (the only outbound HTTP client).
+- `HtmlTemplate.render(template, vars)`: Thymeleaf subset (`th:text`, `th:href`, drops `xmlns:th`).
+- `OriginNormalizer.normalize(raw)`: developer origin validation (`INVALID_ORIGIN`).
+- `ZoneDates.dayOf/startOfDay/plusDays/today(zone)`: calendar days in a named zone.
+- `Log.installTap(LogTap)`: observer of every written line (a line logged inside the tap is not tapped again).
+- `Db.poolStats()`: `DbPoolStats(active, idle, total, waiting, max, min)` or null.
+- `kernel.monitoring`: `DayLog(dir, retentionDays)` (UTC day JSONL files, `append`, `rotate`, `scan` newest first in blocks), `RequestMetrics` (60 minute buckets, per-second counts, in-flight gauge, `overview(nowMs)`), `EventBuffer` (bounded queue, recent window, per-minute cap, level/type counters), `HostResources` (JVM, system memory from `/proc/meminfo`, cgroup memory and CPU, pool).

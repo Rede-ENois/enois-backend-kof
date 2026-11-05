@@ -1,0 +1,39 @@
+package push
+
+import kernel.*
+import kernel.config.*
+import kernel.security.*
+import notifications.*
+
+// Composition of the push domain. Needs the notifications module (listener + preferences).
+//
+//   var pushModule = PushModule.install(platform, shared, hooks, parts, notificationsModule)
+//
+// VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY / VAPID_SUBJECT (default mailto:suporte@enois.ia.br); without the
+// keys push is off and GET /push/config answers {"enabled":false,"publicKey":null}.
+class PushModule {
+    PushStore store
+    PushSubscriptionService service
+    PushSender sender
+    PushNotificationListener listener
+    public constructor(store: PushStore, service: PushSubscriptionService, sender: PushSender, listener: PushNotificationListener) {
+        this.store = store
+        this.service = service
+        this.sender = sender
+        this.listener = listener
+    }
+    static PushModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks, parts: SecurityParts, notificationsModule: NotificationsModule) {
+        var store = PushStore(platform.db)
+        var cfg = platform.cfg
+        var sender = WebPushSender.fromConfig(store, cfg.getStr("VAPID_PUBLIC_KEY", ""), cfg.getStr("VAPID_PRIVATE_KEY", ""), cfg.getStr("VAPID_SUBJECT", "mailto:suporte@enois.ia.br"))
+        return PushModule.installWith(platform, notificationsModule, store, sender, PushPresence(platform.db), false)
+    }
+    // Same with the seams in hand: tests pass a stub sender and `inline = true`.
+    static PushModule installWith(platform: Platform, notificationsModule: NotificationsModule, store: PushStore, sender: PushSender, presence: PushPresence, inline: Bool) {
+        var service = PushSubscriptionService(store, sender)
+        var listener = PushNotificationListener(sender, notificationsModule.preferences, presence, inline)
+        notificationsModule.notifications.addListener(listener)
+        PushRoutes.register(platform.server, service)
+        return PushModule(store, service, sender, listener)
+    }
+}

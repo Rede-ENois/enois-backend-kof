@@ -1,0 +1,52 @@
+package messaging
+
+import kernel.db.*
+import kernel.testkit.*
+import notifications.*
+
+// Request helpers shared by the messaging and calls suites. Every call returns the raw response.
+class MessagingTestKit {
+    static TestResponse call(app: TestApp, token: String, key: String, path: String, body: String) = app.client.send("POST", path, DomainTestKit.command(token, key), "", body)
+    static TestResponse get(app: TestApp, token: String, path: String) = app.client.getWith(path, DomainTestKit.auth(token))
+    static String idsJson(ids: List<String>) = "{\"ids\":" + json.encode(ids) + "}"
+    // POST /conversations/direct, must succeed; returns the conversation id.
+    static String direct(app: TestApp, token: String, key: String, otherId: String) {
+        var res = MessagingTestKit.call(app, token, key, "/conversations/direct", "{\"userId\":" + json.encode(otherId) + "}")
+        Check.status(res, 200)
+        return "" + res.jsonStr("id")
+    }
+    // POST /conversations of kind DIRECT, must succeed (201); returns the conversation id.
+    static String createDirect(app: TestApp, token: String, key: String, otherId: String) {
+        var res = MessagingTestKit.call(app, token, key, "/conversations", "{\"kind\":\"DIRECT\",\"participantIds\":[" + json.encode(otherId) + "]}")
+        Check.status(res, 201)
+        return "" + res.jsonStr("id")
+    }
+    static TestResponse send(app: TestApp, token: String, key: String, conversationId: String, text: String) = MessagingTestKit.call(app, token, key, "/conversations/" + conversationId + "/messages", "{\"text\":" + json.encode(text) + "}")
+    // Sends and returns the message id; the send must be a 201.
+    static String sendOk(app: TestApp, token: String, key: String, conversationId: String, text: String) {
+        var res = MessagingTestKit.send(app, token, key, conversationId, text)
+        Check.status(res, 201)
+        return "" + res.jsonStr("id")
+    }
+    static List<String> idsAt(res: TestResponse, listPath: String) {
+        var out = listOf<String>()
+        var n = res.jsonSize(listPath)
+        var i = 0
+        while (i < n) {
+            out.add("" + res.jsonStr(listPath + "." + i + ".id"))
+            i = i + 1
+        }
+        return out
+    }
+    static List<String> messageIds(app: TestApp, token: String, conversationId: String) {
+        var res = MessagingTestKit.get(app, token, "/conversations/" + conversationId + "/messages")
+        Check.status(res, 200)
+        return MessagingTestKit.idsAt(res, "items")
+    }
+    static List<String> conversationIds(app: TestApp, token: String, path: String) {
+        var res = MessagingTestKit.get(app, token, path)
+        Check.status(res, 200)
+        return MessagingTestKit.idsAt(res, "items")
+    }
+    static Long count(app: TestApp, sql: String, a: String, b: String) = app.db().queryLong(sql, DbParams().bindStr(a).bindStr(b))
+}

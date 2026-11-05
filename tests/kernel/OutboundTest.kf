@@ -1,0 +1,54 @@
+import kernel.*
+import kernel.http.*
+import kernel.testkit.*
+
+class OutboundHolder {
+    static TestApp? app = null
+}
+
+TestApp outboundApp() {
+    var cur = OutboundHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = TestApp.bootWire("outbound", (p: Platform) -> {
+    p.server.post("/echo", () -> status(201, "{\"header\":" + json.encode(Req.headerOrNull("x-probe")) + ",\"body\":" + json.encode(Req.bodyText()) + "}"))
+    p.server.get("/boom", () -> status(500, "{\"code\":\"X\"}"))
+    p.server.get("/missing", () -> status(404, ""))
+})
+    OutboundHolder.app = created
+    return created
+}
+
+test "a JSON POST carries the headers and the UTF-8 body and answers status and body" {
+    var app = outboundApp()
+    var reply = Outbound.postJson("http://127.0.0.1:" + app.port + "/echo", listOf("Content-Type: application/json", "X-Probe: hello", "Authorization: Bearer tok"), "{\"a\":\"ç\"}", 3000)
+    Check.eqInt("status", 201, reply.status())
+    Check.eqStr("header and body echoed", "{\"header\":\"hello\",\"body\":\"{\\\"a\\\":\\\"ç\\\"}\"}", reply.body())
+}
+
+test "an error status still returns its body and an empty error body reads empty" {
+    var app = outboundApp()
+    var boom = Outbound.get("http://127.0.0.1:" + app.port + "/boom", listOf(), 3000)
+    Check.eqInt("status", 500, boom.status())
+    Check.eqStr("body", "{\"code\":\"X\"}", boom.body())
+    var missing = Outbound.get("http://127.0.0.1:" + app.port + "/missing", listOf(), 3000)
+    Check.eqInt("404", 404, missing.status())
+}
+
+test "a refused connection is an OUTBOUND_FAILED without the address" {
+    var failure = ""
+    try {
+        var ignored = Outbound.get("http://127.0.0.1:1/x", listOf(), 1000)
+    } catch (String e) {
+        failure = e
+    }
+    Check.eqStr("failure", "OUTBOUND_FAILED", failure)
+    var bad = ""
+    try {
+        var ignored = Outbound.get("not a url", listOf(), 1000)
+    } catch (String e) {
+        bad = e
+    }
+    Check.eqStr("bad url", "OUTBOUND_FAILED", bad)
+}

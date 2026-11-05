@@ -1,0 +1,76 @@
+package calls
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+
+// HTTP adapter of the calls domain (CallController). Every route needs a session and checks the link
+// (conversation or group) on the server: the client does not decide who enters nor who can end.
+// The entry token leaves only in POST /calls/{id}/join.
+class CallsRoutes {
+    static register(server: HttpServer, service: CallService) {
+        server.post("/conversations/:conversationId/calls", () -> CallsRoutes.startDirect(service))
+        server.post("/groups/:groupId/calls", () -> CallsRoutes.startGroup(service))
+        server.get("/conversations/:conversationId/calls/open", () -> CallsRoutes.openOfConversation(service))
+        server.get("/groups/:groupId/calls/open", () -> CallsRoutes.openOfGroup(service))
+        server.get("/calls/open", () -> json.encode(service.openFor(Auth.requireUser())))
+        server.get("/calls/:callId", () -> json.encode(service.get(Req.pathParam("callId"), Auth.requireUser())))
+        server.post("/calls/:callId/answer", () -> json.encode(service.answer(Req.pathParam("callId"), Auth.requireUser())))
+        server.post("/calls/:callId/decline", () -> json.encode(service.decline(Req.pathParam("callId"), Auth.requireUser())))
+        server.post("/calls/:callId/cancel", () -> json.encode(service.cancel(Req.pathParam("callId"), Auth.requireUser())))
+        server.post("/calls/:callId/join", () -> json.encode(service.join(Req.pathParam("callId"), Auth.requireUser())))
+        server.post("/calls/:callId/leave", () -> json.encode(service.leave(Req.pathParam("callId"), Auth.requireUser())))
+        server.post("/calls/:callId/end", () -> json.encode(service.end(Req.pathParam("callId"), Auth.requireUser())))
+        server.post("/calls/:callId/fail", () -> json.encode(service.fail(Req.pathParam("callId"), Auth.requireUser())))
+    }
+    // The body is optional; a blank kind is AUDIO, anything else must be AUDIO or VIDEO.
+    static String kindOf() {
+        var raw = Req.bodyText()
+        if (raw.trim().length() == 0) {
+            return "AUDIO"
+        }
+        var body = CallStartBody(null)
+        try {
+            body = json.decode<CallStartBody>(raw)
+        } catch (String bad) {
+            throw Errors.badRequest()
+        }
+        var kind = body.kind()
+        if (kind == null) {
+            return "AUDIO"
+        }
+        var upper = kind.trim().toUpperCase()
+        if (upper.length() == 0) {
+            return "AUDIO"
+        }
+        if (upper == "AUDIO" || upper == "VIDEO") {
+            return upper
+        }
+        throw Errors.badRequest()
+    }
+    static String startDirect(service: CallService) {
+        var userId = Auth.requireUser()
+        return json.encode(service.startDirect(Req.pathParam("conversationId"), userId, CallsRoutes.kindOf()))
+    }
+    static String startGroup(service: CallService) {
+        var userId = Auth.requireUser()
+        return json.encode(service.startGroup(Req.pathParam("groupId"), userId, CallsRoutes.kindOf()))
+    }
+    // A null body (no open call) is a 200 with nothing in it.
+    static String openOfConversation(service: CallService) {
+        var userId = Auth.requireUser()
+        var open = service.openOf(Req.pathParam("conversationId"), null, userId)
+        if (open == null) {
+            return ""
+        }
+        return json.encode(open)
+    }
+    static String openOfGroup(service: CallService) {
+        var userId = Auth.requireUser()
+        var open = service.openOf(null, Req.pathParam("groupId"), userId)
+        if (open == null) {
+            return ""
+        }
+        return json.encode(open)
+    }
+}

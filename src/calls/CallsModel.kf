@@ -1,0 +1,175 @@
+package calls
+
+import java.time.Instant
+import kernel.error.*
+import kernel.time.*
+
+// Table `call_sessions`. Enumerations are their Java names as strings: kind AUDIO|VIDEO, modality
+// DIRECT|GROUP, state INITIATING|RINGING|CONNECTING|ACTIVE|DECLINED|MISSED|CANCELLED|ENDED|FAILED.
+record CallRecord(String id, String kind, String modality, String? conversationId, String? groupId, String initiatorId, String roomId, String displayName, String state, String createdAt, String? answeredAt, String? endedAt, String? endedBy, String? endReason, String? expiresAt, String lastActivityAt)
+
+// The call for one person (CallService.CallView). Never carries a token or a room name.
+record CallView(String id, String kind, String modality, String? conversationId, String? groupId, String initiatorId, String displayName, String state, String createdAt, String? answeredAt, String? endedAt, String? endReason, String? expiresAt, Int participantCount, Bool isInitiator, String? myState)
+
+// The credential to enter the room (CallService.JoinView).
+record CallJoinView(String callId, String kind, String modality, String host, Long tokenTtlSeconds, String room, String jwt, CallView call)
+
+record CallStartBody(String? kind)
+
+// The state machine (CallState): closed on purpose, so two taps on answer and decline at once cannot leave
+// the call in both states.
+class CallStates {
+    static Bool isOpen(state: String) = "|INITIATING|RINGING|CONNECTING|ACTIVE|".contains("|" + state + "|")
+    static Bool isTerminal(state: String) = !CallStates.isOpen(state)
+    static Bool allowsJoin(state: String) = state == "CONNECTING" || state == "ACTIVE"
+    static String openList() = "(\'INITIATING\', \'RINGING\', \'CONNECTING\', \'ACTIVE\')"
+    static Bool canMoveTo(from: String, next: String) {
+        if (from == next) {
+            return false
+        }
+        if (from == "INITIATING") {
+            return "|RINGING|CONNECTING|ACTIVE|CANCELLED|DECLINED|MISSED|FAILED|".contains("|" + next + "|")
+        }
+        if (from == "RINGING") {
+            return "|CONNECTING|ACTIVE|DECLINED|MISSED|CANCELLED|FAILED|".contains("|" + next + "|")
+        }
+        if (from == "CONNECTING") {
+            return "|ACTIVE|ENDED|FAILED|MISSED|".contains("|" + next + "|")
+        }
+        if (from == "ACTIVE") {
+            return "|ENDED|FAILED|".contains("|" + next + "|")
+        }
+        return false
+    }
+    static String describe(state: String) {
+        if (state == "CONNECTING") {
+            return "atendida"
+        }
+        if (state == "ACTIVE") {
+            return "colocada em andamento"
+        }
+        if (state == "DECLINED") {
+            return "recusada"
+        }
+        if (state == "MISSED") {
+            return "marcada como não atendida"
+        }
+        if (state == "CANCELLED") {
+            return "cancelada"
+        }
+        if (state == "ENDED") {
+            return "encerrada"
+        }
+        if (state == "FAILED") {
+            return "marcada como falha"
+        }
+        if (state == "RINGING") {
+            return "colocada para tocar"
+        }
+        return "iniciada"
+    }
+    // The refusal a join gets once the call is over.
+    static String terminalCode(state: String) {
+        if ("|DECLINED|MISSED|CANCELLED|ENDED|FAILED|".contains("|" + state + "|")) {
+            return "CALL_" + state
+        }
+        return "CALL_STATE_CONFLICT"
+    }
+    static String terminalMessage(state: String) {
+        if (state == "DECLINED") {
+            return "A chamada foi recusada."
+        }
+        if (state == "MISSED") {
+            return "A chamada nao foi atendida a tempo."
+        }
+        if (state == "CANCELLED") {
+            return "A chamada foi cancelada."
+        }
+        if (state == "ENDED") {
+            return "A chamada ja terminou."
+        }
+        if (state == "FAILED") {
+            return "A chamada falhou."
+        }
+        return "A chamada nao aceita novas entradas agora."
+    }
+}
+
+// Transitions of CallSession, on immutable records: every function returns the next record.
+class CallTransitions {
+    // How long a direct call rings, an empty group call lives and a silent session is kept (seconds).
+    static Long ringTimeout() = 40L
+    static Long emptyGroupTimeout() = 300L
+    static Long abandonTimeout() = 1800L
+    static CallRecord start(id: String, kind: String, modality: String, conversationId: String?, groupId: String?, initiatorId: String, roomId: String, displayName: String, now: String) {
+        var initial = "CONNECTING"
+        var window = CallTransitions.emptyGroupTimeout()
+        if (modality == "DIRECT") {
+            initial = "RINGING"
+            window = CallTransitions.ringTimeout()
+        }
+        return CallRecord(id, kind, modality, conversationId, groupId, initiatorId, roomId, displayName, initial, now, null, null, null, null, Time.plusSeconds(now, window), now)
+    }
+    // Moves only when the machine allows it, otherwise the conflict is answered instead of pretended.
+    static CallRecord moveTo(call: CallRecord, next: String, now: String, reason: String?) {
+        if (!CallStates.canMoveTo(call.state(), next)) {
+            throw Errors.api(409, "CALL_STATE_CONFLICT", "A chamada já está em outro estado e não pode ser " + CallStates.describe(next) + ".")
+        }
+        var answeredAt = call.answeredAt()
+        var endedAt = call.endedAt()
+        var endReason = call.endReason()
+        if (next == "DECLINED" || next == "MISSED" || next == "CANCELLED") {
+            endedAt = now
+            endReason = next
+            if (reason != null) {
+                endReason = reason
+            }
+        }
+        if (next == "CONNECTING" && answeredAt == null) {
+            answeredAt = now
+        }
+        if (next == "ENDED" || next == "FAILED") {
+            endedAt = now
+            endReason = reason
+        }
+        return CallRecord(call.id(), call.kind(), call.modality(), call.conversationId(), call.groupId(), call.initiatorId(), call.roomId(), call.displayName(), next, call.createdAt(), answeredAt, endedAt, call.endedBy(), endReason, call.expiresAt(), now)
+    }
+    // Closes by somebody's decision (end, cancel or decline).
+    static CallRecord closeBy(call: CallRecord, actorId: String, next: String, now: String, reason: String?) {
+        var moved = CallTransitions.moveTo(call, next, now, reason)
+        return CallRecord(moved.id(), moved.kind(), moved.modality(), moved.conversationId(), moved.groupId(), moved.initiatorId(), moved.roomId(), moved.displayName(), moved.state(), moved.createdAt(), moved.answeredAt(), moved.endedAt(), actorId, moved.endReason(), moved.expiresAt(), moved.lastActivityAt())
+    }
+    // The deadline moves later: answering is a new reason to wait for the other side.
+    static CallRecord extendTo(call: CallRecord, now: String, windowSeconds: Long) = CallRecord(call.id(), call.kind(), call.modality(), call.conversationId(), call.groupId(), call.initiatorId(), call.roomId(), call.displayName(), call.state(), call.createdAt(), call.answeredAt(), call.endedAt(), call.endedBy(), call.endReason(), Time.plusSeconds(now, windowSeconds), now)
+    static String? expiredState(call: CallRecord, now: String) {
+        if (!CallStates.isOpen(call.state())) {
+            return null
+        }
+        var expiresAt = call.expiresAt()
+        if (expiresAt == null) {
+            return null
+        }
+        if (Instant.parse(now).isBefore(Instant.parse(expiresAt))) {
+            return null
+        }
+        if (call.state() == "INITIATING" || call.state() == "RINGING") {
+            return "MISSED"
+        }
+        if (call.state() == "CONNECTING") {
+            return "FAILED"
+        }
+        return "ENDED"
+    }
+    // Expiry: acts only when the deadline passed and the call is still open. Idempotent: the same call
+    // after the fact comes back unchanged (callers compare the state).
+    static CallRecord expire(call: CallRecord, now: String, reason: String) {
+        var next = CallTransitions.expiredState(call, now)
+        if (next == null) {
+            return call
+        }
+        if (!CallStates.canMoveTo(call.state(), next)) {
+            return call
+        }
+        return CallRecord(call.id(), call.kind(), call.modality(), call.conversationId(), call.groupId(), call.initiatorId(), call.roomId(), call.displayName(), next, call.createdAt(), call.answeredAt(), now, call.endedBy(), reason, call.expiresAt(), now)
+    }
+}

@@ -1,0 +1,132 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import leaves.*
+
+// Port of ReleaseNoteTests (HTTP): anyone reads, only admins write, items are validated plain text.
+class ReleaseHolder {
+    static TestApp? app = null
+}
+
+TestApp releaseApp() {
+    var cur = ReleaseHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = LeavesApp.boot("releasenotes", mapOf("X", "1"))
+    ReleaseHolder.app = created
+    return created
+}
+
+List<String> asToken(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+
+String releaseAdmin(app: TestApp) {
+    if (app.db().queryLong("select count(*) from users where id = 'release_admin'", DbParams()) == 0L) {
+        SecurityFixtures.login(app.db(), "release_admin", "tok-release-admin-12")
+        app.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr("release_admin"))
+    }
+    return "tok-release-admin-12"
+}
+
+reset(app: TestApp) {
+    app.db().execute("delete from release_note", DbParams())
+}
+
+String item(title: String, description: String) = "{\"title\":" + json.encode(title) + ",\"description\":" + json.encode(description) + "}"
+
+TestResponse publish(app: TestApp, token: String, items: String) = app.client.send("PUT", "/admin/novidades", asToken(token), "", "{\"items\":[" + items + "]}")
+
+String repeatItem(times: Int, one: String) {
+    var out = one
+    var i = 1
+    while (i < times) {
+        out = out + "," + one
+        i = i + 1
+    }
+    return out
+}
+
+test "an admin publishes and any visitor reads without a session" {
+    var app = releaseApp()
+    reset(app)
+    var token = releaseAdmin(app)
+    Check.status(app.client.get("/novidades/atual"), 204)
+    var res = publish(app, token, item("Enquetes", "Agora da para criar enquete no feed."))
+    Check.status(res, 200)
+    Check.jsonEq(res, "id", "ativo")
+    Check.jsonEq(res, "items.0.title", "Enquetes")
+    var read = app.client.get("/novidades/atual")
+    Check.status(read, 200)
+    Check.jsonEq(read, "id", "ativo")
+    Check.eqInt("items", 1, read.jsonSize("items"))
+    Check.jsonEq(read, "items.0.title", "Enquetes")
+    Check.jsonEq(read, "items.0.description", "Agora da para criar enquete no feed.")
+    Check.isTrue("publishedAt", read.jsonHas("publishedAt"))
+    Check.isTrue("updatedAt", read.jsonHas("updatedAt"))
+    Check.status(app.client.get("/v1/novidades/atual"), 200)
+}
+
+test "a regular account can neither publish nor retire" {
+    var app = releaseApp()
+    SecurityFixtures.login(app.db(), "release_plain_person", "tok-release-plain-12")
+    Check.apiError(publish(app, "tok-release-plain-12", item("Titulo", "Descricao")), 403, "FORBIDDEN")
+    Check.apiError(app.client.send("DELETE", "/admin/novidades", asToken("tok-release-plain-12"), "", ""), 403, "FORBIDDEN")
+    Check.apiError(app.client.send("PUT", "/admin/novidades", listOf("Content-Type: application/json"), "", "{}"), 401, "UNAUTHENTICATED")
+}
+
+test "items are trimmed and defused" {
+    var app = releaseApp()
+    reset(app)
+    var token = releaseAdmin(app)
+    var res = publish(app, token, item("  Perfil​ novo  ", " Mais " + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" + " "))
+    Check.status(res, 200)
+    Check.jsonEq(res, "items.0.title", "Perfil novo")
+    Check.jsonEq(res, "items.0.description", "Mais aaaaaaaaaaaa")
+}
+
+test "invalid items fail with 400 and the limits are inclusive" {
+    var app = releaseApp()
+    reset(app)
+    var token = releaseAdmin(app)
+    var long80 = strings.repeat("ab", 40)
+    Check.apiError(app.client.send("PUT", "/admin/novidades", asToken(token), "", "{}"), 400, "INVALID_RELEASE_ITEMS")
+    Check.apiError(app.client.send("PUT", "/admin/novidades", asToken(token), "", "{\"items\":[]}"), 400, "INVALID_RELEASE_ITEMS")
+    Check.apiError(publish(app, token, repeatItem(9, item("T", "D"))), 400, "INVALID_RELEASE_ITEMS")
+    Check.apiError(publish(app, token, item("   ", "D")), 400, "RELEASE_ITEM_TITLE_REQUIRED")
+    Check.apiError(publish(app, token, item("​", "D")), 400, "RELEASE_ITEM_TITLE_REQUIRED")
+    Check.apiError(publish(app, token, item(strings.repeat("ab", 41), "D")), 400, "RELEASE_ITEM_TITLE_TOO_LONG")
+    Check.apiError(publish(app, token, item("T", " ")), 400, "RELEASE_ITEM_DESCRIPTION_REQUIRED")
+    Check.apiError(publish(app, token, item("T", strings.repeat("ab", 121))), 400, "RELEASE_ITEM_DESCRIPTION_TOO_LONG")
+    var ok = publish(app, token, repeatItem(8, item(long80, strings.repeat("ab", 120))))
+    Check.status(ok, 200)
+    Check.eqInt("items", 8, ok.jsonSize("items"))
+    Check.apiError(app.client.send("PUT", "/admin/novidades", asToken(token), "", "not json"), 400, "BAD_REQUEST")
+}
+
+test "republishing keeps publishedAt and bumps updatedAt" {
+    var app = releaseApp()
+    reset(app)
+    var token = releaseAdmin(app)
+    Check.status(publish(app, token, item("Versao 1", "Primeira")), 200)
+    // Backdate the row so the second publish is provably later, whatever the clock resolution.
+    app.db().execute("update release_note set published_at = dateadd('DAY', -1, published_at), updated_at = dateadd('DAY', -1, updated_at)", DbParams())
+    var first = app.client.get("/novidades/atual")
+    var second = publish(app, token, item("Versao 2", "Segunda"))
+    Check.status(second, 200)
+    Check.eqStr("publishedAt kept", "" + first.jsonStr("publishedAt"), "" + second.jsonStr("publishedAt"))
+    Check.isTrue("updatedAt moved", Time.toMillis("" + second.jsonStr("updatedAt")) > Time.toMillis("" + first.jsonStr("updatedAt")))
+    Check.isTrue("new text", second.body.contains("Versao 2") && !second.body.contains("Versao 1"))
+    Check.eqStr("one row", "1", "" + app.db().queryLong("select count(*) from release_note", DbParams()))
+}
+
+test "retiring takes it down and is idempotent" {
+    var app = releaseApp()
+    reset(app)
+    var token = releaseAdmin(app)
+    Check.status(publish(app, token, item("No ar", "Visivel")), 200)
+    Check.status(app.client.send("DELETE", "/admin/novidades", asToken(token), "", ""), 204)
+    Check.status(app.client.get("/novidades/atual"), 204)
+    Check.status(app.client.send("DELETE", "/admin/novidades", asToken(token), "", ""), 204)
+}

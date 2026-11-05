@@ -1,0 +1,68 @@
+package suggestions
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+
+// POST /suggestions (a session), GET /suggestions/mine (the author's history) and the moderators' panel under
+// /admin/suggestions (the route guard opens it to moderators, requireModerator is the defence in depth).
+class SuggestionRoutes {
+    static register(server: HttpServer, service: SuggestionService) {
+        server.post("/suggestions", () -> SuggestionRoutes.submit(service))
+        server.get("/suggestions/mine", () -> SuggestionRoutes.mine(service))
+        server.get("/admin/suggestions", () -> SuggestionRoutes.list(service))
+        server.post("/admin/suggestions/:id/approve", () -> SuggestionRoutes.approve(service))
+        server.post("/admin/suggestions/:id/reject", () -> SuggestionRoutes.reject(service))
+    }
+    static String submit(service: SuggestionService) {
+        var userId = Auth.requireUser()
+        var request = SuggestionRoutes.parse()
+        var target = request.target()
+        // An unknown enum constant is a body Jackson cannot read: a plain 400.
+        if (target != null && !SuggestionViews.targets().contains(target)) {
+            throw Errors.badRequest()
+        }
+        return status(201, json.encode(SuggestionViews.of(service.submit(userId, target, request.title(), request.body()))))
+    }
+    static String mine(service: SuggestionService) {
+        var userId = Auth.requireUser()
+        return json.encode(SuggestionViews.views(service.mine(userId, Req.queryInt("limit", 20))))
+    }
+    static String list(service: SuggestionService) {
+        Auth.requireModerator()
+        var raw = Req.queryParam("status")
+        var statusFilter = ""
+        var filtered = false
+        if (raw != null) {
+            if (raw.length() > 0) {
+                if (!SuggestionViews.statuses().contains(raw)) {
+                    throw Errors.badRequest()
+                }
+                statusFilter = raw
+                filtered = true
+            }
+        }
+        var limit = Req.queryInt("limit", 50)
+        if (!filtered) {
+            return json.encode(SuggestionViews.adminViews(service.list(null, limit)))
+        }
+        return json.encode(SuggestionViews.adminViews(service.list(statusFilter, limit)))
+    }
+    static String approve(service: SuggestionService) {
+        var moderator = Auth.requireModerator()
+        return json.encode(SuggestionViews.admin(service.approve(Req.pathParam("id"), moderator)))
+    }
+    static String reject(service: SuggestionService) {
+        var moderator = Auth.requireModerator()
+        return json.encode(SuggestionViews.admin(service.reject(Req.pathParam("id"), moderator)))
+    }
+    static SuggestionRequest parse() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<SuggestionRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

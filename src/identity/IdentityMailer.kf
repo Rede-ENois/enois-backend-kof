@@ -1,0 +1,165 @@
+package identity
+
+import kernel.config.*
+import kernel.id.*
+import kernel.log.*
+import kernel.time.*
+import kernel.url.*
+
+// Outgoing identity e-mails (EmailService): the subjects, the bodies and the links of the Java service.
+// Every message goes through `deliver`, the one overridable seam. The default renders the template and logs
+// the metadata (no address, no body, never a code) instead of speaking SMTP.
+// pending-port: mail transport. The SMTP sender (MAIL_HOST/PORT/USERNAME/PASSWORD with jakarta.mail) is not
+// ported: subclass this class, override `deliver` and wire it in Main.kf. With `capture` on, the messages
+// are kept in memory for tests (sent()).
+class IdentityMailer {
+    Log log = Log("identity.mail")
+    String frontendUrl
+    String backendUrl
+    String templatesDir
+    Bool capture
+    IdentityStore store
+    List<IdentityMail> captured = listOf<IdentityMail>()
+    public constructor(cfg: Config, store: IdentityStore, capture: Bool) {
+        this.frontendUrl = IdentityMailer.trimSlash(cfg.getStr("FRONTEND_URL", "http://localhost:5173"))
+        this.backendUrl = IdentityMailer.trimSlash(cfg.getStr("REDE_BACKEND_URL", "https://api.enois.ia.br"))
+        this.templatesDir = cfg.getStr("TEMPLATES_DIR", "resources/templates")
+        this.capture = capture
+        this.store = store
+    }
+    static String trimSlash(url: String) {
+        if (url.endsWith("/")) {
+            return url.substring(0, url.length() - 1)
+        }
+        return url
+    }
+    // The transport. Return false when the message did not leave (the caller decides what to tell the user).
+    Bool deliver(to: String, subject: String, html: String) = true
+    List<IdentityMail> sent() = captured
+    clearSent() {
+        captured.clear()
+    }
+    Bool dispatch(kind: String, to: String, subject: String, html: String) {
+        var ok = false
+        var failure = IdentityText.none()
+        try {
+            ok = deliver(to, subject, html)
+        } catch (String e) {
+            failure = "delivery failed"
+            log.warn("email_delivery_failed kind=" + kind)
+        }
+        if (capture) {
+            captured.add(IdentityMail(kind, to, subject, html))
+        }
+        if (ok) {
+            log.info("email_sent kind=" + kind)
+        }
+        else 
+            if (failure == null) {
+                failure = "not delivered"
+            }
+        // Metadata only; the subject of a two-factor message is redacted, a code never reaches the table.
+        var safeSubject = subject
+        if (kind == "TWO_FACTOR") {
+            safeSubject = "Seu código de acesso (redigido)"
+        }
+        try {
+            store.logEmail(Ids.prefixed("email_"), to, safeSubject, kind, ok, failure, Time.nowIso())
+        } catch (String e) {
+            log.warn("email_log_failed kind=" + kind)
+        }
+        return ok
+    }
+    Bool sendVerificationEmail(to: String, userName: String, token: String) {
+        var html = render("email-verification", mapOf("userName", userName, "verificationLink", frontendUrl + "/auth/verify?token=" + token, "currentYear", year()))
+        return dispatch("EMAIL_VERIFICATION", to, "Confirme seu e-mail no Énóis", html)
+    }
+    Bool sendPasswordResetEmail(to: String, userName: String, token: String) {
+        var html = render("password-reset", mapOf("userName", userName, "resetLink", frontendUrl + "/auth/reset?token=" + token, "#dates.format(#dates.createNow(), \'yyyy\')", year()))
+        return dispatch("PASSWORD_RESET", to, "Redefinição de senha", html)
+    }
+    Bool sendTwoFactorCode(to: String, userName: String, code: String) {
+        var html = render("two-factor-code", mapOf("userName", userName, "code", code, "currentYear", year()))
+        return dispatch("TWO_FACTOR", to, "Seu código de acesso ao Énóis", html)
+    }
+    Bool sendParentalConsentEmail(guardianEmail: String, minorName: String, token: String) {
+        var html = render("parental-consent", mapOf("minorName", minorName, "consentLink", frontendUrl + "/responsavel?token=" + token, "currentYear", year()))
+        return dispatch("PARENTAL_CONSENT", guardianEmail, "Autorizacao de responsavel no Enois", html)
+    }
+    Bool sendEmailChangeConfirmation(to: String, userName: String, token: String) {
+        var link = backendUrl + "/api/auth/email/change/confirm?token=" + UrlCodec.encode(token)
+        var body = "<p>Olá, " + IdentityMailer.escapeHtml(userName) + ".</p>" + "<p>Recebemos um pedido para trocar o e-mail da sua conta no Énóis para este endereço.</p>" + "<p><a href=\"" + IdentityMailer.escapeHtml(link) + "\" style=\"display:inline-block;padding:12px 24px;" + "background:#6366f1;color:#fff;text-decoration:none;border-radius:999px;font-weight:600\">" + "Confirmar novo e-mail</a></p>" + "<p>Se não foi você, ignore esta mensagem: nada muda até o clique.</p>" + "<p>— Equipe Énóis</p>"
+        return dispatch("HTML", to, "Confirme seu novo e-mail — Énóis", body)
+    }
+    Bool sendSignupAttemptNotice(to: String, userName: String) {
+        var body = "<p>Olá, " + IdentityMailer.escapeHtml(userName) + ".</p>" + "<p>Alguém tentou criar uma conta no Énóis com este e-mail, mas ele já tem uma conta.</p>" + "<p>Se foi você, <a href=\"" + IdentityMailer.escapeHtml(frontendUrl + "/entrar") + "\">entre</a> normalmente " + "ou use \"Esqueci minha senha\". Se não foi, pode ignorar esta mensagem: nada mudou na sua conta.</p>" + "<p>— Equipe Énóis</p>"
+        return dispatch("HTML", to, "Tentativa de cadastro com seu e-mail — Énóis", body)
+    }
+    Bool sendHtml(to: String, subject: String, html: String) = dispatch("HTML", to, subject, html)
+    String year() = Time.todayIso().substring(0, 4)
+    // The Thymeleaf subset the identity templates use: th:text="${x}" replaces the element text and
+    // th:href="${x}" becomes href. Values are HTML-escaped, like th:text/th:href.
+    String render(template: String, vars: Map<String,String>) {
+        var html = File(templatesDir + "/" + template + ".html").readText()
+        if (html == null) {
+            throw "TEMPLATE_MISSING: " + template
+        }
+        var out = html
+        for (var name in vars.keys()) {
+            var value = vars.get(name)
+            if (value == null) {
+                continue
+            }
+            out = fillText(out, name, value)
+            out = fillHref(out, name, value)
+        }
+        return out
+    }
+    String fillText(html: String, name: String, value: String) {
+        var out = html
+        var marker = "th:text=\"${" + name + "}\""
+        if (name.startsWith("#")) {
+            marker = "th:text=\"${" + name + "}\""
+        }
+        var guard = 0
+        while (guard < 20) {
+            guard = guard + 1
+            var at = out.indexOf(marker)
+            if (at < 0) {
+                return out
+            }
+            var tagEnd = out.indexOf(">", at)
+            var close = out.indexOf("</", tagEnd)
+            if (tagEnd < 0 || close < 0) {
+                return out
+            }
+            var before = out.substring(0, at)
+            if (before.endsWith(" ")) {
+                before = before.substring(0, before.length() - 1)
+            }
+            out = before + out.substring(at + marker.length(), tagEnd + 1) + IdentityMailer.escapeHtml(value) + out.substring(close)
+        }
+        return out
+    }
+    String fillHref(html: String, name: String, value: String) {
+        var out = html
+        var marker = "th:href=\"${" + name + "}\""
+        var guard = 0
+        while (guard < 20) {
+            guard = guard + 1
+            var at = out.indexOf(marker)
+            if (at < 0) {
+                return out
+            }
+            out = out.substring(0, at) + "href=\"" + IdentityMailer.escapeHtml(value) + "\"" + out.substring(at + marker.length())
+        }
+        return out
+    }
+    // HtmlUtils.htmlEscape(value, "UTF-8"): & < > " ' only.
+    static String escapeHtml(value: String?) {
+        if (value == null) {
+            return ""
+        }
+        return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("\'", "&#39;")
+    }
+}

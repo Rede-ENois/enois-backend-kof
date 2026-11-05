@@ -1,0 +1,22 @@
+package blog
+
+import kernel.*
+import kernel.security.*
+import ops.*
+
+class BlogModule {
+    BlogService service
+    public constructor(service: BlogService) {
+        this.service = service
+    }
+    static BlogModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks) = BlogModule.withSeams(platform, shared, BlogProfiles(platform.db), BlogFeedPointers(), BlogNotifier(), BlogCoins(), BlogEmailSender(EmailLogStore(platform.db)))
+    // The feed, notifications, coins and mail domains pass their own subclasses of the seams.
+    static BlogModule withSeams(platform: Platform, shared: SharedServices, profiles: BlogProfiles, feed: BlogFeedPointers, notifier: BlogNotifier, coins: BlogCoins, email: BlogEmailSender) {
+        var store = BlogStore(platform.db)
+        var service = BlogService(platform.db, store, profiles, feed, notifier, coins, shared.sanctionReader, shared.suspiciousText, shared.outbox)
+        var newsletter = BlogNewsletterService.fromConfig(platform.cfg, store, profiles, email, shared.cipher)
+        shared.outbox.register(BlogService.publishedEvent(), BlogOutboxHandler(newsletter))
+        BlogRoutes.register(platform.server, service, newsletter, shared.idempotency, platform.cfg.getStr("FRONTEND_URL", "http://localhost:5173"))
+        return BlogModule(service)
+    }
+}

@@ -1,0 +1,174 @@
+package blog
+
+import kernel.config.*
+import kernel.log.*
+import kernel.outbox.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+
+// Blog newsletter: when a post goes out, the SUBSCRIBERS get an e-mail, Substack/Ghost style, without anyone's
+// credentials: it leaves through the SMTP of Énóis with the blog name ("{blog} via Énóis") and the Reply-To points
+// to the owner's e-mail, so an answer lands straight in their inbox.
+//
+// Rules: only on the FIRST publish (editing never resends), only to verified e-mails, the author never gets their own
+// post, and every e-mail carries a one-click unsubscribe link (a token encrypted with the installation secret)
+// plus the List-Unsubscribe header. The send runs AFTER the commit, in the background (outbox worker): publishing
+// never waits for the SMTP.
+class BlogNewsletterService {
+    BlogStore blogs
+    BlogProfiles profiles
+    BlogEmailSender email
+    SecretCipher cipher
+    String frontendUrl
+    String templatesDir
+    Log log = Log("blog.newsletter")
+    public constructor(blogs: BlogStore, profiles: BlogProfiles, email: BlogEmailSender, cipher: SecretCipher, frontendUrl: String, templatesDir: String) {
+        this.blogs = blogs
+        this.profiles = profiles
+        this.email = email
+        this.cipher = cipher
+        this.frontendUrl = BlogNewsletterService.withoutTrailingSlash(frontendUrl)
+        this.templatesDir = templatesDir
+    }
+    static BlogNewsletterService fromConfig(cfg: Config, blogs: BlogStore, profiles: BlogProfiles, email: BlogEmailSender, cipher: SecretCipher) = BlogNewsletterService(blogs, profiles, email, cipher, cfg.getStr("FRONTEND_URL", "http://localhost:5173"), cfg.getStr("TEMPLATES_DIR", "resources/templates"))
+    static String withoutTrailingSlash(url: String) {
+        if (url.endsWith("/")) {
+            return url.substring(0, url.length() - 1)
+        }
+        return url
+    }
+    static Int previewChars() = 300
+    // The fan-out itself (the outbox handler and the tests call it directly).
+    sendToSubscribers(event: BlogPostPublishedEvent) {
+        if (!cipher.isEnabled()) {
+            log.warn("Newsletter do blog " + event.blogSlug() + " nao enviada: REDE_SECURITY_ENCRYPTION_KEY ausente (token de descadastro).")
+            return
+        }
+        var subscriberIds = listOf<String>()
+        for (var id in blogs.subscriberIds(event.blogId())) {
+            if (id != event.authorUserId()) {
+                subscriberIds.add(id)
+            }
+        }
+        if (subscriberIds.size() == 0) {
+            return
+        }
+        var author = profiles.findById(event.authorUserId())
+        var authorName = event.blogSlug()
+        var replyTo = ""
+        if (author != null) {
+            authorName = author.name()
+            var authorEmail = author.email()
+            if (authorEmail != null && authorEmail.trim().length() > 0) {
+                replyTo = authorEmail
+            }
+        }
+        var blogTitle = event.blogSlug()
+        if (event.blogTitle().trim().length() > 0) {
+            blogTitle = event.blogTitle()
+        }
+        var postLink = frontendUrl + "/blog/" + event.blogSlug() + "/" + event.postId()
+        var preview = BlogNewsletterService.previewOf(event.postBody())
+        var template = this.template()
+        var sent = 0
+        for (var subscriber in profiles.findAllByIds(subscriberIds)) {
+            var to = subscriber.email()
+            // Only a verified e-mail receives; the unverified ones keep the in-app notification.
+            if (to != null && to.trim().length() > 0 && subscriber.emailVerified()) {
+                var delivered = this.sendOne(template, to, subscriber.id(), event, blogTitle, authorName, replyTo, postLink, preview)
+                if (delivered) {
+                    sent = sent + 1
+                }
+            }
+        }
+        log.info("Newsletter do blog " + event.blogSlug() + ": " + sent + " de " + subscriberIds.size() + " assinantes receberam.")
+    }
+    Bool sendOne(template: String, to: String, subscriberId: String, event: BlogPostPublishedEvent, blogTitle: String, authorName: String, replyTo: String, postLink: String, preview: String) {
+        var delivered = false
+        try {
+            var unsubscribeLink = frontendUrl + "/api/blogs/descadastrar?token=" + this.unsubscribeToken(event.blogId(), subscriberId)
+            var vars = mapOf("blogTitle", blogTitle, "authorName", authorName, "postTitle", event.postTitle(), "preview", preview, "postLink", postLink, "unsubscribeLink", unsubscribeLink, "currentYear", Time.todayIso().substring(0, 4))
+            delivered = email.sendHtml(to, event.postTitle(), HtmlTemplate.render(template, vars), blogTitle + " via Énóis", BlogNewsletterService.replyOf(replyTo), unsubscribeLink, "BLOG_POST")
+        } catch (String perSubscriber) {
+            log.warn("Falha ao enviar a newsletter do blog " + event.blogSlug() + " para " + subscriberId)
+        }
+        return delivered
+    }
+    static String? replyOf(replyTo: String) {
+        if (replyTo.length() == 0) {
+            return null
+        }
+        return replyTo
+    }
+    String template() {
+        var text = File(templatesDir + "/email-blog-post.html").readText()
+        if (text == null) {
+            throw "TEMPLATE_MISSING"
+        }
+        return text
+    }
+    // The unsubscribe token: encrypted with the installation secret (nobody forges another person's) and in
+    // BASE64 URL-SAFE: the standard alphabet has `+`, `/` and `=`, which get lost in the query string of the link.
+    String unsubscribeToken(blogId: String, userId: String) {
+        var standard = cipher.encrypt(blogId + ":" + userId)
+        return standard.replace("+", "-").replace("/", "_").replace("=", "")
+    }
+    // Back to the standard BASE64 text the cipher expects.
+    static String standardOf(token: String) {
+        var std = token.replace("-", "+").replace("_", "/")
+        while (std.length() % 4 != 0) {
+            std = std + "="
+        }
+        return std
+    }
+    // One-click unsubscribe (the e-mail link, no session). false for a missing, foreign or forged token.
+    Bool unsubscribeByToken(token: String?) {
+        if (token == null) {
+            return false
+        }
+        if (token.trim().length() == 0) {
+            return false
+        }
+        if (!cipher.isEnabled()) {
+            return false
+        }
+        var data = ""
+        try {
+            data = cipher.decrypt(BlogNewsletterService.standardOf(token.trim()))
+        } catch (String invalidToken) {
+            return false
+        }
+        var sep = data.indexOf(":")
+        if (sep <= 0 || sep == data.length() - 1) {
+            return false
+        }
+        return blogs.deleteSubscription(data.substring(0, sep), data.substring(sep + 1)) > 0
+    }
+    // Preview of the post body: no tags, no Markdown, no excess of lines.
+    static String previewOf(body: String?) {
+        if (body == null) {
+            return ""
+        }
+        if (body.trim().length() == 0) {
+            return ""
+        }
+        var text = body.replaceAll("<[^>]+>", " ").replaceAll("!\\[[^\\]]*\\]\\([^\\)]*\\)", " ").replaceAll("\\[([^\\]]*)\\]\\([^\\)]*\\)", "$1").replaceAll("(?m)^#{1,6}\\s*", "").replaceAll("[*_`>~]", "").replaceAll("\\s+", " ").trim()
+        if (text.length() > BlogNewsletterService.previewChars()) {
+            return text.substring(0, BlogNewsletterService.previewChars()).trim() + "…"
+        }
+        return text
+    }
+}
+
+// Delivers the BLOG_POST_PUBLISHED events appended inside the publish transaction.
+class BlogOutboxHandler extends OutboxEventHandler {
+    BlogNewsletterService newsletter
+    public constructor(newsletter: BlogNewsletterService) {
+        super()
+        this.newsletter = newsletter
+    }
+    handle(eventType: String, aggregateId: String, payload: String) {
+        newsletter.sendToSubscribers(json.decode<BlogPostPublishedEvent>(payload))
+    }
+}

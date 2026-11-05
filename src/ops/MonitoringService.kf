@@ -1,0 +1,293 @@
+package ops
+
+import kernel.db.*
+import kernel.id.*
+import kernel.monitoring.*
+import kernel.security.*
+import kernel.time.*
+
+// Monitoring of the admin panel: load, latency, resources, events and logs.
+//
+// Metrics are in memory (60-minute series, per instance); events, errors and logs go to a JSONL file on the VPS
+// asynchronously: observability NEVER uses the database pool, so it never competes with the users' requests. Nothing
+// blocks a request: the queue has a ceiling and the excess is counted in `droppedEvents`. Sensitive data is redacted
+// before it is kept. Every request becomes an event, its level following the status (5xx ERROR, 4xx WARN, the rest
+// INFO); the panel pages them and filters by level, type and text.
+//
+// The Java MonitoringService, split: kernel.monitoring owns the machinery (RequestMetrics, EventBuffer, DayLog,
+// HostResources) and this class the events, redaction and the panel's read side.
+class MonitoringService {
+    RequestMetrics metrics = RequestMetrics()
+    EventBuffer eventBuffer
+    DayLog sink
+    HostResources resources = HostResources()
+    Db? database
+    public constructor(database: Db?, sink: DayLog, maxEventsPerMinute: Int) {
+        this.database = database
+        this.sink = sink
+        this.eventBuffer = EventBuffer(maxEventsPerMinute)
+    }
+    static Int maxMessage() = 1000
+    static Int maxLine() = 16384
+    static Int slowMs() = 2000
+    // -------------------------------------------------------------- ingestion
+    requestStarted() {
+        metrics.started()
+    }
+    // A request the client aborted only ends the in-flight gauge.
+    recordClientDisconnect() {
+        metrics.disconnected()
+    }
+    // Every request counts in the metrics and becomes an event.
+    recordRequest(method: String?, path: String, route: String?, status: Int, durationMs: Long, requestId: String?, userId: String?, clientIp: String?, deviceId: String?) {
+        var now = Time.nowMillis()
+        metrics.observe(method, route, status, durationMs, now)
+        var level = "INFO"
+        if (status >= 500) {
+            level = "ERROR"
+        }
+        else 
+            if (status >= 400) {
+                level = "WARN"
+            }
+        var shown = path
+        if (route != null && route != "UNMATCHED") {
+            shown = route
+        }
+        var label = "null"
+        if (method != null) {
+            label = method
+        }
+        this.enqueue(MonitoringEvent(Ids.prefixed("evt_"), Time.nowIso(), level, "REQUEST", label + " " + shown + " -> " + status, requestId, method, path, route, status, durationMs, userId, clientIp, deviceId, null), now)
+    }
+    // An exception, with the request it came from (the client IP is the request's, from the log context) and its
+    // redacted failure text for the panel: the cause without request body or secret.
+    recordException(status: Int, code: String, message: String?, method: String?, path: String?, requestId: String?, userId: String?, failure: String?) {
+        var level = "WARN"
+        if (status >= 500) {
+            level = "ERROR"
+        }
+        var ip = LogContext.get("clientIp")
+        this.enqueue(MonitoringEvent(Ids.prefixed("evt_"), Time.nowIso(), level, "EXCEPTION", code + ": " + MonitoringService.safe(message), requestId, method, path, null, status, null, userId, ip, null, MonitoringService.safeFailure(failure, 4000)), Time.nowMillis())
+    }
+    // An event by hand (level/type are normalized); `metadata` is rendered `{k=v, k2=v2}` like the Java Map.toString.
+    recordEvent(level: String, type: String, message: String, metadata: Map<String,String>?) {
+        this.enqueue(MonitoringEvent(Ids.prefixed("evt_"), Time.nowIso(), MonitoringService.normalizeLevel(level), MonitoringService.normalizeType(type), MonitoringService.safe(message), null, null, null, null, null, null, null, null, null, MonitoringService.render(metadata)), Time.nowMillis())
+    }
+    // A captured log line: WARN/ERROR of the app and the audit logger.
+    recordLog(level: String, logger: String, message: String, requestId: String?, userId: String?, path: String?) {
+        var type = "LOG"
+        if (logger == "audit") {
+            type = "AUDIT"
+        }
+        this.enqueue(MonitoringEvent(Ids.prefixed("evt_"), Time.nowIso(), MonitoringService.normalizeLevel(level), type, MonitoringService.safe(logger + ": " + message), requestId, null, path, null, null, null, userId, null, null, null), Time.nowMillis())
+    }
+    enqueue(event: MonitoringEvent, nowMs: Long) {
+        var line = json.encode(event)
+        if (line.length() > MonitoringService.maxLine()) {
+            line = line.substring(0, MonitoringService.maxLine())
+        }
+        eventBuffer.offer(line, event.level(), event.type(), nowMs)
+    }
+    // -------------------------------------------------------------- jobs
+    // Every 500 ms: up to 200 events to the file, outside the database pool.
+    flush() {
+        for (var line in eventBuffer.drain(200)) {
+            sink.append(line)
+        }
+    }
+    // Every minute: CPU and heap for the resources chart.
+    sampleResources() {
+        var cpu = HostResources.processCpuPercent()
+        var rounded = -1L
+        if (cpu >= 0.0) {
+            rounded = cpu + 0.5 as Long
+        }
+        metrics.sampleResources(Time.nowMillis(), rounded, HostResources.heapUsedNow())
+    }
+    pruneMinutes() {
+        metrics.prune(Time.nowMillis())
+    }
+    // Rotation by day in the sink: closes yesterday's file and deletes past the retention.
+    purgeOld() {
+        sink.rotate()
+    }
+    // -------------------------------------------------------------- reading
+    MonitoringOverview overview() {
+        var now = Time.nowMillis()
+        var m = metrics.overview(now)
+        var host = resources.sample(database)
+        return MonitoringOverview(Time.nowIso(), HostResources.uptimeSeconds(), m.requestsLastMinute(), m.errors4xxLastMinute(), m.errors5xxLastMinute(), m.errorRate(), m.p95Ms(), eventBuffer.droppedCount(), m.series(), eventBuffer.levels(now), eventBuffer.types(now), m.topRoutes(), this.recentEvents(100), MonitoringJvm(host.heapUsedBytes(), host.heapMaxBytes(), host.threads(), host.processors()), m.requestsPerSecond(), m.inFlight(), m.peakInFlight(), m.requestsTotal(), m.p50Ms(), m.p99Ms(), m.maxMs(), m.slowLastMinute(), m.rateLimitedLastMinute(), m.statusCounts(), m.methodCounts(), host)
+    }
+    List<MonitoringEvent> recentEvents(limit: Int) {
+        var out = listOf<MonitoringEvent>()
+        for (var line in eventBuffer.recent(limit)) {
+            var event = MonitoringService.parse(line)
+            if (event != null) {
+                out.add(event)
+            }
+        }
+        return out
+    }
+    // Reads the file (no database) newest first with every filter applied along the way: the `before` cursor picks up
+    // where the previous page stopped, also after the page restarts. The scan stops when the page is full or it
+    // crosses `from`.
+    List<MonitoringEvent> events(level: String?, type: String?, q: String?, from: String?, to: String?, before: String?, limit: Int) {
+        var wantLevel = MonitoringService.upperOrEmpty(level)
+        var wantType = MonitoringService.upperOrEmpty(type)
+        var needle = MonitoringService.lowerOrEmpty(q)
+        var fromMs = MonitoringService.millisOrMin(from)
+        var toMs = MonitoringService.millisOrMin(to)
+        var beforeMs = MonitoringService.millisOrMin(before)
+        var size = limit
+        if (size > 200) {
+            size = 200
+        }
+        if (size < 1) {
+            size = 1
+        }
+        var found = listOf<MonitoringEvent>()
+        sink.scan((line: String) -> {
+    var event = MonitoringService.parse(line)
+    if (event == null) {
+        return true
+    }
+    var at = MonitoringService.instantOf(event)
+    if (beforeMs != MonitoringService.noInstant() && at >= beforeMs) {
+        return true
+    }
+    if (fromMs != MonitoringService.noInstant() && at < fromMs) {
+        return false
+    }
+    if (!MonitoringService.matches(event, wantLevel, wantType, needle, at, toMs)) {
+        return true
+    }
+    found.add(event)
+    return found.size() < size
+})
+        return found
+    }
+    static Long noInstant() = -9223372036854775807L
+    static Bool matches(event: MonitoringEvent, wantLevel: String, wantType: String, needle: String, at: Long, toMs: Long) {
+        if (wantLevel.length() > 0 && wantLevel != event.level()) {
+            return false
+        }
+        if (wantType.length() > 0 && wantType != event.type()) {
+            return false
+        }
+        if (needle.length() > 0) {
+            var path = event.path()
+            var hay = event.message() + " "
+            if (path != null) {
+                hay = hay + path
+            }
+            if (!hay.toLowerCase().contains(needle)) {
+                return false
+            }
+        }
+        return toMs == MonitoringService.noInstant() || at <= toMs
+    }
+    static MonitoringEvent? parse(line: String) {
+        try {
+            return json.decode<MonitoringEvent>(line)
+        } catch (String e) {
+            return null
+        }
+    }
+    // The event's instant in epoch millis; a bad createdAt reads as the epoch.
+    static Long instantOf(event: MonitoringEvent) {
+        try {
+            return Time.toMillis(event.createdAt())
+        } catch (String e) {
+            return 0L
+        }
+    }
+    static Long millisOrMin(value: String?) {
+        if (value == null) {
+            return MonitoringService.noInstant()
+        }
+        if (value.trim().length() == 0) {
+            return MonitoringService.noInstant()
+        }
+        try {
+            return Time.toMillis(value.trim())
+        } catch (String e) {
+            return MonitoringService.noInstant()
+        }
+    }
+    static String upperOrEmpty(value: String?) {
+        if (value == null) {
+            return ""
+        }
+        return value.trim().toUpperCase()
+    }
+    static String lowerOrEmpty(value: String?) {
+        if (value == null) {
+            return ""
+        }
+        return value.trim().toLowerCase()
+    }
+    // -------------------------------------------------------------- redaction
+    static String normalizeLevel(level: String?) {
+        var value = MonitoringService.upperOrEmpty(level)
+        if (value == "ERROR" || value == "WARN" || value == "INFO" || value == "DEBUG") {
+            return value
+        }
+        return "INFO"
+    }
+    static String normalizeType(type: String?) {
+        var value = MonitoringService.upperOrEmpty(type)
+        if (value.length() == 0) {
+            return "SYSTEM"
+        }
+        if (value.length() > 32) {
+            return value.substring(0, 32)
+        }
+        return value
+    }
+    static String? render(metadata: Map<String,String>?) {
+        if (metadata == null) {
+            return null
+        }
+        var out = "{"
+        var first = true
+        for (var key in metadata.keys()) {
+            if (!first) {
+                out = out + ", "
+            }
+            out = out + key + "=" + metadata.getOrDefault(key, "")
+            first = false
+        }
+        return out + "}"
+    }
+    // Strips e-mail addresses, token-like pairs and control characters; caps the length.
+    static String safe(message: String?) {
+        if (message == null) {
+            return ""
+        }
+        var clean = message.replaceAll("(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}", "***@***").replaceAll("(?i)(bearer|authorization|token|refresh_token|senha|password)([=: ]+)[^ ,;]+", "$1$2***").replaceAll("\\p{Cntrl}", " ")
+        if (clean.length() > MonitoringService.maxMessage()) {
+            return clean.substring(0, MonitoringService.maxMessage())
+        }
+        return clean
+    }
+    // The failure text for the panel, through the same filter as the message (control characters of a stack are
+    // kept as lines in the Java version; here the thrown text is a single line, so the same filter applies).
+    static String? safeFailure(failure: String?, maxChars: Int) {
+        if (failure == null) {
+            return null
+        }
+        var cleaned = MonitoringService.safe(failure)
+        var ceiling = maxChars
+        if (ceiling > 8000) {
+            ceiling = 8000
+        }
+        if (ceiling < 500) {
+            ceiling = 500
+        }
+        if (cleaned.length() > ceiling) {
+            return cleaned.substring(0, ceiling)
+        }
+        return cleaned
+    }
+}

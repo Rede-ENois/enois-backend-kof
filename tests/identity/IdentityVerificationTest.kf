@@ -1,0 +1,168 @@
+import identity.*
+import kernel.db.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+
+IdentityTestApp ctx() = IdentityTestApp.shared("identityverification", mapOf("REDE_FRONTEND_URL", "https://front.example.com/"))
+
+IdentityVerificationFake fake() {
+    var f = IdentityVerificationFake.identityVerificationFakeSlot
+    if (f == null) {
+        throw "fake provider not wired"
+    }
+    f.up = true
+    f.outcome = IdentityText.noOutcome()
+    f.callbackOutcome = IdentityText.noOutcome()
+    f.startResult = IdentityProviderStart("attempt-" + Time.nowMillis(), "https://provedor/exemplo")
+    return f
+}
+
+TestResponse idStart(t: IdentityTestApp, token: String, key: String) = t.postWith("/identity/verification", listOf("X-Session-Token: " + token, "Idempotency-Key: " + key), "{\"consentVersion\":\"v1\"}")
+
+String idState(t: IdentityTestApp, token: String) {
+    var res = t.getWithToken("/identity", token)
+    Check.status(res, 200)
+    return "" + JsonPath.str(res.body, "state")
+}
+
+test "providerUnavailableFailsSafeAndDoesNotVerify (IdentityVerificationServiceTests)" {
+    var t = ctx()
+    var f = fake()
+    f.up = false
+    var user = t.authenticate("idv_none")
+    var status = t.getWithToken("/identity", user.token)
+    Check.status(status, 200)
+    Check.jsonEq(status, "state", "NOT_VERIFIED")
+    Check.jsonEq(status, "verified", "false")
+    Check.jsonEq(status, "providerAvailable", "false")
+    Check.apiError(idStart(t, user.token, "idv-none-1"), 503, "IDENTITY_PROVIDER_UNAVAILABLE")
+    Check.apiError(t.postWithToken("/identity/verification/refresh", user.token, ""), 503, "IDENTITY_PROVIDER_UNAVAILABLE")
+}
+
+test "startGoesPendingAndOnlyProviderOutcomeVerifies (IdentityVerificationServiceTests)" {
+    var t = ctx()
+    var f = fake()
+    var user = t.authenticate("idv_flow")
+    var started = idStart(t, user.token, "idv-flow-1")
+    Check.status(started, 200)
+    Check.jsonEq(started, "redirectUrl", "https://provedor/exemplo")
+    Check.eqStr("pending", "PENDING", idState(t, user.token))
+    // Pending does not verify.
+    var undecided = t.postWithToken("/identity/verification/refresh", user.token, "")
+    Check.jsonEq(undecided, "state", "PENDING")
+    Check.jsonEq(undecided, "verified", "false")
+    f.outcome = IdentityProviderOutcome("VERIFIED", IdentityText.none())
+    var done = t.postWithToken("/identity/verification/refresh", user.token, "")
+    Check.jsonEq(done, "state", "VERIFIED")
+    Check.jsonEq(done, "verified", "true")
+    Check.jsonEq(done, "provider", "fake-test-provider")
+    Check.isTrue("completedAt", JsonPath.str(done.body, "completedAt") != null)
+}
+
+test "providerRejectionDoesNotVerify (IdentityVerificationServiceTests)" {
+    var t = ctx()
+    var f = fake()
+    var user = t.authenticate("idv_reject")
+    Check.status(idStart(t, user.token, "idv-reject-1"), 200)
+    f.outcome = IdentityProviderOutcome("REJECTED", "DOCUMENT_MISMATCH")
+    var res = t.postWithToken("/identity/verification/refresh", user.token, "")
+    Check.jsonEq(res, "state", "REJECTED")
+    Check.jsonEq(res, "verified", "false")
+    Check.jsonEq(res, "reasonCode", "DOCUMENT_MISMATCH")
+}
+
+test "revokedIdentityStopsBeingVerified (IdentityVerificationServiceTests)" {
+    var t = ctx()
+    var f = fake()
+    var user = t.authenticate("idv_revoke")
+    Check.status(idStart(t, user.token, "idv-revoke-1"), 200)
+    f.outcome = IdentityProviderOutcome("VERIFIED", IdentityText.none())
+    Check.jsonEq(t.postWithToken("/identity/verification/refresh", user.token, ""), "verified", "true")
+    var revoked = t.postWith("/identity/verification", listOf("X-Session-Token: " + user.token, "Idempotency-Key: idv-revoke-del"), "")
+    // POST starts; the revoke is DELETE.
+    var del = t.app.client.send("DELETE", "/identity/verification", listOf("X-Session-Token: " + user.token, "Idempotency-Key: idv-revoke-del-2"), "", "")
+    Check.status(del, 200)
+    Check.jsonEq(del, "state", "REVOKED")
+    Check.jsonEq(del, "verified", "false")
+    Check.eqStr("state", "REVOKED", idState(t, user.token))
+}
+
+test "callbackVerifiesAndCannotBeReplayed (IdentityVerificationServiceTests)" {
+    var t = ctx()
+    var f = fake()
+    var user = t.authenticate("idv_callback")
+    var started = idStart(t, user.token, "idv-callback-1")
+    var attempt = "" + JsonPath.str(started.body, "attemptId")
+    Check.eqStr("pending", "PENDING", idState(t, user.token))
+    f.callbackOutcome = IdentityProviderOutcome("VERIFIED", IdentityText.none())
+    var cb = t.app.client.get("/identity/govbr/callback?code=codigo&state=" + attempt)
+    Check.status(cb, 302)
+    Check.eqStr("redirect", "https://front.example.com/seguranca?identidade=ok", "" + cb.headerOf("Location"))
+    Check.eqStr("verified", "VERIFIED", idState(t, user.token))
+    // Single use: repeating the same state cannot conclude again.
+    var replay = t.app.client.get("/identity/govbr/callback?code=codigo&state=" + attempt)
+    Check.eqStr("replay", "https://front.example.com/seguranca?identidade=erro", "" + replay.headerOf("Location"))
+}
+
+test "callbackWithUnknownStateIsRejected (IdentityVerificationServiceTests)" {
+    var t = ctx()
+    var f = fake()
+    var cb = t.app.client.get("/identity/govbr/callback?code=codigo&state=state-desconhecido")
+    Check.eqStr("unknown", "https://front.example.com/seguranca?identidade=erro", "" + cb.headerOf("Location"))
+    var empty = t.app.client.get("/identity/govbr/callback")
+    Check.eqStr("empty", "https://front.example.com/seguranca?identidade=erro", "" + empty.headerOf("Location"))
+}
+
+test "providerFailureDoesNotVerify (IdentityVerificationServiceTests)" {
+    var t = ctx()
+    var f = fake()
+    var user = t.authenticate("idv_fail")
+    var started = idStart(t, user.token, "idv-fail-1")
+    f.callbackOutcome = IdentityProviderOutcome("ERROR", "PROVIDER_UNAVAILABLE")
+    t.app.client.get("/identity/govbr/callback?code=codigo&state=" + ("" + JsonPath.str(started.body, "attemptId")))
+    var status = t.getWithToken("/identity", user.token)
+    Check.jsonEq(status, "state", "ERROR")
+    Check.jsonEq(status, "verified", "false")
+    Check.jsonEq(status, "reasonCode", "PROVIDER_UNAVAILABLE")
+}
+
+test "invalidTransitionIsRejected (IdentityVerificationServiceTests)" {
+    var t = ctx()
+    var f = fake()
+    var user = t.authenticate("idv_transition")
+    Check.status(idStart(t, user.token, "idv-trans-1"), 200)
+    f.outcome = IdentityProviderOutcome("VERIFIED", IdentityText.none())
+    Check.status(t.postWithToken("/identity/verification/refresh", user.token, ""), 200)
+    // VERIFIED -> PENDING is not in the table: starting again over a verified identity is a 409.
+    Check.apiError(idStart(t, user.token, "idv-trans-2"), 409, "INVALID_IDENTITY_TRANSITION")
+}
+
+test "eligibilityShowsWhatIsMissing" {
+    var t = ctx()
+    var f = fake()
+    var user = t.authenticate("idv_elig")
+    var low = t.getWithToken("/identity/eligibility", user.token)
+    Check.status(low, 200)
+    Check.jsonEq(low, "allowed", "false")
+    Check.jsonEq(low, "reason", "LOW_REPUTATION")
+    Check.jsonEq(low, "requiredReputation", "150")
+    t.db().execute("update users set reputation = 151 where id = ?", DbParams().bindStr(user.userId))
+    var ok = t.getWithToken("/identity/eligibility", user.token)
+    Check.jsonEq(ok, "allowed", "true")
+    Check.jsonEq(ok, "identityEnforced", "false")
+    t.db().execute("update users set reputation = 150 where id = ?", DbParams().bindStr(user.userId))
+    Check.jsonEq(t.getWithToken("/identity/eligibility", user.token), "allowed", "false")
+}
+
+test "identityRoutesRequireASession" {
+    var t = ctx()
+    Check.apiError(t.app.client.get("/identity"), 401, "UNAUTHENTICATED")
+    Check.apiError(t.app.client.get("/identity/eligibility"), 401, "UNAUTHENTICATED")
+    Check.apiError(t.post("/identity/verification", "{}"), 401, "UNAUTHENTICATED")
+}
+
+test "zz shutdown identity verification" {
+    ctx().stop()
+}

@@ -1,0 +1,216 @@
+package identity
+
+import kernel.db.*
+import kernel.security.*
+import kernel.time.*
+
+// SQL of the identity tables: user_credentials, auth_sessions, pending_signups, email_verification_tokens,
+// password_reset_tokens, pending_email_changes, known_devices, signup_challenge_nonces. Same columns as the
+// Java JPA entities. Only hashes of tokens are stored.
+class IdentityStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // ---- credentials
+    IdentityCredential? credentialByEmail(email: String) = credential(store.queryOptional("select user_id, email, password_hash, password_usable, reset_needed from user_credentials where email = ?", DbParams().bindStr(email)))
+    IdentityCredential? credentialByUser(userId: String) = credential(store.queryOptional("select user_id, email, password_hash, password_usable, reset_needed from user_credentials where user_id = ?", DbParams().bindStr(userId)))
+    IdentityCredential? credential(row: DbRow?) {
+        if (row == null) {
+            return null
+        }
+        return IdentityCredential(row.getStr("user_id"), row.getStr("email"), row.getStr("password_hash"), row.getBool("password_usable"), row.getBool("reset_needed"))
+    }
+    Bool credentialEmailExists(email: String) = store.queryLong("select count(*) from user_credentials where email = ?", DbParams().bindStr(email)) > 0L
+    // CredentialPersistenceAdapter.save: an upsert that also clears reset_needed (the entity is rebuilt).
+    saveCredential(userId: String, email: String, passwordHash: String, passwordUsable: Bool, now: String) {
+        var updated = store.execute("update user_credentials set email = ?, password_hash = ?, password_usable = ?, reset_needed = ?, updated_at = ? where user_id = ?", DbParams().bindStr(email).bindStr(passwordHash).bindBool(passwordUsable).bindBool(false).bindInstant(now).bindStr(userId))
+        if (updated == 0) {
+            store.execute("insert into user_credentials (user_id, email, password_hash, created_at, updated_at, password_usable, reset_needed) values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(userId).bindStr(email).bindStr(passwordHash).bindInstant(now).bindInstant(now).bindBool(passwordUsable).bindBool(false))
+        }
+    }
+    deleteCredential(userId: String) {
+        store.execute("delete from user_credentials where user_id = ?", DbParams().bindStr(userId))
+    }
+    deleteExternalIdentities(userId: String) {
+        store.execute("delete from user_external_identities where user_id = ?", DbParams().bindStr(userId))
+    }
+    // ---- sessions
+    saveSession(token: String, refreshToken: String, userId: String, now: String, expiresAt: String, refreshExpiresAt: String, ip: String?) {
+        store.execute("insert into auth_sessions (token, refresh_token, user_id, created_at, expires_at, refresh_expires_at, ip) values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(Hashes.sha256Hex(token)).bindStr(Hashes.sha256Hex(refreshToken)).bindStr(userId).bindInstant(now).bindInstant(expiresAt).bindInstant(refreshExpiresAt).bindStrOrNull(ip))
+    }
+    // A raw (unhashed) row is honoured only for the deploy window, and never for a value shaped like a
+    // stored hash (AuthSessionPersistenceAdapter.findSession).
+    DbRow? sessionRow(token: String) {
+        var hashed = store.queryOptional("select token, user_id, expires_at, revoked_at from auth_sessions where token = ?", DbParams().bindStr(Hashes.sha256Hex(token)))
+        if (hashed != null || AuthStore.looksLikeStoredHash(token)) {
+            return hashed
+        }
+        return store.queryOptional("select token, user_id, expires_at, revoked_at from auth_sessions where token = ?", DbParams().bindStr(token))
+    }
+    DbRow? refreshRow(refreshToken: String) {
+        var hashed = store.queryOptional("select token, user_id, expires_at, refresh_expires_at, revoked_at from auth_sessions where refresh_token = ?", DbParams().bindStr(Hashes.sha256Hex(refreshToken)))
+        if (hashed != null || AuthStore.looksLikeStoredHash(refreshToken)) {
+            return hashed
+        }
+        return store.queryOptional("select token, user_id, expires_at, refresh_expires_at, revoked_at from auth_sessions where refresh_token = ?", DbParams().bindStr(refreshToken))
+    }
+    String? activeUserId(token: String, now: String) {
+        var row = sessionRow(token)
+        if (row == null) {
+            return null
+        }
+        if (!row.isNull("revoked_at")) {
+            return null
+        }
+        if (Time.toMillis(row.getInstant("expires_at")) <= Time.toMillis(now)) {
+            return null
+        }
+        return row.getStr("user_id")
+    }
+    String? activeUserIdByRefresh(refreshToken: String, now: String) {
+        var row = refreshRow(refreshToken)
+        if (row == null) {
+            return null
+        }
+        if (!row.isNull("revoked_at")) {
+            return null
+        }
+        var limit = row.getInstant("expires_at")
+        if (!row.isNull("refresh_expires_at")) {
+            limit = row.getInstant("refresh_expires_at")
+        }
+        if (Time.toMillis(limit) <= Time.toMillis(now)) {
+            return null
+        }
+        return row.getStr("user_id")
+    }
+    revokeSession(token: String, now: String) {
+        var row = sessionRow(token)
+        if (row == null) {
+            return
+        }
+        store.execute("update auth_sessions set revoked_at = ? where token = ?", DbParams().bindInstant(now).bindStr(row.getStr("token")))
+    }
+    // Atomic: only one of two concurrent refreshes of the same token revokes the row.
+    Bool revokeByRefresh(refreshToken: String, now: String) {
+        var row = refreshRow(refreshToken)
+        if (row == null) {
+            return false
+        }
+        return store.execute("update auth_sessions set revoked_at = ? where token = ? and revoked_at is null", DbParams().bindInstant(now).bindStr(row.getStr("token"))) > 0
+    }
+    revokeAllByUser(userId: String, now: String) {
+        store.execute("update auth_sessions set revoked_at = ? where user_id = ? and revoked_at is null", DbParams().bindInstant(now).bindStr(userId))
+    }
+    // Every session but the one presented (hashed or raw), after a second factor is switched on or off.
+    revokeOthersByUser(userId: String, keepToken: String?, now: String) {
+        var keep = ""
+        if (keepToken != null) {
+            keep = keepToken.trim()
+        }
+        store.execute("update auth_sessions set revoked_at = ? where user_id = ? and revoked_at is null and token <> ? and token <> ?", DbParams().bindInstant(now).bindStr(userId).bindStr(Hashes.sha256Hex(keep)).bindStr(keep))
+    }
+    // The deploy-window sweep of SessionTokenHashMigration: raw rows become hashed rows.
+    Int rehashLegacySessions() {
+        var rows = store.queryList("select token, refresh_token from auth_sessions where char_length(token) <> 64", DbParams())
+        var migrated = 0
+        for (var r in rows) {
+            var token = r.getStr("token")
+            if (AuthStore.looksLikeStoredHash(token)) {
+                continue
+            }
+            var refresh = r.getStrOrNull("refresh_token")
+            var refreshHash = IdentityText.none()
+            if (refresh != null) {
+                refreshHash = Hashes.sha256Hex(refresh)
+            }
+            store.execute("update auth_sessions set token = ?, refresh_token = ? where token = ?", DbParams().bindStr(Hashes.sha256Hex(token)).bindStrOrNull(refreshHash).bindStr(token))
+            migrated = migrated + 1
+        }
+        return migrated
+    }
+    // ---- pending signups
+    IdentityPending? pendingByEmail(email: String) = pending(store.queryOptional("select id, email, name, birth_date, password_hash, token_hash, expires_at, created_at, resend_count, last_sent_at from pending_signups where email = ?", DbParams().bindStr(email)))
+    IdentityPending? pendingByToken(tokenHash: String) = pending(store.queryOptional("select id, email, name, birth_date, password_hash, token_hash, expires_at, created_at, resend_count, last_sent_at from pending_signups where token_hash = ?", DbParams().bindStr(tokenHash)))
+    IdentityPending? pending(row: DbRow?) {
+        if (row == null) {
+            return null
+        }
+        return IdentityPending(row.getStr("id"), row.getStr("email"), row.getStr("name"), row.getDate("birth_date"), row.getStr("password_hash"), row.getStr("token_hash"), row.getInstant("expires_at"), row.getInstant("created_at"), row.getInt("resend_count"), row.getInstantOrNull("last_sent_at"))
+    }
+    savePending(p: IdentityPending) {
+        var updated = store.execute("update pending_signups set email = ?, name = ?, birth_date = ?, password_hash = ?, token_hash = ?, expires_at = ?, created_at = ?, resend_count = ?, last_sent_at = ? where id = ?", DbParams().bindStr(p.email()).bindStr(p.name()).bindDate(p.birthDate()).bindStr(p.passwordHash()).bindStr(p.tokenHash()).bindInstant(p.expiresAt()).bindInstant(p.createdAt()).bindInt(p.resendCount()).bindInstantOrNull(p.lastSentAt()).bindStr(p.id()))
+        if (updated == 0) {
+            store.execute("insert into pending_signups (id, email, name, birth_date, password_hash, token_hash, expires_at, created_at, resend_count, last_sent_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(p.id()).bindStr(p.email()).bindStr(p.name()).bindDate(p.birthDate()).bindStr(p.passwordHash()).bindStr(p.tokenHash()).bindInstant(p.expiresAt()).bindInstant(p.createdAt()).bindInt(p.resendCount()).bindInstantOrNull(p.lastSentAt()))
+        }
+    }
+    deletePendingByEmail(email: String) {
+        store.execute("delete from pending_signups where email = ?", DbParams().bindStr(email))
+    }
+    Int deleteExpiredPending(now: String) = store.execute("delete from pending_signups where expires_at < ?", DbParams().bindInstant(now))
+    // ---- email verification tokens
+    saveVerification(tokenHash: String, userId: String, expiresAt: String, now: String) {
+        store.execute("insert into email_verification_tokens (token, user_id, expires_at, used_at, created_at) values (?, ?, ?, null, ?)", DbParams().bindStr(tokenHash).bindStr(userId).bindInstant(expiresAt).bindInstant(now))
+    }
+    IdentityToken? verificationByHash(tokenHash: String) = tokenRow(store.queryOptional("select token, user_id, expires_at, used_at from email_verification_tokens where token = ?", DbParams().bindStr(tokenHash)))
+    markVerificationUsed(tokenHash: String, now: String) {
+        store.execute("update email_verification_tokens set used_at = ? where token = ?", DbParams().bindInstant(now).bindStr(tokenHash))
+    }
+    markAllVerificationUsed(userId: String, now: String) {
+        store.execute("update email_verification_tokens set used_at = ? where user_id = ? and used_at is null", DbParams().bindInstant(now).bindStr(userId))
+    }
+    Int verificationsSince(userId: String, since: String) = store.queryLong("select count(*) from email_verification_tokens where user_id = ? and created_at > ?", DbParams().bindStr(userId).bindInstant(since)) as Int
+    // ---- password reset tokens
+    saveReset(tokenHash: String, userId: String, expiresAt: String, now: String) {
+        store.execute("insert into password_reset_tokens (token, user_id, expires_at, used_at, created_at) values (?, ?, ?, null, ?)", DbParams().bindStr(tokenHash).bindStr(userId).bindInstant(expiresAt).bindInstant(now))
+    }
+    IdentityToken? resetByHash(tokenHash: String) = tokenRow(store.queryOptional("select token, user_id, expires_at, used_at from password_reset_tokens where token = ?", DbParams().bindStr(tokenHash)))
+    markResetUsed(tokenHash: String, now: String) {
+        store.execute("update password_reset_tokens set used_at = ? where token = ?", DbParams().bindInstant(now).bindStr(tokenHash))
+    }
+    deleteResetsByUser(userId: String) {
+        store.execute("delete from password_reset_tokens where user_id = ?", DbParams().bindStr(userId))
+    }
+    IdentityToken? tokenRow(row: DbRow?) {
+        if (row == null) {
+            return null
+        }
+        return IdentityToken(row.getStr("token"), row.getStr("user_id"), row.getInstant("expires_at"), row.getInstantOrNull("used_at"))
+    }
+    // ---- e-mail change
+    replaceEmailChange(id: String, userId: String, newEmail: String, tokenHash: String, expiresAt: String, now: String) {
+        store.execute("delete from pending_email_changes where user_id = ?", DbParams().bindStr(userId))
+        store.execute("insert into pending_email_changes (id, user_id, new_email, token_hash, expires_at, created_at) values (?, ?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(userId).bindStr(newEmail).bindStr(tokenHash).bindInstant(expiresAt).bindInstant(now))
+    }
+    DbRow? emailChangeByHash(tokenHash: String) = store.queryOptional("select user_id, new_email, expires_at from pending_email_changes where token_hash = ?", DbParams().bindStr(tokenHash))
+    deleteEmailChange(userId: String) {
+        store.execute("delete from pending_email_changes where user_id = ?", DbParams().bindStr(userId))
+    }
+    // ---- known devices
+    Bool deviceKnown(userId: String, fingerprint: String) = store.queryLong("select count(*) from known_devices where user_id = ? and fingerprint = ?", DbParams().bindStr(userId).bindStr(fingerprint)) > 0L
+    saveDevice(id: String, userId: String, fingerprint: String, now: String) {
+        store.execute("insert into known_devices (id, user_id, fingerprint, first_seen_at) values (?, ?, ?, ?)", DbParams().bindStr(id).bindStr(userId).bindStr(fingerprint).bindInstant(now))
+    }
+    // ---- signup challenge nonces
+    deleteExpiredNonces(now: String) {
+        store.execute("delete from signup_challenge_nonces where expires_at < ?", DbParams().bindInstant(now))
+    }
+    insertNonce(nonce: String, expiresAt: String) {
+        store.execute("insert into signup_challenge_nonces (nonce, expires_at) values (?, ?)", DbParams().bindStr(nonce).bindInstant(expiresAt))
+    }
+    // ---- e-mail log (metadata only, never the body)
+    logEmail(id: String, to: String, subject: String, kind: String, sent: Bool, error: String?, now: String) {
+        var status = "FAILED"
+        if (sent) {
+            status = "SENT"
+        }
+        store.execute("insert into email_log (id, to_email, subject, kind, status, error, created_at) values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(IdentityStore.clip(to, 180)).bindStr(IdentityStore.clip(subject, 200)).bindStr(kind).bindStr(status).bindStrOrNull(error).bindInstant(now))
+    }
+    static String clip(value: String, max: Int) {
+        if (value.length() <= max) {
+            return value
+        }
+        return value.substring(0, max)
+    }
+}

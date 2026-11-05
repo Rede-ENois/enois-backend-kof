@@ -1,0 +1,375 @@
+import java.io.ByteArrayOutputStream
+import java.util.Base64
+import java.util.HashMap
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import calls.*
+import messaging.*
+import notifications.*
+
+class CallFlowHolder {
+    static TestApp? cached = null
+    static CallsModule? module = null
+}
+
+String testSecret() = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+TestApp callsApp() {
+    var cur = CallFlowHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var cfg = new HashMap<String, String>()
+    cfg.put("REDE_CALLS_JITSI_URL", "https://chamadas.example.test/")
+    cfg.put("REDE_CALLS_JITSI_JWT_SECRET", testSecret())
+    cfg.put("REDE_CALLS_JITSI_JWT_ISSUER", "rede-teste")
+    var created = DomainTestKit.boot("callflow", cfg, (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+    var notifications = NotificationsModule.install(p, s, SecurityHooks(), parts)
+    var messaging = MessagingModule.install(p, s, SecurityHooks(), parts, notifications)
+    CallFlowHolder.module = CallsModule.install(p, s, SecurityHooks(), parts, notifications, messaging)
+})
+    CallFlowHolder.cached = created
+    return created
+}
+
+String who(id: String) = DomainTestKit.loginAdult(callsApp(), id)
+
+TestResponse post(token: String, path: String, body: String) = callsApp().client.send("POST", path, DomainTestKit.auth(token), "", body)
+
+TestResponse startCall(token: String, conversationId: String, kind: String) {
+    if (kind.length() == 0) {
+        return post(token, "/conversations/" + conversationId + "/calls", "")
+    }
+    return callsApp().client.send("POST", "/conversations/" + conversationId + "/calls", listOf("X-Session-Token: " + token, "Content-Type: application/json"), "", "{\"kind\":\"" + kind + "\"}")
+}
+
+String startedId(token: String, conversationId: String) {
+    var res = startCall(token, conversationId, "AUDIO")
+    Check.status(res, 200)
+    return "" + res.jsonStr("id")
+}
+
+String stateOf(token: String, callId: String) = "" + MessagingTestKit.get(callsApp(), token, "/calls/" + callId).jsonStr("state")
+
+expireNow() {
+    var m = CallFlowHolder.module
+    if (m == null) {
+        throw "module not wired"
+    }
+    m.worker.sweepOnce()
+}
+
+group(id: String, owner: String) {
+    var now = Time.nowIso()
+    callsApp().db().execute("insert into groups (id, slug, name, owner_id, status, created_at, updated_at) values (?, ?, ?, ?, \'ACTIVE\', ?, ?)", DbParams().bindStr(id).bindStr(id).bindStr("Tamo Junto " + id).bindStr(owner).bindInstant(now).bindInstant(now))
+    member(id, owner, "OWNER")
+}
+
+member(groupId: String, userId: String, role: String) {
+    callsApp().db().execute("insert into group_members (id, group_id, user_id, role, joined_at) values (?, ?, ?, ?, ?)", DbParams().bindStr("gm-" + groupId + "-" + userId).bindStr(groupId).bindStr(userId).bindStr(role).bindInstant(Time.nowIso()))
+}
+
+String b64(bytes: Byte[]) = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+
+String signatureOf(signingInput: String) {
+    var key = testSecret().getBytes() as Byte[]
+    var mac = Mac.getInstance("HmacSHA256")
+    mac.init(new SecretKeySpec(key, "HmacSHA256"))
+    return b64(mac.doFinal(signingInput.getBytes()))
+}
+
+String decodePart(part: String) {
+    var raw = Base64.getUrlDecoder().decode(part)
+    var out = new ByteArrayOutputStream()
+    out.write(raw, 0, raw.length)
+    return out.toString()
+}
+
+// ---- 1:1
+test "a 1:1 video call rings, is answered, joined with a signed token and ended" {
+    var app = callsApp()
+    var a = who("call-a1")
+    var b = who("call-b1")
+    var conversation = MessagingTestKit.direct(app, a, "dm-call-a1-b1", "call-b1")
+    var call = startCall(a, conversation, "VIDEO")
+    Check.status(call, 200)
+    Check.jsonEq(call, "state", "RINGING")
+    Check.jsonEq(call, "kind", "VIDEO")
+    Check.jsonEq(call, "participantCount", "0")
+    Check.jsonEq(call, "isInitiator", "true")
+    var callId = "" + call.jsonStr("id")
+    // the other side sees it ringing in the conversation, and in the notices
+    var open = MessagingTestKit.get(app, b, "/conversations/" + conversation + "/calls/open")
+    Check.jsonEq(open, "id", callId)
+    Check.jsonEq(open, "state", "RINGING")
+    Check.jsonEq(open, "isInitiator", "false")
+    Check.jsonEq(open, "myState", "INVITED")
+    Check.eqInt("incoming notice", 1, app.db().queryLong("select count(*) from notifications where user_id = ? and kind = \'CALL_INCOMING\'", DbParams().bindStr("call-b1")) as Int)
+    // answering: CONNECTING with the answerer already counted
+    var answered = post(b, "/calls/" + callId + "/answer", "")
+    Check.status(answered, 200)
+    Check.jsonEq(answered, "state", "CONNECTING")
+    Check.jsonEq(answered, "participantCount", "1")
+    // joining: the Jitsi address, a random room and the signed token
+    var join = post(b, "/calls/" + callId + "/join", "")
+    Check.status(join, 200)
+    Check.jsonEq(join, "host", "https://chamadas.example.test")
+    var room = "" + join.jsonStr("room")
+    Check.eqInt("room length", 32, room.length())
+    assert(!room.contains("call-b1"))
+    assert(!room.contains("call-a1"))
+    Check.jsonEq(join, "call.state", "ACTIVE")
+    Check.jsonEq(join, "tokenTtlSeconds", "7200")
+    var jwt = "" + join.jsonStr("jwt")
+    var parts = jwt.split("\\.")
+    Check.eqInt("jwt parts", 3, parts.length)
+    Check.eqStr("signature", signatureOf(parts[0] + "." + parts[1]), parts[2])
+    assert(decodePart(parts[0]).contains("\"alg\":\"HS256\""))
+    var claims = decodePart(parts[1])
+    assert(claims.contains("\"iss\":\"rede-teste\""))
+    assert(claims.contains("\"aud\":\"meet.jitsi\""))
+    assert(claims.contains("\"room\":\"" + room + "\""))
+    assert(claims.contains("\"id\":\"call-b1\""))
+    assert(claims.contains("\"recording\":false"))
+    assert(claims.contains("\"moderator\":false"))
+    // who called enters the same room, as moderator
+    var joinA = post(a, "/calls/" + callId + "/join", "")
+    Check.status(joinA, 200)
+    Check.jsonEq(joinA, "room", room)
+    Check.jsonEq(joinA, "call.participantCount", "2")
+    var jwtA = "" + joinA.jsonStr("jwt")
+    var partsA = jwtA.split("\\.")
+    assert(decodePart(partsA[1]).contains("\"moderator\":true"))
+    // ending on one side closes it for both
+    var ended = post(a, "/calls/" + callId + "/end", "")
+    Check.status(ended, 200)
+    Check.jsonEq(ended, "state", "ENDED")
+    Check.eqStr("seen by the other", "ENDED", stateOf(b, callId))
+    var late = post(b, "/calls/" + callId + "/join", "")
+    Check.apiError(late, 409, "CALL_ENDED")
+    // ending again is the same result
+    Check.jsonEq(post(a, "/calls/" + callId + "/end", ""), "state", "ENDED")
+}
+
+test "who is not in the conversation neither sees nor enters" {
+    var app = callsApp()
+    var a = who("call-a2")
+    who("call-b2")
+    var intruder = who("call-x2")
+    var conversation = MessagingTestKit.direct(app, a, "dm-call-a2-b2", "call-b2")
+    var callId = startedId(a, conversation)
+    Check.apiError(MessagingTestKit.get(app, intruder, "/calls/" + callId), 403, "NOT_PARTICIPANT")
+    Check.status(post(intruder, "/calls/" + callId + "/join", ""), 403)
+    Check.status(post(intruder, "/calls/" + callId + "/answer", ""), 403)
+    Check.status(post(intruder, "/calls/" + callId + "/end", ""), 403)
+    Check.apiError(MessagingTestKit.get(app, intruder, "/calls/nope"), 404, "CALL_NOT_FOUND")
+    assert(MessagingTestKit.get(app, intruder, "/conversations/" + conversation + "/calls/open").body.length() == 0)
+    Check.apiError(app.client.get("/calls/open"), 401, "UNAUTHENTICATED")
+}
+
+test "declining closes the call and the caller sees the refusal" {
+    var app = callsApp()
+    var a = who("call-a3")
+    var b = who("call-b3")
+    var conversation = MessagingTestKit.direct(app, a, "dm-call-a3-b3", "call-b3")
+    var callId = startedId(a, conversation)
+    var declined = post(b, "/calls/" + callId + "/decline", "")
+    Check.status(declined, 200)
+    Check.jsonEq(declined, "state", "DECLINED")
+    var seen = MessagingTestKit.get(app, a, "/calls/" + callId)
+    Check.jsonEq(seen, "state", "DECLINED")
+    Check.jsonEq(seen, "endReason", "DECLINED")
+    Check.apiError(post(b, "/calls/" + callId + "/answer", ""), 409, "CALL_DECLINED")
+    // declining twice answers the same result
+    Check.jsonEq(post(b, "/calls/" + callId + "/decline", ""), "state", "DECLINED")
+}
+
+test "letting it ring until the deadline turns it into not answered" {
+    var app = callsApp()
+    var a = who("call-a4")
+    var b = who("call-b4")
+    var conversation = MessagingTestKit.direct(app, a, "dm-call-a4-b4", "call-b4")
+    var callId = startedId(a, conversation)
+    // before the deadline it keeps ringing
+    SecurityClock.advanceSeconds(30L)
+    Check.eqStr("ringing at 30s", "RINGING", stateOf(b, callId))
+    expireNow()
+    Check.eqStr("ringing after a sweep", "RINGING", stateOf(b, callId))
+    // after the ring timeout the worker closes it as not answered
+    SecurityClock.advanceSeconds(15L)
+    expireNow()
+    var missed = MessagingTestKit.get(app, b, "/calls/" + callId)
+    Check.jsonEq(missed, "state", "MISSED")
+    Check.jsonEq(missed, "endReason", "TIMEOUT")
+    Check.jsonEq(missed, "myState", "MISSED")
+    Check.apiError(post(b, "/calls/" + callId + "/join", ""), 409, "CALL_MISSED")
+    Check.eqInt("missed notice", 1, app.db().queryLong("select count(*) from notifications where user_id = ? and kind = \'CALL_MISSED\'", DbParams().bindStr("call-b4")) as Int)
+    // sweeping again changes nothing
+    expireNow()
+    Check.eqStr("still missed", "MISSED", stateOf(b, callId))
+}
+
+test "cancelling before the answer" {
+    var app = callsApp()
+    var a = who("call-a5")
+    var b = who("call-b5")
+    var conversation = MessagingTestKit.direct(app, a, "dm-call-a5-b5", "call-b5")
+    var callId = startedId(a, conversation)
+    Check.jsonEq(post(a, "/calls/" + callId + "/cancel", ""), "state", "CANCELLED")
+    Check.apiError(post(b, "/calls/" + callId + "/answer", ""), 409, "CALL_CANCELLED")
+    // only who called cancels
+    var other = startedId(b, conversation)
+    Check.apiError(post(a, "/calls/" + other + "/cancel", ""), 403, "NOT_CALL_INITIATOR")
+    // cancelling twice is the same result
+    Check.jsonEq(post(a, "/calls/" + callId + "/cancel", ""), "state", "CANCELLED")
+}
+
+test "repeating the start does not create another call in the same conversation" {
+    var app = callsApp()
+    var a = who("call-a6")
+    who("call-b6")
+    var conversation = MessagingTestKit.direct(app, a, "dm-call-a6-b6", "call-b6")
+    var first = startedId(a, conversation)
+    var second = startedId(a, conversation)
+    Check.eqStr("same call", first, second)
+    Check.eqInt("one row", 1, app.db().queryLong("select count(*) from call_sessions where conversation_id = ?", DbParams().bindStr(conversation)) as Int)
+}
+
+test "answer and decline in either order leave exactly one state" {
+    var app = callsApp()
+    var a = who("call-a7")
+    var b = who("call-b7")
+    var conversation = MessagingTestKit.direct(app, a, "dm-call-a7-b7", "call-b7")
+    // answer first: the decline that comes after finds a call that already allows joining
+    var first = startedId(a, conversation)
+    Check.status(post(b, "/calls/" + first + "/answer", ""), 200)
+    var late = post(b, "/calls/" + first + "/decline", "")
+    assert(late.status == 200 || late.status == 409)
+    var settled = stateOf(a, first)
+    assert(settled == "CONNECTING" || settled == "DECLINED" || settled == "ACTIVE")
+    post(a, "/calls/" + first + "/end", "")
+    // decline first: the answer that comes after is refused
+    var second = startedId(a, conversation)
+    Check.jsonEq(post(b, "/calls/" + second + "/decline", ""), "state", "DECLINED")
+    Check.apiError(post(b, "/calls/" + second + "/answer", ""), 409, "CALL_DECLINED")
+    Check.eqStr("settled", "DECLINED", stateOf(a, second))
+}
+
+test "leaving a 1:1 call ends it and a lost connection fails it" {
+    var app = callsApp()
+    var a = who("call-a8")
+    var b = who("call-b8")
+    var conversation = MessagingTestKit.direct(app, a, "dm-call-a8-b8", "call-b8")
+    var callId = startedId(a, conversation)
+    Check.status(post(b, "/calls/" + callId + "/answer", ""), 200)
+    Check.status(post(b, "/calls/" + callId + "/join", ""), 200)
+    var left = post(b, "/calls/" + callId + "/leave", "")
+    Check.jsonEq(left, "state", "ENDED")
+    Check.jsonEq(left, "endReason", "LEFT")
+    Check.eqInt("ended notice for the other side", 1, app.db().queryLong("select count(*) from notifications where user_id = ? and kind = \'CALL_ENDED\'", DbParams().bindStr("call-a8")) as Int)
+    var next = startedId(a, conversation)
+    Check.status(post(b, "/calls/" + next + "/answer", ""), 200)
+    var failed = post(b, "/calls/" + next + "/fail", "")
+    Check.jsonEq(failed, "state", "FAILED")
+    Check.jsonEq(failed, "endReason", "CONNECTION_LOST")
+}
+
+test "an active call without signs of life is closed by the worker" {
+    var app = callsApp()
+    var a = who("call-a9")
+    var b = who("call-b9")
+    var conversation = MessagingTestKit.direct(app, a, "dm-call-a9-b9", "call-b9")
+    var callId = startedId(a, conversation)
+    Check.status(post(b, "/calls/" + callId + "/answer", ""), 200)
+    Check.jsonEq(post(b, "/calls/" + callId + "/join", ""), "call.state", "ACTIVE")
+    SecurityClock.advanceSeconds(1900L)
+    expireNow()
+    var closed = MessagingTestKit.get(app, a, "/calls/" + callId)
+    Check.jsonEq(closed, "state", "ENDED")
+    Check.jsonEq(closed, "endReason", "TIMEOUT")
+    Check.jsonEq(closed, "participantCount", "0")
+}
+
+test "the open calls of a person and the kind of a call" {
+    var app = callsApp()
+    var a = who("call-a10")
+    var b = who("call-b10")
+    var conversation = MessagingTestKit.direct(app, a, "dm-call-a10-b10", "call-b10")
+    Check.apiError(startCall(a, conversation, "HOLOGRAM"), 400, "BAD_REQUEST")
+    var callId = startedId(a, conversation)
+    var mine = MessagingTestKit.get(app, b, "/calls/open")
+    Check.status(mine, 200)
+    Check.eqInt("open calls", 1, mine.jsonSize(""))
+    Check.jsonEq(mine, "0.id", callId)
+    Check.jsonEq(mine, "0.kind", "AUDIO")
+    // a conversation with more than two people is not a direct call
+    who("call-c10")
+    var group = MessagingTestKit.call(app, a, "call-group-conv", "/conversations", "{\"kind\":\"GROUP\",\"title\":\"trio\",\"participantIds\":[\"call-b10\",\"call-c10\"]}")
+    Check.status(group, 201)
+    Check.apiError(startCall(a, "" + group.jsonStr("id"), "AUDIO"), 409, "NOT_A_DIRECT_CONVERSATION")
+}
+
+// ---- group "Tamo junto"
+test "tamo junto rings nobody, notifies once and joins without ending it for the others" {
+    var app = callsApp()
+    var owner = who("call-g9-owner")
+    var member = who("call-g9-member")
+    var other = who("call-g9-other")
+    group("call-tamo-9", "call-g9-owner")
+    member("call-tamo-9", "call-g9-member", "MEMBER")
+    member("call-tamo-9", "call-g9-other", "MEMBER")
+    var call = callsApp().client.send("POST", "/groups/call-tamo-9/calls", listOf("X-Session-Token: " + owner, "Content-Type: application/json"), "", "{\"kind\":\"AUDIO\"}")
+    Check.status(call, 200)
+    var callId = "" + call.jsonStr("id")
+    Check.jsonEq(call, "state", "CONNECTING")
+    Check.jsonEq(call, "modality", "GROUP")
+    // one notice per person, no ringing
+    var notice = app.db().queryOne("select title, body from notifications where user_id = ? and kind = \'CALL_GROUP_LIVE\' and group_key = ?", DbParams().bindStr("call-g9-member").bindStr("call_live:" + callId))
+    Check.eqStr("title", "Tamo junto ao vivo", notice.getStr("title"))
+    assert(notice.getStr("body").contains("O grupo esta ao vivo!"))
+    Check.eqInt("no ringing", 0, app.db().queryLong("select count(*) from notifications where kind = \'CALL_INCOMING\' and user_id in (\'call-g9-member\', \'call-g9-other\')", DbParams()) as Int)
+    // asking again for the same group returns the same call and does not notify again
+    Check.jsonEq(callsApp().client.send("POST", "/groups/call-tamo-9/calls", DomainTestKit.auth(member), "", ""), "id", callId)
+    Check.eqInt("still one notice", 1, app.db().queryLong("select count(*) from notifications where user_id = ? and kind = \'CALL_GROUP_LIVE\'", DbParams().bindStr("call-g9-member")) as Int)
+    // the group shows it live for every member
+    Check.jsonEq(MessagingTestKit.get(app, member, "/groups/call-tamo-9/calls/open"), "id", callId)
+    // owner and member enter; the count follows who is in the room
+    Check.jsonEq(post(owner, "/calls/" + callId + "/join", ""), "call.state", "ACTIVE")
+    Check.jsonEq(post(member, "/calls/" + callId + "/join", ""), "call.participantCount", "2")
+    // leaving on one side does NOT end it for the other
+    var left = post(owner, "/calls/" + callId + "/leave", "")
+    Check.jsonEq(left, "state", "ACTIVE")
+    Check.jsonEq(left, "participantCount", "1")
+    // the last one out closes it
+    var last = post(member, "/calls/" + callId + "/leave", "")
+    Check.jsonEq(last, "state", "ENDED")
+    Check.jsonEq(last, "endReason", "GROUP_EMPTY")
+    assert(MessagingTestKit.get(app, member, "/groups/call-tamo-9/calls/open").body.length() == 0)
+    Check.status(MessagingTestKit.get(app, other, "/calls/" + callId), 200)
+}
+
+test "who is not a member does not enter tamo junto" {
+    var app = callsApp()
+    var owner = who("call-g10-owner")
+    group("call-tamo-10", "call-g10-owner")
+    var callId = "" + post(owner, "/groups/call-tamo-10/calls", "").jsonStr("id")
+    var outsider = who("call-g10-outsider")
+    Check.apiError(post(outsider, "/groups/call-tamo-10/calls", ""), 403, "NOT_GROUP_MEMBER")
+    Check.apiError(post(outsider, "/calls/" + callId + "/join", ""), 403, "NOT_GROUP_MEMBER")
+    Check.apiError(MessagingTestKit.get(app, outsider, "/calls/" + callId), 403, "NOT_GROUP_MEMBER")
+}
+
+test "an empty group call closes by itself after the deadline" {
+    var app = callsApp()
+    var owner = who("call-g11-owner")
+    group("call-tamo-11", "call-g11-owner")
+    var callId = "" + post(owner, "/groups/call-tamo-11/calls", "").jsonStr("id")
+    SecurityClock.advanceSeconds(360L)
+    expireNow()
+    Check.eqStr("closed", "FAILED", stateOf(owner, callId))
+}

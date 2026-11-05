@@ -1,0 +1,157 @@
+package kernel.monitoring
+
+import java.util.HashMap
+import java.util.concurrent.locks.ReentrantLock
+
+// One event waiting to be written: the JSON line plus the two labels the panel counts by.
+record BufferedEvent(String line, String level, String type)
+
+// The in-memory side of event capture: a bounded queue the flush job drains into the DayLog, the most recent events for
+// the panel's first page and its level/type counters, a per-minute rate cap and the count of what was dropped.
+// Nothing here blocks a request: when the cap or the queue is full the event is counted in `dropped` and forgotten.
+// The Java MonitoringService queue/recent/allowEvent half.
+//
+//   if (buffer.offer(line, "ERROR", "EXCEPTION", nowMs)) { ... }
+//   var batch = buffer.drain(200)           // the flush job, every 500 ms
+//   var recent = buffer.recent(100)         // newest first
+class EventBuffer {
+    ReentrantLock gate = new ReentrantLock()
+    List<BufferedEvent> queue = listOf<BufferedEvent>()
+    // Oldest first; trimmed to the newest `recentLimit` once it grows past a margin (no O(n) shift per event).
+    List<BufferedEvent> kept = listOf<BufferedEvent>()
+    Int maxEventsPerMinute
+    Long eventMinute = -1L
+    Int eventCount = 0
+    Long dropped = 0L
+    Long countsAt = -1000000L
+    List<MonitoringCount> levelCounts = listOf<MonitoringCount>()
+    List<MonitoringCount> typeCounts = listOf<MonitoringCount>()
+    public constructor(maxEventsPerMinute: Int) {
+        this.maxEventsPerMinute = maxEventsPerMinute
+        if (maxEventsPerMinute < 1) {
+            this.maxEventsPerMinute = 1
+        }
+    }
+    static Int recentLimit() = 500
+    static Int queueLimit() = 5000
+    static Long countsCacheMs() = 30000L
+    // False when the event was dropped (rate cap or full queue).
+    Bool offer(line: String, level: String, type: String, nowMs: Long) {
+        gate.lock()
+        var accepted = this.offerLocked(BufferedEvent(line, level, type), nowMs)
+        gate.unlock()
+        return accepted
+    }
+    Bool offerLocked(event: BufferedEvent, nowMs: Long) {
+        var minute = nowMs / 60000L
+        if (eventMinute != minute) {
+            eventMinute = minute
+            eventCount = 0
+        }
+        if (eventCount >= maxEventsPerMinute) {
+            dropped = dropped + 1L
+            return false
+        }
+        eventCount = eventCount + 1
+        kept.add(event)
+        if (kept.size() > EventBuffer.recentLimit() + 100) {
+            kept = this.newest(EventBuffer.recentLimit())
+        }
+        if (queue.size() >= EventBuffer.queueLimit()) {
+            dropped = dropped + 1L
+            return false
+        }
+        queue.add(event)
+        return true
+    }
+    // The newest `limit` kept events, oldest first.
+    List<BufferedEvent> newest(limit: Int) {
+        var out = listOf<BufferedEvent>()
+        var from = kept.size() - limit
+        if (from < 0) {
+            from = 0
+        }
+        var i = from
+        while (i < kept.size()) {
+            out.add(kept.get(i))
+            i = i + 1
+        }
+        return out
+    }
+    // Takes up to `max` lines off the queue, oldest first.
+    List<String> drain(max: Int) {
+        gate.lock()
+        var batch = listOf<String>()
+        var rest = listOf<BufferedEvent>()
+        for (var event in queue) {
+            if (batch.size() < max) {
+                batch.add(event.line())
+            }
+            else {
+                rest.add(event)
+            }
+        }
+        queue = rest
+        gate.unlock()
+        return batch
+    }
+    // The newest events first, at most `limit` (1..500).
+    List<String> recent(limit: Int) {
+        gate.lock()
+        var size = limit
+        if (size > EventBuffer.recentLimit()) {
+            size = EventBuffer.recentLimit()
+        }
+        if (size < 1) {
+            size = 1
+        }
+        var out = listOf<String>()
+        var i = kept.size() - 1
+        while (i >= 0 && out.size() < size) {
+            out.add(kept.get(i).line())
+            i = i - 1
+        }
+        gate.unlock()
+        return out
+    }
+    Long droppedCount() {
+        gate.lock()
+        var count = dropped
+        gate.unlock()
+        return count
+    }
+    // Level and type counters of the kept window, recomputed at most every 30 s (no database, no polling cost).
+    List<MonitoringCount> levels(nowMs: Long) {
+        gate.lock()
+        this.refreshCountsLocked(nowMs)
+        var out = levelCounts
+        gate.unlock()
+        return out
+    }
+    List<MonitoringCount> types(nowMs: Long) {
+        gate.lock()
+        this.refreshCountsLocked(nowMs)
+        var out = typeCounts
+        gate.unlock()
+        return out
+    }
+    refreshCountsLocked(nowMs: Long) {
+        if (nowMs - countsAt < EventBuffer.countsCacheMs()) {
+            return
+        }
+        var levels = new HashMap<String, Long>()
+        var levelOrder = listOf<String>()
+        var types = new HashMap<String, Long>()
+        var typeOrder = listOf<String>()
+        // Newest first, like the Java deque iteration: ties keep that order.
+        var i = kept.size() - 1
+        while (i >= 0) {
+            RequestMetrics.bump(levels, levelOrder, kept.get(i).level())
+            RequestMetrics.bump(types, typeOrder, kept.get(i).type())
+            i = i - 1
+        }
+        levelCounts = RequestMetrics.top(levels, levelOrder, 12)
+        typeCounts = RequestMetrics.top(types, typeOrder, 12)
+        countsAt = nowMs
+    }
+}

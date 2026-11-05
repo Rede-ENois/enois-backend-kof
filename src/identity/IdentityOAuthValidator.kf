@@ -1,0 +1,272 @@
+package identity
+
+import kernel.http.*
+import kernel.id.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import kernel.url.*
+
+// Token validators of Google, Apple, LinkedIn and GitHub (GoogleTokenValidator and friends). The id_token is
+// checked for signature (RS256 against the provider JWKS), issuer, audience, expiry and nonce; a plain code is
+// first exchanged at the token endpoint. Anything that is off answers null (the service turns it into
+// INVALID_OAUTH_TOKEN), never an exception. The wire is IdentityOAuthTransport, so tests stub it.
+class IdentityOAuthValidator {
+    static Long jwksTtlMs = 3600000L
+    IdentityOAuthConfig oauthConfig
+    IdentityOAuthTransport transport
+    Map<String,String> jwksCache = mapOf()
+    Map<String,Long> jwksFetchedAt = mapOf()
+    public constructor(oauthConfig: IdentityOAuthConfig, transport: IdentityOAuthTransport) {
+        this.oauthConfig = oauthConfig
+        this.transport = transport
+    }
+    static String jwksUrl(provider: String) {
+        if (provider == "GOOGLE") {
+            return "https://www.googleapis.com/oauth2/v3/certs"
+        }
+        if (provider == "APPLE") {
+            return "https://appleid.apple.com/auth/keys"
+        }
+        // The old api.linkedin.com/v2/openid/jwks wants an access token; the public one is in the discovery doc.
+        return "https://www.linkedin.com/oauth/openid/jwks"
+    }
+    static String tokenUrl(provider: String) {
+        if (provider == "GOOGLE") {
+            return "https://oauth2.googleapis.com/token"
+        }
+        if (provider == "APPLE") {
+            return "https://appleid.apple.com/auth/token"
+        }
+        return "https://www.linkedin.com/oauth/v2/accessToken"
+    }
+    static Bool issuerOk(provider: String, iss: String) {
+        if (provider == "GOOGLE") {
+            return iss == "https://accounts.google.com" || iss == "accounts.google.com"
+        }
+        if (provider == "APPLE") {
+            return iss == "https://appleid.apple.com"
+        }
+        return iss == "https://www.linkedin.com/oauth"
+    }
+    IdentityOAuthClaims? validate(provider: String, credential: String, expectedNonce: String) {
+        var value = credential.trim()
+        if (value.length() == 0 || !oauthConfig.configured(provider)) {
+            return null
+        }
+        if (provider == "GITHUB") {
+            return github(value)
+        }
+        if (provider != "GOOGLE" && provider != "APPLE" && provider != "LINKEDIN") {
+            return null
+        }
+        if (Jwt.looksLikeJwt(value)) {
+            return verifyIdToken(provider, value, expectedNonce, null, null)
+        }
+        return exchange(provider, value, expectedNonce)
+    }
+    // The cached JWKS, refetched after an hour; a failed refresh keeps the old keys.
+    String jwks(provider: String) {
+        var url = IdentityOAuthValidator.jwksUrl(provider)
+        var now = Time.nowMillis()
+        var cached = jwksCache.get(url)
+        var at = jwksFetchedAt.get(url)
+        if (cached != null && at != null && now - at < IdentityOAuthValidator.jwksTtlMs) {
+            return cached
+        }
+        var reply = transport.get(url, listOf())
+        if (reply.status() == 200 && reply.body().length() > 0) {
+            jwksCache.put(url, reply.body())
+            jwksFetchedAt.put(url, now)
+            return reply.body()
+        }
+        if (cached != null) {
+            return cached
+        }
+        return ""
+    }
+    static String claim(payload: String, name: String) {
+        var v = JsonPath.str(payload, name)
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    static Bool truthy(payload: String, name: String) = IdentityOAuthValidator.claim(payload, name).toLowerCase() == "true"
+    // `aud` may be a string or an array: the first value.
+    static String audience(payload: String) {
+        var raw = JsonPath.raw(payload, "aud")
+        if (raw == null) {
+            return ""
+        }
+        if (raw.startsWith("[")) {
+            return IdentityOAuthValidator.claim(payload, "aud.0")
+        }
+        return IdentityOAuthValidator.claim(payload, "aud")
+    }
+    static Bool expired(payload: String) {
+        var exp = IdentityOAuthValidator.claim(payload, "exp")
+        if (exp.length() == 0) {
+            return false
+        }
+        var seconds = 0L
+        try {
+            seconds = exp.split("\\.")[0].toLong()
+        } catch (String e) {
+            return true
+        }
+        return seconds * 1000L < Time.nowMillis()
+    }
+    IdentityOAuthClaims? verifyIdToken(provider: String, token: String, expectedNonce: String, accessToken: String?, accessTokenExpiresAt: String?) {
+        var body = Jwt.verifyRs256(token, jwks(provider))
+        if (body == null) {
+            return null
+        }
+        var payload = "" + body
+        if (!IdentityOAuthValidator.issuerOk(provider, IdentityOAuthValidator.claim(payload, "iss"))) {
+            return null
+        }
+        if (IdentityOAuthValidator.audience(payload) != oauthConfig.clientId(provider)) {
+            return null
+        }
+        if (IdentityOAuthValidator.expired(payload)) {
+            return null
+        }
+        // The nonce ties the token to the request WE started. LinkedIn's id_token carries none (only the single-use
+        // state ties it), so it is checked there only when the claim is present.
+        var nonce = IdentityOAuthValidator.claim(payload, "nonce")
+        if (expectedNonce.trim().length() > 0 && nonce != expectedNonce) {
+            if (provider != "LINKEDIN" || nonce.length() > 0) {
+                return null
+            }
+        }
+        var sub = IdentityOAuthValidator.claim(payload, "sub")
+        if (sub.trim().length() == 0) {
+            return null
+        }
+        var name = IdentityOAuthValidator.claim(payload, "name")
+        if (provider == "APPLE") {
+            // The `user` claim only comes with the first authorization.
+            var first = IdentityOAuthValidator.claim(payload, "user.name.firstName")
+            if (first.length() > 0) {
+                var last = IdentityOAuthValidator.claim(payload, "user.name.lastName")
+                name = first
+                if (last.length() > 0) {
+                    name = first + " " + last
+                }
+            }
+        }
+        return IdentityOAuthClaims(sub, IdentityOAuthValidator.claim(payload, "email"), name, IdentityOAuthValidator.truthy(payload, "email_verified"), accessToken, accessTokenExpiresAt, null)
+    }
+    static String form(pairs: List<String>) {
+        var out = ""
+        var i = 0
+        while (i + 1 < pairs.size()) {
+            if (out.length() > 0) {
+                out = out + "&"
+            }
+            out = out + pairs.get(i) + "=" + UrlCodec.encode(pairs.get(i + 1))
+            i = i + 2
+        }
+        return out
+    }
+    // Apple's client_secret: an ES256 JWT (iss teamId, sub clientId, aud Apple) signed with the team's .p8 key;
+    // without it the code exchange answers invalid_client. Valid 150 days (Apple caps it at six months).
+    String? appleClientSecret() {
+        if (oauthConfig.appleTeamId().trim().length() == 0 || oauthConfig.appleKeyId().trim().length() == 0 || oauthConfig.applePrivateKey().trim().length() == 0) {
+            return null
+        }
+        var secret = ""
+        var ok = true
+        try {
+            var now = Time.nowMillis() / 1000L
+            var header = "{\"alg\":\"ES256\",\"kid\":\"" + oauthConfig.appleKeyId() + "\"}"
+            var payload = "{\"iss\":\"" + oauthConfig.appleTeamId() + "\",\"sub\":\"" + oauthConfig.appleClientId() + "\",\"aud\":\"https://appleid.apple.com\",\"iat\":" + now + ",\"exp\":" + (now + 12960000L) + ",\"jti\":\"" + Ids.uuid() + "\"}"
+            secret = Jwt.sign("ES256", oauthConfig.applePrivateKey(), header, payload)
+        } catch (String e) {
+            ok = false
+        }
+        if (!ok) {
+            return null
+        }
+        return secret
+    }
+    IdentityOAuthClaims? exchange(provider: String, code: String, expectedNonce: String) {
+        var pairs = listOf<String>()
+        if (provider == "APPLE") {
+            var secret = appleClientSecret()
+            if (secret == null) {
+                return null
+            }
+            pairs = listOf("code", code, "client_id", oauthConfig.appleClientId(), "client_secret", secret, "grant_type", "authorization_code")
+            if (oauthConfig.appleRedirectUri().length() > 0) {
+                pairs.add("redirect_uri")
+                pairs.add(oauthConfig.appleRedirectUri())
+            }
+        }
+        else 
+            if (provider == "GOOGLE") {
+                pairs = listOf("code", code, "client_id", oauthConfig.googleClientId(), "client_secret", oauthConfig.googleClientSecret(), "redirect_uri", oauthConfig.googleRedirectUri(), "grant_type", "authorization_code")
+            }
+            else {
+                pairs = listOf("code", code, "client_id", oauthConfig.linkedinClientId(), "client_secret", oauthConfig.linkedinClientSecret(), "redirect_uri", oauthConfig.linkedinRedirectUri(), "grant_type", "authorization_code")
+            }
+        var reply = transport.post(IdentityOAuthValidator.tokenUrl(provider), listOf(), IdentityOAuthValidator.form(pairs))
+        if (reply.status() != 200) {
+            return null
+        }
+        var idToken = IdentityOAuthValidator.claim(reply.body(), "id_token")
+        if (idToken.length() == 0) {
+            return null
+        }
+        var accessToken = IdentityText.none()
+        var accessExpires = IdentityText.none()
+        if (provider == "LINKEDIN") {
+            // The token that signs in also publishes when the link asked for w_member_social; the validity is
+            // the expires_in (seconds) of LinkedIn itself.
+            var at = IdentityOAuthValidator.claim(reply.body(), "access_token")
+            if (at.length() > 0) {
+                accessToken = at
+            }
+            var expiresIn = IdentityOAuthValidator.claim(reply.body(), "expires_in")
+            if (expiresIn.length() > 0) {
+                var seconds = 0L
+                var parsed = true
+                try {
+                    seconds = expiresIn.split("\\.")[0].toLong()
+                } catch (String e) {
+                    parsed = false
+                }
+                if (parsed) {
+                    accessExpires = Time.plusSeconds(Time.nowIso(), seconds)
+                }
+            }
+        }
+        return verifyIdToken(provider, idToken, expectedNonce, accessToken, accessExpires)
+    }
+    // GitHub issues no id_token: the code is exchanged server-side and /user answers. The identity is the numeric
+    // id (immutable); the login is only presentation. Only for LINKING: its public e-mail is not proof of
+    // ownership, so emailVerified is always false.
+    IdentityOAuthClaims? github(code: String) {
+        var tokenForm = IdentityOAuthValidator.form(listOf("client_id", oauthConfig.githubClientId(), "client_secret", oauthConfig.githubClientSecret(), "code", code, "redirect_uri", oauthConfig.githubRedirectUri()))
+        var exchanged = transport.post("https://github.com/login/oauth/access_token", listOf("Accept: application/json", "User-Agent: EnoisBot/1.0"), tokenForm)
+        if (exchanged.status() == 0 || exchanged.status() >= 400) {
+            return null
+        }
+        var accessToken = IdentityOAuthValidator.claim(exchanged.body(), "access_token")
+        if (accessToken.length() == 0) {
+            return null
+        }
+        var scope = IdentityOAuthValidator.claim(exchanged.body(), "scope")
+        var user = transport.get("https://api.github.com/user", listOf("Accept: application/vnd.github+json", "X-GitHub-Api-Version: 2022-11-28", "User-Agent: EnoisBot/1.0", "Authorization: Bearer " + accessToken))
+        if (user.status() == 0 || user.status() >= 400) {
+            return null
+        }
+        var id = IdentityOAuthValidator.claim(user.body(), "id")
+        var login = IdentityOAuthValidator.claim(user.body(), "login")
+        if (id.trim().length() == 0 || login.trim().length() == 0) {
+            return null
+        }
+        return IdentityOAuthClaims(id, IdentityOAuthValidator.claim(user.body(), "email"), login, false, accessToken, null, scope)
+    }
+}

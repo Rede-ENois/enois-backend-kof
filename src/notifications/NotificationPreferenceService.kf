@@ -1,0 +1,39 @@
+package notifications
+
+import kernel.time.*
+
+// A partial update of the preferences: -1 keeps the current value, 0 turns it off, 1 turns it on
+// (Kof has no nullable Bool, the Java record used `Boolean`).
+record NotificationPrefsPatch(Int weeklyDigest, Int pushSocial, Int pushMessages, Int pushGroups, Int pushJobs, Int pushSystem)
+
+// Push categories and the weekly digest toggle (NotificationPreferenceService). No stored row means the
+// defaults: everything on. The in-app inbox is never filtered; these toggles decide push and the digest.
+class NotificationPreferenceService {
+    NotificationsStore store
+    public constructor(store: NotificationsStore) {
+        this.store = store
+    }
+    static NotificationPreferencesView defaults() = NotificationPreferencesView(true, true, true, true, true, true, null)
+    static NotificationPrefsPatch keepAll() = NotificationPrefsPatch(-1, -1, -1, -1, -1, -1)
+    static Bool pick(patch: Int, current: Bool) {
+        if (patch < 0) {
+            return current
+        }
+        return patch == 1
+    }
+    NotificationPreferencesView of(userId: String) {
+        var found = store.findPreferences(userId)
+        if (found == null) {
+            return NotificationPreferenceService.defaults()
+        }
+        return found
+    }
+    NotificationPreferencesView update(userId: String, patch: NotificationPrefsPatch) {
+        var now = Time.nowIso()
+        var cur = of(userId)
+        var next = NotificationPreferencesView(NotificationPreferenceService.pick(patch.weeklyDigest(), cur.weeklyDigest()), NotificationPreferenceService.pick(patch.pushSocial(), cur.pushSocial()), NotificationPreferenceService.pick(patch.pushMessages(), cur.pushMessages()), NotificationPreferenceService.pick(patch.pushGroups(), cur.pushGroups()), NotificationPreferenceService.pick(patch.pushJobs(), cur.pushJobs()), NotificationPreferenceService.pick(patch.pushSystem(), cur.pushSystem()), now)
+        store.savePreferences(userId, next, now)
+        return next
+    }
+    Bool allowsPush(userId: String, kind: String) = NotificationCategories.allowsPush(of(userId), kind)
+}

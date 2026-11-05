@@ -1,0 +1,151 @@
+package notifications
+
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.util.HashMap
+import java.util.HashSet
+import kernel.db.*
+
+// An event the person confirmed (WeeklyDigestRepository.AttendingEvent): date and time are free text.
+record NotificationAttendingEvent(String id, String title, String date, String? time)
+
+// Event days as the app writes them: ISO or dd/MM/yyyy (Event.parseDate). Anything else is null.
+class NotificationDates {
+    static String? parse(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        var value = raw.trim()
+        if (value.length() == 0) {
+            return null
+        }
+        try {
+            return LocalDate.parse(value).toString()
+        } catch (String ignored) {
+        }
+        // falls through to the Brazilian format
+        var parts = value.split("/")
+        if (parts.length != 3 || parts[0].length() != 2 || parts[1].length() != 2 || parts[2].length() != 4) {
+            return null
+        }
+        try {
+            return LocalDate.parse(parts[2] + "-" + parts[1] + "-" + parts[0]).toString()
+        } catch (String invalid) {
+            return null
+        }
+    }
+    // Today in Brazil, the calendar day of the app's "today".
+    static String todayBrazil() = Instant.now().atZone(ZoneId.of("America/Sao_Paulo")).toLocalDate().toString()
+}
+
+// pending-port: communities, groups, events. Read-time lookups of the places a notification points at:
+// the default reads `communities`, `posts`, `groups`, `events` and `event_attendees` read-only (same SQL
+// as the Java NotificationPlacePersistenceAdapter / WeeklyDigestPersistenceAdapter); the owning ports may
+// subclass it.
+class NotificationPlaceReader {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    Map<String,NotificationPlaceView> places(sql: String, keys: List<String>, type: String) {
+        var out = new HashMap<String, NotificationPlaceView>()
+        if (keys.isEmpty()) {
+            return out
+        }
+        for (var r in database.queryList(sql.replace("(:keys)", "(" + NotificationActors.marks(keys.size()) + ")"), NotificationActors.bindAll(keys))) {
+            out.put(r.getStr("k"), NotificationPlaceView(type, r.getStr("id"), r.getStr("name"), null))
+        }
+        return out
+    }
+    Map<String,NotificationPlaceView> communitiesByIds(ids: List<String>) = places("select c.id as k, c.id as id, c.name as name from communities c where c.id in (:keys)", ids, "COMMUNITY")
+    Map<String,NotificationPlaceView> communitiesOfPosts(postIds: List<String>) = places("select p.id as k, c.id as id, c.name as name from posts p join communities c on c.id = p.community_id where p.id in (:keys)", postIds, "COMMUNITY")
+    Map<String,NotificationPlaceView> groupsBySlugs(slugs: List<String>) = places("select g.slug as k, g.id as id, g.name as name from groups g where g.slug in (:keys) and g.status <> \'CLOSED\'", slugs, "GROUP")
+    Map<String,String> eventDatesByIds(ids: List<String>) {
+        var out = new HashMap<String, String>()
+        if (ids.isEmpty()) {
+            return out
+        }
+        for (var r in database.queryList("select e.id as id, e.date as event_date from events e where e.id in (" + NotificationActors.marks(ids.size()) + ")", NotificationActors.bindAll(ids))) {
+            var day = r.getStrOrNull("event_date")
+            if (day != null) {
+                out.put(r.getStr("id"), day)
+            }
+        }
+        return out
+    }
+    List<NotificationAttendingEvent> attendingEvents(userId: String) {
+        var out = listOf<NotificationAttendingEvent>()
+        for (var r in database.queryList("select e.id, e.title, e.date as event_date, e.time as event_time from events e join event_attendees a on a.event_id = e.id and a.user_id = ? where e.sanitized_at is null", DbParams().bindStr(userId))) {
+            out.add(NotificationAttendingEvent(r.getStr("id"), r.getStr("title"), r.getStr("event_date"), r.getStrOrNull("event_time")))
+        }
+        return out
+    }
+}
+
+// Read-time enrichment of notifications from their href (NotificationPlaces): the community or group they
+// came from and the day of the event they are about. One read per kind of target, whatever the page size.
+class NotificationPlaces {
+    NotificationPlaceReader reader
+    public constructor(reader: NotificationPlaceReader) {
+        this.reader = reader
+    }
+    static List<String> keysOf(targets: Map<String,NotificationTarget>, type: String) {
+        var seen = new HashSet<String>()
+        var out = listOf<String>()
+        for (var href in targets.keys()) {
+            var t = targets.get(href)
+            if (t != null && t.type() == type && seen.add(t.key())) {
+                out.add(t.key())
+            }
+        }
+        return out
+    }
+    Map<String,NotificationResolved> resolve(hrefs: List<String>) {
+        var targets = new HashMap<String, NotificationTarget>()
+        for (var href in hrefs) {
+            var t = NotificationTargets.of(href)
+            if (t != null) {
+                targets.put(href, t)
+            }
+        }
+        var communities = reader.communitiesByIds(NotificationPlaces.keysOf(targets, "COMMUNITY"))
+        var posts = reader.communitiesOfPosts(NotificationPlaces.keysOf(targets, "POST"))
+        var groups = reader.groupsBySlugs(NotificationPlaces.keysOf(targets, "GROUP"))
+        var eventDates = reader.eventDatesByIds(NotificationPlaces.keysOf(targets, "EVENT"))
+        var resolved = new HashMap<String, NotificationResolved>()
+        for (var href in hrefs) {
+            var t = targets.get(href)
+            if (t == null) {
+                resolved.put(href, NotificationResolved(null, null))
+                continue
+            }
+            if (t.type() == "COMMUNITY") {
+                resolved.put(href, NotificationResolved(communities.get(t.key()), null))
+            }
+            else 
+                if (t.type() == "POST") {
+                    resolved.put(href, NotificationResolved(posts.get(t.key()), null))
+                }
+                else 
+                    if (t.type() == "GROUP") {
+                        resolved.put(href, NotificationResolved(groups.get(t.key()), null))
+                    }
+                    else {
+                        resolved.put(href, NotificationResolved(null, NotificationDates.parse(eventDates.get(t.key()))))
+                    }
+        }
+        return resolved
+    }
+    // Confirmed events happening today in Brazil.
+    Int eventsToday(userId: String) {
+        var today = NotificationDates.todayBrazil()
+        var count = 0
+        for (var e in reader.attendingEvents(userId)) {
+            if (NotificationDates.parse(e.date()) == today) {
+                count = count + 1
+            }
+        }
+        return count
+    }
+}

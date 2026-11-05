@@ -1,0 +1,358 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import messaging.*
+import notifications.*
+
+class MessagesHolder {
+    static TestApp? cached = null
+}
+
+TestApp msgApp() {
+    var cur = MessagesHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = DomainTestKit.boot("msgmessages", mapOf<String, String>(), (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+    var notifications = NotificationsModule.install(p, s, SecurityHooks(), parts)
+    MessagingModule.install(p, s, SecurityHooks(), parts, notifications)
+})
+    MessagesHolder.cached = created
+    return created
+}
+
+String who(id: String) = DomainTestKit.loginAdult(msgApp(), id)
+
+// ---- MessagingContractControllerTests
+test "creates a conversation, sends a message and marks it read" {
+    var app = msgApp()
+    var a = who("msg_user_a")
+    var b = who("msg_user_b")
+    var created = MessagingTestKit.call(app, a, "msg-create-1", "/conversations", "{\"kind\":\"DIRECT\",\"participantIds\":[\"msg_user_b\"]}")
+    Check.status(created, 201)
+    Check.jsonEq(created, "kind", "DIRECT")
+    var id = "" + created.jsonStr("id")
+    var sent = MessagingTestKit.send(app, a, "msg-send-1", id, "Ola, tudo bem?")
+    Check.status(sent, 201)
+    Check.jsonEq(sent, "text", "Ola, tudo bem?")
+    Check.jsonEq(sent, "from", "msg_user_a")
+    var messageId = "" + sent.jsonStr("id")
+    var detail = MessagingTestKit.get(app, a, "/conversations/" + id)
+    Check.status(detail, 200)
+    Check.jsonEq(detail, "lastMessage", "Ola, tudo bem?")
+    var unread = MessagingTestKit.get(app, b, "/conversations/unread-count")
+    Check.jsonEq(unread, "count", "1")
+    var read = MessagingTestKit.call(app, b, "msg-read-1", "/conversations/" + id + "/read", "")
+    Check.status(read, 200)
+    Check.jsonEq(read, "status", "READ")
+    Check.jsonEq(MessagingTestKit.get(app, b, "/conversations/unread-count"), "count", "0")
+    var list = MessagingTestKit.get(app, a, "/conversations/" + id + "/messages")
+    Check.status(list, 200)
+    Check.eqInt("items", 1, list.jsonSize("items"))
+    Check.jsonEq(list, "items.0.id", messageId)
+    // the sender sees the other participant read it
+    var seen = MessagingTestKit.get(app, a, "/conversations/" + id)
+    assert(!seen.jsonIsNull("otherLastReadAt"))
+}
+
+test "replays an idempotent message send" {
+    var app = msgApp()
+    var c = who("msg_user_c")
+    who("msg_user_d")
+    var id = MessagingTestKit.createDirect(app, c, "msg-create-idem", "msg_user_d")
+    var first = MessagingTestKit.send(app, c, "msg-send-idem", id, "Idempotente")
+    Check.status(first, 201)
+    var replay = MessagingTestKit.send(app, c, "msg-send-idem", id, "Idempotente")
+    Check.status(replay, 201)
+    Check.eqStr("replayed body", first.body, replay.body)
+    Check.eqInt("stored once", 1, MessagingTestKit.messageIds(app, c, id).size())
+    // the same key with another payload is a conflict
+    Check.apiError(MessagingTestKit.send(app, c, "msg-send-idem", id, "Outro texto"), 409, "IDEMPOTENCY_PAYLOAD_CONFLICT")
+    // the key is mandatory
+    Check.apiError(app.client.send("POST", "/conversations/" + id + "/messages", listOf("X-Session-Token: " + c, "Content-Type: application/json"), "", "{\"text\":\"x\"}"), 400, "IDEMPOTENCY_KEY_REQUIRED")
+}
+
+// ---- DuplicateMessageTests
+test "a repeated message returns the same row" {
+    var app = msgApp()
+    var a = who("dup_msg_a")
+    who("dup_msg_b")
+    var id = MessagingTestKit.direct(app, a, "dup-msg-direct", "dup_msg_b")
+    var first = MessagingTestKit.sendOk(app, a, "dup-msg-1", id, "mesma mensagem")
+    var second = MessagingTestKit.sendOk(app, a, "dup-msg-2", id, "mesma mensagem")
+    Check.eqStr("same id", first, second)
+    Check.eqInt("items", 1, MessagingTestKit.messageIds(app, a, id).size())
+}
+
+// ---- MessageMediaTests
+test "sends and reads media ids with optional text" {
+    var app = msgApp()
+    var a = who("dmm_a")
+    var b = who("dmm_b")
+    var id = MessagingTestKit.direct(app, a, "dmm-conv", "dmm_b")
+    var sent = MessagingTestKit.call(app, a, "dmm-1", "/conversations/" + id + "/messages", "{\"text\":\"olha isso\",\"mediaIds\":[\"media_1\",\"media_2\"]}")
+    Check.status(sent, 201)
+    Check.eqInt("media", 2, sent.jsonSize("mediaIds"))
+    var list = MessagingTestKit.get(app, b, "/conversations/" + id + "/messages")
+    Check.eqInt("listed media", 2, list.jsonSize("items.0.mediaIds"))
+    Check.status(MessagingTestKit.call(app, a, "dmm-2", "/conversations/" + id + "/messages", "{\"text\":\"\",\"mediaIds\":[\"media_3\"]}"), 201)
+}
+
+test "rejects an empty message and too many media" {
+    var app = msgApp()
+    var a = who("dmm_c")
+    who("dmm_d")
+    var id = MessagingTestKit.direct(app, a, "dmm-conv-2", "dmm_d")
+    Check.apiError(MessagingTestKit.call(app, a, "dmm-empty", "/conversations/" + id + "/messages", "{\"text\":\"\",\"mediaIds\":[]}"), 400, "EMPTY_MESSAGE")
+    Check.apiError(MessagingTestKit.call(app, a, "dmm-many", "/conversations/" + id + "/messages", "{\"text\":\"muitas\",\"mediaIds\":[\"m1\",\"m2\",\"m3\",\"m4\",\"m5\"]}"), 400, "TOO_MANY_MEDIA")
+}
+
+// ---- MessagePaginationTests
+test "listing older messages uses the cursor" {
+    var app = msgApp()
+    var a = who("msg_page_a")
+    who("msg_page_b")
+    var id = MessagingTestKit.createDirect(app, a, "mp-conv", "msg_page_b")
+    var i = 1
+    while (i <= 5) {
+        MessagingTestKit.sendOk(app, a, "mp-msg-" + i, id, "mensagem " + i)
+        i = i + 1
+    }
+    var first = MessagingTestKit.get(app, a, "/conversations/" + id + "/messages?limit=2")
+    Check.eqInt("first page", 2, first.jsonSize("items"))
+    assert(!first.jsonIsNull("nextCursor"))
+    var cursor = "" + first.jsonStr("nextCursor")
+    var second = MessagingTestKit.get(app, a, "/conversations/" + id + "/messages?limit=2&cursor=" + cursor)
+    Check.eqInt("second page", 2, second.jsonSize("items"))
+    var firstIds = MessagingTestKit.idsAt(first, "items")
+    for (var other in MessagingTestKit.idsAt(second, "items")) {
+        assert(!firstIds.contains(other))
+    }
+    Check.jsonEq(first, "items.0.text", "mensagem 5")
+    Check.apiError(MessagingTestKit.get(app, a, "/conversations/" + id + "/messages?cursor=nope"), 400, "INVALID_CURSOR")
+}
+
+test "the last page has no cursor" {
+    var app = msgApp()
+    var a = who("msg_page_a2")
+    who("msg_page_b2")
+    var id = MessagingTestKit.createDirect(app, a, "mp-conv-2", "msg_page_b2")
+    MessagingTestKit.sendOk(app, a, "mp-only-1", id, "unica")
+    var page = MessagingTestKit.get(app, a, "/conversations/" + id + "/messages?limit=20")
+    Check.eqInt("items", 1, page.jsonSize("items"))
+    assert(page.jsonIsNull("nextCursor"))
+}
+
+// ---- MessagePreviewOrderTests
+test "the preview shows the last of two messages sent in the same second" {
+    var app = msgApp()
+    var a = who("preview_order_a")
+    who("preview_order_b")
+    var id = MessagingTestKit.direct(app, a, "preview-order-direct", "preview_order_b")
+    MessagingTestKit.sendOk(app, a, "preview-order-1", id, "primeira")
+    MessagingTestKit.sendOk(app, a, "preview-order-2", id, "segunda")
+    var list = MessagingTestKit.get(app, a, "/conversations/" + id + "/messages")
+    Check.eqInt("items", 2, list.jsonSize("items"))
+    Check.jsonEq(list, "items.0.text", "segunda")
+    var newest = "" + list.jsonStr("items.0.time")
+    var oldest = "" + list.jsonStr("items.1.time")
+    assert(newest.compareTo(oldest) > 0)
+    var inbox = MessagingTestKit.get(app, a, "/conversations")
+    Check.eqStr("preview", "segunda", "" + DomainTestKit.itemStr(inbox, "items", id, "lastMessage"))
+    Check.eqStr("from", "preview_order_a", "" + DomainTestKit.itemStr(inbox, "items", id, "lastMessageFrom"))
+}
+
+// ---- MessageReactionViewTests
+test "the message list carries the reaction summary and the viewers own reaction" {
+    var app = msgApp()
+    var alice = who("msg_reaction_alice")
+    var bob = who("msg_reaction_bob")
+    var id = MessagingTestKit.direct(app, alice, "msg-react-conv", "msg_reaction_bob")
+    var messageId = MessagingTestKit.sendOk(app, alice, "msg-react-send", id, "oi, tudo bem?")
+    var reacted = MessagingTestKit.call(app, bob, "msg-react-like", "/conversations/" + id + "/messages/" + messageId + "/reactions", "{\"type\":\"LIKE\"}")
+    Check.status(reacted, 200)
+    Check.jsonEq(reacted, "status", "REACTED")
+    var bobView = MessagingTestKit.get(app, bob, "/conversations/" + id + "/messages")
+    Check.jsonEq(bobView, "items.0.reactions.LIKE", "1")
+    Check.jsonEq(bobView, "items.0.myReaction", "LIKE")
+    var aliceView = MessagingTestKit.get(app, alice, "/conversations/" + id + "/messages")
+    Check.jsonEq(aliceView, "items.0.reactions.LIKE", "1")
+    assert(aliceView.jsonIsNull("items.0.myReaction"))
+    // the same reaction again takes it back
+    var removed = MessagingTestKit.call(app, bob, "msg-react-like-2", "/conversations/" + id + "/messages/" + messageId + "/reactions", "{\"type\":\"LIKE\"}")
+    Check.jsonEq(removed, "status", "REMOVED")
+    var list = MessagingTestKit.get(app, bob, "/conversations/" + id + "/messages/" + messageId + "/reactions")
+    Check.status(list, 200)
+    Check.jsonEq(list, "messageId", messageId)
+    Check.eqInt("reactions", 0, list.jsonSize("reactions"))
+}
+
+test "reaction endpoints check the participation, the message and the type" {
+    var app = msgApp()
+    var a = who("react_rules_a")
+    who("react_rules_b")
+    var outsider = who("react_rules_out")
+    var id = MessagingTestKit.direct(app, a, "react-rules-conv", "react_rules_b")
+    var messageId = MessagingTestKit.sendOk(app, a, "react-rules-send", id, "oi")
+    var path = "/conversations/" + id + "/messages/" + messageId + "/reactions"
+    Check.apiError(MessagingTestKit.call(app, outsider, "react-out-1", path, "{\"type\":\"LIKE\"}"), 403, "NOT_PARTICIPANT")
+    Check.apiError(MessagingTestKit.get(app, outsider, path), 403, "NOT_PARTICIPANT")
+    Check.apiError(MessagingTestKit.call(app, a, "react-missing", "/conversations/" + id + "/messages/nope/reactions", "{\"type\":\"LIKE\"}"), 404, "MESSAGE_NOT_FOUND")
+    Check.apiError(MessagingTestKit.call(app, a, "react-bad", path, "{\"type\":\"HEART\"}"), 400, "BAD_REQUEST")
+    var fire = MessagingTestKit.call(app, a, "react-fire", path, "{\"type\":\"FIRE\"}")
+    Check.status(fire, 200)
+    var listed = MessagingTestKit.get(app, a, path)
+    Check.jsonEq(listed, "summary.FIRE", "1")
+    Check.jsonEq(listed, "reactions.0.userId", "react_rules_a")
+}
+
+// ---- access, search, reply and the inbox
+test "only participants read a conversation and its messages" {
+    var app = msgApp()
+    var a = who("acc_a")
+    who("acc_b")
+    var outsider = who("acc_out")
+    var id = MessagingTestKit.direct(app, a, "acc-conv", "acc_b")
+    Check.apiError(MessagingTestKit.get(app, outsider, "/conversations/" + id), 403, "NOT_PARTICIPANT")
+    Check.apiError(MessagingTestKit.get(app, outsider, "/conversations/" + id + "/messages"), 403, "NOT_PARTICIPANT")
+    Check.apiError(MessagingTestKit.send(app, outsider, "acc-send", id, "oi"), 403, "NOT_PARTICIPANT")
+    Check.apiError(MessagingTestKit.send(app, a, "acc-send-2", "no-such-conversation", "oi"), 404, "CONVERSATION_NOT_FOUND")
+    Check.apiError(app.client.get("/conversations"), 401, "UNAUTHENTICATED")
+}
+
+test "a reply carries the quoted message and a foreign reply target is refused" {
+    var app = msgApp()
+    var a = who("reply_a")
+    var b = who("reply_b")
+    who("reply_c")
+    var id = MessagingTestKit.direct(app, a, "reply-conv", "reply_b")
+    var other = MessagingTestKit.direct(app, a, "reply-conv-2", "reply_c")
+    var quoted = MessagingTestKit.sendOk(app, a, "reply-q", id, "pergunta")
+    var foreign = MessagingTestKit.sendOk(app, a, "reply-f", other, "outra conversa")
+    var reply = MessagingTestKit.call(app, b, "reply-send", "/conversations/" + id + "/messages", "{\"text\":\"resposta\",\"replyToId\":\"" + quoted + "\"}")
+    Check.status(reply, 201)
+    Check.jsonEq(reply, "replyToId", quoted)
+    var list = MessagingTestKit.get(app, a, "/conversations/" + id + "/messages")
+    Check.jsonEq(list, "items.0.replyTo.id", quoted)
+    Check.jsonEq(list, "items.0.replyTo.text", "pergunta")
+    Check.apiError(MessagingTestKit.call(app, b, "reply-bad", "/conversations/" + id + "/messages", "{\"text\":\"x\",\"replyToId\":\"" + foreign + "\"}"), 400, "INVALID_REPLY")
+}
+
+test "search filters the inbox by title" {
+    var app = msgApp()
+    var a = who("search_a")
+    who("search_b")
+    who("search_c")
+    var created = MessagingTestKit.call(app, a, "search-group", "/conversations", "{\"kind\":\"GROUP\",\"title\":\"Estudo de Rust\",\"participantIds\":[\"search_b\",\"search_c\"]}")
+    Check.status(created, 201)
+    var id = "" + created.jsonStr("id")
+    MessagingTestKit.direct(app, a, "search-direct", "search_b")
+    var hit = MessagingTestKit.get(app, a, "/conversations/search?q=rust")
+    Check.status(hit, 200)
+    Check.eqInt("hits", 1, hit.jsonSize("items"))
+    Check.jsonEq(hit, "items.0.id", id)
+    assert(hit.jsonIsNull("nextCursor"))
+    Check.eqInt("blank query lists all", 2, MessagingTestKit.get(app, a, "/conversations/search").jsonSize("items"))
+}
+
+test "the first page of the inbox carries a cursor only when it is full" {
+    var app = msgApp()
+    var a = who("inbox_a")
+    who("inbox_b")
+    who("inbox_c")
+    MessagingTestKit.direct(app, a, "inbox-1", "inbox_b")
+    MessagingTestKit.direct(app, a, "inbox-2", "inbox_c")
+    var full = MessagingTestKit.get(app, a, "/conversations?limit=2")
+    Check.eqInt("items", 2, full.jsonSize("items"))
+    assert(!full.jsonIsNull("nextCursor"))
+    var roomy = MessagingTestKit.get(app, a, "/conversations?limit=5")
+    assert(roomy.jsonIsNull("nextCursor"))
+}
+
+// ---- viewing and the stream
+test "viewing needs a participant and answers 204" {
+    var app = msgApp()
+    var a = who("view_a")
+    who("view_b")
+    var outsider = who("view_out")
+    var id = MessagingTestKit.direct(app, a, "view-conv", "view_b")
+    Check.status(MessagingTestKit.call(app, a, "view-1", "/conversations/" + id + "/viewing", ""), 204)
+    Check.apiError(MessagingTestKit.call(app, outsider, "view-2", "/conversations/" + id + "/viewing", ""), 403, "NOT_PARTICIPANT")
+    var left = app.client.send("DELETE", "/conversations/" + id + "/viewing", DomainTestKit.auth(a), "", "")
+    Check.status(left, 204)
+}
+
+test "the event stream needs a session and ends with a retry hint" {
+    var app = msgApp()
+    var a = who("stream_a")
+    var anon = app.client.get("/conversations/stream")
+    Check.status(anon, 401)
+    var res = MessagingTestKit.get(app, a, "/conversations/stream")
+    Check.status(res, 200)
+    Check.eqStr("content type", "text/event-stream", "" + res.headerOf("Content-Type"))
+    assert(res.body.contains("retry: 5000"))
+}
+
+// ---- end to end encryption keys
+test "stores and serves the keypair" {
+    var app = msgApp()
+    var a = who("e2e_a")
+    var b = who("e2e_b")
+    Check.apiError(MessagingTestKit.get(app, a, "/e2e/keypair"), 404, "NO_KEYPAIR")
+    assert(MessagingTestKit.get(app, b, "/e2e/keypair/e2e_a").jsonIsNull("publicKey"))
+    Check.apiError(MessagingTestKit.call(app, a, "e2e-bad", "/e2e/keypair", "{\"publicKey\":\"pk\"}"), 400, "INVALID_KEYPAIR")
+    var saved = MessagingTestKit.call(app, a, "e2e-up", "/e2e/keypair", "{\"publicKey\":\"pk1\",\"encryptedPrivateKey\":\"epk1\"}")
+    Check.status(saved, 200)
+    Check.jsonEq(saved, "status", "ACTIVE")
+    // a second upload replaces the first
+    MessagingTestKit.call(app, a, "e2e-up-2", "/e2e/keypair", "{\"publicKey\":\"pk2\",\"encryptedPrivateKey\":\"epk2\",\"algorithm\":\"ECDH\"}")
+    var mine = MessagingTestKit.get(app, a, "/e2e/keypair")
+    Check.jsonEq(mine, "publicKey", "pk2")
+    Check.jsonEq(mine, "encryptedPrivateKey", "epk2")
+    Check.jsonEq(mine, "algorithm", "ECDH")
+    var theirs = MessagingTestKit.get(app, b, "/e2e/keypair/e2e_a")
+    Check.jsonEq(theirs, "publicKey", "pk2")
+    Check.jsonEq(theirs, "algorithm", "ECDH")
+    var big = ""
+    var i = 0
+    while (i < 8193) {
+        big = big + "x"
+        i = i + 1
+    }
+    Check.apiError(MessagingTestKit.call(app, a, "e2e-big", "/e2e/keypair", "{\"publicKey\":\"" + big + "\",\"encryptedPrivateKey\":\"e\"}"), 400, "KEY_TOO_LARGE")
+}
+
+test "distributes conversation keys and sends an encrypted message" {
+    var app = msgApp()
+    var a = who("e2e_conv_a")
+    var b = who("e2e_conv_b")
+    var outsider = who("e2e_conv_out")
+    var id = MessagingTestKit.direct(app, a, "e2e-conv", "e2e_conv_b")
+    var path = "/e2e/conversations/" + id + "/keys"
+    Check.apiError(MessagingTestKit.call(app, outsider, "e2e-k-out", path, "[]"), 403, "NOT_PARTICIPANT")
+    Check.apiError(MessagingTestKit.call(app, a, "e2e-k-bad", path, "[{\"userId\":\"stranger\",\"encryptedKey\":\"k\"}]"), 400, "INVALID_PARTICIPANT")
+    Check.apiError(MessagingTestKit.call(app, a, "e2e-k-nokey", path, "[{\"userId\":\"e2e_conv_b\"}]"), 400, "INVALID_KEY")
+    var ok = MessagingTestKit.call(app, a, "e2e-k-ok", path, "[{\"userId\":\"e2e_conv_a\",\"encryptedKey\":\"ka\"},{\"userId\":\"e2e_conv_b\",\"encryptedKey\":\"kb\"}]")
+    Check.status(ok, 200)
+    Check.jsonEq(ok, "status", "DISTRIBUTED")
+    Check.jsonEq(ok, "conversationId", id)
+    // replacing a key keeps one row per person
+    MessagingTestKit.call(app, a, "e2e-k-again", path, "[{\"userId\":\"e2e_conv_b\",\"encryptedKey\":\"kb2\"}]")
+    var key = MessagingTestKit.get(app, b, "/e2e/conversations/" + id + "/key")
+    Check.jsonEq(key, "encryptedKey", "kb2")
+    Check.jsonEq(key, "keyVersion", "1")
+    Check.apiError(MessagingTestKit.get(app, outsider, "/e2e/conversations/" + id + "/key"), 403, "NOT_PARTICIPANT")
+    var none = MessagingTestKit.get(app, a, "/e2e/conversations/" + id + "/key")
+    Check.jsonEq(none, "encryptedKey", "ka")
+    // the encrypted message keeps ciphertext and iv, and the preview is flagged
+    var sent = MessagingTestKit.call(app, a, "e2e-msg", "/conversations/" + id + "/messages", "{\"text\":\"Y2lwaGVy\",\"e2e\":true,\"iv\":\"aXY=\"}")
+    Check.status(sent, 201)
+    Check.jsonEq(sent, "e2e", "true")
+    Check.jsonEq(sent, "iv", "aXY=")
+    var detail = MessagingTestKit.get(app, b, "/conversations/" + id)
+    Check.jsonEq(detail, "lastMessageE2e", "true")
+    Check.jsonEq(detail, "lastMessageIv", "aXY=")
+    Check.apiError(MessagingTestKit.call(app, a, "e2e-msg-noiv", "/conversations/" + id + "/messages", "{\"text\":\"Y2lwaGVy\",\"e2e\":true}"), 400, "MISSING_IV")
+}

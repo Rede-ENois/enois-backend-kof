@@ -1,0 +1,202 @@
+import java.util.HashMap
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import notifications.*
+
+test "every kind lands in its area" {
+    var expected = listOf<String>("MESSAGE:MESSAGES", "NEW_MESSAGE:MESSAGES", "NEW_WORK_MESSAGE:MESSAGES", "EVENT:EVENTS", "EVENT_NEXT_OCCURRENCE:EVENTS", "JOB:JOBS", "JOB_APPLICATION_STATUS:JOBS", "COMPANY_NEW_OPPORTUNITY:JOBS", "MICROPROJETO:COMPANIES", "MENTORING:MENTORING", "JOGO_DIARIO:DAILY_GAMES", "NEW_GAME:COMMUNITY_GAMES", "GROUP_MEMBER_JOINED:GROUPS", "GROUP_JOIN_REQUEST:GROUPS", "GROUP_JOIN_APPROVED:GROUPS", "GROUP_JOIN_REJECTED:GROUPS", "GROUP_MEMBER_REMOVED:GROUPS", "GROUP_OWNERSHIP_TRANSFERRED:GROUPS", "GROUP_CONTENT_REMOVED:GROUPS", "GROUP_STATUS_CHANGED:GROUPS", "GROUP_NEW_POST:GROUPS", "NEW_GROUP_COMMENT:GROUPS", "NEW_GROUP_REPLY:GROUPS", "STUDY_PAIR_MATCHED:STUDY_PAIRS", "STUDY_PAIR_CHECKIN:STUDY_PAIRS", "STUDY_PAIR_ENDED:STUDY_PAIRS", "STUDY_PAIR_REMINDER:STUDY_PAIRS", "NEW_BLOG_POST:BLOGS", "CONNECTION_REQUEST:NETWORK", "CONNECTION_ACCEPTED:NETWORK", "NEW_COMMENT:OTHER", "NEW_REPLY:OTHER", "NEW_REACTION:OTHER", "COMMENT_REACTION:OTHER", "MENTION:OTHER", "ANSWER_ACCEPTED:OTHER", "SEGURANCA:OTHER", "MODERACAO:OTHER", "SANCAO:OTHER", "RECURSO:OTHER", "SUPORTE:OTHER", "SISTEMA:OTHER", "UNKNOWN_KIND:OTHER", "CALL_GROUP_LIVE:GROUPS", "CALL_INCOMING:MESSAGES")
+    for (var pair in expected) {
+        var parts = pair.split(":")
+        Check.eqStr("kind " + parts[0], parts[1], NotificationModules.of(parts[0]))
+    }
+}
+
+test "kinds are compared case insensitively" {
+    Check.eqStr("a", "MESSAGES", NotificationModules.of("new_message"))
+    Check.eqStr("b", "GROUPS", NotificationModules.of("group_join_request"))
+    Check.eqStr("c", "STUDY_PAIRS", NotificationModules.of("Study_Pair_Matched"))
+    Check.eqStr("d", "OTHER", NotificationModules.of(null))
+}
+
+test "every kind the code writes has a push category" {
+    // The Java test scanned the sources; here the closed list of the kinds written by the ported domains
+    // (notifications, messaging, calls, push) plus the ones other domains send through the API.
+    var kinds = listOf<String>("SEGURANCA", "NEW_MESSAGE", "NEW_WORK_MESSAGE", "JOB_APPLICATION_STATUS", "GROUP_JOIN_REQUEST", "CALL_INCOMING", "CALL_GROUP_LIVE", "CALL_MISSED", "CALL_ENDED", "NEW_COMMENT", "NEW_REACTION", "COMMENT_REACTION", "SISTEMA")
+    for (var kind in kinds) {
+        Check.isTrue("kind " + kind + " needs a push category", NotificationCategories.isMapped(kind))
+    }
+    assert(!NotificationCategories.isMapped("UNKNOWN_KIND"))
+    Check.eqStr("unmapped falls back to SYSTEM", "SYSTEM", NotificationCategories.of("UNKNOWN_KIND"))
+    Check.eqStr("null falls back to SYSTEM", "SYSTEM", NotificationCategories.of(null))
+}
+
+test "security, moderation and sanctions are always pushed" {
+    var off = NotificationPreferencesView(false, false, false, false, false, false, null)
+    assert(NotificationCategories.allowsPush(off, "SEGURANCA"))
+    assert(NotificationCategories.allowsPush(off, "MODERACAO"))
+    assert(NotificationCategories.allowsPush(off, "SANCAO"))
+    assert(NotificationCategories.allowsPush(off, "RECURSO"))
+    assert(!NotificationCategories.allowsPush(off, "NEW_REACTION"))
+    assert(!NotificationCategories.allowsPush(off, "UNKNOWN_KIND"))
+}
+
+test "hrefs are read in the formats the modules write" {
+    var c = NotificationTargets.of("/comunidades/c1/posts")
+    assert(c != null)
+    if (c != null) {
+        Check.eqStr("community", "COMMUNITY:c1", c.type() + ":" + c.key())
+    }
+    var p = NotificationTargets.of("/api/feed/posts/p1?reacoes=1")
+    if (p != null) {
+        Check.eqStr("post", "POST:p1", p.type() + ":" + p.key())
+    }
+    var g = NotificationTargets.of("/grupos/roda-de-bh")
+    if (g != null) {
+        Check.eqStr("group", "GROUP:roda-de-bh", g.type() + ":" + g.key())
+    }
+    var e = NotificationTargets.of("/eventos?evento=e1")
+    if (e != null) {
+        Check.eqStr("event", "EVENT:e1", e.type() + ":" + e.key())
+    }
+    assert(NotificationTargets.of("/eventos") == null)
+    assert(NotificationTargets.of("/vagas/j1") == null)
+    assert(NotificationTargets.of(null) == null)
+}
+
+test "the preview is readable text" {
+    Check.eqStr("html", "Olha o que eu aprendi hoje sobre Kotlin", "" + NotificationPreviews.of("<p>Olha o que eu aprendi hoje sobre <b>Kotlin</b></p>"))
+    Check.eqStr("markdown", "Título primeiro item e link", "" + NotificationPreviews.of("## Título\n*primeiro* item e [link](https://exemplo.dev)"))
+    Check.eqStr("image", "legenda", "" + NotificationPreviews.of("![foto](https://cdn/foto.png) legenda"))
+    assert(NotificationPreviews.of("   ") == null)
+    assert(NotificationPreviews.of(null) == null)
+    assert(NotificationPreviews.of("![foto](https://cdn/foto.png)") == null)
+    assert(NotificationPreviews.of("<video src=\"x.mp4\"></video>") == null)
+    var cutText = NotificationPreviews.of(strings.repeat("a", NotificationPreviews.maxChars() + 50))
+    assert(cutText != null)
+    if (cutText != null) {
+        Check.eqInt("cut length", NotificationPreviews.maxChars() + 1, cutText.length())
+        assert(cutText.endsWith("…"))
+    }
+}
+
+// Counts the reads of a page: a subclass of the place reader, like the Mockito verify(times(1)).
+class CountingPlaceReader extends NotificationPlaceReader {
+    Int communityReads = 0
+    Int postReads = 0
+    Int groupReads = 0
+    Int eventReads = 0
+    public constructor(database: Db) {
+        super(database)
+    }
+    Map<String,NotificationPlaceView> communitiesByIds(ids: List<String>) {
+        communityReads = communityReads + 1
+        var out = new HashMap<String, NotificationPlaceView>()
+        out.put("c0", NotificationPlaceView("COMMUNITY", "c0", "Mesa", null))
+        return out
+    }
+    Map<String,NotificationPlaceView> communitiesOfPosts(ids: List<String>) {
+        postReads = postReads + 1
+        return new HashMap<String, NotificationPlaceView>()
+    }
+    Map<String,NotificationPlaceView> groupsBySlugs(ids: List<String>) {
+        groupReads = groupReads + 1
+        return new HashMap<String, NotificationPlaceView>()
+    }
+    Map<String,String> eventDatesByIds(ids: List<String>) {
+        eventReads = eventReads + 1
+        var out = new HashMap<String, String>()
+        out.put("e3", "2026-11-02")
+        return out
+    }
+}
+
+test "a page of many notifications is resolved with one read per kind" {
+    var reader = CountingPlaceReader(TestApp.shared().db())
+    var places = NotificationPlaces(reader)
+    var hrefs = listOf<String>()
+    var i = 0
+    while (i < 40) {
+        var m = i % 5
+        if (m == 0) {
+            hrefs.add("/comunidades/c" + i)
+        }
+        else 
+            if (m == 1) {
+                hrefs.add("/api/feed/posts/p" + i)
+            }
+            else 
+                if (m == 2) {
+                    hrefs.add("/grupos/g" + i)
+                }
+                else 
+                    if (m == 3) {
+                        hrefs.add("/eventos?evento=e" + i)
+                    }
+                    else {
+                        hrefs.add("/suporte")
+                    }
+        i = i + 1
+    }
+    var resolved = places.resolve(hrefs)
+    Check.eqInt("community reads", 1, reader.communityReads)
+    Check.eqInt("post reads", 1, reader.postReads)
+    Check.eqInt("group reads", 1, reader.groupReads)
+    Check.eqInt("event reads", 1, reader.eventReads)
+    Check.eqInt("distinct hrefs", 33, resolved.size())
+    var c0 = resolved.get("/comunidades/c0")
+    assert(c0 != null)
+    if (c0 != null) {
+        var place = c0.place()
+        assert(place != null)
+        if (place != null) {
+            Check.eqStr("name", "Mesa", place.name())
+        }
+    }
+    var c5 = resolved.get("/api/feed/posts/p1")
+    if (c5 != null) {
+        assert(c5.place() == null)
+    }
+    var none = resolved.get("/suporte")
+    if (none != null) {
+        assert(none.place() == null && none.eventDate() == null)
+    }
+}
+
+class FixedEventsReader extends NotificationPlaceReader {
+    public constructor(database: Db) {
+        super(database)
+    }
+    List<NotificationAttendingEvent> attendingEvents(userId: String) {
+        if (userId != "u1") {
+            return listOf<NotificationAttendingEvent>()
+        }
+        var today = NotificationDates.todayBrazil()
+        var parts = today.split("-")
+        return listOf<NotificationAttendingEvent>(NotificationAttendingEvent("e1", "A", today, "19:00"), NotificationAttendingEvent("e2", "B", parts[2] + "/" + parts[1] + "/" + parts[0], "20:00"), NotificationAttendingEvent("e3", "C", "2099-01-01", "19:00"), NotificationAttendingEvent("e4", "D", "sem data", null))
+    }
+}
+
+test "events today counts confirmed events of the Brazilian day" {
+    var places = NotificationPlaces(FixedEventsReader(TestApp.shared().db()))
+    Check.eqInt("u1", 2, places.eventsToday("u1"))
+    Check.eqInt("nobody", 0, places.eventsToday("nobody"))
+}
+
+test "event dates read ISO and dd/MM/yyyy strictly" {
+    Check.eqStr("iso", "2026-12-24", "" + NotificationDates.parse("2026-12-24"))
+    Check.eqStr("br", "2026-12-24", "" + NotificationDates.parse("24/12/2026"))
+    assert(NotificationDates.parse("31/02/2026") == null)
+    assert(NotificationDates.parse("sem data") == null)
+    assert(NotificationDates.parse("") == null)
+    assert(NotificationDates.parse(null) == null)
+}
+
+test "the notification column is is_read" {
+    // NotificationColumnQuotingTests: `read` is reserved in MariaDB, the schema column is is_read.
+    var db = TestApp.shared().db()
+    assert(db.queryLong("select count(*) from information_schema.columns where table_name = 'NOTIFICATIONS' and column_name = 'IS_READ'", DbParams()) == 1L)
+    assert(db.queryLong("select count(*) from information_schema.columns where table_name = 'NOTIFICATIONS' and column_name = 'READ'", DbParams()) == 0L)
+}

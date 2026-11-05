@@ -1,0 +1,160 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import leaves.*
+
+// Port of SearchContractControllerTests and the /search half of CatalogSearchTests (the /blogs search is
+// in tests/blog; the /mentors catalogue endpoint belongs to the mentoring domain). Extra tests lock the
+// type list, the limit clamp and the blocked-user filter.
+class SearchHolder {
+    static TestApp? app = null
+}
+
+TestApp searchApp() {
+    var cur = SearchHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = LeavesApp.boot("search", mapOf("X", "1"))
+    SearchHolder.app = created
+    return created
+}
+
+seedUser(app: TestApp, id: String, name: String, headline: String) {
+    SecurityFixtures.user(app.db(), id, true, false)
+    app.db().execute("update users set name = ?, headline = ? where id = ?", DbParams().bindStr(name).bindStr(headline).bindStr(id))
+}
+
+seedCommunity(app: TestApp, id: String, name: String, description: String, topic: String) {
+    var now = Time.nowIso()
+    app.db().execute("insert into communities (id, name, description, topic, created_by, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(name).bindStr(description).bindStr(topic).bindStr("search_creator").bindInstant(now).bindInstant(now))
+}
+
+seedJob(app: TestApp, id: String, title: String, company: String) {
+    var now = Time.nowIso()
+    app.db().execute("insert into jobs (id, title, company, type, level, posted_by, posted_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(title).bindStr(company).bindStr("FULL_TIME").bindStr("MID").bindStr("search_creator").bindInstant(now).bindInstant(now))
+}
+
+seedEvent(app: TestApp, id: String, title: String, host: String) {
+    var now = Time.nowIso()
+    app.db().execute("insert into events (id, title, date, time, format, host, created_by, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(title).bindStr("2026-12-01").bindStr("19:00").bindStr("ONLINE").bindStr(host).bindStr("search_creator").bindInstant(now).bindInstant(now))
+}
+
+seedMentor(app: TestApp, id: String, userId: String, expertise: String) {
+    var now = Time.nowIso()
+    app.db().execute("insert into mentors (id, user_id, expertise, rating, sessions_count, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(userId).bindStr(expertise).bindDouble(5.0).bindInt(0).bindInstant(now).bindInstant(now))
+}
+
+List<String> ids(res: TestResponse) {
+    var out = listOf<String>()
+    var i = 0
+    while (i < res.jsonSize("items")) {
+        out.add("" + res.jsonStr("items." + i + ".id"))
+        i = i + 1
+    }
+    return out
+}
+
+test "it searches by keyword and answers the page envelope" {
+    var app = searchApp()
+    seedUser(app, "search_kw_user", "Maria Design", "Designer de produto")
+    seedCommunity(app, "search_kw_comm", "Comunidade de design", "Falamos de interface", "design")
+    var res = app.client.get("/search?q=design&types=users,communities")
+    Check.status(res, 200)
+    Check.isTrue("items is an array", res.jsonSize("items") >= 2)
+    Check.isTrue("nextCursor is null", res.jsonIsNull("nextCursor"))
+    Check.isTrue("the community is found", ids(res).contains("search_kw_comm"))
+    Check.isTrue("the user is found", ids(res).contains("search_kw_user"))
+    Check.status(app.client.get("/v1/search?q=design"), 200)
+}
+
+test "gibberish and a blank query answer an empty list" {
+    var app = searchApp()
+    var none = app.client.get("/search?q=zzzzzznotfound&types=users")
+    Check.status(none, 200)
+    Check.eqInt("empty", 0, none.jsonSize("items"))
+    Check.eqInt("blank", 0, app.client.get("/search?q=%20%20").jsonSize("items"))
+    Check.eqInt("absent", 0, app.client.get("/search").jsonSize("items"))
+}
+
+test "wildcard characters match literally" {
+    var app = searchApp()
+    SecurityFixtures.user(app.db(), "likewildcard", true, false)
+    for (var wildcard in listOf("like%25card", "likewildcar_", "like!%25card")) {
+        var res = app.client.get("/search?q=" + wildcard + "&types=users,communities,jobs,events,mentors")
+        Check.status(res, 200)
+        Check.eqInt("no hit for " + wildcard, 0, res.jsonSize("items"))
+    }
+    var res = app.client.get("/search?q=likewild&types=users")
+    Check.status(res, 200)
+    Check.jsonEq(res, "items.0.title", "likewildcard")
+    Check.jsonEq(res, "items.0.href", "/api/users/likewildcard")
+}
+
+test "every catalogue answers with its type and href" {
+    var app = searchApp()
+    seedUser(app, "search_cat_user", "Catalogo Mentor", "Mentoria de catalogo")
+    seedCommunity(app, "search_cat_comm", "Catalogo comunidade", "texto", "catalogo")
+    seedJob(app, "search_cat_job", "Catalogo engenheiro", "Catalogo SA")
+    seedEvent(app, "search_cat_event", "Catalogo encontro", "Catalogo host")
+    seedMentor(app, "search_cat_mentor", "search_cat_user", "catalogo expertise")
+    var res = app.client.get("/search?q=catalogo&types=communities&types=jobs&types=events,mentors&limit=50")
+    Check.status(res, 200)
+    var all = ids(res)
+    Check.isTrue("community", all.contains("search_cat_comm"))
+    Check.isTrue("job", all.contains("search_cat_job"))
+    Check.isTrue("event", all.contains("search_cat_event"))
+    Check.isTrue("mentor", all.contains("search_cat_mentor"))
+    Check.isTrue("users were not asked for", !all.contains("search_cat_user"))
+    var jobs = app.client.get("/search?q=catalogo+engenheiro&types=jobs")
+    Check.jsonEq(jobs, "items.0.type", "jobs")
+    Check.jsonEq(jobs, "items.0.title", "Catalogo engenheiro")
+    Check.jsonEq(jobs, "items.0.subtitle", "Catalogo SA")
+    Check.jsonEq(jobs, "items.0.href", "/api/jobs/search_cat_job")
+    var mentors = app.client.get("/search?q=catalogo+expertise&types=mentors")
+    Check.jsonEq(mentors, "items.0.href", "/api/mentors/search_cat_mentor")
+    Check.jsonEq(mentors, "items.0.title", "Catalogo Mentor")
+}
+
+test "an unknown type is a 400 and the limit is clamped" {
+    var app = searchApp()
+    Check.apiError(app.client.get("/search?q=algo&types=users,planets"), 400, "INVALID_SEARCH_TYPE")
+    Check.jsonEq(app.client.get("/search?q=algo&types=planets"), "message", "Tipo de busca invalido: planets")
+    Check.apiError(app.client.get("/search?q=algo&limit=abc"), 400, "BAD_REQUEST")
+    var i = 0
+    while (i < 3) {
+    seedUser(app, "search_clamp_" + i, "Clampy " + i, "x")
+        i = i + 1
+    }
+    Check.eqInt("limit 0 becomes 1", 1, app.client.get("/search?q=clampy&types=users&limit=0").jsonSize("items"))
+    Check.eqInt("limit -5 becomes 1", 1, app.client.get("/search?q=clampy&types=users&limit=-5").jsonSize("items"))
+    Check.eqInt("all three under a big limit", 3, app.client.get("/search?q=clampy&types=users&limit=1000").jsonSize("items"))
+}
+
+test "exact and prefix matches rank first" {
+    var app = searchApp()
+    seedUser(app, "search_rank_a", "Rankzao", "x")
+    seedUser(app, "search_rank_b", "Zrank", "x")
+    seedUser(app, "search_rank_c", "Rank", "x")
+    var res = app.client.get("/search?q=rank&types=users&limit=50")
+    var all = ids(res)
+    Check.eqStr("exact first", "search_rank_c", all.get(0))
+    Check.eqStr("prefix second", "search_rank_a", all.get(1))
+    Check.eqStr("contains last", "search_rank_b", all.get(2))
+}
+
+test "an account the viewer blocked, or that blocked the viewer, is hidden for the viewer only" {
+    var app = searchApp()
+    SecurityFixtures.login(app.db(), "search_viewer", "tok-search-viewer-12")
+    seedUser(app, "search_hidden", "Hiddenperson", "x")
+    seedUser(app, "search_visible", "Hiddenperson visivel", "x")
+    var anonymous = ids(app.client.get("/search?q=hiddenperson&types=users&limit=50"))
+    Check.isTrue("anonymous sees both", anonymous.contains("search_hidden") && anonymous.contains("search_visible"))
+    app.db().execute("insert into user_blocks (blocker_id, blocked_id, created_at) values (?, ?, ?)", DbParams().bindStr("search_viewer").bindStr("search_hidden").bindInstant(Time.nowIso()))
+    var viewer = ids(app.client.getWith("/search?q=hiddenperson&types=users&limit=50", listOf("X-Session-Token: tok-search-viewer-12")))
+    Check.isTrue("the viewer no longer sees the blocked one", !viewer.contains("search_hidden") && viewer.contains("search_visible"))
+    var after = ids(app.client.get("/search?q=hiddenperson&types=users&limit=50"))
+    Check.isTrue("anonymous still sees both", after.contains("search_hidden"))
+}

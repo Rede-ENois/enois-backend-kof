@@ -1,10 +1,14 @@
 package kernel.http
 
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.lang.String
 import java.net.HttpURLConnection
 import java.net.URL
-import java.io.InputStream
 import kernel.files.*
+
+record OutboundReply(Int status, String body)
 
 // A finished outbound GET: status, lower-cased Content-Type ("" when absent) and the body bytes
 // (at most `maxBytes + 1` of them, so a caller detects "too large" without reading the rest).
@@ -21,18 +25,77 @@ class OutboundResponse {
     String text() = new String(body, "UTF-8")
 }
 
-// Status (0 = unreachable) and text body of a call.
-record HttpReply(Int status, String body)
-
 // Result of a HEAD/GET probe: status (0 = unreachable) and the Content-Type header ("" when absent).
-record FetchProbe(Int status, String contentType)
+record OutboundProbe(Int status, String contentType)
 
-// Outbound HTTP for the media workers: a public-URL probe and a size-capped download to a temp file.
-// The caller checks the URL with OutboundUrlGuard first; nothing here follows a redirect on download.
-class HttpFetch {
+// Outgoing HTTP for the integrations (Turnstile, OAuth providers, Gov.br): one blocking call with
+// timeouts, any method and headers, status and body back (kof.http returns only the body, G15).
+// A failure to connect or read (refused, timeout, bad URL) is thrown as exactly "OUTBOUND_FAILED", with no
+// URL, address or header in the message, so callers map it to their own 503 without leaking secrets.
+// Byte-reading GET, probe and size-capped download live here too: this is the only outbound HTTP client.
+// Callers that must be testable wrap this in a small overridable class and stub it: tests never hit the
+// network.
+class Outbound {
+    // headers: "Name: value" lines. body "" sends no payload.
+    static OutboundReply request(method: String, url: String, headers: List<String>, body: String, timeoutMs: Int) {
+        var status = 0
+        var text = ""
+        var failure = ""
+        try {
+            var conn = new URL(url).openConnection() as HttpURLConnection
+            conn.setRequestMethod(method)
+            conn.setConnectTimeout(timeoutMs)
+            conn.setReadTimeout(timeoutMs)
+            conn.setInstanceFollowRedirects(false)
+            for (var h in headers) {
+                var colon = h.indexOf(":")
+                if (colon > 0) {
+                    conn.setRequestProperty(h.substring(0, colon).trim(), h.substring(colon + 1).trim())
+                }
+            }
+            if (body.length() > 0) {
+                conn.setDoOutput(true)
+                var payload = body.getBytes()
+                var out = conn.getOutputStream()
+                out.write(payload, 0, body.getBytes().length)
+                out.flush()
+                out.close()
+            }
+            status = conn.getResponseCode()
+            if (status >= 400) {
+                text = Outbound.readAll(conn.getErrorStream())
+            }
+            else {
+                text = Outbound.readAll(conn.getInputStream())
+            }
+            conn.disconnect()
+        } catch (String e) {
+            failure = "OUTBOUND_FAILED"
+        } catch (IOException e) {
+            failure = "OUTBOUND_FAILED"
+        }
+        if (failure.length() > 0) {
+            throw failure
+        }
+        return OutboundReply(status, text)
+    }
+    static OutboundReply postJson(url: String, headers: List<String>, body: String, timeoutMs: Int) = Outbound.request("POST", url, headers, body, timeoutMs)
+    static OutboundReply postForm(url: String, form: String, timeoutMs: Int) = Outbound.request("POST", url, listOf("Content-Type: application/x-www-form-urlencoded"), form, timeoutMs)
+    static OutboundReply get(url: String, headers: List<String>, timeoutMs: Int) = Outbound.request("GET", url, headers, "", timeoutMs)
+    // Like `request`, but a transport failure answers status 0 and an empty body instead of throwing, for
+    // callers that map "unreachable" to their own outcome.
+    static OutboundReply attempt(method: String, url: String, headers: List<String>, body: String, timeoutMs: Int) {
+        var reply = OutboundReply(0, "")
+        try {
+            reply = Outbound.request(method, url, headers, body, timeoutMs)
+        } catch (String e) {
+            reply = OutboundReply(0, "")
+        }
+        return reply
+    }
     // GET returning status, lower-cased Content-Type and raw bytes (at most `maxBytes + 1`), for adapters that need
-    // what `kof.http` hides (KOF_GAPS G15). Redirects are NOT followed. A network failure throws `OUTBOUND_FAILED: ...`.
-    //   var res = HttpFetch.getBytes("https://cdn.example/x.png", listOf("Accept: image/*"), 4000, 6000, 1048576)
+    // what `kof.http` hides (KOF_GAPS G15). Redirects are NOT followed. A network failure throws "OUTBOUND_FAILED".
+    //   var res = Outbound.getBytes("https://cdn.example/x.png", listOf("Accept: image/*"), 4000, 6000, 1048576)
     static OutboundResponse getBytes(url: String, headers: List<String>, connectTimeoutMs: Int, readTimeoutMs: Int, maxBytes: Int) {
         var failure = ""
         var out = OutboundResponse(0, "", new Byte[0])
@@ -44,7 +107,9 @@ class HttpFetch {
             conn.setReadTimeout(readTimeoutMs)
             for (var h in headers) {
                 var colon = h.indexOf(":")
-                conn.setRequestProperty(h.substring(0, colon).trim(), h.substring(colon + 1).trim())
+                if (colon > 0) {
+                    conn.setRequestProperty(h.substring(0, colon).trim(), h.substring(colon + 1).trim())
+                }
             }
             var status = conn.getResponseCode()
             var type = conn.getContentType()
@@ -68,60 +133,25 @@ class HttpFetch {
             conn.disconnect()
             out = OutboundResponse(status, kind, bytes)
         } catch (IOException e) {
-            failure = "OUTBOUND_FAILED: " + e.getMessage()
+            failure = "OUTBOUND_FAILED"
         } catch (String e) {
-            failure = "OUTBOUND_FAILED: " + e
+            failure = "OUTBOUND_FAILED"
         }
         if (failure.length() > 0) {
             throw failure
         }
         return out
     }
-    // POST and friends: see `send` (status 0 = unreachable).
-    // A request with text body and "Name: value" headers; the reply body is read for any status.
-    static HttpReply send(method: String, url: String, headers: List<String>, body: String?, timeoutMs: Int) {
-        try {
-            var connection = new URL(url).openConnection() as HttpURLConnection
-            connection.setRequestMethod(method)
-            connection.setConnectTimeout(5000)
-            connection.setReadTimeout(timeoutMs)
-            for (var h in headers) {
-                var colon = h.indexOf(":")
-                connection.setRequestProperty(h.substring(0, colon).trim(), h.substring(colon + 1).trim())
-            }
-            if (body != null) {
-                var payload = body.getBytes()
-                connection.setDoOutput(true)
-                connection.setFixedLengthStreamingMode(payload.length)
-                var out = connection.getOutputStream()
-                out.write(payload, 0, payload.length)
-                out.close()
-            }
-            var status = connection.getResponseCode()
-            InputStream? stream = connection.getErrorStream() as InputStream
-            if (status < 400) {
-                stream = connection.getInputStream() as InputStream
-            }
-            var text = ""
-            if (stream != null) {
-                var bytes = stream.readAllBytes()
-                text = new String(bytes as Byte[], "UTF-8")
-            }
-            return HttpReply(status, text)
-        } catch (IOException e) {
-            return HttpReply(0, "")
-        }
-    }
     // HEAD, and a one-byte ranged GET when the server answers 405. Redirects are followed (a CDN may
-    // redirect to its edge).
-    static FetchProbe probe(url: String, timeoutMs: Int) {
-        var first = HttpFetch.probeOnce(url, "HEAD", timeoutMs)
+    // redirect to its edge). Status 0 = unreachable.
+    static OutboundProbe probe(url: String, timeoutMs: Int) {
+        var first = Outbound.probeOnce(url, "HEAD", timeoutMs)
         if (first.status() == 405) {
-            return HttpFetch.probeOnce(url, "GET", timeoutMs)
+            return Outbound.probeOnce(url, "GET", timeoutMs)
         }
         return first
     }
-    static FetchProbe probeOnce(url: String, method: String, timeoutMs: Int) {
+    static OutboundProbe probeOnce(url: String, method: String, timeoutMs: Int) {
         try {
             var connection = new URL(url).openConnection() as HttpURLConnection
             connection.setRequestMethod(method)
@@ -136,9 +166,9 @@ class HttpFetch {
             if (type == null) {
                 type = ""
             }
-            return FetchProbe(status, type)
+            return OutboundProbe(status, type)
         } catch (IOException e) {
-            return FetchProbe(0, "")
+            return OutboundProbe(0, "")
         }
     }
     // Downloads `url` (200 only, no redirects) into a new temp file and returns its path. Throws
@@ -183,5 +213,13 @@ class HttpFetch {
             throw "download falhou: " + failure
         }
         return path
+    }
+    static String readAll(s: InputStream?) {
+        if (s == null) {
+            return ""
+        }
+        var bytes = s.readAllBytes()
+        s.close()
+        return new String(bytes, "UTF-8")
     }
 }

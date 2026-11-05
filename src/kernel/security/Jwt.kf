@@ -1,0 +1,193 @@
+package kernel.security
+
+import java.lang.String
+import java.math.BigInteger
+import java.security.KeyFactory
+import java.security.KeyPairGenerator
+import java.security.Signature
+import java.security.interfaces.RSAPublicKey
+import java.security.spec.PKCS8EncodedKeySpec
+import java.security.spec.RSAPublicKeySpec
+import java.security.spec.X509EncodedKeySpec
+import java.util.Base64
+import kernel.testkit.*
+
+// Compact JWS (RFC 7515) for the OAuth providers: RS256 verification against a JWKS document and
+// RS256 / ES256 signing (Apple's client_secret is an ES256 JWT; tests sign provider tokens with RS256).
+// Plain java.security, no third-party jars: the claims are read as text by the callers (Jwt.claim).
+// Never decodes an unsigned or `none` token: verify() demands the RS256 header and a matching key.
+class Jwt {
+    // The JWS segment as text, "" when the token does not have three parts.
+    static String segment(token: String, index: Int) {
+        var parts = token.split("\\.", -1)
+        if (parts.length != 3) {
+            return ""
+        }
+        return parts[index]
+    }
+    static String text(value: String?) {
+        if (value == null) {
+            return ""
+        }
+        return value
+    }
+    static Bool looksLikeJwt(value: String) {
+        var dots = 0
+        var i = 0
+        while (i < value.length()) {
+            if (value.substring(i, i + 1) == ".") {
+                dots = dots + 1
+            }
+            i = i + 1
+        }
+        return dots == 2
+    }
+    // The text of segment 0 (header) or 1 (payload); null when it is not valid base64url.
+    static String? decodeSegment(token: String, index: Int) {
+        var s = Jwt.segment(token, index)
+        if (s.length() == 0) {
+            return null
+        }
+        return Tokens.base64UrlDecode(s)
+    }
+    // Verifies an RS256 token against the JWKS and returns its payload JSON, or null when anything
+    // is off (shape, algorithm, unknown key, bad signature). Time, issuer and audience checks are the caller's.
+    static String? verifyRs256(token: String, jwks: String) {
+        var header = Jwt.decodeSegment(token, 0)
+        var payload = Jwt.decodeSegment(token, 1)
+        if (header == null) {
+            return null
+        }
+        if (payload == null) {
+            return null
+        }
+        if (Jwt.text(JsonPath.str(header, "alg")) != "RS256") {
+            return null
+        }
+        var kid = Jwt.text(JsonPath.str(header, "kid"))
+        var n = ""
+        var e = ""
+        var found = false
+        var count = JsonPath.size(jwks, "keys")
+        var i = 0
+        while (i < count) {
+            var base = "keys." + i
+            var kty = Jwt.text(JsonPath.str(jwks, base + ".kty"))
+            var keyId = Jwt.text(JsonPath.str(jwks, base + ".kid"))
+            var keyN = Jwt.text(JsonPath.str(jwks, base + ".n"))
+            var keyE = Jwt.text(JsonPath.str(jwks, base + ".e"))
+            var sameKey = kid.length() == 0 || kid == keyId
+            if (!found && kty == "RSA" && sameKey && keyN.length() > 0 && keyE.length() > 0) {
+                n = keyN
+                e = keyE
+                found = true
+            }
+            i = i + 1
+        }
+        if (!found) {
+            return null
+        }
+        var ok = false
+        try {
+            var nBytes = Base64.getUrlDecoder().decode(n) as Byte[]
+            var eBytes = Base64.getUrlDecoder().decode(e) as Byte[]
+            var spec = new RSAPublicKeySpec(new BigInteger(1, nBytes), new BigInteger(1, eBytes))
+            var key = KeyFactory.getInstance("RSA").generatePublic(spec)
+            var sig = Signature.getInstance("SHA256withRSA")
+            sig.initVerify(key)
+            var signed = Jwt.segment(token, 0) + "." + Jwt.segment(token, 1)
+            var signedBytes = signed.getBytes() as Byte[]
+            sig.update(signedBytes, 0, signed.length())
+            var sigBytes = Base64.getUrlDecoder().decode(Jwt.segment(token, 2)) as Byte[]
+            ok = sig.verify(sigBytes)
+        } catch (String err) {
+            ok = false
+        }
+        if (!ok) {
+            return null
+        }
+        return payload
+    }
+    // PKCS#8 private key from a PEM (literal "\n" from env vars are real line breaks) or bare base64.
+    static String pemBody(pem: String) {
+        var text = pem.replace("\\n", "\n").trim()
+        var out = ""
+        for (var line in text.split("\n")) {
+            var l = line.trim()
+            if (l.length() > 0 && !l.startsWith("-----")) {
+                out = out + l
+            }
+        }
+        return out
+    }
+    // Signs header.payload (alg RS256 or ES256) with a PKCS#8 key; ES256 is the raw R||S form JWS wants.
+    static String sign(alg: String, pkcs8: String, header: String, payload: String) {
+        var input = Tokens.base64UrlEncode(header) + "." + Tokens.base64UrlEncode(payload)
+        var inputBytes = input.getBytes() as Byte[]
+        var keyBytes = Base64.getDecoder().decode(Jwt.pemBody(pkcs8)) as Byte[]
+        var spec = new PKCS8EncodedKeySpec(keyBytes)
+        var signature = ""
+        if (alg == "RS256") {
+            var key = KeyFactory.getInstance("RSA").generatePrivate(spec)
+            var sig = Signature.getInstance("SHA256withRSA")
+            sig.initSign(key)
+            sig.update(inputBytes, 0, input.length())
+            var raw = sig.sign() as Byte[]
+            signature = Base64.getUrlEncoder().encodeToString(raw).replace("=", "")
+        }
+        else {
+            var key = KeyFactory.getInstance("EC").generatePrivate(spec)
+            var sig = Signature.getInstance("SHA256withECDSAinP1363Format")
+            sig.initSign(key)
+            sig.update(inputBytes, 0, input.length())
+            var raw = sig.sign() as Byte[]
+            signature = Base64.getUrlEncoder().encodeToString(raw).replace("=", "")
+        }
+        return input + "." + signature
+    }
+    // Test support: a fresh RSA-2048 key pair as (JWKS document, base64 PKCS#8 private key).
+    static JwtKeyPair newRsaPair(kid: String) {
+        var gen = KeyPairGenerator.getInstance("RSA")
+        gen.initialize(2048)
+        var pair = gen.generateKeyPair()
+        var pub = pair.getPublic() as RSAPublicKey
+        var nRaw = pub.getModulus().toByteArray() as Byte[]
+        var eRaw = pub.getPublicExponent().toByteArray() as Byte[]
+        var n = Base64.getUrlEncoder().encodeToString(nRaw).replace("=", "")
+        var e = Base64.getUrlEncoder().encodeToString(eRaw).replace("=", "")
+        var jwks = "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"" + kid + "\",\"alg\":\"RS256\",\"use\":\"sig\",\"n\":\"" + n + "\",\"e\":\"" + e + "\"}]}"
+        var privRaw = pair.getPrivate().getEncoded() as Byte[]
+        var priv = Base64.getEncoder().encodeToString(privRaw)
+        return JwtKeyPair(jwks, priv)
+    }
+    // Test support: a fresh P-256 key as base64 PKCS#8 plus the base64 X.509 public key.
+    static JwtKeyPair newEcPair() {
+        var gen = KeyPairGenerator.getInstance("EC")
+        gen.initialize(256)
+        var pair = gen.generateKeyPair()
+        var pubRaw = pair.getPublic().getEncoded() as Byte[]
+        var privRaw = pair.getPrivate().getEncoded() as Byte[]
+        return JwtKeyPair(Base64.getEncoder().encodeToString(pubRaw), Base64.getEncoder().encodeToString(privRaw))
+    }
+    // Verifies an ES256 token with a base64 X.509 public key (tests of the Apple client_secret).
+    static Bool verifyEs256(token: String, publicKeyBase64: String) {
+        var ok = false
+        try {
+            var pubBytes = Base64.getDecoder().decode(publicKeyBase64) as Byte[]
+            var key = KeyFactory.getInstance("EC").generatePublic(new X509EncodedKeySpec(pubBytes))
+            var sig = Signature.getInstance("SHA256withECDSAinP1363Format")
+            sig.initVerify(key)
+            var signed = Jwt.segment(token, 0) + "." + Jwt.segment(token, 1)
+            var signedBytes = signed.getBytes() as Byte[]
+            sig.update(signedBytes, 0, signed.length())
+            var sigBytes = Base64.getUrlDecoder().decode(Jwt.segment(token, 2)) as Byte[]
+            ok = sig.verify(sigBytes)
+        } catch (String err) {
+            ok = false
+        }
+        return ok
+    }
+}
+
+// publicPart: the JWKS (RSA) or the base64 public key (EC); privatePart: base64 PKCS#8.
+record JwtKeyPair(String publicPart, String privatePart)

@@ -1,0 +1,47 @@
+package identity
+
+import kernel.db.*
+
+// oauth_authorization_requests (state, nonce, expiry, optional account to link) and user_external_identities.
+class IdentityOAuthStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    saveRequest(r: IdentityOAuthRequest) {
+        store.execute("insert into oauth_authorization_requests (state, provider, nonce, user_id, expires_at, created_at) values (?, ?, ?, ?, ?, ?)", DbParams().bindStr(r.state()).bindStr(r.provider()).bindStr(r.nonce()).bindStrOrNull(r.userId()).bindInstant(r.expiresAt()).bindInstant(r.createdAt()))
+    }
+    IdentityOAuthRequest? findRequest(state: String) {
+        var r = store.queryOptional("select state, provider, nonce, user_id, expires_at, created_at from oauth_authorization_requests where state = ?", DbParams().bindStr(state))
+        if (r == null) {
+            return null
+        }
+        return IdentityOAuthRequest(r.getStr("state"), r.getStr("provider"), r.getStr("nonce"), r.getStrOrNull("user_id"), r.getInstant("expires_at"), r.getInstant("created_at"))
+    }
+    deleteRequest(state: String) {
+        store.execute("delete from oauth_authorization_requests where state = ?", DbParams().bindStr(state))
+    }
+    deleteExpired(now: String) {
+        store.execute("delete from oauth_authorization_requests where expires_at < ?", DbParams().bindInstant(now))
+    }
+    String? userIdByExternal(provider: String, externalUserId: String) {
+        var r = store.queryOptional("select user_id from user_external_identities where provider = ? and external_user_id = ?", DbParams().bindStr(provider).bindStr(externalUserId))
+        if (r == null) {
+            return null
+        }
+        return r.getStr("user_id")
+    }
+    saveIdentity(userId: String, provider: String, externalUserId: String, email: String, now: String) {
+        store.execute("insert into user_external_identities (user_id, provider, external_user_id, email, created_at) values (?, ?, ?, ?, ?)", DbParams().bindStr(userId).bindStr(provider).bindStr(externalUserId).bindStr(email).bindInstant(now))
+    }
+    List<IdentityLinkedIdentity> identitiesOf(userId: String) {
+        var out = listOf<IdentityLinkedIdentity>()
+        for (var r in store.queryList("select provider, email, created_at from user_external_identities where user_id = ? order by created_at, id", DbParams().bindStr(userId))) {
+            out.add(IdentityLinkedIdentity(r.getStr("provider"), r.getStrOrNull("email"), r.getInstantOrNull("created_at")))
+        }
+        return out
+    }
+    deleteIdentity(userId: String, provider: String) {
+        store.execute("delete from user_external_identities where user_id = ? and provider = ?", DbParams().bindStr(userId).bindStr(provider))
+    }
+}

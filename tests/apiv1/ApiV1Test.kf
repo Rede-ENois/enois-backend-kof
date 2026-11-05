@@ -1,0 +1,229 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import leaves.*
+
+// Port of DeveloperOriginTests (registration, admin and the end-to-end effect on the origin gate) and
+// V1ApiAliasTests. The gate-only tests of the Java origins package (OptionsAlwaysAllowedTests, AdminPreflightTests,
+// OriginAbuseGuardTests and the gate half of DeveloperOriginTests) are ported in tests/security/OriginTest, where the
+// kernel's gate lives; here the origins are registered through the real endpoints and the gate runs enforced.
+class ApiV1Holder {
+    static TestApp? app = null
+}
+
+TestApp originsApp() {
+    var cur = ApiV1Holder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = LeavesApp.boot("apiv1", mapOf("REDE_ORIGINS_ENFORCE", "true", "REDE_ORIGINS_MAX_FAILURES", "3", "REDE_ORIGINS_WINDOW_SECONDS", "60"))
+    ApiV1Holder.app = created
+    return created
+}
+
+String orEmpty(v: String?) {
+    if (v == null) {
+        return ""
+    }
+    return v
+}
+
+List<String> asApp(token: String) = listOf("X-Session-Token: " + token, "X-Client-Origin: https://enois.ia.br", "Content-Type: application/json")
+
+List<String> appOnly() = listOf("X-Client-Origin: https://enois.ia.br")
+
+String originUser(app: TestApp, id: String, admin: Bool) {
+    var token = "tok-" + id + "-1234567890"
+    if (app.db().queryLong("select count(*) from users where id = ?", DbParams().bindStr(id)) == 0L) {
+        SecurityFixtures.login(app.db(), id, token)
+        if (admin) {
+            app.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr(id))
+        }
+    }
+    return token
+}
+
+String register(app: TestApp, token: String, origin: String) {
+    var res = app.client.send("POST", "/developers/origins", asApp(token), "", "{\"origin\":" + json.encode(origin) + "}")
+    Check.status(res, 201)
+    return orEmpty(res.jsonStr("id"))
+}
+
+test "registration validates and normalizes the origin" {
+    var app = originsApp()
+    var token = originUser(app, "origin_cors_user", false)
+    var http = app.client.send("POST", "/developers/origins", asApp(token), "", "{\"origin\":\"http://app.example\"}")
+    Check.apiError(http, 400, "INVALID_ORIGIN")
+    Check.jsonEq(http, "message", "A origem precisa ser https (http so para localhost).")
+    Check.jsonEq(app.client.send("POST", "/developers/origins", asApp(token), "", "{}"), "message", "Informe a origem do seu app.")
+    Check.apiError(app.client.send("POST", "/developers/origins", asApp(token), "", "{\"origin\":\"*\"}"), 400, "INVALID_ORIGIN")
+    Check.jsonEq(app.client.send("POST", "/developers/origins", asApp(token), "", "{\"origin\":\"https://app.example/caminho\"}"), "message", "A origem nao pode ter caminho; use so o dominio.")
+    Check.apiError(app.client.send("POST", "/developers/origins", asApp(token), "", "{\"origin\":\"https://user@app.example\"}"), 400, "INVALID_ORIGIN")
+    Check.apiError(app.client.send("POST", "/developers/origins", asApp(token), "", "{\"origin\":\"https://app.example?x=1\"}"), 400, "INVALID_ORIGIN")
+
+    var created = app.client.send("POST", "/developers/origins", asApp(token), "", "{\"origin\":\"https://App.Example/\"}")
+    Check.status(created, 201)
+    Check.jsonEq(created, "origin", "https://app.example")
+    Check.jsonEq(created, "blocked", "false")
+    Check.isTrue("id prefix", orEmpty(created.jsonStr("id")).startsWith("origin_"))
+    Check.isTrue("blockedReason is null", created.jsonIsNull("blockedReason"))
+    // localhost may use http and keeps its port.
+    Check.jsonEq(app.client.send("POST", "/developers/origins", asApp(token), "", "{\"origin\":\"http://localhost:3000\"}"), "origin", "http://localhost:3000")
+
+    var duplicate = app.client.send("POST", "/developers/origins", asApp(token), "", "{\"origin\":\"https://app.example\"}")
+    Check.apiError(duplicate, 409, "ORIGIN_ALREADY_REGISTERED")
+    Check.jsonEq(duplicate, "message", "Esta origem ja esta cadastrada.")
+    Check.status(app.client.send("POST", "/developers/origins", asApp(token), "", "not json"), 400)
+}
+
+test "an account holds at most five origins and only the owner removes one" {
+    var app = originsApp()
+    var token = originUser(app, "origin_limit_user", false)
+    var other = originUser(app, "origin_limit_other", false)
+    var first = register(app, token, "https://um.example")
+    register(app, token, "https://dois.example")
+    register(app, token, "https://tres.example")
+    register(app, token, "https://quatro.example")
+    register(app, token, "https://cinco.example")
+    var sixth = app.client.send("POST", "/developers/origins", asApp(token), "", "{\"origin\":\"https://seis.example\"}")
+    Check.apiError(sixth, 400, "TOO_MANY_ORIGINS")
+    Check.jsonEq(sixth, "message", "Voce pode cadastrar no maximo 5 origens.")
+    Check.eqInt("listed", 5, app.client.getWith("/developers/origins", asApp(token)).jsonSize(""))
+    Check.eqInt("another account sees none", 0, app.client.getWith("/developers/origins", asApp(other)).jsonSize(""))
+
+    Check.apiError(app.client.send("DELETE", "/developers/origins/" + first, asApp(other), "", ""), 404, "ORIGIN_NOT_FOUND")
+    var removed = app.client.send("DELETE", "/developers/origins/" + first, asApp(token), "", "")
+    Check.status(removed, 200)
+    Check.eqStr("empty body", "", removed.body)
+    Check.apiError(app.client.send("DELETE", "/developers/origins/" + first, asApp(token), "", ""), 404, "ORIGIN_NOT_FOUND")
+    Check.status(app.client.send("GET", "/developers/origins", listOf("X-Client-Origin: https://enois.ia.br"), "", ""), 401)
+}
+
+test "a registered origin gets CORS and the gate follows every change at once" {
+    var app = originsApp()
+    var token = originUser(app, "origin_gate_user", false)
+    var id = register(app, token, "https://gate.example")
+    var allowed = app.client.getWith("/v1", listOf("Origin: https://gate.example"))
+    Check.status(allowed, 200)
+    Check.eqStr("cors", "https://gate.example", orEmpty(allowed.headerOf("Access-Control-Allow-Origin")))
+    Check.status(app.client.getWith("/v1", listOf("X-Client-Origin: https://gate.example")), 200)
+    Check.filterError(app.client.getWith("/v1", listOf("Origin: https://evil.example")), 403, "ORIGIN_NOT_ALLOWED")
+    Check.filterError(app.client.get("/v1"), 403, "ORIGIN_REQUIRED")
+    // Removing the registration closes the gate immediately (the cache was invalidated).
+    Check.status(app.client.send("DELETE", "/developers/origins/" + id, asApp(token), "", ""), 200)
+    Check.filterError(app.client.getWith("/v1", listOf("Origin: https://gate.example")), 403, "ORIGIN_NOT_ALLOWED")
+}
+
+test "admin can block and unblock an origin" {
+    var app = originsApp()
+    var owner = originUser(app, "origin_admin_target", false)
+    var admin = originUser(app, "group-admin", true)
+    var id = register(app, owner, "https://manual.example")
+
+    Check.apiError(app.client.send("POST", "/admin/developers/origins/" + id + "/block", asApp(owner), "", "{\"reason\":\"x\"}"), 403, "FORBIDDEN")
+    var blocked = app.client.send("POST", "/admin/developers/origins/" + id + "/block", asApp(admin), "", "{\"reason\":\"teste de bloqueio manual\"}")
+    Check.status(blocked, 200)
+    Check.jsonEq(blocked, "blocked", "true")
+    Check.jsonEq(blocked, "blockedReason", "teste de bloqueio manual")
+    Check.jsonEq(blocked, "userId", "origin_admin_target")
+    Check.filterError(app.client.getWith("/v1", listOf("Origin: https://manual.example")), 403, "ORIGIN_BLOCKED")
+    // Blocking twice: no active origin left to block.
+    Check.apiError(app.client.send("POST", "/admin/developers/origins/" + id + "/block", asApp(admin), "", "{}"), 404, "ORIGIN_NOT_FOUND")
+
+    var unblocked = app.client.send("POST", "/admin/developers/origins/" + id + "/unblock", asApp(admin), "", "")
+    Check.status(unblocked, 200)
+    Check.jsonEq(unblocked, "blocked", "false")
+    Check.status(app.client.getWith("/v1", listOf("Origin: https://manual.example")), 200)
+    Check.apiError(app.client.send("POST", "/admin/developers/origins/" + id + "/unblock", asApp(admin), "", ""), 404, "ORIGIN_NOT_BLOCKED")
+    Check.apiError(app.client.send("POST", "/admin/developers/origins/origin_nope/block", asApp(admin), "", ""), 404, "ORIGIN_NOT_FOUND")
+
+    // A body-less block records the default reason.
+    var again = app.client.send("POST", "/admin/developers/origins/" + id + "/block", asApp(admin), "", "")
+    Check.jsonEq(again, "blockedReason", "Bloqueio manual da administracao")
+    var listing = app.client.getWith("/admin/developers/origins?limit=500", asApp(admin))
+    Check.status(listing, 200)
+    Check.isTrue("admin listing carries the origin and strikes", listing.body.contains("\"strikes\":") && listing.body.contains("https://manual.example"))
+    Check.apiError(app.client.getWith("/admin/developers/origins", asApp(owner)), 403, "FORBIDDEN")
+}
+
+test "a suspicious origin is blocked automatically and shows blocked to its owner" {
+    var app = originsApp()
+    var token = originUser(app, "origin_abuse_user", false)
+    register(app, token, "https://abuso.example")
+    var i = 0
+    while (i < 3) {
+        var refused = app.client.getWith("/developers/origins", listOf("Origin: https://abuso.example"))
+        Check.isTrue("refused", refused.status >= 400 && refused.status < 500)
+        i = i + 1
+    }
+    Check.filterError(app.client.getWith("/v1", listOf("Origin: https://abuso.example")), 403, "ORIGIN_BLOCKED")
+    var mine = app.client.getWith("/developers/origins", asApp(token))
+    Check.status(mine, 200)
+    Check.jsonEq(mine, "0.blocked", "true")
+}
+
+test "the version index lists the real router and says there is no OpenAPI document" {
+    var app = originsApp()
+    var index = app.client.getWith("/v1", appOnly())
+    Check.status(index, 200)
+    Check.jsonEq(index, "version", "v1")
+    Check.jsonEq(index, "base", "/v1")
+    Check.isTrue("lists a real route", index.body.contains("{\"method\":\"GET\",\"path\":\"/stats/community\"}"))
+    Check.isTrue("path params in braces", index.body.contains("\"path\":\"/blogs/{slug}/feed.xml\""))
+    Check.isTrue("aliases not repeated", !index.body.contains("\"path\":\"/v1/"))
+    Check.isTrue("index itself not listed", !index.body.contains("\"path\":\"/v1\""))
+    var note = orEmpty(index.jsonStr("note"))
+    Check.isTrue("note says no OpenAPI", note.contains("nao publica documento OpenAPI"))
+    Check.isTrue("note points to /developers", note.contains("/developers"))
+    // The decision is locked: /openapi.json answers like any unknown path, 200 with an empty body.
+    var openapi = app.client.getWith("/openapi.json", appOnly())
+    Check.status(openapi, 200)
+    Check.eqStr("empty", "", openapi.body)
+}
+
+test "the alias answers exactly like the unversioned path" {
+    var app = originsApp()
+    var plain = app.client.getWith("/stats/community", appOnly())
+    var versioned = app.client.getWith("/v1/stats/community", appOnly())
+    Check.eqInt("same status", plain.status, versioned.status)
+    Check.eqStr("same body", plain.body, versioned.body)
+
+    var token = originUser(app, "v1-alias-leitura", false)
+    var mine = app.client.getWith("/me/projects", asApp(token))
+    var mineV1 = app.client.getWith("/v1/me/projects", asApp(token))
+    Check.eqInt("same status authenticated", mine.status, mineV1.status)
+    Check.eqStr("same body authenticated", mine.body, mineV1.body)
+
+    var missing = app.client.getWith("/temas/galeria/tema-que-nao-existe", appOnly())
+    var missingV1 = app.client.getWith("/v1/temas/galeria/tema-que-nao-existe", appOnly())
+    Check.eqInt("same error status", missing.status, missingV1.status)
+    Check.eqStr("same error code", orEmpty(missing.jsonStr("code")), orEmpty(missingV1.jsonStr("code")))
+    Check.eqStr("same error message", orEmpty(missing.jsonStr("message")), orEmpty(missingV1.jsonStr("message")))
+    Check.isTrue("error has a timestamp", missingV1.jsonHas("timestamp"))
+}
+
+test "writes through the alias keep the shape and an anonymous write is still refused" {
+    var app = originsApp()
+    var token = originUser(app, "v1-alias-escrita", false)
+    var payload = "{\"title\":\"Projeto alias\",\"stack\":[\"Kof\"],\"repoUrl\":\"https://github.com/eu/projeto\",\"status\":\"em andamento\",\"diary\":[],\"html\":null}"
+    var plain = app.client.send("POST", "/me/projects", asApp(token), "", payload)
+    var versioned = app.client.send("POST", "/v1/me/projects", asApp(token), "", payload)
+    Check.status(plain, 201)
+    Check.status(versioned, 201)
+    Check.eqInt("same fields", plain.jsonSize(""), versioned.jsonSize(""))
+    Check.apiError(app.client.send("POST", "/v1/me/projects", listOf("X-Client-Origin: https://enois.ia.br", "Content-Type: application/json"), "", payload), 401, "UNAUTHENTICATED")
+}
+
+test "unknown paths answer 200 empty under the alias and a named version is not a version" {
+    var app = originsApp()
+    var plain = app.client.getWith("/nao-existe-mesmo", appOnly())
+    var versioned = app.client.getWith("/v1/nao-existe-mesmo", appOnly())
+    Check.status(plain, 200)
+    Check.status(versioned, 200)
+    Check.eqStr("same empty body", plain.body, versioned.body)
+    var named = app.client.getWith("/v1x/stats/community", appOnly())
+    Check.status(named, 200)
+    Check.eqStr("no data for /v1x", "", named.body)
+    Check.status(app.client.getWith("/stats/community", appOnly()), 200)
+}

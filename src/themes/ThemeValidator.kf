@@ -1,0 +1,125 @@
+package themes
+
+import kernel.error.*
+import kernel.text.*
+
+// Validation of a theme package: the palette carries exactly the known keys, colours are 6-digit hex, the
+// gradient has the allowed shape, and the text colours reach 4.5:1 against every surface they appear on (the
+// same calculation as the contrast auditor of the front end, here at the door). The key contract lives in
+// the front end (`theme-collection-palette-spec.ts`): the required keys have no safe derivation and the
+// optional ones go into hexToRgb() unguarded, so a colour outside the format does not degrade a theme, it
+// breaks the whole application.
+class ThemeValidator {
+    static String hex() = "#[0-9a-fA-F]{6}"
+    static List<String> paletteKeys() = listOf("background", "surface", "muted", "border", "input", "primary", "onPrimary", "soft", "secondary", "onSecondary", "accent", "onAccent", "ring", "gradient", "radius", "fontSans", "surfaceAlpha", "text")
+    // No safe derivation: the front calls hexToRgb() on them without a guard.
+    static List<String> requiredColors() = listOf("background", "surface", "muted", "border", "primary", "onPrimary")
+    static List<String> optionalColors() = listOf("input", "soft", "secondary", "onSecondary", "accent", "onAccent", "ring")
+    // Valid for the hardcoded themes of the collection, but raw CSS: out of the gallery.
+    static List<String> rawCssKeys() = listOf("shadows", "extra")
+    static String invalid(message: String) = Errors.api(400, "INVALID_THEME_PACKAGE", message)
+    static validate(packageJson: String) {
+        var pkg = ThemeJsonReader.parseObject(packageJson)
+        if (pkg == null) {
+            throw ThemeValidator.invalid("Pacote nao e um JSON valido.")
+        }
+        ThemeValidator.rejectUnknown(pkg, "pacote", listOf("palette"))
+        var palette = ThemeValidator.objectOf(pkg, "palette", "Pacote precisa do objeto palette.")
+        ThemeValidator.rejectUnknown(palette, "palette", ThemeValidator.paletteKeys())
+        for (var field in ThemeValidator.requiredColors()) {
+            ThemeValidator.checkColor(palette, field, field)
+        }
+        for (var field in ThemeValidator.optionalColors()) {
+            if (palette.has(field)) {
+                ThemeValidator.checkColor(palette, field, field)
+            }
+        }
+        if (palette.has("gradient") && !Regexes.matches("linear-gradient\\(\\d+deg, " + ThemeValidator.hex() + ", " + ThemeValidator.hex() + "\\)", palette.valueOf("gradient"))) {
+            throw ThemeValidator.invalid("Gradiente fora do formato permitido.")
+        }
+        if (palette.has("radius") && !Regexes.matches("\\d+(\\.\\d+)?(px|rem)", palette.valueOf("radius"))) {
+            throw ThemeValidator.invalid("Raio deve vir em px ou rem, ex.: 0.875rem.")
+        }
+        if (palette.has("fontSans") && !Regexes.matches("[A-Za-z][A-Za-z0-9 _-]{0,63}", palette.valueOf("fontSans"))) {
+            throw ThemeValidator.invalid("Fonte deve ser uma unica familia, sem virgula, aspas ou ponto e virgula.")
+        }
+        var surfaceAlpha = ThemeValidator.surfaceAlphaOf(palette)
+        var text = ThemeValidator.objectOf(palette, "text", "Pacote precisa do objeto text.")
+        ThemeValidator.rejectUnknown(text, "text", listOf("strong", "subtle", "date"))
+        ThemeValidator.checkColor(text, "strong", "text.strong")
+        ThemeValidator.checkColor(text, "subtle", "text.subtle")
+        ThemeValidator.checkColor(text, "date", "text.date")
+        // The text sits on the background, on the card and on the alternate block, which is also the
+        // --surface-2 of the selected navigation item. Measuring only against the background is what let
+        // themes with unreadable dates and menus through. The date is left out: the front adjusts it to the
+        // real surface (textSafeAccent), so it does not depend on this gate.
+        var background = palette.valueOf("background")
+        var surface = Contrast.over(palette.valueOf("surface"), background, surfaceAlpha)
+        var muted = palette.valueOf("muted")
+        ThemeValidator.requireContrast(text.valueOf("strong"), background, "texto forte com o fundo")
+        ThemeValidator.requireContrast(text.valueOf("strong"), surface, "texto forte com o cartao")
+        ThemeValidator.requireContrast(text.valueOf("strong"), muted, "texto forte com o bloco alternativo")
+        ThemeValidator.requireContrast(text.valueOf("subtle"), background, "texto secundario com o fundo")
+        ThemeValidator.requireContrast(text.valueOf("subtle"), muted, "texto secundario com o bloco alternativo")
+    }
+    // The member `key` as an object, or the refusal `message` when it is absent or of another kind.
+    static ThemeJsonObject objectOf(parent: ThemeJsonObject, key: String, message: String) {
+        var member = parent.find(key)
+        if (member == null) {
+            throw ThemeValidator.invalid(message)
+        }
+        if (member.kind() != "object") {
+            throw ThemeValidator.invalid(message)
+        }
+        var parsed = ThemeJsonReader.parseObject(member.text())
+        if (parsed == null) {
+            throw ThemeValidator.invalid(message)
+        }
+        return parsed
+    }
+    static checkColor(obj: ThemeJsonObject, key: String, field: String) {
+        if (!obj.has(key) || !Regexes.matches(ThemeValidator.hex(), obj.valueOf(key))) {
+            throw ThemeValidator.invalid("Cor invalida em " + field + ".")
+        }
+    }
+    static rejectUnknown(obj: ThemeJsonObject, where: String, allowed: List<String>) {
+        for (var name in obj.keys()) {
+            if (ThemeValidator.rawCssKeys().contains(name)) {
+                throw ThemeValidator.invalid(where + "." + name + " nao e aceito na galeria: CSS cru. Publique so tokens.")
+            }
+            if (!allowed.contains(name)) {
+                // A colour key at the root of the package is the likeliest mistake of whoever publishes by API,
+                // and the front reads only what is inside palette: without the hint the author configured it
+                // and saw the colour not appear with no explanation.
+                var hint = ""
+                if (where == "pacote" && ThemeValidator.paletteKeys().contains(name)) {
+                    hint = " Mova para dentro de palette."
+                }
+                throw ThemeValidator.invalid("Chave desconhecida em " + where + ": " + name + "." + hint)
+            }
+        }
+    }
+    // 0..1 of the opacity of the card surface; absent means opaque.
+    static Double surfaceAlphaOf(palette: ThemeJsonObject) {
+        if (!palette.has("surfaceAlpha")) {
+            return 1.0
+        }
+        var member = palette.find("surfaceAlpha")
+        if (member == null) {
+            return 1.0
+        }
+        if (member.kind() == "number") {
+            var n = member.text().toDouble()
+            if (n >= 0.0 && n <= 100.0) {
+                return n / 100.0
+            }
+        }
+        throw ThemeValidator.invalid("surfaceAlpha deve ser um numero de 0 a 100.")
+    }
+    static requireContrast(foreground: String, background: String, pair: String) {
+        var ratio = Contrast.ratio(foreground, background)
+        if (ratio < 4.5) {
+            throw Errors.api(400, "THEME_CONTRAST_LOW", "O contraste do " + pair + " precisa ser de pelo menos 4.5:1 (medido: " + Contrast.wholePart(ratio) + ":1).")
+        }
+    }
+}

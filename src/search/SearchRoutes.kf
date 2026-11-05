@@ -1,0 +1,33 @@
+package search
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+
+// GET /search?q=&types=users,communities&limit=10. Public: a session, when there is one, only hides the
+// accounts the viewer blocked. The `search` rate limiter (resilience4j in Java) is one global bucket.
+class SearchRoutes {
+    static register(server: HttpServer, service: SearchService, limiters: NamedRateLimiters) {
+        server.get("/search", () -> SearchRoutes.search(service, limiters))
+    }
+    static String search(service: SearchService, limiters: NamedRateLimiters) {
+        var limit = Req.queryInt("limit", 10)
+        var types = SearchRoutes.types()
+        limiters.require("search")
+        var hits = service.search(Req.queryParam("q"), types, limit, Auth.viewerIdOrNull())
+        return json.encode(SearchPage(hits, null))
+    }
+    // Spring's List<String>: repeated parameters add up, each value splits on commas, items are trimmed
+    // and an empty value is no item.
+    static List<String> types() {
+        var out = listOf<String>()
+        for (var value in Req.queryAll("types")) {
+            if (value.length() > 0) {
+                for (var part in value.split(",")) {
+                    out.add(part.trim())
+                }
+            }
+        }
+        return out
+    }
+}

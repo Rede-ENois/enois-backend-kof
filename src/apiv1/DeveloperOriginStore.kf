@@ -1,0 +1,42 @@
+package apiv1
+
+import kernel.db.*
+
+// table developer_origins (shared with the kernel's JdbcOriginDirectory, which reads it for the origin gate).
+class DeveloperOriginStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static DeveloperOriginView view(r: DbRow) = DeveloperOriginView(r.getStr("id"), r.getStr("origin"), r.getInstant("created_at"), r.getBool("blocked"), r.getStrOrNull("blocked_reason"), r.getInstantOrNull("blocked_until"))
+    static DeveloperOriginAdminView adminView(r: DbRow) = DeveloperOriginAdminView(r.getStr("id"), r.getStr("origin"), r.getStr("user_id"), r.getInstant("created_at"), r.getBool("blocked"), r.getStrOrNull("blocked_reason"), r.getInstantOrNull("blocked_until"), r.getInt("strikes"))
+    List<DeveloperOriginView> ofUser(userId: String) {
+        var out = listOf<DeveloperOriginView>()
+        for (var r in store.queryList("select id, origin, created_at, blocked, blocked_reason, blocked_until from developer_origins where user_id = ? order by created_at desc", DbParams().bindStr(userId))) {
+            out.add(DeveloperOriginStore.view(r))
+        }
+        return out
+    }
+    List<DeveloperOriginAdminView> listAll(limit: Int) {
+        var out = listOf<DeveloperOriginAdminView>()
+        for (var r in store.queryList("select id, origin, user_id, created_at, blocked, blocked_reason, blocked_until, strikes from developer_origins order by blocked desc, created_at desc limit ?", DbParams().bindInt(limit))) {
+            out.add(DeveloperOriginStore.adminView(r))
+        }
+        return out
+    }
+    DeveloperOriginAdminView? byId(id: String) {
+        var r = store.queryOptional("select id, origin, user_id, created_at, blocked, blocked_reason, blocked_until, strikes from developer_origins where id = ?", DbParams().bindStr(id))
+        if (r == null) {
+            return null
+        }
+        return DeveloperOriginStore.adminView(r)
+    }
+    Long countOf(userId: String) = store.queryLong("select count(*) from developer_origins where user_id = ?", DbParams().bindStr(userId))
+    // Throws CONFLICT on the (user_id, origin) unique key.
+    insert(id: String, userId: String, origin: String, createdAt: String) {
+        store.execute("insert into developer_origins (id, user_id, origin, created_at) values (?, ?, ?, ?)", DbParams().bindStr(id).bindStr(userId).bindStr(origin).bindInstant(createdAt))
+    }
+    Int delete(userId: String, id: String) = store.execute("delete from developer_origins where id = ? and user_id = ?", DbParams().bindStr(id).bindStr(userId))
+    Int block(id: String, reason: String, at: String) = store.execute("update developer_origins set blocked = true, blocked_reason = ?, blocked_at = ? where id = ? and blocked = false", DbParams().bindStr(reason).bindInstant(at).bindStr(id))
+    Int unblock(id: String) = store.execute("update developer_origins set blocked = false, blocked_reason = null, blocked_at = null, blocked_until = null where id = ? and blocked = true", DbParams().bindStr(id))
+}

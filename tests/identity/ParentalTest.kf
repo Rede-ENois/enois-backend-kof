@@ -1,0 +1,159 @@
+import age.*
+import identity.*
+import kernel.db.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+
+class ParentalGateHolder {
+    static AgeGate? gate = null
+}
+
+String gatedProbe() {
+    var userId = Auth.requireUser()
+    var g = ParentalGateHolder.gate
+    if (g == null) {
+        throw "gate not wired"
+    }
+    g.requireCanWrite(userId)
+    return "ok"
+}
+
+wireProbes(s: HttpServer) {
+    s.post("/probe/gated", () -> gatedProbe())
+}
+
+IdentityTestApp ctx() {
+    var t = IdentityTestApp.sharedWith("parental", mapOf(), (s: HttpServer) -> wireProbes(s))
+    ParentalGateHolder.gate = t.age.gate
+    return t
+}
+
+// A write guarded by the age gate, standing in for the feed (a domain that is not ported here).
+String gatedWrite(t: IdentityTestApp, token: String) {
+    var res = t.postWithToken("/probe/gated", token, "{}")
+    return "" + res.status + ":" + res.jsonStr("code")
+}
+
+// Creates the account through the real flow (pending signup + confirmation) and returns the session token.
+String createUser(t: IdentityTestApp, name: String, email: String, birthDate: String) {
+    var body = "{\"name\":\"" + name + "\",\"email\":\"" + email + "\",\"password\":\"senha-segura\",\"acceptedTerms\":true,\"birthDate\":\"" + birthDate + "\"}"
+    Check.status(t.postWith("/auth/signup", listOf("Idempotency-Key: parental-signup-" + email), body), 201)
+    var verified = t.post("/auth/email/verify", "{\"token\":\"" + t.mailToken("EMAIL_VERIFICATION", email) + "\"}")
+    Check.status(verified, 200)
+    return verified.cookie("enois_session")
+}
+
+test "minorOnlyWritesAfterAnAdultAcceptsTheInvitation (ParentalSupervisionFlowTests)" {
+    var t = ctx()
+    var minorEmail = "jovem.supervisao@example.com"
+    var guardianEmail = "responsavel.supervisao@example.com"
+    var minorSession = createUser(t, "Jovem Supervisionado", minorEmail, "2012-05-10")
+    var guardianSession = createUser(t, "Responsavel Adulto", guardianEmail, "1988-02-20")
+    // 1. A minor with no guardian: writing is blocked with its own code.
+    Check.eqStr("blocked", "403:PARENTAL_CONSENT_REQUIRED", gatedWrite(t, minorSession))
+    // 2. The minor invites the guardian.
+    var invite = t.postWithToken("/age/parental/invite", minorSession, "{\"email\":\"" + guardianEmail + "\"}")
+    Check.status(invite, 200)
+    Check.jsonEq(invite, "status", "PENDING")
+    Check.jsonEq(invite, "emailSent", "true")
+    var token = t.mailToken("PARENTAL_CONSENT", guardianEmail)
+    Check.isTrue("link token mailed", token.length() > 0)
+    var accept = "{\"token\":\"" + token + "\"}"
+    // 3. The minor cannot accept it either (the accept needs an adult account).
+    Check.apiError(t.postWithToken("/age/parental/accept", minorSession, accept), 403, "GUARDIAN_MUST_BE_ADULT")
+    // 4. The adult accepts.
+    var accepted = t.postWithToken("/age/parental/accept", guardianSession, accept)
+    Check.status(accepted, 200)
+    Check.jsonEq(accepted, "status", "SUPERVISION_ACCEPTED")
+    Check.jsonEq(accepted, "id", token)
+    // 5. The minor now writes.
+    Check.eqStr("allowed", "200:null", gatedWrite(t, minorSession))
+    // 6. The guardian sees only their own supervised profile.
+    var mine = t.getWithToken("/age/parental/mine", guardianSession)
+    Check.status(mine, 200)
+    Check.eqInt("one supervised", 1, mine.jsonSize(""))
+    Check.isTrue("username", mine.json("0.username").length() > 0)
+    Check.eqInt("the minor supervises nobody", 0, t.getWithToken("/age/parental/mine", minorSession).jsonSize(""))
+    // 7. Revoking blocks the writing again.
+    var revoke = t.postWithToken("/age/parental/revoke", guardianSession, "{\"minorUserId\":\"" + t.userId(minorEmail) + "\"}")
+    Check.status(revoke, 200)
+    Check.jsonEq(revoke, "status", "SUPERVISION_REVOKED")
+    Check.eqStr("blocked again", "403:PARENTAL_CONSENT_REQUIRED", gatedWrite(t, minorSession))
+    Check.isTrue("audit trail", t.db().queryLong("select count(*) from age_audit_events where user_id = ?", DbParams().bindStr(t.userId(minorEmail))) >= 3L)
+}
+
+test "adultCannotRevokeSomeoneElsesSupervision (ParentalSupervisionFlowTests)" {
+    var t = ctx()
+    var minorEmail = "jovem.idor@example.com"
+    var guardianEmail = "responsavel.idor@example.com"
+    var minorSession = createUser(t, "Jovem IDOR", minorEmail, "2013-03-03")
+    var guardianSession = createUser(t, "Responsavel IDOR", guardianEmail, "1985-07-07")
+    var strangerSession = createUser(t, "Estranho IDOR", "estranho.idor@example.com", "1990-01-01")
+    Check.status(t.postWithToken("/age/parental/invite", minorSession, "{\"email\":\"" + guardianEmail + "\"}"), 200)
+    var token = t.mailToken("PARENTAL_CONSENT", guardianEmail)
+    Check.status(t.postWithToken("/age/parental/accept", guardianSession, "{\"token\":\"" + token + "\"}"), 200)
+    // Another adult cannot revoke somebody else's link.
+    Check.apiError(t.postWithToken("/age/parental/revoke", strangerSession, "{\"minorUserId\":\"" + t.userId(minorEmail) + "\"}"), 403, "NOT_YOUR_MINOR")
+    Check.eqStr("still supervised", "200:null", gatedWrite(t, minorSession))
+}
+
+test "invite guards: adults, same e-mail, bad e-mail, duplicated and single-use or expired tokens" {
+    var t = ctx()
+    var adult = createUser(t, "Adulto Convite", "adulto.convite@example.com", "1990-01-01")
+    Check.apiError(t.postWithToken("/age/parental/invite", adult, "{\"email\":\"alguem@example.com\"}"), 403, "NOT_A_MINOR")
+    var minor = createUser(t, "Menor Convite", "menor.convite@example.com", "2012-01-01")
+    Check.apiError(t.postWithToken("/age/parental/invite", minor, "{\"email\":\"sem-arroba\"}"), 400, "INVALID_EMAIL")
+    Check.apiError(t.postWithToken("/age/parental/invite", minor, "{\"email\":\"MENOR.convite@example.com\"}"), 400, "SAME_EMAIL")
+    Check.apiError(t.postWithToken("/age/parental/accept", adult, "{}"), 400, "INVALID_TOKEN")
+    Check.apiError(t.postWithToken("/age/parental/accept", adult, "{\"token\":\"nao-existe\"}"), 404, "INVALID_TOKEN")
+    Check.status(t.postWithToken("/age/parental/invite", minor, "{\"email\":\"adulto.convite@example.com\"}"), 200)
+    var first = t.mailToken("PARENTAL_CONSENT", "adulto.convite@example.com")
+    // A new invite closes the pending one: the old link no longer works.
+    Check.status(t.postWithToken("/age/parental/invite", minor, "{\"email\":\"adulto.convite@example.com\"}"), 200)
+    var second = t.mailToken("PARENTAL_CONSENT", "adulto.convite@example.com")
+    Check.isTrue("a new token", first != second)
+    Check.apiError(t.postWithToken("/age/parental/accept", adult, "{\"token\":\"" + first + "\"}"), 409, "TOKEN_ALREADY_USED")
+    t.db().execute("update parental_links set expires_at = ? where token_hash = ?", DbParams().bindInstant("2020-01-01T00:00:00Z").bindStr(Hashes.sha256Hex(second)))
+    Check.apiError(t.postWithToken("/age/parental/accept", adult, "{\"token\":\"" + second + "\"}"), 410, "TOKEN_EXPIRED")
+    // Reject: a fresh invite the adult turns down is single use too.
+    Check.status(t.postWithToken("/age/parental/invite", minor, "{\"email\":\"adulto.convite@example.com\"}"), 200)
+    var third = t.mailToken("PARENTAL_CONSENT", "adulto.convite@example.com")
+    var rejected = t.postWithToken("/age/parental/reject", adult, "{\"token\":\"" + third + "\"}")
+    Check.status(rejected, 200)
+    Check.jsonEq(rejected, "status", "SUPERVISION_REJECTED")
+    Check.apiError(t.postWithToken("/age/parental/accept", adult, "{\"token\":\"" + third + "\"}"), 409, "TOKEN_ALREADY_USED")
+    Check.apiError(t.postWithToken("/age/parental/revoke", adult, "{\"minorUserId\":\"" + t.userId("menor.convite@example.com") + "\"}"), 404, "NO_SUPERVISION")
+}
+
+test "a minor without a birth date and an already supervised minor" {
+    var t = ctx()
+    var nodate = createUser(t, "Sem Data", "sem.data@example.com", "2012-01-01")
+    t.db().execute("update users set birth_date = null where email = ?", DbParams().bindStr("sem.data@example.com"))
+    Check.apiError(t.postWithToken("/age/parental/invite", nodate, "{\"email\":\"alguem@example.com\"}"), 403, "BIRTH_DATE_REQUIRED")
+    Check.eqStr("gate says regularise", "403:BIRTH_DATE_REQUIRED", gatedWrite(t, nodate))
+    var minor = createUser(t, "Menor Duplo", "menor.duplo@example.com", "2012-01-01")
+    var guardian = createUser(t, "Adulto Duplo", "adulto.duplo@example.com", "1980-01-01")
+    Check.status(t.postWithToken("/age/parental/invite", minor, "{\"email\":\"adulto.duplo@example.com\"}"), 200)
+    Check.status(t.postWithToken("/age/parental/accept", guardian, "{\"token\":\"" + t.mailToken("PARENTAL_CONSENT", "adulto.duplo@example.com") + "\"}"), 200)
+    Check.apiError(t.postWithToken("/age/parental/invite", minor, "{\"email\":\"outro@example.com\"}"), 409, "ALREADY_SUPERVISED")
+}
+
+test "the policy reader answers from the declared birth date" {
+    var t = ctx()
+    createUser(t, "Leitor Adulto", "leitor.adulto@example.com", "1990-05-10")
+    createUser(t, "Leitor Menor", "leitor.menor@example.com", "2012-05-10")
+    var adult = t.userId("leitor.adulto@example.com")
+    var minor = t.userId("leitor.menor@example.com")
+    var reader = t.age.policy
+    Check.isTrue("adult declared", reader.birthDateDeclared(adult))
+    Check.isTrue("adult is not a minor", !reader.isMinor(adult))
+    Check.isTrue("minor is a minor", reader.isMinor(minor))
+    Check.isTrue("no consent yet", !reader.parentalConsentActive(minor))
+    Check.eqInt("minorIds", 1, reader.minorIds(listOf(adult, minor, "missing")).size())
+    Check.isTrue("unknown user", !reader.birthDateDeclared("missing") && !reader.isMinor("missing"))
+}
+
+test "zz shutdown" {
+    ctx().stop()
+}

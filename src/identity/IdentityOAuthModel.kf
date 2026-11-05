@@ -1,0 +1,145 @@
+package identity
+
+import kernel.config.*
+import kernel.http.*
+import kernel.log.*
+
+record IdentityOAuthRequest(String state, String provider, String nonce, String? userId, String expiresAt, String createdAt)
+
+// What a provider vouches for after the id_token (or the GitHub user lookup) was checked.
+record IdentityOAuthClaims(String externalUserId, String email, String name, Bool emailVerified, String? accessToken, String? accessTokenExpiresAt, String? scope)
+
+record IdentityOAuthStartBody(String provider, String state, String authorizationUrl)
+
+record IdentityLinkedProviderBody(String provider, String? email, String? linkedAt, Bool hasUsablePassword)
+
+record IdentityOAuthTokenRequest(String? idToken, String? state)
+
+record IdentityLinkedIdentity(String provider, String? email, String? createdAt)
+
+// rede.oauth.*: client ids come from the environment, never from the repository. Property-style keys
+// (REDE_OAUTH_GOOGLE_CLIENT_ID) win over the short ones the Java profiles read (GOOGLE_CLIENT_ID).
+class IdentityOAuthConfig {
+    Config cfg
+    public constructor(cfg: Config) {
+        this.cfg = cfg
+    }
+    String pick(property: String, alias: String, fallback: String) = cfg.getStr(property, cfg.getStr(alias, fallback))
+    // Trailing slashes would double up in the callback and Google answers redirect_uri_mismatch.
+    static String clean(url: String) {
+        var out = url.trim()
+        while (out.endsWith("/")) {
+            out = out.substring(0, out.length() - 1)
+        }
+        return out
+    }
+    String backendCallback(provider: String, fallback: String) {
+        var backend = cfg.getStr("REDE_BACKEND_URL", "")
+        if (backend.trim().length() > 0) {
+            return IdentityOAuthConfig.clean(backend) + "/api/auth/oauth/" + provider + "/callback"
+        }
+        return fallback
+    }
+    String frontendRedirectUrl() {
+        var explicit = cfg.getStr("REDE_OAUTH_FRONTEND_REDIRECT_URL", "")
+        if (explicit.trim().length() > 0) {
+            return explicit.trim()
+        }
+        var frontend = cfg.getStr("REDE_FRONTEND_URL", "")
+        if (frontend.trim().length() > 0) {
+            return IdentityOAuthConfig.clean(frontend) + "/auth/callback"
+        }
+        return ""
+    }
+    String googleClientId() = pick("REDE_OAUTH_GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_ID", "")
+    String googleClientSecret() = pick("REDE_OAUTH_GOOGLE_CLIENT_SECRET", "GOOGLE_CLIENT_SECRET", "")
+    String googleRedirectUri() = IdentityOAuthConfig.clean(pick("REDE_OAUTH_GOOGLE_REDIRECT_URI", "GOOGLE_REDIRECT_URI", backendCallback("google", "https://enois.ia.br/auth/callback?provider=GOOGLE")))
+    String appleClientId() = pick("REDE_OAUTH_APPLE_CLIENT_ID", "APPLE_CLIENT_ID", "")
+    String appleTeamId() = pick("REDE_OAUTH_APPLE_TEAM_ID", "APPLE_TEAM_ID", "")
+    String appleKeyId() = pick("REDE_OAUTH_APPLE_KEY_ID", "APPLE_KEY_ID", "")
+    String applePrivateKey() = pick("REDE_OAUTH_APPLE_PRIVATE_KEY", "APPLE_PRIVATE_KEY", "")
+    String appleRedirectUri() = IdentityOAuthConfig.clean(pick("REDE_OAUTH_APPLE_REDIRECT_URI", "APPLE_REDIRECT_URI", ""))
+    String linkedinClientId() = pick("REDE_OAUTH_LINKEDIN_CLIENT_ID", "LINKEDIN_CLIENT_ID", "77oxnpfdt2gttd")
+    String linkedinClientSecret() = pick("REDE_OAUTH_LINKEDIN_CLIENT_SECRET", "LINKEDIN_CLIENT_SECRET", "")
+    String linkedinRedirectUri() = IdentityOAuthConfig.clean(pick("REDE_OAUTH_LINKEDIN_REDIRECT_URI", "LINKEDIN_REDIRECT_URI", "https://enois.ia.br/auth/callback?provider=LINKEDIN"))
+    String githubClientId() = pick("REDE_OAUTH_GITHUB_CLIENT_ID", "GITHUB_CLIENT_ID", "")
+    String githubClientSecret() = pick("REDE_OAUTH_GITHUB_CLIENT_SECRET", "GITHUB_CLIENT_SECRET", "")
+    String githubRedirectUri() = IdentityOAuthConfig.clean(pick("REDE_OAUTH_GITHUB_REDIRECT_URI", "GITHUB_REDIRECT_URI", ""))
+    String clientId(provider: String) {
+        if (provider == "GOOGLE") {
+            return googleClientId()
+        }
+        if (provider == "APPLE") {
+            return appleClientId()
+        }
+        if (provider == "LINKEDIN") {
+            return linkedinClientId()
+        }
+        return githubClientId()
+    }
+    String redirectUri(provider: String) {
+        if (provider == "GOOGLE") {
+            return googleRedirectUri()
+        }
+        if (provider == "APPLE") {
+            return appleRedirectUri()
+        }
+        if (provider == "LINKEDIN") {
+            return linkedinRedirectUri()
+        }
+        return githubRedirectUri()
+    }
+    Bool configured(provider: String) {
+        var id = clientId(provider)
+        if (id.trim().length() > 0) {
+            return true
+        }
+        return false
+    }
+}
+
+// The wire to the providers (token endpoints, JWKS, GitHub API). A seam: tests replace it with canned answers,
+// so no suite ever touches the network. A transport failure comes back as status 0 (never an exception), which
+// every caller treats like a provider that refused.
+class IdentityOAuthTransport {
+    Log log = Log("identity.oauth.transport")
+    public constructor() {}
+    OutboundReply post(url: String, headers: List<String>, body: String) {
+        var all = listOf("Content-Type: application/x-www-form-urlencoded")
+        for (var h in headers) {
+            all.add(h)
+        }
+        return call("POST", url, all, body)
+    }
+    OutboundReply get(url: String, headers: List<String>) = call("GET", url, headers, "")
+    OutboundReply call(method: String, url: String, headers: List<String>, body: String) {
+        var failure = ""
+        try {
+            return Outbound.request(method, url, headers, body, 10000)
+        } catch (String e) {
+            failure = e
+        }
+        log.warn("oauth_transport_failed")
+        return OutboundReply(0, "")
+    }
+}
+
+// Where an identity that belongs to another domain goes once linked: LinkedIn posting access (linkedin domain)
+// and the GitHub identity and token (contributions domain). pending-port: each default only logs, so linking
+// still works and the owner replaces the method when its domain is ported.
+class IdentityOAuthLinks {
+    Log log = Log("identity.oauth.links")
+    public constructor() {}
+    rememberGithub(userId: String, externalUserId: String, name: String, accessToken: String?, scope: String?) {
+        log.info("github_identity_linked_pending_port")
+    }
+    unlinkGithub(userId: String) {
+        log.info("github_identity_unlinked_pending_port")
+    }
+    rememberLinkedIn(userId: String, externalUserId: String, accessToken: String, expiresAt: String?) {
+        log.info("linkedin_access_pending_port")
+    }
+    removeLinkedIn(userId: String) {
+        log.info("linkedin_access_removed_pending_port")
+    }
+}

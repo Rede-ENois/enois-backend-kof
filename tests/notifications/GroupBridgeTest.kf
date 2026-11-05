@@ -1,0 +1,46 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import groups.*
+import messaging.*
+import notifications.*
+import push.*
+
+class BridgeHolder {
+    static TestApp? cached = null
+    static GroupNotificationsBridge? bridge = null
+    static RecordingPushSender sender = RecordingPushSender()
+}
+
+TestApp bridgeApp() {
+    var cur = BridgeHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = DomainTestKit.boot("groupbridge", mapOf<String, String>(), (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+    var module = NotificationsModule.install(p, s, SecurityHooks(), parts)
+    PushModule.installWith(p, module, PushStore(p.db), BridgeHolder.sender, PushPresence(p.db), true)
+    BridgeHolder.bridge = GroupNotificationsBridge(p.db, module.notifications)
+})
+    BridgeHolder.cached = created
+    return created
+}
+
+test "group notices go through the Notifications API: counted, pushed and listed" {
+    var app = bridgeApp()
+    var token = DomainTestKit.login(app, "gb_reader")
+    DomainTestKit.login(app, "gb_actor")
+    var bridge = BridgeHolder.bridge
+    if (bridge == null) {
+        throw "bridge not wired"
+    }
+    bridge.createCounted("gb_reader", "GROUP_NEW_POST", "group_posts:g1", "gb_actor", "Novo post", "1 nova publicacao", " novas publicacoes", "/api/groups/g1", "Ver")
+    bridge.createCounted("gb_reader", "GROUP_NEW_POST", "group_posts:g1", "gb_actor", "Novo post", "1 nova publicacao", " novas publicacoes", "/api/groups/g1", "Ver")
+    bridge.create("gb_reader", "GROUP_MEMBER_JOINED", "gb_actor", "Entrou", "alguem entrou", "/api/groups/g1", "Ver")
+    var list = MessagingTestKit.get(app, token, "/notifications")
+    Check.status(list, 200)
+    Check.eqInt("notices", 2, list.jsonSize("items"))
+    Check.eqStr("counted body", "2 novas publicacoes", "" + DomainTestKit.itemStr(list, "items", "" + list.jsonStr("items.1.id"), "body"))
+    assert(BridgeHolder.sender.countFor("gb_reader") >= 2)
+}

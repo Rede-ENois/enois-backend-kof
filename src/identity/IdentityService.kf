@@ -1,0 +1,659 @@
+package identity
+
+import kernel.config.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.log.*
+import kernel.sanctions.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+
+// What a login answers: a session, a second-factor challenge, or "the password must be reset first".
+record IdentityLoginResult(String kind, IdentityIssued? session, String? challengeId, String? method, String? expiresAt, String? resetToken)
+
+// Sign up, e-mail confirmation, login, refresh, logout, password reset / change, e-mail change and account
+// deletion (AuthService). Same rules, limits, codes and pt-BR messages as the Java service. Every use case is
+// one transaction, like @Transactional: a thrown error rolls it back.
+class IdentityService {
+    Log log = Log("identity.service")
+    Db store
+    IdentityStore identity
+    IdentityUsers users
+    IdentityMailer mailer
+    IdentityTwoFactor twoFactor
+    SanctionGateReader sanctions
+    IpRateLimiter ipLimiter
+    Long accessTtlSeconds
+    Long refreshTtlSeconds
+    String dummyHash = ""
+    public constructor(cfg: Config, store: Db, identity: IdentityStore, users: IdentityUsers, mailer: IdentityMailer, twoFactor: IdentityTwoFactor, sanctions: SanctionGateReader, ipLimiter: IpRateLimiter) {
+        this.store = store
+        this.identity = identity
+        this.users = users
+        this.mailer = mailer
+        this.twoFactor = twoFactor
+        this.sanctions = sanctions
+        this.ipLimiter = ipLimiter
+        this.accessTtlSeconds = cfg.getLong("AUTH_ACCESS_TOKEN_TTL_MINUTES", 60L) * 60L
+        this.refreshTtlSeconds = cfg.getLong("AUTH_REFRESH_TOKEN_TTL_DAYS", 30L) * 86400L
+    }
+    static Long verificationTtlSeconds() = 86400L
+    static Long resetTtlSeconds() = 86400L
+    static Long resendWindowSeconds() = 3600L
+    static Int resendLimit() = 3
+    // ---- sign up
+    IdentitySignupBody signup(name: String?, role: String, email: String?, password: String?, acceptedTerms: String?, birthDate: String?) {
+        var out = IdentitySignupBody("", true, true)
+        var self = this
+        store.transaction(() -> {
+    out = self.signupTx(name, role, email, password, acceptedTerms, birthDate)
+})
+        return out
+    }
+    IdentitySignupBody signupTx(name: String?, role: String, email: String?, password: String?, acceptedTerms: String?, birthDate: String?) {
+        if (IdentityText.blank(name) || role.trim().length() == 0 || IdentityText.blank(email) || IdentityText.blank(password)) {
+            throw Errors.api(400, "INVALID_SIGNUP", "Nome, cargo, email e senha sao obrigatorios.")
+        }
+        var passwordText = IdentityText.orEmpty(password)
+        Passwords.validateStrength(passwordText)
+        if (!IdentityText.orEmpty(email).contains("@")) {
+            throw Errors.api(400, "INVALID_EMAIL", "Email invalido.")
+        }
+        if (acceptedTerms != "true") {
+            throw Errors.api(400, "TERMS_NOT_ACCEPTED", "E necessario aceitar os termos de uso e confirmar que voce tem 18 anos ou mais.")
+        }
+        var birth = IdentityDates.parseBirthDate(birthDate)
+        var normalized = IdentityText.lower(email)
+        var existing = users.findByEmail(normalized)
+        if (existing == null) {
+            existing = users.findByEmail(IdentityService.canonicalEmail(normalized))
+        }
+        if (existing != null || identity.credentialEmailExists(normalized)) {
+            // Same response as a new signup, so the endpoint does not reveal registered addresses. The
+            // owner gets a notice instead of a verification link; the discarded hash keeps the latency alike.
+            var ignored = Passwords.hash(passwordText)
+            var sent = true
+            if (existing != null) {
+                // Capped per account so repeated signups cannot flood the owner's inbox.
+                if (ipLimiter.tryAcquire(IpRateLimiter.email(), "signup-notice:" + existing.id())) {
+                    sent = mailer.sendSignupAttemptNotice(existing.email(), existing.name())
+                }
+            }
+            log.info("auth_signup_existing_account emailSent=" + sent)
+            return IdentitySignupBody(normalized, true, sent)
+        }
+        var now = Time.nowIso()
+        // Two steps: NOTHING of an account (users/credentials) is born here. The signup waits, with the
+        // password hash, for the e-mail link: a mass signup with invalid addresses pollutes nothing.
+        identity.deleteExpiredPending(now)
+        identity.deletePendingByEmail(normalized)
+        var raw = IdentityService.newVerificationToken()
+        var cleanName = IdentityText.orEmpty(name).trim()
+        // The signup e-mail counts as the first send of the window: two resends are left.
+        identity.savePending(IdentityPending(Ids.prefixed("pending_"), normalized, cleanName, birth, Passwords.hash(passwordText), Hashes.sha256Hex(raw), Time.plusSeconds(now, IdentityService.verificationTtlSeconds()), now, 1, now))
+        var emailSent = mailer.sendVerificationEmail(normalized, cleanName, raw)
+        log.info("auth_signup_pending emailSent=" + emailSent)
+        return IdentitySignupBody(normalized, true, emailSent)
+    }
+    // ---- login
+    IdentityLoginResult login(email: String?, password: String?, ip: String) {
+        var out = IdentityLoginResult("", null, null, null, null, null)
+        var self = this
+        store.transaction(() -> {
+    out = self.loginTx(email, password, ip)
+})
+        return out
+    }
+    IdentityLoginResult loginTx(email: String?, password: String?, ip: String) {
+        if (IdentityText.blank(email) || IdentityText.blank(password)) {
+            throw Errors.api(400, "INVALID_LOGIN", "Email e senha sao obrigatorios.")
+        }
+        var passwordText = IdentityText.orEmpty(password)
+        var normalized = IdentityText.lower(email)
+        var credential = identity.credentialByEmail(normalized)
+        if (credential == null) {
+            // A dummy PBKDF2: without it an unknown e-mail answered in ~33 ms and a known one in ~650 ms,
+            // letting accounts be enumerated by latency. A signup still waiting for its e-mail link answers
+            // EMAIL_NOT_VERIFIED, but only with the right password (else it would reveal pending signups).
+            var pending = identity.pendingByEmail(normalized)
+            var livePending = false
+            var hashToCheck = dummyPasswordHash()
+            if (pending != null) {
+                if (Time.toMillis(pending.expiresAt()) > Time.nowMillis()) {
+                    livePending = true
+                    hashToCheck = pending.passwordHash()
+                }
+            }
+            var matches = Passwords.matches(passwordText, hashToCheck)
+            if (livePending && matches) {
+                log.warn("auth_login_failed reason=email_not_verified")
+                throw Errors.api(403, "EMAIL_NOT_VERIFIED", "Confirme o e-mail que enviamos para ativar a conta.")
+            }
+            log.warn("auth_login_failed reason=unknown_email")
+            throw Errors.api(401, "INVALID_CREDENTIALS", "Email ou senha invalidos.")
+        }
+        if (!Passwords.matches(passwordText, credential.passwordHash())) {
+            log.warn("auth_login_failed reason=invalid_password")
+            throw Errors.api(401, "INVALID_CREDENTIALS", "Email ou senha invalidos.")
+        }
+        if (credential.resetNeeded()) {
+            log.info("auth_login_reset_needed")
+            var raw = IdentityService.newResetToken()
+            var now = Time.nowIso()
+            identity.deleteResetsByUser(credential.userId())
+            identity.saveReset(Hashes.sha256Hex(raw), credential.userId(), Time.plusSeconds(now, IdentityService.resetTtlSeconds()), now)
+            return IdentityLoginResult("PASSWORD_EXPIRED", null, null, null, null, raw)
+        }
+        var profile = users.findById(credential.userId())
+        if (profile == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        requireVerifiedIdentity(profile)
+        // A ban (appeal denied) stops even the login: the account issues no new session.
+        if (sanctions.banned(profile.id())) {
+            log.warn("auth_login_blocked reason=account_banned")
+            throw Errors.api(403, "ACCOUNT_BANNED", "Esta conta foi banida apos revisao do recurso. Fale com o suporte se precisar.")
+        }
+        // The right password is the first step: with a second factor on, a challenge comes out, not a session.
+        var method = twoFactor.requiredMethod(profile.id())
+        if (method != null) {
+            log.info("auth_login_two_factor_required method=" + method)
+            var challenge = twoFactor.startChallenge(profile.id(), method)
+            return IdentityLoginResult("TWO_FACTOR", null, challenge.id(), method, challenge.expiresAt(), null)
+        }
+        log.info("auth_login_success")
+        return IdentityLoginResult("SESSION", createSession(profile, ip), null, null, null, null)
+    }
+    // Finishes a login with the second-factor code (or a recovery code). The attempt counter commits on its own
+    // (verifyChallenge claims it outside any transaction); the session is issued in one transaction with the
+    // challenge being consumed.
+    IdentityIssued verifyTwoFactor(challengeId: String?, code: String?) {
+        if (IdentityText.blank(challengeId)) {
+            throw Errors.api(400, "TWO_FACTOR_CHALLENGE_NOT_FOUND", "Informe o desafio do login.")
+        }
+        var userId = twoFactor.verifyChallenge(IdentityText.orEmpty(challengeId).trim(), code)
+        var profile = users.findById(userId)
+        if (profile == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        if (sanctions.banned(profile.id())) {
+            throw Errors.api(403, "ACCOUNT_BANNED", "Esta conta foi banida apos revisao do recurso. Fale com o suporte se precisar.")
+        }
+        log.info("auth_login_success via=2fa")
+        return createSession(profile, null)
+    }
+    resendTwoFactorCode(challengeId: String?) {
+        twoFactor.resendTwoFactorCode(challengeId)
+    }
+    // ---- e-mail confirmation
+    IdentityIssued verifyEmail(token: String?) {
+        var out = IdentityIssued("", "", "", "", IdentityUserView("", "", "", null, "", false, false, false, false, false))
+        var self = this
+        store.transaction(() -> {
+    out = self.verifyEmailTx(token)
+})
+        return out
+    }
+    IdentityIssued verifyEmailTx(token: String?) {
+        if (IdentityText.blank(token)) {
+            throw Errors.api(400, "INVALID_TOKEN", "Token de confirmacao obrigatorio.")
+        }
+        var tokenHash = Hashes.sha256Hex(IdentityText.orEmpty(token).trim())
+        // Two-step signup: the link confirms the e-mail AND creates the account (which did not exist yet).
+        var pending = identity.pendingByToken(tokenHash)
+        if (pending != null) {
+            var now = Time.nowIso()
+            if (Time.toMillis(pending.expiresAt()) <= Time.toMillis(now)) {
+                // Not deleted here: the transaction rolls back with the 410. The expired row goes in the
+                // next opportunistic cleanup (a new signup, a resend or the worker).
+                throw Errors.api(410, "TOKEN_EXPIRED", "Link de confirmacao expirado. Peca um novo.")
+            }
+            // Rare race: the same person may have created the account another way in the meantime.
+            if (users.existsByEmail(pending.email()) || identity.credentialEmailExists(pending.email())) {
+                identity.deletePendingByEmail(pending.email())
+                throw Errors.api(409, "EMAIL_ALREADY_REGISTERED", "Email ja cadastrado.")
+            }
+            var userId = Ids.prefixed("user_")
+            var username = uniqueUsername(pending.name(), pending.email())
+            users.create(userId, username, pending.email(), pending.name(), pending.createdAt(), now, pending.birthDate())
+            identity.saveCredential(userId, pending.email(), pending.passwordHash(), true, now)
+            identity.deletePendingByEmail(pending.email())
+            var created = users.findById(userId)
+            if (created == null) {
+                throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+            }
+            return createSession(created, null)
+        }
+        var verification = identity.verificationByHash(tokenHash)
+        if (verification == null) {
+            throw Errors.api(404, "INVALID_TOKEN", "Link de confirmacao invalido.")
+        }
+        if (verification.usedAt() != null) {
+            throw Errors.api(409, "TOKEN_ALREADY_USED", "Este link de confirmacao ja foi usado.")
+        }
+        if (Time.toMillis(Time.nowIso()) > Time.toMillis(verification.expiresAt())) {
+            throw Errors.api(410, "TOKEN_EXPIRED", "Link de confirmacao expirado. Peca um novo.")
+        }
+        var profile = users.findById(verification.userId())
+        if (profile == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        var now = Time.nowIso()
+        if (!profile.emailVerified()) {
+            users.markEmailVerified(profile.id(), now)
+        }
+        // Single use: the token is spent before the session is issued.
+        identity.markVerificationUsed(tokenHash, now)
+        var refreshed = users.findById(profile.id())
+        if (refreshed == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        return createSession(refreshed, null)
+    }
+    resendVerification(email: String?) {
+        var self = this
+        store.transaction(() -> {
+    self.resendVerificationTx(email)
+})
+    }
+    resendVerificationTx(email: String?) {
+        if (IdentityText.blank(email) || !IdentityText.orEmpty(email).contains("@")) {
+            throw Errors.api(400, "INVALID_EMAIL", "Email invalido.")
+        }
+        var normalized = IdentityText.lower(email)
+        // Neutral answer: we never confirm whether the address exists (no account enumeration).
+        var profile = users.findByEmail(normalized)
+        if (profile != null && !profile.emailVerified()) {
+            var now = Time.nowIso()
+            var since = Time.plusSeconds(now, -IdentityService.resendWindowSeconds())
+            if (identity.verificationsSince(profile.id(), since) >= IdentityService.resendLimit()) {
+                throw Errors.api(429, "TOO_MANY_REQUESTS", "Limite de reenvios atingido. Tente novamente mais tarde.")
+            }
+            var raw = IdentityService.newVerificationToken()
+            // One valid token at a time: resending invalidates the previous link (marked used).
+            identity.markAllVerificationUsed(profile.id(), now)
+            identity.saveVerification(Hashes.sha256Hex(raw), profile.id(), Time.plusSeconds(now, IdentityService.verificationTtlSeconds()), now)
+            mailer.sendVerificationEmail(profile.email(), profile.name(), raw)
+        }
+        // Two-step signup: no account yet, but the pending one can resend its link, with the SAME ceiling of
+        // the account flow (3 sends per hour). Without the counter the resend had no limit.
+        var pending = identity.pendingByEmail(normalized)
+        if (pending != null) {
+            var now = Time.nowIso()
+            if (sendsWithin(pending, now) >= IdentityService.resendLimit()) {
+                throw Errors.api(429, "TOO_MANY_REQUESTS", "Limite de reenvios atingido. Tente novamente mais tarde.")
+            }
+            var raw = IdentityService.newVerificationToken()
+            identity.savePending(IdentityPending(pending.id(), pending.email(), pending.name(), pending.birthDate(), pending.passwordHash(), Hashes.sha256Hex(raw), Time.plusSeconds(now, IdentityService.verificationTtlSeconds()), pending.createdAt(), pending.resendCount() + 1, now))
+            mailer.sendVerificationEmail(pending.email(), pending.name(), raw)
+        }
+    }
+    // How many link sends happened inside the window. The window restarts after an hour without a send.
+    Int sendsWithin(p: IdentityPending, now: String) {
+        var last = p.lastSentAt()
+        if (last == null) {
+            return 0
+        }
+        if (Time.toMillis(last) <= Time.toMillis(now) - IdentityService.resendWindowSeconds() * 1000L) {
+            return 0
+        }
+        return p.resendCount()
+    }
+    // ---- session
+    logout(token: String?, refreshToken: String?) {
+        var now = Time.nowIso()
+        if (token != null && token.trim().length() > 0) {
+            identity.revokeSession(token.trim(), now)
+        }
+        // An expired access cookie is gone from the browser while the refresh cookie still is: without this
+        // the session could still be refreshed after "logging out".
+        if (refreshToken != null && refreshToken.trim().length() > 0) {
+            identity.revokeByRefresh(refreshToken.trim(), now)
+        }
+    }
+    IdentityUserView authenticatedUser(token: String?) {
+        var userId = requireUserId(token)
+        var profile = users.findById(userId)
+        if (profile == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        return view(profile, hasUsablePassword(userId))
+    }
+    IdentityIssued refresh(refreshToken: String?) {
+        if (IdentityText.blank(refreshToken)) {
+            throw Errors.api(400, "INVALID_REFRESH_TOKEN", "Refresh token obrigatorio.")
+        }
+        var out = IdentityIssued("", "", "", "", IdentityUserView("", "", "", null, "", false, false, false, false, false))
+        var current = IdentityText.orEmpty(refreshToken).trim()
+        var self = this
+        store.transaction(() -> {
+    out = self.refreshTx(current)
+})
+        return out
+    }
+    IdentityIssued refreshTx(current: String) {
+        var now = Time.nowIso()
+        var userId = identity.activeUserIdByRefresh(current, now)
+        if (userId == null) {
+            throw Errors.api(401, "INVALID_REFRESH_TOKEN", "Refresh token invalido ou expirado.")
+        }
+        // Atomic revocation: two concurrent refreshes of the same token cannot make two sessions.
+        if (!identity.revokeByRefresh(current, now)) {
+            throw Errors.api(401, "INVALID_REFRESH_TOKEN", "Refresh token invalido ou expirado.")
+        }
+        var profile = users.findById(userId)
+        if (profile == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        return createSession(profile, null)
+    }
+    // ---- passwords
+    requestReset(email: String?) {
+        var self = this
+        store.transaction(() -> {
+    self.requestResetTx(email)
+})
+    }
+    requestResetTx(email: String?) {
+        if (IdentityText.blank(email) || !IdentityText.orEmpty(email).contains("@")) {
+            throw Errors.api(400, "INVALID_EMAIL", "Email invalido.")
+        }
+        var normalized = IdentityText.lower(email)
+        var profile = users.findByEmail(normalized)
+        if (profile == null) {
+            return
+        }
+        // Per-account cap on top of the per-IP one: requests spread over many IPs cannot flood one inbox.
+        // Silent, so the response stays neutral.
+        if (!ipLimiter.tryAcquire(IpRateLimiter.password(), "account:" + profile.id())) {
+            log.warn("auth_reset_throttled")
+            return
+        }
+        var raw = IdentityService.newResetToken()
+        var now = Time.nowIso()
+        // Only the hash goes to the database; the clear token exists only in the e-mail.
+        identity.deleteResetsByUser(profile.id())
+        identity.saveReset(Hashes.sha256Hex(raw), profile.id(), Time.plusSeconds(now, IdentityService.resetTtlSeconds()), now)
+        mailer.sendPasswordResetEmail(normalized, profile.name(), raw)
+    }
+    // A session when the reset lifts an expired-password flag; null otherwise.
+    IdentityIssued? reset(token: String?, newPassword: String?) {
+        var out = IdentityText.noSession()
+        var self = this
+        store.transaction(() -> {
+    out = self.resetTx(token, newPassword)
+})
+        return out
+    }
+    IdentityIssued? resetTx(token: String?, newPassword: String?) {
+        if (IdentityText.blank(token)) {
+            throw Errors.api(400, "INVALID_TOKEN", "Token obrigatorio.")
+        }
+        Passwords.validateStrength(newPassword)
+        var tokenHash = Hashes.sha256Hex(IdentityText.orEmpty(token).trim())
+        var row = identity.resetByHash(tokenHash)
+        if (row == null) {
+            throw Errors.api(404, "INVALID_TOKEN", "Token invalido ou nao encontrado.")
+        }
+        if (row.usedAt() != null) {
+            throw Errors.api(409, "TOKEN_ALREADY_USED", "Token ja utilizado.")
+        }
+        var now = Time.nowIso()
+        if (Time.toMillis(now) > Time.toMillis(row.expiresAt())) {
+            throw Errors.api(410, "TOKEN_EXPIRED", "Token de reset expirado.")
+        }
+        var credential = identity.credentialByUser(row.userId())
+        if (credential == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        var wasExpired = credential.resetNeeded()
+        // Strength was validated above, so newPassword is not null here.
+        identity.saveCredential(credential.userId(), credential.email(), Passwords.hash("" + newPassword), true, now)
+        identity.markResetUsed(tokenHash, now)
+        identity.revokeAllByUser(row.userId(), now)
+        if (wasExpired) {
+            var profile = users.findById(row.userId())
+            if (profile == null) {
+                throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+            }
+            return createSession(profile, null)
+        }
+        return null
+    }
+    changePassword(sessionToken: String?, currentPassword: String?, newPassword: String?) {
+        var self = this
+        store.transaction(() -> {
+    self.changePasswordTx(sessionToken, currentPassword, newPassword)
+})
+    }
+    changePasswordTx(sessionToken: String?, currentPassword: String?, newPassword: String?) {
+        var userId = requireUserId(sessionToken)
+        Passwords.validateStrength(newPassword)
+        var credential = requireCredential(userId)
+        // An account made by social login is born with a random hash nobody knows: here the person CREATES
+        // the first password, so there is nothing to confirm. Asking for the current one locked them out.
+        if (credential.passwordUsable() && (IdentityText.blank(currentPassword) || !Passwords.matches(IdentityText.orEmpty(currentPassword), credential.passwordHash()))) {
+            throw Errors.api(401, "INVALID_CREDENTIALS", "Senha atual incorreta.")
+        }
+        var now = Time.nowIso()
+        // Java saves with passwordUsable defaulting to true (the first password makes it usable).
+        identity.saveCredential(userId, credential.email(), Passwords.hash("" + newPassword), true, now)
+        // Ends every session: the person must sign in again with the new password.
+        identity.revokeAllByUser(userId, now)
+    }
+    // ---- e-mail change
+    changeEmail(sessionToken: String?, newEmail: String?, password: String?) {
+        var self = this
+        store.transaction(() -> {
+    self.changeEmailTx(sessionToken, newEmail, password)
+})
+    }
+    changeEmailTx(sessionToken: String?, newEmail: String?, password: String?) {
+        var userId = requireUserId(sessionToken)
+        if (IdentityText.blank(newEmail) || !IdentityText.orEmpty(newEmail).contains("@")) {
+            throw Errors.api(400, "INVALID_EMAIL", "Email invalido.")
+        }
+        var normalized = IdentityText.lower(newEmail)
+        var credential = requireCredential(userId)
+        if (IdentityText.blank(password) || !Passwords.matches(IdentityText.orEmpty(password), credential.passwordHash())) {
+            throw Errors.api(401, "INVALID_CREDENTIALS", "Senha incorreta.")
+        }
+        if (normalized == credential.email()) {
+            return
+        }
+        if (users.existsByEmail(normalized) || identity.credentialEmailExists(normalized)) {
+            throw Errors.api(409, "EMAIL_ALREADY_REGISTERED", "Email ja esta em uso.")
+        }
+        var profile = users.findById(userId)
+        if (profile == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        // Does NOT apply the address yet: only after the click on the link sent to it (E-02/E-11).
+        var raw = IdentityService.newVerificationToken()
+        var now = Time.nowIso()
+        identity.replaceEmailChange(Ids.prefixed("emailchg_"), userId, normalized, Hashes.sha256Hex(raw), Time.plusSeconds(now, IdentityService.verificationTtlSeconds()), now)
+        mailer.sendEmailChangeConfirmation(normalized, profile.name(), raw)
+    }
+    confirmEmailChange(rawToken: String?) {
+        var self = this
+        store.transaction(() -> {
+    self.confirmEmailChangeTx(rawToken)
+})
+    }
+    confirmEmailChangeTx(rawToken: String?) {
+        if (IdentityText.blank(rawToken)) {
+            throw Errors.api(400, "INVALID_TOKEN", "Token obrigatorio.")
+        }
+        var row = identity.emailChangeByHash(Hashes.sha256Hex(IdentityText.orEmpty(rawToken).trim()))
+        if (row == null) {
+            throw Errors.api(404, "INVALID_TOKEN", "Link invalido ou ja usado.")
+        }
+        var userId = row.getStr("user_id")
+        var newEmail = row.getStr("new_email")
+        var now = Time.nowIso()
+        if (Time.toMillis(row.getInstant("expires_at")) < Time.toMillis(now)) {
+            identity.deleteEmailChange(userId)
+            throw Errors.api(410, "TOKEN_EXPIRED", "Link expirado. Peça a troca novamente.")
+        }
+        var profile = users.findById(userId)
+        if (profile == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        var credential = requireCredential(userId)
+        if (users.existsByEmail(newEmail) || identity.credentialEmailExists(newEmail)) {
+            throw Errors.api(409, "EMAIL_ALREADY_REGISTERED", "Email ja esta em uso.")
+        }
+        var oldEmail = credential.email()
+        users.changeEmail(userId, newEmail, now)
+        users.markEmailVerified(userId, now)
+        identity.saveCredential(userId, newEmail, credential.passwordHash(), credential.passwordUsable(), now)
+        // Old sessions fall: the recovery address changed.
+        identity.revokeAllByUser(userId, now)
+        identity.deleteEmailChange(userId)
+        mailer.sendHtml(oldEmail, "Seu e-mail foi alterado — Énóis", "<p>O e-mail da sua conta no Énóis foi alterado para <b>" + IdentityMailer.escapeHtml(newEmail) + "</b>. Se não foi você, fale com o suporte imediatamente.</p>")
+    }
+    // ---- account deletion
+    deleteAccount(sessionToken: String?, password: String?) {
+        var self = this
+        store.transaction(() -> {
+    self.deleteAccountTx(sessionToken, password)
+})
+    }
+    deleteAccountTx(sessionToken: String?, password: String?) {
+        var userId = requireUserId(sessionToken)
+        var credential = requireCredential(userId)
+        if (IdentityText.blank(password) || !Passwords.matches(IdentityText.orEmpty(password), credential.passwordHash())) {
+            throw Errors.api(401, "INVALID_CREDENTIALS", "Senha incorreta.")
+        }
+        var profile = users.findById(userId)
+        if (profile == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        var now = Time.nowIso()
+        identity.revokeAllByUser(userId, now)
+        identity.deleteCredential(userId)
+        identity.deleteExternalIdentities(userId)
+        var suffix = userId
+        if (userId.startsWith("user_")) {
+            suffix = userId.substring(5)
+        }
+        users.anonymize(userId, "removed+" + suffix + "@enois.invalid", "removed-" + suffix, now)
+    }
+    // ---- shared
+    // The OAuth login confirms the e-mail itself: the account is born verified.
+    markEmailVerifiedForProvider(userId: String) {
+        users.markEmailVerified(userId, Time.nowIso())
+    }
+    // Verified identity: e-mail confirmed OR a second factor on (the same rule feeds the credibility).
+    requireVerifiedIdentity(profile: IdentityUserRow) {
+        if (!identityVerified(profile)) {
+            throw Errors.api(403, "EMAIL_NOT_VERIFIED", "Confirme seu e-mail ou ative a verificacao em duas etapas para entrar. Enviamos o link de confirmacao para " + profile.email().trim().toLowerCase() + ".")
+        }
+    }
+    Bool twoFactorOn(p: IdentityUserRow) = p.totpEnabled() || p.emailOtpEnabled() || p.federatedSecondFactor()
+    Bool identityVerified(p: IdentityUserRow) = p.emailVerified() || twoFactorOn(p)
+    IdentityUserView view(p: IdentityUserRow, hasPassword: Bool) = IdentityUserView(p.id(), p.username(), p.name(), p.headline(), p.email(), p.emailVerified(), twoFactorOn(p), identityVerified(p), hasPassword, p.onboardingCompleted())
+    // Accounts born by social login have a random hash (`password_usable = false`): the screen asks to
+    // "create a password" instead of "confirm the current one".
+    Bool hasUsablePassword(userId: String) {
+        var c = identity.credentialByUser(userId)
+        if (c == null) {
+            return false
+        }
+        return c.passwordUsable()
+    }
+    String requireUserId(sessionToken: String?) {
+        if (IdentityText.blank(sessionToken)) {
+            throw Errors.api(401, "UNAUTHENTICATED", "Sessao invalida ou expirada.")
+        }
+        var userId = identity.activeUserId(IdentityText.orEmpty(sessionToken).trim(), Time.nowIso())
+        if (userId == null) {
+            throw Errors.api(401, "UNAUTHENTICATED", "Sessao invalida ou expirada.")
+        }
+        return userId
+    }
+    IdentityCredential requireCredential(userId: String) {
+        var c = identity.credentialByUser(userId)
+        if (c == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        return c
+    }
+    // Issues a session: only the SHA-256 of both tokens is stored. A null `ip` takes the request's client ip.
+    IdentityIssued createSession(profile: IdentityUserRow, ip: String?) {
+        var now = Time.nowIso()
+        var expiresAt = Time.plusSeconds(now, accessTtlSeconds)
+        var refreshExpiresAt = Time.plusSeconds(now, refreshTtlSeconds)
+        var token = IdentityService.newToken()
+        var refreshToken = IdentityService.newToken()
+        // ponytail: callers other than the password login pass no ip; the request's client ip fills it in
+        // one place instead of threading it through every use case (like the Java MDC lookup).
+        var sessionIp = IdentityText.none()
+        if (!IdentityText.blank(ip)) {
+            sessionIp = IdentityText.orEmpty(ip).trim()
+        }
+        else {
+            var fromRequest = LogContext.get("clientIp")
+            if (fromRequest != null) {
+                sessionIp = fromRequest.trim()
+            }
+        }
+        identity.saveSession(token, refreshToken, profile.id(), now, expiresAt, refreshExpiresAt, sessionIp)
+        return IdentityIssued(token, refreshToken, expiresAt, refreshExpiresAt, view(profile, hasUsablePassword(profile.id())))
+    }
+    // A throwaway hash that equalises the cost of a login for an unknown e-mail.
+    String dummyPasswordHash() {
+        if (dummyHash.length() == 0) {
+            dummyHash = Passwords.hash(IdentityService.newToken())
+        }
+        return dummyHash
+    }
+    String uniqueUsername(name: String, email: String) {
+        var source = name
+        if (name.trim().length() == 0) {
+            source = email.substring(0, email.indexOf("@"))
+        }
+        var base = IdentityService.slug(source)
+        var candidate = base
+        var suffix = 1
+        while (users.existsByUsername(candidate) || AdminGuard.isReservedUsername(candidate)) {
+            candidate = base + "-" + suffix
+            suffix = suffix + 1
+        }
+        return candidate
+    }
+    static String newToken() = Tokens.random(32)
+    static String newResetToken() = "reset_" + Tokens.random(48)
+    static String newVerificationToken() = "verify_" + Tokens.random(48)
+    // UsernameSlug.from: an accent becomes the plain letter, anything else that is not a letter or digit a
+    // hyphen, the ends trimmed, "user" when nothing is left.
+    static String slug(value: String) {
+        var plain = Texts.stripAccents(value).toLowerCase().replaceAll("[^a-z0-9]+", "-").replaceAll("(^-|-$)", "")
+        if (plain.length() == 0) {
+            return "user"
+        }
+        return plain
+    }
+    // Canonical mailbox: no "+tag" and, for Gmail, no dots in the local part. Two accounts must not be
+    // created for the same inbox.
+    static String canonicalEmail(email: String) {
+        var at = email.lastIndexOf("@")
+        if (at <= 0) {
+            return email
+        }
+        var local = email.substring(0, at)
+        var domain = email.substring(at)
+        var plus = local.indexOf("+")
+        if (plus > 0) {
+            local = local.substring(0, plus)
+        }
+        if (domain == "@gmail.com" || domain == "@googlemail.com") {
+            local = local.replace(".", "")
+        }
+        return local + domain
+    }
+    // PendingSignupCleanupWorker.purge: the expired pending signups go; returns how many.
+    Int purgePending() = identity.deleteExpiredPending(Time.nowIso())
+}

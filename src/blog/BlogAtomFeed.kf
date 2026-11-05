@@ -1,0 +1,97 @@
+package blog
+
+import kernel.text.*
+
+// Atom 1.0 feed of a blog: title, link, date and a PLAIN TEXT summary of each post. The full body stays out on
+// purpose: it may be HTML with its own theme and the RSS reader is a client we do not control.
+class BlogAtomFeed {
+    static Int maxEntries() = 20
+    static String contentType() = "application/atom+xml;charset=UTF-8"
+    // frontendUrl has no trailing slash; `now` is used only when the blog has no post yet (Atom requires `updated`).
+    static String render(blog: BlogView, frontendUrl: String, now: String) {
+        var blogLink = frontendUrl + "/blog/" + blog.slug()
+        var selfLink = frontendUrl + "/api/blogs/" + blog.slug() + "/feed.xml"
+        var items = listOf<BlogPostView>()
+        for (var p in blog.items()) {
+            if (items.size() < BlogAtomFeed.maxEntries()) {
+                items.add(p)
+            }
+        }
+        var updated = now
+        var first = true
+        for (var p in items) {
+            var changed = BlogAtomFeed.lastChange(p)
+            if (first || changed.compareTo(updated) > 0) {
+                updated = changed
+                first = false
+            }
+        }
+        var xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        xml = xml + "<feed xmlns=\"http://www.w3.org/2005/Atom\" xml:lang=\"pt-BR\">\n"
+        xml = xml + "  <id>" + BlogAtomFeed.escape(blogLink) + "</id>\n"
+        xml = xml + "  <title>" + BlogAtomFeed.escape(blog.title()) + "</title>\n"
+        var description = blog.description()
+        if (description != null && description.trim().length() > 0) {
+            xml = xml + "  <subtitle>" + BlogAtomFeed.escape(description) + "</subtitle>\n"
+        }
+        xml = xml + "  <link rel=\"alternate\" type=\"text/html\" href=\"" + BlogAtomFeed.escape(blogLink) + "\"/>\n"
+        xml = xml + "  <link rel=\"self\" type=\"application/atom+xml\" href=\"" + BlogAtomFeed.escape(selfLink) + "\"/>\n"
+        xml = xml + "  <updated>" + updated + "</updated>\n"
+        xml = xml + "  <author><name>" + BlogAtomFeed.escape(blog.authorName()) + "</name></author>\n"
+        for (var post in items) {
+            var link = blogLink + "/" + post.id()
+            xml = xml + "  <entry>\n"
+            xml = xml + "    <id>" + BlogAtomFeed.escape(link) + "</id>\n"
+            xml = xml + "    <title>" + BlogAtomFeed.escape(post.title()) + "</title>\n"
+            xml = xml + "    <link rel=\"alternate\" type=\"text/html\" href=\"" + BlogAtomFeed.escape(link) + "\"/>\n"
+            xml = xml + "    <published>" + post.publishedAt() + "</published>\n"
+            xml = xml + "    <updated>" + BlogAtomFeed.lastChange(post) + "</updated>\n"
+            var summary = BlogNewsletterService.previewOf(post.body())
+            if (summary.length() > 0) {
+                xml = xml + "    <summary type=\"text\">" + BlogAtomFeed.escape(summary) + "</summary>\n"
+            }
+            xml = xml + "  </entry>\n"
+        }
+        return xml + "</feed>\n"
+    }
+    static String lastChange(post: BlogPostView) {
+        if (post.updatedAt().length() > 0) {
+            return post.updatedAt()
+        }
+        return post.publishedAt()
+    }
+    // Escapes for XML and drops the characters XML 1.0 admits not even escaped.
+    static String escape(text: String) {
+        var out = ""
+        var i = 0
+        while (i < text.length()) {
+            var c = text.charAt(i)
+            i = i + 1
+            var code = c as Int
+            if (c == '&') {
+                out = out + "&amp;"
+            }
+            else 
+                if (c == '<') {
+                    out = out + "&lt;"
+                }
+                else 
+                    if (c == '>') {
+                        out = out + "&gt;"
+                    }
+                    else 
+                        if (c == '\"') {
+                            out = out + "&quot;"
+                        }
+                        else 
+                            if (c == '\'') {
+                                out = out + "&apos;"
+                            }
+                            else 
+                                if (code == 9 || code == 10 || code == 13 || code >= 32 && code <= 55295 || code >= 57344 && code <= 65533 || code >= 55296 && code <= 57343) {
+                                    out = out + c
+                                }
+        }
+        return out
+    }
+}

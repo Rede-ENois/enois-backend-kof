@@ -3,6 +3,7 @@
 | Domain | Endpoints ported / total | Tests ported / total | Gaps |
 |---|---|---|---|
 | shared/web + shared/security (request pipeline) + `apiv1` origin gate | `GET/POST /admin/panic` 2/2 (the `/v1` index and `/developers/origins` CRUD belong to `apiv1`) | 87 / 100 Java tests (149 Kof tests in `tests/security/`) | G28 to G35 |
+| notifications, push, messaging, calls (slug `messaging`) | notifications 8/8, push 3/3, messaging 24/24 (`GET /conversations/stream` answers but cannot stream, G201), calls 13/13 | 117 / 122 Java tests (notifications 34/34, push 21/21, messaging 51/55, calls 11/12; 127 Kof tests in `tests/notifications`, `tests/push`, `tests/messaging`, `tests/calls`, `tests/kernel/WebPushAdapterTest.kf`) | G200 to G212 |
 
 ## Request pipeline (`kernel.security`)
 
@@ -166,6 +167,100 @@ Ported with a changed trigger: `MediaControllerTests.deletesMediaReferencedByDel
 `requestPostMediaDeletion` (what the feed calls on post deletion) because the feed endpoint is not part of this
 domain; the `/storage` tests use real bytes through the binary lane; `MediaStorageProxyTests` and the S3 tests run
 with fakes behind the `MediaObjectStore` seam, like the Java ones.
+
+## Notifications, push, messaging, calls (`notifications`, `push`, `messaging`, `calls`)
+
+Wired in `Main.kf` in this order (notifications is the sink the other domains write to):
+`NotificationsModule.install`, `PushModule.install`, `MessagingModule.install`, `CallsModule.install`.
+`install(platform, shared, hooks, parts, ...)` takes `SecurityParts` as a fourth argument (the guide shows three):
+messaging and calls need `parts.userLimiter` and `parts.timingGuard`. Tests install a module with `installWith`
+and a swapped seam (`tests/*/` boot through `notifications.DomainTestKit`).
+
+Ported: every endpoint (notifications `GET /notifications`, `/notifications/unread-summary`,
+`POST /notifications/{id}/read`, `/notifications/read-all`, `GET`/`PUT /me/notification-preferences`,
+`GET`/`POST /notifications/digest/unsubscribe`; push `GET /push/config`, `POST`/`DELETE /push/subscriptions`;
+the 19 `/conversations/**` routes and the 5 `/e2e/**` routes; the 13 call routes), the outbox handler, the
+weekly digest cron, the community apology worker, web push with VAPID (`kernel.push.WebPushAdapter`), the call
+expiry worker and the `ConversationViewers.dropExpired` job, all on `kernel.jobs`.
+
+### The Notifications API other domains call (`notifications.Notifications`)
+
+Take it from the module: `var notifications = notificationsModule.notifications`. Every method writes inside the
+caller's transaction (a nested `Db.transaction` joins it) and publishes the push event after the outermost
+commit (`Db.afterCommit`), so a rolled back write sends nothing.
+
+```
+notifications.create(userId, kind, actorId, title, body, href, ctaLabel)            // simple notice
+notifications.createWithPreview(..., ctaLabel, preview)                              // + the 140 char preview
+notifications.createGrouped(userId, kind, groupKey, actorId, title, body, groupedBody: (Int) -> String, href, groupedHref, ctaLabel, preview)
+notifications.createCounted(userId, kind, groupKey, actorId, title, body, countedBody: (Int) -> String, href, ctaLabel)  // "N novos", first one pushes
+notifications.createCountedAndPushed(...)                                            // same, every increment pushes (messages)
+notifications.markReadByHref(userId, href)    notifications.markRead(id, userId)    notifications.markAllRead(userId)
+notifications.addListener(listener)           // NotificationListener.onCreated(event), what push uses
+```
+
+`NotificationOutboxEventHandler.forTypes(shared.outbox, notifications, sources, actors)` is registered by
+`NotificationsModule.install` for `PostCommented`, `PostReacted` and `CommentReacted`. Other domains register their
+own event types on `shared.outbox` as before.
+
+Groups: `groups.GroupNotifications` (its own seam) inserts into `notifications` directly, so a group notice sends no
+push. `notifications.GroupNotificationsBridge` subclasses it and routes `create`/`createCounted` through
+`Notifications` (push after commit, preferences, same group-key counter). `Main.kf` passes it with
+`GroupsModule.installWith(..., GroupNotificationsBridge(platform.db, notificationsModule.notifications), ...)`.
+The `GroupNotifier` outbox handler (`GroupPostPublished`) does not overlap with
+`NotificationOutboxEventHandler` (`PostCommented`, `PostReacted`, `CommentReacted`).
+
+### Pending ports (seams owned by other domains; every default reads the owner's tables read-only)
+
+| Seam | Default | Owner / what it needs |
+|---|---|---|
+| `NotificationActors` (`notifications`) | reads `users`, `corporate_profiles` | profile and corporate: names, avatars, name style of the actor |
+| `NotificationSources` | reads `posts`, `comments` | feed: the post and comment behind an outbox event |
+| `NotificationCoins` | grants every reward, `hasReward(ref)` is false | coin: the daily/first notification rewards |
+| `NotificationAccounts`, `DigestAccounts`, `DigestPersonalization` | read `users` and the digest sources | identity and feed: who gets the weekly digest and what it shows |
+| `NotificationPlaceReader` | reads `communities`, `posts`, `groups`, `events` | communities, groups, events: the place a notice points to |
+| `DigestMailer` | logs and answers `false` (nothing is sent) | identity: `EmailService` (the digest and the apology mail) |
+| `PushPresence` (`push`) | reads `user_presence` | presence: who is online (no push to them) |
+| `MessagingAgePolicy` | reads `users.birth_date` and `parental_links` | profile/age: `AgeGate` and `AgePolicyReader` (`BIRTH_DATE_REQUIRED`, `PARENTAL_CONSENT_REQUIRED`) |
+| `MessagingConnections` | reads `user_connections` (ACCEPTED) | network: `ConnectionRepository` |
+| `MessagingCorporate` | reads `corporate_profiles` (ACTIVE) | corporate: `CorporateProfileService` |
+| `MessagingCoins` | `recordPresence` does nothing | coin: the daily presence streak |
+| `CallGroups` (`calls`) | reads `group_members` | groups: `GroupService.roleOf` and `memberIds` |
+| `CallProfiles` | reads `users.social_name`, `users.name` | profile: `displayName` |
+| `CallClock` | the security clock (tests move it with `SecurityClock.advanceSeconds`) | none: kept as a seam for tests |
+| call events (`CallService.publish`) | no listener | the event stream (G201); `CallChanged` has no consumer yet |
+
+Seams are concrete classes with overridable methods (interfaces across packages do not work, G30/G42): the
+owner subclasses the default and passes it in `NotificationsSeams` / `MessagingSeamSet` / `CallsSeamSet`.
+
+Configuration: `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` (push is off without the keys),
+`REDE_DIGEST_CRON`, `REDE_COMMUNICATIONS_APOLOGY_*`, `REDE_CALLS_JITSI_URL`, `REDE_CALLS_JITSI_JWT_SECRET`
+(32 bytes or more), `REDE_CALLS_JITSI_JWT_ISSUER` (`rede`), `REDE_CALLS_JITSI_JWT_AUDIENCE` (`meet.jitsi`),
+`REDE_CALLS_JITSI_TOKEN_TTL_MINUTES` (120). Without the Jitsi address and secret every call start is
+`503 CALLS_NOT_CONFIGURED`.
+
+### Java tests not ported (5 of 122)
+
+| Java test | Why |
+|---|---|
+| `MessageStreamTests` (4: `newMessageIsSignalledToTheRecipientStream`, `readReceiptIsSignalledToTheOtherParticipant`, `streamsPerUserAreCapped`, `streamRequiresASession`) | the runtime cannot hold a response open (G201). `streamRequiresASession` is covered in spirit by `MessagesTest` ("the event stream needs a session and ends with a retry hint": 401 without a session, a closed `text/event-stream` body with `retry: 5000` otherwise); the three that read events from an open stream have no equivalent until the runtime streams |
+| `CallMediaProbe.gravaTokensDosDoisLadosDaChamada` | a manual probe, disabled unless `-Dcall.probe.url` points to a real Jitsi stack; it needs a browser and external infrastructure, not a suite |
+
+Ported with a changed setup: `GroupCreationQueryCountTests` (3) keep the behaviour (a large group with one
+connected minor, an unconnected minor and a blocked member are decided as in Java) as HTTP tests; the Mockito
+call counts (`verify(agePolicy, times(1)).minorIds(...)`) have no HTTP equivalent, so "one read per kind" is
+guaranteed by the code (`MessagingService.createConversation` reads blocks and minors once) and not asserted.
+`CallFlowTests.atenderERecusarAoMesmoTempoNaoDeixaDoisEstados` ran two threads against MockMvc: here the two
+requests run one after the other in both orders (the compare and set in `CallsStore.advance` is what keeps one
+state; the loser gets `200` or `409`). `MessageNotificationTests` stub the push sender with
+`push.RecordingPushSender` and `inline = true` instead of mocking `PushSender` and `pushExecutor`.
+`MessagePreviewOrderTests` ran on a fixed clock; here the assertion is the same (the second message is strictly
+later than the first even inside one second) on the real clock.
+
+Deliberate differences: the 100 conversation participants limit, the 10 second duplicate window and the 4 media
+limit are the Java values; `PushService` is `PushSubscriptionService` (G206); a send with `"e2e": true` checks the
+ciphertext (`EMPTY_MESSAGE`, `MESSAGE_TOO_LONG` over 8000) and the IV (`MISSING_IV`) before storing.
+
 ## profile (profile, network, preferences, presence)
 
 Slug `profile`, branch `port/profile`. One module entry: `ProfileModule.install(platform, shared, hooks)` (one line in `Main.kf`, after `Security.install`); it also installs network, preferences and presence.
@@ -367,10 +462,10 @@ Seams (defaults in `LinkedInModule.install`):
 | Seam | Default | Owner / what it needs |
 |---|---|---|
 | `LinkedInPostLookup.findById` | reads `posts` (id, author_id, content, status, type, author_identity) read-only | feed: `// pending-port: feed`; extend it when the feed store exists |
-| `LinkedInShareClient.share` | `LinkedInHttpShareClient` (POST `https://api.linkedin.com/v2/ugcPosts` via `kernel.http.HttpFetch.send`) | tests extend it with a stub; the endpoint is a constructor argument |
+| `LinkedInShareClient.share` | `LinkedInHttpShareClient` (POST `https://api.linkedin.com/v2/ugcPosts` via `kernel.http.Outbound.attempt`) | tests extend it with a stub; the endpoint is a constructor argument |
 | `LinkedInClock.nowIso` | `Time.nowIso()` | tests extend it to fix the clock (Java `Clock.fixed`) |
 
-Kernel: outbound POST with status goes through the shared `kernel.http.HttpFetch.send` (G178). Base URL of the share link: `REDE_FRONTEND_BASE_URL` (default `https://enois.ia.br`, the Java `rede.frontend.base-url`).
+Kernel: outbound POST with status goes through the shared `kernel.http.Outbound.attempt` (G178). Base URL of the share link: `REDE_FRONTEND_BASE_URL` (default `https://enois.ia.br`, the Java `rede.frontend.base-url`).
 
 ## emotes
 
@@ -406,7 +501,7 @@ Behaviour notes:
 
 | Seam | Default | Notes |
 |---|---|---|
-| `EmoteFeed` (provider JSON GET) | real HTTP through `kernel.http.HttpFetch.getBytes` | tests subclass it |
+| `EmoteFeed` (provider JSON GET) | real HTTP through `kernel.http.Outbound.getBytes` | tests subclass it |
 | `EmoteImageFetcher` (CDN image GET) | real HTTP, 4 s connect / 6 s read, `image/*` only, 1 MB cap | tests subclass it |
 | binary route `GET /emotes/image/{provider}/{id}` | not registered | media port (binary lane) calls `EmotesModule.image` |
 
@@ -418,3 +513,113 @@ Behaviour notes:
 | `EmoteCatalogSchedulerTest` (4) | the Java boot thread and `@Scheduled` are the kernel jobs `emotes-boot` (one run, then a 10 year period) and `emotes-refresh` (cron); the mock service is a subclass overriding `refresh()` |
 | `EmoteControllerTest.imagemVemDoCacheComCacheLongo`, `imagemDeFigurinhaAnimadaPedeOArquivoEmMovimento`, `imagemDeFigurinhaDesconhecidaNaoTentaOArquivoAnimado`, `imagemDeProvedorDesconhecidoResponde404` | asserted on `EmotesModule.image` (content type, URLs fetched, null for 404); the status and the `Cache-Control`/`nosniff` headers wait for the binary route |
 | `EmoteSourcesTest`, `EmoteImageCacheTest`, `EmoteImagesTest` | JSON is passed as text instead of a Jackson tree; the stubbed CDN is an `EmoteImageFetcher` subclass |
+
+## identity (identity, age, onboarding)
+
+Slug `identity`, branch `port/identity`, gaps G100 to G109. Code in `src/identity`, `src/age`, `src/onboarding`; tests in
+`tests/identity` (one H2 app per file, real migrations, no network).
+
+- **Endpoints: 47 of 47** (`/auth/**` 33 including the 8 OAuth routes, `/identity/**` 6, `/age/parental/**` 5,
+  `/me/onboarding/**` 3), same paths, status codes, JSON and pt-BR codes and messages.
+- **Tests: about 90 of the 98 Java `@Test`s ported** (167 Kof tests in `tests/identity`, the rest are extra edge cases and
+  the kernel adapters: Tokens, Outbound, Jwt). Each Java test name appears in the Kof test name.
+- **Jobs on `kernel.jobs`:** `identity-session-rehash` (every 60 s, SessionTokenHashMigration) and
+  `identity-pending-signup-cleanup` (15 s then 180 s, PendingSignupCleanupWorker).
+
+### Kernel files added (no existing kernel file changed in behaviour)
+
+`kernel/security/Tokens.kf` (random tokens, HMAC-SHA256, base64), `kernel/security/Jwt.kf` (RS256 verify against a JWKS,
+RS256 and ES256 signing, plain `java.security`, no third-party jar), `kernel/http/Outbound.kf` (one HTTP call with timeouts
+and any method), `kernel/url/UrlCodec.kf`. The jose4j/nimbus jars were not needed.
+
+### Seams owned by this slice (concrete classes with overridable methods, defaults wired in `Main.kf`)
+
+| Seam | Default | Replaced by |
+| --- | --- | --- |
+| `IdentityUsers` (profile reads and writes of `users`) | direct SQL on `users` | profile |
+| `IdentityMailer` (mail transport) | renders the Thymeleaf template text, logs metadata only, writes `email_log`, `deliver()` true. **SMTP is not ported** | the mail owner |
+| `IdentityTurnstileTransport` | `Outbound.postForm` to siteverify, fail-closed | tests stub it |
+| `IdentityIpBlocks`, `IdentitySignupGuard` | read `blocked_ips` (5 s cache); per-pod name pattern and cooldown guard | moderation |
+| `IdentityNotifier` | logging no-op (new device, parental events) | notifications |
+| `IdentityOAuthTransport` | `Outbound` to the providers and their JWKS | tests stub it |
+| `IdentityOAuthLinks` | logging no-op for the LinkedIn posting token and the GitHub identity and token | linkedin, contributions |
+| `IdentityVerificationProvider` list | gov.br (only active with `REDE_IDENTITY_GOVBR_*`), so the verification is unavailable by default | a legitimate private provider |
+| `IdentityEligibility` (JobPublishingPolicy) | reads `users.reputation`, rule `> 150` and, when enforced, a verified identity | jobs |
+| `OnboardingActions` | liked topics and skills merged by SQL; community, group and connection joins only report what is already in place (logged `pending-port`) | preferences, communities, groups, network |
+| `AgePolicyReader` and `AgeGate` | owned here: other domains (feed, messaging) call `requireDeclared` / `requireCanWrite` | n/a |
+
+### Seams expected from other domains
+
+`/me/age-state` and `/me/birth-date` stay in profile (already ported). Feed and conversations must call `AgeGate`. The
+onboarding joins need the real communities, groups and network services (`OnboardingActions` subclass).
+
+### Java tests not ported
+
+- `AgePolicyTests.regularizationUnlocksWriting` and `strangerCannotMessageMinorButConnectionCan`: need `/feed/posts` and
+  `/conversations`. The gate itself is covered with a probe route in `ParentalTest` and by `minorIds` in the policy reader.
+- `AuthProfileFlowTests` profile and feed parts, `AccountHardening` rename-to-admin (profile PATCH).
+- `PasswordChangeEndsSessionTests` end-to-end keypair and `TwoFactorFlowTests` `/notifications`: replaced by probe routes.
+- `AuthThrottleKeyTests`: already ported in the security `LimitersTest`.
+- `EmailServiceListUnsubscribeTests` (List-Unsubscribe header): needs the SMTP sender, which is not ported.
+- `OnboardingFlowTests.completeFollowsTheManualJoinRules`, `connectionRequestsSkipInvalidTargetsAndAreNotDuplicated`,
+  `manualJoinOfUnknownCommunityIs404`: need communities, groups and network. Ported with seeded rows: only what is already
+  in place counts as joined, self and unknown ids are skipped, an approval group is never joined.
+- `SessionTokenHashingTests.savesOnlyHashesAndStillLooksUpByRawToken`: covered at HTTP level (the table keeps only hashes).
+
+### Differences from the Java service
+
+- The POST `/auth/oauth/{provider}/callback` (Apple form_post) keeps the Java behaviour: a refusal is the JSON error, only
+  the GET callback redirects.
+- OAuth account creation sets no terms acceptance and no birth date (as Java); `users.create` and
+  `createFederated` write every column default explicitly because the Kof insert has no JPA defaults.
+- Provider env names: property style (`REDE_OAUTH_GOOGLE_CLIENT_ID`) first, then the short ones the Java profiles read
+  (`GOOGLE_CLIENT_ID`).
+## Leaf domains: ops, apiv1, stats, search, themes, projects, notices, releasenotes, suggestions, blog
+
+Slug `leaves`, branch `port/leaves`. Modules installed in `Main.kf`: `OpsModule` and `ApiV1Module` BEFORE `Security.install` (the pipeline captures `hooks.monitoring` and `hooks.origins` by value), the other eight after it.
+
+| Domain | Endpoints ported/total | Kof tests | Java tests ported/total |
+|---|---|---|---|
+| ops (`src/ops`) | 4/4 (`GET /admin/monitoring/overview`, `/users`, `/events`, `GET /admin/emails`) | `tests/ops/*` (19), `tests/kernel/{DayLog,HostResources,RequestMetrics,EventBuffer,Numbers,ZoneDates}Test` | 12/12 |
+| apiv1 (`src/apiv1`) | 7/7 (`GET /v1`, `GET/POST/DELETE /developers/origins`, `GET /admin/developers/origins`, `POST .../{id}/block`, `.../unblock`) | `tests/apiv1/ApiV1Test` (9) | 27/27 (gate-only tests live in `tests/security/OriginTest` and `IdentityRateLimitTest`, the rest in `tests/apiv1`) |
+| stats | 1/1 | `StatsTest` (2) | 2/2 |
+| search | 1/1 | `SearchTest` (7) | 5/6 (the `/mentors` search belongs to the mentoring domain) |
+| themes | 8/8 | `ThemeTest` (9) | 7/7 |
+| projects | 5/5 | `ProjectsTest` (10) | 9/9 |
+| notices | 3/3 | `NoticeTest` (8) | 8/8 |
+| releasenotes | 3/3 | `ReleaseNoteTest` (6) | 6/6 |
+| suggestions | 5/5 | `SuggestionFlowTest` (9), `SuggestionIssueClientTest` (6) | 12/12 |
+| blog | 12/12 | `BlogFlowTest` (9), `BlogNewsletterTest` (7) | 14/14 |
+
+Total: 49 of 49 endpoints, 102 of 103 Java tests ported.
+
+### Pending seams (concrete classes, safe default, `// pending-port: <owner>`)
+
+| Seam | Owner | Default |
+|---|---|---|
+| `ProjectsProfiles` (`idByUsername`) | profile | reads `users` read-only (same SQL; `ProjectsModule.withProfiles` takes a profile subclass) |
+| `SuggestionsGithubToken` | support | `GITHUB_ISSUES_TOKEN` from the environment |
+| `BlogFeedPointers` (`publish`, `delete`) | feed | mints the post id and logs `blog_feed_pointer_pending`; the feed owner writes the BLOG pointer post (tag `blog`, visible only in "Para voce" of subscribers) |
+| `BlogNotifier` (`notifyNewPost`) | notifications | logs `blog_notification_pending`; the owner writes the `NEW_BLOG_POST` notification |
+| `BlogCoins` (`recordPresence`) | coin | no-op |
+| `BlogEmailSender` (`sendHtml`) | identity (EmailService) | cannot send: records a FAILED `email_log` row `EMAIL_SENDER_NOT_WIRED` |
+| `BlogModule.withSeams` | feed, notifications, coin, identity | wiring point for the four blog seams above; `BlogService.authorsFollowedBy` is what the feed adds to "Para voce" |
+| ops hooks | kernel | `OpsMonitoring` replaces `hooks.monitoring`; `OpsLogTap` replaces the Java logback appender and `GlobalExceptionHandler` calls (`Log.installTap`) |
+| apiv1 hooks | kernel | `DeveloperOriginService` calls `hooks.origins.invalidate()` after every table change |
+
+### Decisions and deliberate differences
+
+- **No OpenAPI document.** The Java `V1ApiController` note says "a API nao publica documento OpenAPI (nao existe /openapi.json)". The note text is kept verbatim and `GET /openapi.json` answers 200 with an empty body (the unknown-path rule); asserted in `ApiV1Test`.
+- **`GET /v1` index** is built from `server.routes`: `/v1`-prefixed aliases are skipped, `:id` is shown as `{id}`, sorted by path then method.
+- **ops, capture**: Kof has no logback; `Log` has a tap (`Log.installTap`) that feeds WARN/ERROR lines of every logger and the `audit` logger. `kernel.http` `unhandled_exception` and 5xx `api_error` lines become EXCEPTION events with the request (method, path, requestId, user) from `LogContext`. Loggers `ops.*`, `kernel.monitoring*` and `kernel.http.access` are not captured. The "stack trace" of an exception event is the redacted thrown text (Kof exceptions are strings).
+- **ops, file reader**: the Java `FileEventSink.readFileBackward` processed the block head as a whole line and carried the wrong end, losing one event per 64 KiB block boundary. `DayLog` carries the cut head into the next (earlier) block instead (tested across block boundaries with multibyte text). Everything else (UTC day files, 7-day retention, 16384 line cap, 500 recent, queue 5000, 1000 events/min cap, flush 500 ms draining 200) is unchanged.
+- **ops, jobs** on `kernel.jobs`: `monitoring-flush` (500 ms), `monitoring-sample-resources` (60 s, 5 s initial delay), `monitoring-prune-minutes` (300 s), `monitoring-purge-old` (3600 s, 60 s initial delay). Env: `REDE_MONITORING_FILE_DIR`, `REDE_MONITORING_RETENTION_DAYS`, `REDE_MONITORING_MAX_EVENTS_PER_MINUTE`.
+- **ops, `/admin/emails`** keeps the Java rules: moderator or admin, TWO_FACTOR rows hidden, recipient masked (`***`), subject and error scrubbed of addresses. The writer (`EmailLogStore.append`) is what the identity port's e-mail sender calls.
+- **blog, newsletter** runs on the shared outbox (event `BLOG_POST_PUBLISHED`, worker every 5 s) instead of a Java executor, so nothing is sent if the publish transaction reverts. Rules unchanged (first publish only, verified e-mails only, never the author, Reply-To the author, `List-Unsubscribe`). Needs `REDE_SECURITY_ENCRYPTION_KEY` (otherwise logged and skipped, as in Java). The unsubscribe token is the standard-base64 `cipher.encrypt(blogId:userId)` made URL-safe without padding and converted back before decrypting, so tokens issued by the Java service keep working. The template `resources/templates/email-blog-post.html` is rendered by the kernel `HtmlTemplate` (Thymeleaf subset: `th:text`, `th:href`).
+- **themes**: the JSON literal `null` as a package is a 400 (Java answered 500).
+- **blog tests**: the Java feed and notification assertions of `BlogFlowTests` are asserted against fakes of the `BlogFeedPointers`/`BlogNotifier` seams (a pointer per post, one `NEW_BLOG_POST` per subscriber with href `/blog/<username>/<postId>`); the real `/feed` and `/notifications` checks move to the feed/notifications ports. The Mockito spy assertions of `BlogDirectoryTests` ("no per-blog query") cannot be written over HTTP; the directory instead uses bulk queries (`bannedAmong`, one grouped post count, one author batch) and the behaviour (counts, banned author left out) is asserted.
+- **suggestions**: the moderator approve/reject path is covered in `tests/security` (`SecurityModerators` defaults to nobody here).
+
+### Kernel files added or changed by this slice
+
+`kernel/http/Req.kf` (`queryAll`, `queryParam`, `formDecode`, raw-query decoding), `kernel/http/OutboundHttp.kf` (later merged into `Outbound.kf`), `kernel/text/{Regexes,Texts,Contrast,HtmlTemplate,Numbers}.kf`, `kernel/url/OriginNormalizer.kf`, `kernel/time/ZoneDates.kf`, `kernel/log/Log.kf` (`LogTap`), `kernel/db/Db.kf` (`poolStats`), `kernel/monitoring/{DayLog,HostResources,RequestMetrics,EventBuffer}.kf`. Gaps found: G220 to G230 in `KOF_GAPS.md`.

@@ -1,0 +1,104 @@
+package notifications
+
+import kernel.db.*
+
+// SQL of the notifications domain: `notifications`, `notification_preferences`, `system_announcements`.
+class NotificationsStore {
+    Db database
+    public constructor(database: Db) {
+        this.database = database
+    }
+    static NotificationRecord toRecord(r: DbRow) = NotificationRecord(r.getStr("id"), r.getStr("user_id"), r.getStr("kind"), r.getStr("actor_id"), r.getStr("title"), r.getStrOrNull("body"), r.getStrOrNull("href"), r.getStrOrNull("cta_label"), r.getBool("is_read"), r.getInstant("created_at"), r.getStrOrNull("group_key"), r.getInt("actor_count"), r.getStrOrNull("preview"))
+    static String columns() = "id, user_id, kind, actor_id, title, body, href, cta_label, is_read, created_at, group_key, actor_count, preview"
+    insert(n: NotificationRecord) {
+        database.execute("insert into notifications (" + NotificationsStore.columns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(n.id()).bindStr(n.userId()).bindStr(n.kind()).bindStr(n.actorId()).bindStr(n.title()).bindStrOrNull(n.body()).bindStrOrNull(n.href()).bindStrOrNull(n.ctaLabel()).bindBool(n.read()).bindInstant(n.createdAt()).bindStrOrNull(n.groupKey()).bindInt(n.actorCount()).bindStrOrNull(n.preview()))
+    }
+    // NotificationJpaEntity.joinedBy: a grouped notification absorbs a new actor and becomes unread, newest.
+    updateJoined(n: NotificationRecord) {
+        database.execute("update notifications set actor_id = ?, body = ?, href = ?, is_read = false, created_at = ?, actor_count = ? where id = ?", DbParams().bindStr(n.actorId()).bindStrOrNull(n.body()).bindStrOrNull(n.href()).bindInstant(n.createdAt()).bindInt(n.actorCount()).bindStr(n.id()))
+    }
+    NotificationRecord? findById(id: String) {
+        var row = database.queryOptional("select " + NotificationsStore.columns() + " from notifications where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return NotificationsStore.toRecord(row)
+    }
+    // `context` null = no filter; SHARED kinds always show; PROFESSIONAL adds the work kinds, SOCIAL the rest.
+    static String contextClause(context: String?) {
+        if (context == null) {
+            return ""
+        }
+        var sql = " and (kind in " + NotificationContexts.sharedList()
+        if (context == "PROFESSIONAL") {
+            sql = sql + " or kind in " + NotificationContexts.professionalList()
+        }
+        else {
+            sql = sql + " or kind not in " + NotificationContexts.professionalList()
+        }
+        return sql + ")"
+    }
+    List<NotificationRecord> findByUser(userId: String, before: String?, context: String?, limit: Int) {
+        var params = DbParams().bindStr(userId)
+        var sql = "select " + NotificationsStore.columns() + " from notifications where user_id = ?"
+        if (before != null) {
+            sql = sql + " and created_at < ?"
+            params.bindInstant(before)
+        }
+        sql = sql + NotificationsStore.contextClause(context) + " order by created_at desc limit " + limit
+        var out = listOf<NotificationRecord>()
+        for (var r in database.queryList(sql, params)) {
+            out.add(NotificationsStore.toRecord(r))
+        }
+        return out
+    }
+    List<NotificationUnreadCount> countUnread(userId: String, context: String?) {
+        var sql = "select kind, actor_id, href, count(*) as total from notifications where user_id = ? and is_read = false" + NotificationsStore.contextClause(context) + " group by kind, actor_id, href"
+        var out = listOf<NotificationUnreadCount>()
+        for (var r in database.queryList(sql, DbParams().bindStr(userId))) {
+            out.add(NotificationUnreadCount(r.getStr("kind"), r.getStrOrNull("actor_id"), r.getStrOrNull("href"), r.getLong("total")))
+        }
+        return out
+    }
+    NotificationRecord? findUnreadGroup(userId: String, groupKey: String) {
+        var row = database.queryOptional("select " + NotificationsStore.columns() + " from notifications where user_id = ? and group_key = ? and is_read = false order by created_at desc limit 1", DbParams().bindStr(userId).bindStr(groupKey))
+        if (row == null) {
+            return null
+        }
+        return NotificationsStore.toRecord(row)
+    }
+    markRead(id: String) {
+        database.execute("update notifications set is_read = true where id = ?", DbParams().bindStr(id))
+    }
+    markAllRead(userId: String) {
+        database.execute("update notifications set is_read = true where user_id = ?", DbParams().bindStr(userId))
+    }
+    markReadByHref(userId: String, href: String) {
+        database.execute("update notifications set is_read = true where user_id = ? and href = ? and is_read = false", DbParams().bindStr(userId).bindStr(href))
+    }
+    NotificationPreferencesView? findPreferences(userId: String) {
+        var r = database.queryOptional("select weekly_digest, push_social, push_messages, push_groups, push_jobs, push_system, updated_at from notification_preferences where user_id = ?", DbParams().bindStr(userId))
+        if (r == null) {
+            return null
+        }
+        return NotificationPreferencesView(r.getBool("weekly_digest"), r.getBool("push_social"), r.getBool("push_messages"), r.getBool("push_groups"), r.getBool("push_jobs"), r.getBool("push_system"), r.getInstantOrNull("updated_at"))
+    }
+    // Update first, insert when there was no row; a concurrent insert falls back to the update.
+    savePreferences(userId: String, p: NotificationPreferencesView, now: String) {
+        if (updatePreferences(userId, p, now) > 0) {
+            return
+        }
+        try {
+            database.execute("insert into notification_preferences (user_id, weekly_digest, push_social, push_messages, push_groups, push_jobs, push_system, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(userId).bindBool(p.weeklyDigest()).bindBool(p.pushSocial()).bindBool(p.pushMessages()).bindBool(p.pushGroups()).bindBool(p.pushJobs()).bindBool(p.pushSystem()).bindInstant(now))
+        } catch (String concurrentInsert) {
+            updatePreferences(userId, p, now)
+        }
+    }
+    Int updatePreferences(userId: String, p: NotificationPreferencesView, now: String) = database.execute("update notification_preferences set weekly_digest = ?, push_social = ?, push_messages = ?, push_groups = ?, push_jobs = ?, push_system = ?, updated_at = ? where user_id = ?", DbParams().bindBool(p.weeklyDigest()).bindBool(p.pushSocial()).bindBool(p.pushMessages()).bindBool(p.pushGroups()).bindBool(p.pushJobs()).bindBool(p.pushSystem()).bindInstant(now).bindStr(userId))
+    Bool announcementSent(key: String) = database.queryLong("select count(*) from system_announcements where announcement_key = ?", DbParams().bindStr(key)) > 0L
+    markAnnouncementSent(key: String, now: String) {
+        if (!announcementSent(key)) {
+            database.execute("insert into system_announcements (announcement_key, sent_at) values (?, ?)", DbParams().bindStr(key).bindInstant(now))
+        }
+    }
+}

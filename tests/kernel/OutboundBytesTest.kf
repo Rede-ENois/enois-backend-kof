@@ -3,7 +3,7 @@ import kernel.http.*
 import kernel.concurrent.*
 import kernel.testkit.*
 
-// HttpFetch.getBytes and Gate: the adapters load, run and map status, content type, size and failures.
+// Outbound.getBytes and Gate: the adapters load, run and map status, content type, size and failures.
 class OhtHolder {
     static TestApp? cached = null
     static TestApp app() {
@@ -27,7 +27,7 @@ class OhtHolder {
 }
 
 test "get returns status, lower-cased content type and the body bytes" {
-    var res = HttpFetch.getBytes(OhtHolder.url("/ok"), listOf("Accept: */*", "User-Agent: probe"), 2000, 2000, 1000)
+    var res = Outbound.getBytes(OhtHolder.url("/ok"), listOf("Accept: */*", "User-Agent: probe"), 2000, 2000, 1000)
     assert(res.status == 200)
     assert(res.contentType.startsWith("text/plain"))
     assert(res.size() == 3)
@@ -35,30 +35,30 @@ test "get returns status, lower-cased content type and the body bytes" {
 }
 
 test "an error status still returns its body and does not throw" {
-    var res = HttpFetch.getBytes(OhtHolder.url("/gone"), listOf<String>(), 2000, 2000, 1000)
+    var res = Outbound.getBytes(OhtHolder.url("/gone"), listOf<String>(), 2000, 2000, 1000)
     assert(res.status == 404)
     assert(res.text() == "nope")
 }
 
 test "the body is read at most maxBytes plus one so a caller sees it is too large" {
-    var res = HttpFetch.getBytes(OhtHolder.url("/big"), listOf<String>(), 2000, 2000, 4)
+    var res = Outbound.getBytes(OhtHolder.url("/big"), listOf<String>(), 2000, 2000, 4)
     assert(res.status == 200)
     assert(res.size() == 5)
 }
 
 test "redirects are not followed" {
-    var res = HttpFetch.getBytes(OhtHolder.url("/moved"), listOf<String>(), 2000, 2000, 1000)
+    var res = Outbound.getBytes(OhtHolder.url("/moved"), listOf<String>(), 2000, 2000, 1000)
     assert(res.status == 302)
 }
 
 test "a network failure throws OUTBOUND_FAILED" {
     var failed = ""
     try {
-        HttpFetch.getBytes("http://127.0.0.1:1/x", listOf<String>(), 500, 500, 10)
+        Outbound.getBytes("http://127.0.0.1:1/x", listOf<String>(), 500, 500, 10)
     } catch (String e) {
         failed = e
     }
-    assert(failed.startsWith("OUTBOUND_FAILED"))
+    assert(failed == "OUTBOUND_FAILED")
 }
 
 test "gate enter, leave and tryEnter work (the cross-thread skip is asserted in the emotes catalog test)" {
@@ -69,4 +69,16 @@ test "gate enter, leave and tryEnter work (the cross-thread skip is asserted in 
     gate.leave()
     assert(gate.tryEnter())
     gate.leave()
+}
+
+test "attempt answers status 0 instead of throwing when the host is unreachable" {
+    var reply = Outbound.attempt("GET", "http://127.0.0.1:1/x", listOf<String>(), "", 500)
+    assert(reply.status == 0)
+    assert(reply.body == "")
+}
+
+test "probe answers the status and content type, and 0 when unreachable" {
+    var ok = Outbound.probe(OhtHolder.url("/ok"), 2000)
+    assert(ok.status == 200)
+    assert(Outbound.probe("http://127.0.0.1:1/x", 500).status == 0)
 }

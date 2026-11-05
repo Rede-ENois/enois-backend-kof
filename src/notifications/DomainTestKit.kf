@@ -1,0 +1,99 @@
+package notifications
+
+import java.time.Instant
+import java.time.ZoneId
+import java.util.HashMap
+import kernel.*
+import kernel.db.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Test support shared by the notifications, push, messaging and calls suites (one booted app per test
+// file: Security.install sets process-wide statics).
+//
+//   var app = DomainTestKit.boot("calls", mapOf(), (p: Platform, s: SharedServices, parts: SecurityParts) -> { ... })
+//   var res = app.client.getWith("/notifications", DomainTestKit.auth(token))
+class DomainTestKit {
+    // Platform + the whole request pipeline + shared services; `wire` installs the domain modules.
+    static TestApp boot(name: String, overrides: Map<String,String>, wire: (Platform, SharedServices, SecurityParts) -> void) {
+        var merged = new HashMap<String, String>()
+        merged.put("REDE_ORIGINS_ENFORCE", "false")
+        for (var k in overrides.keys()) {
+            merged.put(k, overrides.getOrDefault(k, ""))
+        }
+        SecurityClock.reset()
+        return TestApp.bootWith(name, merged, (p: Platform) -> DomainTestKit.wireAll(p, wire))
+    }
+    static wireAll(p: Platform, wire: (Platform, SharedServices, SecurityParts) -> void) {
+        var parts = Security.install(p, SecurityHooks.defaults(p.db))
+        var shared = SharedServices.create(p)
+        wire(p, shared, parts)
+        // Background loops (outbox worker, sweeps) would keep the test process alive: tests drive them
+        // by hand (`outbox.processPending()`, `sweepOnce()`).
+        shared.stop()
+    }
+    static List<String> auth(token: String) = listOf("X-Session-Token: " + token)
+    // Auth + JSON body + an Idempotency-Key.
+    static List<String> command(token: String, key: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json", "Idempotency-Key: " + key)
+    // A verified user with a live session; the token is `tok-<id>-1234567890`.
+    static String login(app: TestApp, id: String) {
+        var token = "tok-" + id + "-1234567890"
+        SecurityFixtures.login(app.db(), id, token)
+        return token
+    }
+    // Position of the item with this `id` in the array at `listPath`, or -1.
+    static Int indexOfId(res: TestResponse, listPath: String, id: String) {
+        var n = res.jsonSize(listPath)
+        var i = 0
+        while (i < n) {
+            if (res.jsonStr(listPath + "." + i + ".id") == id) {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+    // `field` of the item with this id; throws when the item is missing.
+    static String? itemStr(res: TestResponse, listPath: String, id: String, field: String) {
+        var i = DomainTestKit.indexOfId(res, listPath, id)
+        if (i < 0) {
+            throw "FAIL item " + id + " not in " + listPath + "; body=" + res.body
+        }
+        return res.jsonStr(listPath + "." + i + "." + field)
+    }
+    static Bool itemIsNull(res: TestResponse, listPath: String, id: String, field: String) {
+        var i = DomainTestKit.indexOfId(res, listPath, id)
+        if (i < 0) {
+            throw "FAIL item " + id + " not in " + listPath + "; body=" + res.body
+        }
+        return res.jsonIsNull(listPath + "." + i + "." + field)
+    }
+    // Inserts a notification row the way the Java tests do with JdbcTemplate.
+    static insertNotification(store: Db, id: String, userId: String, kind: String, actorId: String, read: Bool, href: String?) {
+        store.execute("insert into notifications (id, user_id, kind, actor_id, title, body, href, is_read, created_at) values (?, ?, ?, ?, \'Aviso\', \'corpo\', ?, ?, ?)", DbParams().bindStr(id).bindStr(userId).bindStr(kind).bindStr(actorId).bindStrOrNull(href).bindBool(read).bindInstant(Time.nowIso()))
+    }
+    // Like `login` with an adult birth date (the age gate of every write path needs one).
+    static String loginAdult(app: TestApp, id: String) {
+        var token = DomainTestKit.login(app, id)
+        app.db().execute("update users set birth_date = \'1990-01-01\' where id = ?", DbParams().bindStr(id))
+        return token
+    }
+    static makeMinor(app: TestApp, id: String) {
+        var cutoff = Instant.now().atZone(ZoneId.of("America/Sao_Paulo")).toLocalDate().minusYears(15L).toString()
+        app.db().execute("update users set birth_date = ? where id = ?", DbParams().bindDate(cutoff).bindStr(id))
+    }
+    static connect(app: TestApp, a: String, b: String, status: String) {
+        var now = Time.nowIso()
+        app.db().execute("insert into user_connections (requester_user_id, receiver_user_id, status, created_at) values (?, ?, ?, ?)", DbParams().bindStr(a).bindStr(b).bindStr(status).bindInstant(now))
+    }
+    static block(app: TestApp, blocker: String, blocked: String) {
+        app.db().execute("insert into user_blocks (blocker_id, blocked_id, created_at) values (?, ?, ?)", DbParams().bindStr(blocker).bindStr(blocked).bindInstant(Time.nowIso()))
+    }
+    // An ACTIVE (or any status) professional profile, the state the corporate domain would leave.
+    static professional(app: TestApp, userId: String, status: String) {
+        var now = Time.nowIso()
+        app.db().execute("insert into corporate_profiles (user_id, username, name, status, created_at, updated_at) values (?, ?, \'Perfil Profissional\', ?, ?, ?)", DbParams().bindStr(userId).bindStr("pro" + userId).bindStr(status).bindInstant(now).bindInstant(now))
+    }
+}

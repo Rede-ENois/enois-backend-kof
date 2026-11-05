@@ -1,0 +1,82 @@
+import identity.*
+import kernel.db.*
+import kernel.testkit.*
+
+IdentityTestApp ctx() = IdentityTestApp.shared("emailverif", mapOf())
+
+test "accountOnlyWorksAfterTheEmailIsConfirmed (EmailVerificationFlowTests)" {
+    var t = ctx()
+    var email = "verifica.fluxo@example.com"
+    Check.status(t.signup(email, "Test1234!", "signup-" + email), 201)
+    Check.eqInt("one link mailed", 1, t.mailCount("EMAIL_VERIFICATION", email))
+    var token = t.mailToken("EMAIL_VERIFICATION", email)
+    // Pending: the login issues no session and says why.
+    Check.apiError(t.login(email, "Test1234!"), 403, "EMAIL_NOT_VERIFIED")
+    var verified = t.post("/auth/email/verify", "{\"token\":\"" + token + "\"}")
+    Check.status(verified, 200)
+    Check.jsonEq(verified, "user.emailVerified", "true")
+    var sessionToken = verified.cookie("enois_session")
+    // The session of the link already works for protected features.
+    var me = t.getWithToken("/auth/me", sessionToken)
+    Check.status(me, 200)
+    Check.jsonEq(me, "emailVerified", "true")
+    // Single use: in the two-step signup the pending row is gone, so the second time is 404 INVALID_TOKEN.
+    Check.apiError(t.post("/auth/email/verify", "{\"token\":\"" + token + "\"}"), 404, "INVALID_TOKEN")
+    // Once confirmed, the normal login works.
+    Check.status(t.login(email, "Test1234!"), 200)
+}
+
+test "rejectsUnknownAndExpiredTokens (EmailVerificationFlowTests)" {
+    var t = ctx()
+    var email = "verifica.expirado@example.com"
+    Check.status(t.signup(email, "Test1234!", "signup-" + email), 201)
+    Check.apiError(t.post("/auth/email/verify", "{\"token\":\"verify_nao-existe\"}"), 404, "INVALID_TOKEN")
+    var expired = t.mailToken("EMAIL_VERIFICATION", email)
+    t.db().execute("update pending_signups set expires_at = ? where email = ?", DbParams().bindInstant("2020-01-01T00:00:00Z").bindStr(email))
+    Check.apiError(t.post("/auth/email/verify", "{\"token\":\"" + expired + "\"}"), 410, "TOKEN_EXPIRED")
+}
+
+test "resendIsRateLimitedAndDoesNotRevealWhetherTheEmailExists (EmailVerificationFlowTests)" {
+    var t = ctx()
+    var email = "verifica.reenvio@example.com"
+    Check.status(t.signup(email, "Test1234!", "signup-" + email), 201)
+    Check.eqInt("one mail", 1, t.mailCount("EMAIL_VERIFICATION", email))
+    var body = "{\"email\":\"" + email + "\"}"
+    // The signup already spent 1 of the 3 resends of the window.
+    Check.status(t.post("/auth/email/resend", body), 202)
+    Check.status(t.post("/auth/email/resend", body), 202)
+    Check.apiError(t.post("/auth/email/resend", body), 429, "TOO_MANY_REQUESTS")
+    // An e-mail with no account: a neutral answer, it does not say it does not exist.
+    Check.status(t.post("/auth/email/resend", "{\"email\":\"nao-existe-1@example.com\"}"), 202)
+}
+
+test "signupResponseNeverCarriesCredentials (EmailVerificationFlowTests)" {
+    var t = ctx()
+    var res = t.signup("verifica.resposta@example.com", "Test1234!", "signup-resposta")
+    Check.status(res, 201)
+    Check.isTrue("no token", res.body.indexOf("token") < 0)
+    Check.isTrue("no refreshToken", res.body.indexOf("refreshToken") < 0)
+    Check.isTrue("verificationRequired", res.body.indexOf("verificationRequired") >= 0)
+}
+
+test "an e-mail sent for an existing unverified account links a one-use token that resend invalidates" {
+    var t = ctx()
+    // An account born with an unverified e-mail (a second factor is what lets it in elsewhere).
+    var id = "unverified_acct_1"
+    t.db().execute("insert into users (id, username, name, email, open_to_work, is_mentor, reputation, is_admin, created_at, updated_at) values (?, ?, ?, ?, false, false, 0, false, ?, ?)", DbParams().bindStr(id).bindStr(id).bindStr("Sem Confirmar").bindStr("unverified1@example.com").bindInstant("2026-01-01T00:00:00Z").bindInstant("2026-01-01T00:00:00Z"))
+    Check.status(t.post("/auth/email/resend", "{\"email\":\"unverified1@example.com\"}"), 202)
+    var first = t.mailToken("EMAIL_VERIFICATION", "unverified1@example.com")
+    Check.status(t.post("/auth/email/resend", "{\"email\":\"unverified1@example.com\"}"), 202)
+    var second = t.mailToken("EMAIL_VERIFICATION", "unverified1@example.com")
+    Check.isTrue("a new token", first != second)
+    // The older link was marked used by the resend.
+    Check.apiError(t.post("/auth/email/verify", "{\"token\":\"" + first + "\"}"), 409, "TOKEN_ALREADY_USED")
+    var ok = t.post("/auth/email/verify", "{\"token\":\"" + second + "\"}")
+    Check.status(ok, 200)
+    Check.jsonEq(ok, "user.emailVerified", "true")
+    Check.apiError(t.post("/auth/email/verify", "{\"token\":\"" + second + "\"}"), 409, "TOKEN_ALREADY_USED")
+}
+
+test "zz shutdown" {
+    ctx().stop()
+}

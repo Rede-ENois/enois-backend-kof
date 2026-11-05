@@ -1,0 +1,81 @@
+package themes
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+
+record ThemePublished(String id, String status)
+
+record ThemeStatus(String status)
+
+// Community theme gallery. Reads are public; every write needs a session (the write gate) and publishing,
+// editing and hiding belong to the author.
+class ThemeRoutes {
+    static register(server: HttpServer, service: ThemeService) {
+        server.get("/temas/galeria", () -> ThemeRoutes.list(service))
+        // The literal path before the variable one, as Spring prefers it.
+        server.get("/temas/galeria/mine", () -> ThemeRoutes.mine(service))
+        server.get("/temas/galeria/:themeId", () -> ThemeRoutes.get(service))
+        server.post("/temas/galeria", () -> ThemeRoutes.publish(service))
+        server.patch("/temas/galeria/:themeId", () -> ThemeRoutes.update(service))
+        server.post("/temas/galeria/:themeId/install", () -> ThemeRoutes.install(service))
+        server.post("/temas/galeria/:themeId/report", () -> ThemeRoutes.report(service))
+        server.post("/temas/galeria/:themeId/hide", () -> ThemeRoutes.hide(service))
+    }
+    static String list(service: ThemeService) {
+        // Capped: every theme carries its whole JSON package and the gallery is public.
+        var limit = Req.queryInt("limit", 60)
+        if (limit < 1) {
+            limit = 1
+        }
+        if (limit > 100) {
+            limit = 100
+        }
+        return json.encode(ThemeRoutes.views(service.list(limit)))
+    }
+    static String get(service: ThemeService) = json.encode(ThemeViews.of(service.get(Req.pathParam("themeId"))))
+    static String mine(service: ThemeService) {
+        var userId = Auth.requireUser()
+        return json.encode(ThemeRoutes.views(service.mine(userId)))
+    }
+    static List<ThemeGalleryView> views(themes: List<ThemePackage>) {
+        var out = listOf<ThemeGalleryView>()
+        for (var t in themes) {
+            out.add(ThemeViews.of(t))
+        }
+        return out
+    }
+    static String publish(service: ThemeService) {
+        var userId = Auth.requireUser()
+        var request = ThemeRoutes.parse()
+        var created = service.publish(userId, request.name(), request.description(), request.packageJson(), request.modeDefault())
+        return json.encode(ThemePublished(created.id(), created.status()))
+    }
+    static String update(service: ThemeService) {
+        var userId = Auth.requireUser()
+        var request = ThemeRoutes.parse()
+        return json.encode(ThemeViews.of(service.update(Req.pathParam("themeId"), userId, request.name(), request.description(), request.packageJson(), request.modeDefault())))
+    }
+    static String install(service: ThemeService) {
+        service.install(Req.pathParam("themeId"))
+        return json.encode(ThemeStatus("INSTALLED"))
+    }
+    static String report(service: ThemeService) {
+        service.report(Req.pathParam("themeId"))
+        return json.encode(ThemeStatus("REPORTED"))
+    }
+    static String hide(service: ThemeService) {
+        var userId = Auth.requireUser()
+        service.hide(Req.pathParam("themeId"), userId)
+        return json.encode(ThemeStatus("HIDDEN"))
+    }
+    static ThemeRequest parse() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ThemeRequest>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

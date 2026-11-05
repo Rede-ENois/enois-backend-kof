@@ -1,0 +1,223 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import leaves.*
+
+// Port of ThemeGalleryTests (HTTP) plus the gate details of ThemeService: schema, contrast, patch, owner.
+class ThemeHolder {
+    static TestApp? app = null
+}
+
+TestApp themeApp() {
+    var cur = ThemeHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = LeavesApp.boot("themes", mapOf("X", "1"))
+    ThemeHolder.app = created
+    return created
+}
+
+List<String> asToken(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+
+// A verified user with a live session whose token is derived from the id.
+String author(app: TestApp, id: String) {
+    var token = "tok-" + id + "-1234567890"
+    if (app.db().queryLong("select count(*) from users where id = ?", DbParams().bindStr(id)) == 0L) {
+        SecurityFixtures.login(app.db(), id, token)
+    }
+    return token
+}
+
+String pkg(bg: String, strong: String) = "{\"palette\":{\"background\":\"" + bg + "\",\"surface\":\"" + bg + "\",\"muted\":\"" + bg + "\",\"border\":\"" + bg + "\",\"primary\":\"#7c3aed\",\"onPrimary\":\"#ffffff\",\"soft\":\"#ede8f5\",\"text\":{\"strong\":\"" + strong + "\",\"subtle\":\"#555555\",\"date\":\"#777777\"},\"radius\":\"8px\"}}"
+
+// A complete light palette: enough to pass the schema and reach only the contrast gate.
+String light() = "\"background\":\"#f5e6c8\",\"surface\":\"#f0e2c4\",\"muted\":\"#e8d9b8\",\"border\":\"#d8c9a8\",\"primary\":\"#7c3aed\",\"onPrimary\":\"#ffffff\",\"text\":{\"strong\":\"#3a2a10\",\"subtle\":\"#5a4a30\",\"date\":\"#777777\"}"
+
+String themeBody(name: String, packageJson: String) = "{\"name\":" + json.encode(name) + ",\"modeDefault\":\"light\",\"packageJson\":" + json.encode(packageJson) + "}"
+
+TestResponse publish(app: TestApp, token: String, name: String, packageJson: String) = app.client.send("POST", "/temas/galeria", asToken(token), "", themeBody(name, packageJson))
+
+TestResponse patch(app: TestApp, token: String, themeId: String, body: String) = app.client.send("PATCH", "/temas/galeria/" + themeId, asToken(token), "", body)
+
+String publishId(app: TestApp, token: String, name: String, packageJson: String) {
+    var res = publish(app, token, name, packageJson)
+    Check.status(res, 200)
+    return "" + res.jsonStr("id")
+}
+
+String msg(res: TestResponse) = "" + res.jsonStr("message")
+
+test "the palette contract is enforced on publish" {
+    var app = themeApp()
+    var token = author(app, "tgal_contract")
+    // radius at the root is read by nobody: refusing with the right path beats publishing a theme whose
+    // colour would vanish without any explanation.
+    var root = publish(app, token, "Radius Solto", "{\"palette\":{" + light() + "},\"radius\":\"8px\"}")
+    Check.status(root, 400)
+    Check.isTrue("hint to move it", msg(root).contains("Mova para dentro de palette"))
+    // muted is not an optional colour: the front calls hexToRgb() on it without a guard.
+    var noMuted = publish(app, token, "Sem Muted", "{\"palette\":{\"background\":\"#f5e6c8\",\"surface\":\"#f0e2c4\",\"border\":\"#d8c9a8\",\"primary\":\"#7c3aed\",\"onPrimary\":\"#ffffff\",\"text\":{\"strong\":\"#3a2a10\",\"subtle\":\"#5a4a30\",\"date\":\"#777777\"}}}")
+    Check.status(noMuted, 400)
+    Check.isTrue("names muted", msg(noMuted).contains("Cor invalida em muted"))
+    // extra is raw CSS and went straight into the browser <style>.
+    var extra = publish(app, token, "Com CSS Cru", "{\"palette\":{" + light() + ",\"extra\":{\"--card\":\"url(evil)\"}}}")
+    Check.status(extra, 400)
+    Check.isTrue("raw css", msg(extra).contains("CSS cru"))
+    // The hole that published unreadable themes: strong text passes against the BACKGROUND and the CARD but
+    // not against the alternate block, which is the --surface-2 of the selected navigation item.
+    var menu = publish(app, token, "Menu Ilegivel", "{\"palette\":{\"background\":\"#2b2a33\",\"surface\":\"#3a3945\",\"muted\":\"#f2f0e8\",\"border\":\"#4a4859\",\"primary\":\"#bd93f9\",\"onPrimary\":\"#282a36\",\"text\":{\"strong\":\"#f8f8f2\",\"subtle\":\"#c8c6d2\",\"date\":\"#b0aec0\"}}}")
+    Check.apiError(menu, 400, "THEME_CONTRAST_LOW")
+    Check.isTrue("names the alternate block", msg(menu).contains("bloco alternativo"))
+}
+
+test "publish, list, install and report" {
+    var app = themeApp()
+    var token = author(app, "tgal_author")
+    var created = app.client.send("POST", "/temas/galeria", asToken(token), "", "{\"name\":\"Tema Bonito\",\"description\":\"tema de teste\",\"modeDefault\":\"light\",\"packageJson\":" + json.encode(pkg("#f5e6c8", "#3a2a10")) + "}")
+    Check.status(created, 200)
+    Check.jsonEq(created, "status", "PUBLISHED")
+    var themeId = "" + created.jsonStr("id")
+    Check.isTrue("theme_ id", themeId.startsWith("theme_"))
+    var list = app.client.get("/temas/galeria?limit=30")
+    Check.status(list, 200)
+    Check.isTrue("listed", list.body.contains(themeId) && list.body.contains("Tema Bonito"))
+    Check.status(app.client.get("/v1/temas/galeria"), 200)
+    // Installing and reporting are WRITES: the fail-closed gate asks for a session.
+    Check.apiError(app.client.send("POST", "/temas/galeria/" + themeId + "/install", listOf("Content-Type: application/json"), "", ""), 401, "UNAUTHENTICATED")
+    var install = app.client.send("POST", "/temas/galeria/" + themeId + "/install", asToken(token), "", "")
+    Check.status(install, 200)
+    Check.jsonEq(install, "status", "INSTALLED")
+    var report = app.client.send("POST", "/temas/galeria/" + themeId + "/report", asToken(token), "", "")
+    Check.status(report, 200)
+    Check.jsonEq(report, "status", "REPORTED")
+    Check.eqStr("reported once", "1", "" + app.db().queryLong("select reported from theme_gallery where id = ?", DbParams().bindStr(themeId)))
+    // A package with a url() where a colour belongs is refused at the door.
+    var bad = publish(app, token, "Tema Ruim", "{\"palette\":{\"background\":\"url(evil)\",\"text\":{\"strong\":\"#000\"}}}")
+    Check.apiError(bad, 400, "INVALID_THEME_PACKAGE")
+    Check.eqStr("which colour", "Cor invalida em background.", msg(bad))
+}
+
+test "a low contrast theme is rejected" {
+    var app = themeApp()
+    var token = author(app, "tgal_author2")
+    var res = publish(app, token, "Tema Invisivel", pkg("#f8f8f8", "#f0f0f0"))
+    Check.apiError(res, 400, "THEME_CONTRAST_LOW")
+    // Math.round(ratio * 100) / 100 in Java is an integer division: the message reads a whole number.
+    Check.isTrue("measured", msg(res).contains("pelo menos 4.5:1 (medido: 1:1)."))
+}
+
+test "anyone lists but only a session publishes" {
+    var app = themeApp()
+    Check.status(app.client.get("/temas/galeria?limit=5"), 200)
+    var res = app.client.send("POST", "/temas/galeria", listOf("Content-Type: application/json"), "", themeBody("Anon", pkg("#f5e6c8", "#3a2a10")))
+    Check.apiError(res, 401, "UNAUTHENTICATED")
+}
+
+test "the author patches the published theme keeping id and installs" {
+    var app = themeApp()
+    var token = author(app, "tgal_patch")
+    var themeId = publishId(app, token, "Tema Patch", pkg("#f5e6c8", "#3a2a10"))
+    Check.status(app.client.send("POST", "/temas/galeria/" + themeId + "/install", asToken(token), "", ""), 200)
+    Check.status(app.client.send("POST", "/temas/galeria/" + themeId + "/install", asToken(token), "", ""), 200)
+    var novo = pkg("#eef3f7", "#1e2a36")
+    var res = patch(app, token, themeId, "{\"packageJson\":" + json.encode(novo) + ",\"description\":\"ajeitei o azul\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "id", themeId)
+    Check.jsonEq(res, "name", "Tema Patch")
+    Check.jsonEq(res, "description", "ajeitei o azul")
+    Check.jsonEq(res, "installs", "2")
+    Check.jsonEq(res, "packageJson", novo)
+    // The same id with the new package: whoever installed before gets the fix without reinstalling.
+    var read = app.client.get("/temas/galeria/" + themeId)
+    Check.status(read, 200)
+    Check.jsonEq(read, "packageJson", novo)
+    Check.jsonEq(read, "installs", "2")
+}
+
+test "a patch keeps what the body omits and revalidates what it sends" {
+    var app = themeApp()
+    var token = author(app, "tgal_patch2")
+    var original = pkg("#f5e6c8", "#3a2a10")
+    var themeId = publishId(app, token, "Tema Omissao", original)
+    var empty = patch(app, token, themeId, "{}")
+    Check.status(empty, 200)
+    Check.jsonEq(empty, "name", "Tema Omissao")
+    Check.jsonEq(empty, "packageJson", original)
+    var renamed = patch(app, token, themeId, "{\"name\":\"Tema Renomeado\"}")
+    Check.status(renamed, 200)
+    Check.jsonEq(renamed, "name", "Tema Renomeado")
+    Check.jsonEq(renamed, "packageJson", original)
+    Check.apiError(patch(app, token, themeId, "{\"packageJson\":" + json.encode("{\"palette\":{\"background\":\"url(evil)\"}}") + "}"), 400, "INVALID_THEME_PACKAGE")
+    Check.apiError(patch(app, token, themeId, "{\"packageJson\":" + json.encode(pkg("#f8f8f8", "#f0f0f0")) + "}"), 400, "THEME_CONTRAST_LOW")
+    Check.apiError(patch(app, token, themeId, "{\"name\":\"ab\"}"), 400, "INVALID_THEME_NAME")
+    Check.apiError(patch(app, token, themeId, "{\"modeDefault\":\"neon\"}"), 400, "INVALID_THEME_MODE")
+    // The column is varchar(300): a longer body would overflow in the database and become a 500.
+    Check.apiError(patch(app, token, themeId, "{\"description\":\"" + strings.repeat("d", 301) + "\"}"), 400, "INVALID_THEME_DESCRIPTION")
+    var desc = app.client.send("POST", "/temas/galeria", asToken(token), "", "{\"name\":\"Descricao Cumprida\",\"modeDefault\":\"light\",\"description\":\"" + strings.repeat("d", 301) + "\",\"packageJson\":" + json.encode(pkg("#f5e6c8", "#3a2a10")) + "}")
+    Check.apiError(desc, 400, "INVALID_THEME_DESCRIPTION")
+    // None of the refusals touched what is published.
+    var read = app.client.get("/temas/galeria/" + themeId)
+    Check.jsonEq(read, "name", "Tema Renomeado")
+    Check.jsonEq(read, "packageJson", original)
+    Check.jsonEq(read, "modeDefault", "light")
+}
+
+test "only the author can patch" {
+    var app = themeApp()
+    var token = author(app, "tgal_patch3")
+    var stranger = author(app, "tgal_patch3_outsider")
+    var themeId = publishId(app, token, "Tema Fechado", pkg("#f5e6c8", "#3a2a10"))
+    Check.apiError(patch(app, stranger, themeId, "{\"name\":\"Sequestrado\"}"), 403, "NOT_AUTHORIZED")
+    Check.apiError(app.client.send("PATCH", "/temas/galeria/" + themeId, listOf("Content-Type: application/json"), "", "{\"name\":\"Sem Sessao\"}"), 401, "UNAUTHENTICATED")
+    Check.jsonEq(app.client.get("/temas/galeria/" + themeId), "name", "Tema Fechado")
+    // A theme that does not exist: 404, not 403 — there is no edit without the theme.
+    Check.apiError(patch(app, token, "theme_nao_existe", "{\"name\":\"Fantasma\"}"), 404, "THEME_NOT_FOUND")
+}
+
+test "mine lists the authors themes, hide takes one out of the gallery and only the author hides" {
+    var app = themeApp()
+    var token = author(app, "tgal_mine")
+    var other = author(app, "tgal_mine_other")
+    var first = publishId(app, token, "Meu Tema Um", pkg("#f5e6c8", "#3a2a10"))
+    var second = publishId(app, token, "Meu Tema Dois", pkg("#f5e6c8", "#3a2a10"))
+    var mine = app.client.getWith("/temas/galeria/mine", asToken(token))
+    Check.status(mine, 200)
+    Check.eqInt("two", 2, mine.jsonSize(""))
+    Check.apiError(app.client.get("/temas/galeria/mine"), 401, "UNAUTHENTICATED")
+    Check.apiError(app.client.send("POST", "/temas/galeria/" + first + "/hide", asToken(other), "", ""), 403, "NOT_AUTHORIZED")
+    var hidden = app.client.send("POST", "/temas/galeria/" + first + "/hide", asToken(token), "", "")
+    Check.status(hidden, 200)
+    Check.jsonEq(hidden, "status", "HIDDEN")
+    Check.apiError(app.client.get("/temas/galeria/" + first), 404, "THEME_NOT_FOUND")
+    Check.apiError(app.client.send("POST", "/temas/galeria/" + first + "/install", asToken(token), "", ""), 404, "THEME_NOT_FOUND")
+    Check.status(app.client.get("/temas/galeria/" + second), 200)
+    Check.isTrue("not in the gallery list", !app.client.get("/temas/galeria?limit=100").body.contains(first))
+    Check.eqInt("the author still sees both", 2, app.client.getWith("/temas/galeria/mine", asToken(token)).jsonSize(""))
+}
+
+test "name, mode and package size are validated on publish" {
+    var app = themeApp()
+    var token = author(app, "tgal_valid")
+    var ok = pkg("#f5e6c8", "#3a2a10")
+    Check.apiError(publish(app, token, "ab", ok), 400, "INVALID_THEME_NAME")
+    Check.apiError(app.client.send("POST", "/temas/galeria", asToken(token), "", "{\"name\":\"Modo Errado\",\"modeDefault\":\"neon\",\"packageJson\":" + json.encode(ok) + "}"), 400, "INVALID_THEME_MODE")
+    Check.apiError(app.client.send("POST", "/temas/galeria", asToken(token), "", "{\"name\":\"Sem Pacote\",\"modeDefault\":\"dark\"}"), 400, "INVALID_THEME_PACKAGE")
+    Check.apiError(publish(app, token, "Pacote Gigante", "{\"palette\":\"" + strings.repeat("a", 4100) + "\"}"), 400, "INVALID_THEME_PACKAGE")
+    var notJson = publish(app, token, "Nao E Json", "not json at all")
+    Check.apiError(notJson, 400, "INVALID_THEME_PACKAGE")
+    Check.eqStr("message", "Pacote nao e um JSON valido.", msg(notJson))
+    Check.eqStr("array root", "Pacote nao e um JSON valido.", msg(publish(app, token, "Raiz Array", "[1,2]")))
+    Check.eqStr("unknown key", "Chave desconhecida em pacote: foo.", msg(publish(app, token, "Chave Nova", "{\"foo\":1}")))
+    Check.eqStr("needs palette", "Pacote precisa do objeto palette.", msg(publish(app, token, "Sem Paleta", "{}")))
+    Check.eqStr("unknown palette key", "Chave desconhecida em palette: zebra.", msg(publish(app, token, "Chave Paleta", "{\"palette\":{\"zebra\":1}}")))
+    var gradient = publish(app, token, "Gradiente Ruim", "{\"palette\":{" + light() + ",\"gradient\":\"url(x)\"}}")
+    Check.eqStr("gradient", "Gradiente fora do formato permitido.", msg(gradient))
+    Check.eqStr("radius", "Raio deve vir em px ou rem, ex.: 0.875rem.", msg(publish(app, token, "Raio Ruim", "{\"palette\":{" + light() + ",\"radius\":\"1em\"}}")))
+    Check.eqStr("font", "Fonte deve ser uma unica familia, sem virgula, aspas ou ponto e virgula.", msg(publish(app, token, "Fonte Ruim", "{\"palette\":{" + light() + ",\"fontSans\":\"Arial, serif\"}}")))
+    Check.eqStr("alpha", "surfaceAlpha deve ser um numero de 0 a 100.", msg(publish(app, token, "Alfa Ruim", "{\"palette\":{" + light() + ",\"surfaceAlpha\":150}}")))
+    Check.eqStr("needs text", "Pacote precisa do objeto text.", msg(publish(app, token, "Sem Texto", "{\"palette\":{\"background\":\"#f5e6c8\",\"surface\":\"#f0e2c4\",\"muted\":\"#e8d9b8\",\"border\":\"#d8c9a8\",\"primary\":\"#7c3aed\",\"onPrimary\":\"#ffffff\"}}")))
+    Check.status(publish(app, token, "Gradiente Bom", "{\"palette\":{" + light() + ",\"gradient\":\"linear-gradient(45deg, #112233, #445566)\",\"radius\":\"0.875rem\",\"fontSans\":\"Inter\",\"surfaceAlpha\":90,\"accent\":\"#112233\"}}"), 200)
+    Check.apiError(app.client.send("POST", "/temas/galeria", asToken(token), "", "not json"), 400, "BAD_REQUEST")
+}

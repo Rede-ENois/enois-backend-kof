@@ -1,0 +1,154 @@
+package themes
+
+import kernel.error.*
+import kernel.id.*
+import kernel.time.*
+
+// The community theme gallery: publish and edit (author), list, install and report (everybody), hide
+// (author). The package is a JSON of TOKENS validated by ThemeValidator.
+class ThemeService {
+    ThemeStore themes
+    public constructor(themes: ThemeStore) {
+        this.themes = themes
+    }
+    static Int maxPackageChars() = 4096
+    static Int maxDescriptionChars() = 300
+    ThemePackage publish(userId: String, name: String?, description: String?, packageJson: String?, modeDefault: String?) {
+        var cleanName = ThemeService.requireName(name)
+        ThemeService.requireDescription(description)
+        var pkg = ThemeService.requirePackageSize(packageJson)
+        var mode = ThemeService.requireMode(modeDefault)
+        ThemeValidator.validate(pkg)
+        var theme = ThemePackage(Ids.prefixed("theme_"), userId, cleanName, ThemeService.blankToNull(description), pkg, mode, 0, "PUBLISHED", 0, Time.nowIso())
+        themes.insert(theme)
+        return theme
+    }
+    // The author's edit keeps the id: fixing a colour must not publish a new theme nor hide the old one, which
+    // pollutes the gallery and zeroes the installs. What the body leaves out stays; what it brings passes
+    // through exactly the same refusals as publishing. Clearing the description takes a blank string.
+    ThemePackage update(themeId: String, userId: String, name: String?, description: String?, packageJson: String?, modeDefault: String?) {
+        var theme = themes.findById(themeId)
+        if (theme == null) {
+            throw Errors.api(404, "THEME_NOT_FOUND", "Tema nao encontrado na galeria.")
+        }
+        if (theme.authorId() != userId) {
+            throw Errors.api(403, "NOT_AUTHORIZED", "So o autor pode editar o tema publicado.")
+        }
+        var nextName = theme.name()
+        if (name != null) {
+            nextName = ThemeService.requireName(name)
+        }
+        ThemeService.requireDescription(description)
+        var nextPackage = theme.packageJson()
+        if (packageJson != null) {
+            nextPackage = ThemeService.requirePackageSize(packageJson)
+            ThemeValidator.validate(nextPackage)
+        }
+        var nextMode = theme.modeDefault()
+        if (modeDefault != null) {
+            nextMode = ThemeService.requireMode(modeDefault)
+        }
+        var nextDescription = theme.description()
+        if (description != null) {
+            nextDescription = ThemeService.blankToNull(description)
+        }
+        var edited = ThemePackage(theme.id(), theme.authorId(), nextName, nextDescription, nextPackage, nextMode, theme.installs(), theme.status(), theme.reported(), theme.createdAt())
+        themes.updateContent(edited)
+        return edited
+    }
+    static String requireName(name: String?) {
+        if (name == null) {
+            throw ThemeService.invalidName()
+        }
+        var clean = name.trim()
+        if (clean.length() < 3 || clean.length() > 80) {
+            throw ThemeService.invalidName()
+        }
+        return clean
+    }
+    static String invalidName() = Errors.api(400, "INVALID_THEME_NAME", "Nome do tema precisa de 3 a 80 caracteres.")
+    // The column is varchar(300): without this guard a long body overflows in the database and becomes a 500.
+    static requireDescription(description: String?) {
+        if (description != null && description.trim().length() > ThemeService.maxDescriptionChars()) {
+            throw Errors.api(400, "INVALID_THEME_DESCRIPTION", "Descricao do tema passa de " + ThemeService.maxDescriptionChars() + " caracteres.")
+        }
+    }
+    static String requirePackageSize(packageJson: String?) {
+        if (packageJson == null) {
+            throw ThemeService.invalidPackageSize()
+        }
+        if (packageJson.trim().length() == 0 || packageJson.length() > ThemeService.maxPackageChars()) {
+            throw ThemeService.invalidPackageSize()
+        }
+        return packageJson
+    }
+    static String invalidPackageSize() = Errors.api(400, "INVALID_THEME_PACKAGE", "Pacote do tema invalido ou grande demais (teto de " + ThemeService.maxPackageChars() + " caracteres).")
+    static String requireMode(modeDefault: String?) {
+        if (modeDefault == null) {
+            throw ThemeService.invalidMode()
+        }
+        if (modeDefault != "light" && modeDefault != "dark") {
+            throw ThemeService.invalidMode()
+        }
+        return modeDefault
+    }
+    static String invalidMode() = Errors.api(400, "INVALID_THEME_MODE", "Modo padrao deve ser light ou dark.")
+    // Trimmed text, or null for blank/absent.
+    static String? blankToNull(text: String?) {
+        if (text == null) {
+            return null
+        }
+        if (text.trim().length() == 0) {
+            return null
+        }
+        return text.trim()
+    }
+    List<ThemePackage> list(limit: Int) = themes.findPublished(limit)
+    List<ThemePackage> mine(userId: String) = themes.findByAuthor(userId)
+    // Only a published theme is public.
+    ThemePackage get(id: String) {
+        var theme = themes.findById(id)
+        if (theme == null) {
+            throw Errors.api(404, "THEME_NOT_FOUND", "Tema nao encontrado na galeria.")
+        }
+        if (theme.status() != "PUBLISHED") {
+            throw Errors.api(404, "THEME_NOT_FOUND", "Tema nao encontrado na galeria.")
+        }
+        return theme
+    }
+    // Whether the id is a theme published in the gallery: an account may keep a community theme as its
+    // preference, and those ids are UUIDs that are not in the static list of the hardcoded themes.
+    Bool isPublished(themeId: String) {
+        var theme = themes.findById(themeId)
+        if (theme == null) {
+            return false
+        }
+        return theme.status() == "PUBLISHED"
+    }
+    report(themeId: String) {
+        if (themes.findById(themeId) == null) {
+            throw Errors.api(404, "THEME_NOT_FOUND", "Tema nao encontrado.")
+        }
+        themes.addReport(themeId)
+    }
+    install(themeId: String) {
+        var theme = themes.findById(themeId)
+        if (theme == null) {
+            throw Errors.api(404, "THEME_NOT_FOUND", "Tema nao encontrado.")
+        }
+        if (theme.status() != "PUBLISHED") {
+            throw Errors.api(404, "THEME_NOT_FOUND", "Tema nao encontrado.")
+        }
+        themes.addInstall(themeId)
+    }
+    hide(themeId: String, userId: String) {
+        var theme = themes.findById(themeId)
+        if (theme == null) {
+            throw Errors.api(404, "THEME_NOT_FOUND", "Tema nao encontrado.")
+        }
+        if (theme.authorId() != userId) {
+            throw Errors.api(403, "NOT_AUTHORIZED", "So o autor pode remover o tema da galeria.")
+        }
+        themes.hide(themeId)
+    }
+}

@@ -1,0 +1,66 @@
+package blog
+
+// The blog of a person: one per user (`user_id` is unique) with its own slug, today the username of whoever
+// created it. `themeHtml` is the sanitised HTML/CSS that becomes the face of the page; null means the
+// default header, "" means it was cleared.
+record BlogRecord(String id, String userId, String slug, String title, String? description, String? themeHtml, String createdAt, String updatedAt)
+
+// A post of the blog. Its id is the SAME id as the pointer post created in the feed, so the feed card links
+// straight to the blog post. bodyFormat is HTML (already sanitised) or MARKDOWN (plain text the front formats).
+record BlogPostRecord(String id, String blogId, String userId, String title, String body, String bodyFormat, String publishedAt, String updatedAt)
+
+// Personalisation of the name (theme, font, colour, equipped nameplate) chosen in the profile; null when the
+// person did not customise anything.
+record BlogNameStyle(String? theme, String? font, String? color, String? nameplate)
+
+// What the blog needs to know about the author: the profile fields behind the page header and the newsletter.
+record BlogAuthor(String id, String username, String name, String? avatar, String? email, Bool emailVerified, List<String> badges, BlogNameStyle? style)
+
+record BlogPostView(String id, String title, String body, String bodyFormat, String publishedAt, String updatedAt)
+
+// A blog in the showcase (the Blogs tab): enough to list and link.
+record BlogSummaryView(String slug, String title, String? description, String authorName, String authorUsername, String? authorAvatar, BlogNameStyle? authorStyle, Int posts)
+
+// The blog page: author data (for the header), the theme, the posts and the viewer's state. `subscribed` is the
+// VISITOR's (false without a session), `owner` says whether the reader is the owner.
+record BlogView(String id, String slug, String title, String? description, String? themeHtml, String authorName, String authorUsername, String? authorAvatar, String? authorBadge, List<String> authorBadges, BlogNameStyle? authorStyle, Int posts, Bool subscribed, Bool owner, List<BlogPostView> items)
+
+record BlogRequest(String? title, String? description, String? themeHtml)
+
+record BlogPostRequest(String? title, String? body, String? format, Troolean notifySubscribers)
+
+record BlogStatus(String id, String status)
+
+// Published inside the transaction (an outbox event); the e-mail fan-out runs after the commit.
+record BlogPostPublishedEvent(String blogId, String blogSlug, String blogTitle, String authorUserId, String postId, String postTitle, String postBody)
+
+class BlogViews {
+    static List<String> formats() = listOf("HTML", "MARKDOWN")
+    static BlogPostView post(p: BlogPostRecord) = BlogPostView(p.id(), p.title(), p.body(), p.bodyFormat(), p.publishedAt(), p.updatedAt())
+    static List<BlogPostView> posts(items: List<BlogPostRecord>) {
+        var out = listOf<BlogPostView>()
+        for (var p in items) {
+            out.add(BlogViews.post(p))
+        }
+        return out
+    }
+    static BlogSummaryView summary(blog: BlogRecord, author: BlogAuthor?, posts: Int) {
+        if (author == null) {
+            return BlogSummaryView(blog.slug(), blog.title(), blog.description(), blog.slug(), blog.slug(), null, null, posts)
+        }
+        return BlogSummaryView(blog.slug(), blog.title(), blog.description(), author.name(), author.username(), author.avatar(), author.style(), posts)
+    }
+    static BlogView page(blog: BlogRecord, author: BlogAuthor?, items: List<BlogPostView>, subscribed: Bool, owner: Bool) {
+        if (author == null) {
+            return BlogView(blog.id(), blog.slug(), blog.title(), blog.description(), blog.themeHtml(), blog.slug(), blog.slug(), null, null, listOf<String>(), null, items.size(), subscribed, owner, items)
+        }
+        var badges = author.badges()
+        if (badges.size() == 0) {
+            return BlogView(blog.id(), blog.slug(), blog.title(), blog.description(), blog.themeHtml(), author.name(), author.username(), author.avatar(), null, badges, author.style(), items.size(), subscribed, owner, items)
+        }
+        return BlogView(blog.id(), blog.slug(), blog.title(), blog.description(), blog.themeHtml(), author.name(), author.username(), author.avatar(), badges.get(0), badges, author.style(), items.size(), subscribed, owner, items)
+    }
+    // A write answer carries no post list: it may hold dozens of large HTML posts and would overflow the
+    // idempotency record that stores the answer. The front reloads the page and fetches the list anyway.
+    static BlogView withoutItems(v: BlogView) = BlogView(v.id(), v.slug(), v.title(), v.description(), v.themeHtml(), v.authorName(), v.authorUsername(), v.authorAvatar(), v.authorBadge(), v.authorBadges(), v.authorStyle(), v.posts(), v.subscribed(), v.owner(), listOf<BlogPostView>())
+}

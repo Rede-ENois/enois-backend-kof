@@ -1,10 +1,27 @@
 import gifs.*
 import emotes.*
+import calls.*
 import kernel.*
 import kernel.config.*
 import kernel.log.*
 import kernel.security.*
+import identity.*
+import age.*
+import onboarding.*
+import apiv1.*
+import blog.*
+import notices.*
+import ops.*
+import projects.*
+import releasenotes.*
+import search.*
+import stats.*
+import suggestions.*
+import themes.*
+import messaging.*
+import notifications.*
 import profile.*
+import push.*
 import communities.*
 import communityprojects.*
 import groups.*
@@ -25,11 +42,26 @@ main() {
         // Request pipeline (filters, limiters, guards). Each domain port replaces its own seam in `hooks`
         // (moderators, monitoring, reports, origins) before this line.
         var hooks = SecurityHooks.defaults(platform.db)
-        Security.install(platform, hooks)
+        // ops replaces hooks.monitoring and apiv1 uses hooks.origins: both before Security.install captures them.
+        OpsModule.install(platform, shared, hooks)
+        ApiV1Module.install(platform, shared, hooks)
+        var parts = Security.install(platform, hooks)
+        // identity (auth, 2FA, social login, identity verification), age (parental supervision, age gate) and
+        // onboarding. Seams: IdentitySeams (users, mailer, Turnstile, IP blocks, signup guard, notifier, OAuth links,
+        // identity providers) and OnboardingActions (communities, groups, network); defaults documented in
+        // docs/PORTING_STATUS.md.
+        var identity = IdentityModule.install(platform, shared, hooks, parts)
+        var age = AgeModule.install(platform, identity.mailer)
+        OnboardingModule.install(platform, age.policy)
         // profile, network, preferences, presence (seams: ProfileModule.installWith).
         ProfileModule.install(platform, shared, hooks)
-        // Domains (one line each, after Security.install).
-        GroupsModule.install(platform, shared, hooks)
+        // Domains (one block each, ordered by dependency): notifications is the sink the others write to.
+        var notificationsModule = NotificationsModule.install(platform, shared, hooks, parts)
+        PushModule.install(platform, shared, hooks, parts, notificationsModule)
+        var messagingModule = MessagingModule.install(platform, shared, hooks, parts, notificationsModule)
+        CallsModule.install(platform, shared, hooks, parts, notificationsModule, messagingModule)
+        // Groups notices go through the Notifications API (push + preferences): see GroupNotificationsBridge.
+        GroupsModule.installWith(platform, shared, GroupProfileLookup(platform.db), GroupAgeGate(platform.db), GroupMediaLookup(platform.db), GroupNotificationsBridge(platform.db, notificationsModule.notifications), GroupCoins())
         CommunitiesModule.install(platform, shared, hooks)
         CommunityProjectsModule.install(platform, shared, hooks)
         StudyPairsModule.install(platform, shared, hooks)
@@ -37,6 +69,15 @@ main() {
         LinkedInModule.install(platform, shared, hooks)
         EmotesModule.install(platform, shared, hooks)
         MediaModule.install(platform, shared, hooks)
+        // Leaf domains: stats, search, themes, projects, notices, releasenotes, suggestions, blog.
+        StatsModule.install(platform, shared, hooks)
+        NoticeModule.install(platform, shared, hooks)
+        ReleaseNoteModule.install(platform, shared, hooks)
+        SearchModule.install(platform, shared, hooks)
+        ThemeModule.install(platform, shared, hooks)
+        ProjectsModule.install(platform, shared, hooks)
+        SuggestionsModule.install(platform, shared, hooks)
+        BlogModule.install(platform, shared, hooks)
         log.info("listening on port " + port)
         platform.start(port)
     } catch (String e) {

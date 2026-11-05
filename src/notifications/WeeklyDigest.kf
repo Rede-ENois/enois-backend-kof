@@ -1,0 +1,289 @@
+package notifications
+
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.temporal.IsoFields
+import java.util.Base64
+import kernel.config.*
+import kernel.jobs.*
+import kernel.log.*
+import kernel.security.*
+import kernel.time.*
+
+// The weekly e-mail digest (WeeklyDigestService): at most one per person per ISO week, only to verified
+// e-mails that did not opt out, only when there is something to say (at least two items).
+//
+//   digest.sendTo(userId): "SENT" | "FAILED" | "EMPTY" | "ALREADY_SENT" | "NOT_ELIGIBLE"
+//   digest.runWeekly()                 // every eligible person, in pages
+//   digest.schedule(jobs, cfg)         // REDE_DIGEST_CRON (0 0 9 * * MON), REDE_DIGEST_ZONE, REDE_DIGEST_ENABLED
+class WeeklyDigest {
+    WeeklyDigestStore store
+    NotificationPreferenceService preferences
+    NotificationPlaceReader events
+    DigestPersonalization personalization
+    DigestAccounts accounts
+    DigestMailer mailer
+    SecretCipher cipher
+    String zone
+    Int batchSize
+    String frontendUrl
+    Bool enabled
+    Bool running = false
+    Log log = Log("notifications.digest")
+    public constructor(store: WeeklyDigestStore, preferences: NotificationPreferenceService, events: NotificationPlaceReader, personalization: DigestPersonalization, accounts: DigestAccounts, mailer: DigestMailer, cipher: SecretCipher, cfg: Config) {
+        this.store = store
+        this.preferences = preferences
+        this.events = events
+        this.personalization = personalization
+        this.accounts = accounts
+        this.mailer = mailer
+        this.cipher = cipher
+        this.zone = cfg.getStr("REDE_DIGEST_ZONE", "America/Sao_Paulo")
+        this.batchSize = WeeklyDigest.atLeastOne(cfg.getInt("REDE_DIGEST_BATCH_SIZE", 200))
+        var url = cfg.getStr("REDE_FRONTEND_URL", cfg.getStr("FRONTEND_URL", "http://localhost:5173"))
+        if (url.endsWith("/")) {
+            url = url.substring(0, url.length() - 1)
+        }
+        this.frontendUrl = url
+        this.enabled = cfg.getBool("REDE_DIGEST_ENABLED", true)
+    }
+    static Int atLeastOne(n: Int) {
+        if (n < 1) {
+            return 1
+        }
+        return n
+    }
+    static String tokenPrefix() = "digest:"
+    static Int minItems() = 2
+    static Int maxPosts() = 5
+    static Int maxJobs() = 3
+    static Int maxEvents() = 3
+    static Int excerptChars() = 160
+    static Long windowSeconds() = 604800L
+    schedule(jobs: Scheduler, cfg: Config) {
+        var self = this
+        jobs.cron("weekly-digest", cfg.getStr("REDE_DIGEST_CRON", "0 0 9 * * MON"), zone, () -> {
+    if (self.enabled) {
+        self.runWeekly()
+    }
+})
+    }
+    runWeekly() {
+        if (running) {
+            return
+        }
+        running = true
+        try {
+            if (!cipher.isEnabled()) {
+                log.warn("weekly_digest skipped: REDE_SECURITY_ENCRYPTION_KEY missing (opt-out token)")
+            }
+            else {
+                runPages()
+            }
+        } catch (String failed) {
+            log.warn("weekly_digest_failed " + failed)
+        }
+        running = false
+    }
+    runPages() {
+        var week = weekKey()
+        var cursor = ""
+        var sent = 0
+        var failed = 0
+        var empty = 0
+        var page = listOf<String>()
+        var more = true
+        while (more) {
+            page = store.eligibleUserIds(week, cursor, batchSize)
+            for (var userId in page) {
+                try {
+                    var outcome = sendTo(userId)
+                    if (outcome == "SENT") {
+                        sent = sent + 1
+                    }
+                    else 
+                        if (outcome == "FAILED") {
+                            failed = failed + 1
+                        }
+                        else 
+                            if (outcome == "EMPTY") {
+                                empty = empty + 1
+                            }
+                } catch (String perRecipient) {
+                    failed = failed + 1
+                    log.warn("weekly_digest recipient_failed")
+                }
+            }
+            if (!page.isEmpty()) {
+                cursor = page.get(page.size() - 1)
+            }
+            more = page.size() == batchSize
+        }
+        log.info("weekly_digest week=" + week + " sent=" + sent + " failed=" + failed + " empty=" + empty)
+    }
+    // The whole rule for one person (also called directly by the tests).
+    String sendTo(userId: String) {
+        var profile = accounts.find(userId)
+        if (profile == null) {
+            return "NOT_ELIGIBLE"
+        }
+        if (profile.email().trim().length() == 0 || !profile.emailVerified() || !preferences.of(userId).weeklyDigest() || !cipher.isEnabled()) {
+            return "NOT_ELIGIBLE"
+        }
+        var now = Time.nowIso()
+        var since = Time.plusSeconds(now, 0L - WeeklyDigest.windowSeconds())
+        var disabled = personalization.disabledModules(userId)
+        var posts = listOf<DigestItem>()
+        if (!disabled.contains("COMMUNITIES")) {
+            for (var post in store.communityPosts(userId, since, WeeklyDigest.maxPosts())) {
+                posts.add(DigestItem(WeeklyDigest.excerpt(post.title()), post.context(), post.path(), post.score()))
+            }
+        }
+        if (!disabled.contains("GROUPS")) {
+            posts.addAll(store.activeGroups(userId, since, WeeklyDigest.maxPosts()))
+        }
+        posts = WeeklyDigest.topByScore(posts, WeeklyDigest.maxPosts())
+        var jobs = listOf<DigestItem>()
+        if (!disabled.contains("JOBS")) {
+            jobs = store.matchingJobs(userId, since, WeeklyDigest.maxJobs())
+        }
+        var upcoming = listOf<DigestItem>()
+        if (!disabled.contains("EVENTS")) {
+            upcoming = upcomingEvents(userId)
+        }
+        if (posts.size() + jobs.size() + upcoming.size() < WeeklyDigest.minItems()) {
+            return "EMPTY"
+        }
+        if (!store.claim(userId, weekKey(), now)) {
+            return "ALREADY_SENT"
+        }
+        var link = frontendUrl + "/api/notifications/digest/unsubscribe?token=" + unsubscribeToken(userId)
+        var html = WeeklyDigestPage.render(WeeklyDigest.firstName(profile.name()), frontendUrl, store.unreadNotifications(userId, since), posts, jobs, upcoming, link, currentYear())
+        if (mailer.sendHtml(profile.email(), "Sua semana no Énóis", html, "Énóis", link, "WEEKLY_DIGEST")) {
+            return "SENT"
+        }
+        return "FAILED"
+    }
+    // Highest score first, the first `limit` (stable for ties, like Java's sorted().limit()).
+    static List<DigestItem> topByScore(items: List<DigestItem>, limit: Int) {
+        var rest = listOf<DigestItem>()
+        rest.addAll(items)
+        var out = listOf<DigestItem>()
+        while (!rest.isEmpty() && out.size() < limit) {
+            var best = 0
+            var i = 1
+            while (i < rest.size()) {
+                if (rest.get(i).score() > rest.get(best).score()) {
+                    best = i
+                }
+                i = i + 1
+            }
+            out.add(rest.get(best))
+            rest.remove(best)
+        }
+        return out
+    }
+    static String excerpt(content: String) {
+        var text = NotificationPreviews.plain(content, 300)
+        if (text.length() > WeeklyDigest.excerptChars()) {
+            return text.substring(0, WeeklyDigest.excerptChars()).trim() + "…"
+        }
+        return text
+    }
+    static String firstName(name: String) {
+        var n = name.trim()
+        var space = n.indexOf(" ")
+        if (space > 0) {
+            return n.substring(0, space)
+        }
+        return n
+    }
+    LocalDate today() = Instant.now().atZone(ZoneId.of(zone)).toLocalDate()
+    Int currentYear() = today().getYear()
+    // ISO week in the digest zone, e.g. "2026-W44".
+    String weekKey() {
+        var t = today()
+        var week = t.get(IsoFields.WEEK_OF_WEEK_BASED_YEAR)
+        var label = "" + week
+        if (week < 10) {
+            label = "0" + week
+        }
+        return t.get(IsoFields.WEEK_BASED_YEAR) + "-W" + label
+    }
+    List<DigestItem> upcomingEvents(userId: String) {
+        var todayIso = today().toString()
+        var untilIso = today().plusDays(7L).toString()
+        var picked = listOf<NotificationAttendingEvent>()
+        var days = listOf<String>()
+        for (var e in events.attendingEvents(userId)) {
+            var day = NotificationDates.parse(e.date())
+            if (day != null && day.compareTo(todayIso) >= 0 && day.compareTo(untilIso) < 0) {
+                picked.add(e)
+                days.add(day)
+            }
+        }
+        var out = listOf<DigestItem>()
+        while (!picked.isEmpty() && out.size() < WeeklyDigest.maxEvents()) {
+            var best = 0
+            var i = 1
+            while (i < picked.size()) {
+                if (days.get(i).compareTo(days.get(best)) < 0) {
+                    best = i
+                }
+                i = i + 1
+            }
+            out.add(DigestItem(picked.get(best).title(), WeeklyDigest.when(days.get(best), picked.get(best).time()), "/eventos", 0))
+            picked.remove(best)
+            days.remove(best)
+        }
+        return out
+    }
+    // "segunda-feira, 02/11 às 19:00" (pt-BR weekday and dd/MM).
+    static String when(dayIso: String, time: String?) {
+        var d = LocalDate.parse(dayIso)
+        var names = listOf<String>("segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo")
+        var label = names.get(d.getDayOfWeek().getValue() - 1) + ", " + dayIso.substring(8, 10) + "/" + dayIso.substring(5, 7)
+        if (time == null) {
+            return label
+        }
+        var clock = time.trim()
+        if (clock.length() > 0) {
+            return label + " às " + clock
+        }
+        return label
+    }
+    // Same encrypted token as the blog newsletter, with its own prefix so the two never mix.
+    String unsubscribeToken(userId: String) {
+        var standard = cipher.encrypt(WeeklyDigest.tokenPrefix() + userId)
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(Base64.getDecoder().decode(standard))
+    }
+    // One-click opt-out from the e-mail. Idempotent: a second click on a valid link still succeeds.
+    Bool unsubscribeByToken(token: String?) {
+        if (token == null) {
+            return false
+        }
+        var clean = token.trim()
+        if (clean.length() == 0 || !cipher.isEnabled()) {
+            return false
+        }
+        var data = decodeToken(clean)
+        if (!data.startsWith(WeeklyDigest.tokenPrefix()) || data.length() == WeeklyDigest.tokenPrefix().length()) {
+            return false
+        }
+        var userId = data.substring(WeeklyDigest.tokenPrefix().length())
+        if (accounts.find(userId) == null) {
+            return false
+        }
+        preferences.update(userId, NotificationPrefsPatch(0, -1, -1, -1, -1, -1))
+        return true
+    }
+    // The cleartext of a token, or "" when it is forged or damaged.
+    String decodeToken(token: String) {
+        try {
+            return cipher.decrypt(Base64.getEncoder().encodeToString(Base64.getUrlDecoder().decode(token)))
+        } catch (String invalid) {
+            return ""
+        }
+    }
+}

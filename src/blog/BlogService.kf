@@ -1,0 +1,340 @@
+package blog
+
+import kernel.db.*
+import kernel.error.*
+import kernel.html.*
+import kernel.id.*
+import kernel.outbox.*
+import kernel.sanctions.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+
+// The corner of each person: a blog with its own address (`/blog/{username}`), posts that do NOT enter the
+// global feed, and a subscription to follow. When a post goes out it also becomes a pointer post in the feed
+// (type BLOG, tag "blog") that only shows in "Para voce" of the subscribers (never in "Tudo") and notifies them.
+// The id of the blog post is the SAME id as the pointer, so the feed card links straight to the post.
+class BlogService {
+    Db database
+    BlogStore blogs
+    BlogProfiles profiles
+    BlogFeedPointers feed
+    BlogNotifier notifier
+    BlogCoins coins
+    SanctionGateReader sanctions
+    SuspiciousText suspicious
+    Outbox outbox
+    public constructor(database: Db, blogs: BlogStore, profiles: BlogProfiles, feed: BlogFeedPointers, notifier: BlogNotifier, coins: BlogCoins, sanctions: SanctionGateReader, suspicious: SuspiciousText, outbox: Outbox) {
+        this.database = database
+        this.blogs = blogs
+        this.profiles = profiles
+        this.feed = feed
+        this.notifier = notifier
+        this.coins = coins
+        this.sanctions = sanctions
+        this.suspicious = suspicious
+        this.outbox = outbox
+    }
+    static Int maxBlogTitle() = 160
+    static Int maxDescription() = 500
+    static Int maxPostTitle() = 200
+    // The ceiling of a Markdown body: the same as the HTML one, a single limit for everybody.
+    static Int maxMarkdown() = 20000
+    static Int postsPage() = 50
+    static String publishedEvent() = "BLOG_POST_PUBLISHED"
+    // The showcase: the blogs created, newest first. The page is cut first and filtered after, with the bans,
+    // the authors and the post counts of the whole page in one query each.
+    List<BlogSummaryView> directory(query: String?, limit: Int) {
+        var page = blogs.findAll(query, limit)
+        var owners = listOf<String>()
+        for (var b in page) {
+            owners.add(b.userId())
+        }
+        var banned = sanctions.bannedAmong(owners)
+        var listed = listOf<BlogRecord>()
+        for (var b in page) {
+            // The blog of a banned account leaves the showcase (the profile already answers 404).
+            if (!banned.contains(b.userId()) && !suspicious.matchesAny(listOf(b.title(), b.slug()))) {
+                listed.add(b)
+            }
+        }
+        var authorIds = listOf<String>()
+        var blogIds = listOf<String>()
+        for (var b in listed) {
+            authorIds.add(b.userId())
+            blogIds.add(b.id())
+        }
+        var authors = profiles.findAllByIds(authorIds)
+        var counts = blogs.countPosts(blogIds)
+        var out = listOf<BlogSummaryView>()
+        for (var b in listed) {
+            var count = counts.get(b.id())
+            var total = 0
+            if (count != null) {
+                total = count
+            }
+            out.add(BlogViews.summary(b, BlogService.authorOf(authors, b.userId()), total))
+        }
+        return out
+    }
+    static BlogAuthor? authorOf(authors: List<BlogAuthor>, userId: String) {
+        for (var a in authors) {
+            if (a.id() == userId) {
+                return a
+            }
+        }
+        return null
+    }
+    // The public page of the blog: posts, the author's data and the viewer's state. null = no such blog (also
+    // for a banned account or a suspicious title).
+    BlogView? blogOf(slug: String, viewerId: String?) {
+        var found = blogs.findBySlug(slug)
+        if (found == null) {
+            return null
+        }
+        if (sanctions.banned(found.userId())) {
+            return null
+        }
+        if (suspicious.matchesAny(listOf(found.title(), found.slug()))) {
+            return null
+        }
+        return this.view(found, viewerId, BlogService.postsPage())
+    }
+    // My blog (for the editor). null when it does not exist yet: the screen offers to create it.
+    BlogView? mine(userId: String) {
+        var found = blogs.findByUserId(userId)
+        if (found == null) {
+            return null
+        }
+        return this.view(found, userId, BlogService.postsPage())
+    }
+    // Creates or edits my blog. A blank title or an absent field keeps what was there; an empty theme CLEARS it
+    // (back to the default header), an absent one keeps it.
+    BlogView saveMine(userId: String, title: String?, description: String?, themeHtml: String?) {
+        var profile = profiles.findById(userId)
+        if (profile == null) {
+            throw Errors.api(404, "PROFILE_NOT_FOUND", "Perfil nao encontrado.")
+        }
+        var cleanTitle = BlogService.titleOrNull(title)
+        if (cleanTitle != null) {
+            BlogService.check("titulo", cleanTitle, BlogService.maxBlogTitle())
+        }
+        var cleanDescription = BlogService.trimmedOrNull(description)
+        if (cleanDescription != null) {
+            BlogService.check("descricao", cleanDescription, BlogService.maxDescription())
+        }
+        var cleanTheme = BlogService.themeOf(themeHtml)
+        var now = Time.nowIso()
+        var existing = blogs.findByUserId(userId)
+        if (existing == null) {
+            var firstTitle = profile.username()
+            if (cleanTitle != null) {
+                firstTitle = cleanTitle
+            }
+            blogs.insertBlog(BlogRecord(Ids.prefixed("blog_"), userId, profile.username(), firstTitle, cleanDescription, null, now, now))
+        }
+        var current = blogs.findByUserId(userId)
+        if (current == null) {
+            throw Errors.conflict()
+        }
+        var nextTitle = current.title()
+        if (cleanTitle != null) {
+            nextTitle = cleanTitle
+        }
+        var nextDescription = current.description()
+        if (cleanDescription != null) {
+            nextDescription = cleanDescription
+        }
+        var nextTheme = current.themeHtml()
+        if (cleanTheme != null) {
+            nextTheme = cleanTheme
+        }
+        blogs.updateBlog(BlogRecord(current.id(), current.userId(), current.slug(), nextTitle, nextDescription, nextTheme, current.createdAt(), now))
+        var saved = blogs.findByUserId(userId)
+        if (saved == null) {
+            throw Errors.conflict()
+        }
+        return this.view(saved, userId, BlogService.postsPage())
+    }
+    static String? titleOrNull(title: String?) {
+        if (title == null) {
+            return null
+        }
+        if (title.trim().length() == 0) {
+            return null
+        }
+        return title.trim()
+    }
+    static String? trimmedOrNull(text: String?) {
+        if (text == null) {
+            return null
+        }
+        return text.trim()
+    }
+    static String? themeOf(themeHtml: String?) {
+        if (themeHtml == null) {
+            return null
+        }
+        if (themeHtml.trim().length() == 0) {
+            return ""
+        }
+        return SafeHtml.requireBlogHtml(themeHtml)
+    }
+    // Publishes a post: the pointer in the feed (tag "blog"), the in-app notification and the E-MAIL to the
+    // subscribers. `notify` turns both notices off, and only on the FIRST publish (editing never resends). The
+    // e-mail runs after the commit, through the outbox (see BlogNewsletterService).
+    BlogPostView publish(userId: String, title: String?, body: String?, format: String?, notify: Bool) {
+        var cleanTitle = BlogService.requireText(title, BlogService.maxPostTitle(), "titulo", "Post precisa de um titulo.")
+        var cleanBody = BlogService.cleanBody(body, format)
+        // A post without a format cannot be stored (NOT NULL): the Java save failed on the constraint.
+        if (format == null) {
+            throw Errors.conflict()
+        }
+        var postFormat = format
+        var result = BlogPostView("", "", "", "", "", "")
+        database.transaction(() -> {
+    var b = this.ensureBlog(userId)
+    var postId = feed.publish(userId, cleanTitle)
+    coins.recordPresence(userId)
+    var now = Time.nowIso()
+    var saved = BlogPostRecord(postId, b.id(), userId, cleanTitle, cleanBody, postFormat, now, now)
+    blogs.insertPost(saved)
+    if (notify) {
+        this.notifySubscribers(b, saved)
+        outbox.append(BlogService.publishedEvent(), b.id(), json.encode(BlogPostPublishedEvent(b.id(), b.slug(), b.title(), b.userId(), saved.id(), cleanTitle, cleanBody)))
+    }
+    result = BlogViews.post(saved)
+})
+        // The pointer is born first: its id is the id of the blog post (and what the feed card links to).
+        // The e-mail fan-out is delivered AFTER the commit by the outbox worker: nothing goes out if this reverts.
+        return result
+    }
+    BlogPostView edit(userId: String, postId: String, title: String?, body: String?, format: String?) {
+        var post = this.ownedPost(userId, postId)
+        var cleanTitle = BlogService.requireText(title, BlogService.maxPostTitle(), "titulo", "Post precisa de um titulo.")
+        var cleanBody = BlogService.cleanBody(body, format)
+        if (format == null) {
+            throw Errors.conflict()
+        }
+        var edited = BlogPostRecord(post.id(), post.blogId(), post.userId(), cleanTitle, cleanBody, format, post.publishedAt(), Time.nowIso())
+        blogs.updatePost(edited)
+        return BlogViews.post(edited)
+    }
+    delete(userId: String, postId: String) {
+        var post = this.ownedPost(userId, postId)
+        database.transaction(() -> {
+    blogs.deletePost(post.id())
+    feed.delete(userId, post.id(), "post do blog apagado")
+})
+    }
+    // The pointer leaves the feed together (soft delete, as any post its author deletes).
+    // Subscribing is what makes the news of the blog appear in the "Para voce" of whoever follows.
+    subscribe(userId: String, slug: String) {
+        var b = this.blogBySlug(slug)
+        if (blogs.isSubscribed(b.id(), userId)) {
+            return
+        }
+        blogs.insertSubscription(Ids.prefixed("bsub_"), b.id(), userId, Time.nowIso())
+    }
+    unsubscribe(userId: String, slug: String) {
+        var b = this.blogBySlug(slug)
+        blogs.deleteSubscription(b.id(), userId)
+    }
+    // The authors this reader follows through blog subscriptions (the feed adds them to "Para voce").
+    List<String> authorsFollowedBy(userId: String) = blogs.authorsFollowedBy(userId)
+    BlogRecord blogBySlug(slug: String) {
+        var found = blogs.findBySlug(slug)
+        if (found == null) {
+            throw Errors.api(404, "BLOG_NOT_FOUND", "Blog nao encontrado.")
+        }
+        return found
+    }
+    // Publishing without having created the blog creates one with the username: one step less for whoever
+    // only wants to write.
+    BlogRecord ensureBlog(userId: String) {
+        var existing = blogs.findByUserId(userId)
+        if (existing != null) {
+            return existing
+        }
+        var profile = profiles.findById(userId)
+        if (profile == null) {
+            throw Errors.api(404, "PROFILE_NOT_FOUND", "Perfil nao encontrado.")
+        }
+        var now = Time.nowIso()
+        var created = BlogRecord(Ids.prefixed("blog_"), userId, profile.username(), profile.username(), null, null, now, now)
+        blogs.insertBlog(created)
+        return created
+    }
+    BlogPostRecord ownedPost(userId: String, postId: String) {
+        var post = blogs.findPost(postId)
+        if (post == null) {
+            throw Errors.api(404, "BLOG_POST_NOT_FOUND", "Post do blog nao encontrado.")
+        }
+        if (post.userId() != userId) {
+            throw Errors.api(403, "NOT_BLOG_OWNER", "Este post nao e seu.")
+        }
+        return post
+    }
+    notifySubscribers(b: BlogRecord, post: BlogPostRecord) {
+        var author = profiles.findById(b.userId())
+        var name = b.slug()
+        var username = b.slug()
+        if (author != null) {
+            name = author.name()
+            username = author.username()
+        }
+        // The address of the blog page is the CURRENT USERNAME, not the stored slug: whoever changed username
+        // without editing the blog left the notification pointing at a blog that does not exist.
+        var href = "/blog/" + username + "/" + post.id()
+        for (var subscriberId in blogs.subscriberIds(b.id())) {
+            // The author does not need to be told about their own post.
+            if (subscriberId != b.userId()) {
+                notifier.notifyNewPost(subscriberId, b.userId(), name + " publicou no blog", post.title(), href)
+            }
+        }
+    }
+    BlogView view(b: BlogRecord, viewerId: String?, limit: Int) {
+        var items = BlogViews.posts(blogs.findPosts(b.id(), limit))
+        var subscribed = false
+        var owner = false
+        if (viewerId != null) {
+            subscribed = blogs.isSubscribed(b.id(), viewerId)
+            owner = viewerId == b.userId()
+        }
+        return BlogViews.page(b, profiles.findById(b.userId()), items, subscribed, owner)
+    }
+    // The body: HTML enters sanitised; Markdown enters as text (the front formats it) with the usual defence.
+    static String cleanBody(body: String?, format: String?) {
+        if (body == null) {
+            throw Errors.api(400, "INVALID_BLOG_BODY", "Post precisa de conteudo.")
+        }
+        if (body.trim().length() == 0) {
+            throw Errors.api(400, "INVALID_BLOG_BODY", "Post precisa de conteudo.")
+        }
+        if (format == "HTML") {
+            return SafeHtml.requireBlogHtml(body)
+        }
+        var clean = PlainText.defuse(body.trim())
+        if (clean == null) {
+            return ""
+        }
+        BlogService.check("conteudo", clean, BlogService.maxMarkdown())
+        return clean
+    }
+    static String requireText(value: String?, max: Int, field: String, message: String) {
+        if (value == null) {
+            throw Errors.api(400, "INVALID_BLOG_TITLE", message)
+        }
+        if (value.trim().length() == 0) {
+            throw Errors.api(400, "INVALID_BLOG_TITLE", message)
+        }
+        var clean = value.trim()
+        BlogService.check(field, clean, max)
+        return clean
+    }
+    static check(field: String, value: String, max: Int) {
+        if (value.length() > max) {
+            throw Errors.api(400, "BLOG_FIELD_TOO_LONG", "O campo " + field + " aceita no maximo " + max + " caracteres.")
+        }
+    }
+}

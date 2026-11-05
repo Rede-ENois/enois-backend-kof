@@ -1,0 +1,246 @@
+import kernel.*
+import kernel.db.*
+import kernel.idempotency.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import messaging.*
+import notifications.*
+
+class HiddenHolder {
+    static TestApp? cached = null
+    static MessagingModule? module = null
+    static SharedServices? shared = null
+}
+
+TestApp msgApp() {
+    var cur = HiddenHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = DomainTestKit.boot("msghidden", mapOf<String, String>(), (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+    var notifications = NotificationsModule.install(p, s, SecurityHooks(), parts)
+    HiddenHolder.module = MessagingModule.install(p, s, SecurityHooks(), parts, notifications)
+    HiddenHolder.shared = s
+})
+    HiddenHolder.cached = created
+    return created
+}
+
+MessagingService service() {
+    var m = HiddenHolder.module
+    if (m == null) {
+        throw "module not wired"
+    }
+    return m.service
+}
+
+String who(id: String) = DomainTestKit.loginAdult(msgApp(), id)
+
+String conversation(token: String, otherId: String) = MessagingTestKit.createDirect(msgApp(), token, "hm-conv-" + token + "-" + otherId, otherId)
+
+String say(token: String, userId: String, conversationId: String, text: String) = MessagingTestKit.sendOk(msgApp(), token, "hm-send-" + userId + "-" + conversationId + "-" + text.length(), conversationId, text)
+
+TestResponse hide(token: String, conversationId: String, ids: List<String>, key: String) = MessagingTestKit.call(msgApp(), token, key, "/conversations/" + conversationId + "/messages/hide", MessagingTestKit.idsJson(ids))
+
+Long hiddenRows(userId: String, messageId: String) = MessagingTestKit.count(msgApp(), "select count(*) from message_hidden where user_id = ? and message_id = ?", userId, messageId)
+
+Bool sees(token: String, conversationId: String, messageId: String) = MessagingTestKit.messageIds(msgApp(), token, conversationId).contains(messageId)
+
+test "hiding a message only affects who asked" {
+    var a = who("hide_msg_a")
+    var b = who("hide_msg_b")
+    var id = conversation(a, "hide_msg_b")
+    var messageId = say(a, "hide_msg_a", id, "combinado, te mando o orçamento amanhã")
+    var res = hide(a, id, listOf(messageId), "hide-msg-1")
+    Check.status(res, 200)
+    Check.jsonEq(res, "hidden", "1")
+    assert(!sees(a, id, messageId))
+    assert(sees(b, id, messageId))
+    var again = hide(a, id, listOf(messageId), "hide-msg-2")
+    Check.status(again, 200)
+    Check.jsonEq(again, "hidden", "0")
+}
+
+test "refuses hiding in a conversation the person is not in" {
+    var a = who("hide_msg_c")
+    who("hide_msg_d")
+    var outsider = who("hide_msg_e")
+    var id = conversation(a, "hide_msg_d")
+    var messageId = say(a, "hide_msg_c", id, "oi")
+    Check.apiError(hide(outsider, id, listOf(messageId), "hide-msg-outsider"), 403, "NOT_PARTICIPANT")
+}
+
+test "an empty selection of messages is rejected" {
+    var a = who("hide_msg_f")
+    who("hide_msg_g")
+    var id = conversation(a, "hide_msg_g")
+    Check.apiError(hide(a, id, listOf<String>(), "hide-msg-empty"), 400, "EMPTY_MESSAGE_LIST")
+}
+
+assertOtherConversationRejected(prefix: String, alsoParticipant: Bool) {
+    var requester = who(prefix + "_a")
+    var peer = who(prefix + "_b")
+    var sender = who(prefix + "_c")
+    var mine = conversation(requester, prefix + "_b")
+    var otherId = prefix + "_b"
+    if (alsoParticipant) {
+        otherId = prefix + "_a"
+    }
+    var other = conversation(sender, otherId)
+    var message = say(sender, prefix + "_c", other, "synthetic scoped message")
+    Check.apiError(hide(requester, mine, listOf(message), prefix), 404, "MESSAGE_NOT_FOUND")
+    Check.eqInt("hidden rows", 0, hiddenRows(prefix + "_a", message) as Int)
+    assert(sees(sender, other, message))
+    if (alsoParticipant) {
+        assert(sees(requester, other, message))
+    }
+    else {
+        assert(sees(peer, other, message))
+    }
+}
+
+test "rejects a message from a foreign conversation" {
+    assertOtherConversationRejected("hide_scope_foreign", false)
+}
+
+test "rejects a message from another conversation of the same user" {
+    assertOtherConversationRejected("hide_scope_own", true)
+}
+
+test "rejects a missing message without writing" {
+    var requester = who("hide_scope_missing_a")
+    who("hide_scope_missing_b")
+    var id = conversation(requester, "hide_scope_missing_b")
+    var missing = "synthetic-missing-hide-scope"
+    Check.eqInt("no such message", 0, msgApp().db().queryLong("select count(*) from messages where id = ?", DbParams().bindStr(missing)) as Int)
+    Check.apiError(hide(requester, id, listOf(missing), "hide-scope-missing"), 404, "MESSAGE_NOT_FOUND")
+    Check.eqInt("hidden rows", 0, hiddenRows("hide_scope_missing_a", missing) as Int)
+}
+
+assertMixedBatchRejected(prefix: String, validFirst: Bool) {
+    var requester = who(prefix + "_a")
+    var peer = who(prefix + "_b")
+    var sender = who(prefix + "_c")
+    var mine = conversation(requester, prefix + "_b")
+    var other = conversation(sender, prefix + "_b")
+    var valid = say(requester, prefix + "_a", mine, "synthetic valid message")
+    var invalid = say(sender, prefix + "_c", other, "synthetic unrelated message")
+    var ids = listOf(invalid, valid)
+    if (validFirst) {
+        ids = listOf(valid, invalid)
+    }
+    Check.apiError(hide(requester, mine, ids, prefix), 404, "MESSAGE_NOT_FOUND")
+    Check.eqInt("valid not hidden", 0, hiddenRows(prefix + "_a", valid) as Int)
+    Check.eqInt("invalid not hidden", 0, hiddenRows(prefix + "_a", invalid) as Int)
+    assert(sees(requester, mine, valid))
+    assert(sees(peer, mine, valid))
+    assert(sees(sender, other, invalid))
+    assert(sees(peer, other, invalid))
+    var ok = hide(requester, mine, listOf(valid), prefix + "-ok")
+    Check.status(ok, 200)
+    Check.jsonEq(ok, "hidden", "1")
+}
+
+test "rejects a mixed batch with the valid message first" {
+    assertMixedBatchRejected("hide_scope_first", true)
+}
+
+test "rejects a mixed batch with the invalid message first" {
+    assertMixedBatchRejected("hide_scope_last", false)
+}
+
+test "idempotency distinguishes conversations and replays the same request" {
+    var requester = who("hide_scope_idem_a")
+    who("hide_scope_idem_b")
+    who("hide_scope_idem_c")
+    var first = conversation(requester, "hide_scope_idem_b")
+    var second = conversation("tok-hide_scope_idem_c-1234567890", "hide_scope_idem_a")
+    var message = say(requester, "hide_scope_idem_a", first, "synthetic idempotent message")
+    var one = hide(requester, first, listOf(message), "hide-scope-shared-key")
+    Check.status(one, 200)
+    Check.jsonEq(one, "hidden", "1")
+    var replay = hide(requester, first, listOf(message), "hide-scope-shared-key")
+    Check.status(replay, 200)
+    Check.jsonEq(replay, "hidden", "1")
+    Check.apiError(hide(requester, second, listOf(message), "hide-scope-shared-key"), 409, "IDEMPOTENCY_PAYLOAD_CONFLICT")
+    Check.eqInt("hidden rows", 1, hiddenRows("hide_scope_idem_a", message) as Int)
+}
+
+test "a legacy idempotency hash returns an explicit conflict" {
+    var requester = who("hide_scope_legacy_a")
+    var peer = who("hide_scope_legacy_b")
+    var id = conversation(requester, "hide_scope_legacy_b")
+    var message = say(requester, "hide_scope_legacy_a", id, "synthetic legacy retry")
+    var key = "hide-scope-legacy-key"
+    var shared = HiddenHolder.shared
+    if (shared == null) {
+        throw "shared not wired"
+    }
+    var svc = service()
+    var legacyHash = Idempotency.hash("{\"ids\":" + json.encode(listOf(message)) + "}")
+    shared.idempotency.execute("hide_scope_legacy_a", "POST", "/api/conversations/{conversationId}/messages/hide", key, legacyHash, 200, () -> "{\"hidden\":" + svc.hideMessages(id, "hide_scope_legacy_a", listOf(message)) + "}")
+    Check.apiError(hide(requester, id, listOf(message), key), 409, "IDEMPOTENCY_PAYLOAD_CONFLICT")
+    Check.eqInt("hidden rows", 1, hiddenRows("hide_scope_legacy_a", message) as Int)
+    assert(sees(peer, id, message))
+}
+
+String refusal(run: () -> void) {
+    var caught = ""
+    try {
+        run()
+    } catch (String e) {
+        caught = e
+    }
+    return caught
+}
+
+test "the service rejects an outsider without the controller" {
+    var requester = who("hide_scope_service_a")
+    who("hide_scope_service_b")
+    who("hide_scope_service_c")
+    var id = conversation(requester, "hide_scope_service_b")
+    var message = say(requester, "hide_scope_service_a", id, "synthetic service authorization")
+    var svc = service()
+    var caught = refusal(() -> {
+    svc.hideMessages(id, "hide_scope_service_c", listOf(message))
+})
+    assert(caught.contains("NOT_PARTICIPANT"))
+    assert(caught.contains("403"))
+    Check.eqInt("hidden rows", 0, hiddenRows("hide_scope_service_c", message) as Int)
+}
+
+test "the service rejects a mixed batch without the controller" {
+    var requester = who("hide_scope_service_mix_a")
+    who("hide_scope_service_mix_b")
+    var id = conversation(requester, "hide_scope_service_mix_b")
+    var message = say(requester, "hide_scope_service_mix_a", id, "synthetic service batch")
+    var missing = "synthetic-service-missing-hide-scope"
+    var svc = service()
+    var caught = refusal(() -> {
+    svc.hideMessages(id, "hide_scope_service_mix_a", listOf(message, missing))
+})
+    assert(caught.contains("MESSAGE_NOT_FOUND"))
+    Check.eqInt("hidden rows", 0, hiddenRows("hide_scope_service_mix_a", message) as Int)
+    Check.eqInt("hidden missing", 0, hiddenRows("hide_scope_service_mix_a", missing) as Int)
+    assert(sees(requester, id, message))
+}
+
+test "a valid batch normalizes ids and keeps the other participant visibility" {
+    var requester = who("hide_scope_normal_a")
+    var peer = who("hide_scope_normal_b")
+    var id = conversation(requester, "hide_scope_normal_b")
+    var first = say(requester, "hide_scope_normal_a", id, "synthetic first message")
+    var second = say(peer, "hide_scope_normal_b", id, "synthetic second message")
+    var body = "{\"ids\":[\" " + first + " \",\"" + first + "\",null,\" \",\"" + second + "\"]}"
+    var res = MessagingTestKit.call(msgApp(), requester, "hide-scope-normal", "/conversations/" + id + "/messages/hide", body)
+    Check.status(res, 200)
+    Check.jsonEq(res, "hidden", "2")
+    assert(!sees(requester, id, first))
+    assert(!sees(requester, id, second))
+    assert(sees(peer, id, first))
+    assert(sees(peer, id, second))
+    var again = hide(requester, id, listOf(first, second), "hide-scope-normal-again")
+    Check.status(again, 200)
+    Check.jsonEq(again, "hidden", "0")
+}

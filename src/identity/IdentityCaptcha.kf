@@ -1,0 +1,195 @@
+package identity
+
+import kernel.config.*
+import kernel.error.*
+import kernel.http.*
+import kernel.id.*
+import kernel.log.*
+import kernel.security.*
+import kernel.time.*
+import kernel.url.*
+
+// Own captcha for the signup when Turnstile is not configured: a signed sum question (SignupChallengeService).
+// The answer only enters the HMAC input, so the token carries nothing that can be checked offline against
+// candidate answers. Single use is the primary key of signup_challenge_nonces, shared by every pod.
+// ponytail: a sum question is readable by any bot; production should configure Turnstile, which takes precedence.
+class IdentitySignupChallenge {
+    Log log = Log("identity.captcha")
+    Bool enabled
+    String secret
+    IdentityStore store
+    public constructor(cfg: Config, store: IdentityStore) {
+        this.enabled = cfg.getBool("SIGNUP_CAPTCHA_ENABLED", true)
+        this.store = store
+        var key = cfg.getStr("REDE_SECURITY_ENCRYPTION_KEY", "")
+        if (key.length() > 0 && Tokens.validKey(key)) {
+            this.secret = key
+        }
+        else {
+            if (enabled) {
+                throw "CONFIG_MISSING: REDE_SECURITY_ENCRYPTION_KEY obrigatoria para o desafio de cadastro (32 bytes em base64)."
+            }
+            log.warn("signup challenge off without an encryption key: using an ephemeral secret")
+            this.secret = SecretCipher.generateKeyBase64()
+        }
+    }
+    static Long ttlMs() = 300000L
+    static Long minElapsedMs() = 1200L
+    Bool isEnabled() = enabled
+    IdentityChallengeBody issue() {
+        var left = 2 + Tokens.randomInt(8)
+        var right = 2 + Tokens.randomInt(8)
+        var answer = left + right
+        var now = Time.nowMillis()
+        var expires = now + IdentitySignupChallenge.ttlMs()
+        var nonce = Ids.uuid().replace("-", "")
+        var payload = "" + now + "|" + expires + "|" + nonce
+        var token = Tokens.base64UrlEncode(payload) + "." + Tokens.hmacSha256Url(secret, payload + "|" + answer)
+        return IdentityChallengeBody(token, "Quanto é " + left + " + " + right + "?", Time.fromMillis(expires))
+    }
+    require(challengeId: String?, answer: Int?) {
+        if (!enabled) {
+            return
+        }
+        if (IdentityText.blank(challengeId) || answer == null) {
+            throw Errors.api(400, "SIGNUP_CAPTCHA_REQUIRED", "Resolva a verificação de segurança para criar a conta.")
+        }
+        var parts = IdentityText.orEmpty(challengeId).split("\\.")
+        if (parts.length != 2) {
+            throw invalid()
+        }
+        var payload = Tokens.base64UrlDecode(parts[0])
+        if (payload == null) {
+            throw invalid()
+        }
+        // A wrong answer and a forged token are indistinguishable: both fail the HMAC.
+        if (!Tokens.safeEquals(parts[1], Tokens.hmacSha256Url(secret, payload + "|" + answer))) {
+            throw invalid()
+        }
+        var fields = payload.split("\\|")
+        if (fields.length != 3) {
+            throw invalid()
+        }
+        var issuedAt = 0L
+        var expiresAt = 0L
+        try {
+            issuedAt = fields[0].toLong()
+            expiresAt = fields[1].toLong()
+        } catch (String e) {
+            throw invalid()
+        }
+        var now = Time.nowMillis()
+        if (expiresAt < now) {
+            throw Errors.api(400, "SIGNUP_CAPTCHA_EXPIRED", "A verificação de segurança expirou. Recarregue e tente de novo.")
+        }
+        if (now - issuedAt < IdentitySignupChallenge.minElapsedMs()) {
+            throw Errors.api(400, "SIGNUP_CAPTCHA_TOO_FAST", "Calma aí: resolva a verificação com um tempinho e envie de novo.")
+        }
+        remember(fields[2], expiresAt, now)
+    }
+    // The primary key makes the second use of a nonce fail on any pod.
+    remember(nonce: String, expiresAt: Long, now: Long) {
+        store.deleteExpiredNonces(Time.fromMillis(now))
+        var reused = false
+        try {
+            store.insertNonce(nonce, Time.fromMillis(expiresAt))
+        } catch (String e) {
+            if (!Errors.hasCode(e, "CONFLICT")) {
+                throw e
+            }
+            reused = true
+        }
+        if (reused) {
+            throw Errors.api(400, "SIGNUP_CAPTCHA_REUSED", "Esta verificação já foi usada. Recarregue e tente de novo.")
+        }
+    }
+    String invalid() = Errors.api(400, "SIGNUP_CAPTCHA_INVALID", "Verificação de segurança inválida. Recarregue e tente de novo.")
+}
+
+// The siteverify call, behind a seam so tests stub the network: it returns the response text.
+class IdentityTurnstileTransport {
+    String verify(secret: String, token: String) {
+        var form = "secret=" + UrlCodec.encode(secret) + "&response=" + UrlCodec.encode(token)
+        return Outbound.postForm("https://challenges.cloudflare.com/turnstile/v0/siteverify", form, 5000).body()
+    }
+}
+
+record IdentityTurnstileReply(String? success)
+
+// Cloudflare Turnstile (TurnstileValidator). Fail-closed: a network failure or an ambiguous answer never
+// lets the signup through. Without a secret (dev, tests) the check is skipped on purpose; Cloudflare's
+// public TEST keys accept any token, so they never count as configured.
+class IdentityTurnstile {
+    Log log = Log("identity.turnstile")
+    String secretKey
+    String siteKeyValue
+    IdentityTurnstileTransport transport
+    public constructor(cfg: Config, transport: IdentityTurnstileTransport) {
+        this.secretKey = cfg.getStr("TURNSTILE_SECRET_KEY", "")
+        this.siteKeyValue = cfg.getStr("TURNSTILE_SITE_KEY", "")
+        this.transport = transport
+        var policy = IdentityTurnstile.policy(cfg.getStr("TURNSTILE_TEST_KEY_POLICY", "degrade"))
+        if (!IdentityTurnstile.isTestKey(secretKey) && !IdentityTurnstile.isTestKey(siteKeyValue)) {
+            return
+        }
+        if (policy == "fatal") {
+            throw "CONFIG_INVALID: TURNSTILE_SITE_KEY/TURNSTILE_SECRET_KEY are Cloudflare test keys. Configure real keys, leave both empty (the signup challenge is used instead), or set TURNSTILE_TEST_KEY_POLICY=degrade."
+        }
+        log.error("TURNSTILE_* are Cloudflare TEST keys: the external captcha is OFF in this environment and the signup uses the backend\'s own challenge")
+    }
+    // Only `fatal` refuses the boot; any other value (a typo included) degrades.
+    static String policy(raw: String) {
+        var value = raw.trim().toLowerCase()
+        if (value.length() == 0 || value == "degrade") {
+            return "degrade"
+        }
+        if (value == "fatal") {
+            return "fatal"
+        }
+        Log("identity.turnstile").error("TURNSTILE_TEST_KEY_POLICY does not exist (degrade, fatal): using degrade")
+        return "degrade"
+    }
+    static Bool isTestKey(key: String) {
+        var value = key.trim().toLowerCase()
+        return value.startsWith("1x000") || value.startsWith("2x000") || value.startsWith("3x000")
+    }
+    Bool isConfigured() = secretKey.trim().length() > 0 && !IdentityTurnstile.isTestKey(secretKey)
+    String siteKey() = siteKeyValue
+    // Configured AND with a real site key: what the front end can render.
+    Bool isAvailable() = isConfigured() && siteKeyValue.trim().length() > 0 && !IdentityTurnstile.isTestKey(siteKeyValue)
+    require(token: String?) {
+        if (!isConfigured()) {
+            return
+        }
+        if (IdentityText.blank(token)) {
+            throw Errors.api(403, "TURNSTILE_REQUIRED", "Verificacao anti-bot obrigatoria.")
+        }
+        var response = IdentityText.orEmpty(token)
+        var text = ""
+        var failure = ""
+        try {
+            text = transport.verify(secretKey, response)
+        } catch (String e) {
+            failure = e
+        }
+        if (failure.length() > 0) {
+            log.error("turnstile_unavailable")
+            throw Errors.api(503, "TURNSTILE_UNAVAILABLE", "Verificacao anti-bot indisponivel agora. Tente novamente em instantes.")
+        }
+        var ok = false
+        var unreadable = false
+        try {
+            var reply = json.decode<IdentityTurnstileReply>(text)
+            ok = reply.success == "true"
+        } catch (String e) {
+            unreadable = true
+        }
+        if (unreadable) {
+            throw Errors.api(503, "TURNSTILE_UNAVAILABLE", "Verificacao anti-bot indisponivel agora. Tente novamente em instantes.")
+        }
+        if (!ok) {
+            log.warn("turnstile_rejected")
+            throw Errors.api(403, "TURNSTILE_FAILED", "Verificacao anti-bot falhou. Tente novamente.")
+        }
+    }
+}

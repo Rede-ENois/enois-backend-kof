@@ -1,0 +1,279 @@
+package themes
+
+import kernel.text.*
+
+// One member of a JSON object: its name, the kind of its value (string, number, bool, null, object, array)
+// and the value as text (a string decoded, a container as its raw JSON, a literal as written).
+record ThemeJsonMember(String key, String kind, String text)
+
+// The members of a parsed JSON object, in first-seen order; a repeated key keeps the last value (a Jackson Map).
+class ThemeJsonObject {
+    List<ThemeJsonMember> members
+    public constructor(members: List<ThemeJsonMember>) {
+        this.members = members
+    }
+    List<String> keys() {
+        var out = listOf<String>()
+        for (var m in members) {
+            if (!out.contains(m.key())) {
+                out.add(m.key())
+            }
+        }
+        return out
+    }
+    ThemeJsonMember? find(key: String) {
+        var i = members.size() - 1
+        while (i >= 0) {
+            if (members.get(i).key() == key) {
+                return members.get(i)
+            }
+            i = i - 1
+        }
+        return null
+    }
+    // The value is present and not a JSON null.
+    Bool has(key: String) {
+        var m = this.find(key)
+        if (m == null) {
+            return false
+        }
+        return m.kind() != "null"
+    }
+    // String.valueOf(map.get(key)): the text of the value, "null" when absent.
+    String valueOf(key: String) {
+        var m = this.find(key)
+        if (m == null) {
+            return "null"
+        }
+        if (m.kind() == "null") {
+            return "null"
+        }
+        return m.text()
+    }
+}
+
+// A strict reader for the theme package: only what the gallery needs from Jackson's readValue(Map). It stops
+// after the first value (trailing text is ignored like Jackson does) and refuses nesting past 1000 levels.
+class ThemeJsonReader {
+    String text
+    Int pos = 0
+    Bool malformed = false
+    public constructor(text: String) {
+        this.text = text
+    }
+    // The object at the top of `raw`, or null when `raw` is not a JSON object.
+    static ThemeJsonObject? parseObject(raw: String) {
+        var reader = ThemeJsonReader(raw)
+        reader.skipSpace()
+        if (reader.pos >= raw.length() || raw.charAt(reader.pos) != '{') {
+            return null
+        }
+        var members = reader.readObject(0)
+        if (reader.malformed) {
+            return null
+        }
+        return ThemeJsonObject(members)
+    }
+    skipSpace() {
+        while (pos < text.length() && (text.charAt(pos) == ' ' || text.charAt(pos) == '\n' || text.charAt(pos) == '\r' || text.charAt(pos) == '\t')) {
+            pos = pos + 1
+        }
+    }
+    Bool more() = !malformed && pos < text.length()
+    List<ThemeJsonMember> readObject(depth: Int) {
+        var members = listOf<ThemeJsonMember>()
+        if (depth > 1000) {
+            malformed = true
+            return members
+        }
+        pos = pos + 1
+        this.skipSpace()
+        if (this.more() && text.charAt(pos) == '}') {
+            pos = pos + 1
+            return members
+        }
+        var going = true
+        while (going && !malformed) {
+            this.skipSpace()
+            if (pos >= text.length() || text.charAt(pos) != '\"') {
+                malformed = true
+                return members
+            }
+            var key = this.readString()
+            this.skipSpace()
+            if (malformed || pos >= text.length() || text.charAt(pos) != ':') {
+                malformed = true
+                return members
+            }
+            pos = pos + 1
+            this.skipSpace()
+            var member = this.readValue(key, depth + 1)
+            if (malformed) {
+                return members
+            }
+            members.add(member)
+            this.skipSpace()
+            if (pos >= text.length()) {
+                malformed = true
+                return members
+            }
+            var c = text.charAt(pos)
+            pos = pos + 1
+            if (c == '}') {
+                going = false
+            }
+            else {
+                if (c != ',') {
+                    malformed = true
+                }
+            }
+        }
+        return members
+    }
+    skipArray(depth: Int) {
+        if (depth > 1000) {
+            malformed = true
+            return
+        }
+        pos = pos + 1
+        this.skipSpace()
+        if (this.more() && text.charAt(pos) == ']') {
+            pos = pos + 1
+            return
+        }
+        var going = true
+        while (going && !malformed) {
+            this.skipSpace()
+            var ignored = this.readValue("", depth + 1)
+            if (malformed) {
+                return
+            }
+            this.skipSpace()
+            if (pos >= text.length()) {
+                malformed = true
+                return
+            }
+            var c = text.charAt(pos)
+            pos = pos + 1
+            if (c == ']') {
+                going = false
+            }
+            else {
+                if (c != ',') {
+                    malformed = true
+                }
+            }
+        }
+    }
+    ThemeJsonMember readValue(key: String, depth: Int) {
+        var empty = ThemeJsonMember(key, "null", "null")
+        if (pos >= text.length()) {
+            malformed = true
+            return empty
+        }
+        var c = text.charAt(pos)
+        if (c == '\"') {
+            var s = this.readString()
+            return ThemeJsonMember(key, "string", s)
+        }
+        if (c == '{') {
+            var start = pos
+            var ignored = this.readObject(depth)
+            if (malformed) {
+                return empty
+            }
+            return ThemeJsonMember(key, "object", text.substring(start, pos))
+        }
+        if (c == '[') {
+            var start = pos
+            this.skipArray(depth)
+            if (malformed) {
+                return empty
+            }
+            return ThemeJsonMember(key, "array", text.substring(start, pos))
+        }
+        return this.readLiteral(key)
+    }
+    ThemeJsonMember readLiteral(key: String) {
+        var start = pos
+        while (pos < text.length() && !ThemeJsonReader.isDelimiter(text.charAt(pos))) {
+            pos = pos + 1
+        }
+        var token = text.substring(start, pos)
+        if (token == "true" || token == "false") {
+            return ThemeJsonMember(key, "bool", token)
+        }
+        if (token == "null") {
+            return ThemeJsonMember(key, "null", token)
+        }
+        if (ThemeJsonReader.isNumber(token)) {
+            return ThemeJsonMember(key, "number", token)
+        }
+        malformed = true
+        return ThemeJsonMember(key, "null", "null")
+    }
+    static Bool isDelimiter(c: Char) = c == ',' || c == '}' || c == ']' || c == ' ' || c == '\n' || c == '\r' || c == '\t'
+    // RFC 8259 number: -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?
+    static Bool isNumber(token: String) = Regexes.matches("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?", token)
+    // The string starting at the opening quote, decoded; leaves `pos` after the closing quote.
+    String readString() {
+        pos = pos + 1
+        var out = ""
+        while (pos < text.length()) {
+            var c = text.charAt(pos)
+            if (c == '\"') {
+                pos = pos + 1
+                return out
+            }
+            if (c == '\\') {
+                if (pos + 1 >= text.length()) {
+                    malformed = true
+                    return out
+                }
+                var e = text.charAt(pos + 1)
+                pos = pos + 2
+                if (e == 'n') {
+                    out = out + "\n"
+                }
+                else if (e == 't') {
+                    out = out + "\t"
+                }
+                else if (e == 'r') {
+                    out = out + "\r"
+                }
+                else if (e == 'b') {
+                    out = out + "\b"
+                }
+                else if (e == 'f') {
+                    out = out + "\f"
+                }
+                else if (e == 'u') {
+                    if (pos + 4 > text.length()) {
+                        malformed = true
+                        return out
+                    }
+                    var unit = Texts.fromHex4(text.substring(pos, pos + 4))
+                    if (unit.length() == 0) {
+                        malformed = true
+                        return out
+                    }
+                    out = out + unit
+                    pos = pos + 4
+                }
+                else if (e == '\"' || e == '\\' || e == '/') {
+                    out = out + text.substring(pos - 1, pos)
+                }
+                else {
+                    malformed = true
+                    return out
+                }
+            }
+            else {
+                out = out + text.substring(pos, pos + 1)
+                pos = pos + 1
+            }
+        }
+        malformed = true
+        return out
+    }
+}

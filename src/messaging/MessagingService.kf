@@ -1,0 +1,431 @@
+package messaging
+
+import java.time.Instant
+import java.util.HashMap
+import java.time.temporal.ChronoUnit
+import java.util.HashMap
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.sanctions.*
+import kernel.security.*
+import kernel.blocks.*
+import kernel.time.*
+import notifications.*
+
+// Counts of one message's reactions and the viewer's own (MessageReactionSummary).
+record MessageReactionSummary(Map<String,Int> counts, String? myReaction)
+
+// Conversations and messages (MessagingService). Every write is one transaction; the notification of a
+// new message is created inside it (after-commit push, see Notifications).
+class MessagingService {
+    Db database
+    MessagingStore store
+    Notifications notifications
+    UserRateLimiter userLimiter
+    BehavioralTimingGuard timingGuard
+    MessagingAgePolicy agePolicy
+    SanctionGate sanctionGate
+    MessagingConnections connections
+    BlockedUsers blockedUsers
+    MessagingCorporate corporate
+    MessagingCoins coins
+    ConversationViewers viewers
+    public constructor(database: Db, store: MessagingStore, notifications: Notifications, userLimiter: UserRateLimiter, timingGuard: BehavioralTimingGuard, agePolicy: MessagingAgePolicy, sanctionGate: SanctionGate, connections: MessagingConnections, blockedUsers: BlockedUsers, corporate: MessagingCorporate, coins: MessagingCoins, viewers: ConversationViewers) {
+        this.database = database
+        this.store = store
+        this.notifications = notifications
+        this.userLimiter = userLimiter
+        this.timingGuard = timingGuard
+        this.agePolicy = agePolicy
+        this.sanctionGate = sanctionGate
+        this.connections = connections
+        this.blockedUsers = blockedUsers
+        this.corporate = corporate
+        this.coins = coins
+        this.viewers = viewers
+    }
+    static Int clamp(value: Int, low: Int, high: Int) {
+        if (value < low) {
+            return low
+        }
+        if (value > high) {
+            return high
+        }
+        return value
+    }
+    static String notParticipantError() = Errors.api(403, "NOT_PARTICIPANT", "Voce nao participa desta conversa.")
+    static String minorDmRestricted() = Errors.api(403, "MINOR_DM_RESTRICTED", "Para proteger usuarios menores de idade, so e possivel conversar com eles apos uma conexao aceita.")
+    static String conversationHref(conversationId: String) = "/api/conversations/" + conversationId
+    static String conversationNoticeGroup(conversationId: String) = "conversation:" + conversationId
+    static String newConversationId() = Ids.prefixed("conversation_")
+    // Messages of the same second would tie in the ordering: the next one is at least one second later.
+    String nextMessageInstant(conversationId: String) {
+        var now = Time.nowIso()
+        var last = store.lastMessage(conversationId)
+        if (last == null) {
+            return now
+        }
+        var nowSecond = Instant.parse(now).truncatedTo(ChronoUnit.SECONDS)
+        var lastSecond = Instant.parse(last.createdAt()).truncatedTo(ChronoUnit.SECONDS)
+        if (nowSecond.isAfter(lastSecond)) {
+            return now
+        }
+        return lastSecond.plusSeconds(1L).toString()
+    }
+    List<String> cleanIds(raw: List<String>) {
+        var out = listOf<String>()
+        for (var v in raw) {
+            var t = v.trim()
+            if (t.length() > 0 && !out.contains(t)) {
+                out.add(t)
+            }
+        }
+        return out
+    }
+    // POST /conversations: DIRECT or GROUP among people the creator may reach.
+    ConversationRecord createConversation(kind: String?, title: String?, participantIds: List<String>?, createdBy: String) {
+        var self = this
+        var created = ConversationRecord("", "DIRECT", null, createdBy, Time.nowIso(), Time.nowIso())
+        if (participantIds == null) {
+            throw Errors.api(400, "INVALID_PARTICIPANTS", "Informe pelo menos um participante.")
+        }
+        var members = listOf<String>()
+        for (var raw in participantIds) {
+            if (raw.trim().length() > 0 && !members.contains(raw.trim())) {
+                members.add(raw.trim())
+            }
+        }
+        if (members.isEmpty()) {
+            throw Errors.api(400, "INVALID_PARTICIPANTS", "Informe pelo menos um participante.")
+        }
+        if (members.size() > 100) {
+            throw Errors.api(400, "TOO_MANY_PARTICIPANTS", "Uma conversa pode ter no maximo 100 participantes.")
+        }
+        var normalizedKind = "DIRECT"
+        if (kind != null && kind.trim().length() > 0) {
+            normalizedKind = kind.trim().toUpperCase()
+        }
+        if (normalizedKind != "DIRECT" && normalizedKind != "GROUP") {
+            throw Errors.api(400, "INVALID_CONVERSATION_KIND", "Tipo de conversa invalido.")
+        }
+        agePolicy.requireCanWrite(createdBy)
+        if (!members.contains(createdBy)) {
+            members.add(createdBy)
+        }
+        var creatorHidden = blockedUsers.hiddenIdsFor(createdBy)
+        var others = listOf<String>()
+        for (var pid in members) {
+            if (pid != createdBy) {
+                others.add(pid)
+            }
+        }
+        for (var other in others) {
+            if (creatorHidden.contains(other)) {
+                throw Errors.api(403, "USER_BLOCKED", "Nao e possivel conversar com este usuario.")
+            }
+        }
+        var minors = agePolicy.minorIds(others)
+        if (!minors.isEmpty()) {
+            var connected = connections.acceptedAmong(createdBy, minors)
+            for (var minor in minors) {
+                if (!connected.contains(minor)) {
+                    throw MessagingService.minorDmRestricted()
+                }
+            }
+        }
+        if (normalizedKind == "DIRECT" && others.size() == 1) {
+            var existing = store.findPair(createdBy, others.get(0), "DIRECT")
+            if (existing != null) {
+                return existing
+            }
+        }
+        var id = MessagingService.newConversationId()
+        var now = Time.nowIso()
+        var conversation = ConversationRecord(id, normalizedKind, title, createdBy, now, now)
+        database.transaction(() -> {
+    self.store.insertConversation(conversation)
+    for (var pid in members) {
+        self.store.insertParticipant(id, pid, Time.nowIso())
+    }
+})
+        return conversation
+    }
+    // POST /conversations/direct: the pair's conversation, created when it does not exist.
+    String directConversationBetween(userA: String, userB: String) = pairConversation(userA, userB, "DIRECT", null)
+    // POST /conversations/business-direct: the initiator needs an active professional identity.
+    String businessDirectConversation(initiatorId: String, targetUserId: String) {
+        corporate.requireActive(initiatorId)
+        return pairConversation(initiatorId, targetUserId, "BUSINESS_DIRECT", null)
+    }
+    String serviceConversationBetween(userA: String, userB: String, subject: String) = pairConversation(userA, userB, "SERVICE", subject)
+    String freelanceConversationBetween(proposerId: String, posterId: String, title: String) = pairConversation(proposerId, posterId, "FREELANCE", title)
+    String pairConversation(userA: String, userB: String, kind: String, title: String?) {
+        var self = this
+        var found = store.findPair(userA, userB, kind)
+        if (found != null) {
+            return found.id()
+        }
+        var id = MessagingService.newConversationId()
+        var now = Time.nowIso()
+        database.transaction(() -> {
+    self.store.insertConversation(ConversationRecord(id, kind, title, userA, now, now))
+    self.store.insertParticipant(id, userA, now)
+    self.store.insertParticipant(id, userB, now)
+})
+        return id
+    }
+    // The guards every send goes through: age, sanctions, rate, cadence, membership, work identity, minors.
+    ConversationRecord requireCanSend(conversationId: String, senderId: String) {
+        agePolicy.requireCanWrite(senderId)
+        sanctionGate.requireNotRestricted(senderId)
+        userLimiter.require(senderId, UserRateLimiter.sendMessage())
+        timingGuard.recordAction(senderId)
+        var conversation = store.findConversation(conversationId)
+        if (conversation == null) {
+            throw Errors.api(404, "CONVERSATION_NOT_FOUND", "Conversa nao encontrada.")
+        }
+        if (!store.isParticipant(conversationId, senderId)) {
+            throw MessagingService.notParticipantError()
+        }
+        if (conversation.kind() == "BUSINESS_DIRECT" && conversation.createdBy() == senderId) {
+            corporate.requireActive(senderId)
+        }
+        protectMinorRecipients(conversation, senderId)
+        return conversation
+    }
+    // Job and service threads are exempt; everywhere else a minor only talks to accepted connections.
+    protectMinorRecipients(conversation: ConversationRecord, senderId: String) {
+        var kind = conversation.kind().toUpperCase()
+        if (kind == "JOB" || kind == "SERVICE") {
+            return
+        }
+        for (var p in store.participants(conversation.id())) {
+            if (p.userId() == senderId) {
+                continue
+            }
+            if (agePolicy.isMinor(p.userId()) && !connections.existsAccepted(senderId, p.userId())) {
+                throw MessagingService.minorDmRestricted()
+            }
+        }
+    }
+    requireReplyTarget(replyToId: String?, conversationId: String) {
+        if (replyToId == null) {
+            return
+        }
+        var target = store.findMessage(replyToId)
+        if (target == null) {
+            throw Errors.api(400, "INVALID_REPLY", "Mensagem citada nao encontrada nesta conversa.")
+        }
+        if (target.conversationId() != conversationId) {
+            throw Errors.api(400, "INVALID_REPLY", "Mensagem citada nao encontrada nesta conversa.")
+        }
+    }
+    MessageRecord sendMessage(conversationId: String, senderId: String, text: String?, mediaIds: List<String>?, mediaSpoiler: Bool, replyToId: String?) {
+        var self = this
+        var result = MessageRecord("", conversationId, senderId, "", listOf<String>(), false, false, null, null, Time.nowIso())
+        database.transaction(() -> {
+    var conversation = self.requireCanSend(conversationId, senderId)
+    var media = listOf<String>()
+    if (mediaIds != null) {
+        media = self.cleanIds(mediaIds)
+    }
+    var body = ""
+    if (text != null) {
+        body = text.trim()
+    }
+    if (body.length() == 0 && media.isEmpty()) {
+        throw Errors.api(400, "EMPTY_MESSAGE", "Escreva uma mensagem ou anexe uma midia.")
+    }
+    if (media.size() > 4) {
+        throw Errors.api(400, "TOO_MANY_MEDIA", "Anexe no maximo 4 midias por mensagem.")
+    }
+    self.requireReplyTarget(replyToId, conversationId)
+    var duplicate = self.store.recentDuplicate(conversationId, senderId, body, Time.plusSeconds(Time.nowIso(), -10L))
+    if (duplicate != null && MessagingStore.join(duplicate.mediaIds()) == MessagingStore.join(media) && duplicate.mediaSpoiler() == mediaSpoiler) {
+        result = duplicate
+        return
+    }
+    var message = MessageRecord(Ids.prefixed("message_"), conversationId, senderId, body, media, mediaSpoiler, false, null, replyToId, self.nextMessageInstant(conversationId))
+    self.store.insertMessage(message)
+    var preview = "Nova mensagem"
+    if (body.length() > 0) {
+        preview = body
+        if (body.length() > 80) {
+            preview = body.substring(0, 77) + "..."
+        }
+    }
+    else 
+        if (!media.isEmpty()) {
+            preview = "Enviou uma midia"
+        }
+    self.afterSend(conversation, senderId, preview)
+    result = message
+})
+        return result
+    }
+    MessageRecord sendE2eMessage(conversationId: String, senderId: String, ciphertext: String?, iv: String?, mediaIds: List<String>?, mediaSpoiler: Bool, replyToId: String?) {
+        var self = this
+        var cipher = ""
+        if (ciphertext != null) {
+            cipher = ciphertext
+        }
+        var ivText = ""
+        if (iv != null) {
+            ivText = iv
+        }
+        var result = MessageRecord("", conversationId, senderId, "", listOf<String>(), false, true, iv, null, Time.nowIso())
+        database.transaction(() -> {
+    var conversation = self.requireCanSend(conversationId, senderId)
+    if (cipher.trim().length() == 0) {
+        throw Errors.api(400, "EMPTY_MESSAGE", "Mensagem cifrada vazia.")
+    }
+    if (cipher.length() > 8000) {
+        throw Errors.api(400, "MESSAGE_TOO_LONG", "Mensagem excede o tamanho maximo.")
+    }
+    if (ivText.trim().length() == 0 || ivText.length() > 44) {
+        throw Errors.api(400, "MISSING_IV", "IV obrigatorio para mensagem E2E.")
+    }
+    self.requireReplyTarget(replyToId, conversationId)
+    var media = listOf<String>()
+    if (mediaIds != null) {
+        media = self.cleanIds(mediaIds)
+    }
+    var message = MessageRecord(Ids.prefixed("message_"), conversationId, senderId, cipher, media, mediaSpoiler, true, ivText, replyToId, self.nextMessageInstant(conversationId))
+    self.store.insertMessage(message)
+    self.afterSend(conversation, senderId, "Mensagem cifrada")
+    result = message
+})
+        return result
+    }
+    // The sender has read everything, the conversation moves to the top and the others are told.
+    afterSend(conversation: ConversationRecord, senderId: String, preview: String) {
+        var now = Time.nowIso()
+        store.markRead(conversation.id(), senderId, now)
+        notifications.markReadByHref(senderId, MessagingService.conversationHref(conversation.id()))
+        store.touchConversation(conversation.id(), now)
+        notifyRecipients(conversation, senderId, preview)
+        coins.recordPresence(senderId)
+    }
+    // One notice per conversation that counts the new messages and pushes each one (tag = conversation).
+    notifyRecipients(conversation: ConversationRecord, senderId: String, preview: String) {
+        var id = conversation.id()
+        for (var p in store.participants(id)) {
+            if (p.userId() == senderId || viewers.isViewing(p.userId(), id)) {
+                continue
+            }
+            notifications.createCountedAndPushed(p.userId(), ConversationContexts.messageNotificationKind(conversation.kind()), MessagingService.conversationNoticeGroup(id), senderId, "Nova mensagem", preview, (count: Int) -> count + " novas mensagens", MessagingService.conversationHref(id), "Responder")
+        }
+    }
+    viewing(conversationId: String, userId: String) {
+        if (!store.isParticipant(conversationId, userId)) {
+            throw MessagingService.notParticipantError()
+        }
+        viewers.viewing(userId, conversationId)
+    }
+    leftConversation(conversationId: String, userId: String) {
+        viewers.left(userId, conversationId)
+    }
+    markRead(conversationId: String, userId: String) {
+        var self = this
+        if (!store.isParticipant(conversationId, userId)) {
+            throw MessagingService.notParticipantError()
+        }
+        database.transaction(() -> {
+    self.store.markRead(conversationId, userId, Time.nowIso())
+    self.notifications.markReadByHref(userId, MessagingService.conversationHref(conversationId))
+})
+    }
+    List<ConversationRecord> listConversations(userId: String, before: String?, context: String?, limit: Int) = store.findByParticipant(userId, before, context, MessagingService.clamp(limit, 1, 100), false)
+    List<ConversationRecord> listArchived(userId: String, before: String?, context: String?, limit: Int) = store.findByParticipant(userId, before, context, MessagingService.clamp(limit, 1, 100), true)
+    Int hideConversations(userId: String, ids: List<String>) = store.hideConversations(userId, ids, Time.nowIso())
+    Int unhideConversations(userId: String, ids: List<String>) = store.unhideConversations(userId, ids)
+    Bool isParticipant(conversationId: String, userId: String) = store.isParticipant(conversationId, userId)
+    Bool messageBelongsTo(messageId: String, conversationId: String) {
+        var m = store.findMessage(messageId)
+        return m != null && m.conversationId() == conversationId
+    }
+    ConversationRecord getConversation(id: String) {
+        var c = store.findConversation(id)
+        if (c == null) {
+            throw Errors.api(404, "CONVERSATION_NOT_FOUND", "Conversa nao encontrada.")
+        }
+        return c
+    }
+    List<ParticipantRecord> getParticipants(conversationId: String) = store.participants(conversationId)
+    Int countUnread(conversationId: String, userId: String) = store.countUnread(conversationId, userId)
+    Int countTotalUnread(userId: String, context: String?) = store.countTotalUnread(userId, context)
+    List<MessageRecord> getMessages(conversationId: String, viewerId: String, before: String?, limit: Int) {
+        if (store.findConversation(conversationId) == null) {
+            throw Errors.api(404, "CONVERSATION_NOT_FOUND", "Conversa nao encontrada.")
+        }
+        return store.visibleMessages(conversationId, viewerId, before, MessagingService.clamp(limit, 1, 100))
+    }
+    // "Delete for me" for several messages at once: all of them must belong to the conversation.
+    Int hideMessages(conversationId: String, userId: String, messageIds: List<String>?) {
+        if (!store.isParticipant(conversationId, userId)) {
+            throw MessagingService.notParticipantError()
+        }
+        var ids = listOf<String>()
+        if (messageIds != null) {
+            ids = cleanIds(messageIds)
+        }
+        if (ids.isEmpty()) {
+            throw Errors.api(400, "EMPTY_MESSAGE_LIST", "Selecione ao menos uma mensagem.")
+        }
+        if (store.countInConversation(conversationId, ids) != ids.size() as Long) {
+            throw Errors.api(404, "MESSAGE_NOT_FOUND", "Mensagem nao encontrada nesta conversa.")
+        }
+        return store.hideMessages(userId, ids, Time.nowIso())
+    }
+    LastMessagePreview lastMessagePreview(conversationId: String) {
+        var m = store.lastMessage(conversationId)
+        if (m == null) {
+            return LastMessagePreview(null, false, null, null, null)
+        }
+        return LastMessagePreview(m.text(), m.e2e(), m.iv(), m.createdAt(), m.senderId())
+    }
+    // true = reacted, false = the same reaction was taken back.
+    Bool addReaction(messageId: String, userId: String, type: String) {
+        var self = this
+        var added = false
+        database.transaction(() -> {
+    added = self.store.toggleReaction(Ids.prefixed("mreac_"), messageId, userId, type, Time.nowIso())
+    if (added) {
+        self.coins.recordPresence(userId)
+    }
+})
+        return added
+    }
+    List<MessageReactionView> getReactions(messageId: String) = store.reactionsOf(messageId)
+    List<MessageRecord> findMessagesByIds(ids: List<String>) = store.findMessages(ids)
+    static Map<String,Int> countsIn(counts: Map<String,Map<String,Int>>, messageId: String) {
+        var found = counts.get(messageId)
+        if (found == null) {
+            return new HashMap<String, Int>()
+        }
+        return found
+    }
+    Map<String,MessageReactionSummary> reactionSummaries(messageIds: List<String>, viewerId: String) {
+        var counts = new HashMap<String, Map<String,Int>>()
+        var mine = new HashMap<String, String>()
+        for (var row in store.reactionsOfMessages(messageIds)) {
+            if (counts.get(row.messageId()) == null) {
+                counts.put(row.messageId(), new HashMap<String, Int>())
+            }
+            var byType = MessagingService.countsIn(counts, row.messageId())
+            byType.put(row.type(), byType.getOrDefault(row.type(), 0) + 1)
+            if (row.userId() == viewerId) {
+                mine.put(row.messageId(), row.type())
+            }
+        }
+        var out = new HashMap<String, MessageReactionSummary>()
+        for (var messageId in counts.keys()) {
+            var byType = counts.get(messageId)
+            if (byType != null) {
+                out.put(messageId, MessageReactionSummary(byType, mine.get(messageId)))
+            }
+        }
+        return out
+    }
+}

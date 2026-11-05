@@ -1,0 +1,365 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import notifications.*
+import push.*
+
+class NotificationsApiHolder {
+    static TestApp? cached = null
+    static NotificationsModule? module = null
+    static RecordingPushSender sender = RecordingPushSender()
+}
+
+TestApp notifApp() {
+    var cur = NotificationsApiHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var created = DomainTestKit.boot("notifapi", mapOf<String, String>(), (p: Platform, s: SharedServices, parts: SecurityParts) -> {
+        var module = NotificationsModule.install(p, s, SecurityHooks(), parts)
+        NotificationsApiHolder.module = module
+        PushModule.installWith(p, module, PushStore(p.db), NotificationsApiHolder.sender, PushPresence(p.db), true)
+    })
+    NotificationsApiHolder.cached = created
+    return created
+}
+
+Notifications api() {
+    var m = NotificationsApiHolder.module
+    if (m == null) {
+        throw "module not wired"
+    }
+    return m.notifications
+}
+
+String hdr(app: TestApp, id: String) = DomainTestKit.login(app, id)
+
+insertBlock(app: TestApp, blocker: String, blocked: String) {
+    app.db().execute("insert into user_blocks (blocker_id, blocked_id, created_at) values (?, ?, ?)", DbParams().bindStr(blocker).bindStr(blocked).bindInstant(Time.nowIso()))
+}
+
+seed(app: TestApp, id: String, userId: String, kind: String, actor: String, read: Bool, href: String?) {
+    DomainTestKit.insertNotification(app.db(), id, userId, kind, actor, read, href)
+}
+
+community(app: TestApp, id: String, name: String) {
+    var now = Time.nowIso()
+    app.db().execute("insert into communities (id, name, description, topic, created_by, created_at, updated_at) values (?, ?, 'desc', 'TECNOLOGIA', 'notif_place_friend', ?, ?)", DbParams().bindStr(id).bindStr(name).bindInstant(now).bindInstant(now))
+}
+
+communityPost(app: TestApp, postId: String, communityId: String) {
+    app.db().execute("insert into posts (id, author_id, type, content, created_at, visibility, reactions, comments, saves, shares, status, community_id) values (?, 'notif_place_friend', 'INSIGHT', 'oi', ?, 'PUBLIC', 0, 0, 0, 0, 'ACTIVE', ?)", DbParams().bindStr(postId).bindInstant(Time.nowIso()).bindStr(communityId))
+}
+
+group(app: TestApp, slug: String, name: String, status: String) {
+    var now = Time.nowIso()
+    app.db().execute("insert into groups (id, slug, name, owner_id, status, created_at, updated_at) values (?, ?, ?, 'notif_place_friend', ?, ?, ?)", DbParams().bindStr("id-" + slug).bindStr(slug).bindStr(name).bindStr(status).bindInstant(now).bindInstant(now))
+}
+
+event(app: TestApp, id: String, day: String) {
+    var now = Time.nowIso()
+    app.db().execute("insert into events (id, title, date, time, format, host, created_by, created_at, updated_at) values (?, 'Encontro', ?, '19:00', 'ONLINE', 'Casa', 'notif_place_friend', ?, ?)", DbParams().bindStr(id).bindStr(day).bindInstant(now).bindInstant(now))
+}
+
+attend(app: TestApp, userId: String, eventId: String) {
+    app.db().execute("insert into event_attendees (event_id, user_id, responded_at) values (?, ?, ?)", DbParams().bindStr(eventId).bindStr(userId).bindInstant(Time.nowIso()))
+}
+
+test "lists notifications and marks all read" {
+    var app = notifApp()
+    var token = hdr(app, "notif_user")
+    var res = app.client.getWith("/notifications", DomainTestKit.auth(token))
+    Check.status(res, 200)
+    assert(res.jsonHas("items"))
+    assert(res.jsonSize("items") == 0)
+    var all = app.client.send("POST", "/notifications/read-all", DomainTestKit.command(token, "notif-read-all-1"), "", "")
+    Check.status(all, 200)
+    Check.jsonEq(all, "status", "ALL_READ")
+    // a request without a session is a 401
+    Check.apiError(app.client.get("/notifications"), 401, "UNAUTHENTICATED")
+}
+
+test "marks a single notification read without error" {
+    var app = notifApp()
+    var token = hdr(app, "notif_read_one")
+    seed(app, "notif_read_id_1", "notif_read_one", "SYSTEM", "sistema", false, null)
+    var res = app.client.send("POST", "/notifications/notif_read_id_1/read", DomainTestKit.command(token, "notif-read-one"), "", "")
+    Check.status(res, 200)
+    Check.jsonEq(res, "status", "READ")
+    var list = app.client.getWith("/notifications", DomainTestKit.auth(token))
+    Check.status(list, 200)
+    Check.eqStr("read", "true", "" + DomainTestKit.itemStr(list, "items", "notif_read_id_1", "read"))
+    // somebody else's notification is a 403, an unknown one a 404
+    var other = hdr(app, "notif_read_other")
+    Check.apiError(app.client.send("POST", "/notifications/notif_read_id_1/read", DomainTestKit.command(other, "notif-read-other"), "", ""), 403, "FORBIDDEN")
+    Check.apiError(app.client.send("POST", "/notifications/nope/read", DomainTestKit.command(other, "notif-read-nope"), "", ""), 404, "NOTIFICATION_NOT_FOUND")
+    // the Idempotency-Key is mandatory
+    Check.apiError(app.client.send("POST", "/notifications/read-all", listOf("X-Session-Token: " + other), "", ""), 400, "IDEMPOTENCY_KEY_REQUIRED")
+}
+
+test "unread summary counts per area without blocked actors and honours the context" {
+    var app = notifApp()
+    var token = hdr(app, "notif_summary_owner")
+    hdr(app, "notif_summary_blocked")
+    var me = "notif_summary_owner"
+    seed(app, "summary_msg_1", me, "NEW_MESSAGE", "notif_summary_friend", false, null)
+    seed(app, "summary_msg_2", me, "NEW_MESSAGE", "notif_summary_friend", false, null)
+    seed(app, "summary_work_msg", me, "NEW_WORK_MESSAGE", "notif_summary_friend", false, null)
+    seed(app, "summary_group", me, "GROUP_JOIN_REQUEST", "notif_summary_friend", false, null)
+    seed(app, "summary_request", me, "CONNECTION_REQUEST", "notif_summary_friend", false, null)
+    seed(app, "summary_accepted", me, "CONNECTION_ACCEPTED", "notif_summary_friend", false, null)
+    seed(app, "summary_security", me, "SEGURANCA", "sistema", false, null)
+    seed(app, "summary_read_group", me, "GROUP_NEW_POST", "notif_summary_friend", true, null)
+    seed(app, "summary_blocked_group", me, "GROUP_NEW_POST", "notif_summary_blocked", false, null)
+    insertBlock(app, me, "notif_summary_blocked")
+    var res = app.client.getWith("/notifications/unread-summary", DomainTestKit.auth(token))
+    Check.status(res, 200)
+    Check.jsonEq(res, "total", "3")
+    assert(!res.jsonHas("byModule.MESSAGES"))
+    Check.jsonEq(res, "byModule.NETWORK", "1")
+    Check.jsonEq(res, "byModule.GROUPS", "1")
+    Check.jsonEq(res, "byModule.OTHER", "1")
+    var pro = app.client.getWith("/notifications/unread-summary?context=PROFESSIONAL", DomainTestKit.auth(token))
+    Check.status(pro, 200)
+    Check.jsonEq(pro, "total", "1")
+    assert(!pro.jsonHas("byModule.MESSAGES"))
+    Check.jsonEq(pro, "byModule.OTHER", "1")
+    assert(!pro.jsonHas("byModule.GROUPS"))
+    var social = app.client.getWith("/notifications/unread-summary?context=SOCIAL", DomainTestKit.auth(token))
+    Check.status(social, 200)
+    Check.jsonEq(social, "total", "3")
+    assert(!social.jsonHas("byModule.MESSAGES"))
+    Check.apiError(app.client.getWith("/notifications/unread-summary?context=OTHER", DomainTestKit.auth(token)), 400, "INVALID_CONTEXT")
+}
+
+test "every listed item carries the module of its kind" {
+    var app = notifApp()
+    var token = hdr(app, "notif_module_owner")
+    seed(app, "module_event", "notif_module_owner", "EVENT_NEXT_OCCURRENCE", "notif_module_friend", false, null)
+    seed(app, "module_reaction", "notif_module_owner", "NEW_REACTION", "notif_module_friend", false, null)
+    var res = app.client.getWith("/notifications", DomainTestKit.auth(token))
+    Check.status(res, 200)
+    Check.eqStr("event module", "EVENTS", "" + DomainTestKit.itemStr(res, "items", "module_event", "module"))
+    Check.eqStr("reaction module", "OTHER", "" + DomainTestKit.itemStr(res, "items", "module_reaction", "module"))
+}
+
+test "every listed item carries its place and event date or null" {
+    var app = notifApp()
+    var token = hdr(app, "notif_place_owner")
+    var me = "notif_place_owner"
+    var sfx = "p1"
+    community(app, "place-community-" + sfx, "Mesa de BH")
+    communityPost(app, "place-post-" + sfx, "place-community-" + sfx)
+    group(app, "place-group-" + sfx, "Grupo da Roda", "ACTIVE")
+    group(app, "place-closed-" + sfx, "Grupo Fechado", "CLOSED")
+    var today = NotificationDates.todayBrazil()
+    event(app, "place-event-" + sfx, today)
+    event(app, "place-br-event-" + sfx, "24/12/2026")
+    seed(app, "place_community", me, "MENTION", "notif_place_friend", false, "/comunidades/place-community-" + sfx)
+    seed(app, "place_post", me, "NEW_REACTION", "notif_place_friend", false, "/api/feed/posts/place-post-" + sfx + "?reacoes=1")
+    seed(app, "place_group", me, "GROUP_NEW_POST", "notif_place_friend", false, "/grupos/place-group-" + sfx)
+    seed(app, "place_event", me, "EVENT_NEXT_OCCURRENCE", "notif_place_friend", false, "/eventos?evento=place-event-" + sfx)
+    seed(app, "place_br_event", me, "EVENT_NEXT_OCCURRENCE", "notif_place_friend", false, "/eventos?evento=place-br-event-" + sfx)
+    seed(app, "place_gone_community", me, "MENTION", "notif_place_friend", false, "/comunidades/gone-" + sfx)
+    seed(app, "place_closed_group", me, "GROUP_NEW_POST", "notif_place_friend", false, "/grupos/place-closed-" + sfx)
+    seed(app, "place_gone_event", me, "EVENT_NEXT_OCCURRENCE", "notif_place_friend", false, "/eventos?evento=gone")
+    seed(app, "place_none", me, "SEGURANCA", "sistema", false, "/configuracoes/seguranca")
+    seed(app, "place_no_href", me, "SISTEMA", "sistema", false, null)
+    var res = app.client.getWith("/notifications", DomainTestKit.auth(token))
+    Check.status(res, 200)
+    var k = "items"
+    Check.eqStr("c type", "COMMUNITY", "" + DomainTestKit.itemStr(res, k, "place_community", "place.type"))
+    Check.eqStr("c id", "place-community-" + sfx, "" + DomainTestKit.itemStr(res, k, "place_community", "place.id"))
+    Check.eqStr("c name", "Mesa de BH", "" + DomainTestKit.itemStr(res, k, "place_community", "place.name"))
+    assert(DomainTestKit.itemIsNull(res, k, "place_community", "place.color"))
+    assert(DomainTestKit.itemIsNull(res, k, "place_community", "eventDate"))
+    Check.eqStr("p type", "COMMUNITY", "" + DomainTestKit.itemStr(res, k, "place_post", "place.type"))
+    Check.eqStr("p id", "place-community-" + sfx, "" + DomainTestKit.itemStr(res, k, "place_post", "place.id"))
+    Check.eqStr("g type", "GROUP", "" + DomainTestKit.itemStr(res, k, "place_group", "place.type"))
+    Check.eqStr("g name", "Grupo da Roda", "" + DomainTestKit.itemStr(res, k, "place_group", "place.name"))
+    Check.eqStr("e date", today, "" + DomainTestKit.itemStr(res, k, "place_event", "eventDate"))
+    assert(DomainTestKit.itemIsNull(res, k, "place_event", "place"))
+    Check.eqStr("br date", "2026-12-24", "" + DomainTestKit.itemStr(res, k, "place_br_event", "eventDate"))
+    assert(DomainTestKit.itemIsNull(res, k, "place_gone_community", "place"))
+    assert(DomainTestKit.itemIsNull(res, k, "place_closed_group", "place"))
+    assert(DomainTestKit.itemIsNull(res, k, "place_gone_event", "eventDate"))
+    assert(DomainTestKit.itemIsNull(res, k, "place_none", "place"))
+    assert(DomainTestKit.itemIsNull(res, k, "place_none", "eventDate"))
+    assert(DomainTestKit.itemIsNull(res, k, "place_no_href", "place"))
+}
+
+test "unread summary counts per community and the confirmed events of today" {
+    var app = notifApp()
+    var token = hdr(app, "notif_summary_places")
+    var me = "notif_summary_places"
+    community(app, "summary-community", "Mesa")
+    community(app, "summary-other", "Outra mesa")
+    communityPost(app, "summary-post", "summary-community")
+    seed(app, "summary_place_1", me, "MENTION", "notif_place_friend", false, "/comunidades/summary-community")
+    seed(app, "summary_place_2", me, "NEW_REACTION", "notif_place_friend", false, "/api/feed/posts/summary-post")
+    seed(app, "summary_place_3", me, "NEW_COMMENT", "notif_place_other", false, "/api/feed/posts/summary-post")
+    seed(app, "summary_place_read", me, "MENTION", "notif_place_friend", true, "/comunidades/summary-other")
+    seed(app, "summary_place_gone", me, "MENTION", "notif_place_friend", false, "/comunidades/gone-x")
+    var today = NotificationDates.todayBrazil()
+    var parts = today.split("-")
+    var tomorrow = Time.todayIso()
+    event(app, "summary-today", today)
+    event(app, "summary-today-br", parts[2] + "/" + parts[1] + "/" + parts[0])
+    event(app, "summary-tomorrow", "2099-01-01")
+    event(app, "summary-not-attending", today)
+    attend(app, me, "summary-today")
+    attend(app, me, "summary-today-br")
+    attend(app, me, "summary-tomorrow")
+    var res = app.client.getWith("/notifications/unread-summary", DomainTestKit.auth(token))
+    Check.status(res, 200)
+    Check.jsonEq(res, "total", "4")
+    Check.eqInt("communities", 1, res.jsonSize("byCommunity"))
+    Check.jsonEq(res, "byCommunity.summary-community", "3")
+    Check.jsonEq(res, "eventsToday", "2")
+    var pro = app.client.getWith("/notifications/unread-summary?context=PROFESSIONAL", DomainTestKit.auth(token))
+    Check.eqInt("pro communities", 0, pro.jsonSize("byCommunity"))
+    Check.jsonEq(pro, "eventsToday", "0")
+}
+
+test "unread summary has no communities nor events when there are none" {
+    var app = notifApp()
+    var token = hdr(app, "notif_summary_empty")
+    var res = app.client.getWith("/notifications/unread-summary", DomainTestKit.auth(token))
+    Check.status(res, 200)
+    Check.jsonEq(res, "total", "0")
+    Check.eqInt("communities", 0, res.jsonSize("byCommunity"))
+    Check.jsonEq(res, "eventsToday", "0")
+}
+
+test "paging: the cursor is the instant of the last item and a bad cursor is a 400" {
+    var app = notifApp()
+    var token = hdr(app, "notif_paging")
+    seed(app, "paging_a", "notif_paging", "SISTEMA", "sistema", false, null)
+    seed(app, "paging_b", "notif_paging", "SISTEMA", "sistema", false, null)
+    var first = app.client.getWith("/notifications?limit=1", DomainTestKit.auth(token))
+    Check.status(first, 200)
+    Check.eqInt("page size", 1, first.jsonSize("items"))
+    assert(first.jsonStr("nextCursor") != null)
+    Check.apiError(app.client.getWith("/notifications?cursor=nope", DomainTestKit.auth(token)), 400, "INVALID_CURSOR")
+    Check.apiError(app.client.getWith("/notifications?limit=0", DomainTestKit.auth(token)), 400, "BAD_REQUEST")
+    Check.apiError(app.client.getWith("/notifications?context=OTHER", DomainTestKit.auth(token)), 400, "INVALID_CONTEXT")
+}
+
+test "hidden actors never show in the list" {
+    var app = notifApp()
+    var token = hdr(app, "notif_hide_owner")
+    hdr(app, "notif_hide_blocked")
+    seed(app, "hide_visible", "notif_hide_owner", "SISTEMA", "sistema", false, null)
+    seed(app, "hide_blocked", "notif_hide_owner", "NEW_REACTION", "notif_hide_blocked", false, null)
+    insertBlock(app, "notif_hide_owner", "notif_hide_blocked")
+    var res = app.client.getWith("/notifications", DomainTestKit.auth(token))
+    Check.status(res, 200)
+    assert(DomainTestKit.indexOfId(res, "items", "hide_visible") >= 0)
+    assert(DomainTestKit.indexOfId(res, "items", "hide_blocked") < 0)
+}
+
+test "preferences: defaults are all on and a partial update keeps the rest" {
+    var app = notifApp()
+    var token = hdr(app, "npref_crud")
+    Check.apiError(app.client.get("/me/notification-preferences"), 401, "UNAUTHENTICATED")
+    var res = app.client.getWith("/me/notification-preferences", DomainTestKit.auth(token))
+    Check.status(res, 200)
+    Check.jsonEq(res, "weeklyDigest", "true")
+    Check.jsonEq(res, "pushSocial", "true")
+    Check.jsonEq(res, "pushMessages", "true")
+    Check.jsonEq(res, "pushGroups", "true")
+    Check.jsonEq(res, "pushJobs", "true")
+    Check.jsonEq(res, "pushSystem", "true")
+    var json = DomainTestKit.command(token, "x")
+    var put1 = app.client.send("PUT", "/me/notification-preferences", listOf("X-Session-Token: " + token, "Content-Type: application/json"), "", "{\"pushSocial\":false,\"weeklyDigest\":false}")
+    Check.status(put1, 200)
+    Check.jsonEq(put1, "pushSocial", "false")
+    Check.jsonEq(put1, "weeklyDigest", "false")
+    Check.jsonEq(put1, "pushMessages", "true")
+    assert(put1.jsonStr("updatedAt") != null)
+    Check.status(app.client.send("PUT", "/me/notification-preferences", listOf("X-Session-Token: " + token, "Content-Type: application/json"), "", "{\"pushJobs\":false}"), 200)
+    var res2 = app.client.getWith("/me/notification-preferences", DomainTestKit.auth(token))
+    Check.jsonEq(res2, "pushSocial", "false")
+    Check.jsonEq(res2, "weeklyDigest", "false")
+    Check.jsonEq(res2, "pushJobs", "false")
+    Check.jsonEq(res2, "pushGroups", "true")
+    // an empty body changes nothing, a non boolean value is a 400
+    Check.status(app.client.send("PUT", "/me/notification-preferences", listOf("X-Session-Token: " + token, "Content-Type: application/json"), "", ""), 200)
+    Check.apiError(app.client.send("PUT", "/me/notification-preferences", listOf("X-Session-Token: " + token, "Content-Type: application/json"), "", "{\"pushJobs\":\"talvez\"}"), 400, "BAD_REQUEST")
+}
+
+test "push respects the category and security is always sent" {
+    var app = notifApp()
+    var token = hdr(app, "npref_push")
+    var sender = NotificationsApiHolder.sender
+    var userId = "npref_push"
+    api().create(userId, "NEW_REACTION", "sistema", "Titulo", "Corpo", "/feed", "Ver")
+    Check.eqInt("first push", 1, sender.countFor(userId))
+    var off = "{\"pushSocial\":false,\"pushMessages\":false,\"pushGroups\":false,\"pushJobs\":false,\"pushSystem\":false}"
+    Check.status(app.client.send("PUT", "/me/notification-preferences", listOf("X-Session-Token: " + token, "Content-Type: application/json"), "", off), 200)
+    sender.clear()
+    api().create(userId, "NEW_REACTION", "sistema", "Titulo", "Corpo", "/feed", "Ver")
+    api().create(userId, "NEW_MESSAGE", "sistema", "Titulo", "Corpo", "/feed", "Ver")
+    api().create(userId, "JOB_APPLICATION_STATUS", "sistema", "Titulo", "Corpo", "/feed", "Ver")
+    Check.eqInt("muted", 0, sender.countFor(userId))
+    api().create(userId, "SEGURANCA", "sistema", "Titulo", "Corpo", "/feed", "Ver")
+    Check.eqInt("security", 1, sender.countFor(userId))
+    var res = app.client.getWith("/notifications", DomainTestKit.auth(token))
+    Check.eqInt("inbox keeps all", 5, res.jsonSize("items"))
+}
+
+test "reactions to the same target become one notification" {
+    var app = notifApp()
+    var token = hdr(app, "ngroup_owner")
+    var userId = "ngroup_owner"
+    var sender = NotificationsApiHolder.sender
+    sender.clear()
+    var group = "NEW_REACTION:post:ngroup-1"
+    react(userId, group, "actor_ana", "Ana")
+    react(userId, group, "actor_bia", "Bia")
+    react(userId, group, "actor_bia", "Bia")
+    react(userId, group, "actor_caio", "Caio")
+    react(userId, "NEW_REACTION:post:other-1", "actor_ana", "Ana")
+    var res = app.client.getWith("/notifications", DomainTestKit.auth(token))
+    Check.status(res, 200)
+    Check.eqInt("items", 2, res.jsonSize("items"))
+    Check.jsonEq(res, "items.1.body", "Caio e mais 2 pessoas reagiram ao seu post.")
+    Check.jsonEq(res, "items.1.actorCount", "3")
+    Check.jsonEq(res, "items.1.actorId", "actor_caio")
+    Check.jsonEq(res, "items.1.href", "/post?reacoes=1")
+    Check.jsonEq(res, "items.0.href", "/post")
+    Check.eqInt("pushes", 2, sender.countFor(userId))
+    Check.status(app.client.send("POST", "/notifications/read-all", DomainTestKit.command(token, "ngroup-read"), "", ""), 200)
+    react(userId, group, "actor_davi", "Davi")
+    var after = app.client.getWith("/notifications", DomainTestKit.auth(token))
+    Check.eqInt("after read", 3, after.jsonSize("items"))
+    Check.jsonEq(after, "items.0.body", "Davi reagiu ao seu post.")
+}
+
+react(userId: String, group: String, actorId: String, actorName: String) {
+    api().createGrouped(userId, "NEW_REACTION", group, actorId, "Nova reação", actorName + " reagiu ao seu post.", (count: Int) -> NotificationOutboxEventHandler.othersReacted(actorName, count, "ao seu post"), "/post", "/post?reacoes=1", "Ver", null)
+}
+
+test "a counter notification grows and pushes every time when asked to" {
+    var app = notifApp()
+    var token = hdr(app, "ncount_owner")
+    var sender = NotificationsApiHolder.sender
+    sender.clear()
+    var userId = "ncount_owner"
+    for (var i in listOf<Int>(1, 2, 3)) {
+        api().createCountedAndPushed(userId, "NEW_MESSAGE", "conversation:c-count", "actor_x", "Nova mensagem", "oi " + i, (n: Int) -> n + " novas mensagens", "/api/conversations/c-count", "Responder")
+    }
+    var res = app.client.getWith("/notifications", DomainTestKit.auth(token))
+    Check.eqInt("one row", 1, res.jsonSize("items"))
+    Check.jsonEq(res, "items.0.body", "3 novas mensagens")
+    Check.jsonEq(res, "items.0.actorCount", "3")
+    Check.eqInt("pushes", 3, sender.countFor(userId))
+    Check.eqStr("tag", "conversation:c-count", "" + sender.messages.get(2).tag())
+    sender.clear()
+    for (var i in listOf<Int>(1, 2)) {
+        api().createCounted(userId, "CALL_GROUP_LIVE", "call_live:c1", "actor_x", "Ao vivo", "ao vivo", (n: Int) -> "ao vivo", "/call/c1", "Entrar")
+    }
+    Check.eqInt("counted pushes once", 1, sender.countFor(userId))
+}
