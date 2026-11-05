@@ -10,7 +10,8 @@
 > Cross-domain seams: since the tidy-up round every seam whose owner is ported is switched in `src/app/AppWiring.kf` to a
 > bridge that calls the owner's API. `docs/SEAMS.md` is the inventory (seam, caller, owner, status) and supersedes the
 > "pending port" tables below for those seams; the defaults described below remain only as the test defaults of each
-> domain suite. Left: the moderation seams and the OPEN rows of SEAMS.md.
+> domain suite. Left: only `MediaImageReviewer` / `ModerationImages` (moderation automation, another branch); the rest of the
+> table in SEAMS.md is SWITCHED, WIRED or KEPT with a reason.
 
 ## Request pipeline (`kernel.security`)
 
@@ -268,7 +269,7 @@ limit are the Java values; `PushService` is `PushSubscriptionService` (G206); a 
 ciphertext (`EMPTY_MESSAGE`, `MESSAGE_TOO_LONG` over 8000) and the IV (`MISSING_IV`) before storing.
 ## feed (`src/feed`, tests in `tests/feed/`)
 
-**Ported: 43 / 43 endpoints, 161 / 170 Java tests (163 Kof tests: 2 are Kof-only, `GET /feed/saved` and a trending-cursor check). Gaps G140 to G150.**
+**Ported: 43 / 43 endpoints, 170 / 170 Java tests (167 Kof tests in `tests/feed` plus 6 wired tests in `tests/integration/FeedWiredPresentationTest.kf`; 2 are Kof-only, `GET /feed/saved` and a trending-cursor check). Gaps G140 to G150.**
 Identical paths, status codes, JSON field order, pt-BR codes/messages and `Idempotency-Key` routes.
 
 Endpoints: post core (`POST /feed/posts` for every type, `GET|PATCH|DELETE /feed/posts/{id}`, restore, bulk-delete,
@@ -295,9 +296,12 @@ Deliberate differences:
 - `GET /feed/posts/seals` is registered before `/feed/posts/:postId` because routes match in registration order (G147).
 - Counters move with atomic `update ... set n = n + 1`.
 
-Tests not ported (6 of 170, with reason): the actor-style notification test; the BanCleanupService test (moderation port); the coin-ledger
-reaction test (`FeedRecordingCoins` records the answer reward in the feed suite; the production wiring pays through `CoinFeedCoins`); the media-embedding Mockito `verify`
-test; two identity-presentation tests that need the full profile cosmetics wiring (all four are unblocked by the wired suites, see `docs/SEAMS.md`, not ported yet).
+The six tests that waited for other domains are ported: the BanCleanup test lives in `tests/moderation`; the coin-ledger reaction
+test (no coin entries for received reactions), the badges and name-style tests (set through `PUT /me/badges` and
+`PUT /cosmetics/profile/name-style`, the profile and cosmetics owners), the actor-style notification test (read through
+`GET /notifications`) and the media-embedding test run on the production wiring in
+`tests/integration/FeedWiredPresentationTest.kf`. The Mockito `verify(times(1)).findByIds` is the `MediaFeedBridge.cardLookups`
+counter (one card lookup per page, asserted on the wired app); the removal step uses the real `DELETE /media/{id}`.
 Test wiring: `feed.FeedTestSupport` (limits relaxed, duplicate filters off, outbox worker parked with
 `REDE_OUTBOX_WORKER_DELAY_MS`, `FeedTestSupport.finish()` in the last test of each file stops the shared jobs so the
 process exits: the Kof runtime waits for spawned tasks at exit, which the runner fix on main does not cover, G150), fixtures
@@ -1069,3 +1073,35 @@ review routes in `src/app`). Wired last in `AppWiring`; the seams it owns are in
 - Kernel changes: `DbParams.bindIntOrNull/bindLongOrNull` (G370, same fix as main), `SharedServices.createWith(platform,
   escalation)`.
 - Gaps found: G370 to G377 in `docs/KOF_GAPS.md`.
+
+## Route parity (final tidy)
+
+Audit by a throwaway script that reads every Java mapping (`@Get/Post/Put/Delete/Patch/RequestMapping`, class-level
+`@RequestMapping` prefix, path variables normalised to `{}`) and every `server.<verb>("/path", ...)` / `sse` registration
+of `src/**/*.kf`, and diffs the (method, path) sets.
+
+- Java: 642 distinct (method, path) mappings in 92 controllers. Kof: every one is registered, except the two
+  `GET|PUT /storage/{key}` of `MediaStorageProxyController`, which are served by the binary lane (`BinaryLane.claim("/storage/")`
+  in `src/media/MediaStorageRoutes.kf`) and never go through `server.get/put`.
+- Found and fixed: `GET /support/config` was registered as `/support/settings` (test renamed).
+- Kof-only registrations: none. The script also lists `GET /orgs`, `/repos`, `/users` (outbound GitHub calls) and `PUT /auth/...`
+  (limiter patterns in `RateFilters`); they are not routes.
+- Cosmetics moderation: the Java service has no cosmetics moderation or admin endpoint (`CommunityCosmeticsController` is
+  `/cosmetics/catalog|{id}|drafts|mine|{id}/submit|{id}/report|profile/*`; a submitted cosmetic stays `PENDING_MODERATION`
+  and no Java code approves or rejects it). Nothing to port, nothing to add to `BootRoutesTest`.
+- Deliberate exceptions: the moderation automation classes (`ContentAutomationService`, `LinkSafety*`, `MediaSafety*`,
+  `PostSpamAutomod`, `SexualContentReport*`) have no routes of their own in the list above; their ports belong to another branch.
+
+## Totals (final tidy)
+
+Kof side, counted from the tree: 322 test files with 2186 `test "..."` blocks (about 640 of them HTTP-level against a booted app,
+the rest kernel, security and unit suites), 665 route registrations of which 640 match a Java mapping one to one (the rest are
+the client and filter patterns above). Per domain, tests in `tests/<domain>` (HTTP-level and unit):
+feed 167, identity 138, jobs 108, media 104 (all media suites), profile 93, messaging 69, cosmetics 67, emotes 68, coin 63,
+moderation 62, groups 57, events 53, mentoring 43, notifications 37, ops 37, corporate 33, studypairs 31, importlinkedin 29,
+games 29, support 28, network 25, preferences 25, contributions 24, communities 22, linkedin 20, dailygames 19, gifs 18,
+freelances 18, blog 16, companies 16, marketplace 16, push 16, importresume 16, calls 15, suggestions 15, projects 10,
+contributors 9, apiv1 9, themes 9, notices 8, githubprofile 7, search 7, releasenotes 6, presence 5, communityprojects 3,
+stats 2; `tests/kernel` 144, `tests/security` 150, `tests/shared` 179, `tests/integration` 29 (wiring, boot routes, seams,
+`FeedWiredPresentationTest`, `NotificationPlacesTest`). Java tests ported per domain are in each section above; this round
+closed the feed (170 / 170).
