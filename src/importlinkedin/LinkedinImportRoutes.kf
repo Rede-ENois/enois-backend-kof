@@ -1,0 +1,61 @@
+package importlinkedin
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+
+// HTTP adapter of LinkedinImportController: 6 routes under /me/import/linkedin. The two uploads (the data ZIP at the
+// root and Connections.csv at /contatos) wait for the binary lane: the web runtime only carries UTF-8 String bodies,
+// so a ZIP cannot reach a route. Their whole logic is LinkedinImportService.parseArchive / parseContacts (taking
+// the temp file of the upload) plus LinkedinContactInviteService.importContacts, tested on the service.
+class LinkedinImportRoutes {
+    LinkedinImportService service
+    LinkedinContactInviteService contacts
+    public constructor(service: LinkedinImportService, contacts: LinkedinContactInviteService) {
+        this.service = service
+        this.contacts = contacts
+    }
+    register(server: HttpServer) {
+        var self = this
+        server.post("/me/import/linkedin/texto", () -> self.importText())
+        server.get("/me/import/linkedin/contatos/resumo", () -> self.summary())
+        server.put("/me/import/linkedin/contatos/auto-convite", () -> self.setAutoInvite())
+        server.get("/me/import/linkedin/contatos", () -> self.list())
+    }
+    // The path without a file: the person pastes the text of their own profile.
+    String importText() {
+        Auth.requireUser()
+        var body = LinkedinTextBody(null)
+        var raw = Req.bodyText()
+        if (raw.trim().length() > 0) {
+            try {
+                body = json.decode<LinkedinTextBody>(raw)
+            } catch (String e) {
+                throw Errors.badRequest()
+            }
+        }
+        return json.encode(service.parseText(body.texto))
+    }
+    String summary() {
+        var userId = Auth.requireUser()
+        return json.encode(contacts.summary(userId))
+    }
+    // Turns the automatic invite on or off; turning it on already processes the queue.
+    String setAutoInvite() {
+        var userId = Auth.requireUser()
+        var enabled = false
+        var raw = Req.bodyText()
+        if (raw.trim().length() > 0) {
+            try {
+                enabled = json.decode<LinkedinAutoInviteBody>(raw).enabled
+            } catch (String e) {
+                throw Errors.badRequest()
+            }
+        }
+        return json.encode(contacts.setAutoInvite(userId, enabled))
+    }
+    String list() {
+        var userId = Auth.requireUser()
+        return json.encode(contacts.list(userId, Req.queryInt("limit", 200)))
+    }
+}

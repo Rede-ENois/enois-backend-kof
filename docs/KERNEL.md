@@ -856,3 +856,14 @@ Java interop for the identity flows lives here; domain code only sees Strings.
 - `Log.installTap(LogTap)`: observer of every written line (a line logged inside the tap is not tapped again).
 - `Db.poolStats()`: `DbPoolStats(active, idle, total, waiting, max, min)` or null.
 - `kernel.monitoring`: `DayLog(dir, retentionDays)` (UTC day JSONL files, `append`, `rotate`, `scan` newest first in blocks), `RequestMetrics` (60 minute buckets, per-second counts, in-flight gauge, `overview(nowMs)`), `EventBuffer` (bounded queue, recent window, per-minute cap, level/type counters), `HostResources` (JVM, system memory from `/proc/meminfo`, cgroup memory and CPU, pool).
+
+## Jobs and import kernel additions
+
+- `UrlCanonical.canonicalize(raw)` / `canonicalText(text)`: the dedupe key of the same opportunity across sources (lower-case host without `www.`, no fragment, no tracking parameters, no trailing slash, query sorted); `null` for anything that is not an http(s) URL. `UrlParts` is the `java.net.URI` view.
+- `HtmlEntities.unescape(text)`: Spring `htmlUnescape` for the text of feeds (numeric decimal and hex, the named entities feeds send; an unknown reference stays as written).
+- `Db.requiresNew(body)`: a nested transaction on its own connection that the caller may catch (the job application delivers the DM through it); outside a transaction it is a plain `transaction`. Rows of the outer transaction are not visible to the body.
+- `Regexes.findAll(regex, text)` / `first(...)` / `matches(...)`: matches with their groups (`RegexMatch.text`, `.groups`), literal replacement in `replaceAll`.
+- `kernel.files`: `UploadFiles` (the upload as a temp-file path, which is what the binary lane hands over: `size`, `head(path, n)` magic bytes as ISO-8859-1, `readText`, `readBytes`, `writeText`, `discard`), `ZipReader.read(path, wanted, maxEntries, maxEntryBytes, totalCap)` (bounded read of chosen entries by simple name, opened by the central directory so unwanted entries are never inflated; `ZipRead.refused` is `""`, `TOO_LARGE` or `INVALID`) and `PdfText.extract(path, maxPages)` (the only importer of PDFBox 3.0.8: `PdfRead.status` is `OK`, `ENCRYPTED`, `TOO_MANY_PAGES` or `INVALID`). `Loader.loadPDF(File)` resolves to the wrong overload, so the bytes are read first.
+- `Time.sleep(millis)`: blocks the thread (tests that wait for a background job).
+- Test fixtures (`kernel.testkit`): `ZipFixtures.start()` then `.text/.zeros/.noise/.finish()` builds ZIPs on disk (a 60 MB bomb is under 100 KB), `PdfFixtures.write(lines)` writes a one-page PDF by hand (no lines: a page with no text, the shape of a scanned PDF; PDFBox rebuilds the xref of a hand-made file).
+- `ProfileDirectory.findByEmail(email)`: the account of an e-mail (lower case), used by the LinkedIn contact match.

@@ -1,0 +1,158 @@
+import importlinkedin.*
+import importresume.*
+import jobs.*
+import kernel.db.*
+import kernel.error.*
+import kernel.files.*
+import kernel.testkit.*
+
+// Port of ResumeImportServiceTests and ResumePrefillServiceTests. Both endpoints of the domain are uploads (they wait
+// for the binary lane), so the services take the upload's temp file; the PDFs are real (read by PDFBox).
+
+ResumeImportService svc() = ResumeImportService(LinkedinImportService.withDefaults())
+
+String failure(path: String, name: String, contentType: String) {
+    try {
+        svc().parse(path, name, contentType)
+    } catch (String err) {
+        return err
+    }
+    return ""
+}
+
+LinkedinProfilePreview prof(preview: LinkedinImportPreview) {
+    var p = preview.profile
+    if (p == null) {
+        throw "FAIL: the preview has no profile"
+    }
+    return p
+}
+
+Bool hasMessage(err: String, needle: String) = Errors.isApi(err) && Errors.parse(err).message().contains(needle)
+
+test "textWithSectionsBecomesAPortraitInTheLinkedinFormat" {
+    var resume = "Ana Souza\nEngenheira de Software\n\nSobre\nEngenheira com 5 anos de experiência em Java e Spring.\n\nExperiencia\nEngenheira de Software\nEnois\njan de 2021 - o momento\nSão Paulo, Brasil\nAPIs em Java com Spring Boot.\n\nEducacao\nCiencia da Computacao\nUSP\n2015 - 2019\n\nHabilidades\nJava, Spring, PostgreSQL\n"
+    var preview = svc().parse(UploadFiles.writeText(resume), "curriculo.txt", "text/plain")
+    Check.eqStr("name", "Ana Souza", "" + prof(preview).name)
+    Check.eqInt("experiences", 1, preview.experiences.size())
+    Check.eqStr("company", "Enois", "" + preview.experiences.get(0).company)
+    Check.eqStr("start", "2021-01-01", "" + preview.experiences.get(0).startDate)
+    Check.isTrue("skills", preview.skills.contains("Java") && preview.skills.contains("Spring"))
+    Check.isTrue("found", preview.found > 0)
+}
+
+test "refusesDocxTellingToExportToPdf" {
+    var err = failure(UploadFiles.writeText("PK fake"), "curriculo.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    Check.isTrue("UNSUPPORTED_FORMAT", Errors.hasCode(err, "UNSUPPORTED_FORMAT"))
+    Check.isTrue("says PDF", hasMessage(err, "PDF"))
+}
+
+test "refusesTextThatIsTooShort" {
+    var err = failure(UploadFiles.writeText("Ana"), "curriculo.txt", "text/plain")
+    Check.isTrue("UNREADABLE_RESUME", Errors.hasCode(err, "UNREADABLE_RESUME"))
+    Check.isTrue("says readable text", hasMessage(err, "texto legivel"))
+}
+
+test "requiresAFileAndCapsTheSize" {
+    Check.isTrue("FILE_REQUIRED", Errors.hasCode(failure("", "x.txt", "text/plain"), "FILE_REQUIRED"))
+    Check.isTrue("FILE_REQUIRED for an empty file", Errors.hasCode(failure(UploadFiles.create("empty-", ".txt"), "x.txt", "text/plain"), "FILE_REQUIRED"))
+    var big = UploadFiles.create("big-", ".txt")
+    var out = new java.io.FileOutputStream(big)
+    var chunk = new Byte[1048576]
+    var i = 0
+    while (i < 11) {
+        out.write(chunk, 0, 1048576)
+        i = i + 1
+    }
+    out.close()
+    Check.isTrue("FILE_TOO_LARGE", Errors.hasCode(failure(big, "x.txt", "text/plain"), "FILE_TOO_LARGE"))
+}
+
+test "pdfBecomesAPortrait" {
+    var path = PdfFixtures.write(listOf("Ana Souza", "Engenheira de Software", "", "Sobre", "Engenheira com 5 anos de experiencia em Java.", "", "Habilidades", "Java, Spring"))
+    var preview = svc().parse(path, "curriculo.pdf", "application/pdf")
+    Check.eqStr("name", "Ana Souza", "" + prof(preview).name)
+    Check.isTrue("skill", preview.skills.contains("Java"))
+}
+
+test "aScannedPdfWithoutTextIsRefused" {
+    // A valid PDF with no text line at all: it looks like the scanned one (an image).
+    var err = failure(PdfFixtures.write(listOf<String>()), "curriculo.pdf", "application/pdf")
+    Check.isTrue("UNREADABLE_RESUME", Errors.hasCode(err, "UNREADABLE_RESUME"))
+    Check.isTrue("says readable text", hasMessage(err, "texto legivel"))
+}
+
+test "aPdfIsRecognisedByItsSignatureEvenWithAWrongExtension" {
+    var path = PdfFixtures.write(listOf("Ana Souza", "Engenheira de Software", "Habilidades", "Java, Spring"))
+    var preview = svc().parse(path, "curriculo.bin", "application/octet-stream")
+    Check.eqStr("name", "Ana Souza", "" + prof(preview).name)
+}
+
+test "aBrokenPdfIsRefusedWithoutA500" {
+    var err = failure(UploadFiles.writeText("%PDF-1.4 this is not a pdf at all"), "curriculo.pdf", "application/pdf")
+    Check.isTrue("INVALID_FILE", Errors.hasCode(err, "INVALID_FILE"))
+}
+
+ResumeJobField field(id: String, label: String, type: String, required: Bool) = ResumeJobField(id, label, type, required)
+
+test "prefillSuggestsEmailPhoneAndLinkOnCompatibleFields" {
+    var resume = "Ana Souza\nana.souza@mail.com\n(11) 98765-4321\nhttps://www.linkedin.com/in/anasouza\n5 anos de experiência em Java."
+    var fields = listOf(field("f1", "LinkedIn", "LINK", false), field("f2", "Telefone", "LINK", false), field("f3", "Anos de experiência", "NUMBER", true))
+    var prefill = svc().prefill("job-1", "Dev Java", fields, resume)
+    Check.eqStr("job", "job-1", prefill.jobId)
+    Check.eqInt("fields", 3, prefill.fields.size())
+    Check.isTrue("linkedin", ("" + prefill.fields.get(0).suggestedValue).contains("linkedin.com"))
+    Check.isTrue("phone", ("" + prefill.fields.get(1).suggestedValue).contains("98765"))
+    Check.eqStr("years", "5", "" + prefill.fields.get(2).suggestedValue)
+    Check.isTrue("message", ("" + prefill.suggestedMessage).contains("ana.souza@mail.com"))
+    Check.eqInt("filled", 3, prefill.filled)
+}
+
+test "prefillMarksTheReasonWhenItFindsNothing" {
+    var fields = listOf(field("f1", "LinkedIn", "LINK", false), field("f2", "Carta de apresentacao", "TEXTAREA", false))
+    var prefill = svc().prefill("job-1", "Dev Java", fields, "nome e texto corrido sem contatos aqui mesmo")
+    Check.eqStr("no link", "NO_LINK_FOUND", "" + prefill.fields.get(0).reason)
+    Check.eqStr("manual", "MANUAL_FIELD", "" + prefill.fields.get(1).reason)
+    Check.eqInt("filled", 0, prefill.filled)
+}
+
+test "prefillReadsTheJobAndFillsTheFields" {
+    var owner = ImportTestKit.login("resume_owner")
+    var candidate = ImportTestKit.login("resume_candidate")
+    var job = ImportTestKit.jobs().service.create("Dev Java", "Enois", null, "Remoto", "CLT", "PLENO", null, "BRL", "1500", null, "MONTH", "Vaga backend Java.", listOf("Java"), listOf(JobFieldInput("LinkedIn", "LINK", false)), owner, true, null)
+    var resume = "Ana Souza\nana@mail.com\nhttps://www.linkedin.com/in/ana\ntexto corrido suficiente para passar do minimo de trinta caracteres aqui."
+    var view = ImportTestKit.resume().prefill.prefill(candidate, job.id, resume)
+    Check.eqStr("job id", job.id, view.jobId)
+    Check.eqStr("title", "Dev Java", view.jobTitle)
+    Check.eqInt("fields", 1, view.fields.size())
+    Check.isTrue("linkedin", ("" + view.fields.get(0).suggestedValue).contains("linkedin.com"))
+    Check.isTrue("message", ("" + view.suggestedMessage).contains("ana@mail.com"))
+    // The job rules: the poster cannot prefill their own job and a closed job refuses.
+    var own = ""
+    try {
+        ImportTestKit.resume().prefill.prefill(owner, job.id, resume)
+    } catch (String err) {
+        own = err
+    }
+    Check.isTrue("CANNOT_APPLY_TO_OWN_JOB", Errors.hasCode(own, "CANNOT_APPLY_TO_OWN_JOB"))
+    ImportTestKit.jobs().service.close(job.id, owner)
+    var closed = ""
+    try {
+        ImportTestKit.resume().prefill.prefill(candidate, job.id, resume)
+    } catch (String err) {
+        closed = err
+    }
+    Check.isTrue("JOB_CLOSED", Errors.hasCode(closed, "JOB_CLOSED"))
+}
+
+test "prefillRefusesAMissingJob" {
+    var candidate = ImportTestKit.login("resume_candidate2")
+    var failed = ""
+    try {
+        ImportTestKit.resume().prefill.prefill(candidate, "nope", "texto texto texto texto texto texto")
+    } catch (String err) {
+        failed = err
+    }
+    Check.isTrue("JOB_NOT_FOUND", Errors.hasCode(failed, "JOB_NOT_FOUND"))
+    ImportTestKit.finish()
+}

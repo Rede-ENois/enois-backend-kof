@@ -1,0 +1,295 @@
+package importlinkedin
+
+import kernel.error.*
+import kernel.files.*
+import kernel.text.*
+
+// The LinkedIn import (LinkedinImportService): the ZIP of "Obter uma copia dos seus dados", the pasted profile text
+// and Connections.csv, all answering the same portrait for the front to review. Nothing is saved here. The upload
+// arrives as a temp file (the binary lane hands the body over as a path), never as a String.
+//
+// Zip-bomb guard: only the CSVs the importer uses are ever inflated, each streamed against a per-entry cap, the
+// running total against `maxTotalBytes` (REDE_IMPORT_LINKEDIN_MAX_UNCOMPRESSED_BYTES, default 8 MB) and an expansion
+// ratio of 100 once past 1 MB; the read stops as soon as one is crossed (the bytes actually read, never the sizes
+// the archive declares).
+class LinkedinImportService {
+    Long maxTotalBytes
+    public constructor(maxTotalBytes: Long) {
+        this.maxTotalBytes = maxTotalBytes
+    }
+    static Long maxZipBytes() = 5242880L
+    static Int maxEntries() = 50
+    static Long maxEntryBytes() = 2097152L
+    static Long maxExpansionRatio() = 100L
+    static Long ratioFloorBytes() = 1048576L
+    static Long defaultMaxTotalBytes() = 8388608L
+    static Int maxContacts() = 5000
+    static Int maxNameLength() = 200
+    static Int maxEmailLength() = 254
+    // The CSVs read below; every other entry (photos, messages, other data) is never inflated.
+    static List<String> usedCsvs() = listOf("Positions.csv", "Profile.csv", "Education.csv", "Skills.csv", "Certifications.csv", "Courses.csv", "Languages.csv", "Projects.csv", "Publications.csv", "Volunteering.csv", "Honors & Awards.csv", "Connections.csv")
+    static LinkedinImportService withDefaults() = LinkedinImportService(LinkedinImportService.defaultMaxTotalBytes())
+    static String tooLarge() = Errors.api(413, "IMPORT_TOO_LARGE", "O conteudo descompactado do ZIP e grande demais para um export do LinkedIn.")
+
+    // ===== contacts (Connections.csv) =====
+
+    // The contacts of the data file (Connections.csv inside the ZIP) or of a lone CSV. The LinkedIn connections API
+    // needs a restricted scope; the exported file is the sanctioned way and the member owns their data.
+    List<LinkedinParsedContact> parseContacts(path: String) {
+        if (path.length() == 0 || UploadFiles.size(path) == 0L) {
+            throw Errors.api(400, "FILE_REQUIRED", "Envie o arquivo .zip ou .csv do LinkedIn.")
+        }
+        var size = UploadFiles.size(path)
+        if (size > LinkedinImportService.maxZipBytes()) {
+            throw Errors.api(400, "FILE_TOO_LARGE", "O arquivo passa do limite de 5 MB.")
+        }
+        try {
+            var csv = ""
+            if (UploadFiles.head(path, 2) == "PK") {
+                var csvs = this.readUsedCsvs(path, size)
+                csv = csvs.getOrDefault("Connections.csv", "")
+            }
+            else {
+                csv = UploadFiles.readText(path)
+            }
+            return this.contactsFromCsv(csv)
+        } catch (String e) {
+            if (Errors.isApi(e)) {
+                throw e
+            }
+            throw Errors.api(400, "INVALID_LINKEDIN_FILE", "Não foi possível ler o arquivo do LinkedIn. Use o ZIP de \"Obter uma cópia dos seus dados\".")
+        }
+    }
+    List<LinkedinParsedContact> contactsFromCsv(csv: String) {
+        if (!Texts.hasText(csv)) {
+            throw Errors.api(400, "CONNECTIONS_NOT_FOUND", "Não encontrei o Connections.csv. Exporte em Configurações → \"Obter uma cópia dos seus dados\".")
+        }
+        // The LinkedIn export puts a few note lines before the header.
+        var lines = csv.replace("\r\n", "\n").split("\n", -1)
+        var header = -1
+        var i = 0
+        while (i < lines.length) {
+            if (lines[i].trim().toLowerCase().startsWith("first name")) {
+                header = i
+                break
+            }
+            i = i + 1
+        }
+        var body = csv
+        if (header >= 0) {
+            var kept = listOf<String>()
+            var k = header
+            while (k < lines.length) {
+                kept.add(lines[k])
+                k = k + 1
+            }
+            body = String.join("\n", kept)
+        }
+        var contacts = listOf<LinkedinParsedContact>()
+        var seen = setOf<String>()
+        for (var row in LinkedinCsv.rows(body)) {
+            var name = (LinkedinCsv.cell(row, "first name") + " " + LinkedinCsv.cell(row, "last name")).trim()
+            if (name.length() == 0) {
+                continue
+            }
+            // The column keeps 200 characters; free text in the file must not break the INSERT.
+            if (name.length() > LinkedinImportService.maxNameLength()) {
+                name = name.substring(0, LinkedinImportService.maxNameLength()).trim()
+            }
+            var key = name.toLowerCase().replaceAll("\\s+", " ")
+            if (seen.contains(key)) {
+                continue
+            }
+            seen.add(key)
+            var email = LinkedinCsv.cell(row, "email address").trim()
+            if (email.length() > LinkedinImportService.maxEmailLength()) {
+                email = ""
+            }
+            var address: String? = Nulls.str()
+            if (email.length() > 0) {
+                address = email.toLowerCase()
+            }
+            contacts.add(LinkedinParsedContact(name, address))
+            if (contacts.size() >= LinkedinImportService.maxContacts()) {
+                break
+            }
+        }
+        return contacts
+    }
+
+    // ===== the ZIP =====
+
+    LinkedinImportPreview parseArchive(path: String) {
+        if (path.length() == 0 || UploadFiles.size(path) == 0L) {
+            throw Errors.api(400, "FILE_REQUIRED", "Envie o arquivo .zip exportado do LinkedIn.")
+        }
+        var size = UploadFiles.size(path)
+        if (size > LinkedinImportService.maxZipBytes()) {
+            throw Errors.api(400, "FILE_TOO_LARGE", "O arquivo do LinkedIn deve ter no maximo 5 MB.")
+        }
+        var csvs = this.readUsedCsvs(path, size)
+        // The FAST export only has Profile.csv + Registration.csv: it is accepted with what it has (the profile)
+        // instead of a dead end. Refused only when NO CSV is LinkedIn's.
+        if (!Texts.hasText(csvs.getOrDefault("Positions.csv", "")) && !Texts.hasText(csvs.getOrDefault("Profile.csv", ""))) {
+            throw Errors.api(400, "NOT_A_LINKEDIN_EXPORT", "Não encontrei os CSVs do LinkedIn dentro do arquivo. Exporte em Configurações → \"Obter uma cópia dos seus dados\" → arquivamento completo.")
+        }
+        var experiences = listOf<LinkedinExperiencePreview>()
+        for (var row in LinkedinCsv.rows(csvs.getOrDefault("Positions.csv", ""))) {
+            // The column was renamed in the export: "Position Title" (old) -> "Title" (current).
+            var title = LinkedinCsv.firstFilled(row, "position title", "title")
+            var company = LinkedinCsv.orNullOf(row, "company name")
+            if (!Texts.hasText(title) && company == null) {
+                continue
+            }
+            var start = LinkedinCsv.parseDate(LinkedinCsv.cell(row, "started on"))
+            var end = LinkedinCsv.parseDate(LinkedinCsv.cell(row, "finished on"))
+            experiences.add(LinkedinExperiencePreview(LinkedinCsv.orNull(title), company, LinkedinCsv.orNullOf(row, "location"), LinkedinCsv.orNullOf(row, "description"), start, end, end == null))
+        }
+        var education = listOf<LinkedinEducationPreview>()
+        for (var row in LinkedinCsv.rows(csvs.getOrDefault("Education.csv", ""))) {
+            var school = LinkedinCsv.cell(row, "school name")
+            if (!Texts.hasText(school)) {
+                continue
+            }
+            var start = LinkedinCsv.parseDate(LinkedinCsv.cell(row, "start date"))
+            var end = LinkedinCsv.parseDate(LinkedinCsv.cell(row, "end date"))
+            // Same case as the title: "Degree" (old) -> "Degree Name" (current).
+            education.add(LinkedinEducationPreview(school, LinkedinCsv.orNull(LinkedinCsv.firstFilled(row, "degree", "degree name")), LinkedinCsv.orNull(LinkedinCsv.firstFilled(row, "field of study", "field name")), LinkedinCsv.orNullOf(row, "notes"), start, end, end == null))
+        }
+        var certifications = listOf<LinkedinCertificationPreview>()
+        for (var row in LinkedinCsv.rows(csvs.getOrDefault("Certifications.csv", ""))) {
+            var name = LinkedinCsv.cell(row, "name")
+            if (!Texts.hasText(name)) {
+                continue
+            }
+            certifications.add(LinkedinCertificationPreview(name, LinkedinCsv.orNullOf(row, "authority"), null, LinkedinCsv.parseDate(LinkedinCsv.firstFilled(row, "time period", "started on")), null, LinkedinCsv.orNullOf(row, "url")))
+        }
+        var projects = listOf<LinkedinProjectPreview>()
+        for (var row in LinkedinCsv.rows(csvs.getOrDefault("Projects.csv", ""))) {
+            var title = LinkedinCsv.cell(row, "title")
+            if (!Texts.hasText(title)) {
+                continue
+            }
+            projects.add(LinkedinProjectPreview(title, LinkedinCsv.orNullOf(row, "description"), LinkedinCsv.orNullOf(row, "url"), LinkedinCsv.parseDate(LinkedinCsv.cell(row, "started on")), LinkedinCsv.parseDate(LinkedinCsv.cell(row, "finished on"))))
+        }
+        // LinkedIn publications have a home in the profile PROJECTS (title, description, link, date).
+        for (var row in LinkedinCsv.rows(csvs.getOrDefault("Publications.csv", ""))) {
+            var title = LinkedinCsv.cell(row, "title")
+            if (!Texts.hasText(title)) {
+                continue
+            }
+            projects.add(LinkedinProjectPreview(title, LinkedinCsv.orNullOf(row, "description"), LinkedinCsv.orNullOf(row, "url"), LinkedinCsv.parseDate(LinkedinCsv.cell(row, "published on")), null))
+        }
+        var profile = this.profileOf(csvs.getOrDefault("Profile.csv", ""))
+        // Skills.csv: the column is "name" in the current export (the old one used "skill name").
+        var skills = listOf<String>()
+        for (var row in LinkedinCsv.rows(csvs.getOrDefault("Skills.csv", ""))) {
+            var skill = LinkedinCsv.orNullOf(row, "name")
+            if (skill == null) {
+                skill = LinkedinCsv.orNullOf(row, "skill name")
+            }
+            if (skill != null && !skills.contains(skill)) {
+                skills.add(skill)
+            }
+        }
+        // What came but has no structure in Enois is COUNTED so the person knows (nothing is lost in silence, and
+        // connections/messages do NOT enter: third-party data).
+        var rest: Map<String, Int> = mapOf()
+        this.countRows(rest, "Idiomas", csvs.getOrDefault("Languages.csv", ""))
+        this.countRows(rest, "Prêmios", csvs.getOrDefault("Honors & Awards.csv", ""))
+        this.countRows(rest, "Voluntariado", csvs.getOrDefault("Volunteering.csv", ""))
+        this.countRows(rest, "Cursos", csvs.getOrDefault("Courses.csv", ""))
+        var found = experiences.size() + education.size() + certifications.size() + projects.size() + skills.size()
+        if (profile != null) {
+            found = found + 1
+        }
+        return LinkedinImportPreview(experiences, education, certifications, projects, profile, skills, rest, found)
+    }
+    // Profile.csv: only the fields the Enois profile has somewhere to keep (the first row is the person).
+    LinkedinProfilePreview? profileOf(csv: String) {
+        for (var row in LinkedinCsv.rows(csv)) {
+            var headline = LinkedinCsv.orNullOf(row, "headline")
+            var summary = LinkedinCsv.orNullOf(row, "summary")
+            var location = LinkedinCsv.orNullOf(row, "geo location")
+            if (location == null) {
+                location = LinkedinCsv.orNullOf(row, "location")
+            }
+            var industry = LinkedinCsv.orNullOf(row, "industry")
+            var first = LinkedinCsv.orNullOf(row, "first name")
+            var last = LinkedinCsv.orNullOf(row, "last name")
+            var name: String? = Nulls.str()
+            if (first != null || last != null) {
+                name = (LinkedinImportService.orBlank(first) + " " + LinkedinImportService.orBlank(last)).trim()
+            }
+            if (headline != null || summary != null || location != null || industry != null || name != null) {
+                return LinkedinProfilePreview(name, headline, summary, location, industry)
+            }
+            return null
+        }
+        return null
+    }
+    static String orBlank(value: String?) {
+        if (value == null) {
+            return ""
+        }
+        return value
+    }
+    countRows(target: Map<String,Int>, label: String, csv: String) {
+        var filled = 0
+        for (var row in LinkedinCsv.rows(csv)) {
+            var any = false
+            for (var key in row.keys()) {
+                if (Texts.hasText(row.getOrDefault(key, ""))) {
+                    any = true
+                }
+            }
+            if (any) {
+                filled = filled + 1
+            }
+        }
+        if (filled > 0) {
+            target.put(label, filled)
+        }
+    }
+
+    // ===== pasted text =====
+
+    LinkedinImportPreview parseText(text: String?) {
+        if (text == null) {
+            throw Errors.api(400, "TEXT_REQUIRED", "Cole o texto do seu perfil do LinkedIn.")
+        }
+        if (!Texts.hasText(text)) {
+            throw Errors.api(400, "TEXT_REQUIRED", "Cole o texto do seu perfil do LinkedIn.")
+        }
+        if (text.length() > LinkedinText.maxChars()) {
+            throw Errors.api(400, "TEXT_TOO_LARGE", "O texto colado é grande demais (limite de 120 mil caracteres).")
+        }
+        return LinkedinText.parse(text)
+    }
+
+    // ===== the zip, bounded =====
+
+    // The text of each used CSV, by simple name. The ZIP is opened by its central directory, so the entries the
+    // importer does not use are skipped without being inflated.
+    Map<String,String> readUsedCsvs(path: String, size: Long) {
+        var cap = size * LinkedinImportService.maxExpansionRatio()
+        if (cap < LinkedinImportService.ratioFloorBytes()) {
+            cap = LinkedinImportService.ratioFloorBytes()
+        }
+        if (cap > maxTotalBytes) {
+            cap = maxTotalBytes
+        }
+        var read = ZipReader.read(path, LinkedinImportService.usedCsvs(), LinkedinImportService.maxEntries(), LinkedinImportService.maxEntryBytes(), cap)
+        if (read.refused == "TOO_LARGE") {
+            throw LinkedinImportService.tooLarge()
+        }
+        if (read.refused == "INVALID") {
+            throw Errors.api(400, "INVALID_FILE", "Não foi possível ler o arquivo. É um .zip do LinkedIn?")
+        }
+        var out: Map<String, String> = mapOf()
+        for (var key in read.texts.keys()) {
+            out.put(key, read.texts.getOrDefault(key, ""))
+        }
+        return out
+    }
+}

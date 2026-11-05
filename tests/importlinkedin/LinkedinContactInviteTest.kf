@@ -1,0 +1,115 @@
+import importlinkedin.*
+import kernel.db.*
+import kernel.files.*
+import kernel.log.*
+import kernel.testkit.*
+
+// Port of LinkedinContactInviteTests. Connections.csv (and the data ZIP) are read by the service from a temp file
+// (the upload endpoint waits for the binary lane); the invite routes (summary, auto-invite switch, list) are HTTP.
+// Contacts match by exact full name against the social name; the login names are the user ids.
+
+String connectionsCsv(names: List<String>) {
+    var csv = "Notes:\n\"Quando você exporta seus dados, os contatos vêm neste arquivo.\"\n\nFirst Name,Last Name,URL,Email Address,Company,Position,Connected On\n"
+    for (var name in names) {
+        var space = name.lastIndexOf(" ")
+        csv = csv + name.substring(0, space) + "," + name.substring(space + 1) + ",https://www.linkedin.com/in/x,,Empresa,Cargo,01 Jan 2024\n"
+    }
+    return csv
+}
+
+socialName(userId: String, name: String) {
+    ImportTestKit.db().execute("update users set social_name = ? where id = ?", DbParams().bindStr(name).bindStr(userId))
+}
+
+LinkedinImportResult importCsv(userId: String, names: List<String>) {
+    var contacts = ImportTestKit.linkedin().service.parseContacts(UploadFiles.writeText(connectionsCsv(names)))
+    return ImportTestKit.linkedin().invites.importContacts(userId, contacts)
+}
+
+Int pending(userId: String) {
+    var res = ImportTestKit.get("/network/summary", userId)
+    Check.status(res, 200)
+    return res.json("pendingRequests").toInt()
+}
+
+TestResponse autoInvite(userId: String, enabled: Bool) {
+    var body = "{\"enabled\":false}"
+    if (enabled) {
+        body = "{\"enabled\":true}"
+    }
+    return ImportTestKit.put("/me/import/linkedin/contatos/auto-convite", userId, body)
+}
+
+test "autoInviteSendsToWhoMatchesAndNotToAnAmbiguousName" {
+    var me = ImportTestKit.login("li_convite")
+    var matched = ImportTestKit.login("li_casado")
+    var amb1 = ImportTestKit.login("li_amb1")
+    var amb2 = ImportTestKit.login("li_amb2")
+    socialName(matched, "Zulmira Qa1")
+    socialName(amb1, "Ana Ambigua 1")
+    socialName(amb2, "Ana Ambigua 1")
+    // The switch on before the file: the invite leaves on the import.
+    var on = autoInvite(me, true)
+    Check.status(on, 200)
+    Check.jsonEq(on, "autoInvite", "true")
+    var result = importCsv(me, listOf("Zulmira Qa1", "Ana Ambigua 1", "Zé Ninguem 1"))
+    Check.eqInt("contacts", 3, result.contacts)
+    Check.eqInt("invited", 1, result.invited)
+    Check.eqInt("ambiguous", 1, result.ambiguous)
+    Check.eqInt("noMatch", 1, result.noMatch)
+    Check.isTrue("autoInvite", result.autoInvite)
+    // The request reached who matched, and only them.
+    Check.eqInt("matched pending", 1, pending(matched))
+    Check.eqInt("ambiguous pending", 0, pending(amb1))
+    // The list says the reason of each contact.
+    var list = ImportTestKit.get("/me/import/linkedin/contatos", me)
+    Check.status(list, 200)
+    Check.isTrue("INVITED", list.body.contains("\"status\":\"INVITED\""))
+    Check.isTrue("AMBIGUOUS", list.body.contains("\"status\":\"AMBIGUOUS\""))
+    Check.isTrue("NO_MATCH", list.body.contains("\"status\":\"NO_MATCH\""))
+    Check.isTrue("matched username", list.body.contains("\"matchedUsername\":\"li_casado\""))
+}
+
+test "withoutTheSwitchContactsStayQueuedAndTurningItOnProcesses" {
+    var me = ImportTestKit.login("li_fila")
+    var contact = ImportTestKit.login("li_fila_contato")
+    socialName(contact, "Wesley Qa2")
+    var result = importCsv(me, listOf("Wesley Qa2"))
+    Check.eqInt("invited", 0, result.invited)
+    Check.eqInt("queued", 1, result.queued)
+    Check.isTrue("autoInvite off", !result.autoInvite)
+    Check.eqInt("not asked yet", 0, pending(contact))
+    var on = autoInvite(me, true)
+    Check.status(on, 200)
+    Check.jsonEq(on, "invited", "1")
+    Check.jsonEq(on, "queued", "0")
+    Check.eqInt("asked now", 1, pending(contact))
+}
+
+test "reimportingDoesNotDuplicateAnInviteAlreadyDone" {
+    var me = ImportTestKit.login("li_dup")
+    var contact = ImportTestKit.login("li_dup_contato")
+    socialName(contact, "Dora Qa3")
+    Check.status(autoInvite(me, true), 200)
+    importCsv(me, listOf("Dora Qa3"))
+    importCsv(me, listOf("Dora Qa3"))
+    Check.eqInt("one request", 1, pending(contact))
+    var summary = ImportTestKit.get("/me/import/linkedin/contatos/resumo", me)
+    Check.status(summary, 200)
+    Check.jsonEq(summary, "contacts", "1")
+    Check.jsonEq(summary, "invited", "1")
+    Check.jsonEq(summary, "queued", "0")
+}
+
+test "theWorkerSendsTheQueueOfWhoTurnedTheSwitchOn" {
+    var me = ImportTestKit.login("li_worker")
+    var contact = ImportTestKit.login("li_worker_contato")
+    socialName(contact, "Nina Qa4")
+    importCsv(me, listOf("Nina Qa4"))
+    // The switch is stored without the immediate pass (the person turned it on and the file came later).
+    ImportTestKit.linkedin().store.setAutoInvite(me, true, "2026-11-01T00:00:00Z")
+    var sent = LinkedinImportModule.runWorker(ImportTestKit.linkedin().store, ImportTestKit.linkedin().invites, 200, Log("test"))
+    Check.isTrue("the worker sent at least this one", sent >= 1)
+    Check.eqInt("asked", 1, pending(contact))
+    ImportTestKit.finish()
+}

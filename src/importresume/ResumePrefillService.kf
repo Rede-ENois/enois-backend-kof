@@ -1,0 +1,34 @@
+package importresume
+
+import jobs.*
+import kernel.error.*
+
+// Prefill of the application from the resume (ResumePrefillService): reads the job (title + form fields), and asks
+// ResumeImportService to cross it with the resume text. Read only on the job: it never saves an application, which
+// stays the POST /jobs/{id}/applications, with the person reviewing before sending. An external job has no internal
+// form (the application is on the origin link), so it is refused.
+class ResumePrefillService {
+    JobStore jobs
+    ResumeImportService resumes
+    public constructor(jobs: JobStore, resumes: ResumeImportService) {
+        this.jobs = jobs
+        this.resumes = resumes
+    }
+    ResumeApplyPrefill prefill(userId: String, jobId: String, resumeText: String) {
+        var job = jobs.findById(jobId)
+        if (job == null) {
+            throw Errors.api(404, "JOB_NOT_FOUND", "Vaga nao encontrada.")
+        }
+        if (job.status != "OPEN") {
+            throw Errors.api(409, "JOB_CLOSED", "Esta vaga foi encerrada e nao recebe mais candidaturas.")
+        }
+        if (job.postedBy == userId) {
+            throw Errors.api(400, "CANNOT_APPLY_TO_OWN_JOB", "Voce nao pode se candidatar a sua propria vaga.")
+        }
+        var fields = listOf<ResumeJobField>()
+        for (var f in job.applicationFields) {
+            fields.add(ResumeJobField(f.id, f.label, f.type, f.required))
+        }
+        return resumes.prefill(jobId, job.title, fields, resumeText)
+    }
+}

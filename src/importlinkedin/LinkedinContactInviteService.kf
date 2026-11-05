@@ -1,0 +1,206 @@
+package importlinkedin
+
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.log.*
+import kernel.text.*
+import kernel.time.*
+import network.*
+import profile.*
+
+// Connections.csv contacts and the automatic invite (LinkedinContactInviteService): a contact is matched by exact
+// full name (or e-mail) against the Enois accounts, the ones not yet connected are invited, an ambiguous name is
+// never invited and the person's switch is respected. Connections are asked through the network module.
+class LinkedinContactInviteService {
+    Db database
+    LinkedinInviteStore store
+    ProfileDirectory profiles
+    NetworkService network
+    Int maxPerRun
+    Log log = Log("importlinkedin.invites")
+    public constructor(database: Db, store: LinkedinInviteStore, profiles: ProfileDirectory, network: NetworkService, maxPerRun: Int) {
+        this.database = database
+        this.store = store
+        this.profiles = profiles
+        this.network = network
+        this.maxPerRun = LinkedinContactInviteService.clampRun(maxPerRun)
+    }
+    static Int clampRun(value: Int) {
+        if (value > 1000) {
+            return 1000
+        }
+        if (value < 1) {
+            return 1
+        }
+        return value
+    }
+    // The comparison key of names: no accent, lower case, collapsed spaces.
+    static String nameKey(raw: String?) {
+        if (raw == null) {
+            return ""
+        }
+        return Texts.stripAccents(raw).toLowerCase().trim().replaceAll("\\s+", " ")
+    }
+    // A resolved invite is not redone (nor duplicated) on a re-import.
+    static Bool settled(status: String) = status == "INVITED" || status == "PENDING" || status == "ALREADY_CONNECTED"
+
+    LinkedinImportResult importContacts(userId: String, contacts: List<LinkedinParsedContact>) {
+        var self = this
+        database.transaction(() -> {
+    self.saveContacts(userId, contacts)
+})
+        var auto = store.autoInvite(userId)
+        if (auto) {
+            this.processQueued(userId, maxPerRun)
+        }
+        return this.result(userId, contacts.size(), auto)
+    }
+    saveContacts(userId: String, contacts: List<LinkedinParsedContact>) {
+        var now = Time.nowIso()
+        for (var contact in contacts) {
+            var key = LinkedinContactInviteService.nameKey(contact.name)
+            if (key.length() == 0) {
+                continue
+            }
+            var existing = store.findByUserAndKey(userId, key)
+            if (existing != null && LinkedinContactInviteService.settled(existing.status)) {
+                continue
+            }
+            var invite = LinkedinInvite(Ids.prefixed("li_invite_"), userId, contact.name, key, null, "QUEUED", now, now)
+            if (existing != null) {
+                invite = existing
+            }
+            store.save(this.resolve(userId, invite, contact.email, now))
+        }
+    }
+    LinkedinSummary setAutoInvite(userId: String, enabled: Bool) {
+        var self = this
+        database.transaction(() -> {
+    self.store.setAutoInvite(userId, enabled, Time.nowIso())
+})
+        if (enabled) {
+            this.processQueued(userId, maxPerRun)
+        }
+        return this.summary(userId)
+    }
+    LinkedinSummary summary(userId: String) {
+        var counts = store.countsByStatus(userId)
+        var total = 0
+        for (var key in counts.keys()) {
+            total = total + counts.getOrDefault(key, 0)
+        }
+        return LinkedinSummary(store.autoInvite(userId), total, counts.getOrDefault("INVITED", 0), counts.getOrDefault("PENDING", 0), counts.getOrDefault("ALREADY_CONNECTED", 0), counts.getOrDefault("NO_MATCH", 0), counts.getOrDefault("AMBIGUOUS", 0), counts.getOrDefault("SKIPPED", 0), counts.getOrDefault("QUEUED", 0))
+    }
+    // The list the person checks: who was invited and who matched nobody.
+    List<LinkedinInviteView> list(userId: String, limit: Int) {
+        var cap = limit
+        if (cap > 500) {
+            cap = 500
+        }
+        if (cap < 1) {
+            cap = 1
+        }
+        var rows = store.findByUser(userId, cap)
+        var ids = listOf<String>()
+        for (var row in rows) {
+            var matched = row.matchedUserId
+            if (matched != null && matched.length() > 0 && !ids.contains(matched)) {
+                ids.add(matched)
+            }
+        }
+        var usernames: Map<String, String> = mapOf()
+        for (var p in profiles.findAllByIds(ids)) {
+            usernames.put(p.id, p.username)
+        }
+        var out = listOf<LinkedinInviteView>()
+        for (var row in rows) {
+            var username: String? = Nulls.str()
+            var matched = row.matchedUserId
+            if (matched != null) {
+                username = usernames.get(matched)
+            }
+            out.add(LinkedinInviteView(row.contactName, row.status, username))
+        }
+        return out
+    }
+    // Sends the queued invites (matched, not yet sent). The worker and the button call here; each run has a cap so
+    // a huge file does not become a burst. Answers how many were sent.
+    Int processQueued(userId: String, limit: Int) {
+        var sent = 0
+        var self = this
+        database.transaction(() -> {
+    sent = self.sendQueued(userId, limit)
+})
+        return sent
+    }
+    Int sendQueued(userId: String, limit: Int) {
+        var sent = 0
+        var now = Time.nowIso()
+        for (var invite in store.findQueuedByUser(userId, limit)) {
+            var target = invite.matchedUserId
+            if (target == null) {
+                continue
+            }
+            var status = this.ask(userId, target)
+            store.save(LinkedinInvite(invite.id, invite.userId, invite.contactName, invite.nameKey, invite.matchedUserId, status, invite.createdAt, now))
+            if (status == "INVITED") {
+                sent = sent + 1
+            }
+        }
+        return sent
+    }
+    // Asks the connection and says how it ended. PENDING may be the request I just sent (INVITED) or one the other
+    // person had already sent (PENDING: the next step is to accept). A refusal (block, self) is SKIPPED: no insisting.
+    String ask(userId: String, target: String) {
+        try {
+            network.requestConnection(userId, target)
+        } catch (String refused) {
+            if (!Errors.isApi(refused)) {
+                log.warn("linkedin contact invite failed")
+            }
+            return "SKIPPED"
+        }
+        var state = network.state(userId, target)
+        if (state.status == "ACCEPTED") {
+            return "ALREADY_CONNECTED"
+        }
+        if (state.status == "PENDING" && !state.requestedByMe) {
+            return "PENDING"
+        }
+        return "INVITED"
+    }
+    // Finds the contact again in Enois; the invite with its match (or the reason there is none).
+    LinkedinInvite resolve(userId: String, invite: LinkedinInvite, email: String?, now: String) {
+        if (email != null && email.length() > 0) {
+            var byEmail = profiles.findByEmail(email)
+            if (byEmail != null) {
+                if (byEmail.id == userId) {
+                    return this.withMatch(invite, null, "SKIPPED", now)
+                }
+                return this.withMatch(invite, byEmail.id, "QUEUED", now)
+            }
+        }
+        var candidates = listOf<String>()
+        for (var p in profiles.search(invite.contactName)) {
+            if (p.id == userId || candidates.contains(p.id)) {
+                continue
+            }
+            if (invite.nameKey == LinkedinContactInviteService.nameKey(p.name) || invite.nameKey == LinkedinContactInviteService.nameKey(p.socialName)) {
+                candidates.add(p.id)
+            }
+        }
+        if (candidates.size() > 1) {
+            return this.withMatch(invite, null, "AMBIGUOUS", now)
+        }
+        if (candidates.size() == 0) {
+            return this.withMatch(invite, null, "NO_MATCH", now)
+        }
+        return this.withMatch(invite, candidates.get(0), "QUEUED", now)
+    }
+    LinkedinInvite withMatch(invite: LinkedinInvite, matched: String?, status: String, now: String) = LinkedinInvite(invite.id, invite.userId, invite.contactName, invite.nameKey, matched, status, invite.createdAt, now)
+    LinkedinImportResult result(userId: String, contacts: Int, auto: Bool) {
+        var s = this.summary(userId)
+        return LinkedinImportResult(contacts, s.invited, s.pending, s.alreadyConnected, s.noMatch, s.ambiguous, s.skipped, s.queued, auto)
+    }
+}

@@ -1,0 +1,65 @@
+package importlinkedin
+
+import kernel.db.*
+
+// SQL of the LinkedIn contact invites (linkedin_contact_invites, linkedin_contact_preferences): one invite per
+// (user, normalised name).
+class LinkedinInviteStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, user_id, contact_name, name_key, matched_user_id, status, created_at, updated_at"
+    static LinkedinInvite fromRow(r: DbRow) = LinkedinInvite(r.getStr("id"), r.getStr("user_id"), r.getStr("contact_name"), r.getStr("name_key"), r.getStrOrNull("matched_user_id"), r.getStr("status"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    LinkedinInvite? findByUserAndKey(userId: String, key: String) {
+        var row = store.queryOptional("select " + LinkedinInviteStore.columns() + " from linkedin_contact_invites where user_id = ? and name_key = ?", DbParams().bindStr(userId).bindStr(key))
+        if (row == null) {
+            return null
+        }
+        return LinkedinInviteStore.fromRow(row)
+    }
+    // Insert or update by id.
+    save(invite: LinkedinInvite) {
+        var updated = store.execute("update linkedin_contact_invites set contact_name = ?, name_key = ?, matched_user_id = ?, status = ?, updated_at = ? where id = ?", DbParams().bindStr(invite.contactName).bindStr(invite.nameKey).bindStrOrNull(invite.matchedUserId).bindStr(invite.status).bindInstant(invite.updatedAt).bindStr(invite.id))
+        if (updated == 0) {
+            store.execute("insert into linkedin_contact_invites (id, user_id, contact_name, name_key, matched_user_id, status, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(invite.id).bindStr(invite.userId).bindStr(invite.contactName).bindStr(invite.nameKey).bindStrOrNull(invite.matchedUserId).bindStr(invite.status).bindInstant(invite.createdAt).bindInstant(invite.updatedAt))
+        }
+    }
+    List<LinkedinInvite> findQueuedByUser(userId: String, limit: Int) = this.many(store.queryList("select " + LinkedinInviteStore.columns() + " from linkedin_contact_invites where user_id = ? and status = 'QUEUED' order by created_at asc, id asc limit ?", DbParams().bindStr(userId).bindInt(limit)))
+    List<LinkedinInvite> findByUser(userId: String, limit: Int) = this.many(store.queryList("select " + LinkedinInviteStore.columns() + " from linkedin_contact_invites where user_id = ? order by created_at asc, id asc limit ?", DbParams().bindStr(userId).bindInt(limit)))
+    List<LinkedinInvite> many(rows: List<DbRow>) {
+        var out = listOf<LinkedinInvite>()
+        for (var r in rows) {
+            out.add(LinkedinInviteStore.fromRow(r))
+        }
+        return out
+    }
+    // How many invites the person has in each status.
+    Map<String,Int> countsByStatus(userId: String) {
+        var out: Map<String, Int> = mapOf()
+        for (var r in store.queryList("select status, count(*) as total from linkedin_contact_invites where user_id = ? group by status", DbParams().bindStr(userId))) {
+            out.put(r.getStr("status"), r.getInt("total"))
+        }
+        return out
+    }
+    Bool autoInvite(userId: String) {
+        var row = store.queryOptional("select auto_invite from linkedin_contact_preferences where user_id = ?", DbParams().bindStr(userId))
+        if (row == null) {
+            return false
+        }
+        return row.getBool("auto_invite")
+    }
+    setAutoInvite(userId: String, enabled: Bool, now: String) {
+        var updated = store.execute("update linkedin_contact_preferences set auto_invite = ?, updated_at = ? where user_id = ?", DbParams().bindBool(enabled).bindInstant(now).bindStr(userId))
+        if (updated == 0) {
+            store.execute("insert into linkedin_contact_preferences (user_id, auto_invite, created_at, updated_at) values (?, ?, ?, ?)", DbParams().bindStr(userId).bindBool(enabled).bindInstant(now).bindInstant(now))
+        }
+    }
+    List<String> userIdsWithAutoInvite() {
+        var out = listOf<String>()
+        for (var r in store.queryList("select user_id from linkedin_contact_preferences where auto_invite = true order by user_id", DbParams())) {
+            out.add(r.getStr("user_id"))
+        }
+        return out
+    }
+}

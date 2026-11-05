@@ -1,0 +1,336 @@
+package importlinkedin
+
+import kernel.text.*
+
+// A date range line of a pasted profile ("mar de 2021 - o momento · 4 anos", "Jan 2020 - Jun 2022", "2015 - 2019").
+record LinkedinRange(String start, String? end, Bool current)
+
+// One entry of a section: title, organisation, location, description and its dates.
+record LinkedinEntry(String title, String? org, String? place, String? description, String start, String? end, Bool current)
+
+// The date line that anchors an entry, at its position in the section's list of lines.
+record LinkedinAnchor(Int pos, LinkedinRange range)
+
+// The pasted-text importer (LinkedinImportService.parseTexto): the person copies their own LinkedIn profile and the
+// sections (title, organisation, dates, description) are read by the same portrait as the file import. Heuristic
+// on purpose: nothing is saved before the person reviews the preview in the front.
+class LinkedinText {
+    static Int maxChars() = 120000
+    static LinkedinProfilePreview? noProfile() = null
+    static Int noLimit() = 2147483647
+    static String rangeMonths() = "(?i)^(\\p{L}{3,12}\\.?\\s*(?:de\\s*)?\\d{4})\\s*[-–—]\\s*(.+)$"
+    static String rangeYears() = "^(\\d{4})\\s*[-–—]\\s*(\\d{4}|.+)$"
+    static String issued() = "(?i)^(?:emitido em|issued)\\s+(.+)$"
+    // Section headers of the public LinkedIn profile (pt and en), without accent and lower case.
+    static Map<String,String> sectionNames() = mapOf("experiencia", "experiencia", "experience", "experiencia", "experiencia profissional", "experiencia", "formacao academica", "educacao", "formacao", "educacao", "educacao", "educacao", "education", "educacao", "licencas e certificacoes", "certificacoes", "certificacoes", "certificacoes", "licenses & certifications", "certificacoes", "licences & certifications", "certificacoes", "certifications", "certificacoes", "projetos", "projetos", "projects", "projetos", "sobre", "sobre", "about", "sobre", "habilidades", "habilidades", "competencias", "habilidades", "skills", "habilidades", "idiomas", "idiomas", "languages", "idiomas", "premios", "premios", "premios e honras", "premios", "honors & awards", "premios", "honors and awards", "premios", "premios e premiacoes", "premios", "voluntariado", "voluntariado", "volunteering", "voluntariado", "cursos", "cursos", "courses", "cursos")
+    // The section a line opens, or "" when it is not a header.
+    static String section(line: String) {
+        var s = Texts.stripAccents(line.toLowerCase()).replaceAll("\\s+", " ").replaceAll(":$", "").trim()
+        return LinkedinText.sectionNames().getOrDefault(s, "")
+    }
+    static LinkedinImportPreview parse(text: String) {
+        var lines = listOf<String>()
+        for (var raw in text.replace("\r\n", "\n").split("\n", -1)) {
+            lines.add(raw.trim())
+        }
+        // Section boundaries: a line that (without accent, lower case) IS a known header.
+        var sections: Map<String, List<Int>> = mapOf()
+        var current = "cabecalho"
+        var i = 0
+        while (i < lines.size()) {
+            var name = LinkedinText.section(lines.get(i))
+            if (name.length() > 0) {
+                current = name
+            }
+            else {
+                LinkedinText.indicesOf(sections, current).add(i)
+            }
+            i = i + 1
+        }
+        var experiences = listOf<LinkedinExperiencePreview>()
+        for (var e in LinkedinText.entries(LinkedinText.indicesOf(sections, "experiencia"), lines, true)) {
+            experiences.add(LinkedinExperiencePreview(e.title, e.org, e.place, e.description, e.start, e.end, e.current))
+        }
+        var education = listOf<LinkedinEducationPreview>()
+        for (var e in LinkedinText.entries(LinkedinText.indicesOf(sections, "educacao"), lines, true)) {
+            education.add(LinkedinEducationPreview(e.title, e.org, null, e.description, e.start, e.end, e.current))
+        }
+        var projects = listOf<LinkedinProjectPreview>()
+        for (var e in LinkedinText.entries(LinkedinText.indicesOf(sections, "projetos"), lines, false)) {
+            projects.add(LinkedinProjectPreview(e.title, e.description, null, e.start, e.end))
+        }
+        var certifications = LinkedinText.certifications(LinkedinText.indicesOf(sections, "certificacoes"), lines)
+        var skills = LinkedinText.skills(LinkedinText.indicesOf(sections, "habilidades"), lines)
+        // Profile: name and headline are the first lines of the paste; the summary comes from "Sobre".
+        var name: String? = Nulls.str()
+        var headline: String? = Nulls.str()
+        for (var idx in LinkedinText.indicesOf(sections, "cabecalho")) {
+            var line = lines.get(idx)
+            if (line.length() == 0) {
+                continue
+            }
+            if (name == null && line.length() <= 60) {
+                name = line
+            }
+            else
+                if (headline == null && line.length() <= 120) {
+                    headline = line
+                }
+                else {
+                    break
+                }
+        }
+        var about = LinkedinText.sectionText(LinkedinText.indicesOf(sections, "sobre"), lines)
+        var profile = LinkedinText.noProfile()
+        if (name != null || headline != null || about != null) {
+            profile = LinkedinProfilePreview(name, headline, about, null, null)
+        }
+        var rest: Map<String, Int> = mapOf()
+        LinkedinText.countSection(rest, "Idiomas", LinkedinText.indicesOf(sections, "idiomas"), lines)
+        LinkedinText.countSection(rest, "Prêmios", LinkedinText.indicesOf(sections, "premios"), lines)
+        LinkedinText.countSection(rest, "Voluntariado", LinkedinText.indicesOf(sections, "voluntariado"), lines)
+        LinkedinText.countSection(rest, "Cursos", LinkedinText.indicesOf(sections, "cursos"), lines)
+        var found = experiences.size() + education.size() + certifications.size() + projects.size() + skills.size()
+        if (profile != null) {
+            found = found + 1
+        }
+        return LinkedinImportPreview(experiences, education, certifications, projects, profile, skills, rest, found)
+    }
+    // The list of line indices of a section, created on first use.
+    static List<Int> indicesOf(sections: Map<String,List<Int>>, name: String) {
+        var cur = sections.get(name)
+        if (cur == null) {
+            var fresh = listOf<Int>()
+            sections.put(name, fresh)
+            return fresh
+        }
+        return cur
+    }
+    // Entries of a "title, org, dates, description" section (experience and education; projects have no org). The
+    // date line is the anchor: what comes 1 or 2 lines before is title/org, what comes after is the rest, up to
+    // the title of the next entry.
+    static List<LinkedinEntry> entries(indices: List<Int>, lines: List<String>, withOrg: Bool) {
+        var out = listOf<LinkedinEntry>()
+        if (indices.size() == 0) {
+            return out
+        }
+        var anchors = listOf<LinkedinAnchor>()
+        var p = 0
+        while (p < indices.size()) {
+            var found = LinkedinText.range(lines.get(indices.get(p)))
+            if (found != null) {
+                anchors.add(LinkedinAnchor(p, found))
+            }
+            p = p + 1
+        }
+        var step = 1
+        if (withOrg) {
+            step = 2
+        }
+        var a = 0
+        while (a < anchors.size()) {
+            var pos = anchors.get(a).pos
+            // The entry ends at the TITLE of the next one (not at its date line, or the next item's two title/org
+            // lines would enter as description of this one).
+            var endNext = LinkedinText.noLimit()
+            if (a + 1 < anchors.size()) {
+                var back = anchors.get(a + 1).pos - step
+                if (back < 0) {
+                    back = 0
+                }
+                endNext = indices.get(back)
+            }
+            var title: String? = Nulls.str()
+            var org: String? = Nulls.str()
+            if (pos >= 1 && (pos >= 2 || !withOrg)) {
+                title = LinkedinText.usefulLine(lines.get(indices.get(pos - step)))
+                if (withOrg) {
+                    org = LinkedinText.usefulLine(lines.get(indices.get(pos - 1)))
+                }
+            }
+            else
+                if (pos >= 1) {
+                    title = LinkedinText.usefulLine(lines.get(indices.get(pos - 1)))
+                }
+            if (!Texts.hasText(title)) {
+                title = Nulls.str()
+                if (pos >= 1) {
+                    title = LinkedinText.usefulLine(lines.get(indices.get(pos - 1)))
+                }
+                org = Nulls.str()
+            }
+            if (title == null) {
+                a = a + 1
+                continue
+            }
+            var place: String? = Nulls.str()
+            var description = ""
+            var i = pos + 1
+            while (i < indices.size() && indices.get(i) < endNext) {
+                var line = LinkedinText.usefulLine(lines.get(indices.get(i)))
+                i = i + 1
+                if (line == null) {
+                    continue
+                }
+                if (place == null && LinkedinText.looksLikePlace(line)) {
+                    place = line
+                    continue
+                }
+                if (description.length() > 0) {
+                    description = description + "\n"
+                }
+                description = description + line
+                if (description.length() > 3000) {
+                    break
+                }
+            }
+            var finalDescription: String? = Nulls.str()
+            if (Texts.hasText(description)) {
+                finalDescription = description
+            }
+            var dates = anchors.get(a).range
+            out.add(LinkedinEntry(title, org, place, finalDescription, dates.start, dates.end, dates.current))
+            a = a + 1
+        }
+        return out
+    }
+    // "mar de 2021 - o momento · 4 anos 2 meses", "Jan 2020 - Jun 2022" and "2015 - 2019".
+    static LinkedinRange? range(line: String) {
+        if (!Texts.hasText(line)) {
+            return null
+        }
+        var m = Regexes.first(LinkedinText.rangeMonths(), line)
+        if (m == null) {
+            m = Regexes.first(LinkedinText.rangeYears(), line)
+        }
+        if (m == null) {
+            return null
+        }
+        var first = m.groups.get(1).trim()
+        var start = LinkedinCsv.parseDate(first)
+        if (start == null) {
+            // A bare year ("2015 - 2019", common in education): January at the start and December at the end, in
+            // the full ISO date the profile API takes.
+            if (Regexes.matches("\\d{4}", first)) {
+                start = first + "-01-01"
+            }
+        }
+        if (start == null) {
+            return null
+        }
+        // The end comes before the "· duration" ("mar de 2021 - o momento · 4 anos 2 meses").
+        var endSide = m.groups.get(2).split("·")[0].trim()
+        var current = Regexes.matches("(?i)(o momento|presente|atualmente|present|now|current.*)", endSide)
+        var end: String? = Nulls.str()
+        if (!current) {
+            end = LinkedinCsv.parseDate(endSide)
+            if (end == null && Regexes.matches("\\d{4}", endSide)) {
+                end = endSide + "-12-01"
+            }
+        }
+        return LinkedinRange(start, end, current)
+    }
+    // "Emitido em mar de 2022 · Sem validade": name/issuer 1-2 lines before, link after.
+    static List<LinkedinCertificationPreview> certifications(indices: List<Int>, lines: List<String>) {
+        var out = listOf<LinkedinCertificationPreview>()
+        var p = 0
+        while (p < indices.size()) {
+            var m = Regexes.first(LinkedinText.issued(), lines.get(indices.get(p)))
+            if (m != null) {
+                var issuedOn = m.groups.get(1).split("·")[0].trim()
+                var name: String? = Nulls.str()
+                if (p >= 2) {
+                    name = LinkedinText.usefulLine(lines.get(indices.get(p - 2)))
+                }
+                var issuer: String? = Nulls.str()
+                if (p >= 1) {
+                    issuer = LinkedinText.usefulLine(lines.get(indices.get(p - 1)))
+                }
+                if (!Texts.hasText(name)) {
+                    name = issuer
+                    issuer = Nulls.str()
+                }
+                if (name != null) {
+                    var url: String? = Nulls.str()
+                    var q = p + 1
+                    while (q < indices.size()) {
+                        var link = Regexes.first("https?://\\S+", lines.get(indices.get(q)))
+                        if (link != null) {
+                            url = link.text
+                            break
+                        }
+                        if (LinkedinText.range(lines.get(indices.get(q))) != null || Regexes.first(LinkedinText.issued(), lines.get(indices.get(q))) != null) {
+                            break
+                        }
+                        q = q + 1
+                    }
+                    out.add(LinkedinCertificationPreview(name, issuer, null, LinkedinCsv.parseDate(issuedOn), null, url))
+                }
+            }
+            p = p + 1
+        }
+        return out
+    }
+    static List<String> skills(indices: List<Int>, lines: List<String>) {
+        var out = listOf<String>()
+        for (var i in indices) {
+            for (var piece in lines.get(i).split("[,;·|]")) {
+                var skill = piece.trim()
+                if (skill.length() >= 2 && skill.length() <= 60 && !out.contains(skill)) {
+                    out.add(skill)
+                }
+                if (out.size() >= 50) {
+                    return out
+                }
+            }
+        }
+        return out
+    }
+    static String? sectionText(indices: List<Int>, lines: List<String>) {
+        var text = ""
+        for (var i in indices) {
+            var line = LinkedinText.usefulLine(lines.get(i))
+            if (line == null) {
+                continue
+            }
+            if (text.length() > 0) {
+                text = text + "\n"
+            }
+            text = text + line
+            if (text.length() > 2000) {
+                break
+            }
+        }
+        if (text.length() > 0) {
+            return text
+        }
+        return null
+    }
+    static countSection(target: Map<String,Int>, label: String, indices: List<Int>, lines: List<String>) {
+        var n = 0
+        for (var i in indices) {
+            if (Texts.hasText(lines.get(i))) {
+                n = n + 1
+            }
+        }
+        if (n > 0) {
+            target.put(label, n)
+        }
+    }
+    // Pasted descriptions end in "…ver mais"/"…more" and lines may be empty.
+    static String? usefulLine(line: String?) {
+        if (line == null) {
+            return null
+        }
+        if (!Texts.hasText(line)) {
+            return null
+        }
+        var s = line.trim()
+        if (Regexes.matches("(?i)(ver mais|ver menos|…more|…see more|see more|mostrar mais)", s)) {
+            return null
+        }
+        return s
+    }
+    // "São Paulo, Brasil" and the like: few words, no digits, with a comma, never a description.
+    static Bool looksLikePlace(line: String) = Regexes.matches("[\\p{L}\\p{M}' .,-]{2,60}", line) && !Regexes.matches(".*\\d.*", line) && line.contains(", ")
+}
