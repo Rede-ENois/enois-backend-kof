@@ -1,0 +1,148 @@
+package moderation
+
+import feed.*
+import groups.*
+import java.util.HashMap
+import kernel.*
+import kernel.db.*
+import kernel.mail.*
+import kernel.security.*
+import kernel.testkit.*
+import ops.*
+import profile.*
+
+// Fixtures of the moderation suites (lives in src so every test file can import it). One booted app per test file:
+// the whole request pipeline, the shared services and profile, feed, groups and moderation over the real tables, with a
+// capturing mail transport (no network). The outbox worker is parked: tests drain it by hand.
+//
+//   var app = ModerationTestKit.app()
+//   var reporter = ModerationTestKit.login("mod-reporter")      // verified adult user with a live session
+//   var res = ModerationTestKit.post(reporter, "/reports", "{...}")
+class ModerationTestKit {
+    static TestApp? cachedApp = null
+    static ModerationModule? cachedModule = null
+    static FeedModule? cachedFeed = null
+    static SharedServices? cachedShared = null
+    static MailCapture? cachedMail = null
+    static Int keyCounter = 0
+    static TestApp app() {
+        var cur = ModerationTestKit.cachedApp
+        if (cur != null) {
+            return cur
+        }
+        SecurityClock.reset()
+        var overrides = new HashMap<String, String>()
+        overrides.put("REDE_ORIGINS_ENFORCE", "false")
+        overrides.put("SUPPORT_EMAIL", "support@test.com")
+        // Limits relaxed so a suite can write freely (same set as the feed suites); background workers parked.
+        overrides.put("REDE_OUTBOX_WORKER_DELAY_MS", "86400000")
+        overrides.put("REDE_SECURITY_NEW_ACCOUNT_COOLDOWN_SECONDS", "0")
+        overrides.put("REDE_RATE_POST_LIMIT", "1000")
+        overrides.put("REDE_RATE_COMMENT_LIMIT", "1000")
+        overrides.put("POST_USER_RATE_LIMIT", "100000")
+        overrides.put("GLOBAL_RATE_LIMIT_PER_MINUTE", "0")
+        overrides.put("REDE_SECURITY_DUPLICATE_POST_ENABLED", "false")
+        overrides.put("REDE_RATE_DUPLICATE_WINDOW_MINUTES", "0")
+        overrides.put("REDE_FEED_WORKERS_ENABLED", "false")
+        var created = TestApp.bootWith("moderation", overrides, (p: Platform) -> ModerationTestKit.wire(p))
+        ModerationTestKit.cachedApp = created
+        return created
+    }
+    static wire(p: Platform) {
+        var hooks = SecurityHooks.defaults(p.db)
+        var parts = Security.install(p, hooks)
+        var shared = SharedServices.create(p)
+        ModerationTestKit.cachedShared = shared
+        var capture = MailCapture()
+        ModerationTestKit.cachedMail = capture
+        var mail = MailService(p.cfg, capture, EmailLogStore(p.db))
+        var profiles = ProfileModule.install(p, shared, hooks)
+        var feed = FeedModule.install(p, shared, hooks)
+        ModerationTestKit.cachedFeed = feed
+        var groups = GroupsModule.install(p, shared, hooks)
+        ModerationTestKit.cachedModule = ModerationModule.install(p, shared, parts, feed, groups, profiles, mail)
+        // Jobs registered by the modules above would keep the test process alive: stopped after all installs.
+        shared.stop()
+    }
+    static ModerationModule module() {
+        ModerationTestKit.app()
+        var cur = ModerationTestKit.cachedModule
+        if (cur == null) {
+            throw "ModerationTestKit: module not wired"
+        }
+        return cur
+    }
+    static MailCapture mail() {
+        ModerationTestKit.app()
+        var cur = ModerationTestKit.cachedMail
+        if (cur == null) {
+            throw "ModerationTestKit: mail not wired"
+        }
+        return cur
+    }
+    static Db db() = ModerationTestKit.app().db()
+    static String token(userId: String) = "tok-" + userId + "-1234567890"
+    // A verified adult user with a live one-hour session; the id doubles as username and name. Safe to call twice.
+    static String login(userId: String) {
+        var store = ModerationTestKit.db()
+        if (store.queryLong("select count(*) from users where id = ?", DbParams().bindStr(userId)) == 0L) {
+            SecurityFixtures.login(store, userId, ModerationTestKit.token(userId))
+            store.execute("update users set birth_date = ? where id = ?", DbParams().bindDate("1990-05-10").bindStr(userId))
+        }
+        return userId
+    }
+    static String loginAdmin(userId: String) {
+        ModerationTestKit.login(userId)
+        ModerationTestKit.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr(userId))
+        return userId
+    }
+    static String nextKey() {
+        ModerationTestKit.keyCounter = ModerationTestKit.keyCounter + 1
+        return "mk-" + ModerationTestKit.keyCounter
+    }
+    static TestResponse send(userId: String, method: String, path: String, body: String) {
+        var headers = listOf("Content-Type: application/json", "Idempotency-Key: " + ModerationTestKit.nextKey())
+        if (userId.length() > 0) {
+            headers.add("X-Session-Token: " + ModerationTestKit.token(userId))
+        }
+        return ModerationTestKit.app().client.send(method, path, headers, "", body)
+    }
+    static TestResponse get(userId: String, path: String) {
+        var headers = listOf<String>()
+        if (userId.length() > 0) {
+            headers.add("X-Session-Token: " + ModerationTestKit.token(userId))
+        }
+        return ModerationTestKit.app().client.getWith(path, headers)
+    }
+    static TestResponse post(userId: String, path: String, body: String) = ModerationTestKit.send(userId, "POST", path, body)
+    static String str(res: TestResponse, path: String) {
+        var v = res.jsonStr(path)
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    // A feed post (INSIGHT) by `userId`; returns its id.
+    static String publish(userId: String, content: String) {
+        var res = ModerationTestKit.post(userId, "/feed/posts", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"" + content + "\",\"tags\":[],\"mediaIds\":[]}")
+        Check.status(res, 201)
+        return ModerationTestKit.str(res, "id")
+    }
+    static String comment(userId: String, postId: String, content: String, parentId: String?) {
+        var parent = "null"
+        if (parentId != null) {
+            parent = "\"" + parentId + "\""
+        }
+        var res = ModerationTestKit.post(userId, "/feed/posts/" + postId + "/comments", "{\"content\":\"" + content + "\",\"parentCommentId\":" + parent + ",\"mediaIds\":[],\"mentionedUserIds\":[],\"website\":\"\"}")
+        Check.status(res, 201)
+        return ModerationTestKit.str(res, "id")
+    }
+    // POST /reports; the response.
+    static TestResponse report(userId: String, targetType: String, targetId: String, reason: String, description: String) = ModerationTestKit.post(userId, "/reports", "{\"targetType\":\"" + targetType + "\",\"targetId\":\"" + targetId + "\",\"reason\":\"" + reason + "\",\"description\":\"" + description + "\"}")
+    static finish() {
+        var shared = ModerationTestKit.cachedShared
+        if (shared != null) {
+            shared.stop()
+        }
+    }
+}

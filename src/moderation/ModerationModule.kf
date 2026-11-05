@@ -1,0 +1,31 @@
+package moderation
+
+import feed.*
+import groups.*
+import kernel.*
+import kernel.security.*
+import ops.*
+import profile.*
+
+// Composition of the moderation domain. Installed after the domains whose content it reads and whose actions it
+// triggers (feed, groups, profile); the request-pipeline seams that need only the database (moderators, automatic
+// reports) are set on `hooks` before Security.install by the AppWiring.
+class ModerationModule {
+    ModerationService service
+    ModerationStore store
+    ModerationTargets targets
+    public constructor(service: ModerationService, store: ModerationStore, targets: ModerationTargets) {
+        this.service = service
+        this.store = store
+        this.targets = targets
+    }
+    static ModerationModule install(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService) = ModerationModule.installWith(platform, shared, parts, feed, groups, profiles, mail, ModerationReportEvents(), ModerationCompanies(platform.db))
+    static ModerationModule installWith(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, events: ModerationReportEvents, companies: ModerationCompanies) {
+        var cfg = platform.cfg
+        var store = ModerationStore(platform.db)
+        var targets = ModerationTargets(feed.moderation, groups.reports, companies)
+        var service = ModerationService(platform.db, store, targets, parts.actionThrottle, mail, profiles.directory, events, cfg.getStr("SUPPORT_EMAIL", "suporte@enois.ia.br"), cfg.getStr("FRONTEND_URL", "http://localhost:5173"), cfg.getInt("REDE_MODERATION_REPORTS_PER_HOUR", 10))
+        ModerationRoutes.register(platform.server, service, store, shared.idempotency)
+        return ModerationModule(service, store, targets)
+    }
+}

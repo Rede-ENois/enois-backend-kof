@@ -1,0 +1,120 @@
+import kernel.db.*
+import kernel.testkit.*
+import moderation.*
+
+// Port of MyReportsTests (the reporter follows only their own reports) plus the validation and dedupe rules of
+// ModerationService.report that the Java suite exercises through the other report tests.
+class ReportsList {
+    static Bool has(res: TestResponse, id: String) {
+        var n = res.jsonSize("")
+        var k = 0
+        while (k < n) {
+            if (res.jsonStr(k + ".id") == id) {
+                return true
+            }
+            k = k + 1
+        }
+        return false
+    }
+}
+
+String postReported(reporter: String, content: String) {
+    var postId = ModerationTestKit.publish(reporter, content)
+    var res = ModerationTestKit.report(reporter, "POST", postId, "SCAM", "Parece golpe de investimento")
+    Check.status(res, 201)
+    return postId
+}
+
+test "reporter sees own reports with status and without internal triage" {
+    var reporter = ModerationTestKit.login("myrep_reporter")
+    var postId = postReported(reporter, "conteudo denunciado")
+    var res = ModerationTestKit.get(reporter, "/reports/mine")
+    Check.status(res, 200)
+    var n = res.jsonSize("")
+    var found = false
+    var k = 0
+    while (k < n) {
+        if (res.jsonStr(k + ".targetId") == postId) {
+            found = true
+            Check.jsonEq(res, k + ".targetType", "POST")
+            Check.jsonEq(res, k + ".reason", "SCAM")
+            Check.jsonEq(res, k + ".status", "PENDING")
+            Check.isTrue("no internal triage", !res.jsonHas(k + ".aiTriage"))
+            Check.isTrue("no reporter id", !res.jsonHas(k + ".reporterId"))
+        }
+        k = k + 1
+    }
+    Check.isTrue("report listed", found)
+}
+
+test "other users do not see reports they did not make" {
+    var reporter = ModerationTestKit.login("myrep_reporter2")
+    var other = ModerationTestKit.login("myrep_other2")
+    var postId = postReported(reporter, "denuncia alheia")
+    var res = ModerationTestKit.get(other, "/reports/mine")
+    Check.status(res, 200)
+    var n = res.jsonSize("")
+    var k = 0
+    while (k < n) {
+        Check.isTrue("not the other\'s report", res.jsonStr(k + ".targetId") != postId)
+        k = k + 1
+    }
+}
+
+test "reports mine requires authentication" {
+    var res = ModerationTestKit.get("", "/reports/mine")
+    Check.status(res, 401)
+}
+
+test "a duplicate report on the same target is 409 and a bad body is rejected" {
+    var reporter = ModerationTestKit.login("rep_dupe")
+    var postId = postReported(reporter, "post para denunciar duas vezes")
+    var again = ModerationTestKit.report(reporter, "POST", postId, "SCAM", "de novo")
+    Check.status(again, 409)
+    Check.jsonEq(again, "code", "ALREADY_REPORTED")
+    var noType = ModerationTestKit.post(reporter, "/reports", "{\"targetId\":\"x\",\"reason\":\"SPAM\"}")
+    Check.status(noType, 400)
+    Check.jsonEq(noType, "code", "INVALID_TARGET_TYPE")
+    var noTarget = ModerationTestKit.post(reporter, "/reports", "{\"targetType\":\"POST\",\"reason\":\"SPAM\"}")
+    Check.jsonEq(noTarget, "code", "INVALID_TARGET_ID")
+    var noReason = ModerationTestKit.post(reporter, "/reports", "{\"targetType\":\"POST\",\"targetId\":\"x\"}")
+    Check.jsonEq(noReason, "code", "INVALID_REASON")
+    var unknown = ModerationTestKit.post(reporter, "/reports", "{\"targetType\":\"NOPE\",\"targetId\":\"x\",\"reason\":\"SPAM\"}")
+    Check.status(unknown, 400)
+}
+
+test "the admin lists pending reports and reads the review snapshot" {
+    var admin = ModerationTestKit.loginAdmin("rep_admin")
+    var author = ModerationTestKit.login("rep_author")
+    var reporter = ModerationTestKit.login("rep_reporter3")
+    var postId = ModerationTestKit.publish(author, "texto do post denunciado")
+    var created = ModerationTestKit.report(reporter, "POST", postId, "SPAM", "spam")
+    Check.status(created, 201)
+    var reportId = ModerationTestKit.str(created, "id")
+    var list = ModerationTestKit.get(admin, "/admin/reports?limit=50")
+    Check.status(list, 200)
+    Check.isTrue("pending report listed", ReportsList.has(list, reportId))
+    var review = ModerationTestKit.get(admin, "/admin/reports/" + reportId)
+    Check.status(review, 200)
+    Check.jsonEq(review, "authorId", author)
+    Check.jsonEq(review, "content", "texto do post denunciado")
+    Check.jsonEq(review, "report.status", "PENDING")
+    Check.status(ModerationTestKit.get(reporter, "/admin/reports/" + reportId), 403)
+    Check.status(ModerationTestKit.get(admin, "/admin/reports/report_missing"), 404)
+}
+
+test "the e2e conversation key of a message report is readable only by an admin" {
+    var admin = ModerationTestKit.loginAdmin("rep_admin_e2e")
+    var reporter = ModerationTestKit.login("rep_reporter_e2e")
+    var res = ModerationTestKit.post(reporter, "/reports", "{\"targetType\":\"MESSAGE\",\"targetId\":\"msg1\",\"reason\":\"HARASSMENT\",\"description\":\"x\",\"e2eConversationKey\":\"key-abc\"}")
+    Check.status(res, 201)
+    var reportId = ModerationTestKit.str(res, "id")
+    Check.jsonEq(ModerationTestKit.get(admin, "/admin/reports/" + reportId + "/e2e-key"), "conversationKey", "key-abc")
+    Check.status(ModerationTestKit.get(reporter, "/admin/reports/" + reportId + "/e2e-key"), 403)
+    var none = ModerationTestKit.report(reporter, "MESSAGE", "msg2", "HARASSMENT", "sem chave")
+    Check.status(none, 201)
+    var empty = ModerationTestKit.get(admin, "/admin/reports/" + ModerationTestKit.str(none, "id") + "/e2e-key")
+    Check.status(empty, 200)
+    Check.isTrue("no key", !empty.jsonHas("conversationKey"))
+    ModerationTestKit.finish()
+}

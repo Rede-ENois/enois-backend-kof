@@ -1,0 +1,52 @@
+package moderation
+
+import kernel.db.*
+
+// SQL of the `reports` table and its E2E key side table (ReportPersistenceAdapter, ReportE2eKeyStore).
+class ModerationStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, reporter_id, target_type, target_id, reason, description, status, created_at, reviewed_by, reviewed_at, resolution_note, ai_triage, ai_triaged_at, pre_triage, pre_triage_score, pre_triaged_at"
+    static ModerationReport report(r: DbRow) = ModerationReport(r.getStr("id"), r.getStr("reporter_id"), r.getStr("target_type"), r.getStr("target_id"), r.getStr("reason"), ModerationStore.orEmpty(r.getStrOrNull("description")), r.getStr("status"), r.getInstant("created_at"), r.getStrOrNull("reviewed_by"), r.getInstantOrNull("reviewed_at"), r.getStrOrNull("resolution_note"), r.getStrOrNull("ai_triage"), r.getInstantOrNull("ai_triaged_at"), r.getStrOrNull("pre_triage"), r.getIntOrNull("pre_triage_score"), r.getInstantOrNull("pre_triaged_at"))
+    static String orEmpty(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    insert(r: ModerationReport) {
+        store.execute("insert into reports (id, reporter_id, target_type, target_id, reason, description, status, created_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(r.id).bindStr(r.reporterId).bindStr(r.targetType).bindStr(r.targetId).bindStr(r.reason).bindStr(r.description).bindStr(r.status).bindInstant(r.createdAt))
+    }
+    ModerationReport? findById(id: String) {
+        var row = store.queryOptional("select " + ModerationStore.columns() + " from reports where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return ModerationStore.report(row)
+    }
+    Bool existsByReporterAndTarget(reporterId: String, targetType: String, targetId: String) = store.queryLong("select count(*) from reports where reporter_id = ? and target_type = ? and target_id = ?", DbParams().bindStr(reporterId).bindStr(targetType).bindStr(targetId)) > 0L
+    List<ModerationReport> many(rows: List<DbRow>) {
+        var out = listOf<ModerationReport>()
+        for (var r in rows) {
+            out.add(ModerationStore.report(r))
+        }
+        return out
+    }
+    List<ModerationReport> findByReporter(reporterId: String, limit: Int) = this.many(store.queryList("select " + ModerationStore.columns() + " from reports where reporter_id = ? order by created_at desc limit ?", DbParams().bindStr(reporterId).bindInt(limit)))
+    List<ModerationReport> findByStatus(status: String, limit: Int) = this.many(store.queryList("select " + ModerationStore.columns() + " from reports where status = ? order by created_at desc limit ?", DbParams().bindStr(status).bindInt(limit)))
+    saveE2eKey(reportId: String, conversationKey: String, createdAt: String) {
+        if (store.queryLong("select count(*) from report_e2e_keys where report_id = ?", DbParams().bindStr(reportId)) > 0L) {
+            return
+        }
+        store.execute("insert into report_e2e_keys (report_id, conversation_key, created_at) values (?, ?, ?)", DbParams().bindStr(reportId).bindStr(conversationKey).bindInstant(createdAt))
+    }
+    String? e2eKey(reportId: String) {
+        var row = store.queryOptional("select conversation_key from report_e2e_keys where report_id = ?", DbParams().bindStr(reportId))
+        if (row == null) {
+            return null
+        }
+        return row.getStr("conversation_key")
+    }
+}
