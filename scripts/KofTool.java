@@ -57,7 +57,24 @@ public class KofTool {
                 "-Dstdout.encoding=UTF-8", "-Dstderr.encoding=UTF-8",
                 "-cp", tmp + File.pathSeparator + depsCp + File.pathSeparator + cliJar,
                 "dev.kof.runtime.KofJvmMain", findMainClass(tmp)));
-        System.exit(new ProcessBuilder(cmd).inheritIO().start().waitFor());
+        // The app runs in a child JVM: stop it with the launcher, or a killed launcher leaves the app holding
+        // its port and later boots silently talk to the stale build.
+        Process app = new ProcessBuilder(cmd).inheritIO().start();
+        // SIGTERM alone is not enough: the Kof runtime shutdown hook waits for spawned loops (G150), so the
+        // app gets a short grace period and is then killed.
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            app.descendants().forEach(ProcessHandle::destroy);
+            app.destroy();
+            try {
+                if (!app.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                    app.descendants().forEach(ProcessHandle::destroyForcibly);
+                    app.destroyForcibly();
+                }
+            } catch (InterruptedException e) {
+                app.destroyForcibly();
+            }
+        }));
+        System.exit(app.waitFor());
     }
 
     static void test(String[] args) throws Exception {
