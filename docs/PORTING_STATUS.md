@@ -472,3 +472,60 @@ Total: 49 of 49 endpoints, 102 of 103 Java tests ported.
 ### Kernel files added or changed by this slice
 
 `kernel/http/Req.kf` (`queryAll`, `queryParam`, `formDecode`, raw-query decoding), `kernel/http/OutboundHttp.kf` (later merged into `Outbound.kf`), `kernel/text/{Regexes,Texts,Contrast,HtmlTemplate,Numbers}.kf`, `kernel/url/OriginNormalizer.kf`, `kernel/time/ZoneDates.kf`, `kernel/log/Log.kf` (`LogTap`), `kernel/db/Db.kf` (`poolStats`), `kernel/monitoring/{DayLog,HostResources,RequestMetrics,EventBuffer}.kf`. Gaps found: G220 to G230 in `KOF_GAPS.md`.
+
+
+## economy (coin, cosmetics, marketplace, services)
+
+Slug `economy`, branch `port/economy`, gap numbers G240 to G248. Modules: `CoinCore.create(platform, shared, parts)` before notifications, then `CoinModule.install(...)` after it (the disputes notify); `CosmeticsCore.create(platform)` before profile (its badge ownership replaces a profile seam), then `CosmeticsModule.install(...)`; `MarketplaceModule.install(...)` and `ServicesModule.install(...)` last. All wired in `Main.kf` (the boot was smoke tested with `scripts/kof-run`: it reaches "listening").
+
+| Domain | Endpoints ported/total | Kof tests (`tests/<domain>`) | Java tests ported/total |
+|---|---|---|---|
+| coin (`src/coin`) | 16/16 | 63 tests in 10 files: `CoinFlowTest`, `CoinExtractTest`, `CoinTransferGuardTest`, `CoinDisputeFlowTest`, `CoinEconomyServiceTest`, `CoinEconomyCalculatorTest`, `CoinEconomyEndpointTest`, `CoinStreakTest`, `CoinStreakPresenceTest`, `CoinBridgesTest` | 62/62 behaviours (the parameterised and the date-window Java tests are merged: 62 Java methods become 59 Kof tests, plus 4 new: bridges and the failing-presence case) |
+| cosmetics (`src/cosmetics`) | 22/22 | 67 tests in 8 files | 59/59 methods (8 new tests for paths the Java tests never reached) |
+| marketplace (`src/marketplace`) | 11/11 | 16 tests in 4 files | 15/15 (+1 new: sanitize) |
+| services (`src/services`) | 21/21 (14 in `/servicos`, 7 in `/services`) | 12 tests in 2 files | 12/12 |
+
+Total: 70 of 70 endpoints, 148 of 151 Java behaviours ported as 158 Kof tests; the 3 left are `CoinTestSupportTests` (below).
+
+### coin
+
+- The ledger is the truth: kinds are strings, `grant` checks the balance (400 `INSUFFICIENT_SPARKS`), chains the hash `sha256(prev|account|amount|kind|ref|idem)`, and the balance moves with the same atomic statement as Java (`update coin_accounts set balance = ?, version = version + 1 where account_id = ? and version = ?`, else 409 `COIN_CONCURRENCY`). The idempotency key is `kind:ref`, unique per account.
+- Jobs on `kernel.jobs`: ledger reconcile `0 17 4 * * *` (UTC, like the JVM zone of Java), economy recalculation `0 10 */3 * * *` and monthly round `0 40 3 1 * *`, both in `COIN_ECONOMY_ZONE` (America/Sao_Paulo). All three are overridable with the Java env names (`COIN_ECONOMY_*`, `-` disables a cron).
+- Economy defaults come from `application.properties` (scarcity weight 0.5), not from `docs/COIN_ECONOMY.md` (1.5): same as the Java runtime. One publication per period (24 h by default), the monthly round recalculates from zero.
+- Transfers: dedupe window `REDE_COIN_TRANSFER_DEDUPE_SECONDS` (10), throttles `REDE_COIN_TRANSFER_PER_MINUTE` (10) and `REDE_COIN_TRANSFER_PER_HOUR` (60), new-account cap 500 sparks per UTC day (403 `NEW_ACCOUNT_LIMIT`).
+- Presence (`CoinService.recordPresence`) runs after the commit of the caller's transaction, in its own, and never throws into the action.
+- Fixed while testing: the elapsed fraction of the economy period divided by the period in milliseconds and then by 1000 again (the ported test `after a whole period the step is full again` caught it).
+
+#### Seams replaced in other domains (Main.kf)
+
+| Seam | Replaced by |
+|---|---|
+| `CommunityCoins`, `GroupCoins`, `BlogCoins`, `MessagingCoins` (`recordPresence`) | `CoinCommunityCoins`, `CoinGroupCoins`, `CoinBlogCoins`, `CoinMessagingCoins` (`src/coin/CoinBridges.kf`), tested in `CoinBridgesTest` |
+| `NotificationCoins` (`hasReward`, `reward`: the apology) | `CoinNotificationCoins` |
+| `ProfileBadgeOwnership` | `CosmeticsBadgeOwnership` (an `emblema-*` badge needs ownership and a catalog BADGE id; the old default accepted any owned `emblema-` id) |
+
+#### Seams owned
+
+| Seam | Owner | Default |
+|---|---|---|
+| `CoinDisputeModeration` (`report`, `applyForReport`, `restrictUser`) | moderation | writes `reports` (throttle `report`, 409 `ALREADY_REPORTED`) and `user_sanctions` directly with the Java rule (a USER report of a scam restricts the receiver) |
+| `CosmeticsContributors.isVerified` | contributions | reads `user_seals` (ACTIVE) and `github_identities` |
+| `ServiceLinkGuard` | games (`GameUrlGuard`) | the same rule (https only, no credentials, public host, codes `INVALID_GAME_URL`) |
+
+### Deliberate differences from the Java services
+
+- Coin: a duplicate idempotency key propagates 409 and rolls the transaction back (Java found the existing entry); the dispute decision is an atomic claim (`where state = 'OPEN'`, else 409 `DISPUTE_ALREADY_DECIDED`; Java never checked the state, so a decided dispute could be decided again); request bodies that Java answered with 500 (null pointer) answer 400 `BAD_REQUEST`.
+- Escrow refund reuses the release reference (`ESCROW_RELEASE` kind), so release and refund exclude each other in the ledger itself.
+- Cosmetics: submit of a community cosmetic is an atomic claim (`where status = 'DRAFT'`), an edit only applies while DRAFT or REJECTED, the report counter is `reported = reported + 1` in SQL, a concurrent second look purchase is 409 by the ledger key (the wallet is charged once either way). `PUT /me/status` answers the profile view through `ProfileViews.publicView`. Profile slots are written group by group through `ProfileSlots` (a look change never rewrites a neighbour field; an equipped seasonal name style clears font and color).
+- Marketplace: confirm and refund are atomic claims (`update ... where state = 'HELD'`, 409 `PURCHASE_NOT_HELD`) on top of the `for update` row locks. The Spring rollback test with a spy became a CHECK constraint that makes the REFUNDED write fail once (same observable: money and state roll back, the retry works). Jobs: `marketplace-release-expired` (hourly), `marketplace-sanitize` and `marketplace-gallery-import` (initial 90 s, hourly).
+- Services: accepting, refunding and choosing a proposal are atomic claims on the state, and accept/refund check HELD before moving money; publishing an offer locks the seller's `users` row so the 5 open offers cap holds under concurrency; delivery note and proposal message get 1000 characters with `SERVICE_FIELD_TOO_LONG`. An unresolvable host and a private host share one message in the link guard, and the tolerant re-encoding of links with special characters is not ported. The chat opens a real SERVICE conversation through `MessagingService` and needs the sender to have a birth date (the messaging age rule).
+
+### Java tests not ported (3 of 151)
+
+- `CoinTestSupportTests` (3): test of `retryOnCoinConcurrency`, a helper that exists only because all Java test classes share one H2 and one treasury row. Each Kof test file boots its own database.
+- Moderation endpoints used by the services tests (`/moderation/services/*`) belong to the moderation domain: the tests drive `ServiceOfferService.approve/reject/suspend`, the methods that domain will call. Moderation of community cosmetics (PENDING_MODERATION to PUBLISHED) is moved by SQL in the tests.
+- The feed projections checked by two cosmetics tests (frame and name style on a post/comment) and the `/feed/posts` calls of the streak tests: the feed is not ported, so the streak tests call `CoinService.recordPresenceNow`, the exact call the feed makes.
+
+### Kernel files added or changed by this slice
+
+`kernel/jobs/ProcessLock.kf` (new: the `synchronized` of Java), `kernel/time/ZoneDates.kf` (`localToInstant`, `dayOfWeek`, `weekStart`), both with tests in `tests/kernel`. Config: `COSMETICS_CATALOG` (default `resources/cosmetics/catalog.json`; the deploy must ship the file next to `resources/templates`), `REDE_COSMETICS_EVENTS_{DUEL,HUNT}_{STARTS,ENDS}_AT`, `REDE_MARKETPLACE_*`, `COIN_ECONOMY_*`. Test support in `src/economy/` (`EconomyTestKit`, `CosmeticsTestKit`, `MarketTestKit`, `ServicesTestKit`). Gaps found: G240 to G248 in `KOF_GAPS.md`.

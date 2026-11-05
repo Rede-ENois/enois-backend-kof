@@ -447,6 +447,13 @@ Each job is one virtual-thread loop: never overlaps itself, a throwing job is lo
 (`job_failed`) and keeps its schedule, `stop()` ends every loop within ~50 ms. Single process only
 (no cross-pod lock). `Cron.parse(expr).next(afterMillis, zone)` computes fire times.
 
+`kernel.jobs.ProcessLock` (added by the economy port): the `synchronized` of Java for one process, `gate.enter()` / `gate.leave()`
+(reentrant). Callers wait their turn; there is no cross-pod lock. A `finally` after a rethrow is unsafe (G12): capture the
+failure, `leave()`, then rethrow.
+
+`ZoneDates` also has `localToInstant(localDateTime, zone)` (a zone wall-clock time to its UTC instant),
+`dayOfWeek(day)` (1 = Monday) and `weekStart(day)` (the Monday of the ISO week).
+
 ## kernel.log and PII
 
 ```kotlin
