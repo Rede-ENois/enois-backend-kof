@@ -24,6 +24,7 @@ import communities.*
 import communityprojects.*
 import groups.*
 import studypairs.*
+import jobs.*
 
 // Composition root: config -> datasource -> migrations -> app -> kernel routes -> domain routes -> listen.
 // Domain wiring (stores, services, routes, jobs) is added between Platform.create and start.
@@ -46,11 +47,15 @@ main() {
         // onboarding. Seams: IdentitySeams (users, mailer, Turnstile, IP blocks, signup guard, notifier, OAuth links,
         // identity providers) and OnboardingActions (communities, groups, network); defaults documented in
         // docs/PORTING_STATUS.md.
-        var identity = IdentityModule.install(platform, shared, hooks, parts)
+        // profile, network, preferences, presence (seams: ProfileModule.installWith). Before identity: the job
+        // eligibility rule of identity reads the live reputation of the profile domain.
+        var profiles = ProfileModule.install(platform, shared, hooks)
+        var jobSeams = JobSeamSet(platform, profiles)
+        var identitySeams = IdentitySeams.defaults(platform, IdentityStore(platform.db))
+        identitySeams.reputations = JobsIdentityReputation(jobSeams.reputation)
+        var identity = IdentityModule.installWith(platform, shared, hooks, parts, identitySeams)
         var age = AgeModule.install(platform, identity.mailer)
         OnboardingModule.install(platform, age.policy)
-        // profile, network, preferences, presence (seams: ProfileModule.installWith).
-        ProfileModule.install(platform, shared, hooks)
         // Domains (one block each, ordered by dependency): notifications is the sink the others write to.
         var notificationsModule = NotificationsModule.install(platform, shared, hooks, parts)
         PushModule.install(platform, shared, hooks, parts, notificationsModule)
@@ -58,6 +63,9 @@ main() {
         CallsModule.install(platform, shared, hooks, parts, notificationsModule, messagingModule)
         // Groups notices go through the Notifications API (push + preferences): see GroupNotificationsBridge.
         GroupsModule.installWith(platform, shared, GroupProfileLookup(platform.db), GroupAgeGate(platform.db), GroupMediaLookup(platform.db), GroupNotificationsBridge(platform.db, notificationsModule.notifications), GroupCoins())
+        // Jobs: postings, applications (delivery by message and email), company directory, external listings and
+        // their refresh job. Seams: JobSeamSet (reputation, companies, corporate, source transport).
+        JobsModule.installWith(platform, shared, parts, profiles, notificationsModule, messagingModule, identity.mailer, jobSeams)
         CommunitiesModule.install(platform, shared, hooks)
         CommunityProjectsModule.install(platform, shared, hooks)
         StudyPairsModule.install(platform, shared, hooks)
