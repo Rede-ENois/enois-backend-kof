@@ -6,6 +6,12 @@
 | notifications, push, messaging, calls (slug `messaging`) | notifications 8/8, push 3/3, messaging 24/24 (`GET /conversations/stream` answers but cannot stream, G201), calls 13/13 | 117 / 122 Java tests (notifications 34/34, push 21/21, messaging 51/55, calls 11/12; 127 Kof tests in `tests/notifications`, `tests/push`, `tests/messaging`, `tests/calls`, `tests/kernel/WebPushAdapterTest.kf`) | G200 to G212 |
 | games, dailygames (slug `games`) | games 42/42, dailygames 13/13 | 41 / 41 Java tests (games 28/28, dailygames 13/13; the `null` event list assertion of `BlocksEngineTest` has no Kof counterpart; 52 Kof tests in `tests/games`, `tests/dailygames`, `tests/kernel/GamesAdaptersTest.kf`) | G260 to G265 |
 
+
+> Cross-domain seams: since the tidy-up round every seam whose owner is ported is switched in `src/app/AppWiring.kf` to a
+> bridge that calls the owner's API. `docs/SEAMS.md` is the inventory (seam, caller, owner, status) and supersedes the
+> "pending port" tables below for those seams; the defaults described below remain only as the test defaults of each
+> domain suite. Left: the moderation seams and the OPEN rows of SEAMS.md.
+
 ## Request pipeline (`kernel.security`)
 
 Ported: current-user resolution (`Auth`, `SessionCookies`, CSRF), the filter chain in the Java order (table in
@@ -289,25 +295,19 @@ Deliberate differences:
 - `GET /feed/posts/seals` is registered before `/feed/posts/:postId` because routes match in registration order (G147).
 - Counters move with atomic `update ... set n = n + 1`.
 
-Tests not ported (6 of 170, with reason): the actor-style notification test (notifications port); the BanCleanupService test (moderation port); the coin-ledger
-reaction test (coins port; `FeedRecordingCoins` records the answer reward instead); the media-embedding Mockito `verify`
-test (media port); two identity-presentation tests that need the full profile cosmetics wiring.
+Tests not ported (6 of 170, with reason): the actor-style notification test; the BanCleanupService test (moderation port); the coin-ledger
+reaction test (`FeedRecordingCoins` records the answer reward in the feed suite; the production wiring pays through `CoinFeedCoins`); the media-embedding Mockito `verify`
+test; two identity-presentation tests that need the full profile cosmetics wiring (all four are unblocked by the wired suites, see `docs/SEAMS.md`, not ported yet).
 Test wiring: `feed.FeedTestSupport` (limits relaxed, duplicate filters off, outbox worker parked with
 `REDE_OUTBOX_WORKER_DELAY_MS`, `FeedTestSupport.finish()` in the last test of each file stops the shared jobs so the
 process exits: the Kof runtime waits for spawned tasks at exit, which the runner fix on main does not cover, G150), fixtures
 through SQL where the owner is not ported. Test helper names must not shadow kernel functions (`status`) or hit
 the parse failure of `audited` (G148, G149).
 
-### Seams owned by the feed (classes in `feed`, defaults wired in `FeedModule.install`)
+### Seams owned by the feed (`FeedSeams`, defaults in `FeedModule.install`, production in `AppWiring`)
 
-| Seam | Default | Owner / switch |
-|---|---|---|
-| `FeedAuthors` (`byIds`, `contributorIds`, `corporateByIds`, `idOfUsername`, `plainNames`, `isNewAccount`) | reads `users`, `user_seals`, `corporate_profiles` | profile: `ProfileDirectory` (`findAllByIds`, `findByUsername`, `displayName`, `nameStyle`) is now on main and can replace the reads |
-| `FeedMedia` | reads `media_assets`; deletion request is a no-op | media |
-| `FeedCommunities` (`byId`, `channel`) | reads `communities`, `community_members`, `community_channels` | communities: `CommunityDirectory.byIds(ids, viewerId)` and `CommunityChannelDirectory.byId` are on main and can replace the reads (concrete classes, so the switch is a subclass in `Main.kf`) |
-| `FeedNotifier` | single `notifications` insert; no push | notifications |
-| `FeedAgeGate`, `FeedHoneypot`, `FeedCoins` (`recordPresence`, `rewardAnswer`), `FeedCorporate` (`hasActiveProfile`, `activeUserIdOf`) | allow / never / no-op / read `corporate_profiles` | profile age, moderation, coins, corporate |
-| `FeedGraph`, `FeedBlogs`, `FeedReaderPrefs` | read `follows`/`connections`, `blogs`, `user_preferences` | network (already on main), blogs, preferences (already on main) |
+All switched except `FeedHoneypot` (moderation): see `docs/SEAMS.md`. `FeedModule.installSeams(platform, shared, hooks, seams)`
+takes every seam in one `FeedSeams` holder; `install` / `installWith` keep the table-level defaults for the feed suite.
 
 Defaults are kept on purpose: switching them is a one-line `installWith` change once the owner exposes the class, and
 the feed suite keeps passing on the table-level defaults.
@@ -451,7 +451,7 @@ Deliberate differences: the `communitiesList` cache is not ported (same results 
 | `CommunityFeedLookup` (postRef, communityFeed, channelFeed, post) | reads `posts` read-only, minimal post JSON | feed: real PostView and FeedPage |
 | `CommunityCoins.recordPresence` | no-op | coin: CoinService.recordPresence |
 
-Not ported (1 of 19): `CommunityChannelTests.channelRulesAreEnforcedByTheBackend` exercises `POST /feed/posts`
+Ported in `tests/integration/CommunitySeamsTest.kf` (was: not ported, 1 of 19): `CommunityChannelTests.channelRulesAreEnforcedByTheBackend` exercises `POST /feed/posts`
 (`CHANNEL_REQUIRES_COMMUNITY`, `TOPIC_FROM_CHANNEL`, `CHANNEL_NOT_FOUND` on publish): feed port. The feed-side
 assertions of `channelsAreVisibleOnlyToCommunityMembersAndStayOutOfEveryFeed` (`GET /feed/posts/{id}` 404 for channel
 posts, `/feed`, `/users/x/posts`) also belong to the feed port; the community-side half is ported. Pin and local tests seed

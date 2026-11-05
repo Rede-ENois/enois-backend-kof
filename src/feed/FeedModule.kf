@@ -13,8 +13,6 @@ class FeedModule {
     FeedScheduled scheduled
     FeedNotes notes
     FeedSeals seals
-    // The moderation HoneypotGuard, set by AppWiring before install (the guard needs services built after the feed).
-    static FeedHoneypot feedHoneypotSlot = FeedHoneypot()
     public constructor(service: FeedService, store: FeedStore, reader: FeedReader, moderation: FeedModeration, scheduled: FeedScheduled, notes: FeedNotes, seals: FeedSeals) {
         this.service = service
         this.store = store
@@ -24,19 +22,23 @@ class FeedModule {
         this.notes = notes
         this.seals = seals
     }
-    static FeedModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks) = FeedModule.installWithCorporate(platform, shared, hooks, FeedCoins(), FeedCorporate(platform.db))
+    static FeedModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks) = FeedModule.installSeams(platform, shared, hooks, FeedSeams(platform.db))
     // The coins port passes its own FeedCoins here (and tests a recording one).
-    static FeedModule installWith(platform: Platform, shared: SharedServices, hooks: SecurityHooks, coins: FeedCoins) = FeedModule.installWithCorporate(platform, shared, hooks, coins, FeedCorporate(platform.db))
-    // The corporate port passes its own FeedCorporate here.
-    static FeedModule installWithCorporate(platform: Platform, shared: SharedServices, hooks: SecurityHooks, coins: FeedCoins, corporate: FeedCorporate) {
+    static FeedModule installWith(platform: Platform, shared: SharedServices, hooks: SecurityHooks, coins: FeedCoins) {
+        var seams = FeedSeams(platform.db)
+        seams.coins = coins
+        return FeedModule.installSeams(platform, shared, hooks, seams)
+    }
+    // Every seam in one holder: AppWiring replaces the ones whose owner is ported (docs/SEAMS.md).
+    static FeedModule installSeams(platform: Platform, shared: SharedServices, hooks: SecurityHooks, seams: FeedSeams) {
         var database = platform.db
         var parts = Security.parts()
         var store = FeedStore(database)
-        var authors = FeedAuthors(database)
-        var communities = FeedCommunities(database)
+        var authors = seams.authors
+        var communities = seams.communities
         var notes = FeedNotes(database, store, authors, shared.blockedUsers, parts.userLimiter)
-        var service = FeedService(database, store, authors, FeedMedia(database), communities, FeedNotifier(database), FeedAgeGate(), coins, corporate, shared.blockedUsers, shared.sanctionGate, shared.risk, shared.duplication, shared.outbox, shared.audit, parts, notes)
-        var reader = FeedReader(service, store, authors, communities, corporate, FeedGraph(database), FeedBlogs(database), FeedReaderPrefs(database))
+        var service = FeedService(database, store, authors, seams.media, communities, seams.notifier, seams.ageGate, seams.coins, seams.corporate, shared.blockedUsers, shared.sanctionGate, shared.risk, shared.duplication, shared.outbox, shared.audit, parts, notes)
+        var reader = FeedReader(service, store, authors, communities, seams.corporate, seams.graph, seams.blogs, seams.prefs)
         var reposts = FeedReposts(database, store, service, parts.actionThrottle)
         var scheduled = FeedScheduled(database, service)
         var seals = FeedSeals(database, store)
@@ -51,7 +53,7 @@ class FeedModule {
 })
         }
         FeedExtraRoutes.registerLiteralRoutes(platform.server, seals)
-        FeedRoutes.register(platform.server, service, shared.idempotency, FeedModule.feedHoneypotSlot)
+        FeedRoutes.register(platform.server, service, shared.idempotency, seams.honeypot)
         FeedExtraRoutes.register(platform.server, shared.idempotency, service, reader, reposts, scheduled, seals, notes, answers, FeedPageCards(database, shared.caches.get("pagePreviewCards"), platform.cfg), platform.cfg.getStr("REDE_PAGES_CONTENT_SECURITY_POLICY", FeedExtraRoutes.defaultCsp()))
         return FeedModule(service, store, reader, moderation, scheduled, notes, seals)
     }

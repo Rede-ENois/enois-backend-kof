@@ -1,0 +1,83 @@
+package age
+
+import feed.*
+import groups.*
+import java.util.HashSet
+import kernel.db.*
+import messaging.*
+import profile.*
+import studypairs.*
+
+// The age rules (ECA Digital) the other domains held while this one did not exist, now backed by AgeGate and
+// AgePolicyReader. AppWiring passes these in; the errors and messages are the ones of AgeGate.
+
+// feed: AgeGate.requireCanWrite before a post or a comment.
+class AgeFeedGate extends FeedAgeGate {
+    AgeGate gate
+    public constructor(gate: AgeGate) {
+        super()
+        this.gate = gate
+    }
+    requireCanWrite(userId: String) {
+        gate.requireCanWrite(userId)
+    }
+}
+
+// groups: the same gate before a topic or a comment.
+class AgeGroupGate extends GroupAgeGate {
+    AgeGate gate
+    public constructor(store: Db, gate: AgeGate) {
+        super(store)
+        this.gate = gate
+    }
+    requireCanWrite(userId: String) {
+        gate.requireCanWrite(userId)
+    }
+}
+
+// messaging: the write gate and the minors of a conversation.
+class AgeMessagingPolicy extends MessagingAgePolicy {
+    AgePolicyReader reader
+    AgeGate gate
+    public constructor(database: Db, reader: AgePolicyReader, gate: AgeGate) {
+        super(database)
+        this.reader = reader
+        this.gate = gate
+    }
+    Bool birthDateDeclared(userId: String) = reader.birthDateDeclared(userId)
+    Bool isMinor(userId: String) = reader.isMinor(userId)
+    List<String> minorIds(userIds: List<String>) = reader.minorIds(userIds)
+    Bool parentalConsentActive(userId: String) = reader.parentalConsentActive(userId)
+    requireCanWrite(userId: String) {
+        gate.requireCanWrite(userId)
+    }
+}
+
+// study pairs: birth date and minors (the invitation rules).
+class AgeStudyPairPolicy extends StudyPairAgePolicy {
+    AgePolicyReader reader
+    public constructor(store: Db, reader: AgePolicyReader) {
+        super(store)
+        this.reader = reader
+    }
+    String? birthDate(userId: String) = reader.store.birthDate(userId)
+    Bool birthDateDeclared(userId: String) = reader.birthDateDeclared(userId)
+    Bool isMinor(userId: String) = reader.isMinor(userId)
+    HashSet<String> minorIds(userIds: List<String>) {
+        var out = new HashSet<String>()
+        for (var id in reader.minorIds(userIds)) {
+            out.add(id)
+        }
+        return out
+    }
+}
+
+// profile: parental supervision of a minor (ParentalLinkRepository.findActiveByMinor), through the age policy.
+class AgeProfileParentalLinks extends ProfileParentalLinks {
+    AgePolicyReader reader
+    public constructor(store: Db, reader: AgePolicyReader) {
+        super(store)
+        this.reader = reader
+    }
+    Bool activeForMinor(minorUserId: String) = reader.parentalConsentActive(minorUserId)
+}

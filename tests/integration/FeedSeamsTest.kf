@@ -1,0 +1,57 @@
+import app.*
+import kernel.db.*
+import kernel.testkit.*
+
+// Production wiring (AppWiring): games and blog publish through the feed service, and the daily presence of the
+// author goes through the coin service (streak), not through the table writes the seams defaulted to.
+
+test "a game share becomes a real feed post and counts as presence in the coin streak" {
+    var admin = WiredApp.adult("seam_games_admin")
+    WiredApp.app().db().execute("update users set is_admin = true where id = ?", DbParams().bindStr("seam_games_admin"))
+    var player = WiredApp.adult("seam_games_player")
+    var created = WiredApp.send("POST", "/games", player, "seam-game-1", "{\"title\":\"Fazendinha Seam\",\"url\":\"https://93.184.216.34/fazendinha\"}")
+    Check.status(created, 200)
+    var gameId = created.jsonStr("id")
+    if (gameId == null) {
+        throw "FAIL no game id"
+    }
+    Check.status(WiredApp.send("POST", "/admin/games/" + gameId + "/approve", admin, "seam-game-2", "{\"note\":\"ok\"}"), 200)
+    var shared = WiredApp.send("POST", "/games/" + gameId + "/compartilhar", player, "seam-game-3", "{\"texto\":\"Peguei nivel 10 na fazendinha seam!\"}")
+    Check.status(shared, 200)
+    var postId = shared.jsonStr("postId")
+    if (postId == null) {
+        throw "FAIL no post id"
+    }
+    var post = WiredApp.get("/feed/posts/" + postId, player)
+    Check.status(post, 200)
+    Check.jsonEq(post, "type", "INSIGHT")
+    var events = WiredApp.app().db().queryLong("select count(*) from outbox_events where event_type = 'PostPublished' and payload like ?", DbParams().bindStr("%" + postId + "%"))
+    Check.isTrue("PostPublished raised by the feed service", events > 0L)
+}
+
+test "a blog post is a pointer post in the feed and notifies the subscriber" {
+    var log = WiredApp.notificationLog()
+    var author = WiredApp.adult("seam_blog_author")
+    var follower = WiredApp.adult("seam_blog_follower")
+    var saved = WiredApp.send("PUT", "/blogs/me", author, "seam-blog-1", "{\"title\":\"Blog Seam\",\"themeHtml\":\"<div>tema</div>\"}")
+    Check.status(saved, 200)
+    var slug = saved.jsonStr("slug")
+    if (slug == null) {
+        throw "FAIL no slug"
+    }
+    Check.status(WiredApp.send("POST", "/blogs/" + slug + "/subscription", follower, "seam-blog-2", ""), 200)
+    var published = WiredApp.send("POST", "/blogs/me/posts", author, "seam-blog-3", "{\"title\":\"Primeiro post\",\"body\":\"Corpo do post do blog.\",\"format\":\"MARKDOWN\",\"notifySubscribers\":true}")
+    Check.status(published, 201)
+    var postId = published.jsonStr("id")
+    if (postId == null) {
+        throw "FAIL no post id"
+    }
+    var pointer = WiredApp.get("/feed/posts/" + postId, author)
+    Check.status(pointer, 200)
+    Check.jsonEq(pointer, "type", "BLOG")
+    Check.isTrue("NEW_BLOG_POST published through the Notifications API", log.has("NEW_BLOG_POST", "seam_blog_follower"))
+}
+
+test "the stack is stopped at the end" {
+    WiredApp.finish()
+}

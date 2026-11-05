@@ -1,0 +1,115 @@
+package app
+
+import communities.*
+import groups.*
+import kernel.db.*
+import kernel.error.*
+import network.*
+import onboarding.*
+import preferences.*
+import profile.*
+
+// onboarding: every choice of "complete" goes through the same service as the manual action, so the same rules,
+// counters, notices and presence apply (OnboardingService: mergeLikedTopics, mergeSkills, joinCommunity,
+// joinOpenGroup, requestConnection). An ApiException of a join or request skips that item, as in Java.
+class AppOnboardingActions extends OnboardingActions {
+    PreferencesService preferences
+    ProfileService profile
+    ProfileDirectory directory
+    CommunityService communities
+    GroupService groups
+    NetworkService network
+    public constructor(store: Db, preferences: PreferencesService, profile: ProfileService, directory: ProfileDirectory, communities: CommunityService, groups: GroupService, network: NetworkService) {
+        super(store)
+        this.preferences = preferences
+        this.profile = profile
+        this.directory = directory
+        this.communities = communities
+        this.groups = groups
+        this.network = network
+    }
+    // Adds to "O que quero ver" keeping what was there; a blocked topic is a 409 from the preferences service.
+    mergeLikedTopics(userId: String, topics: List<String>, now: String) {
+        if (topics.size() == 0) {
+            return
+        }
+        var current = preferences.of(userId)
+        var liked = listOf<String>()
+        for (var t in current.likedTopics) {
+            liked.add(t)
+        }
+        for (var t in topics) {
+            if (!liked.contains(t)) {
+                liked.add(t)
+            }
+        }
+        if (liked.size() == current.likedTopics.size()) {
+            return
+        }
+        preferences.update(userId, PreferencesUpdateBody(liked, current.blockedTopics, current.disabledModules, null, null, null))
+    }
+    // Adds skills through the profile update (same validation), keeping the existing ones.
+    mergeSkills(userId: String, skills: List<String>) {
+        if (skills.size() == 0) {
+            return
+        }
+        var me = directory.findById(userId)
+        if (me == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuario nao encontrado.")
+        }
+        var known = listOf<String>()
+        var merged = listOf<String>()
+        for (var s in me.skills) {
+            known.add(s.toLowerCase())
+            merged.add(s)
+        }
+        for (var s in skills) {
+            if (!known.contains(s.toLowerCase())) {
+                merged.add(s)
+            }
+        }
+        if (merged.size() == me.skills.size()) {
+            return
+        }
+        profile.update(userId, ProfileUpdateBody(null, null, null, null, null, null, null, null, null, null, merged, null, null, null, null, null, null, null, null, null, null, null, null, null, null))
+    }
+    Bool joinCommunity(userId: String, communityId: String) {
+        if (communities.isMember(communityId, userId)) {
+            return true
+        }
+        try {
+            communities.join(communityId, userId)
+            return true
+        } catch (String e) {
+            return false
+        }
+    }
+    // Only groups with open entry: a group that needs approval is never joined (nor requested) from here.
+    Bool joinOpenGroup(userId: String, groupId: String) {
+        try {
+            var group = groups.resolve(groupId)
+            if (group.id() != groupId || group.joinMode() != "OPEN") {
+                return false
+            }
+            if (groups.roleOf(groupId, userId) != null) {
+                return true
+            }
+            groups.join(groupId, userId)
+            return true
+        } catch (String e) {
+            return false
+        }
+    }
+    // Same path as the manual request: self, blocked and unknown accounts are skipped; repeats are no-ops.
+    Bool requestConnection(userId: String, targetId: String) {
+        if (targetId == userId) {
+            return false
+        }
+        try {
+            network.requestConnection(userId, targetId)
+            return true
+        } catch (String e) {
+            return false
+        }
+    }
+}
