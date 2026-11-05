@@ -1,0 +1,42 @@
+import app.*
+import kernel.testkit.*
+
+// Port of FreelanceEditDeleteTests: the owner edits and deletes their own freelance; a non-owner gets 403; a closed
+// freelance does not edit; the edit runs the same validations as the creation.
+test "ownerEditsAndDeletesTheFreelance" {
+    var owner = OrgsTestKit.login("frl_edit_owner1")
+    var id = FreelanceTestKit.create(owner, "Landing page")
+    var edited = owner.patch("/freelances/" + id, FreelanceTestKit.body("Landing page + blog", "Construir a landing page e um blog simples com painel de publicação.", 2500, 4000, FreelanceTestKit.day(14), "CASH"))
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "title", "Landing page + blog")
+    Check.jsonEq(edited, "budgetMin", "2500")
+    Check.jsonEq(edited, "paymentMethod", "CASH")
+    var mine = owner.get("/me/freelances")
+    Check.status(mine, 200)
+    var at = FreelanceTestKit.indexOf(mine, "", "id", id)
+    Check.isTrue("the freelance is in my list", at >= 0)
+    Check.jsonEq(mine, "" + at + ".title", "Landing page + blog")
+    var deleted = owner.delete("/freelances/" + id)
+    Check.status(deleted, 200)
+    Check.jsonEq(deleted, "status", "DELETED")
+    var after = owner.get("/me/freelances")
+    Check.status(after, 200)
+    Check.isTrue("the freelance left my list", !FreelanceTestKit.has(after, "", "id", id))
+}
+
+test "nonOwnerCannotEditOrDeleteAndClosedFreelanceDoesNotEdit" {
+    var owner = OrgsTestKit.login("frl_edit_owner2")
+    var other = OrgsTestKit.login("frl_edit_other2")
+    var id = FreelanceTestKit.create(owner, "Landing page")
+    var editBody = FreelanceTestKit.body("Tentativa", FreelanceTestKit.validScope(), 100, 200, FreelanceTestKit.day(3), null)
+    Check.apiError(other.patch("/freelances/" + id, editBody), 403, "NOT_OWNER")
+    Check.apiError(other.delete("/freelances/" + id), 403, "NOT_OWNER")
+    // A closed freelance does not edit (it already left the showcase).
+    Check.status(owner.post("/freelances/" + id + "/close", ""), 200)
+    Check.apiError(owner.patch("/freelances/" + id, editBody), 409, "FREELANCE_CLOSED")
+    // The edit runs the validations of the creation: an inverted value range is refused.
+    var owner3 = OrgsTestKit.login("frl_edit_owner3")
+    var id3 = FreelanceTestKit.create(owner3, "Landing page")
+    Check.apiError(owner3.patch("/freelances/" + id3, FreelanceTestKit.body("Faixa invertida", FreelanceTestKit.validScope(), 500, 100, FreelanceTestKit.day(3), null)), 400, "INVALID_BUDGET")
+    OrgsTestKit.finish()
+}

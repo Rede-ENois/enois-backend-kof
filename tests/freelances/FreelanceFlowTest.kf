@@ -1,0 +1,91 @@
+import app.*
+import kernel.testkit.*
+
+// Port of FreelanceFlowTests: a freelance has a table of its own and needs only a value range, a deadline and a
+// closed scope; the payment is cash or sparks; the proposal leaves the professional identity into the
+// professional inbox.
+String ffBody(title: String, scope: String, min: Int, max: Int, days: Int, payment: String?) = FreelanceTestKit.body(title, scope, min, max, FreelanceTestKit.day(days), payment)
+
+test "paymentCanBeCashOrDefaultsToFaiscas" {
+    var owner = OrgsTestKit.login("free_payment")
+    var cash = owner.post("/freelances", ffBody("Site institucional", "Montar o site com cinco páginas e formulário de contato.", 1500, 2500, 5, "CASH"))
+    Check.status(cash, 200)
+    Check.jsonEq(cash, "paymentMethod", "CASH")
+    // Without the field the freelance stays in the spark circuit (the old behaviour).
+    var plain = owner.post("/freelances", "{\"title\":\"Ajuste de CSS\",\"scope\":\"Corrigir o layout quebrado na home e no painel administrativo.\",\"budgetMin\":5000,\"budgetMax\":8000,\"deadline\":\"" + FreelanceTestKit.day(5) + "\"}")
+    Check.status(plain, 200)
+    Check.jsonEq(plain, "paymentMethod", "FAISCAS")
+    Check.apiError(owner.post("/freelances", ffBody("Outro trabalho", "Descrição com tamanho suficiente para passar na validação de escopo.", 100, 200, 5, "PIX")), 400, "INVALID_PAYMENT_METHOD")
+}
+
+test "searchesByTitleAndScope" {
+    var owner = OrgsTestKit.login("free_search")
+    Check.status(owner.post("/freelances", ffBody("Landing page de vendas", "Página de vendas com formulário e integração com o checkout.", 20000, 30000, 7, null)), 200)
+    Check.status(owner.post("/freelances", ffBody("Ajuste de banco de dados", "Revisar índices e consultas lentas do banco de produção.", 8000, 12000, 7, null)), 200)
+    var guest = OrgsTestKit.anonymous()
+    var found = guest.get("/freelances?q=banco%20de%20dados")
+    Check.status(found, 200)
+    Check.isTrue("the database job is found", FreelanceTestKit.has(found, "items", "title", "Ajuste de banco de dados"))
+    Check.isTrue("the landing page job is not", !FreelanceTestKit.has(found, "items", "title", "Landing page de vendas"))
+    var none = guest.get("/freelances?q=nao-existe-em-lugar-nenhum")
+    Check.status(none, 200)
+    Check.eqInt("no match", 0, none.jsonSize("items"))
+}
+
+test "createsListsAndClosesAFreelance" {
+    var owner = OrgsTestKit.login("free_owner")
+    var created = owner.post("/freelances", ffBody("Landing page de lançamento", "Entregar uma landing responsiva com formulário de contato e deploy.", 80000, 150000, 10, null))
+    Check.status(created, 200)
+    Check.jsonEq(created, "status", "OPEN")
+    Check.jsonEq(created, "budgetMin", "80000")
+    var id = OrgsTestKit.str(created, "id")
+    var guest = OrgsTestKit.anonymous()
+    var listed = guest.get("/freelances")
+    Check.status(listed, 200)
+    Check.jsonEq(listed, "items.0.title", "Landing page de lançamento")
+    var closed = owner.post("/freelances/" + id + "/close", "")
+    Check.status(closed, 200)
+    Check.jsonEq(closed, "status", "CLOSED")
+    // The list is global (other tests leave open freelances): it only asserts about its own.
+    var after = guest.get("/freelances")
+    Check.status(after, 200)
+    Check.isTrue("the closed freelance left the list", !FreelanceTestKit.has(after, "items", "id", id))
+}
+
+test "proposalGoesFromTheProfessionalIdentityToTheProfessionalInbox" {
+    var poster = OrgsTestKit.login("free_prop_owner")
+    var proposer = OrgsTestKit.login("free_prop_pro")
+    var created = poster.post("/freelances", ffBody("Landing page", "Uma landing page com formulario e integracao com o CRM.", 800, 1200, 7, null))
+    Check.status(created, 200)
+    var freelanceId = OrgsTestKit.str(created, "id")
+    var proposalBody = "{\"message\":\"Entrego em cinco dias.\"}"
+    // Without an active professional identity nothing leaves in the name of the social profile.
+    Check.apiError(proposer.post("/freelances/" + freelanceId + "/proposals", proposalBody), 403, "NO_ACTIVE_CORPORATE_PROFILE")
+    var proUsername = FreelanceTestKit.activateProfessional(proposer, "free_prop_pro")
+    var proposed = proposer.post("/freelances/" + freelanceId + "/proposals", proposalBody)
+    Check.status(proposed, 200)
+    var conversationId = OrgsTestKit.str(proposed, "conversationId")
+    // The poster receives it in the professional inbox, seeing the professional identity.
+    var conversation = poster.get("/conversations/" + conversationId)
+    Check.status(conversation, 200)
+    Check.jsonEq(conversation, "kind", "FREELANCE")
+    Check.jsonEq(conversation, "context", "PROFESSIONAL")
+    Check.jsonEq(conversation, "identities.free_prop_pro.username", proUsername)
+    var work = poster.get("/notifications?context=PROFESSIONAL")
+    Check.status(work, 200)
+    Check.jsonEq(work, "items.0.kind", "NEW_WORK_MESSAGE")
+    Check.jsonEq(work, "items.0.context", "PROFESSIONAL")
+    Check.jsonEq(work, "items.0.actorUsername", proUsername)
+    Check.jsonEq(work, "items.0.actorIdentity", "CORPORATE")
+    var social = poster.get("/notifications?context=SOCIAL")
+    Check.status(social, 200)
+    Check.isTrue("no work notification in the social inbox", !FreelanceTestKit.has(social, "items", "kind", "NEW_WORK_MESSAGE"))
+    // A second proposal to the same person stays in the same conversation (no duplicate).
+    var again = proposer.post("/freelances/" + freelanceId + "/proposals", "{\"message\":\"Posso comecar amanha.\"}")
+    Check.status(again, 200)
+    Check.jsonEq(again, "conversationId", conversationId)
+    // The poster does not propose to their own freelance.
+    FreelanceTestKit.activateProfessional(poster, "free_prop_owner")
+    Check.apiError(poster.post("/freelances/" + freelanceId + "/proposals", proposalBody), 400, "CANNOT_PROPOSE_OWN_FREELANCE")
+    OrgsTestKit.finish()
+}
