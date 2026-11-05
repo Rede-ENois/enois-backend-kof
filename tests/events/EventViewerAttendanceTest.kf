@@ -1,0 +1,100 @@
+import app.*
+import kernel.testkit.*
+
+// Port of EventViewerAttendanceTests: after POST .../attendees the authenticated GET exposes attending=true for that
+// event; the anonymous list always answers attending=false.
+test "attendThenAuthenticatedListShowsAttendingTrue" {
+    var host = OrgsTestKit.login("evattend_host")
+    var guest = OrgsTestKit.login("evattend_guest")
+    var eventId = EventsTestKit.create(host, "Meetup attendance flag", "2027-08-10")
+    var rsvp = guest.post("/events/" + eventId + "/attendees", "")
+    Check.status(rsvp, 200)
+    Check.jsonEq(rsvp, "status", "ATTENDING")
+    Check.jsonEq(rsvp, "id", eventId)
+    var list = guest.get("/events?limit=100")
+    Check.status(list, 200)
+    var at = EventsTestKit.indexOf(list, eventId)
+    Check.isTrue("the event is listed", at >= 0)
+    Check.jsonEq(list, "items." + at + ".attending", "true")
+    var detail = guest.get("/events/" + eventId)
+    Check.status(detail, 200)
+    Check.jsonEq(detail, "attending", "true")
+    Check.jsonEq(detail, "attendees", "1")
+}
+
+test "anonymousListAlwaysReturnsAttendingFalse" {
+    var host = OrgsTestKit.login("evattend_anon_host")
+    var eventId = EventsTestKit.create(host, "Public list attending false", "2027-09-01")
+    var list = OrgsTestKit.anonymous().get("/events?limit=100")
+    Check.status(list, 200)
+    var at = EventsTestKit.indexOf(list, eventId)
+    Check.isTrue("the event is listed", at >= 0)
+    Check.jsonEq(list, "items." + at + ".attending", "false")
+}
+
+test "cancelThenDetailShowsAttendingFalse" {
+    var host = OrgsTestKit.login("evattend_cancel_host")
+    var guest = OrgsTestKit.login("evattend_cancel_guest")
+    var eventId = EventsTestKit.create(host, "Cancel attendance flag", "2027-10-12")
+    Check.status(guest.post("/events/" + eventId + "/attendees", ""), 200)
+    var cancel = guest.delete("/events/" + eventId + "/attendees")
+    Check.status(cancel, 200)
+    Check.jsonEq(cancel, "status", "NOT_ATTENDING")
+    var detail = guest.get("/events/" + eventId)
+    Check.status(detail, 200)
+    Check.jsonEq(detail, "attending", "false")
+}
+
+// Contract extras of the same spec (specs/001-event-viewer-attendance): attending twice and cancelling without having
+// confirmed have their own codes, and a write without a session or a key is refused.
+test "attendanceCommandsKeepTheirCodes" {
+    var host = OrgsTestKit.login("evattend_codes_host")
+    var guest = OrgsTestKit.login("evattend_codes_guest")
+    var eventId = EventsTestKit.create(host, "Codes of attendance", "2027-11-02")
+    Check.apiError(guest.delete("/events/" + eventId + "/attendees"), 404, "NOT_ATTENDING")
+    Check.status(guest.post("/events/" + eventId + "/attendees", ""), 200)
+    Check.apiError(guest.post("/events/" + eventId + "/attendees", ""), 409, "ALREADY_ATTENDING")
+    Check.apiError(guest.post("/events/event_missing/attendees", ""), 404, "EVENT_NOT_FOUND")
+    Check.apiError(OrgsTestKit.anonymous().post("/events/" + eventId + "/attendees", ""), 401, "UNAUTHENTICATED")
+    var noKey = guest.callKey("DELETE", "/events/" + eventId + "/attendees", "", "")
+    Check.apiError(noKey, 400, "IDEMPOTENCY_KEY_REQUIRED")
+    // The same key replays the stored answer instead of failing the second time.
+    var first = guest.callKey("DELETE", "/events/" + eventId + "/attendees", "evattend-replay", "")
+    Check.status(first, 200)
+    var again = guest.callKey("DELETE", "/events/" + eventId + "/attendees", "evattend-replay", "")
+    Check.status(again, 200)
+    Check.jsonEq(again, "status", "NOT_ATTENDING")
+}
+
+test "listAndDetailCarryTheContractFields" {
+    var host = OrgsTestKit.login("evattend_shape_host")
+    var res = host.post("/events", "{\"title\":\"Shape of the event\",\"date\":\"2027-12-01\",\"time\":\"18:30\",\"format\":\"Presencial\",\"host\":\"Casa\",\"cover\":\"https://cdn.test/c.png\",\"location\":\"Rua A, 10\",\"city\":\"Belo Horizonte\",\"state\":\"mg\"}")
+    Check.status(res, 201)
+    var id = OrgsTestKit.str(res, "id")
+    Check.isTrue("id prefix", id.startsWith("event_"))
+    Check.jsonEq(res, "title", "Shape of the event")
+    Check.jsonEq(res, "date", "2027-12-01")
+    Check.jsonEq(res, "time", "18:30")
+    Check.jsonEq(res, "format", "Presencial")
+    Check.jsonEq(res, "host", "Casa")
+    Check.jsonEq(res, "attendees", "0")
+    Check.jsonEq(res, "cover", "https://cdn.test/c.png")
+    Check.isTrue("no stream", res.jsonIsNull("streamUrl"))
+    Check.jsonEq(res, "location", "Rua A, 10")
+    Check.jsonEq(res, "expired", "false")
+    Check.jsonEq(res, "attending", "false")
+    Check.jsonEq(res, "recurrence", "NONE")
+    Check.isTrue("no series", res.jsonIsNull("seriesId"))
+    Check.isTrue("no next", res.jsonIsNull("nextOccurrenceDate"))
+    Check.jsonEq(res, "canManageRecurrence", "true")
+    Check.jsonEq(res, "city", "Belo Horizonte")
+    Check.jsonEq(res, "state", "MG")
+    Check.isTrue("the owner id never leaves", !res.body.contains("createdBy"))
+    var missing = OrgsTestKit.anonymous().get("/events/event_missing")
+    Check.apiError(missing, 404, "EVENT_NOT_FOUND")
+    Check.apiError(OrgsTestKit.anonymous().get("/events?cursor=not-an-instant"), 400, "INVALID_CURSOR")
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}

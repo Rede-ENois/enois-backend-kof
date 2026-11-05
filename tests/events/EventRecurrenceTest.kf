@@ -1,0 +1,225 @@
+import app.*
+import events.*
+import identity.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of EventRecurrenceTests: rituals (recurring events). The series schedules the next occurrence once, tells the
+// people who went (without copying their attendance) and stops when the owner turns it off, deletes an occurrence or
+// leaves the network.
+String erecBody(title: String, date: String, time: String, recurrence: String) {
+    var body = "{\"title\":\"" + title + "\",\"date\":\"" + date + "\",\"time\":\"" + time + "\",\"format\":\"Online\",\"host\":\"Énóis\""
+    if (recurrence.length() > 0) {
+        body = body + ",\"recurrence\":\"" + recurrence + "\""
+    }
+    return body + "}"
+}
+
+TestResponse erecCreate(host: ProfileCaller, title: String, date: String, recurrence: String) {
+    var res = host.post("/events", erecBody(title, date, "19:00", recurrence))
+    Check.status(res, 201)
+    return res
+}
+
+String erecChain(sourceId: String) {
+    var latest = EventsTestKit.store().findLatestInSeries(sourceId)
+    if (latest == null) {
+        throw "the series has no occurrence"
+    }
+    return latest.id
+}
+
+Int erecNotices(who: ProfileCaller, kind: String, href: String) {
+    var list = who.get("/notifications?limit=50")
+    Check.status(list, 200)
+    var found = 0
+    var i = 0
+    while (i < list.jsonSize("items")) {
+        if (list.jsonStr("items." + i + ".kind") == kind && list.jsonStr("items." + i + ".href") == href) {
+            found = found + 1
+        }
+        i = i + 1
+    }
+    return found
+}
+
+test "weeklyEventExposesRecurrenceSeriesAndNextDate" {
+    var host = EventsTestKit.host("evrec_host1")
+    var date = EventsTestKit.day(10)
+    var created = erecCreate(host, "evrec Show and tell", date, "WEEKLY")
+    var id = OrgsTestKit.str(created, "id")
+    Check.jsonEq(created, "recurrence", "WEEKLY")
+    Check.jsonEq(created, "seriesId", id)
+    Check.jsonEq(created, "nextOccurrenceDate", EventsTestKit.day(17))
+    var list = OrgsTestKit.anonymous().get("/events?recurring=true&limit=100")
+    Check.status(list, 200)
+    Check.isTrue("the ritual is listed", EventsTestKit.listed(list, id))
+    var i = 0
+    while (i < list.jsonSize("items")) {
+        Check.isTrue("no one-off event among the rituals", list.jsonStr("items." + i + ".recurrence") != "NONE")
+        i = i + 1
+    }
+}
+
+test "invalidRecurrenceAndMissingTimeAreRejected" {
+    var host = EventsTestKit.host("evrec_host2")
+    var date = EventsTestKit.day(10)
+    var bad = host.post("/events", erecBody("evrec invalid", date, "19:00", "DAILY"))
+    Check.apiError(bad, 400, "INVALID_RECURRENCE")
+    Check.jsonEq(bad, "message", "Recorrencia invalida. Use NONE, WEEKLY, BIWEEKLY ou MONTHLY.")
+    var noTime = host.post("/events", erecBody("evrec sem hora", date, "a noite", "WEEKLY"))
+    Check.apiError(noTime, 400, "INVALID_EVENT_TIME")
+    Check.jsonEq(noTime, "message", "Evento recorrente precisa de horario no formato HH:MM.")
+}
+
+test "schedulerCreatesExactlyOneNextOccurrenceAndNotifiesAttendeesWithoutCopyingThem" {
+    var host = EventsTestKit.host("evrec_host3")
+    var attendee = EventsTestKit.host("evrec_guest3")
+    var yesterday = EventsTestKit.day(-1)
+    var created = erecCreate(host, "evrec Live code review", yesterday, "WEEKLY")
+    var eventId = OrgsTestKit.str(created, "id")
+    var store = EventsTestKit.store()
+    store.saveAttendee(eventId, "evrec_guest3", Time.nowIso())
+    var recurrence = EventsTestKit.recurrence()
+    recurrence.spawnNextOccurrences()
+    recurrence.spawnNextOccurrences()
+    var nextDate = EventsTestKit.day(6)
+    Check.isTrue("the next date exists once in the series", store.existsInSeries(eventId, nextDate))
+    var next = store.findLatestInSeries(eventId)
+    if (next == null) {
+        throw "the series has no occurrence"
+    }
+    Check.isTrue("a new event", next.id != eventId)
+    Check.eqStr("date", nextDate, next.date)
+    Check.eqStr("title", "evrec Live code review", next.title)
+    Check.eqStr("recurrence", "WEEKLY", next.recurrence)
+    // Attendance is not copied: confirming again is the person's choice.
+    Check.eqInt("no attendance copied", 0, store.countAttendees(next.id))
+    // The attendee was told exactly once, with the link to the new occurrence.
+    Check.eqInt("one notice", 1, erecNotices(attendee, "EVENT_NEXT_OCCURRENCE", "/eventos?evento=" + next.id))
+    var list = attendee.get("/notifications?limit=50")
+    var at = 0
+    while (list.jsonStr("items." + at + ".kind") != "EVENT_NEXT_OCCURRENCE") {
+        at = at + 1
+    }
+    Check.jsonEq(list, "items." + at + ".title", "Próximo encontro marcado")
+    Check.jsonEq(list, "items." + at + ".body", "evrec Live code review volta em " + nextDate.substring(8, 10) + "/" + nextDate.substring(5, 7) + "/" + nextDate.substring(0, 4) + " às 19:00. Se quiser ir, confirme presença de novo.")
+    Check.jsonEq(list, "items." + at + ".ctaLabel", "Ver evento")
+    // The host confirmed nothing, so is told nothing.
+    Check.eqInt("the owner is not notified", 0, erecNotices(host, "EVENT_NEXT_OCCURRENCE", "/eventos?evento=" + next.id))
+}
+
+test "monthlyOnThe31stFallsOnTheLastDayAndReturnsToThe31st" {
+    var anchor = "2027-01-31"
+    var feb = EventRules.nextDate("MONTHLY", anchor, anchor)
+    var mar = EventRules.nextDate("MONTHLY", anchor, feb)
+    var apr = EventRules.nextDate("MONTHLY", anchor, mar)
+    Check.eqStr("february", "2027-02-28", feb)
+    Check.eqStr("march", "2027-03-31", mar)
+    Check.eqStr("april", "2027-04-30", apr)
+    Check.eqStr("biweekly", "2027-02-14", EventRules.nextDate("BIWEEKLY", anchor, anchor))
+    Check.eqStr("weekly", "2027-02-07", EventRules.nextDate("WEEKLY", anchor, anchor))
+    Check.eqStr("december rolls the year", "2028-01-31", EventRules.nextDate("MONTHLY", anchor, "2027-12-31"))
+}
+
+test "onlyTheOwnerChangesRecurrence" {
+    var host = EventsTestKit.host("evrec_host5")
+    var other = EventsTestKit.host("evrec_other5")
+    var eventId = OrgsTestKit.str(erecCreate(host, "evrec AMA", EventsTestKit.day(10), ""), "id")
+    Check.apiError(other.patch("/events/" + eventId + "/recurrence", "{\"recurrence\":\"WEEKLY\"}"), 403, "NOT_EVENT_OWNER")
+    var changed = host.patch("/events/" + eventId + "/recurrence", "{\"recurrence\":\"MONTHLY\"}")
+    Check.status(changed, 200)
+    Check.jsonEq(changed, "recurrence", "MONTHLY")
+    Check.jsonEq(changed, "seriesId", eventId)
+    Check.apiError(host.patch("/events/" + eventId + "/recurrence", "{\"recurrence\":\"DAILY\"}"), 400, "INVALID_RECURRENCE")
+    Check.apiError(host.patch("/events/event_missing/recurrence", "{\"recurrence\":\"WEEKLY\"}"), 404, "EVENT_NOT_FOUND")
+}
+
+test "onlyTheOwnerSeesCanManageRecurrence" {
+    var host = EventsTestKit.host("evrec_host9")
+    var other = EventsTestKit.host("evrec_other9")
+    var created = erecCreate(host, "evrec Gestao", EventsTestKit.day(10), "WEEKLY")
+    var eventId = OrgsTestKit.str(created, "id")
+    Check.jsonEq(created, "canManageRecurrence", "true")
+    Check.jsonEq(host.get("/events/" + eventId), "canManageRecurrence", "true")
+    var hostList = host.get("/events?recurring=true&limit=100")
+    Check.jsonEq(hostList, "items." + EventsTestKit.indexOf(hostList, eventId) + ".canManageRecurrence", "true")
+    Check.jsonEq(other.get("/events/" + eventId), "canManageRecurrence", "false")
+    var otherList = other.get("/events?recurring=true&limit=100")
+    Check.jsonEq(otherList, "items." + EventsTestKit.indexOf(otherList, eventId) + ".canManageRecurrence", "false")
+    var guest = OrgsTestKit.anonymous().get("/events/" + eventId)
+    Check.jsonEq(guest, "canManageRecurrence", "false")
+    Check.isTrue("the owner id is not in the answer", !guest.jsonHas("createdBy"))
+    var guestList = OrgsTestKit.anonymous().get("/events?recurring=true&limit=100")
+    Check.jsonEq(guestList, "items." + EventsTestKit.indexOf(guestList, eventId) + ".canManageRecurrence", "false")
+}
+
+test "settingNoneStopsTheSeries" {
+    var host = EventsTestKit.host("evrec_host6")
+    var eventId = OrgsTestKit.str(erecCreate(host, "evrec Game jam", EventsTestKit.day(-1), "MONTHLY"), "id")
+    var stopped = host.patch("/events/" + eventId + "/recurrence", "{\"recurrence\":\"NONE\"}")
+    Check.status(stopped, 200)
+    Check.jsonEq(stopped, "recurrence", "NONE")
+    Check.isTrue("no next occurrence", stopped.jsonIsNull("nextOccurrenceDate"))
+    EventsTestKit.recurrence().spawnNextOccurrences()
+    Check.eqStr("the series did not grow", eventId, erecChain(eventId))
+}
+
+test "removedOccurrenceDoesNotSpawnNorComeBack" {
+    var host = EventsTestKit.host("evrec_host7")
+    var eventId = OrgsTestKit.str(erecCreate(host, "evrec Roda de conversa", EventsTestKit.day(-1), "WEEKLY"), "id")
+    var recurrence = EventsTestKit.recurrence()
+    recurrence.spawnNextOccurrences()
+    var nextId = erecChain(eventId)
+    Check.isTrue("a next occurrence exists", nextId != eventId)
+    var next = EventsTestKit.store().findById(nextId)
+    if (next == null) {
+        throw "the next occurrence vanished"
+    }
+    Check.status(host.delete("/events/" + nextId), 200)
+    recurrence.spawnNextOccurrences()
+    // Without stopping the series, the previous occurrence would be the latest again and recreate the date.
+    Check.isTrue("the date did not come back", !EventsTestKit.store().existsInSeries(eventId, next.date))
+    var first = EventsTestKit.store().findById(eventId)
+    if (first == null) {
+        throw "the first occurrence vanished"
+    }
+    Check.eqStr("the series stopped", "NONE", first.recurrence)
+}
+
+test "deletedHostAccountStopsTheSeries" {
+    var host = EventsTestKit.host("evrec_host8")
+    // A real password, so the real account deletion endpoint can run.
+    IdentityStore(OrgsTestKit.db()).saveCredential("evrec_host8", "evrec_host8@test.invalid", Passwords.hash("Test1234!"), true, Time.nowIso())
+    var eventId = OrgsTestKit.str(erecCreate(host, "evrec Clube do livro", EventsTestKit.day(-1), "WEEKLY"), "id")
+    Check.status(host.post("/auth/account/delete", "{\"password\":\"Test1234!\"}"), 200)
+    EventsTestKit.recurrence().spawnNextOccurrences()
+    Check.eqStr("the series did not grow", eventId, erecChain(eventId))
+    var first = EventsTestKit.store().findById(eventId)
+    if (first == null) {
+        throw "the first occurrence vanished"
+    }
+    Check.eqStr("the series stopped", "NONE", first.recurrence)
+}
+
+test "restrictedHostAccountStopsTheSeries" {
+    var host = EventsTestKit.host("evrec_host10")
+    var eventId = OrgsTestKit.str(erecCreate(host, "evrec Sancionado", EventsTestKit.day(-1), "WEEKLY"), "id")
+    OrgsTestKit.db().execute("insert into user_sanctions (id, user_id, type, reason, status, created_at) values (?, ?, \'BAN\', \'teste\', \'ACTIVE\', ?)", DbParams().bindStr("sanction_evrec_10").bindStr("evrec_host10").bindInstant(Time.nowIso()))
+    EventsTestKit.recurrence().spawnNextOccurrences()
+    Check.eqStr("the series did not grow", eventId, erecChain(eventId))
+    var first = EventsTestKit.store().findById(eventId)
+    if (first == null) {
+        throw "the first occurrence vanished"
+    }
+    Check.eqStr("the series stopped", "NONE", first.recurrence)
+    // A banned account's events also leave the showcase.
+    var list = OrgsTestKit.anonymous().get("/events?limit=100&includePast=true")
+    Check.isTrue("hidden from the list", !EventsTestKit.listed(list, eventId))
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}

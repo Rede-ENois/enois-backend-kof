@@ -1,0 +1,77 @@
+import app.*
+import kernel.testkit.*
+
+// Port of EventCityFilterTests: meetups by city (no accents, no case), in-person and hybrid only, and an online event
+// does not take a city.
+String ecityBody(title: String, format: String, city: String, state: String, date: String, recurrence: String) {
+    var body = "{\"title\":\"" + title + "\",\"date\":\"" + date + "\",\"time\":\"19:00\",\"format\":\"" + format + "\",\"host\":\"Enois\""
+    if (recurrence.length() > 0) {
+        body = body + ",\"recurrence\":\"" + recurrence + "\""
+    }
+    if (city.length() > 0) {
+        body = body + ",\"city\":\"" + city + "\",\"state\":\"" + state + "\""
+    }
+    return body + "}"
+}
+
+String ecityCreate(who: ProfileCaller, title: String, format: String, city: String, state: String) {
+    var res = who.post("/events", ecityBody(title, format, city, state, EventsTestKit.day(60), ""))
+    Check.status(res, 201)
+    return OrgsTestKit.str(res, "id")
+}
+
+test "filtersInPersonEventsByCityIgnoringAccents" {
+    var host = OrgsTestKit.login("ecity-1")
+    var meetup = ecityCreate(host, "ecity Meetup Floripa", "IN_PERSON", "Florianópolis", "SC")
+    var hybrid = ecityCreate(host, "ecity Hibrido Floripa", "HYBRID", "florianopolis", "sc")
+    var joinville = ecityCreate(host, "ecity Joinville", "IN_PERSON", "Joinville", "SC")
+    var online = ecityCreate(host, "ecity Online", "ONLINE", "", "")
+    var found = OrgsTestKit.anonymous().get("/events?city=FLORIANOPOLIS&state=SC&limit=100")
+    Check.status(found, 200)
+    Check.isTrue("every item carries its city", found.jsonHas("items.0.city"))
+    Check.isTrue("in person", EventsTestKit.listed(found, meetup))
+    Check.isTrue("hybrid with the same city key", EventsTestKit.listed(found, hybrid))
+    Check.isTrue("other city is out", !EventsTestKit.listed(found, joinville))
+    Check.isTrue("online is out", !EventsTestKit.listed(found, online))
+    // A state alone filters by UF.
+    var byState = OrgsTestKit.anonymous().get("/events?state=sc&limit=100")
+    Check.status(byState, 200)
+    Check.isTrue("joinville by state", EventsTestKit.listed(byState, joinville))
+    Check.isTrue("online never matches a place filter", !EventsTestKit.listed(byState, online))
+}
+
+test "refusesCityOnAnOnlineEventAndAnInvalidState" {
+    var host = OrgsTestKit.login("ecity-2")
+    var online = host.post("/events", ecityBody("ecity Online com cidade", "ONLINE", "Curitiba", "PR", EventsTestKit.day(60), ""))
+    Check.apiError(online, 400, "EVENT_CITY_NOT_IN_PERSON")
+    Check.jsonEq(online, "message", "Cidade e estado so valem para evento presencial ou hibrido.")
+    Check.apiError(host.post("/events", ecityBody("ecity UF ruim", "IN_PERSON", "Curitiba", "ZZ", EventsTestKit.day(60), "")), 400, "INVALID_STATE")
+    Check.apiError(OrgsTestKit.anonymous().get("/events?state=ZZ"), 400, "INVALID_STATE")
+    // A city filter needs its state.
+    Check.apiError(OrgsTestKit.anonymous().get("/events?city=Curitiba"), 400, "CITY_STATE_INCOMPLETE")
+}
+
+test "nextOccurrenceOfARecurringMeetupKeepsTheCityAndMatchesBothFilters" {
+    var host = EventsTestKit.host("ecity-3")
+    var yesterday = EventsTestKit.day(-1)
+    var created = host.post("/events", ecityBody("ecity Ritual Goiania", "IN_PERSON", "Goiânia", "GO", yesterday, "WEEKLY"))
+    Check.status(created, 201)
+    var first = OrgsTestKit.str(created, "id")
+    var single = ecityCreate(host, "ecity Avulso Goiania", "IN_PERSON", "Goiania", "GO")
+    EventsTestKit.recurrence().spawnNextOccurrences()
+    var next = EventsTestKit.store().findLatestInSeries(first)
+    if (next == null) {
+        throw "the series has no occurrence"
+    }
+    Check.isTrue("a new occurrence", next.id != first)
+    Check.eqStr("city kept", "Goiânia", next.city as String)
+    Check.eqStr("state kept", "GO", next.state as String)
+    var found = OrgsTestKit.anonymous().get("/events?city=goiania&state=GO&recurring=true&limit=100")
+    Check.status(found, 200)
+    Check.isTrue("the next occurrence matches the city and recurring filters", EventsTestKit.listed(found, next.id))
+    Check.isTrue("a one-off meetup is not a ritual", !EventsTestKit.listed(found, single))
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}

@@ -1,0 +1,50 @@
+import app.*
+import events.*
+import kernel.testkit.*
+import kernel.text.*
+import kernel.time.*
+
+// Port of EventSanitizationWindowTests: the 24h grace before the sanitisation erases the attendance, with a fixed
+// clock. It exists because of a red CI with no cause in the code: the event date is free text read in UTC while the
+// end-to-end test built its scenario in the local zone (UTC-3), so after 21h local the grace had already expired.
+// Here the instant is explicit and the contract is pinned.
+class EventsFixedClock extends EventsClock {
+    Long at
+    public constructor(iso: String) {
+        super()
+        this.at = Time.toMillis(iso)
+    }
+    Long millis() = at
+    String iso() = Time.fromMillis(at)
+}
+
+// An event that ended at 00:01 UTC of the given day.
+EventRecord ewindowEndingAt(date: String) = EventRecord("e1", "Meetup", date, "00:01", "ONLINE", "Dona", Nulls.str(), Nulls.str(), Nulls.str(), Nulls.str(), Nulls.str(), Nulls.str(), "user", "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z", Nulls.str(), Nulls.integer(), "NONE", Nulls.str())
+
+test "keepsTheAttendanceWhileInsideTheGraceWindow" {
+    // Ended 00:01 UTC; at 23:30 UTC of the SAME day it is still inside the 24h grace.
+    var service = EventsTestKit.service(EventsFixedClock("2026-10-15T23:30:00Z"))
+    Check.isTrue("inside the grace", !service.isReadyForSanitization(ewindowEndingAt("2026-10-15")))
+}
+
+test "sanitizesOnceTheGraceWindowHasPassed" {
+    // 01:05 UTC of the next day: the grace expired at 00:01.
+    var service = EventsTestKit.service(EventsFixedClock("2026-10-16T01:05:00Z"))
+    Check.isTrue("past the grace", service.isReadyForSanitization(ewindowEndingAt("2026-10-15")))
+}
+
+test "theBoundaryItselfIsStillProtected" {
+    // At the exact end of the grace nothing is erased: the comparison is "strictly after".
+    var service = EventsTestKit.service(EventsFixedClock("2026-10-16T00:01:00Z"))
+    Check.isTrue("the boundary is protected", !service.isReadyForSanitization(ewindowEndingAt("2026-10-15")))
+}
+
+test "neverSanitizesAnEventWithoutAUsableDate" {
+    var service = EventsTestKit.service(EventsFixedClock("2030-01-01T00:00:00Z"))
+    var undated = EventRecord("e2", "Meetup", "amanhã", "", "ONLINE", "Dona", Nulls.str(), Nulls.str(), Nulls.str(), Nulls.str(), Nulls.str(), Nulls.str(), "user", "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z", Nulls.str(), Nulls.integer(), "NONE", Nulls.str())
+    Check.isTrue("no usable date is never erased", !service.isReadyForSanitization(undated))
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}

@@ -1,0 +1,72 @@
+package app
+
+import events.*
+import identity.*
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import notifications.*
+import profile.*
+
+// Fixtures of the events suites on top of OrgsTestKit (the exact production wiring): event bodies, dates relative to
+// today, hosts with a credential (an account without one is a deleted account to the recurrence job), and the
+// services the jobs expose (the suites drive the recurrence and the sanitisation by hand, no job thread runs).
+class EventsTestKit {
+    static String body(title: String, date: String, time: String, format: String, host: String) = "{\"title\":\"" + title + "\",\"date\":\"" + date + "\",\"time\":\"" + time + "\",\"format\":\"" + format + "\",\"host\":\"" + host + "\"}"
+    // Online 19:00 event hosted by "Énóis".
+    static String simple(title: String, date: String) = EventsTestKit.body(title, date, "19:00", "ONLINE", "Énóis")
+    // A day relative to today (UTC), `yyyy-MM-dd`.
+    static String day(offset: Int) = ZoneDates.plusDays(Time.todayIso(), offset)
+    static String create(who: ProfileCaller, title: String, date: String) {
+        var res = who.post("/events", EventsTestKit.simple(title, date))
+        Check.status(res, 201)
+        return OrgsTestKit.str(res, "id")
+    }
+    // Position of the item `id` in the `items` of a list answer, or -1.
+    static Int indexOf(res: TestResponse, id: String) {
+        var i = 0
+        while (i < res.jsonSize("items")) {
+            if (res.jsonStr("items." + i + ".id") == id) {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+    static Bool listed(res: TestResponse, id: String) = EventsTestKit.indexOf(res, id) >= 0
+    // A verified account with a session and a password credential: an active host.
+    static ProfileCaller host(id: String) {
+        var who = OrgsTestKit.login(id)
+        IdentityStore(OrgsTestKit.db()).saveCredential(id, id + "@test.invalid", "unused-hash", true, Time.nowIso())
+        return who
+    }
+    static ProfileCaller admin(id: String) {
+        var who = OrgsTestKit.login(id)
+        OrgsTestKit.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr(id))
+        return who
+    }
+    static EventsStore store() = EventsStore(OrgsTestKit.db())
+    static SharedServices sharedOrFail() {
+        var booted = OrgsTestKit.app()
+        var shared = OrgsTestKit.orgsKitShared
+        if (shared == null) {
+            throw "the orgs app is not booted"
+        }
+        return shared
+    }
+    static EventsService service(clock: EventsClock) {
+        var shared = EventsTestKit.sharedOrFail()
+        return EventsService(OrgsTestKit.db(), EventsTestKit.store(), shared.sanctionReader, shared.suspiciousText, clock, shared.caches.get("eventsList"))
+    }
+    static EventsRecurrenceService recurrence() {
+        var shared = EventsTestKit.sharedOrFail()
+        var database = OrgsTestKit.db()
+        var notifications = Notifications(database, NotificationsStore(database), NotificationPlaces(NotificationPlaceReader(database)))
+        return EventsRecurrenceService(EventsTestKit.store(), notifications, IdentityStore(database), shared.sanctionReader, shared.suspiciousText, EventsClock(), true)
+    }
+    static setEventDate(eventId: String, date: String, time: String) {
+        OrgsTestKit.db().execute("update events set date = ?, time = ? where id = ?", DbParams().bindStr(date).bindStr(time).bindStr(eventId))
+    }
+    static Int attendeeRows(eventId: String) = EventsTestKit.store().countAttendees(eventId)
+}
