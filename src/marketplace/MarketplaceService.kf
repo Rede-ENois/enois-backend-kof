@@ -1,0 +1,383 @@
+package marketplace
+
+import coin.*
+import kernel.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.log.*
+import kernel.time.*
+
+// The item marketplace: v1 sells a gallery theme and any content item. Everything goes through ESCROW: the sparks
+// leave the buyer and stay retained until the decision (7 days): confirming releases them to the seller (minus
+// 10%), a refund returns 100%. A package that fails validation on the buyer side is a refund, not a loss.
+class MarketplaceService {
+    Db database
+    MarketplaceStore store
+    CoinService coins
+    Log log = Log("marketplace")
+    public constructor(database: Db, store: MarketplaceStore, coins: CoinService) {
+        this.database = database
+        this.store = store
+        this.coins = coins
+    }
+    // Price floor of the marketplace: 50 sparks.
+    static Long minPrice() = CoinService.fais(50L)
+    static Long decisionWindowMs() = 7L * 24L * 3600000L
+    static String escrowRef(p: MarketplacePurchase) = "mcmp:" + p.id()
+    static String parseKind(raw: String?) {
+        if (raw == null) {
+            return "THEME"
+        }
+        var kind = raw.trim().toUpperCase()
+        if (kind.length() == 0) {
+            return "THEME"
+        }
+        if (!MarketplaceKinds.all().contains(kind)) {
+            throw Errors.api(400, "INVALID_ITEM_KIND", "Tipo de item inválido.")
+        }
+        return kind
+    }
+    static Bool hasText(s: String?) {
+        if (s == null) {
+            return false
+        }
+        return s.trim().length() > 0
+    }
+    static String? trimmed(s: String?) {
+        if (s == null) {
+            return null
+        }
+        return s.trim()
+    }
+    MarketplaceListing createListing(sellerId: String, kind: String, itemId: String, title: String?, description: String?, price: Long, now: String) {
+        if (!MarketplaceService.hasText(itemId)) {
+            throw Errors.api(400, "ITEM_REQUIRED", "O item à venda é obrigatório.")
+        }
+        if (title == null) {
+            throw Errors.api(400, "TITLE_REQUIRED", "O título precisa de pelo menos 3 caracteres.")
+        }
+        if (title.trim().length() < 3) {
+            throw Errors.api(400, "TITLE_REQUIRED", "O título precisa de pelo menos 3 caracteres.")
+        }
+        if (price <= 0L) {
+            throw Errors.api(400, "INVALID_PRICE", "O preço precisa ser positivo.")
+        }
+        var listing = MarketplaceListing(Ids.prefixed("mkt_"), sellerId, kind, itemId, title.trim(), MarketplaceService.trimmed(description), price, "ACTIVE", now, now)
+        store.insertListing(listing)
+        return listing
+    }
+    MarketplaceListing publish(sellerId: String, itemKind: String?, itemId: String, title: String?, description: String?, price: Long) {
+        var self = this
+        var box = listOf<MarketplaceListing>()
+        database.transaction(() -> {
+    box.add(self.publishInTx(sellerId, itemKind, itemId, title, description, price))
+})
+        return box.get(0)
+    }
+    MarketplaceListing publishInTx(sellerId: String, itemKind: String?, itemId: String, title: String?, description: String?, price: Long) {
+        var kind = MarketplaceService.parseKind(itemKind)
+        if (price < MarketplaceService.minPrice()) {
+            throw Errors.api(400, "PRICE_TOO_LOW", "O preço mínimo no marketplace é de 50 faíscas.")
+        }
+        var now = EconomyClock.nowIso()
+        if (store.findActiveByItem(kind, itemId) != null) {
+            throw Errors.api(409, "ITEM_ALREADY_LISTED", "Este item já está à venda.")
+        }
+        return this.createListing(sellerId, kind, itemId, title, description, price, now)
+    }
+    // Makes sure a gallery item is listed at the price floor. Idempotent: an active listing is left alone (null).
+    MarketplaceListing? ensureListed(sellerId: String, itemKind: String, itemId: String, title: String, description: String?, price: Long) {
+        var self = this
+        var box = listOf<MarketplaceListing>()
+        database.transaction(() -> {
+    var kind = MarketplaceService.parseKind(itemKind)
+    if (self.store.findActiveByItem(kind, itemId) == null) {
+        box.add(self.publishInTx(sellerId, itemKind, itemId, title, description, price))
+    }
+})
+        if (box.size() == 0) {
+            return null
+        }
+        return box.get(0)
+    }
+    // Publishes a CONTENT item (template, banner, page, post, blog or service); a theme goes through the gallery.
+    MarketplaceListing publishItem(sellerId: String, itemKind: String?, title: String?, description: String?, content: String?, price: Long) {
+        var self = this
+        var box = listOf<MarketplaceListing>()
+        database.transaction(() -> {
+    box.add(self.publishItemInTx(sellerId, itemKind, title, description, content, price))
+})
+        return box.get(0)
+    }
+    MarketplaceListing publishItemInTx(sellerId: String, itemKind: String?, title: String?, description: String?, content: String?, price: Long) {
+        var kind = MarketplaceService.parseKind(itemKind)
+        if (kind == "THEME") {
+            throw Errors.api(400, "USE_THEME_FLOW", "Para vender um tema, use a Aparência (o pacote precisa da galeria).")
+        }
+        if (title == null) {
+            throw Errors.api(400, "TITLE_REQUIRED", "O título precisa de pelo menos 3 caracteres.")
+        }
+        if (title.trim().length() < 3) {
+            throw Errors.api(400, "TITLE_REQUIRED", "O título precisa de pelo menos 3 caracteres.")
+        }
+        if (kind != "SERVICE") {
+            if (!MarketplaceService.hasText(content)) {
+                throw Errors.api(400, "CONTENT_REQUIRED", "Cole o conteúdo que o comprador vai receber.")
+            }
+        }
+        var now = EconomyClock.nowIso()
+        var item = MarketplaceItem(Ids.prefixed("mitem_"), sellerId, kind, title.trim(), MarketplaceService.trimmed(description), content, now)
+        store.insertItem(item)
+        return this.publishInTx(sellerId, kind, item.id(), title, description, price)
+    }
+    // The bought content: only the buyer opens it.
+    MarketplacePurchased contentForPurchase(purchaseId: String, buyerId: String) {
+        var purchase = this.purchase(purchaseId)
+        if (purchase.buyerId() != buyerId) {
+            throw Errors.api(403, "NOT_THE_BUYER", "Só quem comprou abre este conteúdo.")
+        }
+        if (purchase.state() == "REFUNDED") {
+            throw Errors.api(403, "PURCHASE_REFUNDED", "O acesso foi encerrado após o reembolso.")
+        }
+        var listing = store.findListing(purchase.listingId())
+        if (listing == null) {
+            throw Errors.api(404, "LISTING_NOT_FOUND", "Listagem não encontrada.")
+        }
+        if (listing.itemKind() == "THEME") {
+            // A theme installs from the gallery; the front looks the package up by itemId.
+            return MarketplacePurchased(listing.itemKind(), listing.title(), listing.itemId(), null)
+        }
+        var item = store.findItem(listing.itemId())
+        if (item == null) {
+            throw Errors.api(404, "ITEM_NOT_FOUND", "Conteúdo não encontrado.")
+        }
+        return MarketplacePurchased(listing.itemKind(), item.title(), item.id(), item.content())
+    }
+    MarketplacePurchase buy(listingId: String, buyerId: String) {
+        var self = this
+        var box = listOf<MarketplacePurchase>()
+        database.transaction(() -> {
+    box.add(self.buyInTx(listingId, buyerId))
+})
+        return box.get(0)
+    }
+    MarketplacePurchase buyInTx(listingId: String, buyerId: String) {
+        var listing = store.findListingForUpdate(listingId)
+        if (listing == null) {
+            throw Errors.api(404, "LISTING_NOT_FOUND", "Listagem não encontrada.")
+        }
+        // The importer can list the same item again under another listing id.
+        if (store.hasPurchaseForItem(buyerId, listing.itemKind(), listing.itemId())) {
+            throw Errors.api(409, "ITEM_ALREADY_OWNED", "Você já comprou este item. Acesse Minhas compras.")
+        }
+        if (listing.status() != "ACTIVE") {
+            throw Errors.api(409, "LISTING_NOT_ACTIVE", "Esta listagem não está mais aberta.")
+        }
+        if (listing.sellerId() == buyerId) {
+            throw Errors.api(400, "OWN_ITEM", "Não dá para comprar o seu próprio item.")
+        }
+        var now = EconomyClock.nowIso()
+        var purchaseRef = "mkt_" + listing.id().substring(4) + ":" + Ids.uuid().replace("-", "").substring(0, 8)
+        coins.escrowHold(buyerId, listing.price(), purchaseRef, "Compra no marketplace: " + listing.title())
+        var purchase = MarketplacePurchase(Ids.prefixed("mcmp_"), listing.id(), buyerId, listing.sellerId(), listing.price(), "HELD", now, null)
+        store.insertPurchase(purchase)
+        // Themes are digital: the offer stays open for other buyers and for a new purchase after a refund.
+        // Ownership is checked per buyer and item.
+        if (listing.itemKind() != "THEME") {
+            store.setListingStatus(listing.id(), "SOLD", now)
+        }
+        return purchase
+    }
+    // The buyer confirms (installed and satisfied): the seller gets the price minus 10%.
+    MarketplacePurchase confirm(purchaseId: String, buyerId: String) = this.decide(purchaseId, buyerId, true)
+    // The buyer asks for a refund inside the window: 100% back.
+    MarketplacePurchase refund(purchaseId: String, buyerId: String) = this.decide(purchaseId, buyerId, false)
+    MarketplacePurchase decide(purchaseId: String, buyerId: String, release: Bool) {
+        var self = this
+        var box = listOf<MarketplacePurchase>()
+        database.transaction(() -> {
+    box.add(self.decideInTx(purchaseId, buyerId, release))
+})
+        return box.get(0)
+    }
+    MarketplacePurchase decideInTx(purchaseId: String, buyerId: String, release: Bool) {
+        var purchase = this.purchaseForUpdate(purchaseId)
+        if (purchase.buyerId() != buyerId) {
+            if (release) {
+                throw Errors.api(403, "NOT_THE_BUYER", "Só quem comprou confirma a compra.")
+            }
+            throw Errors.api(403, "NOT_THE_BUYER", "Só quem comprou pede o reembolso.")
+        }
+        var now = EconomyClock.nowIso()
+        if (purchase.state() != "HELD") {
+            throw Errors.api(409, "PURCHASE_NOT_HELD", "Esta compra já foi decidida.")
+        }
+        if (release) {
+            coins.escrowRelease(purchase.sellerId(), purchase.price(), MarketplaceService.escrowRef(purchase), "Venda no marketplace (escrow liberado)")
+            this.settle(purchase, "RELEASED", now)
+            return this.purchase(purchaseId)
+        }
+        if (EconomyClock.nowMillis() - Time.toMillis(purchase.createdAt()) > MarketplaceService.decisionWindowMs()) {
+            throw Errors.api(403, "REFUND_WINDOW_CLOSED", "O prazo de reembolso (7 dias) já fechou — a liberação é automática.")
+        }
+        coins.escrowRefund(purchase.buyerId(), purchase.price(), MarketplaceService.escrowRef(purchase), "Reembolso de compra no marketplace")
+        // Old purchases: their listings left the shop when sold.
+        var listing = store.findListingForUpdate(purchase.listingId())
+        if (listing != null) {
+            if (listing.status() == "SOLD") {
+                if (store.findActiveByItem(listing.itemKind(), listing.itemId()) == null) {
+                    store.setListingStatus(listing.id(), "ACTIVE", now)
+                }
+            }
+        }
+        this.settle(purchase, "REFUNDED", now)
+        return this.purchase(purchaseId)
+    }
+    // The state change is a claim on HELD: it never lands twice (the 409 also rolls the money back).
+    settle(purchase: MarketplacePurchase, state: String, now: String) {
+        if (!store.decide(purchase.id(), state, now)) {
+            throw Errors.api(409, "PURCHASE_NOT_HELD", "Esta compra já foi decidida.")
+        }
+    }
+    // Auto-release: HELD purchases with no decision past the window go to the seller (the creator does not wait
+    // forever). Hourly job. Each purchase in its own transaction: one bad purchase never undoes the others.
+    releaseExpired() {
+        var cutoff = Time.fromMillis(EconomyClock.nowMillis() - MarketplaceService.decisionWindowMs())
+        for (var held in store.findHeldBefore(cutoff, 50)) {
+            this.releaseOne(held.id())
+        }
+    }
+    releaseOne(purchaseId: String) {
+        var self = this
+        try {
+            database.transaction(() -> {
+    self.releaseIfExpired(purchaseId)
+})
+        } catch (String e) {
+            // the next round tries again; nothing here may take the worker down
+            log.warn("marketplace_release_failed purchase=" + purchaseId + " error=" + e)
+        }
+    }
+    releaseIfExpired(purchaseId: String) {
+        var current = this.purchaseForUpdate(purchaseId)
+        if (current.state() != "HELD") {
+            return
+        }
+        if (EconomyClock.nowMillis() - Time.toMillis(current.createdAt()) <= MarketplaceService.decisionWindowMs()) {
+            return
+        }
+        coins.escrowRelease(current.sellerId(), current.price(), MarketplaceService.escrowRef(current), "Venda no marketplace (liberação automática)")
+        this.settle(current, "RELEASED", EconomyClock.nowIso())
+    }
+    List<MarketplaceListing> catalog(limit: Int) = this.catalogFiltered(limit, null, null)
+    // Every listing, for the cleanup of the attack leftovers.
+    List<MarketplaceListing> allListings(limit: Int) {
+        var size = limit
+        if (size > 200) {
+            size = 200
+        }
+        return store.findAll(size)
+    }
+    // Removes a listing refunding whatever sits in the escrow. DELETE instead of status REMOVED: the unique index
+    // (item_kind, item_id, status) refuses a second REMOVED row of the same item.
+    Bool sanitizeListing(listing: MarketplaceListing) {
+        if (listing.status() != "ACTIVE") {
+            return false
+        }
+        var now = EconomyClock.nowIso()
+        for (var held in store.findHeldByListing(listing.id())) {
+            this.refundHeld(held.id(), now)
+        }
+        store.deleteListing(listing.id())
+        return true
+    }
+    refundHeld(purchaseId: String, now: String) {
+        var self = this
+        try {
+            database.transaction(() -> {
+    var purchase = self.purchaseForUpdate(purchaseId)
+    if (purchase.state() == "HELD") {
+        self.coins.escrowRefund(purchase.buyerId(), purchase.price(), MarketplaceService.escrowRef(purchase), "Reembolso: listagem removida na limpeza do marketplace")
+        self.settle(purchase, "REFUNDED", now)
+    }
+})
+        } catch (String e) {
+            // if the refund fails the listing still leaves; support handles the value
+            log.warn("marketplace_sanitize_refund_failed purchase=" + purchaseId + " error=" + e)
+        }
+    }
+    // The catalog with search (title/description) and a kind filter; with neither it answers everything. A fixed
+    // window of 200 is filtered in memory and the answer is capped at 100.
+    List<MarketplaceListing> catalogFiltered(limit: Int, q: String?, kind: String?) {
+        var needle = ""
+        if (q != null) {
+            needle = q.trim().toLowerCase()
+        }
+        var wanted = ""
+        if (kind != null) {
+            wanted = kind.trim().toUpperCase()
+        }
+        var size = limit
+        if (size < 1) {
+            size = 1
+        }
+        if (size > 100) {
+            size = 100
+        }
+        var out = listOf<MarketplaceListing>()
+        for (var l in store.findActive(200)) {
+            if (out.size() >= size) {
+                return out
+            }
+            if (wanted.length() > 0 && l.itemKind() != wanted) {
+                continue
+            }
+            if (needle.length() > 0 && !this.matches(l, needle)) {
+                continue
+            }
+            out.add(l)
+        }
+        return out
+    }
+    Bool matches(l: MarketplaceListing, needle: String) {
+        if (l.title().toLowerCase().contains(needle)) {
+            return true
+        }
+        var d = l.description()
+        if (d == null) {
+            return false
+        }
+        return d.toLowerCase().contains(needle)
+    }
+    List<MarketplaceListing> mine(sellerId: String) = store.findBySeller(sellerId)
+    List<MarketplacePurchase> purchasesByBuyer(buyerId: String) = store.findPurchasesByBuyer(buyerId)
+    List<MarketplacePurchaseDetail> purchasesDetailed(buyerId: String) {
+        var out = listOf<MarketplacePurchaseDetail>()
+        for (var p in store.findPurchasesByBuyer(buyerId)) {
+            var listing = store.findListing(p.listingId())
+            if (listing == null) {
+                out.add(MarketplacePurchaseDetail(p, null, null, null))
+            }
+            else {
+                out.add(MarketplacePurchaseDetail(p, listing.itemKind(), listing.title(), listing.itemId()))
+            }
+        }
+        return out
+    }
+    List<MarketplacePurchase> salesBySeller(sellerId: String) = store.findSalesBySeller(sellerId)
+    MarketplacePurchase purchase(id: String) {
+        var p = store.findPurchase(id)
+        if (p == null) {
+            throw Errors.api(404, "PURCHASE_NOT_FOUND", "Compra não encontrada.")
+        }
+        return p
+    }
+    MarketplacePurchase purchaseForUpdate(id: String) {
+        var p = store.findPurchaseForUpdate(id)
+        if (p == null) {
+            throw Errors.api(404, "PURCHASE_NOT_FOUND", "Compra não encontrada.")
+        }
+        return p
+    }
+}

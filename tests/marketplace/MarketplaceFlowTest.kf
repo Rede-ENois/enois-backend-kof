@@ -1,0 +1,121 @@
+import coin.*
+import economy.*
+import kernel.*
+import kernel.db.*
+import kernel.id.*
+import kernel.testkit.*
+import marketplace.*
+import profile.*
+import themes.*
+
+// Ports of MarketplaceFlowTests, MarketplaceGenericItemTests and MarketplaceIdempotencyTests: list, pay into escrow,
+// confirm (90% to the seller, 10% fee to the treasury) or refund (100% back), content items and the replay of a buy.
+TestApp mfApp() = MarketTestKit.app("marketflow")
+
+String mfTheme(who: ProfileCaller, name: String, bg: String) {
+    // strong text dark enough for the contrast rule of the gallery
+    var body = json.encode(ThemeRequest(name, "tema do marketplace", MarketTestKit.themePackage(bg, "#073642"), "light"))
+    var res = who.post("/temas/galeria", body)
+    Check.status(res, 200)
+    return MarketTestKit.str(res, "id")
+}
+
+String mfList(who: ProfileCaller, themeId: String, title: String, price: Long) {
+    var res = who.post("/marketplace", json.encode(MarketplacePublishRequest(null, themeId, title, null, price)))
+    Check.status(res, 200)
+    return MarketTestKit.str(res, "id")
+}
+
+test "list, buy, confirm and refund with escrow" {
+    var app = mfApp()
+    var author = MarketTestKit.login(app, "mkt-author")
+    var buyer = MarketTestKit.login(app, "mkt-buyer")
+    Check.status(author.get("/carteira"), 200)
+    Check.status(buyer.get("/carteira"), 200)
+    var themeId = mfTheme(author, "Tema à Venda", "#fdf6e3")
+    var listingId = mfList(author, themeId, "Tema à Venda", 50000L)
+    // the author does not buy their own item
+    Check.apiError(author.post("/marketplace/" + listingId + "/buy", ""), 400, "OWN_ITEM")
+    var bought = buyer.post("/marketplace/" + listingId + "/buy", "")
+    Check.status(bought, 200)
+    Check.jsonEq(bought, "state", "HELD")
+    var purchaseId = MarketTestKit.str(bought, "purchaseId")
+    Check.eqStr("buyer balance after escrow", "55000", "" + MarketTestKit.balance(buyer))
+    var confirmed = buyer.post("/marketplace/purchases/" + purchaseId + "/confirm", "")
+    Check.status(confirmed, 200)
+    Check.jsonEq(confirmed, "state", "RELEASED")
+    Check.eqStr("author gets 90%", "150000", "" + MarketTestKit.balance(author))
+    // a second cycle for the refund
+    var theme2 = mfTheme(author, "Tema Reembolsável", "#eee8d5")
+    var listing2 = mfList(author, theme2, "Tema Reembolsável", 50000L)
+    var bought2 = buyer.post("/marketplace/" + listing2 + "/buy", "")
+    Check.status(bought2, 200)
+    var purchase2 = MarketTestKit.str(bought2, "purchaseId")
+    var refunded = buyer.post("/marketplace/purchases/" + purchase2 + "/refund", "")
+    Check.status(refunded, 200)
+    Check.jsonEq(refunded, "state", "REFUNDED")
+    Check.eqStr("buyer balance after the refund", "55000", "" + MarketTestKit.balance(buyer))
+}
+
+test "the buyer receives the content and nobody else can open it" {
+    var app = mfApp()
+    var seller = MarketTestKit.login(app, "mkt-template-seller")
+    var buyer = MarketTestKit.login(app, "mkt-template-buyer")
+    var stranger = MarketTestKit.login(app, "mkt-template-stranger")
+    var html = "<section><h1>Olá, {{nome}}</h1></section>"
+    var published = seller.post("/marketplace/items", json.encode(MarketplaceItemRequest("TEMPLATE", "Template de apresentação", "Template de teste", html, CoinService.fais(50L))))
+    Check.status(published, 200)
+    var listingId = MarketTestKit.str(published, "id")
+    MarketTestKit.fund("mkt-template-buyer", CoinService.fais(60L), "test-mkt-buyer")
+    var catalog = MarketTestKit.anonymous(app).get("/marketplace?q=apresenta%C3%A7%C3%A3o")
+    Check.status(catalog, 200)
+    Check.isTrue("search by title finds the listing", catalog.body.contains(listingId))
+    var bought = buyer.post("/marketplace/" + listingId + "/buy", "")
+    Check.status(bought, 200)
+    var purchaseId = MarketTestKit.str(bought, "purchaseId")
+    var opened = buyer.get("/marketplace/purchases/" + purchaseId + "/content")
+    Check.status(opened, 200)
+    Check.jsonEq(opened, "kind", "TEMPLATE")
+    Check.jsonEq(opened, "content", html)
+    Check.apiError(stranger.get("/marketplace/purchases/" + purchaseId + "/content"), 403, "NOT_THE_BUYER")
+    var purchases = buyer.get("/marketplace/compras")
+    Check.status(purchases, 200)
+    Check.isTrue("purchases carry kind and title", purchases.body.contains("TEMPLATE") && purchases.body.contains("Template de apresentação"))
+    Check.status(buyer.post("/marketplace/purchases/" + purchaseId + "/refund", ""), 200)
+    Check.apiError(buyer.get("/marketplace/purchases/" + purchaseId + "/content"), 403, "PURCHASE_REFUNDED")
+}
+
+Long mfPurchasesOf(buyerId: String, listingId: String) = mfApp().db().queryLong("select count(*) from marketplace_purchases where buyer_id = ? and listing_id = ?", DbParams().bindStr(buyerId).bindStr(listingId))
+
+test "repeating a buy replays the original answer without charging again" {
+    var app = mfApp()
+    var buyer = MarketTestKit.login(app, "mkt-idem-replay")
+    MarketTestKit.fund("mkt-idem-replay", CoinService.fais(200L), "mkt-idem-replay-fund")
+    var seller = "seller-idem-replay"
+    var themeId = "theme-idem-replay"
+    var listing = MarketTestKit.stack().market.service.publish(seller, "THEME", themeId, "Tema idempotente", null, MarketplaceService.minPrice())
+    var route = "/marketplace/" + listing.id() + "/buy"
+    var original = buyer.callKey("POST", route, "buy-original", "")
+    Check.status(original, 200)
+    var purchase = MarketTestKit.str(original, "purchaseId")
+    Check.status(buyer.callKey("POST", "/marketplace/purchases/" + purchase + "/refund", "refund-original", ""), 200)
+    var refundedBalance = MarketTestKit.balance(buyer)
+    var replay = buyer.callKey("POST", route, "buy-original", "")
+    Check.status(replay, 200)
+    Check.eqStr("replay is the original body", original.body, replay.body)
+    Check.eqStr("one purchase", "1", "" + mfPurchasesOf("mkt-idem-replay", listing.id()))
+    Check.eqStr("no new charge", "" + refundedBalance, "" + MarketTestKit.balance(buyer))
+    Check.status(buyer.callKey("POST", "/marketplace/purchases/" + purchase + "/refund", "refund-original", ""), 200)
+    Check.eqStr("replayed refund does not pay twice", "" + refundedBalance, "" + MarketTestKit.balance(buyer))
+    Check.status(buyer.callKey("POST", route, "intentional-new-buy", ""), 200)
+    Check.eqStr("a new key buys again", "2", "" + mfPurchasesOf("mkt-idem-replay", listing.id()))
+}
+
+test "purchase decisions require an idempotency key" {
+    var app = mfApp()
+    var buyer = MarketTestKit.login(app, "mkt-idem-required")
+    Check.apiError(buyer.callKey("POST", "/marketplace/missing-listing/buy", "", ""), 400, "IDEMPOTENCY_KEY_REQUIRED")
+    Check.apiError(buyer.callKey("POST", "/marketplace/purchases/missing-purchase/confirm", "", ""), 400, "IDEMPOTENCY_KEY_REQUIRED")
+    Check.apiError(buyer.callKey("POST", "/marketplace/purchases/missing-purchase/refund", "", ""), 400, "IDEMPOTENCY_KEY_REQUIRED")
+    MarketTestKit.finish()
+}
