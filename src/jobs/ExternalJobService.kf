@@ -1,0 +1,298 @@
+package jobs
+
+import kernel.db.*
+import kernel.error.*
+import kernel.html.*
+import kernel.id.*
+import kernel.log.*
+import kernel.text.*
+import kernel.time.*
+import kernel.url.*
+
+// External jobs listed by the COMMUNITY (ExternalJobSubmissionService): a person pastes a job of another site and
+// Énóis only lists it, with the button going to the origin link; the application never passes here. The record
+// lives in the SAME table as the imported ones, marked with `submitted_by` and the platform "Comunidade", so the
+// listing, the platform filter, the search and the canonical-URL dedupe serve both origins.
+class ExternalJobService {
+    Db database
+    ExternalJobStore store
+    JobReputation reputation
+    public constructor(database: Db, store: ExternalJobStore, reputation: JobReputation) {
+        this.database = database
+        this.store = store
+        this.reputation = reputation
+    }
+    ExternalJobRecord submit(userId: String, title: String?, company: String?, location: String?, url: String?, description: String?, salaryMin: String?, salaryMax: String?, salaryPeriod: String?, applyEmail: String?, communityAgreement: Bool, salaryNotInformed: Bool) {
+        var self = this
+        var created = ExternalJobService.blank()
+        database.transaction(() -> {
+    created = self.submitInTransaction(userId, title, company, location, url, description, salaryMin, salaryMax, salaryPeriod, applyEmail, communityAgreement, salaryNotInformed)
+})
+        return created
+    }
+    static ExternalJobRecord blank() = ExternalJobRecord("", "", "", "", null, null, null, null, "", "", "", "FOUND", null, null, null, null, null, null, null, false)
+    ExternalJobRecord submitInTransaction(userId: String, title: String?, company: String?, location: String?, url: String?, description: String?, salaryMin: String?, salaryMax: String?, salaryPeriod: String?, applyEmail: String?, communityAgreement: Bool, salaryNotInformed: Bool) {
+        var cleanTitle = this.required(title, 300, "Informe o titulo da vaga.")
+        var cleanCompany = this.required(company, 200, "Informe a empresa da vaga.")
+        var cleanLocation = this.optional(location, 200)
+        var cleanUrl = this.validateUrl(url)
+        // Same gate as the house job: listing a job (of any origin) is an act of trust.
+        if (reputation.of(userId) <= JobRules.minReputation()) {
+            throw Errors.api(403, "LOW_REPUTATION", "E necessario ter mais de " + JobRules.minReputation() + " de reputacao para cadastrar vagas.")
+        }
+        if (!communityAgreement) {
+            throw Errors.api(400, "COMMUNITY_RULES_NOT_ACCEPTED", "E preciso declarar que a vaga e real e esta de acordo com as regras da comunidade.")
+        }
+        // The global dedupe: the same canonical URL is the same job, or it would enter twice (one imported, one
+        // pasted by hand).
+        var canonicalUrl = UrlCanonical.canonicalize(cleanUrl)
+        if (canonicalUrl != null) {
+            if (store.findByCanonicalUrl(canonicalUrl) != null) {
+                throw Errors.api(409, "JOB_ALREADY_LISTED", "Esta vaga já está listada no Énóis.")
+            }
+        }
+        var suffix = Ids.prefixed("")
+        var now = Time.nowIso()
+        // "Does not inform salary" is a declaration: the range goes away (no ambiguous empty field).
+        var cleanMin = Nulls.str()
+        var cleanMax = Nulls.str()
+        var cleanPeriod = Nulls.str()
+        if (!salaryNotInformed) {
+            cleanMin = this.optional(salaryMin, 50)
+            cleanMax = this.optional(salaryMax, 50)
+            cleanPeriod = this.normalizePeriod(salaryPeriod)
+        }
+        var job = ExternalJobRecord("ext_com_" + suffix, JobRules.communityPlatform(), "community_" + suffix, cleanTitle, cleanCompany, cleanLocation, null, null, cleanUrl, now, now, "FOUND", canonicalUrl, this.cleanApplyEmail(applyEmail), userId, this.optional(description, 5000), cleanMin, cleanMax, cleanPeriod, salaryNotInformed)
+        store.save(job)
+        // The listing is cached for 5 minutes: without clearing it the new job would only show up later.
+        store.clearCache()
+        return job
+    }
+    // The ones I listed (the "My jobs" screen shows them and lets me delete).
+    List<ExternalJobRecord> mine(userId: String) = store.findBySubmitter(userId)
+    remove(userId: String, id: String) {
+        var self = this
+        database.transaction(() -> {
+    var job = self.store.findById(id)
+    if (job == null) {
+        throw Errors.api(404, "EXTERNAL_JOB_NOT_FOUND", "Vaga externa nao encontrada.")
+    }
+    if (job.submittedBy != userId) {
+        throw Errors.api(403, "NOT_OWNER", "Voce nao pode excluir uma vaga que nao cadastrou.")
+    }
+    self.store.delete(id)
+    self.store.clearCache()
+})
+    }
+    String required(value: String?, max: Int, message: String) {
+        if (!Texts.hasText(value)) {
+            throw Errors.api(400, "INVALID_EXTERNAL_JOB", message)
+        }
+        var clean = (JobRules.trimmed(value) as String).replaceAll("\\s+", " ")
+        if (clean.length() > max) {
+            throw Errors.api(400, "INVALID_EXTERNAL_JOB", message)
+        }
+        return clean
+    }
+    String? optional(value: String?, max: Int) {
+        if (!Texts.hasText(value)) {
+            return null
+        }
+        var clean = (JobRules.trimmed(value) as String).replaceAll("\\s+", " ")
+        if (clean.length() > max) {
+            return clean.substring(0, max)
+        }
+        return clean
+    }
+    // The apply e-mail the author gave (optional); `mailto:` is stripped.
+    String? cleanApplyEmail(value: String?) {
+        var clean = this.optional(value, 320)
+        if (clean == null) {
+            return null
+        }
+        var text = clean
+        if (text.toLowerCase().startsWith("mailto:")) {
+            text = text.substring(7)
+        }
+        if (!text.contains("@") || text.startsWith("@") || text.endsWith("@")) {
+            throw Errors.api(400, "INVALID_APPLY_EMAIL", "Informe um e-mail de candidatura valido.")
+        }
+        return text
+    }
+    String? normalizePeriod(value: String?) {
+        var clean = this.optional(value, 20)
+        if (clean == null) {
+            return null
+        }
+        var upper = clean.toUpperCase()
+        if (upper == "HOUR" || upper == "DAY" || upper == "MONTH" || upper == "YEAR") {
+            return upper
+        }
+        return null
+    }
+    // The link is the only thing that holds an external job (there is no detail in Énóis): only HTTPS of a real
+    // site passes. A dangerous scheme (`javascript:`, `data:`) and an address with embedded credentials are
+    // refused, because the "Visit job" button opens it directly.
+    String validateUrl(url: String?) {
+        if (!Texts.hasText(url)) {
+            throw Errors.api(400, "INVALID_EXTERNAL_JOB", "Informe o link da vaga.")
+        }
+        var clean = JobRules.trimmed(url) as String
+        if (clean.length() > 1000) {
+            throw Errors.api(400, "INVALID_EXTERNAL_JOB", "Link da vaga muito longo.")
+        }
+        var parts = UrlCanonical.parse(clean)
+        if (!parts.valid) {
+            throw Errors.api(400, "INVALID_EXTERNAL_JOB", "Link da vaga invalido.")
+        }
+        if (parts.scheme.toLowerCase() != "https" || parts.host.trim().length() == 0 || parts.userInfo.length() > 0) {
+            throw Errors.api(400, "INVALID_EXTERNAL_JOB", "O link da vaga precisa ser um endereco https valido.")
+        }
+        return clean
+    }
+}
+
+// Imports and refreshes the external jobs from the sources (ExternalJobImportService) into `external_jobs`.
+// It loads EVERYTHING the source publishes (not a sample) in BATCHES, each with its own transaction, so neither
+// memory nor one huge transaction blows up. Dedupe by (platform, external id): importing again does not
+// duplicate. A source that fails does not take the others, nor the internal jobs, down.
+class ExternalJobImportService {
+    Db database
+    List<JobImportSource> sources
+    ExternalJobStore store
+    Int limit
+    Log log = Log("jobs.import")
+    public constructor(database: Db, sources: List<JobImportSource>, store: ExternalJobStore, limit: Int) {
+        this.database = database
+        this.sources = sources
+        this.store = store
+        this.limit = limit
+    }
+    static Int batchSize() = 200
+    // How many external jobs were imported or updated in this pass.
+    Int refresh() {
+        var touched = 0
+        for (var source in sources) {
+            if (!source.available()) {
+                continue
+            }
+            var found = this.discover(source)
+            var from = 0
+            while (from < found.size()) {
+                var chunk = listOf<JobSourceItem>()
+                var i = from
+                while (i < found.size() && i < from + ExternalJobImportService.batchSize()) {
+                    chunk.add(found.get(i))
+                    i = i + 1
+                }
+                touched = touched + this.saveBatch(source.name(), chunk)
+                from = from + ExternalJobImportService.batchSize()
+            }
+        }
+        return touched
+    }
+    // The try covers ONLY the outside call (source down); a database error is not swallowed.
+    List<JobSourceItem> discover(source: JobImportSource) {
+        try {
+            return source.discover(limit)
+        } catch (String e) {
+            log.warn("external job source failed: " + source.name())
+            return listOf<JobSourceItem>()
+        }
+    }
+    Int saveBatch(platform: String, chunk: List<JobSourceItem>) {
+        var self = this
+        var saved = 0
+        database.transaction(() -> {
+    saved = self.saveChunk(platform, chunk)
+})
+        return saved
+    }
+    Int saveChunk(platform: String, chunk: List<JobSourceItem>) {
+        var saved = 0
+        for (var external in chunk) {
+            var rawTitle = external.title
+            if (rawTitle == null) {
+                continue
+            }
+            // Some feeds send HTML-escaped text ("hims &#038; hers"): store it as people read it. A job already
+            // imported escaped heals on the next run (same source = upsert below).
+            var title = HtmlEntities.unescape(rawTitle)
+            var company = Nulls.str()
+            var rawCompany = external.company
+            if (rawCompany != null) {
+                company = HtmlEntities.unescape(rawCompany)
+            }
+            var canonicalUrl = UrlCanonical.canonicalize(external.url)
+            // The apply e-mail comes from the description the source itself publishes (null when none).
+            var applyEmail = ExternalJobs.extractApplyEmail(external.description)
+            var now = Time.nowIso()
+            var sameSource = store.findBySource(platform, external.externalId)
+            if (sameSource != null) {
+                // Same source and same id: update the data and the check (upsert).
+                store.save(ExternalJobRecord(sameSource.id, sameSource.platform, sameSource.externalId, title, company, external.location, external.salary, sameSource.currency, external.url, sameSource.importedAt, now, "FOUND", canonicalUrl, applyEmail, sameSource.submittedBy, sameSource.description, sameSource.salaryMin, sameSource.salaryMax, sameSource.salaryPeriod, sameSource.salaryNotInformed))
+                saved = saved + 1
+                continue
+            }
+            // Global dedupe: the SAME job can show up on another platform (same canonical URL). Then no duplicate
+            // is created and the original provenance is not overwritten.
+            if (canonicalUrl != null) {
+                var original = store.findByCanonicalUrl(canonicalUrl)
+                if (original != null) {
+                    // A job listed by the COMMUNITY: the author's record is the source of truth, the import does not
+                    // rewrite the title/company nor take over its provenance.
+                    if (original.submittedBy != null) {
+                        if ((original.submittedBy as String).trim().length() > 0) {
+                            continue
+                        }
+                    }
+                    store.save(ExternalJobRecord(original.id, original.platform, original.externalId, original.title, original.company, original.location, original.salary, original.currency, original.url, original.importedAt, now, original.status, original.canonicalUrl, original.applyEmail, original.submittedBy, original.description, original.salaryMin, original.salaryMax, original.salaryPeriod, original.salaryNotInformed))
+                    saved = saved + 1
+                    continue
+                }
+            }
+            store.save(ExternalJobRecord("ext_" + platform + "_" + external.externalId, platform, external.externalId, title, company, external.location, external.salary, null, external.url, now, now, "FOUND", canonicalUrl, applyEmail, null, null, null, null, null, false))
+            saved = saved + 1
+        }
+        return saved
+    }
+}
+
+// Rules of the external job record (ExternalJob).
+class ExternalJobs {
+    // The first apply e-mail the ad description publishes (null when none). The description comes as HTML: tags
+    // go before the search, or an address broken by markup would slip by. An automatic address (noreply) and an
+    // example one are not an application mailbox and only dirty the button.
+    static String? extractApplyEmail(description: String?) {
+        if (description == null) {
+            return null
+        }
+        if (description.trim().length() == 0) {
+            return null
+        }
+        var text = description.replaceAll("<[^>]+>", " ")
+        var found = ExternalJobs.firstEmail(text)
+        if (found.length() == 0) {
+            return null
+        }
+        return found
+    }
+    // The first acceptable address, lower-cased and capped at 320 ("" when none).
+    static String firstEmail(text: String) {
+        var matches = Regexes.findAll("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", text)
+        for (var m in matches) {
+            var candidate = m.text.toLowerCase()
+            // An address that keeps going into a path (`banner@empresa.com/logo.png`) is an asset, not a mailbox.
+            var after = m.end
+            var pathAfter = after < text.length() && text.substring(after, after + 1) == "/"
+            if (pathAfter || candidate.startsWith("noreply@") || candidate.startsWith("no-reply@") || candidate.contains("@example.")) {
+                continue
+            }
+            if (candidate.length() > 320) {
+                return candidate.substring(0, 320)
+            }
+            return candidate
+        }
+        return ""
+    }
+}

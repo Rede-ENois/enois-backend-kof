@@ -1,0 +1,358 @@
+package jobs
+
+import kernel.db.*
+import kernel.search.*
+import kernel.text.*
+import kernel.time.*
+
+// SQL over jobs, job_skills, job_application_fields, job_applications, job_application_answers, job_saves and
+// job_abandon_penalties (JobPersistenceAdapter + the Spring Data repositories). Same tables and columns as the
+// Java entities.
+class JobStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, title, company, logo, location, type, level, salary, currency, salary_min, salary_max, salary_period, description, community_agreed_at, posted_by, posted_at, updated_at, status, closed_at, company_id"
+    static String marks(n: Int) {
+        var out = ""
+        var i = 0
+        while (i < n) {
+            if (i > 0) {
+                out = out + ", "
+            }
+            out = out + "?"
+            i = i + 1
+        }
+        return out
+    }
+    static DbParams bindAll(params: DbParams, ids: List<String>) {
+        for (var id in ids) {
+            params.bindStr(id)
+        }
+        return params
+    }
+    // ---------------------------------------------------------------- jobs
+    // Rows to records, with the skills and the form fields in two batch queries (never one per row).
+    List<JobRecord> build(rows: List<DbRow>) {
+        var out = listOf<JobRecord>()
+        if (rows.size() == 0) {
+            return out
+        }
+        var ids = listOf<String>()
+        for (var r in rows) {
+            ids.add(r.getStr("id"))
+        }
+        var skills: Map<String, List<String>> = mapOf()
+        for (var s in store.queryList("select job_id, skill from job_skills where job_id in (" + JobStore.marks(ids.size()) + ")", JobStore.bindAll(DbParams(), ids))) {
+            var key = s.getStr("job_id")
+            var list = listOf<String>()
+            var known = skills.get(key)
+            if (known == null) {
+                skills.put(key, list)
+            }
+            else {
+                list = known
+            }
+            list.add(s.getStr("skill"))
+        }
+        var fields: Map<String, List<JobFieldRecord>> = mapOf()
+        for (var f in store.queryList("select job_id, id, label, field_type, required, position from job_application_fields where job_id in (" + JobStore.marks(ids.size()) + ") order by position", JobStore.bindAll(DbParams(), ids))) {
+            var key = f.getStr("job_id")
+            var list = listOf<JobFieldRecord>()
+            var known = fields.get(key)
+            if (known == null) {
+                fields.put(key, list)
+            }
+            else {
+                list = known
+            }
+            list.add(JobFieldRecord(f.getStr("id"), f.getStr("label"), f.getStr("field_type"), f.getBool("required"), f.getInt("position")))
+        }
+        for (var r in rows) {
+            var id = r.getStr("id")
+            var mySkills = skills.get(id)
+            var skillList = listOf<String>()
+            if (mySkills != null) {
+                skillList = mySkills
+            }
+            var myFields = fields.get(id)
+            var fieldList = listOf<JobFieldRecord>()
+            if (myFields != null) {
+                fieldList = myFields
+            }
+            out.add(JobRecord(id, r.getStr("title"), r.getStr("company"), r.getStrOrNull("logo"), r.getStrOrNull("location"), r.getStr("type"), r.getStr("level"), r.getStrOrNull("salary"), r.getStr("currency"), JobRules.fromDb(r.getStrOrNull("salary_min")), JobRules.fromDb(r.getStrOrNull("salary_max")), r.getStrOrNull("salary_period"), r.getStrOrNull("description"), skillList, fieldList, r.getStr("posted_by"), r.getInstantOrNull("community_agreed_at"), r.getInstant("posted_at"), r.getInstant("updated_at"), r.getStr("status"), r.getInstantOrNull("closed_at"), r.getStrOrNull("company_id")))
+        }
+        return out
+    }
+    JobRecord? one(sql: String, params: DbParams) {
+        var rows = this.build(store.queryList(sql, params))
+        if (rows.size() == 0) {
+            return null
+        }
+        return rows.get(0)
+    }
+    JobRecord? findById(id: String) = this.one("select " + JobStore.columns() + " from jobs where id = ?", DbParams().bindStr(id))
+    // Locks the row until the end of the transaction: the serialisation point between applying and closing.
+    JobRecord? findByIdForUpdate(id: String) = this.one("select " + JobStore.columns() + " from jobs where id = ? for update", DbParams().bindStr(id))
+    List<JobRecord> findByIds(ids: List<String>) {
+        if (ids.size() == 0) {
+            return listOf<JobRecord>()
+        }
+        return this.build(store.queryList("select " + JobStore.columns() + " from jobs where id in (" + JobStore.marks(ids.size()) + ")", JobStore.bindAll(DbParams(), ids)))
+    }
+    insert(job: JobRecord) {
+        store.execute("insert into jobs (" + JobStore.columns() + ") values (" + JobStore.marks(20) + ")", JobStore.bindJob(job))
+        this.replaceCollections(job)
+    }
+    static DbParams bindJob(job: JobRecord) = DbParams().bindStr(job.id).bindStr(job.title).bindStr(job.company).bindStrOrNull(job.logo).bindStrOrNull(job.location).bindStr(job.type).bindStr(job.level).bindStrOrNull(job.salary).bindStr(job.currency).bindStrOrNull(JobRules.dbTextOrNull(job.salaryMin)).bindStrOrNull(JobRules.dbTextOrNull(job.salaryMax)).bindStrOrNull(job.salaryPeriod).bindStrOrNull(job.description).bindInstantOrNull(job.communityAgreedAt).bindStr(job.postedBy).bindInstant(job.postedAt).bindInstant(job.updatedAt).bindStr(job.status).bindInstantOrNull(job.closedAt).bindStrOrNull(job.companyId)
+    // JPA `save` of an existing job: every column and both collections are rewritten.
+    update(job: JobRecord) {
+        store.execute("update jobs set title = ?, company = ?, logo = ?, location = ?, type = ?, level = ?, salary = ?, currency = ?, salary_min = ?, salary_max = ?, salary_period = ?, description = ?, community_agreed_at = ?, posted_by = ?, posted_at = ?, updated_at = ?, status = ?, closed_at = ?, company_id = ? where id = ?", DbParams().bindStr(job.title).bindStr(job.company).bindStrOrNull(job.logo).bindStrOrNull(job.location).bindStr(job.type).bindStr(job.level).bindStrOrNull(job.salary).bindStr(job.currency).bindStrOrNull(JobRules.dbTextOrNull(job.salaryMin)).bindStrOrNull(JobRules.dbTextOrNull(job.salaryMax)).bindStrOrNull(job.salaryPeriod).bindStrOrNull(job.description).bindInstantOrNull(job.communityAgreedAt).bindStr(job.postedBy).bindInstant(job.postedAt).bindInstant(job.updatedAt).bindStr(job.status).bindInstantOrNull(job.closedAt).bindStrOrNull(job.companyId).bindStr(job.id))
+        this.replaceCollections(job)
+    }
+    replaceCollections(job: JobRecord) {
+        store.execute("delete from job_skills where job_id = ?", DbParams().bindStr(job.id))
+        for (var skill in job.skills) {
+            store.execute("insert into job_skills (job_id, skill) values (?, ?)", DbParams().bindStr(job.id).bindStr(skill))
+        }
+        store.execute("delete from job_application_fields where job_id = ?", DbParams().bindStr(job.id))
+        for (var f in job.applicationFields) {
+            store.execute("insert into job_application_fields (job_id, id, label, field_type, required, position) values (?, ?, ?, ?, ?, ?)", DbParams().bindStr(job.id).bindStr(f.id).bindStr(f.label).bindStr(f.type).bindBool(f.required).bindInt(f.position))
+        }
+    }
+    // The author closes the selection process: nothing else changes.
+    close(id: String, at: String) {
+        store.execute("update jobs set status = 'CLOSED', closed_at = ? where id = ?", DbParams().bindInstant(at).bindStr(id))
+    }
+    // The application answers, the applications, the saves, the collections and the job.
+    deleteJob(id: String) {
+        store.execute("delete from job_application_answers where application_id in (select id from job_applications where job_id = ?)", DbParams().bindStr(id))
+        store.execute("delete from job_applications where job_id = ?", DbParams().bindStr(id))
+        store.execute("delete from job_saves where job_id = ?", DbParams().bindStr(id))
+        store.execute("delete from job_skills where job_id = ?", DbParams().bindStr(id))
+        store.execute("delete from job_application_fields where job_id = ?", DbParams().bindStr(id))
+        store.execute("delete from jobs where id = ?", DbParams().bindStr(id))
+    }
+    // ---------------------------------------------------------------- the listing
+    // A term matches when it appears in any searchable field of the job (the text on the card). The coalesce
+    // keeps a null field from turning the LIKE unknown (and, inside a NOT, hiding the job by mistake).
+    static String textMatch(raw: String, params: DbParams) {
+        var pattern = "%" + LikePattern.escape(BooleanQuery.normalize(raw)) + "%"
+        var parts = listOf<String>()
+        for (var field in listOf("title", "company", "location", "type", "level")) {
+            parts.add("lower(coalesce(" + field + ", '')) like ? escape '!'")
+            params.bindStr(pattern)
+        }
+        parts.add("exists (select 1 from job_skills sk where sk.job_id = jobs.id and lower(sk.skill) like ? escape '!')")
+        params.bindStr(pattern)
+        return "(" + String.join(" or ", parts) + ")"
+    }
+    static String nodeSql(node: BooleanNode, params: DbParams) {
+        if (node.kind == "MATCH_ALL") {
+            return "1 = 1"
+        }
+        if (node.kind == "TERM" || node.kind == "PHRASE") {
+            return JobStore.textMatch(node.text, params)
+        }
+        if (node.kind == "NOT") {
+            return "not (" + JobStore.nodeSql(node.children.get(0), params) + ")"
+        }
+        var parts = listOf<String>()
+        for (var child in node.children) {
+            parts.add(JobStore.nodeSql(child, params))
+        }
+        var glue = " and "
+        if (node.kind == "OR") {
+            glue = " or "
+        }
+        return "(" + String.join(glue, parts) + ")"
+    }
+    // Every filter given is applied together; the text accepts the boolean syntax of BooleanQuery.
+    List<JobRecord> findAll(query: String?, type: String?, level: String?, location: String?, skills: List<String>, before: String?, limit: Int) {
+        var sql = "select " + JobStore.columns() + " from jobs where 1 = 1"
+        var params = DbParams()
+        if (before != null) {
+            sql = sql + " and posted_at < ?"
+            params.bindInstant(before)
+        }
+        if (Texts.hasText(type)) {
+            sql = sql + " and type = ?"
+            params.bindStr(JobRules.trimmed(type) as String)
+        }
+        if (Texts.hasText(level)) {
+            sql = sql + " and level = ?"
+            params.bindStr(JobRules.trimmed(level) as String)
+        }
+        if (Texts.hasText(location)) {
+            sql = sql + " and location = ?"
+            params.bindStr(JobRules.trimmed(location) as String)
+        }
+        for (var skill in skills) {
+            if (skill.trim().length() > 0) {
+                sql = sql + " and " + JobStore.textMatch(skill.trim(), params)
+            }
+        }
+        var parsed = BooleanQuery.parse(query)
+        if (!parsed.isEmpty()) {
+            sql = sql + " and " + JobStore.nodeSql(parsed.root(), params)
+        }
+        sql = sql + " order by posted_at desc limit ?"
+        return this.build(store.queryList(sql, params.bindInt(limit)))
+    }
+    List<JobRecord> findByPostedBy(userId: String, before: String?, limit: Int) {
+        var sql = "select " + JobStore.columns() + " from jobs where posted_by = ?"
+        var params = DbParams().bindStr(userId)
+        if (before != null) {
+            sql = sql + " and posted_at < ?"
+            params.bindInstant(before)
+        }
+        return this.build(store.queryList(sql + " order by posted_at desc limit ?", params.bindInt(limit)))
+    }
+    // The jobs a person applied to, most recent application first; the cursor keeps jobs posted up to it.
+    List<JobRecord> findAppliedByUser(userId: String, before: String?, limit: Int) {
+        var ids = listOf<String>()
+        for (var r in store.queryList("select job_id from job_applications where user_id = ? order by applied_at desc limit ?", DbParams().bindStr(userId).bindInt(limit))) {
+            ids.add(r.getStr("job_id"))
+        }
+        var out = listOf<JobRecord>()
+        if (ids.size() == 0) {
+            return out
+        }
+        var byId: Map<String, JobRecord> = mapOf()
+        for (var job in this.findByIds(ids)) {
+            byId.put(job.id, job)
+        }
+        for (var id in ids) {
+            var job = byId.get(id)
+            if (job == null) {
+                continue
+            }
+            if (before != null) {
+                if (Time.toMillis(job.postedAt) > Time.toMillis(before)) {
+                    continue
+                }
+            }
+            out.add(job)
+        }
+        return out
+    }
+    // ---------------------------------------------------------------- applications
+    List<JobApplicationRecord> applications(rows: List<DbRow>) {
+        var out = listOf<JobApplicationRecord>()
+        if (rows.size() == 0) {
+            return out
+        }
+        var ids = listOf<String>()
+        for (var r in rows) {
+            ids.add("" + r.getLong("id"))
+        }
+        var answers: Map<String, List<JobAnswerRecord>> = mapOf()
+        for (var a in store.queryList("select application_id, field_id, label, answer_value, position from job_application_answers where application_id in (" + JobStore.marks(ids.size()) + ") order by position", JobStore.bindAll(DbParams(), ids))) {
+            var key = "" + a.getLong("application_id")
+            var list = listOf<JobAnswerRecord>()
+            var known = answers.get(key)
+            if (known == null) {
+                answers.put(key, list)
+            }
+            else {
+                list = known
+            }
+            list.add(JobAnswerRecord(a.getStr("field_id"), a.getStr("label"), a.getStr("answer_value"), a.getInt("position")))
+        }
+        for (var r in rows) {
+            var id = "" + r.getLong("id")
+            var mine = answers.get(id)
+            var list = listOf<JobAnswerRecord>()
+            if (mine != null) {
+                list = mine
+            }
+            out.add(JobApplicationRecord(id, r.getStr("job_id"), r.getStr("user_id"), r.getStrOrNull("message"), r.getStrOrNull("candidate_snapshot"), r.getInstant("applied_at"), list, r.getStr("status"), r.getStrOrNull("feedback"), r.getInstantOrNull("reviewed_at")))
+        }
+        return out
+    }
+    static String applicationColumns() = "id, job_id, user_id, status, applied_at, message, candidate_snapshot, feedback, reviewed_at"
+    // Writes the application with its answers and answers the generated id.
+    String saveApplication(a: JobApplicationRecord) {
+        var id = store.insertReturningId("insert into job_applications (job_id, user_id, status, applied_at, message, candidate_snapshot, feedback, reviewed_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(a.jobId).bindStr(a.userId).bindStr(a.status).bindInstant(a.appliedAt).bindStrOrNull(a.message).bindStrOrNull(a.candidateSnapshot).bindStrOrNull(a.feedback).bindInstantOrNull(a.reviewedAt))
+        for (var answer in a.answers) {
+            store.execute("insert into job_application_answers (application_id, field_id, label, answer_value, position) values (?, ?, ?, ?, ?)", DbParams().bindLong(id).bindStr(answer.fieldId).bindStr(answer.label).bindStr(answer.value).bindInt(answer.position))
+        }
+        return "" + id
+    }
+    List<JobApplicationRecord> findApplicationsByJob(jobId: String, limit: Int) = this.applications(store.queryList("select " + JobStore.applicationColumns() + " from job_applications where job_id = ? order by applied_at desc limit ?", DbParams().bindStr(jobId).bindInt(limit)))
+    List<JobApplicationRecord> findApplicationsByUser(userId: String, limit: Int) = this.applications(store.queryList("select " + JobStore.applicationColumns() + " from job_applications where user_id = ? order by applied_at desc limit ?", DbParams().bindStr(userId).bindInt(limit)))
+    // An id that is not numeric never existed: the contract is a 404, not an internal error.
+    JobApplicationRecord? findApplicationById(applicationId: String) {
+        if (!applicationId.matches("\\d{1,18}")) {
+            return null
+        }
+        var rows = this.applications(store.queryList("select " + JobStore.applicationColumns() + " from job_applications where id = ?", DbParams().bindLong(Long.parseLong(applicationId))))
+        if (rows.size() == 0) {
+            return null
+        }
+        return rows.get(0)
+    }
+    updateApplicationStatus(applicationId: String, status: String, feedback: String?, reviewedAt: String) {
+        store.execute("update job_applications set status = ?, feedback = ?, reviewed_at = ? where id = ?", DbParams().bindStr(status).bindStrOrNull(feedback).bindInstant(reviewedAt).bindLong(Long.parseLong(applicationId)))
+    }
+    Bool hasApplied(jobId: String, userId: String) = store.queryLong("select count(*) from job_applications where job_id = ? and user_id = ?", DbParams().bindStr(jobId).bindStr(userId)) > 0L
+    Int countApplications(jobId: String) = store.queryLong("select count(*) from job_applications where job_id = ?", DbParams().bindStr(jobId)) as Int
+    Int countUnanswered(jobId: String) = store.queryLong("select count(*) from job_applications where job_id = ? and status = 'APPLIED'", DbParams().bindStr(jobId)) as Int
+    // Ids the user applied to, among these jobs (one query).
+    java.util.HashSet<String> appliedAmong(userId: String, jobIds: List<String>) {
+        var out = new java.util.HashSet<String>()
+        if (jobIds.size() == 0) {
+            return out
+        }
+        for (var r in store.queryList("select job_id from job_applications where user_id = ? and job_id in (" + JobStore.marks(jobIds.size()) + ")", JobStore.bindAll(DbParams().bindStr(userId), jobIds))) {
+            out.add(r.getStr("job_id"))
+        }
+        return out
+    }
+    Map<String,Int> countApplicationsByJobs(jobIds: List<String>) {
+        var out: Map<String, Int> = mapOf()
+        if (jobIds.size() == 0) {
+            return out
+        }
+        for (var r in store.queryList("select job_id, count(*) as total from job_applications where job_id in (" + JobStore.marks(jobIds.size()) + ") group by job_id", JobStore.bindAll(DbParams(), jobIds))) {
+            out.put(r.getStr("job_id"), r.getInt("total"))
+        }
+        return out
+    }
+    // ---------------------------------------------------------------- saves
+    List<String> savedJobIds(userId: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select job_id from job_saves where user_id = ? order by saved_at desc, id desc", DbParams().bindStr(userId))) {
+            out.add(r.getStr("job_id"))
+        }
+        return out
+    }
+    java.util.HashSet<String> savedAmong(userId: String, jobIds: List<String>) {
+        var out = new java.util.HashSet<String>()
+        if (jobIds.size() == 0) {
+            return out
+        }
+        for (var r in store.queryList("select job_id from job_saves where user_id = ? and job_id in (" + JobStore.marks(jobIds.size()) + ")", JobStore.bindAll(DbParams().bindStr(userId), jobIds))) {
+            out.add(r.getStr("job_id"))
+        }
+        return out
+    }
+    Bool hasBookmarked(jobId: String, userId: String) = store.queryLong("select count(*) from job_saves where job_id = ? and user_id = ?", DbParams().bindStr(jobId).bindStr(userId)) > 0L
+    saveBookmark(jobId: String, userId: String, now: String) {
+        store.execute("insert into job_saves (job_id, user_id, saved_at) values (?, ?, ?)", DbParams().bindStr(jobId).bindStr(userId).bindInstant(now))
+    }
+    removeBookmark(jobId: String, userId: String) {
+        store.execute("delete from job_saves where job_id = ? and user_id = ?", DbParams().bindStr(jobId).bindStr(userId))
+    }
+    // ---------------------------------------------------------------- abandon penalties
+    // One row per deleted job: the key makes a repeated record count once. True when the row is new.
+    Bool recordPenalty(jobId: String, userId: String, unanswered: Int, now: String) {
+        if (store.queryLong("select count(*) from job_abandon_penalties where job_id = ?", DbParams().bindStr(jobId)) > 0L) {
+            return false
+        }
+        store.execute("insert into job_abandon_penalties (job_id, user_id, unanswered, recorded_at) values (?, ?, ?, ?)", DbParams().bindStr(jobId).bindStr(userId).bindInt(unanswered).bindInstant(now))
+        return true
+    }
+    Int penaltiesOf(userId: String) = store.queryLong("select count(*) from job_abandon_penalties where user_id = ?", DbParams().bindStr(userId)) as Int
+}

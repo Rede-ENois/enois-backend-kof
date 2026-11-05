@@ -265,6 +265,31 @@ class Db {
         // Committed and released: hooks may use the database on their own connection.
         pending.run(log)
     }
+    // Propagation REQUIRES_NEW: the body runs in its own transaction on a second connection while the
+    // caller's transaction stays suspended, so a refusal inside the body rolls back only the body and the
+    // caller may catch it and carry on (the job application delivery uses it for the direct message).
+    // Outside a transaction it is a plain `transaction`. Rows the outer transaction wrote are not visible
+    // to the body and the body must not wait on rows the outer one holds.
+    requiresNew(body: () -> void) {
+        var outer = current.get()
+        if (outer == null) {
+            this.transaction(body)
+            return
+        }
+        current.remove()
+        var failed = false
+        var failure = ""
+        try {
+            this.transaction(body)
+        } catch (String e) {
+            failed = true
+            failure = e
+        }
+        current.set(outer)
+        if (failed) {
+            throw failure
+        }
+    }
     // @TransactionalEventListener(AFTER_COMMIT): inside a transaction the callback runs only after
     // the outermost commit (never on rollback, in registration order, on the committing thread,
     // after the connection is back in the pool); outside a transaction it runs immediately.

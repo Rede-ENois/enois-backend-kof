@@ -1,0 +1,335 @@
+package jobs
+
+import kernel.config.*
+import kernel.error.*
+import kernel.testkit.*
+import kernel.time.*
+
+// A source of external jobs (JobImportSource). The jobs module knows no vendor: each platform extends this and
+// is wired by configuration. Import only through official APIs or public feeds, never by scraping a SPA nor the
+// vendor's private API.
+class JobImportSource {
+    public constructor() {}
+    // Display name of the platform ("JobRadar").
+    String name() = ""
+    // Whether the source is really configured. Without it, it stays unavailable.
+    Bool available() = false
+    // Public jobs of the source; `limit` is a ceiling per call (0 or less: all of them).
+    List<JobSourceItem> discover(limit: Int) = listOf<JobSourceItem>()
+}
+
+// JobRadar as a source of LISTING + REDIRECT (no credential, no JS scraping): the public sitemap it publishes
+// for indexers (`/sitemap-vagas.xml`, allowed by its robots.txt). Each item becomes an external job with the
+// title derived from the slug and the original URL; description, company and salary stay null (nothing is
+// invented): the person checks and applies on JobRadar.
+class JobRadarJobSource extends JobImportSource {
+    String sitemapUrl
+    String userAgent
+    Bool enabled
+    JobSourceTransport transport
+    public constructor(sitemapUrl: String, userAgent: String, enabled: Bool, transport: JobSourceTransport) {
+        this.sitemapUrl = sitemapUrl
+        this.userAgent = userAgent
+        this.enabled = enabled
+        this.transport = transport
+    }
+    static JobRadarJobSource fromConfig(cfg: Config, transport: JobSourceTransport) = JobRadarJobSource(cfg.getStr("REDE_JOBS_IMPORT_JOBRADAR_SITEMAP_URL", "https://jobradar.com.br/sitemap-vagas.xml"), cfg.getStr("REDE_JOBS_IMPORT_JOBRADAR_USER_AGENT", "EnóisBot/1.0 (+https://enois.ia.br/developers)"), cfg.getBool("REDE_JOBS_IMPORT_JOBRADAR_ENABLED", true), transport)
+    String name() = "JobRadar"
+    // Turned on by configuration (the sitemap is public). Tests switch it off.
+    Bool available() = enabled
+    List<JobSourceItem> discover(limit: Int) {
+        var capped = limit
+        if (limit <= 0) {
+            capped = 2147483647
+        }
+        var body = ""
+        try {
+            body = transport.fetch(sitemapUrl, userAgent, "application/xml", 20000)
+        } catch (String e) {
+            throw Errors.api(502, "IMPORT_SOURCE_ERROR", "Falha ao consultar o JobRadar.")
+        }
+        return this.parse(body, capped)
+    }
+    // The jobs of the sitemap XML: title (from the slug), URL and id. Nothing is invented.
+    List<JobSourceItem> parse(sitemapXml: String, limit: Int) {
+        var jobs = listOf<JobSourceItem>()
+        var from = 0
+        while (jobs.size() < limit) {
+            var open = sitemapXml.indexOf("<loc>", from)
+            if (open < 0) {
+                break
+            }
+            var close = sitemapXml.indexOf("</loc>", open)
+            if (close < 0) {
+                break
+            }
+            from = close + 6
+            var url = sitemapXml.substring(open + 5, close).trim()
+            if (url.length() == 0 || url.matches(".*\\s.*") || url.contains("<")) {
+                continue
+            }
+            var at = url.indexOf("/vaga/")
+            if (at < 0) {
+                continue
+            }
+            var rest = url.substring(at + 6)
+            var dash = rest.lastIndexOf("-")
+            if (dash < 1) {
+                continue
+            }
+            var id = rest.substring(dash + 1)
+            if (!id.matches("\\d+")) {
+                continue
+            }
+            jobs.add(JobSourceItem(id, JobRadarJobSource.humanize(rest.substring(0, dash)), null, null, null, null, null, url, url, "JobRadar", null))
+        }
+        return jobs
+    }
+    static Bool lowercaseWord(word: String) = "|de|da|do|das|dos|e|em|para|com|a|o|na|no|".contains("|" + word + "|")
+    static Bool noiseWord(word: String) = word == "edtech" || word == "vaga" || word == "vagas"
+    // The slug has no reliable separator between title and company, and neither is recoverable safely, so those
+    // fields stay null; the TITLE is cleaned: "-a-"/"-o-" (inclusive) becomes "(a)"/"(o)" glued to the previous
+    // word, noise (edtech/vaga) and adjacent duplicates go, and it is capitalised keeping connectives lower.
+    static String humanize(slug: String) {
+        var out = listOf<String>()
+        for (var raw in slug.split("-")) {
+            var word = raw.trim()
+            if (word.length() == 0 || JobRadarJobSource.noiseWord(word.toLowerCase())) {
+                continue
+            }
+            if (out.size() > 0) {
+                var previous = out.get(out.size() - 1)
+                if (!previous.endsWith(")") && (word.toLowerCase() == "a" || word.toLowerCase() == "o")) {
+                    out.set(out.size() - 1, previous + " (" + word.toLowerCase() + ")")
+                    continue
+                }
+                if (previous.split(" ")[0].toLowerCase() == word.toLowerCase()) {
+                    continue
+                }
+            }
+            out.add(word)
+        }
+        if (out.size() == 0) {
+            return slug
+        }
+        var sb = ""
+        var i = 0
+        while (i < out.size()) {
+            var word = out.get(i)
+            if (i == 0 || !JobRadarJobSource.lowercaseWord(word.toLowerCase())) {
+                word = word.substring(0, 1).toUpperCase() + word.substring(1)
+            }
+            if (sb.length() > 0) {
+                sb = sb + " "
+            }
+            sb = sb + word
+            i = i + 1
+        }
+        return sb
+    }
+}
+
+// How to read the JSON of a public API: where the list is and each field (OpenJobApiSource.Spec).
+record JobApiSpec(String name, String url, Bool rootIsArray, String? rootPath, String? idPath, String? titlePath, String? companyPath, String? locationPath, String? salaryTextPath, String? salaryMinPath, String? salaryMaxPath, String? currencyPath, String? typePath, String? urlPath, String? applyPath, String? publishedAtPath, Bool publishedAtEpochSeconds, String? dateFormat, String attribution, String? descriptionPath)
+
+// A source by PUBLIC API (no key), configured by a spec: aggregators that allow listing and redirecting to the
+// original job (Remotive, Jobicy, RemoteOK, Himalayas). What the source does not give stays null. The credit and
+// the link back are the platform name ("Vaga externa · {platform}") plus the job URL, as the sources ask.
+class OpenJobApiSource extends JobImportSource {
+    JobApiSpec spec
+    JobSourceTransport transport
+    public constructor(spec: JobApiSpec, transport: JobSourceTransport) {
+        this.spec = spec
+        this.transport = transport
+    }
+    String name() = spec.name
+    Bool available() = true
+    // The four sources of the Java OpenJobApisConfig.
+    static List<JobImportSource> defaults(transport: JobSourceTransport) {
+        var out = listOf<JobImportSource>()
+        out.add(OpenJobApiSource(JobApiSpec("Remotive", "https://remotive.com/api/remote-jobs?limit=200", false, "jobs", "id", "title", "company_name", "candidate_required_location", "salary", null, null, null, "job_type", "url", null, "publication_date", false, null, "Remotive (https://remotive.com) — credito obrigatorio.", "description"), transport))
+        out.add(OpenJobApiSource(JobApiSpec("Jobicy", "https://jobicy.com/api/v2/remote-jobs?count=50", false, "jobs", "id", "jobTitle", "companyName", "jobGeo", null, "annualSalaryMin", "annualSalaryMax", "salaryCurrency", "jobType[0]", "url", null, "pubDate", false, null, "Jobicy (https://jobicy.com) — credito e link de origem obrigatorios.", "jobDescription"), transport))
+        out.add(OpenJobApiSource(JobApiSpec("RemoteOK", "https://remoteok.com/api", true, null, "id", "position", "company", "location", null, "salary_min", "salary_max", null, null, "url", "apply_url", "date", false, null, "RemoteOK (https://remoteok.com) — credito obrigatorio.", "description"), transport))
+        out.add(OpenJobApiSource(JobApiSpec("Himalayas", "https://himalayas.app/jobs/api?limit=100", false, "jobs", "applicationLink", "title", "companyName", "locationRestrictions[0]", null, "minSalary", "maxSalary", "salaryCurrency", null, "applicationLink", "applicationLink", "pubDate", true, null, "Himalayas (https://himalayas.app).", "description"), transport))
+        return out
+    }
+    // The elements of a JSON array text, split in ONE pass (reading item i with a path would rescan the list).
+    static List<String> items(arrayText: String) {
+        var out = listOf<String>()
+        if (!arrayText.startsWith("[")) {
+            return out
+        }
+        var pos = 1
+        while (true) {
+            pos = JsonPath.skipWs(arrayText, pos)
+            if (pos >= arrayText.length()) {
+                break
+            }
+            var c = arrayText.substring(pos, pos + 1)
+            if (c == "]") {
+                break
+            }
+            if (c == ",") {
+                pos = pos + 1
+                continue
+            }
+            var end = JsonPath.valueEnd(arrayText, pos)
+            out.add(arrayText.substring(pos, end))
+            pos = end
+        }
+        return out
+    }
+    List<JobSourceItem> discover(limit: Int) {
+        var text = this.fetch()
+        var listText = ""
+        var failed = false
+        try {
+            var root = spec.rootPath
+            var raw = text.trim()
+            if (!spec.rootIsArray && root != null) {
+                var found = JsonPath.raw(raw, root)
+                if (found != null) {
+                    raw = found
+                }
+                else {
+                    raw = ""
+                }
+            }
+            listText = raw
+        } catch (String e) {
+            failed = true
+        }
+        var jobs = listOf<JobSourceItem>()
+        if (failed) {
+            throw Errors.api(502, "IMPORT_SOURCE_ERROR", "Falha ao consultar a fonte externa.")
+        }
+        for (var node in OpenJobApiSource.items(listText)) {
+            if (limit > 0 && jobs.size() >= limit) {
+                break
+            }
+            var id = this.value(node, spec.idPath)
+            var title = this.value(node, spec.titlePath)
+            var url = this.value(node, spec.urlPath)
+            // Without a title or a link there is nothing to show or redirect to (some APIs mix notices in).
+            if (title == null) {
+                continue
+            }
+            if (url == null) {
+                continue
+            }
+            if (spec.rootIsArray && id == null) {
+                continue
+            }
+            var apply = this.value(node, spec.applyPath)
+            var externalId = ""
+            if (id != null) {
+                externalId = id
+            }
+            else {
+                externalId = Integer.toHexString(url.hashCode())
+            }
+            var applyUrl = url
+            if (apply != null) {
+                applyUrl = apply
+            }
+            jobs.add(JobSourceItem(externalId, title, this.value(node, spec.companyPath), this.value(node, spec.locationPath), this.value(node, spec.descriptionPath), this.salary(node), this.value(node, spec.typePath), url, applyUrl, spec.name, this.publishedAt(node)))
+        }
+        return jobs
+    }
+    String fetch() {
+        try {
+            return transport.fetch(spec.url, "EnóisBot/1.0 (+https://enois.ia.br/developers)", "application/json", 25000)
+        } catch (String e) {
+            throw Errors.api(502, "IMPORT_SOURCE_ERROR", "Falha ao consultar a fonte externa.")
+        }
+    }
+    // A text range, or built from min/max + currency. No data: null (nothing is invented).
+    String? salary(node: String) {
+        var text = this.value(node, spec.salaryTextPath)
+        if (text != null) {
+            return text
+        }
+        // Some aggregators send "0" when they do not give the range (RemoteOK): that is absent.
+        var min = OpenJobApiSource.blankIfZero(this.value(node, spec.salaryMinPath))
+        var max = OpenJobApiSource.blankIfZero(this.value(node, spec.salaryMaxPath))
+        if (min == null && max == null) {
+            return null
+        }
+        var currency = this.value(node, spec.currencyPath)
+        var prefix = ""
+        if (currency != null) {
+            prefix = currency + " "
+        }
+        if (min != null && max != null) {
+            return prefix + min + " - " + max
+        }
+        if (min != null) {
+            return prefix + min
+        }
+        return prefix + (max as String)
+    }
+    static String? blankIfZero(value: String?) {
+        if (value == null) {
+            return null
+        }
+        if (value == "0" || value == "0.0") {
+            return null
+        }
+        return value
+    }
+    String? publishedAt(node: String) {
+        var raw = this.value(node, spec.publishedAtPath)
+        if (raw == null) {
+            return null
+        }
+        var iso = this.isoOf(raw.trim())
+        if (iso.length() == 0) {
+            return null
+        }
+        return iso
+    }
+    // The ISO instant of the date text, "" when it does not parse.
+    String isoOf(text: String) {
+        try {
+            if (spec.publishedAtEpochSeconds) {
+                var seconds = Long.parseLong(text)
+                if (seconds > 100000000000L) {
+                    return Time.fromMillis(seconds)
+                }
+                return Time.fromMillis(seconds * 1000L)
+            }
+            var parsed = text
+            if (text.length() == 10) {
+                parsed = text + "T00:00:00Z"
+            }
+            return Time.fromMillis(Time.toMillis(parsed))
+        } catch (String e) {
+            return ""
+        }
+    }
+    // "a.b", "a[0]" or "a[0].b"; an array reads as its first element. Absent or blank: null.
+    String? value(node: String, path: String?) {
+        if (path == null) {
+            return null
+        }
+        if (path.trim().length() == 0) {
+            return null
+        }
+        var text = OpenJobApiSource.readPath(node, path.replace("[", ".").replace("]", ""))
+        if (text.length() == 0) {
+            return null
+        }
+        return text
+    }
+    static String readPath(node: String, dotted: String) {
+        try {
+            var found = JsonPath.str(node, dotted)
+            if (found != null) {
+                return found.trim()
+            }
+        } catch (String e) {
+            return ""
+        }
+        return ""
+    }
+}

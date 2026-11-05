@@ -1,0 +1,80 @@
+package kernel.files
+
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.IOException
+import java.io.InputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+
+// What a bounded read of a ZIP gave: the wanted entries as text, or the reason it was refused.
+class ZipRead {
+    // simple entry name -> text (BOM stripped)
+    Map<String,String> texts = new java.util.HashMap<String, String>()
+    // "" when fine, "TOO_LARGE" (entries, one entry or the total crossed its cap) or "INVALID" (not a readable zip)
+    String refused = ""
+    public constructor() {}
+}
+
+// Reads chosen entries of a ZIP file with a decompression budget (the zip-bomb guard of the LinkedIn import): a
+// small archive can inflate to hundreds of MB. Only the entries whose simple name is in `wanted` are ever
+// inflated, each streamed against `maxEntryBytes` and the running total against `totalCap` (the bytes actually
+// read, never the sizes the archive declares), and the read stops as soon as one is crossed. The archive is opened
+// by its central directory, so the entries nobody asked for are skipped without being inflated.
+class ZipReader {
+    static ZipRead read(path: String, wanted: List<String>, maxEntries: Int, maxEntryBytes: Long, totalCap: Long) {
+        var result = ZipRead()
+        var failure = ""
+        try {
+            var zip = new ZipFile(new File(path))
+            failure = ZipReader.scan(zip, wanted, maxEntries, maxEntryBytes, totalCap, result)
+            zip.close()
+        } catch (IOException e) {
+            failure = "INVALID"
+        } catch (String e) {
+            failure = "INVALID"
+        }
+        result.refused = failure
+        return result
+    }
+    // The loop over the entries; answers the refusal ("" when fine).
+    static String scan(zip: ZipFile, wanted: List<String>, maxEntries: Int, maxEntryBytes: Long, totalCap: Long, result: ZipRead) {
+        if (zip.size() > maxEntries) {
+            return "TOO_LARGE"
+        }
+        var total = 0L
+        var entries = zip.entries()
+        while (entries.hasMoreElements()) {
+            var entry = entries.nextElement() as ZipEntry
+            var name = entry.getName()
+            var slash = name.lastIndexOf("/")
+            var simple = name.substring(slash + 1)
+            // The LinkedIn ZIP keeps the CSVs in a folder (".../Positions.csv"): it matches by the simple name.
+            if (entry.isDirectory() || !wanted.contains(simple) || result.texts.containsKey(simple)) {
+                continue
+            }
+            var out = new ByteArrayOutputStream()
+            var input = zip.getInputStream(entry)
+            var buffer = new Byte[8192]
+            var entryBytes = 0L
+            var read = input.read(buffer, 0, 8192)
+            while (read != -1) {
+                entryBytes = entryBytes + read
+                total = total + read
+                if (entryBytes > maxEntryBytes || total > totalCap) {
+                    input.close()
+                    return "TOO_LARGE"
+                }
+                out.write(buffer, 0, read)
+                read = input.read(buffer, 0, 8192)
+            }
+            input.close()
+            var text = out.toString()
+            if (text.startsWith("﻿")) {
+                text = text.substring(1)
+            }
+            result.texts.put(simple, text)
+        }
+        return ""
+    }
+}

@@ -1,0 +1,312 @@
+package jobs
+
+import kernel.error.*
+import kernel.text.*
+
+// Pure rules of the jobs domain: money, normalisation, labels, the application life cycle.
+class JobRules {
+    static Int minReputation() = 150
+    static Int maxApplicationFields() = 25
+    static Int maxSalaryLength() = 120
+    static Int maxDescriptionLength() = 5000
+    static String communityPlatform() = "Comunidade"
+    static Int clamp(value: Int, low: Int, high: Int) {
+        if (value < low) {
+            return low
+        }
+        if (value > high) {
+            return high
+        }
+        return value
+    }
+    // Teto de qualquer listagem de vagas: sem ele, `?limit=100000` ia direto ao banco.
+    static Int pageLimit(limit: Int) = JobRules.clamp(limit, 1, 100)
+    static Bool has(value: String?) = Texts.hasText(value)
+    static String orEmpty(value: String?) {
+        if (value == null) {
+            return ""
+        }
+        return value
+    }
+    static String? trimmed(value: String?) {
+        if (value == null) {
+            return null
+        }
+        if (value.trim().length() == 0) {
+            return null
+        }
+        return value.trim()
+    }
+    // ---- money (BigDecimal in Java; here whole cents) ----
+    // Plain decimal text ("1500", "1500.5", ".5") into cents, rounded half up; null when it is not a number.
+    static Long? decimalToCents(text: String) {
+        if (!text.matches("\\d+\\.?\\d*|\\.\\d+")) {
+            return null
+        }
+        var dot = text.indexOf(".")
+        var whole = text
+        var fraction = ""
+        if (dot >= 0) {
+            whole = text.substring(0, dot)
+            fraction = text.substring(dot + 1)
+        }
+        if (whole.length() == 0) {
+            whole = "0"
+        }
+        if (whole.length() > 15) {
+            return null
+        }
+        var padded = fraction + "00"
+        var cents = Long.parseLong(whole) * 100L + Long.parseLong(padded.substring(0, 2))
+        if (fraction.length() > 2) {
+            if (Integer.parseInt(fraction.substring(2, 3)) >= 5) {
+                cents = cents + 1L
+            }
+        }
+        return cents
+    }
+    // What the author typed, in the Brazilian formats: "1500", "1.500", "1.500,50" and "R$ 1.500". A dot alone
+    // with three digits after is a thousands separator ("1.500" is fifteen hundred), not a decimal.
+    static Long? parseAmount(value: String?) {
+        if (!JobRules.has(value)) {
+            return null
+        }
+        var raw = ""
+        if (value != null) {
+            raw = value
+        }
+        var cleaned = raw.replaceAll("[^0-9.,]", "")
+        if (cleaned.length() == 0) {
+            return null
+        }
+        if (cleaned.contains(",") && cleaned.contains(".")) {
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        }
+        else 
+            if (cleaned.contains(",")) {
+                cleaned = cleaned.replace(",", ".")
+            }
+            else 
+                if (cleaned.matches("\\d{1,3}(\\.\\d{3})+")) {
+                    cleaned = cleaned.replace(".", "")
+                }
+        return JobRules.decimalToCents(cleaned)
+    }
+    // DECIMAL(12,2) text for the column.
+    static String dbText(cents: Long) {
+        var frac = cents % 100L
+        var fracText = "" + frac
+        if (frac < 10L) {
+            fracText = "0" + frac
+        }
+        return "" + (cents / 100L) + "." + fracText
+    }
+    static String? dbTextOrNull(cents: Long?) {
+        if (cents == null) {
+            return null
+        }
+        var c = 0L
+        c = cents
+        return JobRules.dbText(c)
+    }
+    static Long? fromDb(text: String?) {
+        if (text == null) {
+            return null
+        }
+        return JobRules.decimalToCents(text.trim())
+    }
+    // 1500 -> "1.500", 250050 cents -> "2.500,50" (NumberFormat pt-BR as formatAmount used it).
+    static String formatCents(cents: Long) {
+        var whole = "" + (cents / 100L)
+        var grouped = ""
+        var n = whole.length()
+        var i = 0
+        while (i < n) {
+            if (i > 0 && (n - i) % 3 == 0) {
+                grouped = grouped + "."
+            }
+            grouped = grouped + whole.substring(i, i + 1)
+            i = i + 1
+        }
+        var frac = cents % 100L
+        if (frac == 0L) {
+            return grouped
+        }
+        var fracText = "" + frac
+        if (frac < 10L) {
+            fracText = "0" + frac
+        }
+        return grouped + "," + fracText
+    }
+    static String? formatCentsOrNull(cents: Long?) {
+        if (cents == null) {
+            return null
+        }
+        var c = 0L
+        c = cents
+        return JobRules.formatCents(c)
+    }
+    // An external job keeps the typed text: a number is shown formatted, anything else as typed.
+    static String amountText(value: String) {
+        var trimmed = value.trim()
+        var cents = JobRules.decimalToCents(trimmed.replace(",", "."))
+        if (cents == null) {
+            return trimmed
+        }
+        var c = 0L
+        c = cents
+        return JobRules.formatCents(c)
+    }
+    static String currencySymbol(currency: String?) {
+        var code = "BRL"
+        if (currency != null) {
+            code = currency.toUpperCase()
+        }
+        if (code == "USD") {
+            return "US$"
+        }
+        if (code == "EUR") {
+            return "€"
+        }
+        return "R$"
+    }
+    static String periodLabel(period: String?) {
+        var p = "MONTH"
+        if (period != null) {
+            p = period
+        }
+        if (p == "HOUR") {
+            return "hora"
+        }
+        if (p == "DAY") {
+            return "dia"
+        }
+        if (p == "YEAR") {
+            return "ano"
+        }
+        return "mês"
+    }
+    // "R$ 1.500 / mes" or "de R$ 1.500 ate R$ 2.000 / mes"; null on the old free-text jobs.
+    static String? salaryLabel(job: JobRecord) {
+        var min = job.salaryMin
+        if (min == null) {
+            return null
+        }
+        var low = 0L
+        low = min
+        var symbol = JobRules.currencySymbol(job.currency)
+        var minText = symbol + " " + JobRules.formatCents(low)
+        var max = job.salaryMax
+        if (max != null) {
+            var high = 0L
+            high = max
+            return "de " + minText + " até " + symbol + " " + JobRules.formatCents(high) + " / " + JobRules.periodLabel(job.salaryPeriod)
+        }
+        return minText + " / " + JobRules.periodLabel(job.salaryPeriod)
+    }
+    static String? externalSalaryLabel(job: ExternalJobRecord) {
+        if (job.salaryNotInformed) {
+            return "Salário não informado"
+        }
+        var min = job.salaryMin
+        if (min == null) {
+            return null
+        }
+        if (min.trim().length() == 0) {
+            return null
+        }
+        var symbol = JobRules.currencySymbol(job.currency)
+        var minText = symbol + " " + JobRules.amountText(min)
+        var max = job.salaryMax
+        if (max != null) {
+            if (max.trim().length() > 0) {
+                return "de " + minText + " até " + symbol + " " + JobRules.amountText(max) + " / " + JobRules.periodLabel(job.salaryPeriod)
+            }
+        }
+        return minText + " / " + JobRules.periodLabel(job.salaryPeriod)
+    }
+    // The symbol is chosen in `currency` and rebuilt on display: the same job never shows "R$ R$ 8.000".
+    static String? normalizeSalary(salary: String?) {
+        if (!JobRules.has(salary)) {
+            return null
+        }
+        var raw = ""
+        if (salary != null) {
+            raw = salary
+        }
+        var cleaned = raw.replaceAll("(?i)(R\\$|US\\$|\\$|€)", " ").replaceAll("\\s+", " ").trim()
+        if (cleaned.length() == 0) {
+            return null
+        }
+        if (cleaned.length() > JobRules.maxSalaryLength()) {
+            return cleaned.substring(0, JobRules.maxSalaryLength())
+        }
+        return cleaned
+    }
+    static String normalizeCurrency(currency: String?) {
+        if (!JobRules.has(currency)) {
+            return "BRL"
+        }
+        var raw = ""
+        if (currency != null) {
+            raw = currency
+        }
+        var code = raw.trim().toUpperCase()
+        if (code != "BRL" && code != "USD" && code != "EUR") {
+            throw Errors.api(400, "INVALID_JOB_CURRENCY", "Moeda nao suportada. Use BRL, USD ou EUR.")
+        }
+        return code
+    }
+    // ---- the application life cycle (JobApplicationStatus) ----
+    static Bool canMove(from: String, to: String) {
+        if (from == to) {
+            return false
+        }
+        if (from == "APPLIED") {
+            return to == "IN_REVIEW" || to == "NOT_SELECTED"
+        }
+        if (from == "IN_REVIEW") {
+            return to == "ADVANCED" || to == "NOT_SELECTED"
+        }
+        if (from == "ADVANCED") {
+            return to == "IN_REVIEW"
+        }
+        return false
+    }
+    static Bool knownStatus(status: String) = status == "APPLIED" || status == "IN_REVIEW" || status == "ADVANCED" || status == "NOT_SELECTED"
+    // JobApplicationField.FieldType.from: blank is TEXT, an unknown type is a 400.
+    static String fieldType(value: String?) {
+        if (!JobRules.has(value)) {
+            return "TEXT"
+        }
+        var raw = ""
+        if (value != null) {
+            raw = value
+        }
+        var upper = raw.trim().toUpperCase()
+        if (upper == "TEXT" || upper == "TEXTAREA" || upper == "NUMBER" || upper == "LINK") {
+            return upper
+        }
+        throw Errors.api(400, "INVALID_FIELD_TYPE", "Tipo de campo invalido: " + raw + ". Use TEXT, TEXTAREA, NUMBER ou LINK.")
+    }
+}
+
+// The life cycle of an application (JobApplication.withStatus): the domain refuses an invalid transition and a
+// rejection without a reason, so no path can write an arbitrary state or a silent "not selected".
+class JobApplications {
+    static JobApplicationRecord withStatus(a: JobApplicationRecord, next: String, feedback: String?, reviewedAt: String) {
+        if (!JobRules.canMove(a.status, next)) {
+            throw Errors.api(409, "INVALID_STATUS_TRANSITION", "A candidatura nao pode passar de " + a.status + " para " + next + ".")
+        }
+        var clean = JobRules.trimmed(feedback)
+        if (next == "NOT_SELECTED" && clean == null) {
+            throw Errors.api(400, "FEEDBACK_REQUIRED", "Conte por que a candidatura nao seguiu — o candidato recebe esse retorno.")
+        }
+        if (clean != null) {
+            if (clean.length() > 1000) {
+                throw Errors.api(400, "FEEDBACK_TOO_LONG", "O retorno deve ter no maximo 1000 caracteres.")
+            }
+        }
+        return JobApplicationRecord(a.id, a.jobId, a.userId, a.message, a.candidateSnapshot, a.appliedAt, a.answers, next, clean, reviewedAt)
+    }
+}

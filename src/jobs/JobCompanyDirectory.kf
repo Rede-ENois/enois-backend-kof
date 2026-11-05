@@ -1,0 +1,152 @@
+package jobs
+
+import kernel.db.*
+
+// The company directory derived from the jobs (CompanyDirectoryReaderAdapter): open internal jobs plus external
+// ones grouped by company name, case variants merged. The companies domain reads the page-related counts from
+// here (openJobsByCompanyIds, openJobsOf).
+class JobCompanyDirectory {
+    Db store
+    ExternalJobStore external
+    public constructor(store: Db, external: ExternalJobStore) {
+        this.store = store
+        this.external = external
+    }
+    // Company, total and a logo of any open job, case variants merged: the most frequent spelling is not
+    // known here, the first one read is the display name (the rows come ordered by total).
+    List<JobNamedCount> openCounts(unlinkedOnly: Bool) {
+        var extra = ""
+        if (unlinkedOnly) {
+            extra = " and company_id is null"
+        }
+        var out = listOf<JobNamedCount>()
+        for (var r in store.queryList("select company, count(*) as total, max(logo) as logo from jobs where status = 'OPEN' and company is not null" + extra + " group by company order by count(*) desc", DbParams())) {
+            out.add(JobNamedCount(r.getStr("company"), r.getStrOrNull("logo"), r.getLong("total")))
+        }
+        return out
+    }
+    // Merges rows by lower-cased name: totals add up, the first spelling and the first logo win.
+    static JobMerged merge(rows: List<JobNamedCount>) {
+        var merged = new JobMerged()
+        for (var row in rows) {
+            var key = row.name.toLowerCase()
+            var seen = merged.totals.get(key)
+            if (seen == null) {
+                merged.totals.put(key, row.count)
+                merged.display.put(key, row.name)
+                merged.order.add(key)
+            }
+            else {
+                merged.totals.put(key, seen + row.count)
+            }
+            var logo = row.logo
+            if (logo != null) {
+                if (merged.logos.get(key) == null) {
+                    merged.logos.put(key, logo)
+                }
+            }
+        }
+        return merged
+    }
+    static Bool accepts(needle: String, key: String, display: String) = needle.length() == 0 || key.contains(needle) || display.toLowerCase().contains(needle)
+    List<JobCompanySummary> directory(query: String?, limit: Int) {
+        var enois = JobCompanyDirectory.merge(this.openCounts(false))
+        var externas = JobCompanyDirectory.merge(external.countByCompany())
+        var needle = ""
+        if (query != null) {
+            needle = query.trim().toLowerCase()
+        }
+        var all = listOf<JobCompanySummary>()
+        for (var key in enois.order) {
+            var name = enois.displayOf(key)
+            if (!JobCompanyDirectory.accepts(needle, key, name)) {
+                continue
+            }
+            all.add(JobCompanySummary(name, JobRules.orEmpty(enois.logos.get(key)), enois.totalOf(key), "enois"))
+        }
+        for (var key in externas.order) {
+            var name = externas.displayOf(key)
+            if (!JobCompanyDirectory.accepts(needle, key, name)) {
+                continue
+            }
+            all.add(JobCompanySummary(name, JobRules.orEmpty(externas.logos.get(key)), externas.totalOf(key), "externa"))
+        }
+        // Most open jobs first, stable: sort keys "inverted total + position" as text.
+        var keys = listOf<String>()
+        var i = 0
+        while (i < all.size()) {
+            var inverted = 999999999999L - all.get(i).openJobs
+            keys.add(JobCompanyDirectory.pad(inverted, 13) + JobCompanyDirectory.pad(i as Long, 8))
+            i = i + 1
+        }
+        Texts.sortInPlace(keys)
+        var out = listOf<JobCompanySummary>()
+        for (var key in keys) {
+            if (out.size() >= limit) {
+                break
+            }
+            out.add(all.get(Integer.parseInt(key.substring(13))))
+        }
+        return out
+    }
+    static String pad(value: Long, width: Int) {
+        var text = "" + value
+        while (text.length() < width) {
+            text = "0" + text
+        }
+        return text
+    }
+    // Open internal jobs NOT linked to a page, by company name.
+    List<JobNamedCount> openUnlinkedJobsByName() = JobCompanyDirectory.byName(this.openCounts(true))
+    List<JobNamedCount> externalJobsByName() = JobCompanyDirectory.byName(external.countByCompany())
+    static List<JobNamedCount> byName(rows: List<JobNamedCount>) {
+        var merged = JobCompanyDirectory.merge(rows)
+        var out = listOf<JobNamedCount>()
+        for (var key in merged.order) {
+            out.add(JobNamedCount(merged.displayOf(key), merged.logos.get(key), merged.totalOf(key)))
+        }
+        return out
+    }
+    // Open jobs linked to each of these pages.
+    Map<String,Long> openJobsByCompanyIds(companyIds: List<String>) {
+        var counts: Map<String, Long> = mapOf()
+        if (companyIds.size() == 0) {
+            return counts
+        }
+        for (var r in store.queryList("select company_id, count(*) as total from jobs where status = 'OPEN' and company_id in (" + JobStore.marks(companyIds.size()) + ") group by company_id", JobStore.bindAll(DbParams(), companyIds))) {
+            counts.put(r.getStr("company_id"), r.getLong("total"))
+        }
+        return counts
+    }
+    // Open jobs linked to a page, newest first.
+    List<JobPageJob> openJobsOf(companyId: String, limit: Int) {
+        var out = listOf<JobPageJob>()
+        for (var r in store.queryList("select id, title, location, type, level, posted_at from jobs where company_id = ? and status = 'OPEN' order by posted_at desc limit ?", DbParams().bindStr(companyId).bindInt(limit))) {
+            out.add(JobPageJob(r.getStr("id"), r.getStr("title"), r.getStrOrNull("location"), r.getStr("type"), r.getStr("level"), r.getInstant("posted_at")))
+        }
+        return out
+    }
+}
+
+// The accumulators of one merge (totals, display names, logos and the order the names first appeared).
+class JobMerged {
+    Map<String,Long> totals = new java.util.HashMap<String, Long>()
+    Map<String,String> display = new java.util.HashMap<String, String>()
+    Map<String,String> logos = new java.util.HashMap<String, String>()
+    List<String> order = listOf<String>()
+    public constructor() {}
+    String displayOf(key: String) {
+        var v = display.get(key)
+        if (v == null) {
+            return key
+        }
+        return v
+    }
+    Long totalOf(key: String) {
+        var v = totals.get(key)
+        if (v == null) {
+            return 0L
+        }
+        return v
+    }
+}

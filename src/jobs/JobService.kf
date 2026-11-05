@@ -1,0 +1,500 @@
+package jobs
+
+import kernel.cache.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+import notifications.*
+import profile.*
+
+// The jobs use cases (JobService): publish, edit, close, delete, apply, triage and the saved list. Every
+// message, code and limit is the Java one.
+class JobService {
+    Db database
+    JobStore store
+    JobReputation reputation
+    ProfileDirectory directory
+    ProfileExtensionStore extension
+    JobCorporate corporate
+    JobCompanies companies
+    JobApplicationDelivery delivery
+    JobApplicationStatusNotifier statusNotifier
+    UserRateLimiter userLimiter
+    BehavioralTimingGuard timingGuard
+    Notifications notifications
+    TtlCache jobsCache
+    public constructor(database: Db, store: JobStore, reputation: JobReputation, directory: ProfileDirectory, extension: ProfileExtensionStore, corporate: JobCorporate, companies: JobCompanies, delivery: JobApplicationDelivery, statusNotifier: JobApplicationStatusNotifier, userLimiter: UserRateLimiter, timingGuard: BehavioralTimingGuard, notifications: Notifications, jobsCache: TtlCache) {
+        this.database = database
+        this.store = store
+        this.reputation = reputation
+        this.directory = directory
+        this.extension = extension
+        this.corporate = corporate
+        this.companies = companies
+        this.delivery = delivery
+        this.statusNotifier = statusNotifier
+        this.userLimiter = userLimiter
+        this.timingGuard = timingGuard
+        this.notifications = notifications
+        this.jobsCache = jobsCache
+    }
+    JobRecord requireJob(job: JobRecord?) {
+        if (job == null) {
+            throw Errors.api(404, "JOB_NOT_FOUND", "Vaga nao encontrada.")
+        }
+        return job
+    }
+    // ---------------------------------------------------------------- publish
+    JobRecord create(title: String?, company: String?, logo: String?, location: String?, type: String?, level: String?, salary: String?, currency: String?, salaryMin: String?, salaryMax: String?, salaryPeriod: String?, description: String?, skills: List<String>, fields: List<JobFieldInput>, userId: String, communityAgreement: Bool, companyId: String?) {
+        var self = this
+        var created = this.draft("", "", "", "", "")
+        database.transaction(() -> {
+    created = self.createInTransaction(title, company, logo, location, type, level, salary, currency, salaryMin, salaryMax, salaryPeriod, description, skills, fields, userId, communityAgreement, companyId)
+})
+        return created
+    }
+    JobRecord draft(id: String, title: String, company: String, type: String, level: String) = JobRecord(id, title, company, null, null, type, level, null, "BRL", null, null, null, null, listOf<String>(), listOf<JobFieldRecord>(), "", null, "", "", "OPEN", null, null)
+    JobRecord createInTransaction(title: String?, company: String?, logo: String?, location: String?, type: String?, level: String?, salary: String?, currency: String?, salaryMin: String?, salaryMax: String?, salaryPeriod: String?, description: String?, skills: List<String>, fields: List<JobFieldInput>, userId: String, communityAgreement: Bool, companyId: String?) {
+        // Posting for a company page takes RECRUITER or above on it; the job then carries the page's name and
+        // logo, so nobody publishes in a page's name without being on its team.
+        var page = this.pageFor(companyId, userId)
+        var shownCompany = company
+        var shownLogo = logo
+        if (page != null) {
+            shownCompany = page.name
+            if (Texts.hasText(page.logo)) {
+                shownLogo = page.logo
+            }
+        }
+        this.validate(title, shownCompany, type, level)
+        var rep = reputation.of(userId)
+        // Freelance and one-off work has its own endpoint, with a closed scope, deadline and value range.
+        var kind = ""
+        if (type != null) {
+            kind = type.trim()
+        }
+        if (kind.toUpperCase() == "FREELANCE") {
+            throw Errors.api(400, "USE_FREELANCE_ENDPOINT", "Trabalho pontual agora é publicado em /freelances, com escopo fechado, prazo e faixa de valor.")
+        }
+        if (rep <= JobRules.minReputation()) {
+            throw Errors.api(403, "LOW_REPUTATION", "E necessario ter mais de " + JobRules.minReputation() + " de reputacao para criar vagas.")
+        }
+        // Publishing is saying the job is real and follows the community rules; the instant is kept.
+        if (!communityAgreement) {
+            throw Errors.api(400, "COMMUNITY_RULES_NOT_ACCEPTED", "E preciso declarar que a vaga e real e esta de acordo com as regras da comunidade.")
+        }
+        // The value and the description are REQUIRED on a new job.
+        var range = this.validateSalary(description, salaryMin, salaryMax, salaryPeriod)
+        var id = Ids.prefixed("job_")
+        var now = Time.nowIso()
+        var companyIdValue = Nulls.str()
+        if (page != null) {
+            companyIdValue = page.id
+        }
+        var job = JobRecord(id, (JobRules.trimmed(title) as String), (JobRules.trimmed(shownCompany) as String), shownLogo, location, JobRules.trimmed(type) as String, JobRules.trimmed(level) as String, JobRules.normalizeSalary(salary), JobRules.normalizeCurrency(currency), range.low, range.high, range.period, range.description, skills, this.normalizeFields(id, fields), userId, now, now, now, "OPEN", null, companyIdValue)
+        store.insert(job)
+        jobsCache.clearAfterCommit(database)
+        if (page != null) {
+            for (var follower in companies.followerIds(page.id)) {
+                if (follower != userId) {
+                    var ignored = notifications.create(follower, "COMPANY_NEW_OPPORTUNITY", userId, "Nova vaga", page.name + " abriu a vaga \"" + job.title + "\".", "/empresa/" + page.slug, "Ver")
+                }
+            }
+        }
+        return job
+    }
+    JobCompanyPage? pageFor(companyId: String?, userId: String) {
+        if (!Texts.hasText(companyId)) {
+            return null
+        }
+        var page = companies.company(JobRules.trimmed(companyId) as String)
+        companies.requireRecruiter(page, userId)
+        return page
+    }
+    JobRecord update(jobId: String, title: String?, company: String?, logo: String?, location: String?, type: String?, level: String?, salary: String?, currency: String?, salaryMin: String?, salaryMax: String?, salaryPeriod: String?, description: String?, skills: List<String>, fields: List<JobFieldInput>, userId: String) {
+        var self = this
+        var updated = this.draft("", "", "", "", "")
+        database.transaction(() -> {
+    updated = self.updateInTransaction(jobId, title, company, logo, location, type, level, salary, currency, salaryMin, salaryMax, salaryPeriod, description, skills, fields, userId)
+})
+        return updated
+    }
+    JobRecord updateInTransaction(jobId: String, title: String?, company: String?, logo: String?, location: String?, type: String?, level: String?, salary: String?, currency: String?, salaryMin: String?, salaryMax: String?, salaryPeriod: String?, description: String?, skills: List<String>, fields: List<JobFieldInput>, userId: String) {
+        this.validate(title, company, type, level)
+        var existing = this.requireJob(store.findById(jobId))
+        if (existing.postedBy != userId) {
+            throw Errors.api(403, "NOT_OWNER", "Voce nao pode editar uma vaga que nao criou.")
+        }
+        // A job linked to a page keeps the page's name and logo: editing does not move it out.
+        var shownCompany = company
+        var shownLogo = logo
+        if (existing.companyId != null) {
+            shownCompany = existing.company
+            shownLogo = existing.logo
+        }
+        var range = this.validateSalary(description, salaryMin, salaryMax, salaryPeriod)
+        // Editing does not touch the life cycle: status and closedAt come from the stored row, never from the
+        // body (sending status=OPEN must not reopen a closed job).
+        var updated = JobRecord(jobId, JobRules.trimmed(title) as String, JobRules.trimmed(shownCompany) as String, shownLogo, location, JobRules.trimmed(type) as String, JobRules.trimmed(level) as String, JobRules.normalizeSalary(salary), JobRules.normalizeCurrency(currency), range.low, range.high, range.period, range.description, skills, this.normalizeFields(jobId, fields), userId, existing.communityAgreedAt, existing.postedAt, Time.nowIso(), existing.status, existing.closedAt, existing.companyId)
+        store.update(updated)
+        jobsCache.clearAfterCommit(database)
+        return updated
+    }
+    // Closing keeps everything: the applications already received stay available for the triage.
+    JobRecord close(jobId: String, userId: String) {
+        var self = this
+        var closed = this.draft("", "", "", "", "")
+        database.transaction(() -> {
+    closed = self.closeInTransaction(jobId, userId)
+})
+        return closed
+    }
+    JobRecord closeInTransaction(jobId: String, userId: String) {
+        var existing = this.requireJob(store.findByIdForUpdate(jobId))
+        if (existing.postedBy != userId) {
+            throw Errors.api(403, "NOT_OWNER", "Voce nao pode encerrar uma vaga que nao criou.")
+        }
+        if (existing.status != "OPEN") {
+            throw Errors.api(409, "JOB_ALREADY_CLOSED", "Esta vaga ja esta encerrada.")
+        }
+        var now = Time.nowIso()
+        store.close(jobId, now)
+        jobsCache.clearAfterCommit(database)
+        return JobRecord(existing.id, existing.title, existing.company, existing.logo, existing.location, existing.type, existing.level, existing.salary, existing.currency, existing.salaryMin, existing.salaryMax, existing.salaryPeriod, existing.description, existing.skills, existing.applicationFields, existing.postedBy, existing.communityAgreedAt, existing.postedAt, existing.updatedAt, "CLOSED", now, existing.companyId)
+    }
+    // Deleting with applications still in APPLIED (the employer never answered) records ONE penalty row for the
+    // job (the key is the job), capped in the reputation. Whoever answered every candidate is not penalised.
+    JobDeleteResult delete(jobId: String, userId: String) {
+        var self = this
+        var result = JobDeleteResult(jobId, 0, false)
+        database.transaction(() -> {
+    result = self.deleteInTransaction(jobId, userId)
+})
+        return result
+    }
+    JobDeleteResult deleteInTransaction(jobId: String, userId: String) {
+        var existing = this.requireJob(store.findById(jobId))
+        if (existing.postedBy != userId) {
+            throw Errors.api(403, "NOT_OWNER", "Voce nao pode excluir uma vaga que nao criou.")
+        }
+        var unanswered = store.countUnanswered(jobId)
+        var penalized = false
+        if (unanswered > 0) {
+            penalized = store.recordPenalty(jobId, userId, unanswered, Time.nowIso())
+        }
+        store.deleteJob(jobId)
+        jobsCache.clearAfterCommit(database)
+        return JobDeleteResult(jobId, unanswered, penalized)
+    }
+    // ---------------------------------------------------------------- triage
+    List<JobApplicationRecord> myApplications(userId: String, limit: Int) = store.findApplicationsByUser(userId, JobRules.pageLimit(limit))
+    JobApplicationRecord updateApplicationStatus(jobId: String, applicationId: String, userId: String, newStatus: String, feedback: String?) {
+        var self = this
+        var moved = this.blankApplication()
+        database.transaction(() -> {
+    moved = self.updateStatusInTransaction(jobId, applicationId, userId, newStatus, feedback)
+})
+        return moved
+    }
+    JobApplicationRecord blankApplication() = JobApplicationRecord("", "", "", null, null, "", listOf<JobAnswerRecord>(), "APPLIED", null, null)
+    JobApplicationRecord updateStatusInTransaction(jobId: String, applicationId: String, userId: String, newStatus: String, feedback: String?) {
+        var job = this.requireJob(store.findByIdForUpdate(jobId))
+        if (job.postedBy != userId) {
+            throw Errors.api(403, "NOT_OWNER", "So quem publicou a vaga pode gerenciar as candidaturas.")
+        }
+        // The application must be of THIS job: otherwise the id of another job would be reachable by the URL.
+        var found = store.findApplicationById(applicationId)
+        if (found == null) {
+            throw Errors.api(404, "APPLICATION_NOT_FOUND", "Candidatura nao encontrada.")
+        }
+        if (found.jobId != jobId) {
+            throw Errors.api(404, "APPLICATION_NOT_FOUND", "Candidatura nao encontrada.")
+        }
+        // The domain checks the transition AND the reason (rejecting asks for a return).
+        var moved = JobApplications.withStatus(found, newStatus, feedback, Time.nowIso())
+        store.updateApplicationStatus(applicationId, moved.status, moved.feedback, moved.reviewedAt as String)
+        // Only after persisting: the state is the source of truth, the notice comes from it.
+        statusNotifier.notifyStatusChange(job, moved)
+        return moved
+    }
+    // The applications a job received: only its author sees who applied.
+    List<JobApplicationRecord> applicationsOf(jobId: String, requesterId: String, limit: Int) {
+        var job = this.requireJob(store.findById(jobId))
+        if (job.postedBy != requesterId) {
+            throw Errors.api(403, "NOT_OWNER", "So quem publicou a vaga ve as candidaturas recebidas.")
+        }
+        return store.findApplicationsByJob(jobId, JobRules.clamp(limit, 1, 100))
+    }
+    // ---------------------------------------------------------------- apply
+    JobApplicationRecord apply(jobId: String, userId: String, message: String?, answers: List<JobAnswerInput>) {
+        var self = this
+        var saved = this.blankApplication()
+        database.transaction(() -> {
+    saved = self.applyInTransaction(jobId, userId, message, answers)
+})
+        return saved
+    }
+    JobApplicationRecord applyInTransaction(jobId: String, userId: String, message: String?, answers: List<JobAnswerInput>) {
+        userLimiter.require(userId, UserRateLimiter.applyJob())
+        timingGuard.recordAction(userId)
+        // Locks the row: "is it open" and writing the application share a transaction, so a concurrent close
+        // waits instead of slipping past.
+        var job = this.requireJob(store.findByIdForUpdate(jobId))
+        if (job.status != "OPEN") {
+            throw Errors.api(409, "JOB_CLOSED", "Esta vaga foi encerrada e nao recebe mais candidaturas.")
+        }
+        if (job.postedBy == userId) {
+            throw Errors.api(400, "CANNOT_APPLY_TO_OWN_JOB", "Voce nao pode se candidatar a sua propria vaga.")
+        }
+        if (store.hasApplied(jobId, userId)) {
+            throw Errors.api(409, "ALREADY_APPLIED", "Voce ja se candidatou a esta vaga.")
+        }
+        // An application is ALWAYS of the active professional identity, resolved from the session here.
+        var professional = corporate.requireActive(userId)
+        var normalized = this.validateAnswers(job, answers)
+        var snapshot = this.snapshotOf(userId, professional)
+        var now = Time.nowIso()
+        var text = this.messageText(message)
+        var draft = JobApplicationRecord("", jobId, userId, text, snapshot, now, normalized, "APPLIED", null, null)
+        var applicationId = store.saveApplication(draft)
+        var saved = JobApplicationRecord(applicationId, jobId, userId, text, snapshot, now, normalized, "APPLIED", null, null)
+        // Delivery: the employer gets an e-mail and a direct message with the candidate's profile.
+        delivery.deliver(job, saved)
+        return saved
+    }
+    String? messageText(message: String?) {
+        if (!Texts.hasText(message)) {
+            return null
+        }
+        var trimmed = JobRules.trimmed(message) as String
+        if (trimmed.length() > 2000) {
+            return trimmed.substring(0, 2000)
+        }
+        return trimmed
+    }
+    // The answers against the fields of the job: a required field with no answer stops the application, and the
+    // value must fit the field type (number, link).
+    List<JobAnswerRecord> validateAnswers(job: JobRecord, answers: List<JobAnswerInput>) {
+        var byField: Map<String, String> = mapOf()
+        for (var answer in answers) {
+            if (Texts.hasText(answer.fieldId)) {
+                var key = JobRules.trimmed(answer.fieldId) as String
+                var value = ""
+                var given = answer.value
+                if (given != null) {
+                    value = given.trim()
+                }
+                byField.put(key, value)
+            }
+        }
+        var missing = listOf<String>()
+        var result = listOf<JobAnswerRecord>()
+        for (var field in job.applicationFields) {
+            var value = ""
+            var known = byField.get(field.id)
+            if (known != null) {
+                value = known
+            }
+            if (value.trim().length() == 0) {
+                if (field.required) {
+                    missing.add(field.label)
+                }
+                continue
+            }
+            if (value.length() > 2000) {
+                throw Errors.api(400, "ANSWER_TOO_LONG", "A resposta de \"" + field.label + "\" passa de 2000 caracteres.")
+            }
+            if (field.type == "NUMBER" && !value.matches("[-+]?\\d+([.,]\\d+)?")) {
+                throw Errors.api(400, "INVALID_ANSWER", "O campo \"" + field.label + "\" espera um numero.")
+            }
+            if (field.type == "LINK" && !value.matches("(?i)^(https?://\\S+\\.\\S+|\\S+\\.\\S{2,}/?\\S*)$")) {
+                throw Errors.api(400, "INVALID_ANSWER", "O campo \"" + field.label + "\" espera um link.")
+            }
+            result.add(JobAnswerRecord(field.id, field.label, value, field.position))
+        }
+        if (!missing.isEmpty()) {
+            throw Errors.api(400, "MISSING_REQUIRED_ANSWERS", "Responda os campos obrigatorios: " + String.join(", ", missing) + ".")
+        }
+        return result
+    }
+    // The candidate at the moment of the application: profile, years of experience and credibility. The
+    // presentation (name, @, headline, place, avatar, industry) is the PROFESSIONAL identity, never the social
+    // one; the rest are values of the account.
+    String snapshotOf(userId: String, professional: JobProfessional) {
+        var profile = directory.findById(userId)
+        var rep = reputation.of(userId)
+        var years = this.yearsOfExperience(userId)
+        var socialName = ""
+        var skills = listOf<String>()
+        var verified = false
+        var resumeUrl = ""
+        var resumeName = ""
+        if (profile != null) {
+            var social = profile.socialName
+            if (social != null) {
+                socialName = social
+            }
+            for (var skill in profile.skills) {
+                skills.add(skill)
+            }
+            verified = profile.identityVerified()
+            var url = profile.resumeUrl
+            if (url != null) {
+                resumeUrl = url
+            }
+            var rname = profile.resumeName
+            if (rname != null) {
+                resumeName = rname
+            }
+        }
+        return json.encode(JobSnapshot("CORPORATE", professional.name, socialName, professional.username, JobRules.orEmpty(professional.headline), JobRules.orEmpty(professional.location), JobRules.orEmpty(professional.avatar), JobRules.orEmpty(professional.industry), skills, years, extension.countExperiences(userId), rep, verified, resumeUrl, resumeName))
+    }
+    // Years since the first registered experience (0 when there is none).
+    Int yearsOfExperience(userId: String) {
+        var earliest = ""
+        for (var e in extension.experiences(userId, false)) {
+            if (earliest.length() == 0 || e.startDate.compareTo(earliest) < 0) {
+                earliest = e.startDate
+            }
+        }
+        if (earliest.length() == 0) {
+            return 0
+        }
+        var years = Dates.yearsBetween(earliest, Time.todayIso())
+        if (years < 0) {
+            return 0
+        }
+        return years
+    }
+    // The fields the author sent: each gets its own id and keeps the order it was created in.
+    List<JobFieldRecord> normalizeFields(jobId: String, fields: List<JobFieldInput>) {
+        var normalized = listOf<JobFieldRecord>()
+        if (fields.size() == 0) {
+            return normalized
+        }
+        if (fields.size() > JobRules.maxApplicationFields()) {
+            throw Errors.api(400, "TOO_MANY_FIELDS", "O formulario aceita no maximo " + JobRules.maxApplicationFields() + " campos.")
+        }
+        var labels = listOf<String>()
+        var index = 0
+        for (var input in fields) {
+            var at = index
+            index = index + 1
+            if (!Texts.hasText(input.label)) {
+                continue
+            }
+            var label = JobRules.trimmed(input.label) as String
+            if (label.length() > 160) {
+                throw Errors.api(400, "INVALID_FIELD_LABEL", "O campo deve ter no maximo 160 caracteres.")
+            }
+            if (labels.contains(label.toLowerCase())) {
+                throw Errors.api(400, "DUPLICATE_FIELD_LABEL", "Ha dois campos com o mesmo nome: " + label + ".")
+            }
+            labels.add(label.toLowerCase())
+            normalized.add(JobFieldRecord(Ids.prefixed("field_"), label, JobRules.fieldType(input.type), input.required, at))
+        }
+        return normalized
+    }
+    // ---------------------------------------------------------------- saves and lists
+    List<String> savedJobIds(userId: String) = store.savedJobIds(userId)
+    List<JobRecord> findByIds(ids: List<String>) = store.findByIds(ids)
+    save(jobId: String, userId: String) {
+        var self = this
+        database.transaction(() -> {
+    if (self.store.hasBookmarked(jobId, userId)) {
+        throw Errors.api(409, "ALREADY_SAVED", "Vaga ja salva.")
+    }
+    self.store.saveBookmark(jobId, userId, Time.nowIso())
+})
+    }
+    removeSave(jobId: String, userId: String) {
+        var self = this
+        database.transaction(() -> {
+    if (!self.store.hasBookmarked(jobId, userId)) {
+        throw Errors.api(404, "NOT_SAVED", "Vaga nao estava salva.")
+    }
+    self.store.removeBookmark(jobId, userId)
+})
+    }
+    // The showcase is the same for everybody (what is personal is added by the route), so it is cached.
+    List<JobRecord> list(query: String?, type: String?, level: String?, location: String?, skills: List<String>, before: String?, limit: Int) {
+        var self = this
+        var n = JobRules.pageLimit(limit)
+        var key = "" + query + "|" + type + "|" + level + "|" + location + "|" + skills + "|" + before + "|" + n
+        var text = jobsCache.getOrLoad(key, () -> json.encode(self.store.findAll(query, type, level, location, skills, before, n)))
+        return json.decode<List<JobRecord>>(text)
+    }
+    JobRecord getById(id: String) = this.requireJob(store.findById(id))
+    List<JobRecord> listMine(userId: String, before: String?, limit: Int) = store.findByPostedBy(userId, before, JobRules.pageLimit(limit))
+    List<JobRecord> listApplications(userId: String, before: String?, limit: Int) = store.findAppliedByUser(userId, before, JobRules.pageLimit(limit))
+    java.util.HashSet<String> appliedJobIds(userId: String, jobIds: List<String>) = store.appliedAmong(userId, jobIds)
+    java.util.HashSet<String> savedJobIdsAmong(userId: String, jobIds: List<String>) = store.savedAmong(userId, jobIds)
+    Map<String,Int> applicationsCountByJobIds(jobIds: List<String>) = store.countApplicationsByJobs(jobIds)
+    Int applicationsCount(jobId: String) = store.countApplications(jobId)
+    // ---------------------------------------------------------------- validation
+    validate(title: String?, company: String?, type: String?, level: String?) {
+        if (!Texts.hasText(title)) {
+            throw Errors.api(400, "INVALID_JOB", "Titulo da vaga e obrigatorio.")
+        }
+        if ((JobRules.trimmed(title) as String).length() > 255) {
+            throw Errors.api(400, "INVALID_JOB", "Titulo da vaga deve ter no maximo 255 caracteres.")
+        }
+        if (!Texts.hasText(company)) {
+            throw Errors.api(400, "INVALID_JOB", "Empresa e obrigatoria.")
+        }
+        if ((JobRules.trimmed(company) as String).length() > 255) {
+            throw Errors.api(400, "INVALID_JOB", "Empresa deve ter no maximo 255 caracteres.")
+        }
+        if (!Texts.hasText(type)) {
+            throw Errors.api(400, "INVALID_JOB", "Tipo de contratacao e obrigatorio.")
+        }
+        if (!Texts.hasText(level)) {
+            throw Errors.api(400, "INVALID_JOB", "Nivel da vaga e obrigatorio.")
+        }
+    }
+    // The structured value of a new job: the description is required, the minimum is above zero and the range
+    // is coherent.
+    JobSalaryRange validateSalary(description: String?, salaryMin: String?, salaryMax: String?, salaryPeriod: String?) {
+        if (!Texts.hasText(description)) {
+            throw Errors.api(400, "DESCRIPTION_REQUIRED", "Descreva a vaga: o que a pessoa vai fazer e como será o trabalho.")
+        }
+        var text = JobRules.trimmed(description) as String
+        if (text.length() > JobRules.maxDescriptionLength()) {
+            throw Errors.api(400, "DESCRIPTION_TOO_LONG", "A descrição da vaga deve ter no máximo " + JobRules.maxDescriptionLength() + " caracteres.")
+        }
+        var min = JobRules.parseAmount(salaryMin)
+        if (min == null) {
+            throw Errors.api(400, "SALARY_REQUIRED", "Declare o valor da vaga: um número maior que zero.")
+        }
+        var low = 0L
+        low = min
+        if (low <= 0L) {
+            throw Errors.api(400, "SALARY_REQUIRED", "Declare o valor da vaga: um número maior que zero.")
+        }
+        var max = JobRules.parseAmount(salaryMax)
+        if (max != null) {
+            var high = 0L
+            high = max
+            if (high < low) {
+                throw Errors.api(400, "INVALID_SALARY_RANGE", "O teto da faixa não pode ser menor que o valor mínimo.")
+            }
+        }
+        var period = "MONTH"
+        if (Texts.hasText(salaryPeriod)) {
+            period = (JobRules.trimmed(salaryPeriod) as String).toUpperCase()
+        }
+        if (period != "HOUR" && period != "DAY" && period != "MONTH" && period != "YEAR") {
+            throw Errors.api(400, "INVALID_SALARY_PERIOD", "O período do valor deve ser hora, dia, mês ou ano.")
+        }
+        return JobSalaryRange(low, max, period, text)
+    }
+}
+
+// Min, max (cents), period and description of a validated value.
+record JobSalaryRange(Long low, Long? high, String period, String description)
+
+// The candidate frozen on the application (the JSON written at submission; declaration order = key order).
+record JobSnapshot(String identity, String name, String socialName, String username, String headline, String location, String avatar, String industry, List<String> skills, Int experienceYears, Int experiencesCount, Int reputation, Bool identityVerified, String resumeUrl, String resumeName)

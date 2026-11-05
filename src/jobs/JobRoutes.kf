@@ -1,0 +1,571 @@
+package jobs
+
+import kernel.config.*
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+import kernel.text.*
+import kernel.time.*
+import kernel.url.*
+import profile.*
+
+// HTTP adapter of JobContractController: the 20 routes under /jobs. Literal paths are registered before the
+// parameterised ones (`/jobs/saved` must not read as a job id).
+class JobRoutes {
+    JobService service
+    ExternalJobService externalService
+    ExternalJobStore externalStore
+    JobCompanyDirectory directory
+    JobCompanies companies
+    JobReputation reputation
+    ProfileDirectory profiles
+    Idempotency idem
+    Bool externalListingEnabled
+    Int externalListingLimit
+    public constructor(service: JobService, externalService: ExternalJobService, externalStore: ExternalJobStore, directory: JobCompanyDirectory, companies: JobCompanies, reputation: JobReputation, profiles: ProfileDirectory, idem: Idempotency, externalListingEnabled: Bool, externalListingLimit: Int) {
+        this.service = service
+        this.externalService = externalService
+        this.externalStore = externalStore
+        this.directory = directory
+        this.companies = companies
+        this.reputation = reputation
+        this.profiles = profiles
+        this.idem = idem
+        this.externalListingEnabled = externalListingEnabled
+        this.externalListingLimit = externalListingLimit
+    }
+    register(server: HttpServer) {
+        var self = this
+        server.get("/jobs", () -> self.list())
+        server.get("/jobs/saved", () -> self.saved())
+        server.get("/jobs/platforms", () -> json.encode(self.platforms()))
+        server.get("/jobs/mine", () -> self.mine())
+        server.get("/jobs/applications", () -> self.appliedJobs())
+        server.get("/jobs/applications/mine", () -> self.myApplications())
+        server.get("/jobs/companies", () -> self.companyDirectory())
+        server.get("/jobs/external/mine", () -> self.myExternal())
+        server.post("/jobs/external", () -> self.createExternal())
+        server.delete("/jobs/external/:externalJobId", () -> self.deleteExternal())
+        server.post("/jobs", () -> self.create())
+        server.get("/jobs/:jobId", () -> self.detail())
+        server.put("/jobs/:jobId", () -> self.update())
+        server.delete("/jobs/:jobId", () -> self.remove())
+        server.post("/jobs/:jobId/close", () -> self.close())
+        server.get("/jobs/:jobId/applications", () -> self.applicationsOf())
+        server.post("/jobs/:jobId/applications", () -> self.apply())
+        server.patch("/jobs/:jobId/applications/:applicationId", () -> self.updateApplicationStatus())
+        server.post("/jobs/:jobId/saves", () -> self.save())
+        server.delete("/jobs/:jobId/saves", () -> self.removeSave())
+    }
+    // ---------------------------------------------------------------- reads
+    // `cursor`: an Instant; anything else is 400 INVALID_CURSOR.
+    String? cursor() {
+        var raw = Req.queryParam("cursor")
+        if (!Texts.hasText(raw)) {
+            return null
+        }
+        var text = raw as String
+        var valid = JobRoutes.validInstant(text)
+        if (!valid) {
+            throw Errors.api(400, "INVALID_CURSOR", "Cursor invalido.")
+        }
+        return text.trim()
+    }
+    static Bool validInstant(text: String) {
+        try {
+            var ms = Time.toMillis(text.trim())
+            return ms >= 0L || ms < 0L
+        } catch (String e) {
+            return false
+        }
+    }
+    // `skills` repeats and also splits on commas, like the Spring List<String> binding.
+    List<String> skillsParam() {
+        var out = listOf<String>()
+        for (var value in Req.queryAll("skills")) {
+            for (var part in value.split(",")) {
+                out.add(part)
+            }
+        }
+        return out
+    }
+    String list() {
+        var limit = JobRules.pageLimit(Req.queryInt("limit", 20))
+        var source = Req.queryStr("source", "")
+        var onlyExternal = source.toUpperCase() == "EXTERNAL"
+        var onlyInternal = source.toUpperCase() == "INTERNAL"
+        var viewer = Auth.viewerIdOrNull()
+        var query = Req.queryParam("query")
+        if (onlyExternal) {
+            var showEmail = viewer != null
+            var platform = Req.queryStr("platform", "")
+            var found = listOf<ExternalJobRecord>()
+            if (Texts.hasText(platform)) {
+                found = this.asArray(externalStore.findByPlatform(platform.trim(), query, limit))
+            }
+            else {
+                found = this.asArray(this.externalFound(query))
+            }
+            return json.encode(JobPageView(this.externalViews(found, showEmail), null))
+        }
+        var cursor = this.cursor()
+        var skills = this.skillsParam()
+        var jobs = service.list(query, Req.queryParam("type"), Req.queryParam("level"), Req.queryParam("location"), skills, cursor, limit)
+        // External jobs have no type/level/place/skills: a person who filtered by those does not see them.
+        var structural = Texts.hasText(Req.queryParam("type")) || Texts.hasText(Req.queryParam("level")) || Texts.hasText(Req.queryParam("location")) || this.hasSkill(skills)
+        var firstPage = Req.queryParam("cursor") == null
+        return json.encode(this.page(jobs, limit, viewer, "LIST", !onlyInternal && firstPage && !structural, query))
+    }
+    Bool hasSkill(skills: List<String>) {
+        for (var s in skills) {
+            if (s.trim().length() > 0) {
+                return true
+            }
+        }
+        return false
+    }
+    List<ExternalJobRecord> asArray(list: List<ExternalJobRecord>) {
+        var out = listOf<ExternalJobRecord>()
+        for (var j in list) {
+            out.add(j)
+        }
+        return out
+    }
+    List<JobView> externalViews(list: List<ExternalJobRecord>, showEmail: Bool) {
+        var out = listOf<JobView>()
+        for (var j in list) {
+            out.add(JobViews.external(j, false, showEmail))
+        }
+        return out
+    }
+    // The external jobs ALREADY SAVED (their own table, refreshed by the midnight worker): the source is not
+    // fetched on each request. The ones listed by the community have their own filter and stay out.
+    List<ExternalJobRecord> externalFound(query: String?) {
+        if (Texts.hasText(query)) {
+            return externalStore.searchExcludingPlatform(JobRules.communityPlatform(), JobRules.trimmed(query) as String, externalListingLimit)
+        }
+        return externalStore.findRecentExcludingPlatform(JobRules.communityPlatform(), externalListingLimit)
+    }
+    // The favourites: saved ids resolved on both sides (internal and external), in the order of the save.
+    String saved() {
+        var viewer = Auth.viewerIdOrNull()
+        if (viewer == null) {
+            throw Errors.api(401, "UNAUTHENTICATED", "Sessao obrigatoria para ver as vagas favoritas.")
+        }
+        var ids = service.savedJobIds(viewer)
+        var views = listOf<JobView>()
+        if (ids.isEmpty()) {
+            return json.encode(JobPageView(views, null))
+        }
+        var internal: Map<String, JobRecord> = mapOf()
+        for (var job in service.findByIds(ids)) {
+            internal.put(job.id, job)
+        }
+        var external: Map<String, ExternalJobRecord> = mapOf()
+        for (var ext in externalStore.findByIds(ids)) {
+            external.put(ext.id, ext)
+        }
+        var authors = this.authorsOf(service.findByIds(ids))
+        var slugs = this.slugsOf(service.findByIds(ids))
+        for (var id in ids) {
+            var job = internal.get(id)
+            if (job != null) {
+                views.add(this.internalView(job, viewer, false, true, 0, authors, slugs))
+                continue
+            }
+            var ext = external.get(id)
+            if (ext != null) {
+                var base = JobViews.external(ext, false, true)
+                views.add(JobViews.asSaved(base))
+            }
+        }
+        return json.encode(JobPageView(views, null))
+    }
+    List<String> platforms() {
+        var out = listOf<String>()
+        for (var name in externalStore.distinctPlatforms()) {
+            if (name != JobRules.communityPlatform()) {
+                out.add(name)
+            }
+        }
+        return out
+    }
+    String mine() {
+        var userId = Auth.requireUser()
+        var limit = JobRules.pageLimit(Req.queryInt("limit", 20))
+        var jobs = service.listMine(userId, this.cursor(), limit)
+        return json.encode(this.page(jobs, limit, userId, "MINE", false, null))
+    }
+    String appliedJobs() {
+        var userId = Auth.requireUser()
+        var limit = JobRules.pageLimit(Req.queryInt("limit", 20))
+        var jobs = service.listApplications(userId, this.cursor(), limit)
+        return json.encode(this.page(jobs, limit, userId, "APPLICATIONS", false, null))
+    }
+    String companyDirectory() {
+        var limit = JobRules.clamp(Req.queryInt("limit", 60), 1, 200)
+        return json.encode(directory.directory(Req.queryParam("query"), limit))
+    }
+    String detail() {
+        var jobId = Req.pathParam("jobId")
+        var viewer = Auth.viewerIdOrNull()
+        // The public listing includes external jobs kept in a separate table; their ids live in the `ext_`
+        // namespace and they take no internal application.
+        if (externalListingEnabled && jobId.startsWith("ext_")) {
+            var external = externalStore.findById(jobId)
+            if (external != null) {
+                return json.encode(JobViews.external(external, false, viewer != null))
+            }
+        }
+        var job = service.getById(jobId)
+        var owner = viewer != null && viewer == job.postedBy
+        // The owner is NEVER a candidate on their own job: an orphan application (made before the rule) must not
+        // mark the owner as "applied".
+        var applied = false
+        var wasSaved = false
+        if (viewer != null) {
+            var one = listOf<String>()
+            one.add(job.id)
+            applied = !owner && service.appliedJobIds(viewer, one).contains(job.id)
+            wasSaved = service.savedJobIdsAmong(viewer, one).contains(job.id)
+        }
+        var count = 0
+        if (owner) {
+            count = service.applicationsCount(job.id)
+        }
+        var jobs = listOf<JobRecord>()
+        jobs.add(job)
+        return json.encode(this.internalView(job, viewer, applied, wasSaved, count, this.authorsOf(jobs), this.slugsOf(jobs)))
+    }
+    // ---------------------------------------------------------------- views
+    String? slugOf(job: JobRecord, slugs: Map<String,String>) {
+        var id = job.companyId
+        if (id == null) {
+            return null
+        }
+        return slugs.get(id)
+    }
+    // The slug of the page each job is linked to, in one read (jobs without a page are left out).
+    Map<String,String> slugsOf(jobs: List<JobRecord>) {
+        var ids = listOf<String>()
+        for (var job in jobs) {
+            var id = job.companyId
+            if (id != null) {
+                if (!ids.contains(id)) {
+                    ids.add(id)
+                }
+            }
+        }
+        return companies.slugsOf(ids)
+    }
+    // Who published each job, with reputation and verification: the candidate needs to know who is on the other
+    // side. One batch read of the profiles.
+    Map<String,JobAuthorView> authorsOf(jobs: List<JobRecord>) {
+        var ids = listOf<String>()
+        for (var job in jobs) {
+            if (!ids.contains(job.postedBy)) {
+                ids.add(job.postedBy)
+            }
+        }
+        var out: Map<String, JobAuthorView> = mapOf()
+        for (var p in profiles.findAllByIds(ids)) {
+            out.put(p.id, JobAuthorView(p.id, p.username, p.name, p.avatar, p.headline, reputation.of(p.id), p.identityVerified(), ProfileDirectory.nameStyle(p)))
+        }
+        return out
+    }
+    JobView internalView(job: JobRecord, viewer: String?, applied: Bool, saved: Bool, count: Int, authors: Map<String,JobAuthorView>, slugs: Map<String,String>) {
+        var owner = viewer != null && viewer == job.postedBy
+        return JobViews.internal(job, applied, saved, owner, count, authors.get(job.postedBy), this.slugOf(job, slugs))
+    }
+    JobPageView page(jobs: List<JobRecord>, limit: Int, viewer: String?, kind: String, includeExternal: Bool, externalQuery: String?) {
+        var ids = listOf<String>()
+        for (var job in jobs) {
+            ids.add(job.id)
+        }
+        var authenticated = viewer != null
+        var appliedIds = new java.util.HashSet<String>()
+        var savedIds = new java.util.HashSet<String>()
+        var counts: Map<String, Int> = mapOf()
+        if (viewer != null) {
+            if (kind == "APPLICATIONS") {
+                for (var id in ids) {
+                    appliedIds.add(id)
+                }
+            }
+            else 
+                if (kind == "LIST") {
+                    appliedIds = service.appliedJobIds(viewer, ids)
+                }
+            savedIds = service.savedJobIdsAmong(viewer, ids)
+            counts = this.asCounts(service.applicationsCountByJobIds(ids))
+        }
+        var authors = this.authorsOf(jobs)
+        var slugs = this.slugsOf(jobs)
+        var items = listOf<JobView>()
+        for (var job in jobs) {
+            var owner = authenticated && viewer == job.postedBy
+            var count = 0
+            if (owner) {
+                var known = counts.get(job.id)
+                if (known != null) {
+                    count = known
+                }
+            }
+            items.add(JobViews.internal(job, !owner && appliedIds.contains(job.id), savedIds.contains(job.id), owner, count, authors.get(job.postedBy), this.slugOf(job, slugs)))
+        }
+        var next = Nulls.str()
+        if (jobs.size() == limit) {
+            next = jobs.get(jobs.size() - 1).postedAt
+        }
+        // External jobs come AFTER the internal ones, only on the first page of the public search, honouring the
+        // text search (they have no type/level/place to filter).
+        if (!includeExternal || !externalListingEnabled) {
+            return JobPageView(items, next)
+        }
+        for (var ext in this.externalFound(externalQuery)) {
+            items.add(JobViews.external(ext, false, authenticated))
+        }
+        return JobPageView(items, next)
+    }
+    Map<String,Int> asCounts(counts: Map<String,Int>) = counts
+    // ---------------------------------------------------------------- writes
+    String create() {
+        var userId = Auth.requireUser()
+        SafeLinks.checkRequest()
+        var body = this.createBody()
+        var job = service.create(body.title, body.company, body.logo, body.location, body.type, body.level, body.salary, body.currency, body.salaryMin, body.salaryMax, body.salaryPeriod, body.description, this.skillsOf(body), this.fieldInputs(body), userId, body.communityAgreement, body.companyId)
+        var jobs = listOf<JobRecord>()
+        jobs.add(job)
+        return status(201, json.encode(this.internalView(job, userId, false, false, 0, this.authorsOf(jobs), this.slugsOf(jobs))))
+    }
+    String update() {
+        var userId = Auth.requireUser()
+        SafeLinks.checkRequest()
+        var body = this.createBody()
+        var job = service.update(Req.pathParam("jobId"), body.title, body.company, body.logo, body.location, body.type, body.level, body.salary, body.currency, body.salaryMin, body.salaryMax, body.salaryPeriod, body.description, this.skillsOf(body), this.fieldInputs(body), userId)
+        var jobs = listOf<JobRecord>()
+        jobs.add(job)
+        return json.encode(this.internalView(job, userId, false, false, service.applicationsCount(job.id), this.authorsOf(jobs), this.slugsOf(jobs)))
+    }
+    JobCreateBody createBody() {
+        try {
+            return json.decode<JobCreateBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    List<String> skillsOf(body: JobCreateBody) {
+        var skills = body.skills
+        if (skills == null) {
+            return listOf<String>()
+        }
+        var out = listOf<String>()
+        for (var s in skills) {
+            out.add(s)
+        }
+        return out
+    }
+    List<JobFieldInput> fieldInputs(body: JobCreateBody) {
+        var out = listOf<JobFieldInput>()
+        var fields = body.applicationFields
+        if (fields == null) {
+            return out
+        }
+        for (var f in fields) {
+            out.add(JobFieldInput(f.label, f.type, f.required))
+        }
+        return out
+    }
+    String close() {
+        var userId = Auth.requireUser()
+        var job = service.close(Req.pathParam("jobId"), userId)
+        var jobs = listOf<JobRecord>()
+        jobs.add(job)
+        return json.encode(this.internalView(job, userId, false, false, service.applicationsCount(job.id), this.authorsOf(jobs), this.slugsOf(jobs)))
+    }
+    // The warning comes back in the response: whoever deleted with unanswered candidates must know at once that
+    // the credibility is affected.
+    String remove() {
+        var userId = Auth.requireUser()
+        var result = service.delete(Req.pathParam("jobId"), userId)
+        return json.encode(JobDeleteView(result.jobId, result.unanswered, result.penalized))
+    }
+    String applicationsOf() {
+        var userId = Auth.requireUser()
+        var applications = service.applicationsOf(Req.pathParam("jobId"), userId, Req.queryInt("limit", 50))
+        var out = listOf<JobApplicationView>()
+        for (var a in applications) {
+            out.add(JobApplicationView(a.id, a.jobId, a.status, a.appliedAt, a.answers.size(), JobViews.candidate(a), a.message, JobViews.answers(a), a.feedback, a.reviewedAt))
+        }
+        return json.encode(out)
+    }
+    String myApplications() {
+        var userId = Auth.requireUser()
+        var limit = Req.queryInt("limit", 50)
+        if (limit > 100) {
+            limit = 100
+        }
+        var out = listOf<JobMyApplicationView>()
+        for (var a in service.myApplications(userId, limit)) {
+            var job = service.getById(a.jobId)
+            out.add(JobMyApplicationView(a.id, a.jobId, job.title, job.company, a.status, a.feedback, a.reviewedAt, a.appliedAt))
+        }
+        return json.encode(out)
+    }
+    // The state is validated in the domain; an unknown one is a client error (422), not an internal one.
+    String parseStatus(raw: String?) {
+        if (!Texts.hasText(raw)) {
+            throw Errors.api(422, "INVALID_STATUS", "Informe o novo estado da candidatura.")
+        }
+        var text = (raw as String).trim().toUpperCase()
+        if (!JobRules.knownStatus(text)) {
+            throw Errors.api(422, "INVALID_STATUS", "Estado de candidatura desconhecido: " + raw)
+        }
+        return text
+    }
+    String updateApplicationStatus() {
+        var userId = Auth.requireUser()
+        SafeLinks.checkRequest()
+        var body = this.statusBody()
+        var status = this.parseStatus(body.status)
+        var moved = service.updateApplicationStatus(Req.pathParam("jobId"), Req.pathParam("applicationId"), userId, status, body.feedback)
+        return json.encode(JobApplicationView(moved.id, moved.jobId, moved.status, moved.appliedAt, moved.answers.size(), null, null, listOf<JobAnswerView>(), moved.feedback, moved.reviewedAt))
+    }
+    JobStatusBody statusBody() {
+        try {
+            return json.decode<JobStatusBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    // The body carries the optional message and the answers of the fields the author defined; the required ones
+    // are validated, and the application is delivered to the employer by e-mail and direct message.
+    String apply() {
+        var userId = Auth.requireUser()
+        var jobId = Req.pathParam("jobId")
+        var body = this.applyBody()
+        var hash = Idempotency.hash(jobId + "|" + json.encode(body))
+        var self = this
+        return idem.handle(userId, "POST", "/api/jobs/{jobId}/applications", hash, 201, () -> self.applyAction(jobId, userId, body))
+    }
+    String applyAction(jobId: String, userId: String, body: JobApplyBody) {
+        var inputs = listOf<JobAnswerInput>()
+        var answers = body.answers
+        if (answers != null) {
+            for (var a in answers) {
+                inputs.add(JobAnswerInput(a.fieldId, a.value))
+            }
+        }
+        var application = service.apply(jobId, userId, body.message, inputs)
+        return json.encode(JobApplicationView(application.id, jobId, application.status, application.appliedAt, application.answers.size(), null, null, listOf<JobAnswerView>(), null, null))
+    }
+    // `@RequestBody(required = false)`: no body is an empty application.
+    JobApplyBody applyBody() {
+        if (Req.bodyText().trim().length() == 0) {
+            return JobApplyBody(null, null)
+        }
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<JobApplyBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    String save() {
+        var userId = Auth.requireUser()
+        var jobId = Req.pathParam("jobId")
+        var self = this
+        return idem.handle(userId, "POST", "/api/jobs/{jobId}/saves", Idempotency.hash(jobId), 200, () -> self.saveAction(jobId, userId))
+    }
+    String saveAction(jobId: String, userId: String) {
+        service.save(jobId, userId)
+        return json.encode(JobStatusView(jobId, "SAVED"))
+    }
+    String removeSave() {
+        var userId = Auth.requireUser()
+        var jobId = Req.pathParam("jobId")
+        var self = this
+        return idem.handle(userId, "DELETE", "/api/jobs/{jobId}/saves", Idempotency.hash(jobId), 200, () -> self.removeSaveAction(jobId, userId))
+    }
+    String removeSaveAction(jobId: String, userId: String) {
+        service.removeSave(jobId, userId)
+        return json.encode(JobStatusView(jobId, "UNSAVED"))
+    }
+    // ---------------------------------------------------------------- external jobs
+    // Lists an EXTERNAL job (found on another site): Énóis lists it and "Apply" goes to the origin link. Same
+    // reputation gate as the house job, dedupe by URL and idempotency.
+    String createExternal() {
+        var userId = Auth.requireUser()
+        SafeLinks.checkRequest()
+        var body = this.externalBody()
+        var hash = Idempotency.hash(JobRules.orEmpty(body.title) + "|" + JobRules.orEmpty(body.company) + "|" + JobRules.orEmpty(body.location) + "|" + JobRules.orEmpty(body.url))
+        var self = this
+        return idem.handle(userId, "POST", "/api/jobs/external", hash, 201, () -> self.createExternalAction(userId, body))
+    }
+    String createExternalAction(userId: String, body: JobExternalBody) {
+        var job = externalService.submit(userId, body.title, body.company, body.location, body.url, body.description, body.salaryMin, body.salaryMax, body.salaryPeriod, body.applyEmail, body.communityAgreement, body.salaryNotInformed)
+        return json.encode(JobViews.external(job, true, true))
+    }
+    JobExternalBody externalBody() {
+        try {
+            return json.decode<JobExternalBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    // The external jobs I listed (the screen lists them and lets me delete).
+    String myExternal() {
+        var userId = Auth.requireUser()
+        var out = listOf<JobView>()
+        for (var j in externalService.mine(userId)) {
+            out.add(JobViews.external(j, true, true))
+        }
+        return json.encode(out)
+    }
+    // Deletes an external job LISTED BY ME (the imported ones have no owner).
+    String deleteExternal() {
+        var userId = Auth.requireUser()
+        externalService.remove(userId, Req.pathParam("externalJobId"))
+        return status(204, "")
+    }
+}
+
+// The JSON shapes of the jobs (the toView / toExternalView / toCandidateView of the Java controller).
+class JobViews {
+    static List<JobFieldView> fields(job: JobRecord) {
+        var out = listOf<JobFieldView>()
+        for (var f in job.applicationFields) {
+            out.add(JobFieldView(f.id, f.label, f.type, f.required))
+        }
+        return out
+    }
+    static JobView internal(job: JobRecord, applied: Bool, saved: Bool, owner: Bool, applicationsCount: Int, author: JobAuthorView?, companySlug: String?) = JobView(job.id, job.title, job.company, job.logo, job.location, job.type, job.level, job.salary, job.currency, job.skills, job.postedAt, 0, applied, saved, owner, applicationsCount, author, JobViews.fields(job), job.status, job.closedAt, "INTERNAL", null, null, null, job.description, JobRules.formatCentsOrNull(job.salaryMin), JobRules.formatCentsOrNull(job.salaryMax), job.salaryPeriod, JobRules.salaryLabel(job), false, companySlug)
+    // `showApplyEmail`: the apply e-mail goes only to someone authenticated (the public list used to expose it).
+    static JobView external(job: ExternalJobRecord, owner: Bool, showApplyEmail: Bool) {
+        var email = Nulls.str()
+        if (showApplyEmail) {
+            email = job.applyEmail
+        }
+        return JobView(job.id, job.title, JobRules.orEmpty(job.company), null, job.location, null, null, job.salary, job.currency, listOf<String>(), job.importedAt, 0, false, false, owner, 0, null, listOf<JobFieldView>(), "OPEN", null, "EXTERNAL", job.url, job.platform, email, job.description, job.salaryMin, job.salaryMax, job.salaryPeriod, JobRules.externalSalaryLabel(job), job.salaryNotInformed, null)
+    }
+    // The saved list shows an external job as saved.
+    static JobView asSaved(base: JobView) = JobView(base.id, base.title, base.company, base.logo, base.location, base.type, base.level, base.salary, base.currency, base.skills, base.postedAt, base.matchScore, base.applied, true, false, 0, null, base.applicationFields, base.status, base.closedAt, base.sourceType, base.sourceUrl, base.sourcePlatform, base.applyEmail, base.description, base.salaryMin, base.salaryMax, base.salaryPeriod, base.salaryLabel, base.salaryNotInformed, null)
+    static List<JobAnswerView> answers(a: JobApplicationRecord) {
+        var out = listOf<JobAnswerView>()
+        for (var answer in a.answers) {
+            out.add(JobAnswerView(answer.label, answer.value))
+        }
+        return out
+    }
+    // The candidate as frozen on the application (JSON written at submission); a broken document is an empty one.
+    static JobCandidateView candidate(a: JobApplicationRecord) {
+        var skills = listOf<String>()
+        for (var s in JobSnapshots.list(a, "skills")) {
+            if (s.trim().length() > 0) {
+                skills.add(s)
+            }
+        }
+        return JobCandidateView(a.userId, JobSnapshots.text(a, "name"), JobSnapshots.text(a, "socialName"), JobSnapshots.text(a, "username"), JobSnapshots.text(a, "headline"), JobSnapshots.text(a, "location"), JobSnapshots.text(a, "avatar"), skills, JobSnapshots.intOr(a, "experienceYears"), JobSnapshots.intOr(a, "experiencesCount"), JobSnapshots.intOr(a, "reputation"), JobSnapshots.textOr(a, "identityVerified", "false") == "true", JobSnapshots.text(a, "resumeUrl"), JobSnapshots.text(a, "resumeName"), JobSnapshots.textOr(a, "identity", "SOCIAL"), JobSnapshots.text(a, "industry"))
+    }
+}

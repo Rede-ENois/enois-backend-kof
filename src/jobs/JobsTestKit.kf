@@ -1,0 +1,245 @@
+package jobs
+
+import identity.*
+import kernel.*
+import kernel.db.*
+import kernel.http.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import messaging.*
+import notifications.*
+import profile.*
+
+// A reputation fixed at one value (the Java tests mocked ReputationService to return 300).
+class JobFixedReputation extends JobReputation {
+    Int value
+    public constructor(value: Int) {
+        super()
+        this.value = value
+    }
+    Int of(userId: String) = value
+}
+
+// A job source that answers a fixed list (the stub sources of the Java import tests).
+class JobTestSource extends JobImportSource {
+    String sourceName
+    List<JobSourceItem> found
+    Bool failing = false
+    Int calls = 0
+    public constructor(sourceName: String, found: List<JobSourceItem>) {
+        super()
+        this.sourceName = sourceName
+        this.found = found
+    }
+    String name() = sourceName
+    Bool available() = true
+    List<JobSourceItem> discover(limit: Int) {
+        calls = calls + 1
+        if (failing) {
+            throw "source down"
+        }
+        return found
+    }
+}
+
+// The wire to a source with canned bodies, by URL: no test reaches the network.
+class JobStubTransport extends JobSourceTransport {
+    Map<String,String> bodies = new java.util.HashMap<String, String>()
+    List<String> requested = listOf<String>()
+    public constructor() {
+        super()
+    }
+    String fetch(url: String, userAgent: String, accept: String, timeoutMs: Int) {
+        requested.add(url)
+        var body = bodies.get(url)
+        if (body == null) {
+            throw "OUTBOUND_FAILED"
+        }
+        return body
+    }
+}
+
+// Fixtures of the jobs suites (like kernel.testkit: lives in src so every test file can import it). One booted
+// app per test file: the request pipeline, the shared services, profile, notifications, messaging and the jobs
+// module with a fixed reputation of 300 and a capturing mailer. No source runs and nothing reaches the network.
+//
+//   var app = JobsTestKit.app()
+//   var employer = JobsTestKit.login("emp")                  // verified adult + live session
+//   var res = JobsTestKit.post("/jobs", employer, body)
+class JobsTestKit {
+    static TestApp? jobsKitApp = null
+    static JobsModule? jobsKitModule = null
+    static SharedServices? jobsKitShared = null
+    static IdentityMailer? jobsKitMailer = null
+    static JobStubTransport? jobsKitTransport = null
+    static JobFixedReputation? jobsKitReputation = null
+    static List<JobImportSource> jobsKitSources = listOf<JobImportSource>()
+    static Int jobsKitCounter = 0
+    static TestApp app() = JobsTestKit.bootWith(mapOf())
+    // Boots once per test file; the overrides of the first call win.
+    static TestApp bootWith(overrides: Map<String,String>) {
+        var cur = JobsTestKit.jobsKitApp
+        if (cur != null) {
+            return cur
+        }
+        var merged: Map<String, String> = mapOf()
+        merged.put("REDE_ORIGINS_ENFORCE", "false")
+        merged.put("REDE_JOBS_IMPORT_EXTERNAL_REFRESH_ENABLED", "false")
+        merged.put("REDE_JOBS_IMPORT_JOBRADAR_ENABLED", "false")
+        merged.put("REDE_JOBS_IMPORT_OPEN_APIS_ENABLED", "false")
+        merged.put("REDE_JOBS_IMPORT_EXTERNAL_LISTING_ENABLED", "true")
+        merged.put("REDE_CACHE_JOBS_LIST_TTL", "0ms")
+        merged.put("REDE_CACHE_EXTERNAL_JOBS_TTL", "0ms")
+        for (var k in overrides.keys()) {
+            merged.put(k, overrides.getOrDefault(k, ""))
+        }
+        SecurityClock.reset()
+        var created = TestApp.bootWith("jobs", merged, (p: Platform) -> JobsTestKit.wire(p))
+        JobsTestKit.jobsKitApp = created
+        return created
+    }
+    static wire(p: Platform) {
+        var hooks = SecurityHooks.defaults(p.db)
+        var parts = Security.install(p, hooks)
+        var shared = SharedServices.create(p)
+        var profiles = ProfileModule.install(p, shared, hooks)
+        var notificationsModule = NotificationsModule.install(p, shared, hooks, parts)
+        var messagingModule = MessagingModule.install(p, shared, hooks, parts, notificationsModule)
+        var mailer = IdentityMailer(p.cfg, IdentityStore(p.db), true)
+        var seams = JobSeamSet(p, profiles)
+        var reputation = JobFixedReputation(300)
+        var transport = JobStubTransport()
+        seams.reputation = reputation
+        seams.transport = transport
+        seams.sources = JobsTestKit.jobsKitSources
+        JobsTestKit.jobsKitReputation = reputation
+        JobsTestKit.jobsKitTransport = transport
+        JobsTestKit.jobsKitMailer = mailer
+        JobsTestKit.jobsKitShared = shared
+        JobsTestKit.jobsKitModule = JobsModule.installWith(p, shared, parts, profiles, notificationsModule, messagingModule, mailer, seams)
+        // The outbox worker and the sweeps would keep the test process alive: tests drive them by hand.
+        shared.stop()
+    }
+    static JobsModule module() {
+        JobsTestKit.app()
+        var cur = JobsTestKit.jobsKitModule
+        if (cur == null) {
+            throw "JobsTestKit: module not wired"
+        }
+        return cur
+    }
+    static IdentityMailer mailer() {
+        JobsTestKit.app()
+        var cur = JobsTestKit.jobsKitMailer
+        if (cur == null) {
+            throw "JobsTestKit: mailer not wired"
+        }
+        return cur
+    }
+    static JobStubTransport transport() {
+        JobsTestKit.app()
+        var cur = JobsTestKit.jobsKitTransport
+        if (cur == null) {
+            throw "JobsTestKit: transport not wired"
+        }
+        return cur
+    }
+    static JobFixedReputation reputation() {
+        JobsTestKit.app()
+        var cur = JobsTestKit.jobsKitReputation
+        if (cur == null) {
+            throw "JobsTestKit: reputation not wired"
+        }
+        return cur
+    }
+    static Db db() = JobsTestKit.app().db()
+    static String token(userId: String) = "tok-" + userId + "-1234567890"
+    // A verified adult (birth date declared) with a live one-hour session; id, username and name are the id.
+    static String login(userId: String) {
+        var store = JobsTestKit.db()
+        if (store.queryLong("select count(*) from users where id = ?", DbParams().bindStr(userId)) == 0L) {
+            SecurityFixtures.login(store, userId, JobsTestKit.token(userId))
+            store.execute("update users set birth_date = ? where id = ?", DbParams().bindDate("1990-05-10").bindStr(userId))
+        }
+        return userId
+    }
+    // The state the corporate domain leaves: an ACTIVE professional identity named "Perfil Profissional".
+    static String activateProfessional(userId: String) {
+        JobsTestKit.login(userId)
+        var username = "pro" + userId
+        var now = Time.nowIso()
+        JobsTestKit.db().execute("insert into corporate_profiles (user_id, username, name, status, created_at, updated_at) values (?, ?, 'Perfil Profissional', 'ACTIVE', ?, ?)", DbParams().bindStr(userId).bindStr(username).bindInstant(now).bindInstant(now))
+        return username
+    }
+    static String nextKey() {
+        JobsTestKit.jobsKitCounter = JobsTestKit.jobsKitCounter + 1
+        return "jk-" + JobsTestKit.jobsKitCounter
+    }
+    static TestResponse send(method: String, path: String, userId: String?, body: String, idempotencyKey: String?) {
+        var headers = listOf("Content-Type: application/json")
+        if (userId != null) {
+            headers.add("X-Session-Token: " + JobsTestKit.token(userId))
+        }
+        if (idempotencyKey != null) {
+            headers.add("Idempotency-Key: " + idempotencyKey)
+        }
+        return JobsTestKit.app().client.send(method, path, headers, "", body)
+    }
+    static TestResponse get(path: String, userId: String?) = JobsTestKit.send("GET", path, userId, "", null)
+    // A write with a fresh Idempotency-Key.
+    static TestResponse write(method: String, path: String, userId: String, body: String) = JobsTestKit.send(method, path, userId, body, JobsTestKit.nextKey())
+    static TestResponse post(path: String, userId: String, body: String) = JobsTestKit.write("POST", path, userId, body)
+    static TestResponse put(path: String, userId: String, body: String) = JobsTestKit.write("PUT", path, userId, body)
+    static TestResponse patch(path: String, userId: String, body: String) = JobsTestKit.write("PATCH", path, userId, body)
+    static TestResponse delete(path: String, userId: String) = JobsTestKit.write("DELETE", path, userId, "")
+    static String q(value: String) = json.encode(value)
+    // The body of a valid new job; `fields` is the JSON array of application fields.
+    static String jobBody(title: String, fields: String) = "{\"title\":" + JobsTestKit.q(title) + ",\"company\":\"Acme\",\"location\":\"Remoto\",\"type\":\"CLT\",\"level\":\"PLENO\",\"currency\":\"BRL\",\"salaryMin\":\"1500\",\"salaryPeriod\":\"MONTH\",\"description\":\"Vaga de teste com valor.\",\"skills\":[\"Java\"],\"communityAgreement\":true,\"applicationFields\":" + fields + "}"
+    // POST /jobs; answers the new job id (asserts 201).
+    static String createJob(owner: String, title: String, fields: String) {
+        var res = JobsTestKit.post("/jobs", owner, JobsTestKit.jobBody(title, fields))
+        Check.status(res, 201)
+        return res.json("id")
+    }
+    // POST /jobs/{id}/applications; answers the application id (asserts 201).
+    static String apply(candidate: String, jobId: String, body: String) {
+        var res = JobsTestKit.post("/jobs/" + jobId + "/applications", candidate, body)
+        Check.status(res, 201)
+        return res.json("id")
+    }
+    // Seeds a job row directly (the POST needs reputation and a value the search tests do not care about).
+    static insertJob(id: String, title: String, company: String, location: String, type: String, level: String, skills: List<String>, postedAt: String) {
+        var store = JobsTestKit.db()
+        store.execute("delete from job_skills where job_id = ?", DbParams().bindStr(id))
+        store.execute("delete from jobs where id = ?", DbParams().bindStr(id))
+        store.execute("insert into jobs (id, title, company, location, type, level, salary, currency, posted_by, posted_at, updated_at, community_agreed_at) values (?, ?, ?, ?, ?, ?, null, 'BRL', 'user_job_seed', ?, ?, ?)", DbParams().bindStr(id).bindStr(title).bindStr(company).bindStr(location).bindStr(type).bindStr(level).bindInstant(postedAt).bindInstant(postedAt).bindInstant(postedAt))
+        for (var skill in skills) {
+            store.execute("insert into job_skills (job_id, skill) values (?, ?)", DbParams().bindStr(id).bindStr(skill))
+        }
+    }
+    static setJobPostedBy(jobId: String, userId: String) {
+        JobsTestKit.db().execute("update jobs set posted_by = ? where id = ?", DbParams().bindStr(userId).bindStr(jobId))
+    }
+    // An external job of an aggregator, straight in the table.
+    static insertExternalJob(id: String, title: String, company: String, location: String, url: String, importedAt: String) {
+        var store = JobsTestKit.db()
+        store.execute("delete from external_jobs where id = ?", DbParams().bindStr(id))
+        store.execute("insert into external_jobs (id, platform, external_id, title, company, location, salary, currency, url, imported_at, last_checked_at, external_status) values (?, 'Plataforma Teste', ?, ?, ?, ?, null, 'BRL', ?, ?, ?, 'FOUND')", DbParams().bindStr(id).bindStr(id + "-externo").bindStr(title).bindStr(company).bindStr(location).bindStr(url).bindInstant(importedAt).bindInstant(importedAt))
+    }
+    // An orphan application written straight in the table (the endpoint would refuse it).
+    static insertApplication(jobId: String, userId: String) {
+        var store = JobsTestKit.db()
+        store.execute("delete from job_applications where job_id = ? and user_id = ?", DbParams().bindStr(jobId).bindStr(userId))
+        store.execute("insert into job_applications (job_id, user_id, status, applied_at) values (?, ?, 'APPLIED', ?)", DbParams().bindStr(jobId).bindStr(userId).bindInstant(Time.nowIso()))
+    }
+    // The job tests end here: the shared jobs keep the test process alive otherwise (G124).
+    static finish() {
+        JobsTestKit.app()
+        var shared = JobsTestKit.jobsKitShared
+        if (shared != null) {
+            shared.stop()
+        }
+        JobsTestKit.app().stop()
+    }
+}

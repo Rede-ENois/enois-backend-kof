@@ -1,0 +1,281 @@
+package jobs
+
+import identity.*
+import kernel.db.*
+import kernel.log.*
+import kernel.testkit.*
+import messaging.*
+import notifications.*
+import profile.*
+
+// Reads of the candidate snapshot JSON frozen on an application.
+class JobSnapshots {
+    static String text(application: JobApplicationRecord, field: String) = JobSnapshots.textOr(application, field, "")
+    static String textOr(application: JobApplicationRecord, field: String, fallback: String) {
+        var doc = application.candidateSnapshot
+        if (doc == null) {
+            return fallback
+        }
+        var found = JobSnapshots.read(doc, field)
+        if (found.length() == 0) {
+            return fallback
+        }
+        return found
+    }
+    // A broken document reads as empty, like the Java catch ("" when absent).
+    static String read(doc: String, field: String) {
+        try {
+            var value = JsonPath.str(doc, field)
+            if (value != null) {
+                return value
+            }
+        } catch (String e) {
+            return ""
+        }
+        return ""
+    }
+    static List<String> list(application: JobApplicationRecord, field: String) {
+        var out = listOf<String>()
+        var doc = application.candidateSnapshot
+        if (doc == null) {
+            return out
+        }
+        try {
+            var n = JsonPath.size(doc, field)
+            var i = 0
+            while (i < n) {
+                var item = JsonPath.str(doc, field + "." + i)
+                if (item != null) {
+                    out.add(item)
+                }
+                i = i + 1
+            }
+        } catch (String e) {
+            return listOf<String>()
+        }
+        return out
+    }
+    static Int intOr(application: JobApplicationRecord, field: String) {
+        var text = JobSnapshots.textOr(application, field, "0")
+        if (!text.matches("-?\\d{1,9}")) {
+            return 0
+        }
+        return Integer.parseInt(text)
+    }
+}
+
+// The delivery of an application to whoever published the job (JobApplicationDeliveryAdapter): an e-mail with
+// the candidate's profile and a direct message in the conversation between the two. A failure in either
+// channel never undoes the application (it is already recorded): it is logged.
+class JobApplicationDelivery {
+    Db database
+    ProfileDirectory directory
+    MessagingService messaging
+    IdentityMailer mailer
+    Log log = Log("jobs.delivery")
+    public constructor(database: Db, directory: ProfileDirectory, messaging: MessagingService, mailer: IdentityMailer) {
+        this.database = database
+        this.directory = directory
+        this.messaging = messaging
+        this.mailer = mailer
+    }
+    // The name and @ of the snapshot (the professional identity), never the social @ read now.
+    static String candidateName(application: JobApplicationRecord) {
+        var name = JobSnapshots.text(application, "name")
+        var username = JobSnapshots.text(application, "username")
+        var base = "Candidato(a)"
+        if (name.trim().length() > 0) {
+            base = name
+        }
+        if (username.trim().length() > 0) {
+            return base + " (@" + username + ")"
+        }
+        return base
+    }
+    // Old applications (SOCIAL snapshot) keep pointing at the profile they were made on.
+    static String profilePath(application: JobApplicationRecord, username: String) {
+        if (JobSnapshots.text(application, "identity") == "CORPORATE") {
+            return "/profissional/" + username
+        }
+        return "/perfil/" + username
+    }
+    deliver(job: JobRecord, application: JobApplicationRecord) {
+        var employer = directory.findById(job.postedBy)
+        if (employer == null) {
+            return
+        }
+        var summary = this.summaryText(job, application, JobApplicationDelivery.candidateName(application))
+        // Its own transaction: a refusal of the message (age gate, sanction, rate limit) must not take the
+        // application down with it.
+        var self = this
+        try {
+            database.requiresNew(() -> {
+    var conversationId = self.messaging.pairConversation(application.userId, job.postedBy, "JOB", null)
+    var sent = self.messaging.sendMessage(conversationId, application.userId, summary, null, false, null)
+})
+        } catch (String e) {
+            log.warn("application recorded, but the direct message failed: " + e)
+        }
+        if (employer.email.trim().length() > 0) {
+            var ok = mailer.dispatch("HTML", employer.email, "Nova candidatura: " + job.title, this.emailBody(job, summary))
+        }
+    }
+    // The summary that goes in the DM and the e-mail: what the employer reads first.
+    String summaryText(job: JobRecord, application: JobApplicationRecord, candidateName: String) {
+        var text = "📄 Candidatura para \"" + job.title + "\" (" + job.company + ")\n\n"
+        text = text + "Candidato(a): " + candidateName
+        var headline = JobSnapshots.text(application, "headline")
+        if (headline.trim().length() > 0) {
+            text = text + " — " + headline
+        }
+        text = text + "\n"
+        var resumeUrl = JobSnapshots.text(application, "resumeUrl")
+        if (resumeUrl.trim().length() > 0) {
+            var resumeName = JobSnapshots.text(application, "resumeName")
+            var label = ""
+            if (resumeName.trim().length() > 0) {
+                label = resumeName + " — "
+            }
+            text = text + "Currículo: " + label + resumeUrl + "\n"
+        }
+        var location = JobSnapshots.text(application, "location")
+        if (location.trim().length() > 0) {
+            text = text + "Local: " + location + "\n"
+        }
+        var years = JobSnapshots.intOr(application, "experienceYears")
+        var experiences = JobSnapshots.intOr(application, "experiencesCount")
+        var yearsLabel = " anos"
+        if (years == 1) {
+            yearsLabel = " ano"
+        }
+        var experiencesLabel = " experiências"
+        if (experiences == 1) {
+            experiencesLabel = " experiência"
+        }
+        text = text + "Experiência: " + years + yearsLabel + " (" + experiences + experiencesLabel + ")\n"
+        var verified = " · conta ainda não verificada"
+        if (JobSnapshots.textOr(application, "identityVerified", "false") == "true") {
+            verified = " · conta verificada"
+        }
+        text = text + "Reputação: " + JobSnapshots.intOr(application, "reputation") + verified + "\n"
+        var skills = String.join(", ", JobSnapshots.list(application, "skills"))
+        if (skills.trim().length() > 0) {
+            text = text + "Habilidades: " + skills + "\n"
+        }
+        var username = JobSnapshots.text(application, "username")
+        if (username.trim().length() > 0) {
+            text = text + "Perfil: " + JobApplicationDelivery.profilePath(application, username) + "\n"
+        }
+        var message = application.message
+        if (message != null) {
+            if (message.trim().length() > 0) {
+                text = text + "\nMensagem do candidato:\n" + message + "\n"
+            }
+        }
+        if (!application.answers.isEmpty()) {
+            text = text + "\nRespostas:\n"
+            for (var answer in application.answers) {
+                text = text + "• " + answer.label + ": " + answer.value + "\n"
+            }
+        }
+        return text.trim()
+    }
+    String emailBody(job: JobRecord, summary: String) = "<div style=\"font-family:Inter,Arial,sans-serif;font-size:14px;line-height:1.6;color:#1f2937\">" + "<p>Você recebeu uma candidatura para <strong>" + IdentityMailer.escapeHtml(job.title) + "</strong>.</p>" + "<pre style=\"white-space:pre-wrap;font-family:inherit;background:#f6f5ff;padding:16px;border-radius:12px\">" + IdentityMailer.escapeHtml(summary) + "</pre>" + "<p>Responda pelo app, na conversa direta com o candidato.</p></div>"
+}
+
+// The notice to the CANDIDATE when the state of the application changes (JobApplicationStatusNotifierAdapter):
+// an in-app notification (which also becomes a push), a direct message from the employer and an e-mail. A
+// delivery failure never undoes the state change (it is persisted before).
+class JobApplicationStatusNotifier {
+    Db database
+    ProfileDirectory directory
+    MessagingService messaging
+    IdentityMailer mailer
+    Notifications notifications
+    Log log = Log("jobs.status")
+    public constructor(database: Db, directory: ProfileDirectory, messaging: MessagingService, mailer: IdentityMailer, notifications: Notifications) {
+        this.database = database
+        this.directory = directory
+        this.messaging = messaging
+        this.mailer = mailer
+        this.notifications = notifications
+    }
+    notifyStatusChange(job: JobRecord, application: JobApplicationRecord) {
+        var status = application.status
+        var text = this.messageFor(job, application, status)
+        // No return from the company in the notification: the body can show on a lock screen (push). The return
+        // goes in the direct message, the e-mail and the candidate's list.
+        var notice = notifications.create(application.userId, "JOB_APPLICATION_STATUS", job.postedBy, "Atualização da sua candidatura", this.statusLine(job, status), "/vagas/" + job.id, "Ver vaga")
+        var self = this
+        try {
+            database.requiresNew(() -> {
+    var conversationId = self.messaging.pairConversation(application.userId, job.postedBy, "JOB", null)
+    // It comes from the employer: he decided, in the same application conversation (professional inbox).
+    var sent = self.messaging.sendMessage(conversationId, job.postedBy, text, null, false, null)
+})
+        } catch (String e) {
+            log.warn("status changed, but the direct message failed: " + e)
+        }
+        var candidate = directory.findById(application.userId)
+        if (candidate != null) {
+            if (candidate.email.trim().length() > 0) {
+                var ok = mailer.dispatch("HTML", candidate.email, this.subjectFor(job, status), this.emailBody(job, text))
+            }
+        }
+    }
+    String messageFor(job: JobRecord, application: JobApplicationRecord, status: String) {
+        var base = "📋 Atualização da sua candidatura para \"" + job.title + "\" (" + job.company + ")\n\n"
+        if (status == "IN_REVIEW") {
+            base = base + "Sua candidatura está em análise."
+        }
+        else 
+            if (status == "ADVANCED") {
+                base = base + "Você avançou para a próxima etapa do processo. Fique de olho no seu e-mail."
+            }
+            else 
+                if (status == "NOT_SELECTED") {
+                    base = base + "A empresa seguiu com outras pessoas desta vez. Obrigado por participar."
+                }
+                else {
+                    base = base + "Sua candidatura foi recebida."
+                }
+        var feedback = application.feedback
+        if (feedback == null) {
+            return base
+        }
+        return base + "\n\nRetorno da empresa: " + feedback
+    }
+    String statusLine(job: JobRecord, status: String) {
+        var title = JobApplicationStatusNotifier.subjectText(job.title)
+        if (status == "IN_REVIEW") {
+            return "Sua candidatura para \"" + title + "\" está em análise."
+        }
+        if (status == "ADVANCED") {
+            return "Você avançou no processo de \"" + title + "\"."
+        }
+        if (status == "NOT_SELECTED") {
+            return "A empresa respondeu sobre \"" + title + "\"."
+        }
+        return "Sua candidatura para \"" + title + "\" foi recebida."
+    }
+    String subjectFor(job: JobRecord, status: String) {
+        var title = JobApplicationStatusNotifier.subjectText(job.title)
+        if (status == "IN_REVIEW") {
+            return "Sua candidatura está em análise: " + title
+        }
+        if (status == "ADVANCED") {
+            return "Você avançou no processo: " + title
+        }
+        if (status == "NOT_SELECTED") {
+            return "Sobre a sua candidatura: " + title
+        }
+        return "Candidatura recebida: " + title
+    }
+    // An e-mail subject takes no line break (it would become a header) nor markup.
+    static String subjectText(value: String) = value.replaceAll("[\\r\\n]+", " ").trim()
+    String emailBody(job: JobRecord, text: String) {
+        var body = "<p><strong>" + IdentityMailer.escapeHtml(job.title) + "</strong> — " + IdentityMailer.escapeHtml(job.company) + "</p>"
+        body = body + "<p>" + IdentityMailer.escapeHtml(text).replace("\n", "<br/>") + "</p>"
+        return body + "<p style=\"color:#6b7280;font-size:12px\">" + "Voce recebeu este aviso porque se " + "candidatou a esta vaga no Enois.</p>"
+    }
+}

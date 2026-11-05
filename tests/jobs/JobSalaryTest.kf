@@ -1,0 +1,71 @@
+import kernel.testkit.*
+import jobs.*
+
+// Port of JobSalaryTests: a NEW job says what it is (description) and what it pays (minimum > 0), with a
+// coherent optional range and a period. Without that it is not saved.
+String jobSalaryBody(extra: String) = "{\"title\":\"Backend\",\"company\":\"Acme\",\"location\":\"Remoto\",\"type\":\"CLT\",\"level\":\"PLENO\",\"currency\":\"BRL\",\"salaryMin\":\"1500\",\"salaryPeriod\":\"MONTH\",\"description\":\"Manutenção do legado e café.\",\"skills\":[\"Java\"],\"communityAgreement\":true,\"applicationFields\":[]" + extra + "}"
+
+test "jobWithoutDescriptionIsRejected" {
+    var employer = JobsTestKit.login("salary_employer")
+    var body = jobSalaryBody("").replace("\"description\":\"Manutenção do legado e café.\",", "")
+    Check.apiError(JobsTestKit.post("/jobs", employer, body), 400, "DESCRIPTION_REQUIRED")
+}
+
+test "jobWithoutValueIsRejected" {
+    var employer = JobsTestKit.login("salary_employer")
+    var body = jobSalaryBody("").replace("\"salaryMin\":\"1500\",", "")
+    Check.apiError(JobsTestKit.post("/jobs", employer, body), 400, "SALARY_REQUIRED")
+}
+
+test "zeroOrNegativeValueIsRejected" {
+    var employer = JobsTestKit.login("salary_employer")
+    var body = jobSalaryBody("").replace("\"salaryMin\":\"1500\"", "\"salaryMin\":\"0\"")
+    Check.apiError(JobsTestKit.post("/jobs", employer, body), 400, "SALARY_REQUIRED")
+}
+
+test "invertedRangeIsRejected" {
+    var employer = JobsTestKit.login("salary_employer")
+    var body = jobSalaryBody(",\"salaryMax\":\"1200\"")
+    Check.apiError(JobsTestKit.post("/jobs", employer, body), 400, "INVALID_SALARY_RANGE")
+}
+
+test "invalidPeriodIsRejected" {
+    var employer = JobsTestKit.login("salary_employer")
+    var body = jobSalaryBody("").replace("\"salaryPeriod\":\"MONTH\"", "\"salaryPeriod\":\"WEEK\"")
+    Check.apiError(JobsTestKit.post("/jobs", employer, body), 400, "INVALID_SALARY_PERIOD")
+}
+
+test "validJobIsCreatedWithBrazilianAmountAndLabel" {
+    var employer = JobsTestKit.login("salary_employer")
+    // "1.500" in Portuguese is fifteen hundred; with a range up to "2000".
+    var body = jobSalaryBody(",\"salaryMax\":\"2000\"").replace("\"salaryMin\":\"1500\"", "\"salaryMin\":\"1.500\"")
+    var res = JobsTestKit.post("/jobs", employer, body)
+    Check.status(res, 201)
+    Check.jsonEq(res, "salaryLabel", "de R$ 1.500 até R$ 2.000 / mês")
+    Check.jsonEq(res, "salaryPeriod", "MONTH")
+    Check.jsonEq(res, "description", "Manutenção do legado e café.")
+    var jobId = res.json("id")
+    // The job page (public read) shows the same label.
+    var page = JobsTestKit.get("/jobs/" + jobId, null)
+    Check.status(page, 200)
+    Check.jsonEq(page, "salaryLabel", "de R$ 1.500 até R$ 2.000 / mês")
+    Check.jsonEq(page, "description", "Manutenção do legado e café.")
+}
+
+test "editingAJobKeepsTheRules" {
+    var employer = JobsTestKit.login("salary_employer")
+    var created = JobsTestKit.post("/jobs", employer, jobSalaryBody(""))
+    Check.status(created, 201)
+    var jobId = created.json("id")
+    // Editing without the required value: refused (the rule holds on edit too).
+    var noValue = jobSalaryBody("").replace("\"salaryMin\":\"1500\",", "")
+    Check.apiError(JobsTestKit.put("/jobs/" + jobId, employer, noValue), 400, "SALARY_REQUIRED")
+    // Editing keeping the rule: ok, and the label follows the new range.
+    var ok = JobsTestKit.put("/jobs/" + jobId, employer, jobSalaryBody("").replace("\"salaryMin\":\"1500\"", "\"salaryMin\":\"2500,50\""))
+    Check.status(ok, 200)
+    Check.jsonEq(ok, "salaryLabel", "R$ 2.500,50 / mês")
+}
+
+test "jobs finish" {
+    JobsTestKit.finish()
+}
