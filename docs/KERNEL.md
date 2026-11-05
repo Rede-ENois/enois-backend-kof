@@ -452,7 +452,7 @@ Each job is one virtual-thread loop: never overlaps itself, a throwing job is lo
 (reentrant). Callers wait their turn; there is no cross-pod lock. A `finally` after a rethrow is unsafe (G12): capture the
 failure, `leave()`, then rethrow.
 
-`ZoneDates` also has `localToInstant(localDateTime, zone)` (a zone wall-clock time to its UTC instant),
+`ZoneDates` also has `formatLocal(iso, zone, pattern)` (wall-clock text, e.g. `"dd/MM/yyyy HH:mm"`), `localToInstant(localDateTime, zone)` (a zone wall-clock time to its UTC instant),
 `dayOfWeek(day)` (1 = Monday) and `weekStart(day)` (the Monday of the ISO week).
 
 ## kernel.log and PII
