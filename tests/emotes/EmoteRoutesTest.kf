@@ -157,7 +157,13 @@ EmotesModule ertModule(catalog: List<Emote>, fetcher: ErtFetcher) {
 
 // The image route runs behind the binary lane: a booted app per catalog, with the module and a counting fetcher.
 class ErtImageHolder {
-    static Map<String, TestApp> apps = mapOf<String, TestApp>()
+    static stopAll() {
+        for (var app in ErtImageHolder.started) {
+            app.stop()
+        }
+    }
+    static Map<String,TestApp> apps = mapOf<String, TestApp>()
+    static List<TestApp> started = listOf<TestApp>()
     static ErtFetcher fetcher = ErtFetcher()
     static TestApp get(name: String, catalog: List<Emote>) {
         var cur = ErtImageHolder.apps.get(name)
@@ -165,11 +171,12 @@ class ErtImageHolder {
             return cur
         }
         var made = TestApp.bootWire(name, (p: Platform) -> {
-            var service = EmoteCatalogService(listOf<EmoteSource>(), ErtSource(catalog))
-            ErtImageHolder.fetcher = ErtFetcher()
-            EmoteRoutes.registerImage(p.server, EmotesModule(service, EmoteImageCache(ErtImageHolder.fetcher)))
-        })
+    var service = EmoteCatalogService(listOf<EmoteSource>(), ErtSource(catalog))
+    ErtImageHolder.fetcher = ErtFetcher()
+    EmoteRoutes.registerImage(p.server, EmotesModule(service, EmoteImageCache(ErtImageHolder.fetcher)))
+})
         ErtImageHolder.apps.put(name, made)
+        ErtImageHolder.started.add(made)
         return made
     }
 }
@@ -229,4 +236,9 @@ test "the module wires the routes and boots from the embedded snapshot with the 
     Check.isTrue("index is served", app.client.get("/emotes/index").body.length() > 1000)
     jobs.stop()
     app.stop()
+}
+
+test "zz image apps stop" {
+    // the binary front's threads keep the test process alive otherwise
+    ErtImageHolder.stopAll()
 }
