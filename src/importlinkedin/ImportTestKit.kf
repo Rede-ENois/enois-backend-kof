@@ -1,0 +1,107 @@
+package importlinkedin
+
+import identity.*
+import importresume.*
+import jobs.*
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import messaging.*
+import notifications.*
+import profile.*
+
+// Fixtures of the import suites (like kernel.testkit: lives in src so every test file can import it). One booted app
+// per test file: the request pipeline, the shared services, profile + network, the jobs module and the two import
+// modules. Users come from SecurityFixtures with a live session.
+class ImportTestKit {
+    static TestApp? importKitApp = null
+    static LinkedinImportModule? importKitLinkedin = null
+    static ImportResumeModule? importKitResume = null
+    static JobsModule? importKitJobs = null
+    static SharedServices? importKitShared = null
+    static TestApp app() {
+        var cur = ImportTestKit.importKitApp
+        if (cur != null) {
+            return cur
+        }
+        Map<String,String> cfg = mapOf()
+        cfg.put("REDE_ORIGINS_ENFORCE", "false")
+        cfg.put("REDE_JOBS_IMPORT_EXTERNAL_REFRESH_ENABLED", "false")
+        cfg.put("REDE_JOBS_IMPORT_JOBRADAR_ENABLED", "false")
+        cfg.put("REDE_JOBS_IMPORT_OPEN_APIS_ENABLED", "false")
+        SecurityClock.reset()
+        var created = TestApp.bootWith("import", cfg, (p: Platform) -> ImportTestKit.wire(p))
+        ImportTestKit.importKitApp = created
+        return created
+    }
+    static wire(p: Platform) {
+        var hooks = SecurityHooks.defaults(p.db)
+        var parts = Security.install(p, hooks)
+        var shared = SharedServices.create(p)
+        var profiles = ProfileModule.install(p, shared, hooks)
+        var notificationsModule = NotificationsModule.install(p, shared, hooks, parts)
+        var messagingModule = MessagingModule.install(p, shared, hooks, parts, notificationsModule)
+        var seams = JobSeamSet(p, profiles)
+        seams.reputation = JobFixedReputation(300)
+        var jobs = JobsModule.installWith(p, shared, parts, profiles, notificationsModule, messagingModule, IdentityMailer(p.cfg, IdentityStore(p.db), true), seams)
+        var linkedin = LinkedinImportModule.install(p, shared, profiles)
+        ImportTestKit.importKitJobs = jobs
+        ImportTestKit.importKitLinkedin = linkedin
+        ImportTestKit.importKitResume = ImportResumeModule.install(jobs, linkedin)
+        ImportTestKit.importKitShared = shared
+        // The outbox worker and the sweeps would keep the test process alive: tests drive them by hand.
+        shared.stop()
+    }
+    static LinkedinImportModule linkedin() {
+        ImportTestKit.app()
+        var cur = ImportTestKit.importKitLinkedin
+        if (cur == null) {
+            throw "ImportTestKit: not wired"
+        }
+        return cur
+    }
+    static ImportResumeModule resume() {
+        ImportTestKit.app()
+        var cur = ImportTestKit.importKitResume
+        if (cur == null) {
+            throw "ImportTestKit: not wired"
+        }
+        return cur
+    }
+    static JobsModule jobs() {
+        ImportTestKit.app()
+        var cur = ImportTestKit.importKitJobs
+        if (cur == null) {
+            throw "ImportTestKit: not wired"
+        }
+        return cur
+    }
+    static Db db() = ImportTestKit.app().db()
+    static String token(userId: String) = "tok-" + userId + "-1234567890"
+    // A verified user with a live one-hour session; id, username and name are the id.
+    static String login(userId: String) {
+        if (ImportTestKit.db().queryLong("select count(*) from users where id = ?", DbParams().bindStr(userId)) == 0L) {
+            SecurityFixtures.login(ImportTestKit.db(), userId, ImportTestKit.token(userId))
+        }
+        return userId
+    }
+    static TestResponse send(method: String, path: String, userId: String?, body: String) {
+        var headers = listOf("Content-Type: application/json")
+        if (userId != null) {
+            headers.add("X-Session-Token: " + ImportTestKit.token(userId))
+        }
+        return ImportTestKit.app().client.send(method, path, headers, "", body)
+    }
+    static TestResponse get(path: String, userId: String?) = ImportTestKit.send("GET", path, userId, "")
+    static TestResponse put(path: String, userId: String, body: String) = ImportTestKit.send("PUT", path, userId, body)
+    static TestResponse post(path: String, userId: String, body: String) = ImportTestKit.send("POST", path, userId, body)
+    static finish() {
+        ImportTestKit.app()
+        var shared = ImportTestKit.importKitShared
+        if (shared != null) {
+            shared.stop()
+        }
+        ImportTestKit.app().stop()
+    }
+}

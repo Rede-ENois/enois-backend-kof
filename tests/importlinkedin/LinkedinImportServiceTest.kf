@@ -1,0 +1,288 @@
+import importlinkedin.*
+import kernel.error.*
+import kernel.files.*
+import kernel.testkit.*
+
+// Port of LinkedinImportServiceTests + LinkedinImportBombTests on the service (the upload endpoints wait for the
+// binary lane; here the ZIP is a temp file, which is what the lane hands over).
+LinkedinImportService svc() = LinkedinImportService.withDefaults()
+
+String positionsHeader() = "\"Position Title\",\"Company Name\",\"Location\",\"Description\",\"Started On\",\"Finished On\""
+
+// A ZIP with the given (name, content) text entries.
+String zip(entries: List<List<String>>) {
+    var z = ZipFixtures.start()
+    for (var e in entries) {
+        z.text(e.get(0), e.get(1))
+    }
+    return z.finish()
+}
+
+List<String> e(name: String, content: String) = listOf(name, content)
+
+LinkedinProfilePreview prof(preview: LinkedinImportPreview) {
+    var p = preview.profile
+    if (p == null) {
+        throw "FAIL: the preview has no profile"
+    }
+    return p
+}
+
+String failure(op: String, path: String) {
+    try {
+        if (op == "archive") {
+            svc().parseArchive(path)
+        }
+        if (op == "contacts") {
+            svc().parseContacts(path)
+        }
+    } catch (String err) {
+        return err
+    }
+    return ""
+}
+
+test "parsesPositionsFullRoundTrip" {
+    var quoted = "\"Engenheira de Software\",\"Énóis, LTDA\",\"Remoto\",\"Construí coisas, com vírgulas, e \"\"aspas\"\" dentro.\",\"2020-01\",\"2022-06\""
+    var preview = svc().parseArchive(zip(listOf(e("Positions.csv", positionsHeader() + "\n" + quoted + "\n\"Tech Lead\",\"Nubank\",\"São Paulo\",\"Liderança de time\",\"\",\"\""), e("Education.csv", ""), e("Certifications.csv", ""), e("Projects.csv", ""))))
+    Check.eqInt("experiences", 2, preview.experiences.size())
+    var first = preview.experiences.get(0)
+    Check.eqStr("title", "Engenheira de Software", "" + first.title)
+    Check.eqStr("company", "Énóis, LTDA", "" + first.company)
+    Check.eqStr("description", "Construí coisas, com vírgulas, e \"aspas\" dentro.", "" + first.description)
+    Check.eqStr("start", "2020-01-01", "" + first.startDate)
+    Check.eqStr("end", "2022-06-01", "" + first.endDate)
+    Check.isTrue("not current", !first.currentlyHere)
+    var second = preview.experiences.get(1)
+    Check.eqStr("company 2", "Nubank", "" + second.company)
+    Check.isTrue("no start", second.startDate == null)
+    Check.isTrue("current", second.currentlyHere)
+}
+
+// The CURRENT export headers: `Title` (was `Position Title`) and `Degree Name` (was `Degree`); dates in full ISO.
+test "readsTheCurrentExportHeadersAndProducesIsoDates" {
+    var preview = svc().parseArchive(zip(listOf(e("Positions.csv", "Company Name,Title,Description,Location,Started On,Finished On\n\"É Nóis\",\"Desenvolvedora\",\"\",\"remoto\",\"Oct 2026\",\"\""), e("Education.csv", "School Name,Start Date,End Date,Notes,Degree Name,Activities\n\"UFPR\",\"2012-03\",\"2015-12\",\"\",\"Bacharelado\",\"\""), e("Profile.csv", "First Name,Last Name,Headline,Summary,Industry,Geo Location\n\"Mel\",\"Santos\",\"Dev\",\"resumo\",\"Tech\",\"Arapongas, PR\""))))
+    var experience = preview.experiences.get(0)
+    Check.eqStr("title", "Desenvolvedora", "" + experience.title)
+    Check.eqStr("start", "2026-10-01", "" + experience.startDate)
+    Check.isTrue("current", experience.currentlyHere)
+    var education = preview.education.get(0)
+    Check.eqStr("degree", "Bacharelado", "" + education.degree)
+    Check.eqStr("start", "2012-03-01", "" + education.startDate)
+}
+
+test "parsesEducationCertificationsAndProjects" {
+    var preview = svc().parseArchive(zip(listOf(e("Positions.csv", positionsHeader() + "\n\"Dev\",\"Acme\",\"Remoto\",\"\",\"2020-01\",\"\""), e("Education.csv", "\"School Name\",\"Degree\",\"Field of Study\",\"Notes\",\"Start Date\",\"End Date\"\n\"UFPE\",\"Bacharelado\",\"Ciência da Computação\",\"\",\"2012-03\",\"2017-12\""), e("Certifications.csv", "\"Name\",\"Authority\",\"URL\",\"Time Period\"\n\"AWS Solutions Architect\",\"Amazon Web Services\",\"https://credly.com/x\",\"2021-05\""), e("Projects.csv", "\"Title\",\"Description\",\"URL\",\"Started On\",\"Finished On\"\n\"compilador\",\"um compilador de verdade\",\"https://github.com/eu/comp\",\"2023-02\",\"2024-01\""))))
+    Check.eqInt("education", 1, preview.education.size())
+    Check.eqStr("school", "UFPE", preview.education.get(0).school)
+    Check.eqStr("start", "2012-03-01", "" + preview.education.get(0).startDate)
+    Check.eqInt("certifications", 1, preview.certifications.size())
+    Check.eqStr("cert", "AWS Solutions Architect", preview.certifications.get(0).name)
+    Check.eqStr("issue", "2021-05-01", "" + preview.certifications.get(0).issueDate)
+    Check.eqInt("projects", 1, preview.projects.size())
+    Check.eqStr("url", "https://github.com/eu/comp", "" + preview.projects.get(0).url)
+    Check.eqInt("found", 4, preview.found)
+}
+
+test "parsesPortugueseMonthNames" {
+    var preview = svc().parseArchive(zip(listOf(e("Positions.csv", "\"Position Title\",\"Company Name\",\"Started On\"\n\"Dev\",\"Acme\",\"mar de 2021\""), e("Education.csv", ""), e("Certifications.csv", ""), e("Projects.csv", ""))))
+    Check.eqStr("start", "2021-03-01", "" + preview.experiences.get(0).startDate)
+}
+
+test "refusesNonLinkedinFile" {
+    JobsHas("Não encontrei os CSVs", failure("archive", zip(listOf(e("outra-coisa.csv", "nada aqui")))))
+}
+
+JobsHas(needle: String, text: String) {
+    if (!text.contains(needle)) {
+        throw "FAIL: [" + needle + "] not in [" + text + "]"
+    }
+}
+
+// The FAST export has no Positions.csv: it is accepted with what it has (the profile), not a dead end.
+test "parsesTheFastExportWithProfileOnly" {
+    var preview = svc().parseArchive(zip(listOf(e("Registration.csv", "foo,bar\n1,2"), e("Profile.csv", "\"First Name\",\"Last Name\",\"Headline\",\"Summary\",\"Industry\",\"Geo Location\"\n\"Mel\",\"Santos\",\"Criadora da linguagem Kof\",\" Sou engenheira de software\",\"Technology\",\"Arapongas, Paraná, Brasil\""))))
+    Check.eqInt("experiences", 0, preview.experiences.size())
+    Check.eqInt("education", 0, preview.education.size())
+    var profile = preview.profile
+    Check.isTrue("profile", profile != null)
+    Check.eqStr("name", "Mel Santos", "" + prof(preview).name)
+    Check.eqStr("headline", "Criadora da linguagem Kof", "" + prof(preview).headline)
+    Check.eqStr("location", "Arapongas, Paraná, Brasil", "" + prof(preview).location)
+    Check.eqInt("found", 1, preview.found)
+}
+
+test "refusesEmptyAndHuge" {
+    Check.isTrue("no file", failure("archive", "").length() > 0)
+    var huge = UploadFiles.create("huge-", ".zip")
+    var out = new java.io.FileOutputStream(huge)
+    var chunk = new Byte[1048576]
+    var i = 0
+    while (i < 6) {
+        out.write(chunk, 0, 1048576)
+        i = i + 1
+    }
+    out.close()
+    Check.isTrue("FILE_TOO_LARGE", Errors.hasCode(failure("archive", huge), "FILE_TOO_LARGE"))
+}
+
+test "parsesProfileSkillsPublicationsAndCountsTheRest" {
+    var preview = svc().parseArchive(zip(listOf(e("Profile.csv", "\"First Name\",\"Last Name\",\"Headline\",\"Summary\",\"Geo Location\",\"Industry\"\n\"Ada\",\"Silva\",\"Dev backend\",\"Gosto de café e código.\",\"São Paulo, Brasil\",\"Software\""), e("Skills.csv", "\"Name\"\n\"Java\"\n\"Spring\"\n\"Kof\""), e("Positions.csv", positionsHeader() + "\n\"Dev\",\"Acme\",\"SP\",\"\",\"2020-01\",\"\""), e("Publications.csv", "\"Title\",\"Description\",\"Url\",\"Published On\"\n\"Artigo de IA\",\"Sobre LLMs\",\"https://ex.com/ia\",\"2023-05\""), e("Languages.csv", "\"Name\",\"Proficiency\"\n\"Português\",\"Nativo\"\n\"Inglês\",\"Fluente\""), e("Honors & Awards.csv", "\"Title\",\"Issuer\"\n\"Hackathon\",\"Acme\""), e("Courses.csv", "\"Name\",\"Number\"\n\"Spring Boot\",\"1\""), e("Volunteering.csv", "\"Company Name\",\"Role\"\n\"ONG\",\"Mentora\""))))
+    Check.eqStr("name", "Ada Silva", "" + prof(preview).name)
+    Check.eqStr("headline", "Dev backend", "" + prof(preview).headline)
+    Check.eqStr("location", "São Paulo, Brasil", "" + prof(preview).location)
+    Check.eqStr("summary", "Gosto de café e código.", "" + prof(preview).summary)
+    Check.eqStr("skills", "Java,Spring,Kof", String.join(",", preview.skills))
+    Check.eqInt("projects", 1, preview.projects.size())
+    Check.eqStr("publication title", "Artigo de IA", preview.projects.get(0).title)
+    Check.eqStr("publication url", "https://ex.com/ia", "" + preview.projects.get(0).url)
+    Check.eqInt("Idiomas", 2, preview.semEstrutura.getOrDefault("Idiomas", 0))
+    Check.eqInt("Prêmios", 1, preview.semEstrutura.getOrDefault("Prêmios", 0))
+    Check.eqInt("Cursos", 1, preview.semEstrutura.getOrDefault("Cursos", 0))
+    Check.eqInt("Voluntariado", 1, preview.semEstrutura.getOrDefault("Voluntariado", 0))
+    Check.isTrue("found counts what can be imported", preview.found >= 6)
+}
+
+test "parsesPastedProfileText" {
+    var pasted = "Mel Santos\nDesenvolvedora Java · Énóis\n\nSobre\nConstruo coisas na internet. Gosto de café e código.\n\nExperiência\nDesenvolvedora Backend\nÉnóis\nmar de 2021 - o momento · 4 anos 2 meses\nSão Paulo, Brasil\nConstruí o feed, a carteira e a lojinha.\nVer mais\n\nDesenvolvedora\nAcme Ltda\njan de 2019 - fev de 2021 · 2 anos 2 meses\nRemoto\nAPIs em Java.\n\nFormação acadêmica\nUniversidade de São Paulo\nBacharelado, Ciência da Computação\n2015 - 2019\n\nLicenças e certificações\nOracle Certified Professional: Java SE\nOracle\nEmitido em mar de 2022 · Sem validade\nCredencial ID 123 | https://certs.example.com/ocp\n\nProjetos\nKofBot\njan de 2020 - dez de 2020\nUm bot de doações.\n\nHabilidades\nJava, Spring Boot\nPostgreSQL\n"
+    var preview = svc().parseText(pasted)
+    Check.eqInt("experiences", 2, preview.experiences.size())
+    var first = preview.experiences.get(0)
+    Check.eqStr("title", "Desenvolvedora Backend", "" + first.title)
+    Check.eqStr("company", "Énóis", "" + first.company)
+    Check.eqStr("location", "São Paulo, Brasil", "" + first.location)
+    Check.eqStr("start", "2021-03-01", "" + first.startDate)
+    Check.isTrue("no end", first.endDate == null)
+    Check.isTrue("current", first.currentlyHere)
+    Check.eqStr("description", "Construí o feed, a carteira e a lojinha.", "" + first.description)
+    var second = preview.experiences.get(1)
+    Check.eqStr("title 2", "Desenvolvedora", "" + second.title)
+    Check.eqStr("company 2", "Acme Ltda", "" + second.company)
+    Check.eqStr("start 2", "2019-01-01", "" + second.startDate)
+    Check.eqStr("end 2", "2021-02-01", "" + second.endDate)
+    Check.isTrue("not current", !second.currentlyHere)
+    // The "Ver mais" of LinkedIn is not a description and the next item's title does not leak in.
+    var description = "" + second.description
+    Check.isTrue("no next title", !description.contains("Desenvolvedora"))
+    Check.isTrue("no Ver mais", !description.contains("Ver mais"))
+    Check.eqInt("education", 1, preview.education.size())
+    Check.eqStr("school", "Universidade de São Paulo", preview.education.get(0).school)
+    Check.eqStr("degree", "Bacharelado, Ciência da Computação", "" + preview.education.get(0).degree)
+    Check.eqStr("edu start", "2015-01-01", "" + preview.education.get(0).startDate)
+    Check.eqStr("edu end", "2019-12-01", "" + preview.education.get(0).endDate)
+    Check.eqInt("certifications", 1, preview.certifications.size())
+    var cert = preview.certifications.get(0)
+    Check.eqStr("cert name", "Oracle Certified Professional: Java SE", cert.name)
+    Check.eqStr("issuer", "Oracle", "" + cert.issuer)
+    Check.eqStr("issued", "2022-03-01", "" + cert.issueDate)
+    Check.eqStr("credential", "https://certs.example.com/ocp", "" + cert.credentialUrl)
+    Check.eqInt("projects", 1, preview.projects.size())
+    Check.eqStr("project", "KofBot", preview.projects.get(0).title)
+    Check.eqStr("project start", "2020-01-01", "" + preview.projects.get(0).startDate)
+    Check.eqStr("project end", "2020-12-01", "" + preview.projects.get(0).endDate)
+    Check.eqStr("skills", "Java,Spring Boot,PostgreSQL", String.join(",", preview.skills))
+    Check.eqStr("profile name", "Mel Santos", "" + prof(preview).name)
+    Check.eqStr("headline", "Desenvolvedora Java · Énóis", "" + prof(preview).headline)
+    Check.isTrue("summary", ("" + prof(preview).summary).contains("Gosto de café"))
+}
+
+test "rejectsEmptyPastedText" {
+    var failed = ""
+    try {
+        svc().parseText("   ")
+    } catch (String err) {
+        failed = err
+    }
+    Check.isTrue("TEXT_REQUIRED", Errors.hasCode(failed, "TEXT_REQUIRED"))
+}
+
+// ---------------- zip-bomb guard ----------------
+Bool tooLarge(path: String) {
+    var err = failure("archive", path)
+    return Errors.hasCode(err, "IMPORT_TOO_LARGE") && Errors.parse(err).status() == 413
+}
+
+test "rejectsHighRatioCsvEntry" {
+    var z = ZipFixtures.start()
+    z.zeros("Basic_LinkedInDataExport/Positions.csv", 60 * 1024 * 1024)
+    var path = z.finish()
+    Check.isTrue("tiny on disk", UploadFiles.size(path) < 200L * 1024L)
+    Check.isTrue("413 IMPORT_TOO_LARGE", tooLarge(path))
+}
+
+// A big photo or message dump in a full export must not cost the import: it is skipped from the central
+// directory, so even a 60 MB bomb there is harmless.
+test "entriesTheImporterDoesNotUseAreNeverInflated" {
+    var z = ZipFixtures.start()
+    z.zeros("Basic_LinkedInDataExport/Rich_Media/huge.bin", 60 * 1024 * 1024)
+    z.zeros("Basic_LinkedInDataExport/messages.csv", 60 * 1024 * 1024)
+    z.text("Basic_LinkedInDataExport/Positions.csv", "Company Name,Title,Started On\nAcme,Engenheira,Jan 2020\n")
+    var preview = svc().parseArchive(z.finish())
+    Check.eqInt("experiences", 1, preview.experiences.size())
+    Check.eqStr("company", "Acme", "" + preview.experiences.get(0).company)
+}
+
+test "rejectsWhenTheTotalCrossesTheBudget" {
+    var small = LinkedinImportService(1024L * 1024L)
+    // Incompressible content: only the total budget can stop it, not the ratio cap.
+    var z = ZipFixtures.start()
+    z.noise("Positions.csv", 512 * 1024, 7L)
+    z.noise("Education.csv", 512 * 1024, 8L)
+    z.noise("Skills.csv", 512 * 1024, 9L)
+    var failed = ""
+    try {
+        small.parseArchive(z.finish())
+    } catch (String err) {
+        failed = err
+    }
+    Check.isTrue("IMPORT_TOO_LARGE", Errors.hasCode(failed, "IMPORT_TOO_LARGE"))
+}
+
+test "rejectsTooManyEntries" {
+    var z = ZipFixtures.start()
+    var i = 0
+    while (i < 51) {
+        z.text("Entry" + i + ".csv", "x")
+        i = i + 1
+    }
+    Check.isTrue("413", tooLarge(z.finish()))
+}
+
+// ---------------- Connections.csv ----------------
+String connectionsCsv(names: List<String>) {
+    var csv = "Notes:\n\"Quando você exporta seus dados, os contatos vêm neste arquivo.\"\n\nFirst Name,Last Name,URL,Email Address,Company,Position,Connected On\n"
+    for (var name in names) {
+        var space = name.lastIndexOf(" ")
+        csv = csv + name.substring(0, space) + "," + name.substring(space + 1) + ",https://www.linkedin.com/in/x,,Empresa,Cargo,01 Jan 2024\n"
+    }
+    return csv
+}
+
+test "readsTheContactsOfALoneCsvSkippingTheNoteLines" {
+    var contacts = svc().parseContacts(UploadFiles.writeText(connectionsCsv(listOf("Zulmira Qa", "Ana Ambigua", "Ana Ambigua", "Zé Ninguem")) + "Solo,,,solo@mail.com,,,\n"))
+    // The duplicate name is read once.
+    Check.eqInt("contacts", 4, contacts.size())
+    Check.eqStr("first", "Zulmira Qa", contacts.get(0).name)
+    Check.eqStr("email lower-cased", "solo@mail.com", "" + contacts.get(3).email)
+}
+
+test "readsTheConnectionsOfTheZipByItsSimpleName" {
+    var z = ZipFixtures.start()
+    z.text("Basic_LinkedInDataExport/Connections.csv", connectionsCsv(listOf("Dora Qa")))
+    var contacts = svc().parseContacts(z.finish())
+    Check.eqInt("contacts", 1, contacts.size())
+    Check.eqStr("name", "Dora Qa", contacts.get(0).name)
+}
+
+test "aZipWithoutConnectionsIsRefused" {
+    var z = ZipFixtures.start()
+    z.text("Positions.csv", "Company Name,Title\nAcme,Dev")
+    Check.isTrue("CONNECTIONS_NOT_FOUND", Errors.hasCode(failure("contacts", z.finish()), "CONNECTIONS_NOT_FOUND"))
+}
+
+test "contactsNeedAFileAndAnUnreadableOneIsRefusedWithoutA500" {
+    Check.isTrue("FILE_REQUIRED", Errors.hasCode(failure("contacts", ""), "FILE_REQUIRED"))
+    Check.isTrue("FILE_REQUIRED for an empty file", Errors.hasCode(failure("contacts", UploadFiles.create("empty-", ".csv")), "FILE_REQUIRED"))
+    var broken = UploadFiles.writeText("PK this is not a zip")
+    Check.isTrue("INVALID_FILE", Errors.hasCode(failure("contacts", broken), "INVALID_FILE"))
+}

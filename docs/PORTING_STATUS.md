@@ -677,3 +677,54 @@ Total: 49 of 49 endpoints, 102 of 103 Java tests ported.
 ### Kernel files added or changed by this slice
 
 `kernel/http/Req.kf` (`queryAll`, `queryParam`, `formDecode`, raw-query decoding), `kernel/http/OutboundHttp.kf` (later merged into `Outbound.kf`), `kernel/text/{Regexes,Texts,Contrast,HtmlTemplate,Numbers}.kf`, `kernel/url/OriginNormalizer.kf`, `kernel/time/ZoneDates.kf`, `kernel/log/Log.kf` (`LogTap`), `kernel/db/Db.kf` (`poolStats`), `kernel/monitoring/{DayLog,HostResources,RequestMetrics,EventBuffer}.kf`. Gaps found: G220 to G230 in `KOF_GAPS.md`.
+
+## jobs, importresume, importlinkedin
+
+Slug `jobs`, branch `port/jobs`. Modules installed in `Main.kf`: `ProfileModule` now comes BEFORE identity (the identity job eligibility rule reads the live reputation of the profile domain through `IdentitySeams.reputations = JobsIdentityReputation(...)`); then, after messaging/calls, `JobsModule.installWith(...)`, `LinkedinImportModule.install(platform, shared, profiles)` and `ImportResumeModule.install(jobs, linkedinImport)`. Jobs on `kernel.jobs`: `external-jobs-boot-seed`, `external-jobs-refresh` (cron), `linkedin-contact-invites` (the `LinkedinContactInviteWorker`).
+
+| Domain | Endpoints ported/total | Kof tests | Java tests ported/total |
+|---|---|---|---|
+| jobs (`src/jobs`) | 20/20 | `tests/jobs/*` (108, 17 files; includes the eligibility policy, `OpenJobApiSource` over a stub transport, `UrlCanonical`, `HtmlEntities`, `Db.requiresNew`) | 94/94 methods (one loses two assertions, see below) |
+| importlinkedin (`src/importlinkedin`) | 4/6 (`POST /texto`, `GET /contatos/resumo`, `PUT /contatos/auto-convite`, `GET /contatos`); `POST /me/import/linkedin` and `POST /me/import/linkedin/contatos` wait for the binary lane | `tests/importlinkedin/*` | 18/20 (the two `LinkedinImportUploadLimitTests` are transport tests, they wait for the lane) |
+| importresume (`src/importresume`) | 0/2 over HTTP: `POST /me/import/resume` and `POST /me/import/resume/prefill/{jobId}` are multipart uploads, so they wait for the binary lane; the services behind them (`ResumeImportService.parse/extractText/prefill`, `ResumePrefillService`) are complete and tested on the uploaded temp file | `tests/importresume/ResumeImportServiceTest` | 9/9 |
+
+### What wait for the binary lane
+
+`src/kernel/http/BinaryLane.kf` and `BinaryFront.kf` are on `main` and merged here, but they do not fit these four endpoints yet, so the routes are NOT registered (an unregistered route answers `200` with an empty body, so the front would see a silent success). Measured in `BinaryFront.kf`: the upload branch is `method == "PUT"` only (the download branch `GET`), the claim is a path PREFIX (`BinaryLane.owns` uses `startsWith`) and the body that reaches the route is the raw request body in a temp file. The four endpoints are `POST` `multipart/form-data`, and their prefixes share paths with ordinary routes (`PUT /me/import/linkedin/contatos/auto-convite`, `GET .../contatos`, `POST .../texto`), which a prefix claim would pull into the upload dance. What the lane needs for them (a kernel change owned by the media/lane work, not done here to avoid redesigning another agent's file):
+
+1. `POST` accepted in the upload branch next to `PUT`, with claims matched by method and exact path (or a claim list of `(method, path)`).
+2. A multipart step that extracts the `file` part of the temp file (boundary from `Content-Type`) into its own temp file.
+
+Everything behind the upload is done and tested with files on disk, which is what step 2 would hand over (`UploadFiles`, a temp path); wiring each route is then a few lines:
+
+- `POST /me/import/linkedin` -> `LinkedinImportService.parseArchive(path)` (413 `IMPORT_TOO_LARGE` zip-bomb guard, `REDE_IMPORT_LINKEDIN_MAX_UNCOMPRESSED_BYTES`, 5 MB `FILE_TOO_LARGE`).
+- `POST /me/import/linkedin/contatos` -> `LinkedinImportService.parseContacts(path)` then `LinkedinContactInviteService.importContacts(userId, contacts)`.
+- `POST /me/import/resume` -> `ResumeImportService.parse(path, originalName, contentType)`.
+- `POST /me/import/resume/prefill/{jobId}` -> `ResumePrefillService.prefill(userId, jobId, ResumeImportService.extractText(path, name, type))`.
+- The Java `LinkedinImportUploadLimitTests` (a 3 MB zip reaches the controller, an 8.45 MB one gets 413 `FILE_TOO_LARGE` over a real socket) belong with the lane wiring; a module that claims a prefix must also stop the platform at the end of its suite (see `tests/media/MediaContractTest`).
+
+### Seams replaced by real module APIs
+
+| Seam (Java dependency) | Now |
+|---|---|
+| `ReputationService` (job gate, eligibility) | `ProfileJobReputation` over `ProfileReputation` of the profile module; identity's `IdentityReputation` is `JobsIdentityReputation` (Main.kf) |
+| profile reads (author, candidate portrait, experience years) | `ProfileDirectory`, `ProfileExtensionStore` |
+| direct message to the poster, application status notice | messaging service, `Notifications` of the notifications module |
+| connection requests of the LinkedIn contact invites | `NetworkService.requestConnection/state` |
+| contact lookup | `ProfileDirectory.search/findByEmail/findAllByIds` |
+| outbound calls to job sources | `kernel.http.Outbound` through `JobSourceTransport` |
+
+### Pending seams (concrete classes, safe default, `// pending-port: <owner>`)
+
+| Seam | Owner | Default |
+|---|---|---|
+| `JobCompanies` (`company`, `roleOf`, `requireRecruiter`, `slugsOf`, `followerIds`) | companies | reads `companies`, `company_memberships`, `company_follows` read-only with the owner's SQL |
+| `JobCorporate` (`requireActive`) | corporate | reads `corporate_profiles` read-only |
+
+### Test notes
+
+- `JobCompanyPageTest.onlyThePageTeamPostsForItAndTheJobPointsBackToThePage` seeds the company rows directly (the companies endpoints are not ported) and drops two assertions that read companies endpoints: `GET /empresa/{slug}` (jobs of the page, `stats.openJobs`) and `GET /empresas/diretorio` (`openJobs`). They move to the companies port.
+- `JobCorporateApplicationTest` replaces `/me/business-profile` calls with the `corporate_profiles` row the corporate domain leaves.
+- The Java Mockito tests (`JobServiceTests`, `ExternalJobSubmissionServiceTests`, `ExternalJobRefreshSchedulerTest`) run the real services over H2; "never saved / never delivered" is read from the tables and the captured mailer.
+- The Java `ExternalJobImportServiceTests`, `GlobalDedupeTests` and `CommunitySubmissionImportGuardTests` registered stub `JobImportSource` beans; here `JobTestSource` instances are set before the app of the file boots.
+- Gaps found: G280 to G284 (`docs/KOF_GAPS.md`).

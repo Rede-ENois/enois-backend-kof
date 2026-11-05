@@ -1,0 +1,117 @@
+package jobs
+
+import kernel.error.*
+import kernel.db.*
+import kernel.http.*
+import profile.*
+
+// Caller-owned seams of the jobs domain (concrete classes with overridable methods: an interface of another
+// package cannot be implemented, G30). Tests subclass them; Main.kf wires the defaults.
+// The reputation of a person (ReputationService.reputationOf). The base class answers 0 (nobody may publish);
+// the module wires ProfileJobReputation, the live reputation of the profile domain. Tests extend it with a
+// fixed value, like the Java tests mocked the service.
+class JobReputation {
+    public constructor() {}
+    Int of(userId: String) = 0
+}
+
+class ProfileJobReputation extends JobReputation {
+    ProfileReputation reputation
+    public constructor(reputation: ProfileReputation) {
+        super()
+        this.reputation = reputation
+    }
+    Int of(userId: String) = reputation.reputationOf(userId)
+}
+
+// pending-port: companies. CompanyService: the page of a company, the role of a member and the followers. The
+// default reads `companies`, `company_memberships` and `company_follows` read-only with the same SQL the
+// companies domain will use.
+class JobCompanies {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static JobCompanyPage page(r: DbRow) = JobCompanyPage(r.getStr("id"), r.getStr("slug"), r.getStr("name"), r.getStrOrNull("logo"), r.getStr("owner_user_id"), r.getStr("status"))
+    // 404 COMPANY_NOT_FOUND when the page does not exist.
+    JobCompanyPage company(companyId: String) {
+        var row = store.queryOptional("select id, slug, name, logo, owner_user_id, status from companies where id = ?", DbParams().bindStr(companyId))
+        if (row == null) {
+            throw Errors.api(404, "COMPANY_NOT_FOUND", "Pagina empresarial nao encontrada.")
+        }
+        return JobCompanies.page(row)
+    }
+    String? roleOf(companyId: String, userId: String) {
+        var row = store.queryOptional("select role from company_memberships where company_id = ? and user_id = ?", DbParams().bindStr(companyId).bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return row.getStr("role")
+    }
+    // CompanyService.requireRole(page, user, RECRUITER): the team (owner, ADMIN, EDITOR, RECRUITER) posts.
+    requireRecruiter(page: JobCompanyPage, userId: String) {
+        if (page.status != "ACTIVE") {
+            throw Errors.api(409, "COMPANY_CLOSED", "Esta pagina empresarial foi removida.")
+        }
+        var role = this.roleOf(page.id, userId)
+        if (role == null) {
+            throw Errors.api(403, "NOT_A_MEMBER", "Voce nao faz parte desta pagina empresarial.")
+        }
+        if (page.ownerUserId == userId) {
+            return
+        }
+        if (role == "ADMIN" || role == "EDITOR" || role == "RECRUITER") {
+            return
+        }
+        throw Errors.api(403, "FORBIDDEN", "Seu papel nao permite esta acao.")
+    }
+    // The slug of each page, in one read.
+    Map<String,String> slugsOf(ids: List<String>) {
+        Map<String,String> out = mapOf()
+        if (ids.size() == 0) {
+            return out
+        }
+        for (var r in store.queryList("select id, slug from companies where id in (" + JobStore.marks(ids.size()) + ")", JobStore.bindAll(DbParams(), ids))) {
+            out.put(r.getStr("id"), r.getStr("slug"))
+        }
+        return out
+    }
+    List<String> followerIds(companyId: String) {
+        var out = listOf<String>()
+        for (var r in store.queryList("select user_id from company_follows where company_id = ?", DbParams().bindStr(companyId))) {
+            out.add(r.getStr("user_id"))
+        }
+        return out
+    }
+}
+
+// pending-port: corporate. CorporateProfileService.requireActive: the professional identity every application
+// carries. The default reads `corporate_profiles` read-only.
+class JobCorporate {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // 403 NO_ACTIVE_CORPORATE_PROFILE unless the account has an ACTIVE professional identity.
+    JobProfessional requireActive(userId: String) {
+        var row = store.queryOptional("select user_id, username, name, headline, avatar, location, industry from corporate_profiles where user_id = ? and status = \'ACTIVE\'", DbParams().bindStr(userId))
+        if (row == null) {
+            throw Errors.api(403, "NO_ACTIVE_CORPORATE_PROFILE", "Ative o seu perfil profissional para usar os recursos de trabalho.")
+        }
+        return JobProfessional(row.getStr("user_id"), row.getStr("username"), row.getStr("name"), row.getStrOrNull("headline"), row.getStrOrNull("avatar"), row.getStrOrNull("location"), row.getStrOrNull("industry"))
+    }
+}
+
+// The wire to a job source (sitemap, public API): one GET, the body back. It uses the kernel's one outbound
+// client; tests subclass it and answer a fixed body, so no test reaches the network.
+class JobSourceTransport {
+    public constructor() {}
+    // Throws "IMPORT_SOURCE_ERROR" (502) when the source cannot be read.
+    String fetch(url: String, userAgent: String, accept: String, timeoutMs: Int) {
+        var reply = Outbound.get(url, listOf("User-Agent: " + userAgent, "Accept: " + accept), timeoutMs)
+        if (reply.status() / 100 != 2) {
+            throw Errors.api(502, "IMPORT_SOURCE_ERROR", "Fonte externa indisponivel agora.")
+        }
+        return reply.body()
+    }
+}

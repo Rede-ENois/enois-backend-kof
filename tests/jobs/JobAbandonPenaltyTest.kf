@@ -1,0 +1,51 @@
+import jobs.*
+import kernel.testkit.*
+
+// Port of JobAbandonPenaltyTests: deleting a job WITHOUT answering the candidates (still APPLIED) records a
+// credibility penalty; whoever answered everything is not penalised. The warning is in the delete response.
+String penaltyJob(owner: String) {
+    var body = "{\"title\":\"Vaga de penalidade\",\"company\":\"Acme\",\"location\":\"Remoto\",\"type\":\"CLT\",\"level\":\"PLENO\",\"skills\":[],\"description\":\"Vaga de teste com valor.\",\"salaryMin\":\"1500\",\"communityAgreement\":true}"
+    var res = JobsTestKit.post("/jobs", owner, body)
+    Check.status(res, 201)
+    return res.json("id")
+}
+
+String penaltyApply(candidate: String, jobId: String) = JobsTestKit.apply(candidate, jobId, "{\"message\":\"Tenho interesse.\"}")
+
+test "deletingWithoutRespondingRecordsThePenaltyAndWarns" {
+    var owner = JobsTestKit.login("penalty_owner")
+    var candidate = JobsTestKit.login("penalty_candidate")
+    JobsTestKit.activateProfessional(candidate)
+    var jobId = penaltyJob(owner)
+    penaltyApply(candidate, jobId)
+    var res = JobsTestKit.delete("/jobs/" + jobId, owner)
+    Check.status(res, 200)
+    Check.jsonEq(res, "unanswered", "1")
+    Check.jsonEq(res, "penalized", "true")
+}
+
+test "deletingAfterRespondingDoesNotPenalize" {
+    var owner = JobsTestKit.login("penalty_owner_ok")
+    var candidate = JobsTestKit.login("penalty_candidate_ok")
+    JobsTestKit.activateProfessional(candidate)
+    var jobId = penaltyJob(owner)
+    var applicationId = penaltyApply(candidate, jobId)
+    Check.status(JobsTestKit.patch("/jobs/" + jobId + "/applications/" + applicationId, owner, "{\"status\":\"NOT_SELECTED\",\"feedback\":\"Obrigado, seguimos com outros.\"}"), 200)
+    var res = JobsTestKit.delete("/jobs/" + jobId, owner)
+    Check.status(res, 200)
+    Check.jsonEq(res, "unanswered", "0")
+    Check.jsonEq(res, "penalized", "false")
+}
+
+test "deletingTwiceDoesNotDoubleCount" {
+    var owner = JobsTestKit.login("penalty_owner_dbl")
+    var candidate = JobsTestKit.login("penalty_candidate_dbl")
+    JobsTestKit.activateProfessional(candidate)
+    var jobId = penaltyJob(owner)
+    penaltyApply(candidate, jobId)
+    var first = JobsTestKit.delete("/jobs/" + jobId, owner)
+    Check.status(first, 200)
+    Check.jsonEq(first, "penalized", "true")
+    Check.status(JobsTestKit.delete("/jobs/" + jobId, owner), 404)
+    JobsTestKit.finish()
+}

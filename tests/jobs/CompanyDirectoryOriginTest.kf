@@ -1,0 +1,39 @@
+import jobs.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of CompanyDirectoryOriginTests: the directory says the origin of each company ("enois" for the internal
+// one, "externa" for an aggregator platform) because the front tab filters on it.
+Int indexByName(res: TestResponse, name: String) {
+    var i = 0
+    while (i < res.jsonSize("")) {
+        if (res.json(i + ".name") == name) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+test "directoryTellsTheOriginOfEachCompany" {
+    var now = Time.nowIso()
+    JobsTestKit.insertJob("job_dir_enois", "Vaga interna", "DirOrigem Empresa Interna", "Remoto", "FULL_TIME", "SENIOR", listOf("Java"), now)
+    JobsTestKit.insertExternalJob("ext_dir_externa", "Vaga agregada", "DirOrigem Plataforma Externa", "Remoto", "https://plataforma.exemplo.test/vaga/1", now)
+    var res = JobsTestKit.get("/jobs/companies?query=DirOrigem", null)
+    Check.status(res, 200)
+    var internal = indexByName(res, "DirOrigem Empresa Interna")
+    var external = indexByName(res, "DirOrigem Plataforma Externa")
+    Check.isTrue("internal company is in the directory", internal >= 0)
+    Check.isTrue("external company is in the directory", external >= 0)
+    Check.jsonEq(res, internal + ".origem", "enois")
+    Check.jsonEq(res, external + ".origem", "externa")
+}
+
+test "originAlsoComesInTheNameFilter" {
+    JobsTestKit.insertExternalJob("ext_dir_filtro", "Vaga filtrada", "Plataforma do Filtro SA", "Remoto", "https://plataforma.exemplo.test/vaga/2", Time.nowIso())
+    var res = JobsTestKit.get("/jobs/companies?query=Plataforma%20do%20Filtro", null)
+    Check.status(res, 200)
+    Check.jsonEq(res, "0.name", "Plataforma do Filtro SA")
+    Check.jsonEq(res, "0.origem", "externa")
+    JobsTestKit.finish()
+}

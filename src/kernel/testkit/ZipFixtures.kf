@@ -1,0 +1,71 @@
+package kernel.testkit
+
+import java.io.FileOutputStream
+import java.io.OutputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+import kernel.files.*
+
+// Builds ZIP files on disk for the import tests: text entries, runs of zeros (a bomb: tiny on disk, huge inflated)
+// and incompressible noise (only the total budget can stop it). Usage:
+//
+//   var zip = ZipFixtures.start()
+//   zip.text("Positions.csv", "Company Name,Title\nAcme,Dev")
+//   zip.zeros("Basic/Rich_Media/huge.bin", 60 * 1024 * 1024)
+//   var path = zip.finish()
+class ZipFixtures {
+    String path
+    ZipOutputStream out
+    public constructor(path: String, out: ZipOutputStream) {
+        this.path = path
+        this.out = out
+    }
+    static ZipFixtures start() {
+        var path = UploadFiles.create("fixture-", ".zip")
+        OutputStream sink = new FileOutputStream(path)
+        return ZipFixtures(path, new ZipOutputStream(sink))
+    }
+    text(name: String, content: String) {
+        var bytes = content.getBytes()
+        out.putNextEntry(new ZipEntry(name))
+        out.write(bytes, 0, bytes.length)
+        out.closeEntry()
+    }
+    // `size` bytes of zeros (deflates to almost nothing).
+    zeros(name: String, size: Int) {
+        out.putNextEntry(new ZipEntry(name))
+        var chunk = new Byte[65536]
+        var left = size
+        while (left > 0) {
+            var n = 65536
+            if (left < n) {
+                n = left
+            }
+            out.write(chunk, 0, n)
+            left = left - n
+        }
+        out.closeEntry()
+    }
+    // `size` bytes of seeded random noise (does not compress).
+    noise(name: String, size: Int, seed: Long) {
+        out.putNextEntry(new ZipEntry(name))
+        var random = new java.util.Random(seed)
+        var chunk = new Byte[8192]
+        var left = size
+        while (left > 0) {
+            random.nextBytes(chunk)
+            var n = 8192
+            if (left < n) {
+                n = left
+            }
+            out.write(chunk, 0, n)
+            left = left - n
+        }
+        out.closeEntry()
+    }
+    // Closes the archive; its path.
+    String finish() {
+        out.close()
+        return path
+    }
+}

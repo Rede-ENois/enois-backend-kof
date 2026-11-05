@@ -1,0 +1,126 @@
+package kernel.url
+
+import java.net.URI
+import java.util.ArrayList
+import java.util.Collections
+
+// The parts of a URL as java.net.URI reads them (null parts are empty strings).
+class UrlParts {
+    Bool valid = false
+    String scheme = ""
+    String host = ""
+    String path = ""
+    String rawQuery = ""
+    String userInfo = ""
+    public constructor() {}
+}
+
+// Port of the jobs UrlCanonicalizer (and the URI checks of the external job link): a stable key to compare
+// the SAME opportunity across sources. Lower-case host without `www.`, no fragment, no tracking
+// parameters (utm_*, gclid, ...), no trailing slash, query parameters sorted. It resolves no redirect.
+class UrlCanonical {
+    static String? nullable(value: String?) = value
+    static UrlParts parse(text: String) {
+        var parts = UrlParts()
+        try {
+            var uri = URI.create(text)
+            var scheme: String? = uri.getScheme()
+            if (scheme != null) {
+                parts.scheme = scheme
+            }
+            var host: String? = uri.getHost()
+            if (host != null) {
+                parts.host = host
+            }
+            var path: String? = uri.getPath()
+            if (path != null) {
+                parts.path = path
+            }
+            var query: String? = uri.getRawQuery()
+            if (query != null) {
+                parts.rawQuery = query
+            }
+            var info: String? = uri.getUserInfo()
+            if (info != null) {
+                parts.userInfo = info
+            }
+            parts.valid = true
+        } catch (String e) {
+            parts.valid = false
+        }
+        return parts
+    }
+    static Bool tracking(key: String) {
+        if (key.startsWith("utm_")) {
+            return true
+        }
+        return "|gclid|fbclid|msclkid|ref|referrer|source|src|trk|trackingid|".contains("|" + key + "|")
+    }
+    static String canonicalQuery(rawQuery: String) {
+        if (rawQuery.trim().length() == 0) {
+            return ""
+        }
+        var kept = new ArrayList<String>()
+        for (var pair in rawQuery.split("&")) {
+            var eq = pair.indexOf("=")
+            var key = pair
+            if (eq >= 0) {
+                key = pair.substring(0, eq)
+            }
+            if (!UrlCanonical.tracking(key.toLowerCase())) {
+                kept.add(pair)
+            }
+        }
+        Collections.sort(kept)
+        var out = ""
+        for (var pair in kept) {
+            if (out.length() > 0) {
+                out = out + "&"
+            }
+            out = out + UrlCodec.decode(pair)
+        }
+        if (out.length() == 0) {
+            return ""
+        }
+        return "?" + out
+    }
+    // The canonical form; null for a blank link. An unparseable link keeps its trimmed lower-case text.
+    static String? canonicalize(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        if (raw.trim().length() == 0) {
+            return null
+        }
+        return UrlCanonical.canonicalText(raw.trim())
+    }
+    static String canonicalText(text: String) {
+        var parts = UrlCanonical.parse(text)
+        if (!parts.valid) {
+            return text.toLowerCase()
+        }
+        var scheme = "https"
+        if (parts.scheme.length() > 0) {
+            scheme = parts.scheme.toLowerCase()
+        }
+        var host = parts.host.toLowerCase()
+        if (host.startsWith("www.")) {
+            host = host.substring(4)
+        }
+        var path = parts.path
+        if (path.length() > 1 && path.endsWith("/")) {
+            path = path.substring(0, path.length() - 1)
+        }
+        var query = ""
+        var failed = false
+        try {
+            query = UrlCanonical.canonicalQuery(parts.rawQuery)
+        } catch (String e) {
+            failed = true
+        }
+        if (failed) {
+            return text.toLowerCase()
+        }
+        return scheme + "://" + host + path + query
+    }
+}

@@ -1,0 +1,62 @@
+package importlinkedin
+
+import kernel.*
+import kernel.log.*
+import profile.*
+
+// Composition of the importlinkedin domain. Main.kf calls install once, after profile (the network and the profile
+// directory it matches contacts against):
+//
+//   var linkedinImport = LinkedinImportModule.install(platform, shared, profiles)
+//
+// Job on kernel.jobs: `linkedin-contact-invites` sends the queued invites of everyone who turned the automatic
+// invite on (REDE_LINKEDIN_CONTACT_INVITES_WORKER_ENABLED true, _WORKER_DELAY_MS 900000, _WORKER_INITIAL_DELAY_MS
+// 120000, _MAX_PER_RUN 200). Env: REDE_IMPORT_LINKEDIN_MAX_UNCOMPRESSED_BYTES (8388608) caps the total inflated size
+// of the data ZIP.
+class LinkedinImportModule {
+    LinkedinImportService service
+    LinkedinContactInviteService invites
+    LinkedinInviteStore store
+    public constructor(service: LinkedinImportService, invites: LinkedinContactInviteService, store: LinkedinInviteStore) {
+        this.service = service
+        this.invites = invites
+        this.store = store
+    }
+    static LinkedinImportModule install(platform: Platform, shared: SharedServices, profiles: ProfileModule) {
+        var cfg = platform.cfg
+        var service = LinkedinImportService(cfg.getLong("REDE_IMPORT_LINKEDIN_MAX_UNCOMPRESSED_BYTES", LinkedinImportService.defaultMaxTotalBytes()))
+        var store = LinkedinInviteStore(platform.db)
+        var invites = LinkedinContactInviteService(platform.db, store, profiles.directory, profiles.network, cfg.getInt("REDE_LINKEDIN_CONTACT_INVITES_MAX_PER_RUN", 200))
+        LinkedinImportRoutes(service, invites).register(platform.server)
+        LinkedinImportModule.schedule(shared, cfg, store, invites)
+        return LinkedinImportModule(service, invites, store)
+    }
+    // LinkedinContactInviteWorker: every 15 minutes (the first run after 2), for each person with the switch on. One
+    // person failing never stops the others.
+    static schedule(shared: SharedServices, cfg: Config, store: LinkedinInviteStore, invites: LinkedinContactInviteService) {
+        if (!cfg.getBool("REDE_LINKEDIN_CONTACT_INVITES_WORKER_ENABLED", true)) {
+            return
+        }
+        var log = Log("importlinkedin.worker")
+        var batch = LinkedinContactInviteService.clampRun(cfg.getInt("REDE_LINKEDIN_CONTACT_INVITES_MAX_PER_RUN", 200))
+        shared.jobs.fixedDelay("linkedin-contact-invites", cfg.getLong("REDE_LINKEDIN_CONTACT_INVITES_WORKER_INITIAL_DELAY_MS", 120000L), cfg.getLong("REDE_LINKEDIN_CONTACT_INVITES_WORKER_DELAY_MS", 900000L), () -> {
+    LinkedinImportModule.runWorker(store, invites, batch, log)
+})
+    }
+    // One pass of the worker; answers how many invites it sent.
+    static Int runWorker(store: LinkedinInviteStore, invites: LinkedinContactInviteService, batch: Int, log: Log) {
+        var total = 0
+        for (var userId in store.userIdsWithAutoInvite()) {
+            try {
+                var sent = invites.processQueued(userId, batch)
+                if (sent > 0) {
+                    log.info("linkedin_contact_invites sent=" + sent)
+                }
+                total = total + sent
+            } catch (String failure) {
+                log.warn("linkedin_contact_invites_failed")
+            }
+        }
+        return total
+    }
+}

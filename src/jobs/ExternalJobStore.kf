@@ -1,0 +1,124 @@
+package jobs
+
+import kernel.cache.*
+import kernel.db.*
+import kernel.text.*
+
+// SQL over `external_jobs` (ExternalJobPersistenceAdapter): the listing of outside platforms and of the jobs
+// people of the community listed by hand. The list reads are cached 5 minutes in the `externalJobs` cache like
+// the Java @Cacheable methods (the listing is the same for everybody); a write by hand clears it.
+class ExternalJobStore {
+    Db store
+    TtlCache cacheOfJobs
+    public constructor(store: Db, cacheOfJobs: TtlCache) {
+        this.store = store
+        this.cacheOfJobs = cacheOfJobs
+    }
+    static String columns() = "id, platform, external_id, title, company, location, salary, currency, url, imported_at, last_checked_at, external_status, canonical_url, apply_email, submitted_by, description, salary_min, salary_max, salary_period, salary_not_informed"
+    static ExternalJobRecord fromRow(r: DbRow) = ExternalJobRecord(r.getStr("id"), r.getStr("platform"), r.getStr("external_id"), r.getStr("title"), r.getStrOrNull("company"), r.getStrOrNull("location"), r.getStrOrNull("salary"), r.getStrOrNull("currency"), r.getStr("url"), r.getInstant("imported_at"), r.getInstant("last_checked_at"), r.getStr("external_status"), r.getStrOrNull("canonical_url"), r.getStrOrNull("apply_email"), r.getStrOrNull("submitted_by"), r.getStrOrNull("description"), r.getStrOrNull("salary_min"), r.getStrOrNull("salary_max"), r.getStrOrNull("salary_period"), r.getBool("salary_not_informed"))
+    List<ExternalJobRecord> list(sql: String, params: DbParams) {
+        var out = listOf<ExternalJobRecord>()
+        for (var row in store.queryList(sql, params)) {
+            out.add(ExternalJobStore.fromRow(row))
+        }
+        return out
+    }
+    // The cached read: the JSON text of the list is what the cache holds.
+    List<ExternalJobRecord> cached(key: String, sql: String, params: DbParams) {
+        var self = this
+        var text = cacheOfJobs.getOrLoad(key, () -> json.encode(self.list(sql, params)))
+        return json.decode<List<ExternalJobRecord>>(text)
+    }
+    ExternalJobRecord? one(sql: String, params: DbParams) {
+        var rows = this.list(sql, params)
+        if (rows.size() == 0) {
+            return null
+        }
+        return rows.get(0)
+    }
+    ExternalJobRecord? findById(id: String) = this.one("select " + ExternalJobStore.columns() + " from external_jobs where id = ?", DbParams().bindStr(id))
+    ExternalJobRecord? findBySource(platform: String, externalId: String) = this.one("select " + ExternalJobStore.columns() + " from external_jobs where platform = ? and external_id = ?", DbParams().bindStr(platform).bindStr(externalId))
+    // Global dedupe: the same job (same canonical URL) found by another source.
+    ExternalJobRecord? findByCanonicalUrl(canonicalUrl: String) = this.one("select " + ExternalJobStore.columns() + " from external_jobs where canonical_url = ? order by id limit 1", DbParams().bindStr(canonicalUrl))
+    // JPA save: insert, or rewrite the row when the id exists.
+    save(j: ExternalJobRecord) {
+        if (store.queryLong("select count(*) from external_jobs where id = ?", DbParams().bindStr(j.id)) > 0L) {
+            store.execute("update external_jobs set platform = ?, external_id = ?, title = ?, company = ?, location = ?, salary = ?, currency = ?, url = ?, imported_at = ?, last_checked_at = ?, external_status = ?, canonical_url = ?, apply_email = ?, submitted_by = ?, description = ?, salary_min = ?, salary_max = ?, salary_period = ?, salary_not_informed = ? where id = ?", DbParams().bindStr(j.platform).bindStr(j.externalId).bindStr(j.title).bindStrOrNull(j.company).bindStrOrNull(j.location).bindStrOrNull(j.salary).bindStrOrNull(j.currency).bindStr(j.url).bindInstant(j.importedAt).bindInstant(j.lastCheckedAt).bindStr(j.status).bindStrOrNull(j.canonicalUrl).bindStrOrNull(j.applyEmail).bindStrOrNull(j.submittedBy).bindStrOrNull(j.description).bindStrOrNull(j.salaryMin).bindStrOrNull(j.salaryMax).bindStrOrNull(j.salaryPeriod).bindBool(j.salaryNotInformed).bindStr(j.id))
+            return
+        }
+        store.execute("insert into external_jobs (" + ExternalJobStore.columns() + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(j.id).bindStr(j.platform).bindStr(j.externalId).bindStr(j.title).bindStrOrNull(j.company).bindStrOrNull(j.location).bindStrOrNull(j.salary).bindStrOrNull(j.currency).bindStr(j.url).bindInstant(j.importedAt).bindInstant(j.lastCheckedAt).bindStr(j.status).bindStrOrNull(j.canonicalUrl).bindStrOrNull(j.applyEmail).bindStrOrNull(j.submittedBy).bindStrOrNull(j.description).bindStrOrNull(j.salaryMin).bindStrOrNull(j.salaryMax).bindStrOrNull(j.salaryPeriod).bindBool(j.salaryNotInformed))
+    }
+    delete(id: String) {
+        store.execute("delete from external_jobs where id = ?", DbParams().bindStr(id))
+    }
+    static Int atLeastOne(limit: Int) {
+        if (limit < 1) {
+            return 1
+        }
+        return limit
+    }
+    // `%` and `_` of the text are literal: searching "_" must not match everything.
+    static String pattern(query: String) = "%" + LikePattern.escape(query.toLowerCase()) + "%"
+    static String matchSql() = "(lower(title) like ? escape \'!\' or lower(company) like ? escape \'!\' or lower(location) like ? escape \'!\')"
+    static DbParams bindMatch(params: DbParams, query: String) {
+        var p = ExternalJobStore.pattern(query)
+        return params.bindStr(p).bindStr(p).bindStr(p)
+    }
+    List<ExternalJobRecord> findRecent(limit: Int) {
+        var n = ExternalJobStore.atLeastOne(limit)
+        return this.cached("recent:" + n, "select " + ExternalJobStore.columns() + " from external_jobs order by last_checked_at desc limit ?", DbParams().bindInt(n))
+    }
+    // Title, COMPANY or place: the same ruler as the house job.
+    List<ExternalJobRecord> search(query: String, limit: Int) {
+        var n = ExternalJobStore.atLeastOne(limit)
+        return this.cached("search:" + query + ":" + n, "select " + ExternalJobStore.columns() + " from external_jobs where " + ExternalJobStore.matchSql() + " order by last_checked_at desc limit ?", ExternalJobStore.bindMatch(DbParams(), query).bindInt(n))
+    }
+    List<ExternalJobRecord> findRecentExcludingPlatform(platform: String, limit: Int) {
+        var n = ExternalJobStore.atLeastOne(limit)
+        return this.cached("excluding:" + platform + ":" + n, "select " + ExternalJobStore.columns() + " from external_jobs where platform <> ? order by last_checked_at desc limit ?", DbParams().bindStr(platform).bindInt(n))
+    }
+    List<ExternalJobRecord> searchExcludingPlatform(platform: String, query: String, limit: Int) {
+        var n = ExternalJobStore.atLeastOne(limit)
+        return this.cached("excluding:" + platform + ":" + query + ":" + n, "select " + ExternalJobStore.columns() + " from external_jobs where platform <> ? and " + ExternalJobStore.matchSql() + " order by last_checked_at desc limit ?", ExternalJobStore.bindMatch(DbParams().bindStr(platform), query).bindInt(n))
+    }
+    // One aggregator (the external tab filters by platform); a query narrows by title only.
+    List<ExternalJobRecord> findByPlatform(platform: String, query: String?, limit: Int) {
+        var n = ExternalJobStore.atLeastOne(limit)
+        if (!Texts.hasText(query)) {
+            return this.cached("platform:" + platform + ":" + n, "select " + ExternalJobStore.columns() + " from external_jobs where platform = ? order by last_checked_at desc limit ?", DbParams().bindStr(platform).bindInt(n))
+        }
+        var text = JobRules.trimmed(query) as String
+        return this.cached("platformSearch:" + platform + ":" + text + ":" + n, "select " + ExternalJobStore.columns() + " from external_jobs where platform = ? and lower(title) like ? escape \'!\' order by last_checked_at desc limit ?", DbParams().bindStr(platform).bindStr(ExternalJobStore.pattern(text)).bindInt(n))
+    }
+    List<String> distinctPlatforms() {
+        var self = this
+        var text = cacheOfJobs.getOrLoad("platforms", () -> json.encode(self.platformsNow()))
+        return json.decode<List<String>>(text)
+    }
+    List<String> platformsNow() {
+        var out = listOf<String>()
+        for (var r in store.queryList("select distinct platform from external_jobs order by platform", DbParams())) {
+            out.add(r.getStr("platform"))
+        }
+        return out
+    }
+    List<ExternalJobRecord> findByIds(ids: List<String>) {
+        if (ids.size() == 0) {
+            return listOf<ExternalJobRecord>()
+        }
+        return this.cached("ids:" + String.join(",", ids), "select " + ExternalJobStore.columns() + " from external_jobs where id in (" + JobStore.marks(ids.size()) + ")", JobStore.bindAll(DbParams(), ids))
+    }
+    // The ones THIS person listed (no cache: personal and short, freshness matters more).
+    List<ExternalJobRecord> findBySubmitter(userId: String) = this.list("select " + ExternalJobStore.columns() + " from external_jobs where submitted_by = ? order by imported_at desc", DbParams().bindStr(userId))
+    // Company name and how many external jobs carry it (case variants merged by the reader).
+    List<JobNamedCount> countByCompany() {
+        var out = listOf<JobNamedCount>()
+        for (var r in store.queryList("select company, count(*) as total from external_jobs where company is not null group by company order by count(*) desc", DbParams())) {
+            out.add(JobNamedCount(r.getStr("company"), null, r.getLong("total")))
+        }
+        return out
+    }
+    clearCache() {
+        cacheOfJobs.clear()
+    }
+}

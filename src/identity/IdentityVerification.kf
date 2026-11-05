@@ -309,26 +309,36 @@ class IdentityVerifications {
     }
 }
 
-// JobPublishingPolicy.evaluate, the one place that decides whether an account may publish a job. pending-port:
-// jobs owns the policy (and the reputation), so Main.kf replaces this seam with the jobs domain; the default reads
-// users.reputation. Rule: reputation > 150 AND (when identity is enforced) a verified identity.
-class IdentityEligibility {
-    static Int requiredReputation = 150
-    Db db
-    IdentityVerifications verifications
-    Bool identityEnforced
-    public constructor(db: Db, verifications: IdentityVerifications, identityEnforced: Bool) {
-        this.db = db
-        this.verifications = verifications
-        this.identityEnforced = identityEnforced
-    }
-    Int reputationOf(userId: String) {
+// The reputation of an account as the eligibility rule reads it (ReputationService.reputationOf). The default
+// reads the denormalised users.reputation column; the jobs module replaces it with the live reputation of
+// the profile domain (JobsIdentityReputation), wired in Main.kf.
+class IdentityReputation {
+    public constructor() {}
+    Int of(db: Db, userId: String) {
         var r = db.queryOptional("select reputation from users where id = ?", DbParams().bindStr(userId))
         if (r == null) {
             return 0
         }
         return r.getInt("reputation")
     }
+}
+
+// JobPublishingPolicy.evaluate, the one place that decides whether an account may publish a job. Rule:
+// reputation > 150 AND (when identity is enforced) a verified identity. The reputation comes from the
+// IdentityReputation seam (the jobs module owns the real one).
+class IdentityEligibility {
+    static Int requiredReputation = 150
+    Db db
+    IdentityVerifications verifications
+    Bool identityEnforced
+    IdentityReputation reputations
+    public constructor(db: Db, verifications: IdentityVerifications, identityEnforced: Bool, reputations: IdentityReputation) {
+        this.db = db
+        this.verifications = verifications
+        this.identityEnforced = identityEnforced
+        this.reputations = reputations
+    }
+    Int reputationOf(userId: String) = reputations.of(db, userId)
     IdentityEligibilityBody evaluate(userId: String) {
         var reputation = reputationOf(userId)
         // "More than 150", as JobService.create and the front: exactly 150 still does not publish.

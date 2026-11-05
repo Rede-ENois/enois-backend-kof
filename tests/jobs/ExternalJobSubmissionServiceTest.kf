@@ -1,0 +1,108 @@
+import jobs.*
+import kernel.db.*
+import kernel.error.*
+import kernel.testkit.*
+
+// Port of ExternalJobSubmissionServiceTests: the rules of the MANUAL external job (reputation gate, community
+// agreement, https link on a real site, dedupe by canonical URL), on the real service over H2.
+ExternalJobService ext() = JobsTestKit.module().externalService
+
+String submitFailure(user: String, title: String?, company: String?, url: String?, agreed: Bool) {
+    try {
+        ext().submit(user, title, company, null, url, null, null, null, null, null, agreed, false)
+    } catch (String e) {
+        return e
+    }
+    return ""
+}
+
+Int externalRows(user: String) = JobsTestKit.db().queryLong("select count(*) from external_jobs where submitted_by = ?", DbParams().bindStr(user)).toInt()
+
+test "createsCommunitySubmissionWithTheAuthorAndTheCanonicalUrl" {
+    var user = JobsTestKit.login("user_external_submission")
+    var job = ext().submit(user, "  Desenvolvedora   Back-end ", "Acme", "Remoto", "https://acme.test/vagas/1?utm_source=linkedin", null, null, null, null, null, true, false)
+    Check.isTrue("ext_com_ id", job.id.startsWith("ext_com_"))
+    Check.eqStr("platform", JobRules.communityPlatform(), job.platform)
+    Check.eqStr("author", user, "" + job.submittedBy)
+    Check.eqStr("status", "FOUND", job.status)
+    // Spaces collapsed and the tracking parameter out: the canonical URL is the dedupe key.
+    Check.eqStr("title", "Desenvolvedora Back-end", job.title)
+    Check.eqStr("canonical", "https://acme.test/vagas/1", "" + job.canonicalUrl)
+    Check.eqInt("saved", 1, externalRows(user))
+}
+
+test "salaryNotInformedClearsTheRangeAndKeepsTheFlag" {
+    var user = JobsTestKit.login("user_external_nosalary")
+    var job = ext().submit(user, "Vaga sem faixa", "Acme", "Remoto", "https://acme.test/vagas/sem-salario", "Descrição da vaga", "1500", "2000", "MONTH", null, true, true)
+    Check.isTrue("flag", job.salaryNotInformed)
+    Check.isTrue("min cleared", job.salaryMin == null)
+    Check.isTrue("max cleared", job.salaryMax == null)
+    Check.isTrue("period cleared", job.salaryPeriod == null)
+    Check.eqInt("saved", 1, externalRows(user))
+}
+
+test "keepsTheSameReputationGateAsTheHouseJob" {
+    var user = JobsTestKit.login("user_external_lowrep")
+    JobsTestKit.reputation().value = JobRules.minReputation()
+    var failure = submitFailure(user, "Vaga", "Acme", "https://acme.test/1", true)
+    JobsTestKit.reputation().value = 300
+    Check.isTrue("LOW_REPUTATION", Errors.hasCode(failure, "LOW_REPUTATION"))
+    Check.eqInt("nothing saved", 0, externalRows(user))
+}
+
+test "refusesWithoutTheCommunityAgreement" {
+    var user = JobsTestKit.login("user_external_noagree")
+    Check.isTrue("COMMUNITY_RULES_NOT_ACCEPTED", Errors.hasCode(submitFailure(user, "Vaga", "Acme", "https://acme.test/1", false), "COMMUNITY_RULES_NOT_ACCEPTED"))
+    Check.eqInt("nothing saved", 0, externalRows(user))
+}
+
+test "refusesDuplicateByCanonicalUrl" {
+    var user = JobsTestKit.login("user_external_dup")
+    JobsTestKit.insertExternalJob("ext_ja_existe", "Backend", "Acme", null, "https://acme.test/vagas/dup", "2026-01-01T00:00:00Z")
+    JobsTestKit.db().execute("update external_jobs set canonical_url = \'https://acme.test/vagas/dup\' where id = \'ext_ja_existe\'", DbParams())
+    // The same job with another tracking: the canonical URL knocks the duplicate out.
+    Check.isTrue("JOB_ALREADY_LISTED", Errors.hasCode(submitFailure(user, "Desenvolvedora Back-end", "Acme", "https://acme.test/vagas/dup?ref=indicacao", true), "JOB_ALREADY_LISTED"))
+}
+
+test "refusesLinksThatAreNotHttpsOnARealSite" {
+    var user = JobsTestKit.login("user_external_badurl")
+    // The link is validated BEFORE the reputation gate.
+    for (var url in listOf("http://acme.test/vaga", "javascript:alert(1)", "ftp://acme.test/vaga", "https://usuario@malicioso.test/vaga", "sem-endereco")) {
+        Check.isTrue("INVALID_EXTERNAL_JOB for " + url, Errors.hasCode(submitFailure(user, "Vaga", "Acme", url, true), "INVALID_EXTERNAL_JOB"))
+    }
+    Check.eqInt("nothing saved", 0, externalRows(user))
+}
+
+test "refusesBlankTitleOrCompany" {
+    var user = JobsTestKit.login("user_external_blank")
+    Check.isTrue("blank title", submitFailure(user, "   ", "Acme", "https://acme.test/1", true).length() > 0)
+    Check.isTrue("missing company", submitFailure(user, "Vaga", null, "https://acme.test/1", true).length() > 0)
+    Check.eqInt("nothing saved", 0, externalRows(user))
+}
+
+test "onlyTheAuthorDeletesTheSubmission" {
+    var author = JobsTestKit.login("user_external_author")
+    var other = JobsTestKit.login("user_external_other")
+    var job = ext().submit(author, "Backend", "Acme", null, "https://acme.test/vaga/del", null, null, null, null, null, true, false)
+    var failure = ""
+    try {
+        ext().remove(other, job.id)
+    } catch (String e) {
+        failure = e
+    }
+    Check.isTrue("NOT_OWNER", Errors.hasCode(failure, "NOT_OWNER"))
+    ext().remove(author, job.id)
+    Check.eqInt("deleted", 0, externalRows(author))
+}
+
+test "deletingAMissingSubmissionIs404" {
+    var user = JobsTestKit.login("user_external_missing")
+    var failure = ""
+    try {
+        ext().remove(user, "ext_com_nada")
+    } catch (String e) {
+        failure = e
+    }
+    Check.eqInt("status", 404, Errors.parse(failure).status())
+    JobsTestKit.finish()
+}

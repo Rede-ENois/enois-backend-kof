@@ -1,0 +1,144 @@
+package importlinkedin
+
+import kernel.text.*
+
+// The CSV side of the LinkedIn export: quoted fields, header-keyed rows, and the dates LinkedIn writes
+// ("2020-01", "Jan 2020", "mar de 2021"). Pure functions of text.
+class LinkedinCsv {
+    // The records of a CSV as maps keyed by the lower-cased trimmed header (a short cells fills the rest with "").
+    static List<Map<String,String>> rows(csv: String?) {
+        var out = listOf<Map<String,String>>()
+        if (csv == null) {
+            return out
+        }
+        if (!Texts.hasText(csv)) {
+            return out
+        }
+        var records = listOf<List<String>>()
+        for (var line in csv.replace("\r\n", "\n").split("\n")) {
+            if (line.trim().length() == 0) {
+                continue
+            }
+            records.add(LinkedinCsv.parseLine(line))
+        }
+        if (records.size() == 0) {
+            return out
+        }
+        var header = records.get(0)
+        var i = 1
+        while (i < records.size()) {
+            var cells = records.get(i)
+            Map<String,String> row = mapOf()
+            var c = 0
+            while (c < header.size()) {
+                var value = ""
+                if (c < cells.size()) {
+                    value = cells.get(c).trim()
+                }
+                row.put(header.get(c).trim().toLowerCase(), value)
+                c = c + 1
+            }
+            out.add(row)
+            i = i + 1
+        }
+        return out
+    }
+    // One CSV line: "" is a literal quote inside quotes, commas inside quotes stay in the field.
+    static List<String> parseLine(line: String) {
+        var fields = listOf<String>()
+        var current = ""
+        var inQuotes = false
+        var i = 0
+        while (i < line.length()) {
+            var c = line.substring(i, i + 1)
+            if (inQuotes) {
+                if (c == "\"") {
+                    if (i + 1 < line.length() && line.substring(i + 1, i + 2) == "\"") {
+                        current = current + "\""
+                        i = i + 1
+                    }
+                    else {
+                        inQuotes = false
+                    }
+                }
+                else {
+                    current = current + c
+                }
+            }
+            else 
+                if (c == "\"") {
+                    inQuotes = true
+                }
+                else 
+                    if (c == ",") {
+                        fields.add(current)
+                        current = ""
+                    }
+                    else {
+                        current = current + c
+                    }
+            i = i + 1
+        }
+        fields.add(current)
+        return fields
+    }
+    // The value of a column, "" when the column is absent.
+    static String cell(row: Map<String,String>, column: String) = row.getOrDefault(column, "")
+    // The first filled value among the columns (LinkedIn renames headers between exports), or null.
+    static String? firstFilled(row: Map<String,String>, first: String, second: String) {
+        var a = LinkedinCsv.cell(row, first)
+        if (Texts.hasText(a)) {
+            return a
+        }
+        var b = LinkedinCsv.cell(row, second)
+        if (Texts.hasText(b)) {
+            return b
+        }
+        return null
+    }
+    static String? orNull(value: String?) {
+        if (value == null) {
+            return null
+        }
+        if (Texts.hasText(value)) {
+            return value.trim()
+        }
+        return null
+    }
+    // The value of a column trimmed, or null when blank.
+    static String? orNullOf(row: Map<String,String>, column: String) = LinkedinCsv.orNull(LinkedinCsv.cell(row, column))
+    // The full ISO date ("YYYY-MM-DD") the profile API takes. LinkedIn only says month and year, so the day is the
+    // 1st; "2020-01" and "Jan 2020" both become "2020-01-01".
+    static String? parseDate(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        if (!Texts.hasText(raw)) {
+            return null
+        }
+        var value = raw.trim()
+        if (Regexes.matches("\\d{4}-\\d{2}-\\d{2}", value)) {
+            return value
+        }
+        if (Regexes.matches("\\d{4}-\\d{2}", value)) {
+            return value + "-01"
+        }
+        var m = Regexes.first("(?i)^(\\w{3,12})\\.?\\s*(?:de\\s*)?(\\d{4})$", value)
+        if (m != null) {
+            var month = LinkedinCsv.monthNumber(m.groups.get(1))
+            if (month > 0) {
+                var pad = ""
+                if (month < 10) {
+                    pad = "0"
+                }
+                return m.groups.get(2) + "-" + pad + month + "-01"
+            }
+        }
+        return null
+    }
+    static Int monthNumber(name: String) {
+        var key = name.toLowerCase().replaceAll("[^a-zà-ú]", "")
+        var months = mapOf("jan", 1, "janeiro", 1, "january", 1, "fev", 2, "fevereiro", 2, "february", 2, "mar", 3, "marco", 3, "março", 3, "march", 3, "abr", 4, "abril", 4, "april", 4, "mai", 5, "maio", 5, "may", 5, "jun", 6, "junho", 6, "june", 6, "jul", 7, "julho", 7, "july", 7, "ago", 8, "agosto", 8, "august", 8, "aug", 8, "set", 9, "setembro", 9, "september", 9, "sep", 9, "out", 10, "outubro", 10, "october", 10, "oct", 10, "nov", 11, "novembro", 11, "november", 11, "dez", 12, "dezembro", 12, "december", 12, "dec", 12)
+        return months.getOrDefault(key, 0)
+    }
+}

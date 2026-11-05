@@ -1,0 +1,224 @@
+package importresume
+
+import importlinkedin.*
+import kernel.error.*
+import kernel.files.*
+import kernel.text.*
+
+// Resume import (ResumeImportService): a resume file (PDF or text) becomes text, the text becomes the same portrait
+// as the LinkedIn import (the pasted-text parser) and the prefill crosses the job form with the contacts of the
+// resume. Nothing is saved. Accepted: PDF (up to 10 MB and 20 pages) and .txt/.md; DOC/DOCX would need all of POI for
+// a format the editors export to PDF in one click, so the error says to convert. The upload arrives as a temp file.
+class ResumeImportService {
+    LinkedinImportService linkedin
+    public constructor(linkedin: LinkedinImportService) {
+        this.linkedin = linkedin
+    }
+    static Long maxFileBytes() = 10485760L
+    static Int maxPages() = 20
+    static Long maxTxtBytes() = 524288L
+    static Int maxTextChars() = 120000
+    // The portrait for review. Unreadable or empty content is a 400 with guidance, never an empty portrait.
+    LinkedinImportPreview parse(path: String, originalName: String?, contentType: String?) = linkedin.parseText(this.extractText(path, originalName, contentType))
+    // Just the plain text of the file (for the application prefill, which crosses it with the job form).
+    String extractText(path: String, originalName: String?, contentType: String?) {
+        if (path.length() == 0 || UploadFiles.size(path) == 0L) {
+            throw Errors.api(400, "FILE_REQUIRED", "Envie o seu curriculo em PDF ou texto.")
+        }
+        var size = UploadFiles.size(path)
+        if (size > ResumeImportService.maxFileBytes()) {
+            throw Errors.api(400, "FILE_TOO_LARGE", "O curriculo deve ter no maximo 10 MB.")
+        }
+        var name = ""
+        if (originalName != null) {
+            name = originalName.toLowerCase()
+        }
+        var type = ""
+        if (contentType != null) {
+            type = contentType.toLowerCase()
+        }
+        var text = ""
+        if (this.isPdf(path, name, type)) {
+            text = this.textOfPdf(path)
+        }
+        else 
+            if (name.endsWith(".txt") || name.endsWith(".md") || type.startsWith("text/")) {
+                text = this.textOfPlain(path, originalName, size)
+            }
+            else {
+                throw Errors.api(400, "UNSUPPORTED_FORMAT", "Formato nao suportado. Envie o curriculo em PDF ou texto. DOC/DOCX: exporte em PDF no seu editor.")
+            }
+        if (!Texts.hasText(text) || text.trim().length() < 30) {
+            throw Errors.api(400, "UNREADABLE_RESUME", "Nao encontrei texto legivel nesse arquivo. Se for PDF escaneado (imagem), exporte de novo como PDF com texto.")
+        }
+        if (text.length() > ResumeImportService.maxTextChars()) {
+            text = text.substring(0, ResumeImportService.maxTextChars())
+        }
+        return text
+    }
+    // PDF by its magic signature `%PDF-` (not only the extension, which the person can get wrong).
+    Bool isPdf(path: String, name: String, type: String) {
+        if (UploadFiles.head(path, 5) == "%PDF-") {
+            return true
+        }
+        return name.endsWith(".pdf") || type == "application/pdf"
+    }
+    String textOfPlain(path: String, originalName: String?, size: Long) {
+        if (size > ResumeImportService.maxTxtBytes()) {
+            throw Errors.api(400, "FILE_TOO_LARGE", "O arquivo de texto deve ter no maximo 512 KB.")
+        }
+        var text = UploadFiles.readText(path)
+        if (!Texts.hasText(text)) {
+            var label = ""
+            if (originalName != null) {
+                label = originalName
+            }
+            throw Errors.api(400, "INVALID_FILE", "O arquivo " + label + " parece vazio ou nao e texto.")
+        }
+        return text
+    }
+    // The text of the PDF through PDFBox (read only), kept out of a decompression bomb by the page cap: a real resume
+    // has 1 to 3 pages.
+    String textOfPdf(path: String) {
+        var read = PdfText.extract(path, ResumeImportService.maxPages())
+        if (read.status == "ENCRYPTED") {
+            throw Errors.api(400, "UNREADABLE_RESUME", "Esse PDF esta protegido por senha. Exporte uma copia sem senha para importar.")
+        }
+        if (read.status == "TOO_MANY_PAGES") {
+            throw Errors.api(400, "FILE_TOO_LARGE", "O curriculo deve ter no maximo 20 paginas.")
+        }
+        if (read.status != "OK") {
+            throw Errors.api(400, "INVALID_FILE", "Nao foi possivel ler o PDF. E um PDF valido?")
+        }
+        return read.text
+    }
+    // ===== application prefill =====
+    //
+    // The job defines the form fields (label + type + required). The resume does not answer for it, but it saves what
+    // it can: the e-mail goes to the message, phones/links become the answer of LINK fields with a compatible label,
+    // and what is left comes back as "not filled" for the front to highlight, not as an error.
+    // Crosses the job fields with the resume text. Never writes an application: it only suggests.
+    ResumeApplyPrefill prefill(jobId: String, jobTitle: String, fields: List<ResumeJobField>, resumeText: String?) {
+        var text = ""
+        if (resumeText != null) {
+            text = resumeText
+        }
+        var email = ResumeImportService.findEmail(text)
+        var phone = ResumeImportService.findPhone(text)
+        var link = ResumeImportService.findLink(text)
+        var suggestions = listOf<ResumeFieldSuggestion>()
+        var filled = 0
+        for (var field in fields) {
+            var label = field.label.toLowerCase()
+            String? value = Nulls.str()
+            String? reason = Nulls.str()
+            if (field.type == "LINK") {
+                if (ResumeImportService.looksLike(label, listOf("linkedin", "github", "portfolio", "portfólio", "site", "link", "url"))) {
+                    value = link
+                    if (value == null) {
+                        reason = "NO_LINK_FOUND"
+                    }
+                }
+                else 
+                    if (ResumeImportService.looksLike(label, listOf("telefone", "celular", "whatsapp", "contato", "fone"))) {
+                        value = phone
+                        if (value == null) {
+                            value = email
+                        }
+                        if (value == null) {
+                            reason = "NO_CONTACT_FOUND"
+                        }
+                    }
+                    else 
+                        if (ResumeImportService.looksLike(label, listOf("email", "e-mail"))) {
+                            value = email
+                            if (value == null) {
+                                reason = "NO_CONTACT_FOUND"
+                            }
+                        }
+                        else {
+                            value = link
+                            if (value == null) {
+                                value = email
+                            }
+                            if (value == null) {
+                                reason = "NO_CONTACT_FOUND"
+                            }
+                        }
+            }
+            else 
+                if (field.type == "NUMBER" && ResumeImportService.looksLike(label, listOf("ano", "experiencia", "experiência", "tempo"))) {
+                    value = ResumeImportService.yearsOfExperience(text)
+                    if (value == null) {
+                        reason = "NO_YEARS_FOUND"
+                    }
+                }
+                else {
+                    reason = "MANUAL_FIELD"
+                }
+            if (value != null && Texts.hasText(value)) {
+                filled = filled + 1
+            }
+            suggestions.add(ResumeFieldSuggestion(field.id, field.label, value, reason))
+        }
+        String? message = Nulls.str()
+        if (email != null) {
+            message = "Ola! Segue minha candidatura. Meu e-mail: " + email + "."
+        }
+        return ResumeApplyPrefill(jobId, jobTitle, message, suggestions, filled, suggestions.size())
+    }
+    static Bool looksLike(label: String, keys: List<String>) {
+        var normalized = Texts.stripAccents(label)
+        for (var key in keys) {
+            if (normalized.contains(Texts.stripAccents(key))) {
+                return true
+            }
+        }
+        return false
+    }
+    static String? findEmail(text: String) {
+        var m = Regexes.first("[\\w.+-]+@[\\w-]+(\\.[\\w-]+)+", text)
+        if (m == null) {
+            return null
+        }
+        return m.text
+    }
+    // The first Brazilian phone: 10 to 13 digits.
+    static String? findPhone(text: String) {
+        for (var m in Regexes.findAll("(\\+?55\\s?)?(\\(?\\d{2}\\)?\\s?)?\\d{4,5}[-.\\s]?\\d{4}", text)) {
+            var digits = m.text.replaceAll("\\D", "")
+            if (digits.length() >= 10 && digits.length() <= 13) {
+                return m.text.trim()
+            }
+        }
+        return null
+    }
+    // The first useful link (LinkedIn/GitHub/portfolio before a social network).
+    static String? findLink(text: String) {
+        String? fallback = Nulls.str()
+        for (var m in Regexes.findAll("https?://\\S+", text)) {
+            var url = m.text.replaceAll("[.,;\\)]+$", "")
+            var lower = url.toLowerCase()
+            if (lower.contains("linkedin.com/in") || lower.contains("github.com") || lower.contains("portfolio") || lower.contains("behance") || lower.contains("medium.com")) {
+                return url
+            }
+            if (fallback == null && !lower.contains("facebook.com") && !lower.contains("instagram.com") && !lower.contains("twitter.com") && !lower.contains("x.com")) {
+                fallback = url
+            }
+        }
+        return fallback
+    }
+    // "X anos de experiencia" in the text ("5 anos de experiência", "3+ anos"). Ceiling of 50: a loose bigger number is
+    // a year, not an experience.
+    static String? yearsOfExperience(text: String) {
+        var m = Regexes.first("(?i)(\\d{1,2})\\s*\\+?\\s*anos?(?:\\s+de)?\\s+experi[êe]ncia", text)
+        if (m == null) {
+            return null
+        }
+        var years = m.groups.get(1).toInt()
+        if (years >= 0 && years <= 50) {
+            return "" + years
+        }
+        return null
+    }
+}

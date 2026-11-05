@@ -1,0 +1,140 @@
+import jobs.*
+import kernel.testkit.*
+import kernel.time.*
+import kernel.url.*
+
+// Port of JobSearchContractTests: the boolean search (AND, OR, NOT, minus, parentheses, quoted phrases), the
+// fields it reads, the filters combined with it, literal wildcards, pagination and the absurd query guard.
+// The corpus goes straight in the tables with the unique prefix "zq".
+String zqBase() = Time.plusSeconds(Time.nowIso(), 3600L)
+
+seedSearch() {
+    var base = zqBase()
+    JobsTestKit.insertJob("zq-java-pleno", "Pessoa Desenvolvedora Java", "Acme Tech", "São Paulo", "CLT", "PLENO", listOf("Java", "Spring"), base)
+    JobsTestKit.insertJob("zq-java-senior-remoto", "Pessoa Desenvolvedora Java Senior", "Globex", "Remoto", "PJ", "SENIOR", listOf("Java", "Kotlin"), Time.plusSeconds(base, -60L))
+    JobsTestKit.insertJob("zq-kotlin-junior", "Pessoa Desenvolvedora Kotlin", "Initech", "Recife", "CLT", "JUNIOR", listOf("Kotlin"), Time.plusSeconds(base, -120L))
+    JobsTestKit.insertJob("zq-dados-senior", "Engenheira de Dados", "Acme Tech", "Remoto", "CLT", "SENIOR", listOf("Python", "Spark"), Time.plusSeconds(base, -180L))
+    JobsTestKit.insertJob("zq-estagio-front", "Estágio em Front-end", "Umbrella", "Curitiba", "ESTAGIO", "JUNIOR", listOf("React"), Time.plusSeconds(base, -240L))
+    JobsTestKit.insertJob("zq-porcento", "Analista 100% remoto", "Wayne", "Remoto", "CLT", "PLENO", listOf("SQL"), Time.plusSeconds(base, -300L))
+}
+
+// The query string of "a=b&c" style params: a bare term is the query.
+String searchPath(params: String, limit: Int) {
+    var path = "/jobs?limit=" + limit
+    for (var param in params.split("&")) {
+        if (param.length() == 0) {
+            continue
+        }
+        var sep = param.indexOf("=")
+        if (sep > 0) {
+            path = path + "&" + param.substring(0, sep) + "=" + UrlCodec.encode(param.substring(sep + 1))
+        }
+        else {
+            path = path + "&query=" + UrlCodec.encode(param)
+        }
+    }
+    return path
+}
+
+// The ids of this corpus (prefix zq-) that the search returns, sorted.
+List<String> ids(params: String) {
+    seedSearch()
+    var res = JobsTestKit.get(searchPath(params, 50), null)
+    Check.status(res, 200)
+    return zqIds(res)
+}
+
+List<String> zqIds(res: TestResponse) {
+    var out = listOf<String>()
+    var i = 0
+    while (i < res.jsonSize("items")) {
+        var id = res.json("items." + i + ".id")
+        if (id.startsWith("zq-")) {
+            out.add(id)
+        }
+        i = i + 1
+    }
+    return out.sorted()
+}
+
+expectIds(label: String, params: String, expected: List<String>) {
+    var actual = ids(params)
+    Check.eqStr(label, String.join(",", expected.sorted()), String.join(",", actual))
+}
+
+test "consecutiveTermsRequireAllOfThem" {
+    expectIds("java senior", "java senior", listOf("zq-java-senior-remoto"))
+}
+
+test "orBringsBothSides" {
+    expectIds("kotlin OR dados", "kotlin OR dados", listOf("zq-kotlin-junior", "zq-java-senior-remoto", "zq-dados-senior"))
+}
+
+test "notAndMinusExcludeTerms" {
+    expectIds("java NOT senior", "java NOT senior", listOf("zq-java-pleno"))
+    expectIds("java -senior", "java -senior", listOf("zq-java-pleno"))
+}
+
+test "parenthesesGroupTheExpression" {
+    expectIds("(java OR kotlin) junior", "(java OR kotlin) junior", listOf("zq-kotlin-junior"))
+    expectIds("NOT (java OR kotlin) -estagio", "NOT (java OR kotlin) -estagio", listOf("zq-dados-senior", "zq-porcento"))
+}
+
+test "quotedPhraseMustAppearTogether" {
+    expectIds("phrase", "\"java senior\"", listOf("zq-java-senior-remoto"))
+    expectIds("reversed phrase", "\"senior java\"", listOf())
+}
+
+test "matchesCompanyLocationSkillsTypeAndLevel" {
+    expectIds("company", "globex", listOf("zq-java-senior-remoto"))
+    expectIds("location", "recife", listOf("zq-kotlin-junior"))
+    expectIds("skill", "spark", listOf("zq-dados-senior"))
+    expectIds("type without accent", "estagio", listOf("zq-estagio-front"))
+    expectIds("level", "pleno", listOf("zq-java-pleno", "zq-porcento"))
+}
+
+test "searchAndFiltersAreCombined" {
+    expectIds("query + level", "query=java&level=SENIOR", listOf("zq-java-senior-remoto"))
+    expectIds("remoto + type", "remoto&type=PJ", listOf("zq-java-senior-remoto"))
+    expectIds("remoto + type + level", "remoto&type=CLT&level=PLENO", listOf("zq-porcento"))
+}
+
+test "skillsFilterIsCombinedWithTheQuery" {
+    expectIds("spring", "query=java&skills=Spring", listOf("zq-java-pleno"))
+    expectIds("kotlin", "query=java&skills=Kotlin", listOf("zq-java-senior-remoto"))
+    expectIds("react", "query=java&skills=React", listOf())
+}
+
+test "wildcardsInTheQueryAreLiteral" {
+    expectIds("percent", "%", listOf("zq-porcento"))
+    expectIds("underscore", "_", listOf())
+    expectIds("100%", "100%", listOf("zq-porcento"))
+}
+
+test "paginationStillWorksWithTheBooleanSearch" {
+    seedSearch()
+    var q = "developer OR java OR kotlin OR dados"
+    var first = JobsTestKit.get(searchPath("query=" + q, 2), null)
+    Check.status(first, 200)
+    var firstPage = zqIds(first)
+    var cursor = first.json("nextCursor")
+    Check.isTrue("cursor", cursor.length() > 0)
+    var second = JobsTestKit.get(searchPath("query=" + q, 2) + "&cursor=" + UrlCodec.encode(cursor), null)
+    Check.status(second, 200)
+    Check.isTrue("first page has corpus jobs", firstPage.size() > 0)
+    for (var id in zqIds(second)) {
+        Check.isTrue("second page repeats " + id, !firstPage.contains(id))
+    }
+}
+
+test "rejectsAnAbsurdQueryWithoutBreakingTheListing" {
+    var terms = listOf<String>()
+    var i = 0
+    while (i < 70) {
+        terms.add("termo")
+        i = i + 1
+    }
+    Check.apiError(JobsTestKit.get("/jobs?query=" + UrlCodec.encode(String.join(" ", terms)), null), 400, "BAD_REQUEST")
+    Check.status(JobsTestKit.get("/jobs?query=java", null), 200)
+    JobsTestKit.finish()
+}

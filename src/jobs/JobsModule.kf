@@ -1,0 +1,107 @@
+package jobs
+
+import identity.*
+import kernel.*
+import kernel.db.*
+import kernel.jobs.*
+import kernel.log.*
+import kernel.security.*
+import messaging.*
+import notifications.*
+import profile.*
+
+// The seams of the jobs module, each with its default. Tests replace the reputation (like the Java tests mocked
+// ReputationService), the job sources and their transport; the owners of companies and corporate replace the
+// two table readers when they are ported.
+class JobSeamSet {
+    JobReputation reputation
+    JobCompanies companies
+    JobCorporate corporate
+    JobSourceTransport transport
+    List<JobImportSource>? sources = null
+    public constructor(platform: Platform, profiles: ProfileModule) {
+        this.reputation = ProfileJobReputation(profiles.reputation)
+        this.companies = JobCompanies(platform.db)
+        this.corporate = JobCorporate(platform.db)
+        this.transport = JobSourceTransport()
+    }
+}
+
+// The reputation the identity eligibility rule reads, backed by the live reputation of the profile domain
+// (the Java JobPublishingPolicy asked ReputationService). Main.kf puts it in `IdentitySeams.reputations`.
+class JobsIdentityReputation extends IdentityReputation {
+    JobReputation source
+    public constructor(source: JobReputation) {
+        super()
+        this.source = source
+    }
+    Int of(db: Db, userId: String) = source.of(userId)
+}
+
+// Composition of the jobs domain. Main.kf calls install once, after profile, notifications and messaging:
+//
+//   var jobs = JobsModule.install(platform, shared, parts, profiles, notificationsModule, messagingModule, identity.mailer)
+//
+// Jobs on kernel.jobs: the external refresh (`external-jobs-boot-seed` at boot, then `external-jobs-refresh` on
+// the cron). Env (Spring names as environment variables): REDE_JOBS_IMPORT_EXTERNAL_LISTING_ENABLED (false),
+// _EXTERNAL_LISTING_LIMIT (20), _EXTERNAL_REFRESH_ENABLED (true), _EXTERNAL_REFRESH_CRON ("0 0 0 * * *"),
+// _EXTERNAL_REFRESH_LIMIT (0 = all), _JOBRADAR_ENABLED / _SITEMAP_URL / _USER_AGENT, _OPEN_APIS_ENABLED (true).
+class JobsModule {
+    JobService service
+    ExternalJobService externalService
+    ExternalJobImportService importService
+    JobCompanyDirectory directory
+    JobStore store
+    public constructor(service: JobService, externalService: ExternalJobService, importService: ExternalJobImportService, directory: JobCompanyDirectory, store: JobStore) {
+        this.service = service
+        this.externalService = externalService
+        this.importService = importService
+        this.directory = directory
+        this.store = store
+    }
+    static JobsModule install(platform: Platform, shared: SharedServices, parts: SecurityParts, profiles: ProfileModule, notificationsModule: NotificationsModule, messagingModule: MessagingModule, mailer: IdentityMailer) = JobsModule.installWith(platform, shared, parts, profiles, notificationsModule, messagingModule, mailer, JobSeamSet(platform, profiles))
+    static JobsModule installWith(platform: Platform, shared: SharedServices, parts: SecurityParts, profiles: ProfileModule, notificationsModule: NotificationsModule, messagingModule: MessagingModule, mailer: IdentityMailer, seams: JobSeamSet) {
+        var cfg = platform.cfg
+        var store = JobStore(platform.db)
+        var externalStore = ExternalJobStore(platform.db, shared.caches.get("externalJobs"))
+        var delivery = JobApplicationDelivery(platform.db, profiles.directory, messagingModule.service, mailer)
+        var notifier = JobApplicationStatusNotifier(platform.db, profiles.directory, messagingModule.service, mailer, notificationsModule.notifications)
+        var service = JobService(platform.db, store, seams.reputation, profiles.directory, ProfileExtensionStore(platform.db), seams.corporate, seams.companies, delivery, notifier, parts.userLimiter, parts.timingGuard, notificationsModule.notifications, shared.caches.get("jobsList"))
+        var externalService = ExternalJobService(platform.db, externalStore, seams.reputation)
+        var sources = seams.sources
+        var configured = listOf<JobImportSource>()
+        if (sources == null) {
+            configured.add(JobRadarJobSource.fromConfig(cfg, seams.transport))
+            if (cfg.getBool("REDE_JOBS_IMPORT_OPEN_APIS_ENABLED", true)) {
+                for (var s in OpenJobApiSource.defaults(seams.transport)) {
+                    configured.add(s)
+                }
+            }
+        }
+        else {
+            for (var s in sources) {
+                configured.add(s)
+            }
+        }
+        var importService = ExternalJobImportService(platform.db, configured, externalStore, cfg.getInt("REDE_JOBS_IMPORT_EXTERNAL_REFRESH_LIMIT", 0))
+        var directory = JobCompanyDirectory(platform.db, externalStore)
+        JobRoutes(service, externalService, externalStore, directory, seams.companies, seams.reputation, profiles.directory, shared.idempotency, cfg.getBool("REDE_JOBS_IMPORT_EXTERNAL_LISTING_ENABLED", false), cfg.getInt("REDE_JOBS_IMPORT_EXTERNAL_LISTING_LIMIT", 20)).register(platform.server)
+        JobsModule.schedule(shared.jobs, cfg, importService)
+        return JobsModule(service, externalService, importService, directory, store)
+    }
+    // ExternalJobRefreshScheduler: a first load at boot (in the background, it must not hold the readiness) and
+    // every day at midnight. A failure never takes the app nor the internal jobs down.
+    static schedule(jobs: Scheduler, cfg: Config, importService: ExternalJobImportService) {
+        if (!cfg.getBool("REDE_JOBS_IMPORT_EXTERNAL_REFRESH_ENABLED", true)) {
+            return
+        }
+        var log = Log("jobs.external")
+        jobs.fixedDelay("external-jobs-boot-seed", 0L, 315360000000L, () -> {
+    log.info("external jobs: boot load starting in the background")
+    log.info("external jobs boot load: " + importService.refresh())
+})
+        jobs.cron("external-jobs-refresh", cfg.getStr("REDE_JOBS_IMPORT_EXTERNAL_REFRESH_CRON", "0 0 0 * * *"), "UTC", () -> {
+    log.info("external jobs refreshed: " + importService.refresh())
+})
+    }
+}

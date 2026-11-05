@@ -1,0 +1,64 @@
+import jobs.*
+import kernel.testkit.*
+
+// Port of JobCompanyPageTests: a job posted for a company page. Only the page team (RECRUITER and up) can do it,
+// the job carries the page name and slug, shows in the search and tells the followers. The page itself
+// (/empresa/{slug}, the directory) belongs to the companies domain: the page rows are seeded straight in the
+// tables, and the two endpoints that read them wait for that port (docs/PORTING_STATUS.md).
+String companyJobBody(title: String, company: String, companyId: String?) {
+    var link = ""
+    if (companyId != null) {
+        link = ",\"companyId\":" + JobsTestKit.q(companyId)
+    }
+    return "{\"title\":" + JobsTestKit.q(title) + ",\"company\":" + JobsTestKit.q(company) + ",\"location\":\"Remoto\",\"type\":\"CLT\",\"level\":\"PLENO\",\"currency\":\"BRL\",\"salaryMin\":\"1500\",\"salaryPeriod\":\"MONTH\",\"description\":\"Vaga de teste com valor.\",\"skills\":[\"Java\"],\"communityAgreement\":true,\"applicationFields\":[]" + link + "}"
+}
+
+test "onlyThePageTeamPostsForItAndTheJobPointsBackToThePage" {
+    var owner = JobsTestKit.login("jcp_owner")
+    var recruiter = JobsTestKit.login("jcp_recruiter")
+    var outsider = JobsTestKit.login("jcp_outsider")
+    var fan = JobsTestKit.login("jcp_fan")
+    var slug = "jobs-page-jcp"
+    var companyId = JobsTestKit.insertCompany(slug, "Jobs Page jcp", owner)
+    JobsTestKit.addCompanyMember(companyId, recruiter, "RECRUITER")
+    JobsTestKit.followCompany(companyId, fan)
+    Check.status(JobsTestKit.post("/jobs", outsider, companyJobBody("Vaga de fora jcp", "Acme", companyId)), 403)
+    var title = "Vaga da pagina jcp"
+    var created = JobsTestKit.post("/jobs", recruiter, companyJobBody(title, "Acme", companyId))
+    Check.status(created, 201)
+    Check.jsonEq(created, "company", "Jobs Page jcp")
+    Check.jsonEq(created, "companySlug", slug)
+    var jobId = created.json("id")
+    Check.jsonEq(JobsTestKit.get("/jobs/" + jobId, null), "companySlug", slug)
+    var search = JobsTestKit.get("/jobs?query=jcp&source=INTERNAL", null)
+    Check.status(search, 200)
+    var found = false
+    var i = 0
+    while (i < search.jsonSize("items")) {
+        if (search.json("items." + i + ".id") == jobId) {
+            found = true
+            Check.jsonEq(search, "items." + i + ".companySlug", slug)
+        }
+        i = i + 1
+    }
+    Check.isTrue("job in the search", found)
+    // Editing keeps the job on the page, under the page name.
+    var edited = JobsTestKit.put("/jobs/" + jobId, recruiter, companyJobBody(title, "Outro Nome", null))
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "company", "Jobs Page jcp")
+    Check.jsonEq(edited, "companySlug", slug)
+    var notifications = JobsTestKit.get("/notifications?context=PROFESSIONAL", fan)
+    Check.status(notifications, 200)
+    JobsTestKit.has("kind", notifications.body, "COMPANY_NEW_OPPORTUNITY")
+    JobsTestKit.has("href", notifications.body, "/empresa/" + slug)
+    JobsTestKit.has("context", notifications.body, "PROFESSIONAL")
+}
+
+test "aJobWithoutAPageHasNoSlug" {
+    var poster = JobsTestKit.login("jcp_plain")
+    var created = JobsTestKit.post("/jobs", poster, companyJobBody("Vaga sem pagina", "Acme", null))
+    Check.status(created, 201)
+    Check.jsonEq(created, "company", "Acme")
+    Check.isTrue("no companySlug", !created.jsonHas("companySlug") || created.jsonIsNull("companySlug"))
+    JobsTestKit.finish()
+}
