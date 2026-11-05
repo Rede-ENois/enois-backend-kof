@@ -1,6 +1,7 @@
 package feed
 
 import kernel.error.*
+import kernel.files.*
 import kernel.http.*
 import kernel.idempotency.*
 import kernel.security.*
@@ -28,11 +29,6 @@ class FeedExtraRoutes {
             return 0
         }
         throw Errors.badRequest()
-    }
-    // The preview card is a PNG and a Kof 0.7.1 handler answers a String that the runtime writes as UTF-8, so no
-    // binary body can leave the server (docs/KOF_GAPS.md G145): a real page answers 501 until the runtime can.
-    static String cardUnavailable() {
-        throw Errors.api(501, "PAGE_CARD_UNAVAILABLE", "O cartao de previa da pagina esta indisponivel.")
     }
     static FeedSeenBody seenBody() {
         try {
@@ -92,7 +88,7 @@ class FeedExtraRoutes {
     static registerLiteralRoutes(server: HttpServer, seals: FeedSeals) {
         server.get("/feed/posts/seals", () -> seals.forIds(query("ids"), Auth.viewerIdOrNull()))
     }
-    static register(server: HttpServer, idem: Idempotency, svc: FeedService, reader: FeedReader, reposts: FeedReposts, scheduled: FeedScheduled, seals: FeedSeals, notes: FeedNotes, answers: FeedAnswers, csp: String) {
+    static register(server: HttpServer, idem: Idempotency, svc: FeedService, reader: FeedReader, reposts: FeedReposts, scheduled: FeedScheduled, seals: FeedSeals, notes: FeedNotes, answers: FeedAnswers, cards: FeedPageCards, csp: String) {
         server.get("/feed", () -> {
     var userId = Auth.requireUser()
     var cursor = query("cursor")
@@ -168,10 +164,16 @@ class FeedExtraRoutes {
     return doc.html()
 })
         // The policy travels in headers, never in a <meta> inside the document: the content cannot alter or drop it.
+        // A PNG cannot leave through a String body (G145): the route is claimed in the binary lane and answers with a stream.
+        BinaryLane.claimDownload("/pages/:postId/og.png")
         server.get("/pages/:postId/og.png", () -> {
-    reader.pageDocument(Req.pathParam("postId"))
-    return FeedExtraRoutes.cardUnavailable()
+    var png = cards.cardOf(reader.pageDocument(Req.pathParam("postId")))
+    ResponseHeaders.set("Content-Type", "image/png")
+    ResponseHeaders.set("Cache-Control", "public, max-age=86400")
+    ResponseHeaders.set("X-Kernel-Stream", BinaryLane.stream(ByteStream.ofBytes(png), png.length as Long))
+    return Http.respond(200, "")
 })
+        // A day in the browser or platform; the server keeps its own cache.
         server.delete("/feed/posts/:postId/accepted-answer", () -> json.encode(answers.unaccept(Req.pathParam("postId"), Auth.requireUser())))
     }
 }

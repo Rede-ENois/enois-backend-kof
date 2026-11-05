@@ -1,7 +1,9 @@
 import feed.*
+import kernel.bytes.*
+import kernel.image.*
 import kernel.testkit.*
 
-// Port of PageContentTests. The preview card (og.png) tests are in PagePreviewCardTest.
+// Port of PageContentTests. The preview card service tests (PagePreviewCardServiceTests) are in PagePreviewCardTest.
 String publishKind(token: String, key: String, type: String, html: String) {
     var body = "{\"topic\":\"TECNOLOGIA\",\"type\":\"" + type + "\",\"content\":\"texto\",\"tags\":[],\"mediaIds\":[]}"
     if (type == "PAGE") {
@@ -42,8 +44,7 @@ test "only published pages are served" {
     Check.apiError(c.get("/pages/" + page), 404, "PAGE_NOT_FOUND")
 }
 
-// Port of previewCardForSomethingThatIsNotAPageIsNotFound. A real page answers 501 until the runtime can write a
-// binary body (docs/KOF_GAPS.md G145): previewCardShowsThePageText and PagePreviewCardServiceTests are not ported.
+// Port of previewCardForSomethingThatIsNotAPageIsNotFound.
 test "the preview card of something that is not a page is not found" {
     var author = FeedTestSupport.user("user_page_card2")
     var insight = publishKind(author, "page-card-2", "INSIGHT", "")
@@ -52,9 +53,28 @@ test "the preview card of something that is not a page is not found" {
     Check.apiError(c.get("/pages/post_inexistente_999/og.png"), 404, "PAGE_NOT_FOUND")
 }
 
-test "the preview card of a real page is unavailable while the runtime cannot write bytes" {
+// Port of previewCardShowsThePageText: the card is a PNG streamed through the binary lane.
+test "the preview card shows the page text" {
     var author = FeedTestSupport.user("user_page_card")
-    var page = publishKind(author, "page-card-1", "PAGE", "<h1>Meu portfolio de dados</h1>")
-    Check.apiError(FeedTestSupport.app().client.get("/pages/" + page + "/og.png"), 501, "PAGE_CARD_UNAVAILABLE")
+    var page = publishKind(author, "page-card-1", "PAGE", "<style>.ruido{color:red}</style><h1>Meu portfolio de dados</h1><p>Sou analista, trabalho com pipelines de dados e escrevo sobre isso.</p>")
+    var lane = BinaryClient(FeedTestSupport.app().port)
+    var res = lane.get("/pages/" + page + "/og.png", listOf<String>())
+    Check.eqInt("status", 200, res.status)
+    Check.eqStr("content type", "image/png", res.header("Content-Type"))
+    Check.isTrue("cache header", res.header("Cache-Control").contains("max-age"))
+    Check.isTrue("not empty", res.body.length > 5000)
+    Check.eqInt("png signature", 137, Bytes.at(res.body, 0))
+    Check.eqStr("png tag", "PNG", Bytes.ascii(res.body, 1, 3))
+    Check.eqStr("length", "" + res.body.length, res.header("Content-Length"))
+    var size = Images.dimensions(res.body, 1)
+    Check.isTrue("1200x630", size != null && size.width() == 1200 && size.height() == 630)
+    // The second request is answered by the cache with the same bytes.
+    var again = lane.get("/pages/" + page + "/og.png", listOf<String>())
+    Check.eqStr("cached", Bytes.toHex(res.body), Bytes.toHex(again.body))
+    // The page document next to it is still the ordinary HTML route.
+    var html = lane.get("/pages/" + page, listOf<String>())
+    Check.eqInt("html status", 200, html.status)
+    Check.isTrue("html", html.header("Content-Type").contains("text/html"))
+    Check.isTrue("html body", html.text().contains("Meu portfolio de dados"))
     FeedTestSupport.finish()
 }
