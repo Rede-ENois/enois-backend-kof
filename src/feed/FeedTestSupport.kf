@@ -27,6 +27,15 @@ class FeedTestSupport {
         FeedTestSupport.cachedApp = created
         return created
     }
+    static SharedServices? sharedHandle = null
+    // Last test of a file: stops the shared jobs. The Kof runtime waits for spawned tasks at exit, so a
+    // process that keeps the outbox worker running never ends (G124/G144).
+    static finish() {
+        var shared = FeedTestSupport.sharedHandle
+        if (shared != null) {
+            shared.stop()
+        }
+    }
     static FeedModule? installed = null
     static FeedModule module() {
         var m = FeedTestSupport.installed
@@ -41,6 +50,7 @@ class FeedTestSupport {
     }
     static wire(p: Platform) {
         var shared = SharedServices.create(p)
+        FeedTestSupport.sharedHandle = shared
         var hooks = SecurityHooks.defaults(p.db)
         Security.install(p, hooks)
         FeedTestSupport.installed = FeedModule.installWith(p, shared, hooks, FeedRecordingCoins())
@@ -174,7 +184,7 @@ class FeedRows {
             cursor = next
             page = page + 1
         }
-        throw "pagination did not finish within the fixture's page count"
+        throw "pagination did not finish within the fixture\'s page count"
     }
 }
 
@@ -183,11 +193,11 @@ class FeedRows {
 class FeedWorld {
     static befriend(requester: String, receiver: String) {
         var now = Time.nowIso()
-        FeedTestSupport.app().db().execute("insert into user_connections (requester_user_id, receiver_user_id, status, created_at, accepted_at) values (?, ?, 'ACCEPTED', ?, ?)", DbParams().bindStr(requester).bindStr(receiver).bindInstant(now).bindInstant(now))
+        FeedTestSupport.app().db().execute("insert into user_connections (requester_user_id, receiver_user_id, status, created_at, accepted_at) values (?, ?, \'ACCEPTED\', ?, ?)", DbParams().bindStr(requester).bindStr(receiver).bindInstant(now).bindInstant(now))
     }
     static community(id: String, name: String, topic: String, owner: String) {
         var now = Time.nowIso()
-        FeedTestSupport.app().db().execute("insert into communities (id, name, description, topic, created_by, created_at, updated_at) values (?, ?, 'Comunidade de teste', ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(name).bindStr(topic).bindStr(owner).bindInstant(now).bindInstant(now))
+        FeedTestSupport.app().db().execute("insert into communities (id, name, description, topic, created_by, created_at, updated_at) values (?, ?, \'Comunidade de teste\', ?, ?, ?, ?)", DbParams().bindStr(id).bindStr(name).bindStr(topic).bindStr(owner).bindInstant(now).bindInstant(now))
         FeedWorld.join(id, owner, "OWNER")
     }
     static join(communityId: String, userId: String, role: String) {
@@ -196,24 +206,24 @@ class FeedWorld {
     // A professional (corporate) profile row, ACTIVE or not.
     static corporate(userId: String, username: String, name: String, status: String) {
         var now = Time.nowIso()
-        FeedTestSupport.app().db().execute("insert into corporate_profiles (user_id, username, name, headline, status, created_at, updated_at) values (?, ?, ?, 'Headline profissional', ?, ?, ?)", DbParams().bindStr(userId).bindStr(username).bindStr(name).bindStr(status).bindInstant(now).bindInstant(now))
+        FeedTestSupport.app().db().execute("insert into corporate_profiles (user_id, username, name, headline, status, created_at, updated_at) values (?, ?, ?, \'Headline profissional\', ?, ?, ?)", DbParams().bindStr(userId).bindStr(username).bindStr(name).bindStr(status).bindInstant(now).bindInstant(now))
     }
     // A READY image of a user (media_assets), as the media port would leave it after an upload.
     static media(mediaId: String, ownerId: String) {
         var now = Time.nowIso()
-        FeedTestSupport.app().db().execute("insert into media_assets (id, owner_id, file_name, mime_type, size_bytes, purpose, object_key, cdn_url, status, delete_status, created_at, expires_at) values (?, ?, 'media/x/foto.png', 'image/png', 1024, 'POST_IMAGE', 'media/x/foto.png', 'https://cdn.test/foto.png', 'READY', 'NONE', ?, ?)", DbParams().bindStr(mediaId).bindStr(ownerId).bindInstant(now).bindInstant(Time.plusSeconds(now, 3600L)))
+        FeedTestSupport.app().db().execute("insert into media_assets (id, owner_id, file_name, mime_type, size_bytes, purpose, object_key, cdn_url, status, delete_status, created_at, expires_at) values (?, ?, \'media/x/foto.png\', \'image/png\', 1024, \'POST_IMAGE\', \'media/x/foto.png\', \'https://cdn.test/foto.png\', \'READY\', \'NONE\', ?, ?)", DbParams().bindStr(mediaId).bindStr(ownerId).bindInstant(now).bindInstant(Time.plusSeconds(now, 3600L)))
     }
     // A media asset with its own mime type, pixel size (0 = unknown) and a cdn address ending in /<id>/file.
     static mediaSized(mediaId: String, ownerId: String, mime: String, width: Int, height: Int) {
         var now = Time.nowIso()
         var db = FeedTestSupport.app().db()
-        db.execute("insert into media_assets (id, owner_id, file_name, mime_type, size_bytes, purpose, object_key, cdn_url, status, delete_status, created_at, expires_at) values (?, ?, 'file', ?, 10, 'POST_IMAGE', ?, ?, 'READY', 'NONE', ?, ?)", DbParams().bindStr(mediaId).bindStr(ownerId).bindStr(mime).bindStr("uploads/" + mediaId + "/file").bindStr("https://enois.exemplo.com/api/storage/uploads/" + mediaId + "/file").bindInstant(now).bindInstant(Time.plusSeconds(now, 3600L)))
+        db.execute("insert into media_assets (id, owner_id, file_name, mime_type, size_bytes, purpose, object_key, cdn_url, status, delete_status, created_at, expires_at) values (?, ?, \'file\', ?, 10, \'POST_IMAGE\', ?, ?, \'READY\', \'NONE\', ?, ?)", DbParams().bindStr(mediaId).bindStr(ownerId).bindStr(mime).bindStr("uploads/" + mediaId + "/file").bindStr("https://enois.exemplo.com/api/storage/uploads/" + mediaId + "/file").bindInstant(now).bindInstant(Time.plusSeconds(now, 3600L)))
         if (width > 0) {
             db.execute("update media_assets set width = ?, height = ? where id = ?", DbParams().bindInt(width).bindInt(height).bindStr(mediaId))
         }
     }
     static removeMedia(mediaId: String) {
-        FeedTestSupport.app().db().execute("update media_assets set delete_status = 'DELETED' where id = ?", DbParams().bindStr(mediaId))
+        FeedTestSupport.app().db().execute("update media_assets set delete_status = \'DELETED\' where id = ?", DbParams().bindStr(mediaId))
     }
     static setUsername(userId: String, username: String) {
         FeedTestSupport.app().db().execute("update users set username = ? where id = ?", DbParams().bindStr(username).bindStr(userId))
@@ -222,7 +232,7 @@ class FeedWorld {
     static preferences(userId: String, liked: String, blocked: String) {
         var db = FeedTestSupport.app().db()
         db.execute("delete from user_preferences where user_id = ?", DbParams().bindStr(userId))
-        db.execute("insert into user_preferences (user_id, theme_id, updated_at, liked_topics, blocked_topics) values (?, 'default', ?, ?, ?)", DbParams().bindStr(userId).bindInstant(Time.nowIso()).bindStrOrNull(FeedTestHelpers.blankToNull(liked)).bindStrOrNull(FeedTestHelpers.blankToNull(blocked)))
+        db.execute("insert into user_preferences (user_id, theme_id, updated_at, liked_topics, blocked_topics) values (?, \'default\', ?, ?, ?)", DbParams().bindStr(userId).bindInstant(Time.nowIso()).bindStrOrNull(FeedTestHelpers.blankToNull(liked)).bindStrOrNull(FeedTestHelpers.blankToNull(blocked)))
     }
     // Ids of a feed page as ",a,b," so a test can check membership with contains.
     static String feedIds(token: String, query: String) {
