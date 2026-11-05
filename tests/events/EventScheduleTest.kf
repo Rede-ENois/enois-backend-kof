@@ -1,0 +1,54 @@
+import app.*
+import events.*
+import kernel.testkit.*
+import kernel.time.*
+
+// Port of EventScheduleTests: what is schedulable and what is a mistake. The case that started it: an event on
+// 220122-12-12. The date is free text and the database accepted anything, so the event stayed on top of the list for
+// ever and the cleanup never reached it.
+test "absurdDatesAreRejected" {
+    var creator = OrgsTestKit.login("evsched_creator1")
+    var dates = listOf("220122-12-12", "1500-01-01", "12/12/220122", "31/02/2030", "ontem", "")
+    for (var date in dates) {
+        var res = creator.post("/events", EventsTestKit.body("Evento estranho", date, "19:00", "Presencial", "Énóis"))
+        Check.apiError(res, 400, "INVALID_EVENT_DATE")
+    }
+}
+
+test "realisticDatesPassInBothFormats" {
+    var creator = OrgsTestKit.login("evsched_creator2")
+    Check.status(creator.post("/events", EventsTestKit.body("Encontro do time", "2027-03-15", "19:00", "Presencial", "Énóis")), 201)
+    var br = creator.post("/events", EventsTestKit.body("Encontro do time", "15/03/2027", "19:00", "Presencial", "Énóis"))
+    Check.status(br, 201)
+    // The date is stored as the person wrote it.
+    Check.jsonEq(br, "date", "15/03/2027")
+}
+
+test "absurdDateAlreadyInTheDatabaseCountsAsExpired" {
+    var now = Time.toMillis("2026-10-18T12:00:00Z")
+    Check.isTrue("220122-12-12 is absurd", EventRules.hasAbsurdSchedule("220122-12-12", now))
+    Check.isTrue("and counts as over", EventRules.isExpired("220122-12-12", "10:59", now, 0L))
+    Check.isTrue("2027-03-15 is fine", !EventRules.hasAbsurdSchedule("2027-03-15", now))
+    Check.isTrue("and is not over", !EventRules.isExpired("2027-03-15", "19:00", now, 0L))
+    // The edges of the window: five years ahead and two behind.
+    Check.isTrue("four years ahead is fine", !EventRules.hasAbsurdSchedule("2030-10-18", now))
+    Check.isTrue("six years ahead is absurd", EventRules.hasAbsurdSchedule("2032-10-18", now))
+    Check.isTrue("one year behind is fine", !EventRules.hasAbsurdSchedule("2025-10-18", now))
+    Check.isTrue("three years behind is absurd", EventRules.hasAbsurdSchedule("2023-10-18", now))
+}
+
+test "onlyTheOwnerOrAnAdminDeletes" {
+    var creator = OrgsTestKit.login("evsched_creator3")
+    var other = OrgsTestKit.login("evsched_other3")
+    var admin = EventsTestKit.admin("evsched_admin")
+    var eventId = EventsTestKit.create(creator, "Evento para apagar", "2027-05-20")
+    // Neither the owner nor an admin: no.
+    Check.apiError(other.delete("/events/" + eventId), 403, "NOT_EVENT_OWNER")
+    // The admin deletes (that is how an absurd event leaves the air without anyone touching the database).
+    Check.status(admin.delete("/events/" + eventId), 200)
+    Check.apiError(OrgsTestKit.anonymous().get("/events/" + eventId), 404, "EVENT_NOT_FOUND")
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}

@@ -1,0 +1,42 @@
+package events
+
+import kernel.db.*
+import notifications.*
+import profile.*
+
+// The seams other domains held for the events domain, now backed by EventsStore (AppWiring passes these in). Each
+// keeps the contract of the table reader it replaces: same answers, same SQL semantics.
+// profile: attendances still present plus the aggregate kept before the purge, the events component of the
+// reputation. Only this method is overridden, so another port can subclass ProfileForeignCounts for its own counts.
+class EventsForeignCounts extends ProfileForeignCounts {
+    EventsStore events
+    public constructor(store: Db, events: EventsStore) {
+        super(store)
+        this.events = events
+    }
+    Int eventsAttendedTotal(userId: String) = events.attendedTotal(userId)
+}
+
+// notifications: the day of the event a notice points at, and the events a person confirmed (the weekly digest and
+// the "events today" summary).
+class EventsNotificationPlaces extends NotificationPlaceReader {
+    EventsStore events
+    public constructor(database: Db, events: EventsStore) {
+        super(database)
+        this.events = events
+    }
+    Map<String,String> eventDatesByIds(ids: List<String>) {
+        Map<String,String> out = mapOf()
+        for (var e in events.findByIds(ids)) {
+            out.put(e.id, e.date)
+        }
+        return out
+    }
+    List<NotificationAttendingEvent> attendingEvents(userId: String) {
+        var out = listOf<NotificationAttendingEvent>()
+        for (var e in events.findAttendedNotSanitized(userId)) {
+            out.add(NotificationAttendingEvent(e.id, e.title, e.date, e.time))
+        }
+        return out
+    }
+}

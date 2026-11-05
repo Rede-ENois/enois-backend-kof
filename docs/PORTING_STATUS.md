@@ -898,3 +898,40 @@ Deliberate differences from the Java service:
 - The Java `countOpen` repository method had no caller and is not ported. `freelances` is also named in the Java attack-purge and content-sweep targets: those jobs belong to security and moderation.
 
 No kernel change, no new compiler gap.
+
+### events
+
+Package `events` (`src/events`): `EventsModel` (records and the pure date rules `EventRules`), `EventsStore`, `EventsService`, `EventsRecurrenceService` (+ `EventSanitizationWorker`), `EventsRoutes`, `EventsModule`, `EventsBridges`. Fixtures: `app.EventsTestKit` (on top of `OrgsTestKit`).
+
+| | Ported/total |
+|---|---|
+| Endpoints | 8/8: `GET /events`, `GET /events/{id}`, `POST /events`, `PATCH /events/{id}`, `DELETE /events/{id}`, `PATCH /events/{id}/recurrence`, `POST /events/{id}/attendees`, `DELETE /events/{id}/attendees` |
+| Java tests of the domain (`events/**`) | 30/30 methods: viewer attendance 3, edit 4, city filter 3, sanitization 3, schedule 4, recurrence 9, sanitization window 4 |
+| Java tests elsewhere that hit events | `TextFieldLimitTests` event case 1/1 (`EventFieldLimitTest`), `IntelligentCacheTests` events cases 3/7 (`EventListCacheTest`), `LinkSchemeAllowlistTests` has no event case |
+| Kof tests | 43 in `tests/events` (10 files): the 34 ports above plus 9 extras (attendance codes and idempotent replay, response shape, edit extras, every field ceiling, stream link rules, banned host, the two seams) |
+
+- `IntelligentCacheTests` not ported (4 of 7): the TTL expiry, renewal and concurrent-load cases and the closed list of caches test `TtlCache`/`Caches`, not events; `tests/shared/TtlCacheTest.kf` covers them. The events cases (list served from cache, a write clears it, a refused write leaves it alone) run through HTTP with the cache on (60 s).
+- `NotificationContractControllerTests` event cases (place and day of an event notice, "events today") live in `tests/notifications`; they run unchanged on the events-backed reader, and `EventSeamsTest` also drives them from the events side.
+- Admin allowlist: Java `EventScheduleTests` added `rede.admin.emails`; the Kof test uses `users.is_admin` (the production rule, the allowlist is tests-only).
+
+Differences and decisions:
+
+- `Event` is an immutable `EventRecord`; recurrence is a String (NONE, WEEKLY, BIWEEKLY, MONTHLY) because enums do not cross packages. The date rules (ISO and strict dd/MM/yyyy, absurd window of 5 years ahead and 2 behind, expiry in UTC, monthly anchor math) are pure functions of ISO text and epoch millis in `EventRules`, tested with explicit instants; no Java date API is needed.
+- A missing NOT NULL column (title, date, time, format, host) is `409 CONFLICT` after every other check, as the Java database refused it.
+- The list cache (`eventsList`, `REDE_CACHE_EVENTS_LIST_TTL`) stores the JSON of an `EventListPage` (visible events, how many the database returned and the last `created_at`), so the cursor still comes from the database page; every write clears it after commit (the sanitisation job too, which Java did not).
+- Event links: `streamUrl` keeps the Java https-only rule (`INVALID_STREAM_URL`) and every JSON body goes through `SafeLinks.checkRequest` (`UNSAFE_LINK`, the Java request-body advice). `cover` is stored as sent, as in Java (V169 and V180 only rewrote old rows).
+- Jobs on `kernel.jobs`: `event-recurrence` (cron `REDE_EVENTS_RECURRENCE_CRON`, default `0 20 * * * *`, zone `REDE_EVENTS_RECURRENCE_ZONE`, switch `REDE_EVENTS_RECURRENCE_ENABLED`) and `event-sanitization` (fixed delay `REDE_EVENTS_SANITIZE_DELAY_MS`, default one hour, first run at boot).
+- The recurrence job asks identity (`IdentityStore.credentialByUser`) and the sanction reader whether the host is still active, and writes `EVENT_NEXT_OCCURRENCE` through `Notifications.create`.
+
+Seams replaced:
+
+| Seam | Now |
+|---|---|
+| `ProfileForeignCounts.eventsAttendedTotal` (profile reputation) | `EventsForeignCounts` (overrides only that method), passed in `AppWiring` instead of `ProfileForeignCounts(platform.db)`. A `TODO(orgs merge)` comment in `AppWiring` says to chain it with the mentoring subclass |
+| `NotificationPlaceReader.eventDatesByIds` / `attendingEvents` (notifications) | `EventsNotificationPlaces` in `NotificationsSeams.placeReader` |
+
+Seams owned: none. Remaining reads of `events` tables outside the domain: none (`communities`, `posts` and `groups` readers of the notification place reader stay with their owners).
+
+Kernel changes: `DbParams.bindIntOrNull` and `bindLongOrNull` bound a PRESENT value through `Integer.valueOf(Integer)` (`NoSuchMethodError`, G353); they copy the value into a plain local first, with a test in `tests/kernel/DbTest.kf`.
+
+Gaps: G353. A failing test makes the test JVM hang at exit (existing G105/G124): kill the java child to get its output.

@@ -1,0 +1,87 @@
+import app.*
+import kernel.testkit.*
+
+// Port of EventEditTests: the owner edits title, date, time, format, host and place; a non-owner gets 403; the edit
+// runs the same validations as the creation; a recurring event still needs a fixed time; the creator deletes too.
+test "ownerEditsTheEvent" {
+    var creator = OrgsTestKit.login("evedit_owner1")
+    var eventId = EventsTestKit.create(creator, "Encontro de abertura", "2030-06-10")
+    var edited = creator.patch("/events/" + eventId, "{\"title\":\"Encontro renomeado\",\"date\":\"2030-07-15\",\"time\":\"14:00\",\"format\":\"Presencial\",\"host\":\"Novo host\",\"city\":\"Curitiba\",\"state\":\"PR\"}")
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "id", eventId)
+    Check.jsonEq(edited, "title", "Encontro renomeado")
+    Check.jsonEq(edited, "date", "2030-07-15")
+    Check.jsonEq(edited, "time", "14:00")
+    Check.jsonEq(edited, "host", "Novo host")
+    Check.jsonEq(edited, "city", "Curitiba")
+    Check.jsonEq(edited, "state", "PR")
+    var detail = OrgsTestKit.anonymous().get("/events/" + eventId)
+    Check.status(detail, 200)
+    Check.jsonEq(detail, "title", "Encontro renomeado")
+}
+
+test "nonOwnerCannotEdit" {
+    var creator = OrgsTestKit.login("evedit_owner2")
+    var other = OrgsTestKit.login("evedit_other2")
+    var eventId = EventsTestKit.create(creator, "Mesa redonda", "2030-06-11")
+    var res = other.patch("/events/" + eventId, "{\"title\":\"Assumido\",\"date\":\"2030-06-11\",\"time\":\"19:00\",\"format\":\"Presencial\"}")
+    Check.apiError(res, 403, "NOT_EVENT_OWNER")
+    Check.jsonEq(res, "message", "Este evento nao e seu.")
+    Check.jsonEq(OrgsTestKit.anonymous().get("/events/" + eventId), "title", "Mesa redonda")
+}
+
+test "editRunsTheSameValidationsAsCreation" {
+    var creator = OrgsTestKit.login("evedit_owner3")
+    var eventId = EventsTestKit.create(creator, "Workshop", "2030-06-12")
+    // An absurd date and a stream without https refuse the edit, like the creation.
+    Check.apiError(creator.patch("/events/" + eventId, "{\"title\":\"Workshop\",\"date\":\"220122-12-12\",\"time\":\"19:00\",\"format\":\"Presencial\"}"), 400, "INVALID_EVENT_DATE")
+    Check.apiError(creator.patch("/events/" + eventId, "{\"title\":\"Workshop\",\"date\":\"2030-06-12\",\"time\":\"19:00\",\"format\":\"Online\",\"streamUrl\":\"http://inseguro.example\"}"), 400, "INVALID_STREAM_URL")
+    // A city on an online event does not hold on edit either.
+    Check.apiError(creator.patch("/events/" + eventId, "{\"title\":\"Workshop\",\"date\":\"2030-06-12\",\"time\":\"19:00\",\"format\":\"Online\",\"city\":\"Curitiba\",\"state\":\"PR\"}"), 400, "EVENT_CITY_NOT_IN_PERSON")
+    // The event is untouched by the refused edits.
+    Check.jsonEq(OrgsTestKit.anonymous().get("/events/" + eventId), "date", "2030-06-12")
+}
+
+test "ownerDeletesTheEvent" {
+    var creator = OrgsTestKit.login("evedit_owner4")
+    var other = OrgsTestKit.login("evedit_other4")
+    var eventId = EventsTestKit.create(creator, "Encerramento", "2030-06-13")
+    Check.apiError(other.delete("/events/" + eventId), 403, "NOT_EVENT_OWNER")
+    var deleted = creator.delete("/events/" + eventId)
+    Check.status(deleted, 200)
+    Check.jsonEq(deleted, "status", "DELETED")
+    Check.jsonEq(deleted, "id", eventId)
+    Check.apiError(OrgsTestKit.anonymous().get("/events/" + eventId), 404, "EVENT_NOT_FOUND")
+    Check.apiError(creator.delete("/events/" + eventId), 404, "EVENT_NOT_FOUND")
+}
+
+// The Java service ran the same checks in the same order on both paths; the extras below lock the ones the original
+// four tests do not reach: the edit of a recurring event keeps requiring an hour, and the place clears when omitted.
+test "recurringEventKeepsRequiringAFixedTimeOnEdit" {
+    var creator = EventsTestKit.host("evedit_owner5")
+    var res = creator.post("/events", "{\"title\":\"Ritual editavel\",\"date\":\"" + EventsTestKit.day(20) + "\",\"time\":\"19:00\",\"format\":\"Online\",\"host\":\"Enois\",\"recurrence\":\"WEEKLY\"}")
+    Check.status(res, 201)
+    var eventId = OrgsTestKit.str(res, "id")
+    Check.apiError(creator.patch("/events/" + eventId, "{\"title\":\"Ritual editavel\",\"date\":\"" + EventsTestKit.day(21) + "\",\"time\":\"a noite\",\"format\":\"Online\",\"host\":\"Enois\"}"), 400, "INVALID_EVENT_TIME")
+    var ok = creator.patch("/events/" + eventId, "{\"title\":\"Ritual editavel\",\"date\":\"" + EventsTestKit.day(21) + "\",\"time\":\"20:15\",\"format\":\"Online\",\"host\":\"Enois\"}")
+    Check.status(ok, 200)
+    Check.jsonEq(ok, "recurrence", "WEEKLY")
+    Check.jsonEq(ok, "time", "20:15")
+}
+
+test "editWithoutPlaceClearsIt" {
+    var creator = OrgsTestKit.login("evedit_owner6")
+    var res = creator.post("/events", "{\"title\":\"Com lugar\",\"date\":\"2030-08-01\",\"time\":\"19:00\",\"format\":\"Presencial\",\"host\":\"Casa\",\"city\":\"Recife\",\"state\":\"PE\"}")
+    Check.status(res, 201)
+    var eventId = OrgsTestKit.str(res, "id")
+    var edited = creator.patch("/events/" + eventId, "{\"title\":\"Com lugar\",\"date\":\"2030-08-01\",\"time\":\"19:00\",\"format\":\"Presencial\",\"host\":\"Casa\"}")
+    Check.status(edited, 200)
+    Check.isTrue("city cleared", edited.jsonIsNull("city"))
+    Check.isTrue("state cleared", edited.jsonIsNull("state"))
+    Check.apiError(creator.patch("/events/" + eventId, "{\"title\":\"Com lugar\",\"date\":\"2030-08-01\",\"time\":\"19:00\",\"format\":\"Presencial\",\"host\":\"Casa\",\"city\":\"Recife\"}"), 400, "CITY_STATE_INCOMPLETE")
+    Check.apiError(OrgsTestKit.anonymous().patch("/events/" + eventId, "{}"), 401, "UNAUTHENTICATED")
+}
+
+test "finish" {
+    OrgsTestKit.finish()
+}
