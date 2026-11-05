@@ -1,0 +1,34 @@
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import kernel.http.*
+import kernel.testkit.*
+
+test "a picked port is free on 127.0.0.1" {
+    var picked = LoopbackPorts.pick()
+    Check.isTrue("in range", picked > 0)
+    var holder = new ServerSocket()
+    holder.setReuseAddress(false)
+    holder.bind(new InetSocketAddress("127.0.0.1", picked))
+    Check.eqInt("bound", picked, holder.getLocalPort())
+    holder.close()
+}
+
+test "a port held on 127.0.0.1 by another socket is never picked" {
+    var decoy = new ServerSocket()
+    decoy.setReuseAddress(false)
+    decoy.bind(new InetSocketAddress("127.0.0.1", 0))
+    var held = decoy.getLocalPort()
+    var i = 0
+    while (i < 50) {
+        Check.isTrue("not the held port", LoopbackPorts.pick() != held)
+        i = i + 1
+    }
+    decoy.close()
+}
+
+test "an ephemeral listener answers on 127.0.0.1" {
+    var app = TestApp.boot("loopback")
+    Check.isTrue("port", app.port > 0)
+    Check.status(app.client.get("/health"), 200)
+    app.stop()
+}
