@@ -1094,8 +1094,7 @@ of `src/**/*.kf`, and diffs the (method, path) sets.
 
 ## Totals (final tidy)
 
-Kof side, counted from the tree: 322 test files with 2186 `test "..."` blocks (about 640 of them HTTP-level against a booted app,
-the rest kernel, security and unit suites), 665 route registrations of which 640 match a Java mapping one to one (the rest are
+Kof side, counted from the tree: 322 test files with 2186 `test "..."` blocks, 665 route registrations of which 640 match a Java mapping one to one (the rest are
 the client and filter patterns above). Per domain, tests in `tests/<domain>` (HTTP-level and unit):
 feed 167, identity 138, jobs 108, media 104 (all media suites), profile 93, messaging 69, cosmetics 67, emotes 68, coin 63,
 moderation 62, groups 57, events 53, mentoring 43, notifications 37, ops 37, corporate 33, studypairs 31, importlinkedin 29,
