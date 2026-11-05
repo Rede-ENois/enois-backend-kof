@@ -98,6 +98,75 @@ behaviours on `TtlCache`/`Caches` (reuse, expiry loads nothing on its own, renew
 clears after commit, a failed write leaves the cache alone, one load for concurrent callers, closed list of
 caches with their policy) because `EventService` is not ported.
 
+## media
+
+| Domain | Endpoints ported / total | Tests ported / total | Gaps |
+|---|---|---|---|
+| media (uploads, assets, `/storage` proxy, S3 and ImageKit modes, sanitiser, workers, migration) | 6 / 6 | 69 / 76 Java tests (88 Kof tests in `tests/media/`) | G160 to G169 |
+
+Endpoints: `POST /media/uploads`, `GET /media/{id}`, `DELETE /media/{id}`, `GET /media/migration`,
+`GET /storage/{key}` (Range, `Cache-Control` immutable) and `PUT /storage/{key}` (the owner's session, the
+exact key of the asset, the declared size).
+
+Ported: assets and deletion jobs on the same tables, upload validation (types, purposes, 500 MB), the S3
+mode (`REDE_MEDIA_STORAGE=s3`: URL factory, signer that goes through the app when moderation is on, gateway)
+and the ImageKit mode (the default: uploads answer 503 `UPLOADS_DISABLED`), the metadata sanitiser (JPEG with
+physical EXIF rotation, PNG, GIF, WebP, video and audio through ffmpeg on `ProcessRunner`), image-content
+moderation (classifier and reviewer seams), width and height (on upload and the backfill job),
+`MediaDeletionWorker`, `MediaMigrationService` + worker + `MediaLazyCopyTrigger`, `LazyUrlMigrationService`
+(SSRF guarded by `OutboundUrlGuard`), `MediaResilience` (retry 3 x 250 ms, circuit breaker, bulkhead of 4 on the
+storage gateway: a small helper with no kernel dependency but `Gate`/`Permits`), the S3 REST client with
+Signature V4 (`kernel.storage.S3Rest`, G160).
+
+### Large bodies and binary data (read this)
+
+The Kof web runtime reads every request body as a UTF-8 String and writes every response body as a String, so
+the Java `PUT/GET /api/storage/{key}` (raw image/video bytes, up to 500 MB, Range) cannot be an ordinary route
+(measured, G161). The workaround is a kernel adapter, `kernel.http.BinaryLane` + `BinaryFront`: when a module
+claims a route prefix (`BinaryLane.claim("/storage/")`), `Platform.start` moves the web runtime to an internal
+loopback port and serves the public port with a byte-level front that forwards every other request unchanged.
+For a claimed `PUT` the front asks the route to authorise (the whole security pipeline runs, no body read yet),
+then spools the body to a temp file and calls the route again with a ticket; for a claimed `GET` the route
+registers a stream and the front sends the bytes. Consequences for operators: the service is one hop heavier
+(loopback), the internal port must not be published, `REDE_BINARY_MAX_BODY_BYTES` caps one upload (default
+520 MB), and an upload is spooled to disk (`java.io.tmpdir`), never held in memory. Nothing else changes: the
+gateway still sees one port.
+
+### Pending ports (seams)
+
+| Seam (class in `media`) | Default | Owner / what it needs |
+|---|---|---|
+| `MediaImageClassifier` (`available`, `pornographicScore`) | not available: with `REDE_MEDIA_NSFW_ENABLED=true` (the default) an image upload answers 503 `IMAGE_MODERATION_UNAVAILABLE` | media: the ONNX OpenNSFW model (`OnnxImageContentClassifier`) needs a runtime that is not reachable from Kof yet. Run with `REDE_MEDIA_NSFW_ENABLED=false` only if moderation happens elsewhere |
+| `MediaImageReviewer.review` | no answer (fails closed, 503) | moderation: `ModerationImageContentReviewer` |
+| `MediaPdfCleaner.clean` | passes the bytes through | media: PDFBox (G164): PDFs keep author and title meanwhile |
+| `MediaObjectStore`, `MediaStorageGateway`, `MediaUploadSigner` | S3 (`MediaS3ObjectStore`, `MediaS3Gateway`, `MediaS3UploadSigner`) or ImageKit | tests use `MediaLocalObjectStore` or a fake |
+| S3 credentials | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | the web-identity (IRSA) provider is not ported |
+
+What other domains call (on `MediaModule.service`, wired in `Main.kf`): `visibleByIds(ids): Map<String, MediaSummaryView>`
+(feed, groups, profile cards), `validateOwnedBy(ownerId, ids)` (post and comment creation),
+`requestPostMediaDeletion(ownerId, postId, ids)` (post deletion), and `MediaModule.onUrlAccess(url)` (profiles,
+covers and logos call it when they serve a legacy ImageKit URL). Each of those domains owns its seam class and
+subclasses it over these methods.
+
+Deliberate differences from Java:
+
+- ImageKit mode without `IMAGEKIT_PRIVATE_KEY`: deletion jobs use the no-op gateway and a warning is logged (Java called
+  the ImageKit API with an empty key and failed forever).
+- A JPEG rotated by its EXIF orientation is re-encoded at the ImageIO default quality (G163).
+- The `{*key}` wildcard is registered once per depth (1 to 10 segments), the router matches by segment count.
+- Retry waits and the circuit breaker's open state (60 s, the library default) are fixed values, not Spring properties.
+
+### Java tests that could not be ported (7 of 76)
+
+| Java test | Why |
+|---|---|
+| `OnnxImageContentClassifierTests` (6: animated GIF budget, frame sampling, partial-frame compositing, disposal method, NHWC buffer, centre crop) | the classifier is the ONNX Runtime model, pending (see the seam table). Port them with the classifier |
+| `MediaMetadataSanitizerTests.pdfDocumentInformationIsCleared` | PDF cleaning is a seam without PDFBox (G164). The pass-through default is asserted by `empty, unknown and unreadable data come back unchanged` |
+
+Ported with a changed trigger: `MediaControllerTests.deletesMediaReferencedByDeletedPost` calls
+`requestPostMediaDeletion` (what the feed calls on post deletion) because the feed endpoint is not part of this
+domain; the `/storage` tests use real bytes through the binary lane; `MediaStorageProxyTests` and the S3 tests run
+with fakes behind the `MediaObjectStore` seam, like the Java ones.
 
 ## Notifications, push, messaging, calls (`notifications`, `push`, `messaging`, `calls`)
 
@@ -416,6 +485,88 @@ Tests changed trigger, assertion kept: preferences seeded in `user_preferences` 
 push-off test checks only the in-app row; the reminder schedule test uses `Cron.next` plus the registered job instead of
 reflection on `@Scheduled`. The topic list is copied from `ContentTaxonomy` into `StudyPairRules.topics()` (and into
 `CommunityRules.topics()`): preferences owns it upstream.
+## gifs
+
+| Domain | Endpoints ported / total | Tests ported / total | Gaps |
+|---|---|---|---|
+| gifs (`src/gifs/`, tests in `tests/gifs/`) | 1 / 1 (`GET /gifs/search`) | 12 / 12 Java tests (18 Kof tests: 6 extra for provider URLs, failure mapping, limit floor and malformed limit, term normalisation, failure not cached, key availability, community provider) | G170 to G172 |
+
+Ported: `GifSearchService` (first available provider that answers wins, Tenor before GIPHY, a failing provider hands over to the next, all failing rethrows `502 GIF_PROVIDER_ERROR`, no key anywhere answers `available: false`), the cache `gifSearch` (`term|limit`, 10 min, failures not cached), the Tenor and GIPHY payload mappers, `CommunityGifProvider`.
+Env: `REDE_GIFS_TENOR_KEY`, `REDE_GIFS_GIPHY_KEY` (cache TTL: `REDE_CACHE_GIF_SEARCH_TTL`).
+
+| Seam (class in `gifs`) | Default | Owner / what it needs |
+|---|---|---|
+| `GifHttp.get(url)` | `kof.http` GET, 8 s timeout (any failure is a 502) | tests subclass it; nothing else |
+| `GifCommunityReader.search(term, limit)` | finds nothing | feed: `CommunityGifAdapter` (comments with a `.gif` URL matching the term). Java never registers `CommunityGifProvider` as a bean, so it is not wired here either; wire it (third provider) only if the feed port wants the "Comunidade" source |
+
+Behaviour notes: the Java `Math.clamp(limit, 1, 50)` and the trim + lower-case of `q` are kept; a malformed `limit` answers `400 BAD_REQUEST` (Spring's argument mismatch). The Java suite had 5 MockMvc + 3 service + 3 mapping + 1 unavailable = 12 tests; all are ported with the same assertions.
+## linkedin
+
+| Domain | Endpoints ported / total | Tests ported / total | Gaps |
+|---|---|---|---|
+| linkedin (share on LinkedIn) | 2 / 2 (`GET`, `PUT /me/integrations/linkedin`) | 15 / 15 Java tests (11 Kof tests in `LinkedInApiTest`, 9 in `LinkedInServiceTest`: one per Java test plus extras: bad body 400s, encrypted-at-rest row and unlink, the real HTTP client against a local stub) | G176 to G178 |
+
+`LinkedInModule.install(platform, shared, hooks)` registers the routes and the `PostPublished` handler
+(`shared.outbox.register`). The token is stored with `shared.cipher` (nothing is stored without the key).
+`service.remember(userId, memberSub, accessToken, expiresAtIso)` and `service.remove(userId)` are for identity's OAuth link,
+login and unlink (the Java callback code is not in this domain).
+
+Seams (defaults in `LinkedInModule.install`):
+
+| Seam | Default | Owner / what it needs |
+|---|---|---|
+| `LinkedInPostLookup.findById` | reads `posts` (id, author_id, content, status, type, author_identity) read-only | feed: `// pending-port: feed`; extend it when the feed store exists |
+| `LinkedInShareClient.share` | `LinkedInHttpShareClient` (POST `https://api.linkedin.com/v2/ugcPosts` via `kernel.http.Outbound.attempt`) | tests extend it with a stub; the endpoint is a constructor argument |
+| `LinkedInClock.nowIso` | `Time.nowIso()` | tests extend it to fix the clock (Java `Clock.fixed`) |
+
+Kernel: outbound POST with status goes through the shared `kernel.http.Outbound.attempt` (G178). Base URL of the share link: `REDE_FRONTEND_BASE_URL` (default `https://enois.ia.br`, the Java `rede.frontend.base-url`).
+
+## emotes
+
+| Domain | Endpoints ported / total | Tests ported / total | Gaps |
+|---|---|---|---|
+| emotes (`src/emotes/`) | 3 / 3 (`GET /emotes`, `GET /emotes/index`, `GET /emotes/image/{provider}/{id}` through the binary lane) | 55 / 55 Java tests (67 Kof tests in `tests/emotes/`, 6 in `tests/kernel/HttpFetchBytesTest.kf`) | G173 to G175 |
+
+Ported: the sticker catalog built in memory (`EmoteCatalogService`: last good copy per source, priority merge,
+popular rank, animated flag, name policy and the blocked-artwork gate), the four live sources (BTTV global, FFZ
+global, FFZ animated listing, FFZ popular listing) behind the `EmoteFeed` seam, the embedded snapshot
+(`resources/emotes/catalogo.json`, copied verbatim; override the path with `REDE_EMOTES_CATALOG_FILE`), the image
+cache with the CDN fetch behind the `EmoteImageFetcher` seam, the boot build and the 3-hourly refresh on
+`kernel.jobs` (`REDE_EMOTES_REFRESH_ENABLED`, `REDE_EMOTES_REFRESH_CRON` default `0 0 */3 * * *`,
+`REDE_EMOTES_POPULAR_PAGES` 3, `REDE_EMOTES_ANIMATED_PAGES` 2), and the two JSON reads with `ETag`, `Cache-Control`
+and `304`.
+
+Behaviour notes:
+
+- Image route pending: the runtime cannot send raw bytes (G175). `EmotesModule.image(provider, id, variant)` returns
+  the `EmoteStoredImage(bytes, contentType)` or null (404) with the Java rules (blocked artwork, animation known
+  from the catalog, cache, two tries, static fallback). The route must answer the content type of the image,
+  `X-Content-Type-Options: nosniff` and `Cache-Control: max-age=604800, public, immutable`.
+- The image cache is a plain in-process map with a 48 MB budget (oldest entries go first) and a 7 day expiry, not
+  Caffeine. `EmoteCatalog.etag()` is a hash of the content plus the build second (the Java value was
+  `hashCode()` based); only the `W/"..."` shape is part of the contract.
+- A refresh that starts while another one runs is skipped (`kernel.concurrent.Gate.tryEnter`); Java's `synchronized`
+  made it wait and then repeat the same work.
+- `OutboundUrlGuard` is not used: every upstream address is a constant plus an id validated against
+  `[A-Za-z0-9]{1,40}` (as in Java), so no user text becomes a host.
+- `popularRank` is `-1` inside the `Emote` record for "none" (a nullable `Integer` in Java) and `null` in the JSON.
+
+### Pending seams
+
+| Seam | Default | Notes |
+|---|---|---|
+| `EmoteFeed` (provider JSON GET) | real HTTP through `kernel.http.Outbound.getBytes` | tests subclass it |
+| `EmoteImageFetcher` (CDN image GET) | real HTTP, 4 s connect / 6 s read, `image/*` only, 1 MB cap | tests subclass it |
+| binary route `GET /emotes/image/{provider}/{id}` | not registered | media port (binary lane) calls `EmotesModule.image` |
+
+### Java tests that could not be ported as written (all 55 have a Kof counterpart)
+
+| Java test | Adaptation |
+|---|---|
+| `EmoteCatalogSchedulerTest.erroQueNaoEExcecaoNoBootNaoEscapaDaThread` | Kof throws only Strings (no `Error`): asserts the failing boot build is logged, not counted as a failed job run, and the job survives |
+| `EmoteCatalogSchedulerTest` (4) | the Java boot thread and `@Scheduled` are the kernel jobs `emotes-boot` (one run, then a 10 year period) and `emotes-refresh` (cron); the mock service is a subclass overriding `refresh()` |
+| `EmoteControllerTest.imagemVemDoCacheComCacheLongo`, `imagemDeFigurinhaAnimadaPedeOArquivoEmMovimento`, `imagemDeFigurinhaDesconhecidaNaoTentaOArquivoAnimado`, `imagemDeProvedorDesconhecidoResponde404` | asserted on `EmotesModule.image` (content type, URLs fetched, null for 404); the status and the `Cache-Control`/`nosniff` headers wait for the binary route |
+| `EmoteSourcesTest`, `EmoteImageCacheTest`, `EmoteImagesTest` | JSON is passed as text instead of a Jackson tree; the stubbed CDN is an `EmoteImageFetcher` subclass |
 
 ## identity (identity, age, onboarding)
 

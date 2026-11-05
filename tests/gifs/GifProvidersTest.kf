@@ -1,0 +1,99 @@
+import gifs.*
+import kernel.error.*
+
+// Provider payloads without network: the format is a third party's and changes without notice.
+class StubGifHttp extends GifHttp {
+    String answer
+    String? failure
+    String lastUrl = ""
+    public constructor(answer: String, failure: String?) {
+        super()
+        this.answer = answer
+        this.failure = failure
+    }
+    String get(url: String) {
+        lastUrl = url
+        var f = failure
+        if (f != null) {
+            var raised = "" + f
+            throw raised
+        }
+        return answer
+    }
+}
+
+test "maps Tenor results" {
+    var body = "{\"results\":[{\"id\":\"1\",\"content_description\":\"gato dançando\",\"media_formats\":{\"gif\":{\"url\":\"https://media.tenor.com/1/gato.gif\",\"dims\":[498,498]},\"tinygif\":{\"url\":\"https://media.tenor.com/1/gato-tiny.gif\",\"dims\":[220,220]}}},{\"id\":\"2\",\"content_description\":\"sem gif\",\"media_formats\":{\"tinygif\":{\"url\":\"https://media.tenor.com/2/so-tiny.gif\",\"dims\":[220,220]}}},{\"id\":\"3\",\"content_description\":\"vazio\",\"media_formats\":{}}]}"
+    var items = TenorGifProvider.map(body)
+    assert(items.size() == 2)
+    var first = items.get(0)
+    assert(first.url == "https://media.tenor.com/1/gato.gif")
+    assert(first.previewUrl == "https://media.tenor.com/1/gato-tiny.gif")
+    assert(first.width == 498)
+    assert(first.height == 498)
+    assert(first.description == "gato dançando")
+    assert(first.provider == "Tenor")
+    // Without `gif` the preview becomes the main media: a small GIF beats none.
+    assert(items.get(1).url == "https://media.tenor.com/2/so-tiny.gif")
+}
+
+test "maps GIPHY results" {
+    var body = "{\"data\":[{\"id\":\"a\",\"title\":\"cachorro\",\"images\":{\"original\":{\"url\":\"https://media.giphy.com/media/a/giphy.gif\",\"width\":\"480\",\"height\":\"270\"},\"fixed_width\":{\"url\":\"https://media.giphy.com/media/a/200w.gif\",\"width\":\"200\",\"height\":\"113\"}}},{\"id\":\"b\",\"title\":\"sem original\",\"images\":{\"fixed_width\":{\"url\":\"https://media.giphy.com/media/b/200w.gif\"}}}]}"
+    var items = GiphyGifProvider.map(body)
+    assert(items.size() == 1)
+    var first = items.get(0)
+    assert(first.url == "https://media.giphy.com/media/a/giphy.gif")
+    assert(first.previewUrl == "https://media.giphy.com/media/a/200w.gif")
+    assert(first.width == 480)
+    assert(first.height == 270)
+    assert(first.provider == "GIPHY")
+}
+
+test "empty payload means empty list" {
+    assert(TenorGifProvider.map("{\"results\":[]}").size() == 0)
+    assert(GiphyGifProvider.map("{\"data\":[]}").size() == 0)
+    assert(TenorGifProvider.map("{}").size() == 0)
+}
+
+test "an empty query asks for trending and a term asks for search" {
+    var tenor = StubGifHttp("{\"results\":[]}", null)
+    TenorGifProvider("k e y", tenor).search("", 5)
+    assert(tenor.lastUrl == "https://tenor.googleapis.com/v2/featured?key=k%20e%20y&limit=5&media_filter=gif,tinygif")
+    TenorGifProvider("k", tenor).search("gato bravo", 7)
+    assert(tenor.lastUrl == "https://tenor.googleapis.com/v2/search?key=k&limit=7&media_filter=gif,tinygif&q=gato%20bravo")
+    var giphy = StubGifHttp("{\"data\":[]}", null)
+    GiphyGifProvider("k", giphy).search("", 3)
+    assert(giphy.lastUrl == "https://api.giphy.com/v1/gifs/trending?api_key=k&limit=3&rating=pg-13&bundle=messaging_non_clips")
+    GiphyGifProvider("k", giphy).search("oi", 3)
+    assert(giphy.lastUrl == "https://api.giphy.com/v1/gifs/search?api_key=k&limit=3&rating=pg-13&bundle=messaging_non_clips&q=oi")
+}
+
+test "a network failure or an unreadable answer is a 502 GIF_PROVIDER_ERROR" {
+    var down = false
+    try {
+        TenorGifProvider("k", StubGifHttp("", "connection refused")).search("x", 1)
+    } catch (String e) {
+        down = Errors.hasCode(e, "GIF_PROVIDER_ERROR") && Errors.parse(e).status == 502
+    }
+    assert(down)
+    var junk = false
+    try {
+        GiphyGifProvider("k", StubGifHttp("<html>", null)).search("x", 1)
+    } catch (String e) {
+        junk = Errors.hasCode(e, "GIF_PROVIDER_ERROR")
+    }
+    assert(junk)
+}
+
+test "a provider without a key is unavailable" {
+    assert(!TenorGifProvider("", GifHttp()).available())
+    assert(!GiphyGifProvider("   ", GifHttp()).available())
+    assert(TenorGifProvider("k", GifHttp()).available())
+}
+
+test "the community provider is always available and maps urls" {
+    var p = CommunityGifProvider(GifCommunityReader())
+    assert(p.available())
+    assert(p.name() == "Comunidade")
+    assert(p.search("Oi", 3).size() == 0)
+}

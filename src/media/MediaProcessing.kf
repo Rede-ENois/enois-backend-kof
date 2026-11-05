@@ -1,0 +1,134 @@
+package media
+
+import kernel.error.*
+import kernel.files.*
+import kernel.image.*
+import kernel.log.*
+import kernel.time.*
+
+// Image-content policy applied before an upload reaches public storage (MediaImageModerationService).
+class MediaModeration {
+    Bool enabled
+    Double threshold
+    MediaImageClassifier classifier
+    MediaImageReviewer reviewer
+    public constructor(enabled: Bool, threshold: Double, classifier: MediaImageClassifier, reviewer: MediaImageReviewer) {
+        if (threshold < 0.0 || threshold > 1.0) {
+            throw "rede.media.nsfw.threshold precisa estar entre 0 e 1."
+        }
+        this.enabled = enabled
+        this.threshold = threshold
+        this.classifier = classifier
+        this.reviewer = reviewer
+    }
+    // Throws the ApiError that refuses the image; returns when it may be stored.
+    verifyBeforeStorage(image: Byte[], mimeType: String) {
+        if (!enabled || !mimeType.toLowerCase().startsWith("image/")) {
+            return
+        }
+        if (!classifier.available()) {
+            throw Errors.api(503, "IMAGE_MODERATION_UNAVAILABLE", "A verificação de imagens está indisponível. Tente novamente mais tarde.")
+        }
+        var score = this.score(image, mimeType)
+        if (score >= threshold) {
+            var result = reviewer.review(image)
+            if (result == "") {
+                throw Errors.api(503, "IMAGE_MODERATION_UNAVAILABLE", "Não foi possível confirmar a verificação desta imagem.")
+            }
+            if (result == "PROHIBITED") {
+                throw Errors.api(422, "IMAGE_CONTENT_NOT_ALLOWED", "Esta imagem parece conter conteúdo pornográfico e não pode ser enviada.")
+            }
+            if (result == "UNSURE") {
+                throw Errors.api(503, "IMAGE_MODERATION_UNAVAILABLE", "Não foi possível confirmar a verificação desta imagem.")
+            }
+        }
+    }
+    // The classifier's score; an unreadable image is a 422, any other failure or an out-of-range score a 503.
+    Double score(image: Byte[], mimeType: String) {
+        var value = 0.0
+        try {
+            value = classifier.pornographicScore(image, mimeType)
+        } catch (String e) {
+            if (e == "IMAGE_UNREADABLE") {
+                throw Errors.api(422, "IMAGE_CANNOT_BE_VERIFIED", "Não foi possível verificar esta imagem. Tente outro arquivo.")
+            }
+            if (Errors.isApi(e)) {
+                throw e
+            }
+            throw Errors.api(503, "IMAGE_MODERATION_UNAVAILABLE", "A verificação de imagens está indisponível. Tente novamente mais tarde.")
+        }
+        if (value < 0.0 || value > 1.0 || value != value) {
+            throw Errors.api(503, "IMAGE_MODERATION_UNAVAILABLE", "A verificação de imagens está indisponível. Tente novamente mais tarde.")
+        }
+        return value
+    }
+}
+
+// Pixel size of image assets, so a post card reserves its final height before the image loads. New uploads
+// are measured from the sanitised bytes the proxy holds; older ones by the backfill. Measuring never fails
+// an upload: an unreadable header keeps the size null.
+class MediaDimensions {
+    MediaStore assets
+    MediaModule module
+    Log log = Log("media.dimensions")
+    public constructor(assets: MediaStore, module: MediaModule) {
+        this.assets = assets
+        this.module = module
+    }
+    // Failed reads before the backfill gives up on an asset.
+    static Int maxAttempts() = 3
+    // Only the head of the object is fetched: every supported format keeps its size near the start.
+    static Int headBytes() = 1024 * 1024
+    recordUploaded(asset: MediaAsset, stored: Byte[]) {
+        if (!asset.mimeType.startsWith("image/")) {
+            return
+        }
+        var size = measure(asset, stored)
+        if (size != null) {
+            assets.recordDimensions(asset.id, size.width(), size.height())
+        }
+    }
+    // One backfill round; returns how many assets got their size.
+    Int backfill(batchSize: Int) {
+        var store = module.objectStore
+        if (store == null) {
+            return 0
+        }
+        var filled = 0
+        for (var asset in assets.findForDimensionBackfill(batchSize, MediaDimensions.maxAttempts(), Time.plusSeconds(Time.nowIso(), 0L - MediaRules.uploadWindowSeconds()))) {
+            var size = measure(asset, head(store, asset))
+            if (size == null) {
+                assets.recordDimensionFailure(asset.id)
+            }
+            else {
+                assets.recordDimensions(asset.id, size.width(), size.height())
+                filled = filled + 1
+            }
+        }
+        return filled
+    }
+    Byte[] head(store: MediaObjectStore, asset: MediaAsset) {
+        try {
+            var found = store.read(asset.objectKey, "bytes=0-" + (MediaDimensions.headBytes() - 1))
+            var bytes = found.body.readUpTo(MediaDimensions.headBytes())
+            found.body.close()
+            return bytes
+        } catch (String e) {
+            log.warn("media_dimensions_read_failed mediaId=" + asset.id)
+            return "".getBytes()
+        }
+    }
+    ImageSize? measure(asset: MediaAsset, data: Byte[]) {
+        if (data.length == 0) {
+            return null
+        }
+        var size = Images.dimensions(data, MediaSanitizer.jpegOrientation(data))
+        if (size == null) {
+            return null
+        }
+        if (size.width() <= 0 || size.height() <= 0) {
+            return null
+        }
+        return size
+    }
+}

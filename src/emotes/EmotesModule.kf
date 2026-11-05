@@ -1,0 +1,49 @@
+package emotes
+
+import kernel.*
+import kernel.config.*
+import kernel.security.*
+
+// Wiring of the emotes domain: sources in priority order, the catalog, the image cache, routes and jobs.
+// `Main.kf` calls `EmotesModule.install(platform, shared, hooks)` once.
+//
+// SOURCE ORDER is the artwork priority when a code exists in more than one: BTTV before FFZ, as the picker
+// always showed. The ANIMATED listing comes before the popular one on purpose: FFZ has several uploads with the
+// same name and the one worth drawing in text is the moving one; the popular listing comes after, only to give
+// the usage position. The embedded snapshot fills what the live sources did not bring.
+class EmotesModule {
+    EmoteCatalogService service
+    EmoteImageCache images
+    public constructor(service: EmoteCatalogService, images: EmoteImageCache) {
+        this.service = service
+        this.images = images
+    }
+    // Seams: `feed` (provider JSON) and `fetcher` (CDN images) default to the real HTTP; tests pass stubs.
+    static EmotesModule install(platform: Platform, shared: SharedServices, hooks: SecurityHooks) = EmotesModule.installWith(platform, shared, EmoteFeed(), EmoteImageFetcher())
+    static EmotesModule installWith(platform: Platform, shared: SharedServices, feed: EmoteFeed, fetcher: EmoteImageFetcher) {
+        var cfg = platform.cfg
+        var popularPages = cfg.getInt("REDE_EMOTES_POPULAR_PAGES", 3)
+        var animatedPages = cfg.getInt("REDE_EMOTES_ANIMATED_PAGES", 2)
+        var sources = listOf<EmoteSource>(BttvEmoteSource(feed), FfzGlobalEmoteSource(feed), FfzListingEmoteSource(feed, animatedPages, true), FfzListingEmoteSource(feed, popularPages, false))
+        var embedded = EmbeddedEmoteSource(cfg.getStr("REDE_EMOTES_CATALOG_FILE", "resources/emotes/catalogo.json"))
+        var service = EmoteCatalogService(sources, embedded)
+        var module = EmotesModule(service, EmoteImageCache(fetcher))
+        EmoteRoutes.register(platform.server, service)
+        EmoteRoutes.registerImage(platform.server, module)
+        var refresh = EmoteRefreshJobs(service, cfg.getBool("REDE_EMOTES_REFRESH_ENABLED", true))
+        refresh.warmUpOnBoot(shared.jobs)
+        refresh.schedule(shared.jobs, cfg.getStr("REDE_EMOTES_REFRESH_CRON", "0 0 */3 * * *"))
+        return module
+    }
+    // Service half of `GET /emotes/image/{provider}/{id}?variant=`: null answers 404. A blocked artwork dies
+    // here, before the cache and the fetch; whether the sticker has a moving version is the catalog's knowledge,
+    // not the URL's. The route answers `Content-Type` of the image, `X-Content-Type-Options: nosniff` and
+    // `Cache-Control: max-age=604800, public, immutable`.
+    EmoteStoredImage? image(provider: String?, id: String?, variant: String?) {
+        if (service.isBlocked(provider, id)) {
+            return null
+        }
+        var animated = service.isAnimated(provider, id)
+        return images.find(provider, id, variant, animated)
+    }
+}

@@ -1,0 +1,109 @@
+import emotes.*
+
+// Port of EmoteImageCacheTest (the CDN is a stub: no network).
+class EicFetcher extends EmoteImageFetcher {
+    List<String> urls = listOf<String>()
+    // "ok" | "timeout-first" | "always-fail" | "animated-404"
+    String mode
+    public constructor(mode: String) {
+        super()
+        this.mode = mode
+    }
+    EmoteStoredImage fetch(url: String) {
+        urls.add(url)
+        if (mode == "timeout-first" && urls.size() == 1) {
+            throw "timeout do CDN"
+        }
+        if (mode == "always-fail") {
+            throw "502"
+        }
+        if (mode == "animated-404" && url.contains("animated")) {
+            throw EmoteImageFetcher.notFoundTag() + ": CDN de figurinha respondeu 404"
+        }
+        return EmoteStoredImage(new Byte[3], "image/png")
+    }
+}
+
+test "an unknown provider does not even reach the CDN" {
+    var fetcher = EicFetcher("ok")
+    var cache = EmoteImageCache(fetcher)
+    assert(cache.find("SEILA", "1", "full", false) == null)
+    assert(cache.find(null, "1", "full", false) == null)
+    assert(fetcher.urls.size() == 0)
+}
+
+test "an identifier with a path never becomes an address" {
+    var fetcher = EicFetcher("ok")
+    var cache = EmoteImageCache(fetcher)
+    assert(cache.find("FFZ", "../../etc/passwd", "full", false) == null)
+    assert(cache.find("FFZ", "1/../../x", "full", false) == null)
+    assert(fetcher.urls.size() == 0)
+}
+
+test "the second fetch of the same sticker comes from the cache" {
+    var fetcher = EicFetcher("ok")
+    var cache = EmoteImageCache(fetcher)
+    assert(cache.find("FFZ", "100", "thumb", false) != null)
+    assert(cache.find("FFZ", "100", "thumb", false) != null)
+    assert(fetcher.urls.size() == 1)
+    assert(fetcher.urls.get(0) == "https://cdn.frankerfacez.com/emote/100/1")
+    assert(cache.cachedEntries() == 1)
+}
+
+test "it tries twice before giving up" {
+    var fetcher = EicFetcher("timeout-first")
+    var cache = EmoteImageCache(fetcher)
+    assert(cache.find("FFZ", "100", "full", false) != null)
+    assert(fetcher.urls.size() == 2)
+}
+
+test "a CDN that does not answer returns empty and stores nothing" {
+    var fetcher = EicFetcher("always-fail")
+    var cache = EmoteImageCache(fetcher)
+    assert(cache.find("BTTV", "abc", "thumb", false) == null)
+    assert(fetcher.urls.size() == 2)
+    assert(cache.cachedEntries() == 0)
+}
+
+test "a static sticker goes straight to the static file" {
+    // regression: asking `animated/` of a static FFZ sticker does not answer 404, the connection hangs
+    // until the timeout: 12 s per sticker before falling back
+    var fetcher = EicFetcher("ok")
+    var cache = EmoteImageCache(fetcher)
+    assert(cache.find("FFZ", "100", "full", false) != null)
+    assert(fetcher.urls.size() == 1)
+    assert(fetcher.urls.get(0) == "https://cdn.frankerfacez.com/emote/100/2")
+}
+
+test "the catalog says animated but the CDN refuses the gif: it falls back to the static file" {
+    var fetcher = EicFetcher("animated-404")
+    var cache = EmoteImageCache(fetcher)
+    assert(cache.find("FFZ", "100", "full", true) != null)
+    assert(fetcher.urls.size() == 2)
+    assert(fetcher.urls.get(0) == "https://cdn.frankerfacez.com/emote/100/animated/2")
+    assert(fetcher.urls.get(1) == "https://cdn.frankerfacez.com/emote/100/2")
+    // the detour is kept: the next read comes from the cache without touching the CDN
+    assert(cache.find("FFZ", "100", "full", true) != null)
+    assert(fetcher.urls.size() == 2)
+}
+
+test "animation changes the cache key" {
+    // the static one may already be stored; when the catalog discovers the animation the next read has to
+    // fetch the moving file (the public address also starts to carry `&a=1`)
+    var fetcher = EicFetcher("ok")
+    var cache = EmoteImageCache(fetcher)
+    assert(cache.find("FFZ", "100", "full", false) != null)
+    assert(cache.find("FFZ", "100", "full", true) != null)
+    assert(fetcher.urls.size() == 2)
+    assert(fetcher.urls.get(0) == "https://cdn.frankerfacez.com/emote/100/2")
+    assert(fetcher.urls.get(1) == "https://cdn.frankerfacez.com/emote/100/animated/2")
+}
+
+test "a not-found answer is definitive and is not retried" {
+    var fetcher = EicFetcher("animated-404")
+    var cache = EmoteImageCache(fetcher)
+    // thumb of a non-animated sticker never uses `animated`, so force a 404 on the only address via a variant
+    // that asks for the gif and has no static fallback: BTTV thumb has none
+    assert(cache.find("BTTV", "abc", "thumb", true) != null)
+    assert(fetcher.urls.size() == 1)
+}

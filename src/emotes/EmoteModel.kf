@@ -1,0 +1,197 @@
+package emotes
+
+import kernel.text.*
+
+// One sticker of the catalog: the CODE typed in a post (`KEKW`), its provider ("BTTV" or "FFZ") and the
+// CDN identifier. `popularRank` is the usage position (1 = most used) or -1 when the sticker only belongs to
+// the provider's global collection (Java: a nullable Integer). The image URL is never stored: it is derived
+// from provider + id (see EmoteImages), so a third-party catalog cannot point an image at any host.
+record Emote(String code, String provider, String id, Bool animated, Int popularRank)
+
+// A sticker as the front end needs it (JSON of `GET /emotes`): the code plus the two image paths.
+record EmoteView(String code, String provider, String id, Bool animated, Int? popularRank, String image, String thumb)
+
+record EmotePageView(List<EmoteView> items, Int page, Int limit, Int total, Int totalPages, String generatedAt)
+
+record EmoteIndexView(Map<String,String> entries, String generatedAt)
+
+// The cleaned image of one sticker, ready to be served (`contentType` is always `image/*`, at most 1 MB).
+record EmoteStoredImage(Byte[] bytes, String contentType)
+
+class EmoteRules {
+    static Int noRank() = -1
+    // "BTTV" / "FFZ" in any case, or null (the edge decides what an unknown provider means).
+    static String? parseProvider(value: String?) {
+        if (value == null) {
+            return null
+        }
+        var v = value.trim().toUpperCase()
+        if (v == "BTTV" || v == "FFZ") {
+            return v
+        }
+        return null
+    }
+    // Code accepted in a text: letters, digits, `_` and `-`, 1..64. Anything else is never recognised in a post.
+    static Bool validCode(code: String) = code.matches("[A-Za-z0-9_-]{1,64}")
+    // CDN identifier: a number or a short hash. Never a path.
+    static Bool validId(id: String) = id.matches("[A-Za-z0-9]{1,40}")
+    // The Emote, or null when code, provider, id or rank would not be accepted (Java: the record constructor throws).
+    static Emote? create(code: String?, provider: String?, id: String?, animated: Bool, rank: Int) {
+        if (code == null) {
+            return null
+        }
+        if (id == null) {
+            return null
+        }
+        var p = EmoteRules.parseProvider(provider)
+        if (p == null) {
+            return null
+        }
+        if (!EmoteRules.validCode(code) || !EmoteRules.validId(id)) {
+            return null
+        }
+        if (rank == 0 || rank < EmoteRules.noRank()) {
+            return null
+        }
+        return Emote(code, p, id, animated, rank)
+    }
+    static Bool popular(e: Emote) = e.popularRank() >= 1
+    // The same sticker with a usage position (the popular snapshot rules the picker order).
+    static Emote popularAt(e: Emote, rank: Int) = Emote(e.code(), e.provider(), e.id(), e.animated(), rank)
+    // Provider + id: the key of an artwork (two codes may share one).
+    static String art(provider: String, id: String) = provider + "/" + id
+}
+
+// Name policy: a sticker whose CODE points at sexual content does not enter the catalog. Strong terms match
+// anywhere ("bigbutt"); weak ones only as the whole word ("show" yes, "showdown" no); innocent compounds win.
+class EmoteNamePolicy {
+    static List<String> strong() = listOf("dick", "porn", "nude", "nudes", "boob", "titt", "titty", "pussy", "vagina", "penis", "anal", "orgasm", "handjob", "blowjob", "jerkoff", "hentai", "cumshot", "jizz", "cumm", "sexy", "booty", "butt", "eggplant", "poggies", "peitos", "punheta", "buceta", "transar")
+    static List<String> weak() = listOf("egg", "plant", "show", "sex", "naked", "pelada", "pelado")
+    static List<String> exceptions() = listOf("button", "butter", "butterfly")
+    static Bool blocked(code: String?) {
+        if (code == null) {
+            return false
+        }
+        var n = EmoteNamePolicy.normalize(code)
+        if (n.trim().length() == 0) {
+            return false
+        }
+        for (var innocent in EmoteNamePolicy.exceptions()) {
+            if (n.contains(innocent)) {
+                return false
+            }
+        }
+        for (var term in EmoteNamePolicy.strong()) {
+            if (n.contains(term)) {
+                return true
+            }
+        }
+        for (var term in EmoteNamePolicy.weak()) {
+            if (n == term) {
+                return true
+            }
+        }
+        return false
+    }
+    // Lower case, no accents, no separators, common digit/symbol-for-letter swaps undone: the look-alike
+    // lands on the same rule as the exact name.
+    static String normalize(code: String) {
+        var plain = Texts.stripAccents(code.toLowerCase())
+        var out = ""
+        var i = 0
+        while (i < plain.length()) {
+            var c = plain.substring(i, i + 1)
+            var mapped = c
+            if (c == "0") {
+                mapped = "o"
+            }
+            else 
+                if (c == "1" || c == "!" || c == "|") {
+                    mapped = "i"
+                }
+                else 
+                    if (c == "3") {
+                        mapped = "e"
+                    }
+                    else 
+                        if (c == "4" || c == "@") {
+                            mapped = "a"
+                        }
+                        else 
+                            if (c == "5" || c == "$") {
+                                mapped = "s"
+                            }
+                            else 
+                                if (c == "7") {
+                                    mapped = "t"
+                                }
+            if (mapped.matches("[a-z]")) {
+                out = out + mapped
+            }
+            i = i + 1
+        }
+        return out
+    }
+}
+
+// Image addresses derived from provider + id. The PUBLIC path (`/emotes/image/BTTV/123?variant=thumb`) is
+// what the browser loads: it never talks to the provider CDN, which times out ~30% of the time. The UPSTREAM
+// address is built from constants plus the validated id, so the proxy can never be pointed at another host.
+// Animation comes from the catalog, never from blind attempts: the FFZ `animated/` address of a static
+// sticker does not answer 404, the connection just hangs.
+class EmoteImages {
+    static String bttvCdn() = "https://cdn.betterttv.net/emote/"
+    static String ffzCdn() = "https://cdn.frankerfacez.com/emote/"
+    // "thumb" or "full": anything else is "full".
+    static String variant(value: String?) {
+        if (value != null && value.toLowerCase() == "thumb") {
+            return "thumb"
+        }
+        return "full"
+    }
+    // Path served by this backend (without `/api`, which the gateway strips). The `a=1` marker enters the
+    // address saved in the text, so the browser does not keep serving the static file it cached.
+    static String publicPath(provider: String, id: String, variant: String, animated: Bool) {
+        var path = "/emotes/image/" + provider + "/" + id + "?variant=" + variant
+        if (variant == "full" && animated) {
+            return path + "&a=1"
+        }
+        return path
+    }
+    static String publicPathOf(e: Emote, variant: String) = EmoteImages.publicPath(e.provider(), e.id(), variant, e.animated())
+    // Where the proxy fetches. BTTV: `1x.png` for the grid, `1x.gif` for animated text, `2x.png` otherwise.
+    // FFZ: the scale is the segment (`1`, `2`, `animated/2`).
+    static String upstream(provider: String, id: String, variant: String, animated: Bool) {
+        if (provider == "BTTV") {
+            var file = "2x.png"
+            if (variant == "thumb") {
+                file = "1x.png"
+            }
+            else 
+                if (animated) {
+                    file = "1x.gif"
+                }
+            return EmoteImages.bttvCdn() + id + "/" + file
+        }
+        var segment = "2"
+        if (variant == "thumb") {
+            segment = "1"
+        }
+        else 
+            if (animated) {
+                segment = "animated/2"
+            }
+        return EmoteImages.ffzCdn() + id + "/" + segment
+    }
+    // The same address, static, for when the CDN refuses an animation the provider says exists.
+    // null when the preferred address is already static.
+    static String? fallback(provider: String, id: String, variant: String, animated: Bool) {
+        if (variant == "thumb" || !animated) {
+            return null
+        }
+        if (provider == "BTTV") {
+            return EmoteImages.bttvCdn() + id + "/2x.png"
+        }
+        return EmoteImages.ffzCdn() + id + "/2"
+    }
+}

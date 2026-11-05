@@ -1,0 +1,191 @@
+package kernel.image
+
+import java.awt.image.BufferedImage
+import java.awt.image.RenderedImage
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import javax.imageio.ImageIO
+import javax.imageio.ImageReader
+import javax.imageio.ImageWriter
+
+// Pixel size of an image as displayed.
+record ImageSize(Int width, Int height)
+
+// Image decoding through javax.imageio, kept in the kernel: `ImageIO.read/write` pick the wrong overload
+// from Kof (KOF_GAPS G4), so readers and writers are driven through their iterators.
+class Images {
+    // 16 megapixels: the file size does not bound the decode, a tiny PNG can declare millions of pixels.
+    static Long maxPixels() = 16000000L
+    // Size from the image header only (no bitmap decode), with the EXIF rotation of a JPEG applied: an
+    // orientation of 5 to 8 swaps width and height. null when no reader understands the bytes.
+    static ImageSize? dimensions(data: Byte[], orientation: Int) {
+        try {
+            var stream = ImageIO.createImageInputStream(new ByteArrayInputStream(data))
+            if (stream == null) {
+                return null
+            }
+            var readers = ImageIO.getImageReaders(stream)
+            if (!readers.hasNext()) {
+                stream.close()
+                return null
+            }
+            var reader = readers.next() as ImageReader
+            reader.setInput(stream, true, true)
+            var w = reader.getWidth(0)
+            var h = reader.getHeight(0)
+            reader.dispose()
+            stream.close()
+            if (orientation >= 5 && orientation <= 8) {
+                return ImageSize(h, w)
+            }
+            return ImageSize(w, h)
+        } catch (IOException e) {
+            return null
+        }
+    }
+    // Decodes `data`, applies the EXIF `orientation` (2 to 8) to the pixels and encodes a JPEG (ImageIO
+    // default quality: the 0.92 of the Java service needs the IIOImage constructor, unreachable, G163).
+    // Throws IMAGE_UNREADABLE / IMAGE_TOO_LARGE.
+    static Byte[] rotateJpeg(data: Byte[], orientation: Int) {
+        var source = Images.decode(data)
+        var w = source.getWidth()
+        var h = source.getHeight()
+        var swap = orientation >= 5 && orientation <= 8
+        var outW = w
+        var outH = h
+        if (swap) {
+            outW = h
+            outH = w
+        }
+        var type = source.getType()
+        if (type == 0) {
+            type = 1
+        }
+        var target = new BufferedImage(outW, outH, type)
+        var y = 0
+        while (y < h) {
+            var x = 0
+            while (x < w) {
+                var dx = x
+                var dy = y
+                if (orientation == 2) {
+                    dx = w - 1 - x
+                }
+                else 
+                    if (orientation == 3) {
+                        dx = w - 1 - x
+                        dy = h - 1 - y
+                    }
+                    else 
+                        if (orientation == 4) {
+                            dy = h - 1 - y
+                        }
+                        else 
+                            if (orientation == 5) {
+                                dx = y
+                                dy = x
+                            }
+                            else 
+                                if (orientation == 6) {
+                                    dx = h - 1 - y
+                                    dy = x
+                                }
+                                else 
+                                    if (orientation == 7) {
+                                        dx = h - 1 - y
+                                        dy = w - 1 - x
+                                    }
+                                    else 
+                                        if (orientation == 8) {
+                                            dx = y
+                                            dy = w - 1 - x
+                                        }
+                target.setRGB(dx, dy, source.getRGB(x, y))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        return Images.encode(target, "jpeg")
+    }
+    static BufferedImage decode(data: Byte[]) {
+        var failure = ""
+        try {
+            var stream = ImageIO.createImageInputStream(new ByteArrayInputStream(data))
+            if (stream == null) {
+                failure = "IMAGE_UNREADABLE"
+            }
+            else {
+                var readers = ImageIO.getImageReaders(stream)
+                if (!readers.hasNext()) {
+                    failure = "IMAGE_UNREADABLE"
+                }
+                else {
+                    var reader = readers.next() as ImageReader
+                    reader.setInput(stream, true, true)
+                    var pixels = (reader.getWidth(0) as Long) * (reader.getHeight(0) as Long)
+                    if (pixels > Images.maxPixels()) {
+                        failure = "IMAGE_TOO_LARGE"
+                    }
+                    else {
+                        var image = reader.read(0)
+                        reader.dispose()
+                        stream.close()
+                        return image
+                    }
+                    reader.dispose()
+                }
+                stream.close()
+            }
+        } catch (IOException e) {
+            failure = "IMAGE_UNREADABLE"
+        }
+        throw failure
+    }
+    static Byte[] encode(image: BufferedImage, format: String) {
+        var out = new ByteArrayOutputStream()
+        var failure = ""
+        try {
+            var writers = ImageIO.getImageWritersByFormatName(format)
+            var writer = writers.next() as ImageWriter
+            var stream = ImageIO.createImageOutputStream(out)
+            writer.setOutput(stream)
+            writer.write(image as RenderedImage)
+            stream.close()
+            writer.dispose()
+        } catch (IOException e) {
+            failure = "IMAGE_ENCODE_FAILED"
+        }
+        if (failure.length() > 0) {
+            throw failure
+        }
+        return out.toByteArray()
+    }
+    // Test fixtures: a `width` x `height` image in `format` ("png", "jpeg"), top-left pixel red.
+    static Byte[] sample(format: String, width: Int, height: Int) {
+        var image = new BufferedImage(width, height, 1)
+        image.setRGB(0, 0, 16711680)
+        return Images.encode(image, format)
+    }
+    // Test fixture: the left half red, the right half blue (rotations are checked on it).
+    static Byte[] halves(format: String, width: Int, height: Int) {
+        var image = new BufferedImage(width, height, 1)
+        var y = 0
+        while (y < height) {
+            var x = 0
+            while (x < width) {
+                if (x < width / 2) {
+                    image.setRGB(x, y, 16711680)
+                }
+                else {
+                    image.setRGB(x, y, 255)
+                }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        return Images.encode(image, format)
+    }
+    // RGB of a pixel of an encoded image (tests check rotations with it).
+    static Int pixel(data: Byte[], x: Int, y: Int) = Images.decode(data).getRGB(x, y)
+}

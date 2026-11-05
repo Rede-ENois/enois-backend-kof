@@ -1,0 +1,167 @@
+import kernel.*
+import kernel.bytes.*
+import kernel.db.*
+import kernel.files.*
+import kernel.id.*
+import kernel.image.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import media.*
+
+// Port of MediaDimensionsTests: width and height measured on upload, backfilled for older assets and
+// returned by GET /media/{id}. The map store stands in for the bucket.
+class DimMapStore extends MediaObjectStore {
+    Map<String,String> objects = mapOf<String, String>()
+    public constructor() {
+        super()
+    }
+    MediaStoredObject read(key: String, range: String?) {
+        var hex = objects.get(key)
+        if (hex == null) {
+            throw "NoSuchKey"
+        }
+        var data = Bytes.hex(hex)
+        return MediaStoredObject(ByteStream.ofBytes(data), data.length as Long, "image/png", null, null)
+    }
+    write(key: String, contentType: String, filePath: String) {
+        objects.put(key, Bytes.toHex(TempFiles.readAll(filePath)))
+    }
+    putBytes(key: String, data: Byte[]) {
+        objects.put(key, Bytes.toHex(data))
+    }
+}
+
+class DimHolder {
+    static TestApp? app = null
+    static MediaModule? module = null
+    static SharedServices? shared = null
+    static DimMapStore store = DimMapStore()
+    static TestApp get() {
+        var cur = DimHolder.app
+        if (cur != null) {
+            return cur
+        }
+        var overrides = mapOf("REDE_ORIGINS_ENFORCE", "false", "REDE_MEDIA_STORAGE", "s3", "REDE_MEDIA_S3_BUCKET", "bucket-de-teste", "REDE_MEDIA_S3_PUBLIC_BASE_URL", "https://enois.exemplo.com/api/storage", "REDE_MEDIA_DELETION_WORKER_DELAY_MS", "3600000", "REDE_MEDIA_NSFW_ENABLED", "false", "REDE_MEDIA_DIMENSIONS_BACKFILL_ENABLED", "false")
+        SecurityClock.reset()
+        var created = TestApp.bootWith("mediadims", overrides, (p: Platform) -> DimHolder.wire(p))
+        DimHolder.app = created
+        return created
+    }
+    static wire(p: Platform) {
+        var shared = SharedServices.create(p)
+        DimHolder.shared = shared
+        var hooks = SecurityHooks.defaults(p.db)
+        Security.install(p, hooks)
+        var module = MediaModule.install(p, shared, hooks)
+        module.objectStore = DimHolder.store
+        DimHolder.module = module
+    }
+    static MediaModule mod() {
+        DimHolder.get()
+        var m = DimHolder.module
+        if (m == null) {
+            throw "module not wired"
+        }
+        return m
+    }
+}
+
+Byte[] dimWithOrientation6(jpeg: Byte[]) {
+    var app1 = Bytes.hex("ffe10022457869660000" + "4d4d002a00000008" + "0001" + "011200030000000100060000" + "00000000")
+    var out = ByteSink()
+    out.add(jpeg, 0, 2)
+    out.addAll(app1)
+    out.add(jpeg, 2, jpeg.length - 2)
+    return out.toBytes()
+}
+
+// POST /media/uploads then PUT the bytes; returns the media id.
+String dimUpload(user: String, mime: String, data: Byte[]) {
+    var app = DimHolder.get()
+    var token = "tok-" + user + "-1234567890"
+    SecurityFixtures.login(app.db(), user, token)
+    var body = "{\"fileName\":\"file\",\"mimeType\":\"" + mime + "\",\"size\":" + data.length + ",\"purpose\":\"POST_IMAGE\"}"
+    var created = app.client.send("POST", "/media/uploads", listOf("X-Session-Token: " + token, "Idempotency-Key: " + user + "-1", "Content-Type: application/json"), "", body)
+    Check.status(created, 201)
+    var put = BinaryClient(app.port).put("/storage/" + created.json("objectKey"), listOf("X-Session-Token: " + token, "Content-Type: " + mime), data)
+    Check.eqInt("put", 200, put.status)
+    return created.json("id")
+}
+
+Int dimInt(v: Int?) {
+    if (v == null) {
+        return -1
+    }
+    return v
+}
+
+MediaAsset dimAsset(id: String) {
+    var a = DimHolder.mod().store.findById(id)
+    if (a == null) {
+        throw "asset not found"
+    }
+    return a
+}
+
+// An asset stored on S3 two hours ago, outside the upload window the backfill leaves alone.
+MediaAsset dimStored(mime: String) {
+    var id = "media_dimsbackfill" + Ids.uuid().replace("-", "")
+    var created = Time.plusSeconds(Time.nowIso(), -7200L)
+    var asset = MediaAsset(id, "user_dims_backfill", "file", mime, 10L, "POST_IMAGE", "uploads/" + id + "/file", "https://enois.exemplo.com/api/storage/uploads/" + id + "/file", "PENDING", "NONE", created, Time.plusSeconds(created, 3600L), null, "S3", "https://enois.exemplo.com/api/storage/uploads/" + id + "/file", created, 0, null, null, null, 0)
+    DimHolder.mod().store.save(asset)
+    return asset
+}
+
+test "an uploaded PNG stores its size and GET /media returns it" {
+    var id = dimUpload("media_dims_png", "image/png", Images.sample("png", 3, 2))
+    var res = DimHolder.get().client.get("/media/" + id)
+    Check.status(res, 200)
+    Check.jsonEq(res, "width", "3")
+    Check.jsonEq(res, "height", "2")
+}
+
+test "an uploaded JPEG rotated by EXIF stores the displayed size" {
+    // 4x2 pixels with EXIF orientation 6 (rotate 90): displayed, and stored after sanitising, as 2x4.
+    var id = dimUpload("media_dims_exif", "image/jpeg", dimWithOrientation6(Images.sample("jpeg", 4, 2)))
+    var asset = dimAsset(id)
+    Check.eqInt("width", 2, dimInt(asset.width))
+    Check.eqInt("height", 4, dimInt(asset.height))
+}
+
+test "a non-image keeps a null size" {
+    var id = dimUpload("media_dims_pdf", "application/pdf", "%PDF-1.4 dims".getBytes())
+    var res = DimHolder.get().client.get("/media/" + id)
+    Check.status(res, 200)
+    Check.isTrue("width is null", res.jsonIsNull("width"))
+    Check.isTrue("height is null", res.jsonIsNull("height"))
+}
+
+test "the backfill measures stored images and gives up on unreadable ones" {
+    var readable = dimStored("image/jpeg")
+    var unreadable = dimStored("image/png")
+    DimHolder.store.putBytes(readable.objectKey, dimWithOrientation6(Images.sample("jpeg", 4, 2)))
+    DimHolder.store.putBytes(unreadable.objectKey, "not an image".getBytes())
+    var round = 0
+    while (round < MediaDimensions.maxAttempts() + 1) {
+        DimHolder.mod().dimensions.backfill(100)
+        round = round + 1
+    }
+    var ok = dimAsset(readable.id)
+    Check.eqInt("width", 2, dimInt(ok.width))
+    Check.eqInt("height", 4, dimInt(ok.height))
+    var failed = dimAsset(unreadable.id)
+    assert(failed.width == null)
+    // Counted once per round and then no longer picked: the extra round did not add a fourth try.
+    Check.eqInt("attempts", MediaDimensions.maxAttempts(), failed.dimensionAttempts)
+}
+
+// The job loops would keep the test process alive: stop them (keep this the last test of the file).
+test "zz background jobs stop" {
+    var shared = DimHolder.shared
+    if (shared != null) {
+        shared.stop()
+    }
+    DimHolder.get().stop()
+    assert(DimHolder.module != null)
+}

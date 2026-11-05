@@ -1,0 +1,24 @@
+import kernel.*
+import kernel.http.*
+import kernel.testkit.*
+
+// The binary lane is opt-in: without a claimed prefix the platform serves the web runtime directly on the public
+// port (no front, no extra hop). Order matters: the claim registry is process-wide, so the "no claim" test runs first.
+test "without a claimed prefix there is no front and the web runtime owns the public port" {
+    assert(!BinaryLane.enabled())
+    var app = TestApp.boot("lanedirect")
+    assert(app.platform.front == null)
+    Check.status(app.client.get("/health"), 200)
+    app.stop()
+}
+
+test "with a claimed prefix a front serves the public port and plain routes still work through it" {
+    BinaryLane.claim("/lane-probe/")
+    assert(BinaryLane.enabled())
+    var app = TestApp.boot("lanefronted")
+    assert(app.platform.front != null)
+    Check.status(app.client.get("/health"), 200)
+    var raw = BinaryClient(app.port).get("/health", listOf("X-Kernel-Peer: 203.0.113.9", "X-Kernel-Binary: commit"))
+    Check.eqInt("forwarded", 200, raw.status)
+    app.stop()
+}

@@ -1,0 +1,128 @@
+package media
+
+import kernel.url.*
+
+// Where objects live and how their public address is composed. A base class with failing defaults (a Kof
+// interface of one package cannot be implemented from another, KOF_GAPS G30); the three modes extend it.
+class MediaUrlFactory {
+    public constructor() {}
+    String provider() {
+        throw "MEDIA_URL_FACTORY_NOT_IMPLEMENTED"
+    }
+    String objectKey(mediaId: String, fileName: String) {
+        throw "MEDIA_URL_FACTORY_NOT_IMPLEMENTED"
+    }
+    String cdnUrl(objectKey: String) {
+        throw "MEDIA_URL_FACTORY_NOT_IMPLEMENTED"
+    }
+    String uploadUrl(objectKey: String) {
+        throw "MEDIA_URL_FACTORY_NOT_IMPLEMENTED"
+    }
+    // `a/b/c` -> ["a","b","c"], keeping empty parts (Java `split("/", -1)`).
+    static List<String> segments(path: String) {
+        var out = listOf<String>()
+        var start = 0
+        var i = 0
+        while (i < path.length()) {
+            if (path.substring(i, i + 1) == "/") {
+                out.add(path.substring(start, i))
+                start = i + 1
+            }
+            i = i + 1
+        }
+        out.add(path.substring(start))
+        return out
+    }
+    // Each segment percent-encoded on its own; "." and ".." are not names and become "_" (a CDN would
+    // normalise them into another key).
+    static String encodeName(fileName: String) {
+        var encoded = ""
+        var first = true
+        for (var segment in MediaUrlFactory.segments(fileName)) {
+            var safe = segment
+            if (segment == "." || segment == "..") {
+                safe = "_"
+            }
+            if (!first) {
+                encoded = encoded + "/"
+            }
+            encoded = encoded + Uris.encodePathSegment(safe)
+            first = false
+        }
+        return encoded
+    }
+}
+
+// Objects in the S3 bucket (or any S3-compatible gateway). Composes addresses only, no network.
+class MediaS3UrlFactory extends MediaUrlFactory {
+    String bucket
+    String region
+    String prefix
+    String publicBaseUrl
+    // `region`, `prefix` and `publicBaseUrl` blank = the defaults (us-east-1, `uploads/`, the bucket address).
+    public constructor(bucket: String, region: String, prefix: String, publicBaseUrl: String) {
+        super()
+        if (bucket.trim().length() == 0) {
+            throw "rede.media.s3.bucket e obrigatorio quando o storage e s3"
+        }
+        this.bucket = bucket.trim()
+        if (region.trim().length() == 0) {
+            this.region = "us-east-1"
+        }
+        else {
+            this.region = region.trim()
+        }
+        this.prefix = MediaS3UrlFactory.normalizePrefix(prefix)
+        this.publicBaseUrl = publicBaseUrl.trim()
+    }
+    String provider() = "S3"
+    // Same shape as ImageKit (`uploads/{id}/{file}`); the slashes of the name are real separators.
+    String objectKey(mediaId: String, fileName: String) = prefix + mediaId + "/" + MediaUrlFactory.encodeName(fileName)
+    String cdnUrl(objectKey: String) = baseUrl() + objectKey
+    String uploadUrl(objectKey: String) = cdnUrl(objectKey)
+    // The CDN when configured, else the bucket address in the region.
+    String baseUrl() {
+        if (publicBaseUrl.length() > 0) {
+            if (publicBaseUrl.endsWith("/")) {
+                return publicBaseUrl
+            }
+            return publicBaseUrl + "/"
+        }
+        return "https://" + bucket + ".s3." + region + ".amazonaws.com/"
+    }
+    // No prefix: `uploads/`. Only slashes: the bucket root (an explicit choice).
+    static String normalizePrefix(prefix: String) {
+        if (prefix.trim().length() == 0) {
+            return "uploads/"
+        }
+        var trimmed = prefix
+        while (trimmed.startsWith("/")) {
+            trimmed = trimmed.substring(1)
+        }
+        if (trimmed.length() == 0) {
+            return ""
+        }
+        if (trimmed.endsWith("/")) {
+            return trimmed
+        }
+        return trimmed + "/"
+    }
+}
+
+// The legacy ImageKit account: addresses under its URL endpoint.
+class MediaImageKitUrlFactory extends MediaUrlFactory {
+    String urlEndpoint
+    public constructor(urlEndpoint: String) {
+        super()
+        if (urlEndpoint.endsWith("/")) {
+            this.urlEndpoint = urlEndpoint
+        }
+        else {
+            this.urlEndpoint = urlEndpoint + "/"
+        }
+    }
+    String provider() = "IMAGEKIT"
+    String objectKey(mediaId: String, fileName: String) = "uploads/" + mediaId + "/" + MediaUrlFactory.encodeName(fileName)
+    String cdnUrl(objectKey: String) = urlEndpoint + objectKey
+    String uploadUrl(objectKey: String) = urlEndpoint + objectKey
+}

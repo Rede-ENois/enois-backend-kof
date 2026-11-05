@@ -16,6 +16,7 @@ class Platform {
     Db db
     HttpServer server
     MigrationSummary migrations
+    BinaryFront? front = null
     public constructor(cfg: Config, db: Db, server: HttpServer, migrations: MigrationSummary) {
         this.cfg = cfg
         this.db = db
@@ -35,17 +36,38 @@ class Platform {
         KernelRoutes.register(server, cfg, summary)
         return Platform(cfg, db, server, summary)
     }
-    // Installs the filter chain and serves on `port` (blocking).
+    // Installs the filter chain and serves on `port` (blocking). When a domain claimed a binary lane prefix
+    // (BinaryLane.claim) the web runtime listens on an internal port and a BinaryFront serves `port`.
     start(port: Int) {
         server.install(cfg)
-        server.listen(port)
+        if (BinaryLane.enabled()) {
+            var fronted = startFront(port)
+            while (fronted.running) {
+                time.sleep(1000)
+            }
+        } else {
+            server.listen(port)
+        }
     }
     // Same, in the background; returns the bound port (0 = ephemeral).
     Int startAsync(port: Int) {
         server.install(cfg)
+        if (BinaryLane.enabled()) {
+            return startFront(port).port()
+        }
         return server.listenAsync(port)
     }
+    BinaryFront startFront(port: Int) {
+        var internal = server.listenAsync(0)
+        var created = BinaryFront.serve(port, internal, cfg.getLong("REDE_BINARY_MAX_BODY_BYTES", 545259520L))
+        front = created
+        return created
+    }
     stop() {
+        var f = front
+        if (f != null) {
+            f.close()
+        }
         server.close()
         db.close()
     }

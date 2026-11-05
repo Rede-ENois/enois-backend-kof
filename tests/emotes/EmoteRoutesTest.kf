@@ -1,0 +1,244 @@
+import emotes.*
+import kernel.*
+import kernel.jobs.*
+import kernel.testkit.*
+
+// Port of EmoteControllerTest at HTTP level. The image route (`GET /emotes/image/{provider}/{id}`) serves raw
+// bytes through the binary lane, so its tests use BinaryClient.
+class ErtSource extends EmoteSource {
+    List<Emote> emotes
+    public constructor(emotes: List<Emote>) {
+        super()
+        this.emotes = emotes
+    }
+    String name() = "EMBARCADO"
+    List<Emote> load() = emotes
+}
+
+class ErtFetcher extends EmoteImageFetcher {
+    List<String> urls = listOf<String>()
+    public constructor() {
+        super()
+    }
+    EmoteStoredImage fetch(url: String) {
+        urls.add(url)
+        return EmoteStoredImage(new Byte[2], "image/png")
+    }
+}
+
+Emote ertEmote(code: String, provider: String, id: String, animated: Bool, rank: Int) {
+    var e = EmoteRules.create(code, provider, id, animated, rank)
+    if (e == null) {
+        throw "invalid fixture " + code
+    }
+    return e
+}
+
+Emote ertKekw() = ertEmote("KEKW", "BTTV", "abc", false, -1)
+
+Emote ertOmega() = ertEmote("OMEGALUL", "FFZ", "128054", false, 1)
+
+Emote ertCatJam() = ertEmote("catJAM", "FFZ", "777171", true, -1)
+
+// One booted app per catalog (a test file is one process): routes registered on a fresh platform.
+TestApp ertApp(name: String, catalog: List<Emote>) = TestApp.bootWire(name, (p: Platform) -> EmoteRoutes.register(p.server, EmoteCatalogService(listOf<EmoteSource>(), ErtSource(catalog))))
+
+class ErtHolder {
+    static TestApp? both = null
+    static TestApp? animated = null
+    static TestApp pair() {
+        var cur = ErtHolder.both
+        if (cur != null) {
+            return cur
+        }
+        var created = ertApp("ertboth", listOf(ertKekw(), ertOmega()))
+        ErtHolder.both = created
+        return created
+    }
+    static TestApp onlyAnimated() {
+        var cur = ErtHolder.animated
+        if (cur != null) {
+            return cur
+        }
+        var created = ertApp("ertanim", listOf(ertCatJam()))
+        ErtHolder.animated = created
+        return created
+    }
+}
+
+test "it lists page by page with the image addresses" {
+    var res = ErtHolder.pair().client.get("/emotes?limit=1")
+    Check.status(res, 200)
+    Check.eqInt("items", 1, res.jsonSize("items"))
+    Check.jsonEq(res, "items.0.code", "OMEGALUL")
+    Check.jsonEq(res, "items.0.provider", "FFZ")
+    Check.jsonEq(res, "items.0.id", "128054")
+    Check.jsonEq(res, "items.0.popularRank", "1")
+    Check.jsonEq(res, "items.0.image", "/emotes/image/FFZ/128054?variant=full")
+    Check.jsonEq(res, "items.0.thumb", "/emotes/image/FFZ/128054?variant=thumb")
+    Check.jsonEq(res, "total", "2")
+    Check.jsonEq(res, "totalPages", "2")
+    Check.jsonEq(res, "page", "1")
+    Check.jsonEq(res, "limit", "1")
+    Check.isTrue("generatedAt", res.jsonHas("generatedAt"))
+}
+
+test "a sticker with no usage position has a null popularRank and animated is a boolean" {
+    var res = ErtHolder.pair().client.get("/emotes?limit=1&page=2")
+    Check.status(res, 200)
+    Check.jsonEq(res, "items.0.code", "KEKW")
+    Check.isTrue("popularRank is null", res.jsonIsNull("items.0.popularRank"))
+    Check.isTrue("animated is false", res.body.contains("\"animated\":false"))
+}
+
+test "search and filter reach the service" {
+    var res = ErtHolder.pair().client.get("/emotes?q=kek&provider=BTTV")
+    Check.status(res, 200)
+    Check.eqInt("items", 1, res.jsonSize("items"))
+    Check.jsonEq(res, "items.0.code", "KEKW")
+}
+
+test "limit is clamped between 1 and 100 and a bad number is a 400" {
+    var low = ErtHolder.pair().client.get("/emotes?limit=0")
+    Check.jsonEq(low, "limit", "1")
+    var high = ErtHolder.pair().client.get("/emotes?limit=5000")
+    Check.jsonEq(high, "limit", "100")
+    var fallback = ErtHolder.pair().client.get("/emotes")
+    Check.jsonEq(fallback, "limit", "40")
+    Check.apiError(ErtHolder.pair().client.get("/emotes?limit=abc"), 400, "BAD_REQUEST")
+    Check.apiError(ErtHolder.pair().client.get("/emotes?page=x"), 400, "BAD_REQUEST")
+}
+
+test "the index brings the code to image address map" {
+    var res = ErtHolder.pair().client.get("/emotes/index")
+    Check.status(res, 200)
+    Check.jsonEq(res, "entries.OMEGALUL", "/emotes/image/FFZ/128054?variant=full")
+    Check.jsonEq(res, "entries.KEKW", "/emotes/image/BTTV/abc?variant=full")
+    Check.isTrue("generatedAt", res.jsonHas("generatedAt"))
+}
+
+test "the index marks an animated sticker in its own address" {
+    var res = ErtHolder.onlyAnimated().client.get("/emotes/index")
+    Check.status(res, 200)
+    Check.jsonEq(res, "entries.catJAM", "/emotes/image/FFZ/777171?variant=full&a=1")
+}
+
+test "the answer carries an etag and cache for the reader, and a matching If-None-Match is a 304" {
+    var client = ErtHolder.pair().client
+    var res = client.get("/emotes/index")
+    Check.status(res, 200)
+    var etag = res.header("ETag")
+    Check.isTrue("etag", etag.length() > 0)
+    Check.isTrue("etag is weak", etag.startsWith("W/\""))
+    Check.eqStr("cache-control", "max-age=3600, public", res.header("Cache-Control"))
+    var again = client.getWith("/emotes/index", listOf("If-None-Match: " + etag))
+    Check.status(again, 304)
+    Check.eqStr("304 has no body", "", again.body)
+    Check.eqStr("304 keeps the etag", etag, again.header("ETag"))
+    var other = client.getWith("/emotes/index", listOf("If-None-Match: W/\"nope\""))
+    Check.status(other, 200)
+    var page = client.get("/emotes")
+    Check.eqStr("page cache-control", "max-age=600, public", page.header("Cache-Control"))
+    Check.status(client.getWith("/emotes", listOf("If-None-Match: " + page.header("ETag"))), 304)
+    Check.status(client.getWith("/emotes", listOf("If-None-Match: *")), 304)
+}
+
+test "the lists are public reads: no session needed" {
+    Check.status(ErtHolder.pair().client.get("/emotes"), 200)
+    Check.status(ErtHolder.pair().client.get("/emotes/index"), 200)
+    // the /v1 alias serves the same routes
+    Check.status(ErtHolder.pair().client.get("/v1/emotes"), 200)
+}
+
+EmotesModule ertModule(catalog: List<Emote>, fetcher: ErtFetcher) {
+    var service = EmoteCatalogService(listOf<EmoteSource>(), ErtSource(catalog))
+    return EmotesModule(service, EmoteImageCache(fetcher))
+}
+
+// The image route runs behind the binary lane: a booted app per catalog, with the module and a counting fetcher.
+class ErtImageHolder {
+    static stopAll() {
+        for (var app in ErtImageHolder.started) {
+            app.stop()
+        }
+    }
+    static Map<String,TestApp> apps = mapOf<String, TestApp>()
+    static List<TestApp> started = listOf<TestApp>()
+    static ErtFetcher fetcher = ErtFetcher()
+    static TestApp get(name: String, catalog: List<Emote>) {
+        var cur = ErtImageHolder.apps.get(name)
+        if (cur != null) {
+            return cur
+        }
+        var made = TestApp.bootWire(name, (p: Platform) -> {
+    var service = EmoteCatalogService(listOf<EmoteSource>(), ErtSource(catalog))
+    ErtImageHolder.fetcher = ErtFetcher()
+    EmoteRoutes.registerImage(p.server, EmotesModule(service, EmoteImageCache(ErtImageHolder.fetcher)))
+})
+        ErtImageHolder.apps.put(name, made)
+        ErtImageHolder.started.add(made)
+        return made
+    }
+}
+
+BinaryClient ertImage(name: String, catalog: List<Emote>) = BinaryClient(ErtImageHolder.get(name, catalog).port)
+
+test "image: it comes from the cache with the content type of the CDN" {
+    var res = ertImage("ertimg1", listOf(ertKekw())).get("/emotes/image/BTTV/abc?variant=thumb", listOf<String>())
+    Check.eqInt("status", 200, res.status)
+    Check.eqStr("type", "image/png", res.header("Content-Type"))
+    Check.eqStr("nosniff", "nosniff", res.header("X-Content-Type-Options"))
+    Check.eqStr("cache", "max-age=604800, public, immutable", res.header("Cache-Control"))
+    Check.eqInt("bytes", 2, res.body.length)
+}
+
+test "image: an animated sticker asks for the moving file" {
+    var res = ertImage("ertimg2", listOf(ertCatJam())).get("/emotes/image/FFZ/777171?variant=full", listOf<String>())
+    Check.eqInt("status", 200, res.status)
+    Check.eqInt("fetches", 1, ErtImageHolder.fetcher.urls.size())
+    Check.eqStr("url", "https://cdn.frankerfacez.com/emote/777171/animated/2", ErtImageHolder.fetcher.urls.get(0))
+}
+
+test "image: an unknown sticker does not try the animated file" {
+    // regression: the animated address of a static one on FFZ hangs (no 404) until the timeout
+    var res = ertImage("ertimg3", listOf(ertKekw())).get("/emotes/image/FFZ/999?variant=full", listOf<String>())
+    Check.eqInt("status", 200, res.status)
+    Check.eqStr("type", "image/png", res.header("Content-Type"))
+    Check.eqInt("fetches", 1, ErtImageHolder.fetcher.urls.size())
+    Check.eqStr("url", "https://cdn.frankerfacez.com/emote/999/2", ErtImageHolder.fetcher.urls.get(0))
+}
+
+test "image: an unknown provider or a path-like id answers nothing (404)" {
+    var client = ertImage("ertimg4", listOf(ertKekw()))
+    Check.eqInt("provider", 404, client.get("/emotes/image/SEILA/abc?variant=full", listOf<String>()).status)
+    Check.eqInt("id", 404, client.get("/emotes/image/FFZ/..%2F..%2Fetc?variant=full", listOf<String>()).status)
+}
+
+test "image: a blocked artwork dies before the cache and the fetch" {
+    var res = ertImage("ertimg5", listOf(ertEmote("booty", "FFZ", "999010", false, 1))).get("/emotes/image/FFZ/999010?variant=full", listOf<String>())
+    Check.eqInt("status", 404, res.status)
+    Check.eqInt("fetches", 0, ErtImageHolder.fetcher.urls.size())
+}
+
+test "the module wires the routes and boots from the embedded snapshot with the refresh off" {
+    var overrides = mapOf<String, String>()
+    overrides.put("REDE_EMOTES_REFRESH_ENABLED", "false")
+    var jobs = Scheduler()
+    var app = TestApp.bootWith("ertmodule", overrides, (p: Platform) -> {
+    var shared = SharedServices.create(p)
+    jobs = shared.jobs
+    EmotesModule.installWith(p, shared, EmoteFeed(), ErtFetcher())
+})
+    var res = app.client.get("/emotes?limit=3")
+    Check.status(res, 200)
+    Check.jsonEq(res, "items.0.code", "OMEGALUL")
+    Check.isTrue("snapshot is big", res.json("total").toInt() > 800)
+    Check.isTrue("index is served", app.client.get("/emotes/index").body.length() > 1000)
+    jobs.stop()
+    app.stop()
+}
+
+test "zz image apps stop" {
+    // the binary front's threads keep the test process alive otherwise
+    ErtImageHolder.stopAll()
+}

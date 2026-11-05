@@ -1,0 +1,99 @@
+package kernel.testkit
+
+import java.io.IOException
+import java.net.Socket
+import kernel.bytes.*
+
+// A response with a binary body (TestResponse keeps the body as text).
+class BinaryResponse {
+    Int status
+    List<String> headerNames = listOf<String>()
+    List<String> headerValues = listOf<String>()
+    Byte[] body
+    public constructor(status: Int, body: Byte[]) {
+        this.status = status
+        this.body = body
+    }
+    String header(name: String) {
+        var i = 0
+        while (i < headerNames.size()) {
+            if (headerNames.get(i).toLowerCase() == name.toLowerCase()) {
+                return headerValues.get(i)
+            }
+            i = i + 1
+        }
+        return ""
+    }
+    // The body as UTF-8 text (JSON answers).
+    String text() = new String(body, "UTF-8")
+    String json(path: String) {
+        var v = JsonPath.str(text(), path)
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+}
+
+// HTTP/1.1 client with raw byte bodies, for the binary lane (uploads and downloads). `TestClient` speaks
+// text only: a body with bytes above 0x7F would be re-encoded as UTF-8.
+class BinaryClient {
+    Int port
+    public constructor(port: Int) {
+        this.port = port
+    }
+    BinaryResponse send(method: String, path: String, headers: List<String>, body: Byte[]) {
+        var head = method + " " + path + " HTTP/1.1\r\nHost: localhost:" + port + "\r\nConnection: close\r\n"
+        for (var h in headers) {
+            head = head + h + "\r\n"
+        }
+        if (body.length > 0) {
+            head = head + "Content-Length: " + body.length + "\r\n"
+        }
+        head = head + "\r\n"
+        var socket = new Socket("127.0.0.1", port)
+        socket.setSoTimeout(60000)
+        var out = socket.getOutputStream()
+        var bytes = head.getBytes()
+        out.write(bytes, 0, bytes.length)
+        if (body.length > 0) {
+            out.write(body, 0, body.length)
+        }
+        out.flush()
+        var input = socket.getInputStream()
+        var raw = input.readAllBytes()
+        socket.close()
+        return BinaryClient.parse(raw)
+    }
+    BinaryResponse get(path: String, headers: List<String>) = send("GET", path, headers, "".getBytes())
+    BinaryResponse put(path: String, headers: List<String>, body: Byte[]) = send("PUT", path, headers, body)
+    // Splits at the first blank line (searched on bytes: the body may hold anything).
+    static BinaryResponse parse(raw: Byte[]) {
+        var end = -1
+        var i = 0
+        while (end < 0 && i + 3 < raw.length) {
+            if (Bytes.at(raw, i) == 13 && Bytes.at(raw, i + 1) == 10 && Bytes.at(raw, i + 2) == 13 && Bytes.at(raw, i + 3) == 10) {
+                end = i
+            }
+            i = i + 1
+        }
+        if (end < 0) {
+            throw "BinaryClient: no response head"
+        }
+        var head = Bytes.ascii(raw, 0, end)
+        var sink = ByteSink()
+        sink.add(raw, end + 4, raw.length - end - 4)
+        var lines = head.split("\r\n")
+        var response = BinaryResponse(lines[0].split(" ")[1].toInt(), sink.toBytes())
+        var n = 1
+        while (n < lines.length) {
+            var colon = lines[n].indexOf(":")
+            if (colon > 0) {
+                response.headerNames.add(lines[n].substring(0, colon).trim())
+                response.headerValues.add(lines[n].substring(colon + 1).trim())
+            }
+            n = n + 1
+        }
+        return response
+    }
+}

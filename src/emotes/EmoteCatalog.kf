@@ -1,0 +1,127 @@
+package emotes
+
+import kernel.security.*
+import kernel.time.*
+
+// The whole catalog at one instant: the list already in picker order (popular by usage, then the rest
+// alphabetically) and the build time. The etag derives from content: while nothing changes everyone who has
+// the copy gets 304, and the 3-hourly rebuild recomputes the time, so the reader app picks up the new list.
+class EmoteCatalog {
+    List<Emote> emotes
+    String generatedAt
+    public constructor(emotes: List<Emote>, generatedAt: String) {
+        this.emotes = emotes
+        this.generatedAt = generatedAt
+    }
+    static EmoteCatalog empty() = EmoteCatalog(listOf<Emote>(), EmoteCatalog.epoch())
+    static String epoch() = "1970-01-01T00:00:00Z"
+    Bool isEmpty() = emotes.size() == 0
+    String etag() {
+        var content = ""
+        for (var e in emotes) {
+            content = content + e.code() + ":" + e.id() + ":" + e.popularRank() + ":" + e.animated() + ";"
+        }
+        var seconds = Time.toMillis(generatedAt) / 1000L
+        return "W/\"" + Hashes.sha256Hex(content).substring(0, 8) + "-" + seconds + "\""
+    }
+}
+
+// A page of the catalog, already filtered by the picker. `total` is how many stickers pass the filter (not the
+// catalog size): the number the picker shows as "737 stickers" while it loads 40 at a time.
+record EmotePage(List<Emote> items, Int page, Int limit, Int total, Int totalPages)
+
+class EmotePages {
+    // Popular first by usage position; the rest alphabetically (case-insensitive). Total order: ties on the
+    // lower-cased code fall back to the exact code.
+    static String selectorKey(e: Emote) {
+        var tail = e.code().toLowerCase() + "\t" + e.code()
+        if (EmoteRules.popular(e)) {
+            var rank = "" + e.popularRank()
+            var pad = ""
+            while (pad.length() + rank.length() < 12) {
+                pad = pad + "0"
+            }
+            return "0" + pad + rank + tail
+        }
+        return "1" + tail
+    }
+    static String alphabeticKey(e: Emote) = e.code().toLowerCase() + "\t" + e.code()
+    static List<Emote> sortBy(emotes: List<Emote>, alphabetic: Bool) {
+        var byKey = mapOf<String, Emote>()
+        for (var e in emotes) {
+            if (alphabetic) {
+                byKey.put(EmotePages.alphabeticKey(e), e)
+            }
+            else {
+                byKey.put(EmotePages.selectorKey(e), e)
+            }
+        }
+        var out = listOf<Emote>()
+        for (var key in byKey.keys().sorted()) {
+            var e = byKey.get(key)
+            if (e != null) {
+                out.add(e)
+            }
+        }
+        return out
+    }
+    static List<Emote> sortSelector(emotes: List<Emote>) = EmotePages.sortBy(emotes, false)
+    // Search and provider. `POPULAR` by usage; `ALL` popular first then alphabetical; `BTTV`/`FFZ` only that
+    // provider's collection, alphabetical. An unknown provider does not filter.
+    static List<Emote> filter(catalog: List<Emote>, query: String?, provider: String?) {
+        var term = ""
+        if (query != null) {
+            term = query.trim().toLowerCase()
+        }
+        var kind = "ALL"
+        if (provider != null) {
+            kind = provider.trim().toUpperCase()
+        }
+        var kept = listOf<Emote>()
+        for (var e in catalog) {
+            if (!EmotePages.matchesProvider(e, kind)) {
+                continue
+            }
+            if (term.length() > 0 && !e.code().toLowerCase().contains(term)) {
+                continue
+            }
+            kept.add(e)
+        }
+        return EmotePages.sortBy(kept, kind == "BTTV" || kind == "FFZ")
+    }
+    static Bool matchesProvider(e: Emote, kind: String) {
+        if (kind == "POPULAR") {
+            return EmoteRules.popular(e)
+        }
+        if (kind == "BTTV" || kind == "FFZ") {
+            return e.provider() == kind
+        }
+        return true
+    }
+    static EmotePage of(filtered: List<Emote>, page: Int, limit: Int) {
+        var total = filtered.size()
+        var totalPages = (total + limit - 1) / limit
+        if (totalPages < 1) {
+            totalPages = 1
+        }
+        var current = page
+        if (current < 1) {
+            current = 1
+        }
+        if (current > totalPages) {
+            current = totalPages
+        }
+        var start = (current - 1) * limit
+        var end = start + limit
+        if (end > total) {
+            end = total
+        }
+        var items = listOf<Emote>()
+        var i = start
+        while (i < end) {
+            items.add(filtered.get(i))
+            i = i + 1
+        }
+        return EmotePage(items, current, limit, total, totalPages)
+    }
+}

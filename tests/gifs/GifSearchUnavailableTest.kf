@@ -1,0 +1,28 @@
+import gifs.*
+import kernel.*
+import kernel.config.*
+import kernel.cache.*
+import kernel.security.*
+import kernel.testkit.*
+
+// No key configured (the default of the suite): the picker must say the search is UNAVAILABLE
+// (`available=false`, empty list), never "no GIFs found" for a search that never happened.
+wireNoKeys(p: Platform) {
+    Auth.install(p.server, p.db, p.cfg)
+    GifsModule.installWith(p.server, TtlCache("gifSearch", 600000L, 200), GifsModule.defaultProviders(p.cfg, GifHttp()))
+}
+
+class GifNoKeyHolder {
+    static TestApp? cached = null
+}
+
+test "reports unavailable when no provider has a key" {
+    var app = TestApp.bootWire("gifsnokey", (p: Platform) -> wireNoKeys(p))
+    SecurityFixtures.login(app.db(), "user_gif_sem_chave", "tok-gif-sem-chave-123456")
+    var res = app.client.getWith("/gifs/search?q=qualquer-coisa", listOf("X-Session-Token: tok-gif-sem-chave-123456"))
+    Check.status(res, 200)
+    Check.eqStr("available", "false", res.json("available"))
+    Check.isTrue("provider is null", res.jsonIsNull("provider"))
+    Check.eqInt("no items", 0, res.jsonSize("items"))
+    app.stop()
+}

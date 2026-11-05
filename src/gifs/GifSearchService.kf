@@ -1,0 +1,46 @@
+package gifs
+
+import kernel.cache.*
+import kernel.log.*
+
+// Picker search. The first AVAILABLE provider that answers owns the search (Tenor before GIPHY), with no
+// mixing: two sources in one grid confuse and the attribution must say whose GIF it is. When a provider
+// with a key fails (revoked key, quota, down) the next one tries; only when all fail does the error
+// reach the screen. The answer is cached per `term|limit` (cache `gifSearch`, 10 min) so a repeated
+// term does not spend the provider quota again; failures are never cached.
+class GifSearchService {
+    List<GifProvider> providers
+    TtlCache results
+    Log log = Log("gifs.search")
+    public constructor(providers: List<GifProvider>, cache: TtlCache) {
+        this.providers = providers
+        this.results = cache
+    }
+    // JSON text of the GifSearchResult (the cache stores Strings, G43).
+    String searchJson(query: String, limit: Int) {
+        var svc = this
+        var key = query + "|" + limit
+        var out = this.results.getOrLoad(key, () -> svc.encodeSearch(query, limit))
+        return out
+    }
+    String encodeSearch(query: String, limit: Int) = json.encode(this.search(query, limit))
+    GifSearchResult search(query: String, limit: Int) {
+        var failed = false
+        var lastFailure = ""
+        for (var provider in providers) {
+            if (provider.available()) {
+                try {
+                    return GifSearchResult(true, provider.name(), provider.search(query, limit))
+                } catch (String e) {
+                    log.warn("gif_provider_failed provider=" + provider.name())
+                    failed = true
+                    lastFailure = e
+                }
+            }
+        }
+        if (failed) {
+            throw lastFailure
+        }
+        return GifSearchResult(false, null, listOf<GifItem>())
+    }
+}

@@ -1,0 +1,60 @@
+package linkedin
+
+import kernel.time.*
+
+// A person's publishing connection to LinkedIn. `accessTokenEnc` is SecretCipher output, never the token.
+// Instants are ISO-8601 UTC strings (kernel convention).
+record LinkedInConnection(String userId, String memberSub, String accessTokenEnc, String tokenExpiresAt, Bool postSync, String createdAt, String updatedAt, String? lastShareStatus, String? lastShareAt)
+
+// GET/PUT /me/integrations/linkedin answer (Java `StatusView`).
+record LinkedInStatus(Bool connected, Bool postSync, Bool canPost, String? tokenExpiresAt, String? reason, String? lastShareStatus, String? lastShareAt)
+
+// Result of one share attempt: `detail` is short and stable ("HTTP_403", "EXCEPTION", "SEM_TOKEN"), null when accepted.
+record LinkedInShareOutcome(Bool accepted, String? detail)
+
+// The fields of a post the share handler needs (Java `Post`), read through LinkedInPostLookup.
+record LinkedInPostRef(String id, String authorId, String content, String status, String type, String identity)
+
+// PUT body. `postSync` is a String? because Bool? is not a Kof type (G23) and a missing field must stay distinguishable.
+record LinkedInUpdateRequest(String? postSync)
+
+class LinkedInRules {
+    static String orEmpty(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    // The LinkedIn shareCommentary accepts up to 3000 characters.
+    static Int maxCommentary() = 3000
+    // Share text: the post content and its public link, within the LinkedIn limit.
+    static String commentary(content: String?, url: String) {
+        var base = ""
+        if (content != null) {
+            base = content.trim()
+        }
+        var room = LinkedInRules.maxCommentary() - url.length() - 2
+        if (room < 0) {
+            room = 0
+        }
+        if (base.length() > room) {
+            if (room == 0) {
+                base = ""
+            }
+            else {
+                base = base.substring(0, room - 1).trim() + "…"
+            }
+        }
+        if (base.length() == 0) {
+            return url
+        }
+        return base + "\n\n" + url
+    }
+    // The instant is a valid token window when it lies after `now` (ISO strings of equal format compare by millis).
+    static Bool tokenValid(expiresAt: String?, nowIso: String) {
+        if (expiresAt == null) {
+            return false
+        }
+        return Time.toMillis(expiresAt) > Time.toMillis(nowIso)
+    }
+}

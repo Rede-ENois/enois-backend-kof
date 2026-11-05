@@ -1,0 +1,176 @@
+import kernel.*
+import kernel.config.*
+import kernel.http.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import kernel.time.*
+import linkedin.*
+
+class LiSvcClock extends LinkedInClock {
+    String nowIso() = "2026-10-19T12:00:00Z"
+}
+
+class LiSvcClient extends LinkedInShareClient {
+    List<String> captured = listOf<String>()
+    LinkedInShareOutcome share(accessToken: String, memberSub: String, commentary: String, url: String, title: String) {
+        captured.add(accessToken + "|" + memberSub + "|" + commentary + "|" + url)
+        return LinkedInShareOutcome(true, null)
+    }
+}
+
+String liNow() = "2026-10-19T12:00:00Z"
+
+LinkedInService liSvc(cipher: SecretCipher, client: LinkedInShareClient) {
+    var db = TestApp.shared().db()
+    return LinkedInService(db, LinkedInStore(db), client, cipher, LiSvcClock(), "https://enois.ia.br")
+}
+
+SecretCipher liKey() = SecretCipher(SecretCipher.generateKeyBase64(), false)
+
+String liThrown(body: () -> void) {
+    try {
+        body()
+    } catch (String e) {
+        return e
+    }
+    return ""
+}
+
+test "the token is stored encrypted, never in clear" {
+    var cipher = liKey()
+    var svc = liSvc(cipher, LiSvcClient())
+    svc.remember("svc_u1", "sub-1", "token-secreto", Time.plusSeconds(liNow(), 3600L))
+    var row = TestApp.shared().db().queryOne("select access_token_enc from linkedin_connections where user_id = ?", DbParams().bindStr("svc_u1"))
+    var enc = row.getStr("access_token_enc")
+    Check.isTrue("encrypted", enc != "token-secreto")
+    Check.eqStr("decrypts", "token-secreto", cipher.decrypt(enc))
+    var st = svc.status("svc_u1")
+    Check.isTrue("connected", st.connected)
+    Check.isTrue("canPost", st.canPost)
+    Check.isTrue("postSync off", !st.postSync)
+    Check.isTrue("no reason", st.reason == null)
+}
+
+test "without the encryption key nothing is stored" {
+    var svc = liSvc(SecretCipher("", false), LiSvcClient())
+    svc.remember("svc_u2", "sub-1", "token-secreto", Time.plusSeconds(liNow(), 3600L))
+    Check.eqStr("rows", "0", "" + TestApp.shared().db().queryLong("select count(*) from linkedin_connections where user_id = ?", DbParams().bindStr("svc_u2")))
+    Check.eqStr("reason", "NOT_CONNECTED", LinkedInRules.orEmpty(svc.status("svc_u2").reason))
+}
+
+test "status explains an expired token and a missing key" {
+    var svc = liSvc(liKey(), LiSvcClient())
+    svc.remember("svc_u3", "sub-1", "token", Time.plusSeconds(liNow(), -60L))
+    Check.isTrue("cannot post", !svc.status("svc_u3").canPost)
+    Check.eqStr("expired", "TOKEN_EXPIRED", LinkedInRules.orEmpty(svc.status("svc_u3").reason))
+    // Row exists but the server has no key: connected, yet cannot post.
+    var db = TestApp.shared().db()
+    var now = liNow()
+    db.execute("insert into linkedin_connections (user_id, member_sub, access_token_enc, token_expires_at, post_sync, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr("svc_u4").bindStr("sub-2").bindStr("qualquer").bindInstant(Time.plusSeconds(now, 3600L)).bindBool(false).bindInstant(now).bindInstant(now))
+    var keyless = liSvc(SecretCipher("", false), LiSvcClient())
+    Check.isTrue("connected", keyless.status("svc_u4").connected)
+    Check.isTrue("cannot post", !keyless.status("svc_u4").canPost)
+    Check.eqStr("reason", "SERVER_KEY_MISSING", LinkedInRules.orEmpty(keyless.status("svc_u4").reason))
+}
+
+test "the preference only turns on with a valid connection" {
+    var svc = liSvc(liKey(), LiSvcClient())
+    var first = liThrown(() -> { svc.setPostSync("svc_u5", true) })
+    Check.isTrue("not connected", Errors.hasCode(first, "LINKEDIN_NOT_CONNECTED"))
+    svc.remember("svc_u5", "sub-1", "token", Time.plusSeconds(liNow(), -10L))
+    var second = liThrown(() -> { svc.setPostSync("svc_u5", true) })
+    Check.isTrue("not ready", Errors.hasCode(second, "LINKEDIN_NOT_READY"))
+    svc.remember("svc_u5", "sub-1", "token", Time.plusSeconds(liNow(), 3600L))
+    Check.isTrue("on", svc.setPostSync("svc_u5", true).postSync)
+    Check.isTrue("off", !svc.setPostSync("svc_u5", false).postSync)
+}
+
+test "the share carries the post text and its public link" {
+    var client = LiSvcClient()
+    var svc = liSvc(liKey(), client)
+    svc.remember("svc_u6", "sub-1", "token-abc", Time.plusSeconds(liNow(), 3600L))
+    svc.setPostSync("svc_u6", true)
+    svc.sharePublishedPost("svc_u6", "post_1", "Meu texto", "Publicação no Énóis")
+    Check.eqInt("calls", 1, client.captured.size())
+    var call = client.captured.get(0)
+    Check.isTrue("token", call.startsWith("token-abc|sub-1|"))
+    Check.isTrue("text", call.contains("Meu texto"))
+    Check.isTrue("link", call.contains("https://enois.ia.br/post/post_1"))
+    Check.isTrue("url", call.endsWith("|https://enois.ia.br/post/post_1"))
+}
+
+test "without the preference or with an expired token nothing is published" {
+    var client = LiSvcClient()
+    var svc = liSvc(liKey(), client)
+    svc.remember("svc_u7", "sub-1", "token", Time.plusSeconds(liNow(), 3600L))
+    svc.sharePublishedPost("svc_u7", "post_1", "texto", "t")
+    Check.eqInt("no preference", 0, client.captured.size())
+    svc.setPostSync("svc_u7", true)
+    svc.remember("svc_u7", "sub-1", "token", Time.plusSeconds(liNow(), -1L))
+    svc.sharePublishedPost("svc_u7", "post_1", "texto", "t")
+    Check.eqInt("expired", 0, client.captured.size())
+}
+
+test "a long text fits the LinkedIn limit" {
+    var url = "https://enois.ia.br/post/post_1"
+    var out = LinkedInRules.commentary(strings.repeat("a", 10000), url)
+    Check.isTrue("<= 3000", out.length() <= 3000)
+    Check.isTrue("ends with the link", out.endsWith(url))
+    Check.eqStr("empty text", url, LinkedInRules.commentary("", url))
+}
+
+// ---- LinkedInHttpShareClient against a local stub of the LinkedIn API (no network) ----
+
+class LiStubHolder {
+    static TestApp? app = null
+    static String lastBody = ""
+    static String lastAuth = ""
+    static Int answer = 201
+}
+
+TestApp liStubApp() {
+    var cur = LiStubHolder.app
+    if (cur != null) {
+        return cur
+    }
+    var created = TestApp.bootWire("linkedinstub", (p: Platform) -> {
+        p.server.post("/v2/ugcPosts", () -> {
+            LiStubHolder.lastBody = Req.bodyText()
+            LiStubHolder.lastAuth = LinkedInRules.orEmpty(Req.bearerToken())
+            return status(LiStubHolder.answer, "{}")
+        })
+    })
+    LiStubHolder.app = created
+    return created
+}
+
+String liStubUrl() = "http://127.0.0.1:" + liStubApp().port + "/v2/ugcPosts"
+
+test "the real client posts the UGC payload and maps the outcome" {
+    var client = LinkedInHttpShareClient(liStubUrl())
+    LiStubHolder.answer = 201
+    var ok = client.share("tok", "sub-9", "Texto \"com aspas\"", "https://enois.ia.br/post/p1", "Titulo")
+    Check.isTrue("accepted", ok.accepted)
+    Check.isTrue("author urn", LiStubHolder.lastBody.contains("\"author\":\"urn:li:person:sub-9\""))
+    Check.isTrue("lifecycle", LiStubHolder.lastBody.contains("\"lifecycleState\":\"PUBLISHED\""))
+    Check.isTrue("article", LiStubHolder.lastBody.contains("\"shareMediaCategory\":\"ARTICLE\""))
+    Check.isTrue("link", LiStubHolder.lastBody.contains("\"originalUrl\":\"https://enois.ia.br/post/p1\""))
+    Check.isTrue("public", LiStubHolder.lastBody.contains("\"com.linkedin.ugc.MemberNetworkVisibility\":\"PUBLIC\""))
+    Check.isTrue("escaped text", LiStubHolder.lastBody.contains("Texto \\\"com aspas\\\""))
+    LiStubHolder.answer = 403
+    var refused = client.share("tok", "sub-9", "t", "https://enois.ia.br/post/p1", "T")
+    Check.isTrue("not accepted", !refused.accepted)
+    Check.eqStr("detail", "HTTP_403", LinkedInRules.orEmpty(refused.detail))
+    Check.eqStr("empty token", "SEM_TOKEN", LinkedInRules.orEmpty(client.share("", "sub-9", "t", "u", "T").detail))
+    var down = LinkedInHttpShareClient("http://127.0.0.1:1/v2/ugcPosts").share("tok", "sub-9", "t", "u", "T")
+    Check.eqStr("transport failure", "EXCEPTION", LinkedInRules.orEmpty(down.detail))
+}
+
+test "teardown stops the stub app" {
+    var cur = LiStubHolder.app
+    if (cur != null) {
+        cur.stop()
+    }
+    TestApp.shared().stop()
+}

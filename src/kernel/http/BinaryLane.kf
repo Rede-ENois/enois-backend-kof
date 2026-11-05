@@ -1,0 +1,148 @@
+package kernel.http
+
+import java.util.concurrent.ConcurrentHashMap
+import kernel.files.*
+import kernel.id.*
+import kernel.time.*
+
+// The binary lane: raw request bodies and response bodies that the web runtime cannot carry.
+//
+// The runtime reads every request body as a UTF-8 String (bytes that are not valid UTF-8 become U+FFFD,
+// measured in KOF_GAPS G160) and writes every response body as a UTF-8 String, so an image or video
+// upload (`PUT /storage/{key}`, up to 500 MB) and a binary download cannot go through an ordinary route.
+// A route prefix claimed here is served behind `BinaryFront` (a byte-level front on the public port that
+// forwards everything else untouched); the route handlers keep the whole security pipeline and only
+// exchange small tickets with the front:
+//
+//   upload   front -> route "PUT" with `X-Kernel-Binary: authorize` and `X-Kernel-Declared-Length: N`
+//            (no body): the handler runs every check, then `BinaryLane.accept(user, key, N)` and answers 202
+//            with `X-Kernel-Accept: <ticket>`. The front then reads N bytes from the client into a temp file,
+//            calls the route again with `X-Kernel-Binary: commit` and `X-Kernel-Ticket`, and the handler
+//            takes the file with `BinaryLane.bodyPath(ticket, user, key)` and answers the client.
+//   download the handler registers the stream (`BinaryLane.stream(body, length)`) and answers with
+//            `X-Kernel-Stream: <token>`; the front streams the bytes with the status and headers it got.
+//
+// Tickets and streams live in this process only; a ticket nobody claims expires after two minutes.
+class BinaryLane {
+    static List<String> binaryLanePrefixes = listOf<String>()
+    static Map<String,String> binaryTicketUser = new ConcurrentHashMap<String, String>()
+    static Map<String,String> binaryTicketKey = new ConcurrentHashMap<String, String>()
+    static Map<String,String> binaryTicketLength = new ConcurrentHashMap<String, String>()
+    static Map<String,String> binaryTicketPath = new ConcurrentHashMap<String, String>()
+    static Map<String,String> binaryTicketExpiry = new ConcurrentHashMap<String, String>()
+    static Map<String,ByteStream> binaryStreamBody = new ConcurrentHashMap<String, ByteStream>()
+    static Map<String,String> binaryStreamLength = new ConcurrentHashMap<String, String>()
+    static Map<String,String> binaryStreamExpiry = new ConcurrentHashMap<String, String>()
+    // Claims a route prefix (`/storage/`): requests under it (also under `/v1`) go through the lane.
+    static claim(prefix: String) {
+        if (!binaryLanePrefixes.contains(prefix)) {
+            binaryLanePrefixes.add(prefix)
+        }
+    }
+    static Bool enabled() = binaryLanePrefixes.size() > 0
+    // Whether `path` (raw, `/v1` alias allowed) is under a claimed prefix.
+    static Bool owns(path: String) {
+        var bare = path
+        if (bare.startsWith("/v1/")) {
+            bare = bare.substring(3)
+        }
+        for (var prefix in binaryLanePrefixes) {
+            if (bare.startsWith(prefix)) {
+                return true
+            }
+        }
+        return false
+    }
+    // ---------------------------------------------------------------- upload
+    // Registers an authorised upload of `length` bytes and returns its ticket.
+    static String accept(user: String, key: String, length: Long) {
+        BinaryLane.sweep()
+        var ticket = Ids.prefixed("bt_")
+        binaryTicketUser.put(ticket, user)
+        binaryTicketKey.put(ticket, key)
+        binaryTicketLength.put(ticket, "" + length)
+        binaryTicketExpiry.put(ticket, "" + (Time.nowMillis() + 120000L))
+        return ticket
+    }
+    // The front stores the received body here.
+    static attach(ticket: String, path: String) {
+        binaryTicketPath.put(ticket, path)
+    }
+    // The temp file of a received body, once, for the user and key that were authorised ("" otherwise).
+    static String bodyPath(ticket: String, user: String, key: String) {
+        var owner = binaryTicketUser.get(ticket)
+        if (owner == null) {
+            return ""
+        }
+        var target = binaryTicketKey.get(ticket)
+        if (target == null) {
+            return ""
+        }
+        var path = binaryTicketPath.get(ticket)
+        if (path == null) {
+            return ""
+        }
+        if (owner != user || target != key) {
+            return ""
+        }
+        return path
+    }
+    // Forgets the ticket and deletes its temp file.
+    static discard(ticket: String) {
+        var path = binaryTicketPath.get(ticket)
+        if (path != null) {
+            TempFiles.delete(path)
+        }
+        binaryTicketUser.remove(ticket)
+        binaryTicketKey.remove(ticket)
+        binaryTicketLength.remove(ticket)
+        binaryTicketPath.remove(ticket)
+        binaryTicketExpiry.remove(ticket)
+    }
+    // ---------------------------------------------------------------- download
+    // Registers a body to stream to the client; returns the token for `X-Kernel-Stream`.
+    static String stream(body: ByteStream, length: Long) {
+        BinaryLane.sweep()
+        var token = Ids.prefixed("bs_")
+        binaryStreamBody.put(token, body)
+        binaryStreamLength.put(token, "" + length)
+        binaryStreamExpiry.put(token, "" + (Time.nowMillis() + 120000L))
+        return token
+    }
+    // The registered body (once); null when unknown or taken.
+    static ByteStream? takeStream(token: String) {
+        var body = binaryStreamBody.get(token)
+        binaryStreamBody.remove(token)
+        binaryStreamLength.remove(token)
+        binaryStreamExpiry.remove(token)
+        return body
+    }
+    static Long streamLength(token: String) {
+        var raw = binaryStreamLength.get(token)
+        if (raw == null) {
+            return 0L
+        }
+        return raw.toLong()
+    }
+    // Drops tickets and streams nobody claimed (closing the streams, deleting the files).
+    static sweep() {
+        var now = Time.nowMillis()
+        for (var ticket in binaryTicketExpiry.keys()) {
+            var at = binaryTicketExpiry.get(ticket)
+            if (at != null && at.toLong() < now) {
+                BinaryLane.discard(ticket)
+            }
+        }
+        for (var token in binaryStreamExpiry.keys()) {
+            var at = binaryStreamExpiry.get(token)
+            if (at != null && at.toLong() < now) {
+                var body = BinaryLane.takeStream(token)
+                if (body != null) {
+                    body.close()
+                }
+            }
+        }
+    }
+    static Int pendingTickets() = binaryTicketUser.size()
+    static Int pendingStreams() = binaryStreamBody.size()
+}

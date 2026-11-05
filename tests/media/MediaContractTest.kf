@@ -1,0 +1,155 @@
+import kernel.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import media.*
+
+// Ports of MediaControllerTests, MediaUploadAuthTests and MediaPublicReadTests: S3 storage mode with the
+// proxy base URL (no network: the upload only signs).
+class MediaContractHolder {
+    static TestApp? app = null
+    static MediaModule? module = null
+    static SharedServices? shared = null
+    static TestApp get() {
+        var cur = MediaContractHolder.app
+        if (cur != null) {
+            return cur
+        }
+        var overrides = mapOf("REDE_ORIGINS_ENFORCE", "false", "REDE_MEDIA_STORAGE", "s3", "REDE_MEDIA_S3_BUCKET", "bucket-de-teste", "REDE_MEDIA_S3_PUBLIC_BASE_URL", "https://cdn.exemplo.com", "REDE_MEDIA_DELETION_WORKER_DELAY_MS", "3600000", "REDE_MEDIA_NSFW_ENABLED", "false")
+        SecurityClock.reset()
+        var created = TestApp.bootWith("mediacontract", overrides, (p: Platform) -> MediaContractHolder.wire(p))
+        MediaContractHolder.app = created
+        return created
+    }
+    static wire(p: Platform) {
+        var shared = SharedServices.create(p)
+        MediaContractHolder.shared = shared
+        var hooks = SecurityHooks.defaults(p.db)
+        Security.install(p, hooks)
+        MediaContractHolder.module = MediaModule.install(p, shared, hooks)
+    }
+}
+
+String mcLogin(user: String) {
+    var app = MediaContractHolder.get()
+    SecurityFixtures.login(app.db(), user, "tok-" + user + "-1234567890")
+    return "tok-" + user + "-1234567890"
+}
+
+List<String> mcAuth(token: String, key: String) = listOf("X-Session-Token: " + token, "Idempotency-Key: " + key, "Content-Type: application/json")
+
+TestResponse mcUpload(token: String, key: String, name: String, mime: String, size: String, purpose: String) {
+    var body = "{\"fileName\":\"" + name + "\",\"mimeType\":\"" + mime + "\",\"size\":" + size + ",\"purpose\":\"" + purpose + "\"}"
+    return MediaContractHolder.get().client.send("POST", "/media/uploads", mcAuth(token, key), "", body)
+}
+
+test "accepts media up to 500MB and rejects above it" {
+    var token = mcLogin("user_media_500mb")
+    var atLimit = mcUpload(token, "media-upload-500mb", "video-grande.mp4", "video/mp4", "524288000", "POST_VIDEO")
+    Check.status(atLimit, 201)
+    Check.isTrue("uploadUrl", atLimit.jsonHas("uploadUrl"))
+    var above = mcUpload(token, "media-upload-500mb-plus", "video-grande-demais.mp4", "video/mp4", "524288001", "POST_VIDEO")
+    Check.apiError(above, 400, "MEDIA_TOO_LARGE")
+}
+
+test "creates a media upload and replays the idempotent response" {
+    var token = mcLogin("user_media_upload")
+    var first = mcUpload(token, "media-upload-1", "arquitetura.png", "image/png", "2048", "POST_IMAGE")
+    Check.status(first, 201)
+    Check.isTrue("ownerId", first.jsonHas("ownerId"))
+    Check.jsonEq(first, "status", "PENDING")
+    Check.jsonEq(first, "deleteStatus", "NONE")
+    Check.jsonEq(first, "provider", "S3")
+    Check.jsonEq(first, "uploadMethod", "PUT")
+    Check.jsonEq(first, "uploadHeaders.Content-Type", "image/png")
+    Check.isTrue("uploadUrl is the proxy address", first.json("uploadUrl").startsWith("https://cdn.exemplo.com/uploads/media_"))
+    Check.eqStr("uploadUrl = cdnUrl", first.json("cdnUrl"), first.json("uploadUrl"))
+    var replay = mcUpload(token, "media-upload-1", "arquitetura.png", "image/png", "2048", "POST_IMAGE")
+    Check.status(replay, 201)
+    Check.eqStr("replayed body", first.body, replay.body)
+}
+
+test "deleting the media referenced by a deleted post" {
+    var token = mcLogin("user_media_feed")
+    var created = mcUpload(token, "media-feed-upload-1", "post.png", "image/png", "4096", "POST_IMAGE")
+    Check.status(created, 201)
+    var mediaId = created.json("id")
+    var module = MediaContractHolder.module
+    if (module == null) {
+        throw "module not wired"
+    }
+    // The feed endpoint is not ported yet: the feed calls this on post deletion.
+    var done = module.service.requestPostMediaDeletion("user_media_feed", "post_1", listOf(mediaId))
+    Check.eqInt("deleted ids", 1, done.size())
+    var read = MediaContractHolder.get().client.getWith("/media/" + mediaId, listOf("X-Session-Token: " + token))
+    Check.status(read, 200)
+    var ds = read.json("deleteStatus")
+    Check.isTrue("delete requested", ds == "REQUESTED" || ds == "CDN_PURGED" || ds == "OBJECT_DELETED")
+}
+
+test "rejects active content types even when they claim to be images" {
+    var token = mcLogin("user_media_mime")
+    var mimes = listOf("text/html", "image/svg+xml", "application/javascript")
+    var n = 0
+    for (var mime in mimes) {
+        n = n + 1
+        Check.apiError(mcUpload(token, "media-mime-" + n, "arquivo.html", mime, "1024", "POST_IMAGE"), 400, "MEDIA_TYPE_NOT_ALLOWED")
+    }
+}
+
+test "a verified account can request an upload for an avatar" {
+    var token = mcLogin("media_upload_ok")
+    Check.status(mcUpload(token, "media-up-1", "media/abc/foto.jpg", "image/jpeg", "1024", "AVATAR"), 201)
+}
+
+test "a file above the limit is rejected with a clear message" {
+    var token = mcLogin("media_upload_grande")
+    var res = mcUpload(token, "media-up-grande", "media/abc/video.mp4", "video/mp4", "525336576", "POST_VIDEO")
+    Check.apiError(res, 400, "MEDIA_TOO_LARGE")
+    Check.isTrue("message names 500MB", res.json("message").contains("500MB"))
+}
+
+test "a file up to the limit is accepted" {
+    var token = mcLogin("media_upload_no_limite")
+    Check.status(mcUpload(token, "media-up-no-limite", "media/abc/video.mp4", "video/mp4", "524288000", "POST_VIDEO"), 201)
+}
+
+test "without a session the upload is unauthorized" {
+    var res = MediaContractHolder.get().client.send("POST", "/media/uploads", listOf("Idempotency-Key: media-up-anon", "Content-Type: application/json"), "", "{\"fileName\":\"media/abc/foto.jpg\",\"mimeType\":\"image/jpeg\",\"size\":1024,\"purpose\":\"AVATAR\"}")
+    Check.status(res, 401)
+}
+
+test "anyone can read media published in a post" {
+    var token = mcLogin("user_media_public_read")
+    var created = mcUpload(token, "media-public-1", "foto.png", "image/png", "4096", "POST_IMAGE")
+    Check.status(created, 201)
+    var mediaId = created.json("id")
+    // A visitor without a session: the shared link and the public feed.
+    var res = MediaContractHolder.get().client.get("/media/" + mediaId)
+    Check.status(res, 200)
+    Check.jsonEq(res, "id", mediaId)
+    Check.jsonEq(res, "mimeType", "image/png")
+    Check.isTrue("cdnUrl", res.json("cdnUrl").length() > 0)
+}
+
+test "upload and delete still require a session" {
+    var token = mcLogin("user_media_public_write")
+    var created = mcUpload(token, "media-public-2", "doc.pdf", "application/pdf", "1024", "POST_FILE")
+    Check.status(created, 201)
+    var mediaId = created.json("id")
+    var anon = MediaContractHolder.get().client.send("POST", "/media/uploads", listOf("Idempotency-Key: media-public-3", "Content-Type: application/json"), "", "{\"fileName\":\"x.png\",\"mimeType\":\"image/png\",\"size\":10,\"purpose\":\"POST_IMAGE\"}")
+    Check.status(anon, 401)
+    Check.status(MediaContractHolder.get().client.send("DELETE", "/media/" + mediaId, listOf("Idempotency-Key: media-public-4"), "", ""), 401)
+}
+
+// The job loops would keep the test process alive: stop them (keep this the last test of the file).
+test "zz background jobs stop" {
+    var shared = MediaContractHolder.shared
+    if (shared != null) {
+        shared.stop()
+    }
+    // The media module claims the binary lane: stopping the platform closes the front's accept loop.
+    MediaContractHolder.get().stop()
+    var module = MediaContractHolder.module
+    assert(module != null)
+}
