@@ -1,0 +1,109 @@
+package app
+
+import communityprojects.*
+import events.*
+import coin.*
+import companies.*
+import kernel.cache.*
+import kernel.db.*
+import kernel.security.*
+import moderation.*
+import notifications.*
+
+// Moderation's side of the cross-domain seams (docs/SEAMS.md): subclasses of the callers' seam classes that run the moderation
+// domain's own use cases instead of reading or writing its tables.
+// Coin disputes: the report, the automatic penalty and the restriction are the moderation service's (reporting ceiling per
+// account, dedupe, support notice, content removal, sanction trail). The coin module is installed before moderation, so the
+// services are bound right after the moderation install.
+class ModerationCoinDispute extends CoinDisputeModeration {
+    ModerationService? reports = null
+    ModerationSanctionService? sanctions = null
+    public constructor(database: Db, throttle: ActionThrottle, notifications: Notifications, reportsPerHour: Int) {
+        super(database, throttle, notifications, reportsPerHour)
+    }
+    bind(service: ModerationService, sanctionService: ModerationSanctionService) {
+        this.reports = service
+        this.sanctions = sanctionService
+    }
+    ModerationService reportService() {
+        var s = reports
+        if (s == null) {
+            throw "ModerationCoinDispute: moderation not bound"
+        }
+        return s
+    }
+    ModerationSanctionService sanctionService() {
+        var s = sanctions
+        if (s == null) {
+            throw "ModerationCoinDispute: moderation not bound"
+        }
+        return s
+    }
+    String report(reporterId: String, targetUserId: String, description: String) = reportService().report(reporterId, "USER", targetUserId, "SCAM", description).id
+    Bool applyForReport(reportId: String, motive: String) {
+        var report = reportService().requireReport(reportId)
+        return sanctionService().applyForReport(report, motive)
+    }
+    restrictUser(userId: String, referenceId: String, motive: String) {
+        sanctionService().restrictUser(userId, referenceId, motive)
+    }
+}
+
+// Community projects: who may moderate is an approved moderator application.
+class ModerationProjectModerators extends CommunityProjectModerators {
+    ModerationModeratorStore moderators
+    public constructor(database: Db) {
+        super(database)
+        this.moderators = ModerationModeratorStore(database)
+    }
+    Bool isApprovedModerator(userId: String) = moderators.findApprovedByUser(userId) != null
+}
+
+// Profile reputation: the confirmed report facts come from the moderation store (events and mentoring counts stay as the
+// orgs wave wired them).
+class ModerationForeignCounts extends OrgsForeignCounts {
+    ModerationStore reports
+    public constructor(database: Db, eventsStore: EventsStore) {
+        super(database, eventsStore)
+        this.reports = ModerationStore(database)
+    }
+    Int confirmedReportFacts(userId: String) = reports.confirmedFactsAbout(userId) as Int
+}
+
+// A sanction changes what the public profile and the public ranking show (a banned account leaves both): both caches are
+// dropped when the transaction commits.
+class ModerationProfileCaches extends ModerationSanctionHooks {
+    TtlCache ranking
+    TtlCache profiles
+    Db store
+    public constructor(store: Db, caches: Caches) {
+        super()
+        this.store = store
+        this.ranking = caches.get("publicRanking")
+        this.profiles = caches.get("publicProfiles")
+    }
+    changed(userId: String) {
+        ranking.clearAfterCommit(store)
+        profiles.clearAfterCommit(store)
+    }
+}
+
+// Companies: the page text, the owner and the closing are the companies service's (closeByModeration also tells the owner).
+class ModerationCompaniesBridge extends ModerationCompanies {
+    CompanyService companies
+    public constructor(database: Db, service: CompanyService) {
+        super(database)
+        this.companies = service
+    }
+    String? contentOf(companyId: String) = companies.contentOf(companyId)
+    String? ownerOf(companyId: String) = companies.ownerOf(companyId)
+    String? nameOf(companyId: String) {
+        var c = companies.findById(companyId)
+        if (c == null) {
+            return null
+        }
+        return c.name
+    }
+    Bool close(companyId: String, reviewerId: String, now: String) = companies.closeByModeration(companyId, reviewerId)
+    Bool notifiesOwner() = true
+}

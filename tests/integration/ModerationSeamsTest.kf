@@ -1,0 +1,110 @@
+import app.*
+import kernel.db.*
+import kernel.sanctions.*
+import kernel.security.*
+import kernel.testkit.*
+import moderation.*
+
+// Production wiring (AppWiring): the seams moderation owns run its own use cases. Each test fails if the wiring falls back to
+// the caller's default.
+Bool banned(userId: String) = SanctionGateReader(WiredApp.app().db()).banned(userId)
+
+String admin(id: String) {
+    var token = WiredApp.adult(id)
+    WiredApp.app().db().execute("update users set is_admin = true where id = ?", DbParams().bindStr(id))
+    return token
+}
+
+test "the feed honeypot bans through the moderation sanction service" {
+    var bot = WiredApp.adult("ms_bot")
+    var res = WiredApp.send("POST", "/feed/posts", bot, "ms-hp-1", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Conteudo de robo no wiring real.\",\"tags\":[],\"mediaIds\":[],\"website\":\"https://bot.example\"}")
+    Check.status(res, 201)
+    Check.isTrue("fake id", res.body.contains("post_"))
+    Check.isTrue("banned", banned("ms_bot"))
+    Check.eqInt("never stored", 0, WiredApp.app().db().queryLong("select count(*) from posts where content = ?", DbParams().bindStr("Conteudo de robo no wiring real.")) as Int)
+    Check.status(WiredApp.get("/me", bot), 401)
+}
+
+test "the risk escalation and the guards open system reports through moderation" {
+    WiredApp.adult("ms_risky")
+    WiredApp.adult("ms_limited")
+    var wired = WiredApp.wired()
+    wired.shared.risk.escalation.escalate("ms_risky", "Risco critico no teste.")
+    Security.parts().userLimiter.reports.report("ms_limited", "SPAM", "Excesso de acoes no teste.")
+    var db = WiredApp.app().db()
+    var risky = db.queryOptional("select reason, reporter_id, target_type from reports where target_id = ?", DbParams().bindStr("ms_risky"))
+    if (risky == null) {
+        throw "FAIL no report from the risk escalation"
+    }
+    Check.eqStr("reporter is the system", "system", risky.getStr("reporter_id"))
+    Check.eqStr("reason", "SPAM", risky.getStr("reason"))
+    Check.eqStr("target", "USER", risky.getStr("target_type"))
+    Check.eqInt("report from the guard", 1, db.queryLong("select count(*) from reports where target_id = ? and reporter_id = \'system\'", DbParams().bindStr("ms_limited")) as Int)
+}
+
+test "a blocked ip is refused by identity and a sanction clears the public caches" {
+    var adminToken = admin("ms_admin")
+    var target = WiredApp.adult("ms_target")
+    var ranking = WiredApp.wired().shared.caches.get("publicRanking")
+    ranking.put("warm", "{}")
+    Check.isTrue("warm", ranking.size() > 0)
+    Check.status(WiredApp.send("POST", "/admin/users/ms_target/sanction", adminToken, "ms-sanc-1", "{\"type\":\"RESTRICTION\",\"reason\":\"Restricao para limpar os caches.\"}"), 200)
+    Check.eqInt("ranking cache cleared by the sanction", 0, ranking.size())
+    var blocked = WiredApp.send("POST", "/admin/blocked-ips", adminToken, "ms-ip-1", "{\"ip\":\"127.0.0.1\",\"reason\":\"Teste de bloqueio\"}")
+    Check.status(blocked, 200)
+    var login = WiredApp.app().client.send("POST", "/auth/login", listOf("Idempotency-Key: ms-login-1", "Content-Type: application/json"), "", "{\"email\":\"ninguem@test.com\",\"password\":\"Test1234!\"}")
+    Check.status(login, 403)
+    Check.jsonEq(login, "code", "IP_BLOCKED")
+    WiredApp.send("POST", "/admin/blocked-ips/127.0.0.1/unblock", adminToken, "ms-ip-2", "")
+    Check.isTrue("target exists", target.length() > 0)
+}
+
+test "a company page removed by moderation is closed by the companies service and the owner hears once" {
+    var log = WiredApp.notificationLog()
+    var adminToken = admin("ms_admin2")
+    var owner = WiredApp.adult("ms_owner")
+    var reporter = WiredApp.adult("ms_reporter")
+    var db = WiredApp.app().db()
+    db.execute("insert into companies (id, slug, name, description, sector, size, location, owner_user_id, status, created_at, updated_at) values (\'comp_ms\', \'comp-ms\', \'Pagina Ms\', \'Descricao da pagina de teste.\', \'Tecnologia\', \'1-10\', \'Remoto\', \'ms_owner\', \'ACTIVE\', \'2026-01-01T00:00:00Z\', \'2026-01-01T00:00:00Z\')", DbParams())
+    var report = WiredApp.send("POST", "/reports", reporter, "ms-co-1", "{\"targetType\":\"COMPANY\",\"targetId\":\"comp_ms\",\"reason\":\"SCAM\",\"description\":\"pagina falsa\"}")
+    Check.status(report, 201)
+    var reportId = report.jsonStr("id")
+    if (reportId == null) {
+        throw "FAIL no report id"
+    }
+    Check.status(WiredApp.send("POST", "/admin/reports/" + reportId + "/remove-company", adminToken, "ms-co-2", "{\"note\":\"ok\"}"), 200)
+    Check.eqStr("closed", "CLOSED", db.queryOne("select status from companies where id = \'comp_ms\'", DbParams()).getStr("status"))
+    Check.isTrue("owner told", log.has("MODERACAO", "ms_owner"))
+    Check.eqInt("exactly one notice", 1, db.queryLong("select count(*) from notifications where user_id = \'ms_owner\' and kind = \'MODERACAO\'", DbParams()) as Int)
+}
+
+test "game and service review queues belong to the moderation team and stop self approval" {
+    var adminToken = admin("ms_admin3")
+    var moderator = WiredApp.adult("ms_mod")
+    var maker = WiredApp.adult("ms_maker")
+    var common = WiredApp.adult("ms_common")
+    Check.status(WiredApp.send("POST", "/admin/moderators", adminToken, "ms-mod-1", "{\"username\":\"ms_mod\",\"note\":\"Nomeado para o teste de filas.\"}"), 200)
+    Check.status(WiredApp.get("/moderation/games", common), 403)
+    var game = WiredApp.send("POST", "/games", moderator, "ms-game-1", "{\"title\":\"Jogo do Moderador\",\"url\":\"https://93.184.216.34/jogo\"}")
+    Check.status(game, 200)
+    var gameId = game.jsonStr("id")
+    if (gameId == null) {
+        throw "FAIL no game id"
+    }
+    var queue = WiredApp.get("/moderation/games", moderator)
+    Check.status(queue, 200)
+    Check.isTrue("listed", queue.body.contains(gameId))
+    var own = WiredApp.send("POST", "/moderation/games/" + gameId + "/approve", moderator, "ms-game-2", "{\"note\":\"ok\"}")
+    Check.apiError(own, 403, "OWN_SUBMISSION")
+    var other = WiredApp.send("POST", "/games", maker, "ms-game-3", "{\"title\":\"Jogo da Maker\",\"url\":\"https://93.184.216.34/maker\"}")
+    var otherId = other.jsonStr("id")
+    if (otherId == null) {
+        throw "FAIL no game id"
+    }
+    var approved = WiredApp.send("POST", "/moderation/games/" + otherId + "/approve", moderator, "ms-game-4", "{\"note\":\"ok\"}")
+    Check.status(approved, 200)
+    Check.jsonEq(approved, "status", "PUBLISHED")
+    Check.status(WiredApp.get("/moderation/services", moderator), 200)
+    Check.status(WiredApp.get("/moderation/services", common), 403)
+    WiredApp.finish()
+}
