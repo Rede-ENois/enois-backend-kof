@@ -860,3 +860,25 @@ Slug `orgs`, branch `port/orgs`, gap range G340 to G359. Test fixtures: `app.Org
 | `JobCorporate` (jobs) | `CorporateJobsBridge` in `JobSeamSet.corporate` |
 
 `NotificationActors` and `FeedAuthors.corporateByIds` still read `corporate_profiles` read-only with the same columns (same answers; not swapped).
+
+### mentoring
+
+`src/mentoring` (`MentoringModel`, `MentoringRooms`, `MentoringDialIn`, `MentoringStore`, `MentoringService`, `MentoringViews`, `MentoringRoutes`, `MentoringModule`, `MentoringTestKit`), installed in `AppWiring` after coin and profile; route in `BootRoutesTest` (`GET /mentors/sessions/mine`).
+
+| Item | Result |
+|---|---|
+| Endpoints ported/total | 17/17: `GET /mentors`, `GET /mentors/{id}`, `GET /mentors/{id}/slots`, `POST /mentors`, `PATCH|DELETE /mentors/{id}`, `POST|DELETE .../slots`, `POST|GET .../sessions`, `GET|PUT .../availability`, `GET /mentors/sessions/mine`, `POST .../sessions/{id}/complete`, `POST .../sessions/{id}/cancel`, `GET .../room`, `GET .../sessions/{id}/dial-in` |
+| Java tests ported/total | 24/24 methods: `MentorProfileTests` 2, `MentorRoomTests` 6, `MentorSessionCompletionTests` 4, `MentorSparksPaymentTests` 6, `MentorAgendaTests` 4 (all in `tests/mentoring`), plus the `/mentors` half of `CatalogSearchTests` (2 methods: the mentors search and the wildcard test, `MentorCatalogTest`; the `/blogs` half is in `tests/blog`). `TextFieldLimitTests` and `LinkSchemeAllowlistTests` have no mentoring case |
+| Kof tests | 43 in 6 files (24 ports, 13 extra: delete/FK parity, idempotency replay and conflict, validation, slot ownership, Sao Paulo slot generation, inbox order, orphan escrow refund, room sanitising, Jitsi API parsing, nearest-slot and rating order, profile seam; 6 `finish`) plus `tests/kernel/DbParamsNullableTest` |
+| Seams replaced | `ProfileForeignCounts.mentoringAsMentee` by `MentoringProfileCounts` (subclass, only that count; AppWiring passes it instead of `ProfileForeignCounts`). The `/mentors` search test that `tests/search` waited for |
+| Seams owned | `MentoringDialInGateway` (base class, answers nothing; `JitsiDialInClient` asks `api.jitsi.net`, `REDE_MENTORING_JITSI_API_BASE`, tests point it at a closed loopback port). Coin (`CoinService` escrow), profile (`ProfileDirectory`) are called directly |
+| Kernel changes | `DbParams.bindLongOrNull/bindIntOrNull` fixed for non-null values (G348), with `tests/kernel/DbParamsNullableTest` |
+| Gaps | G348 |
+
+Notes:
+
+- Booking a slot, completing, cancelling and settling a session, and the mentor's completed counter are atomic claims (`update ... where available = true` / `status = 'SCHEDULED'` / `settled_at is null`); Java read and wrote whole rows. The completed counter is `sessions_count + 1` in SQL, counted once whoever completes the session (read, worker or mentor).
+- Java parity kept on purpose: `DELETE /mentors/{id}` of a mentor that already has slots, availability or sessions is `409 CONFLICT` (foreign keys of V5/V203); the settlement job refunds the mentee when the profile is gone (only reachable with FKs off, covered by a test).
+- `GET /mentors` is served with one query per page for the next free slot (Java asked per mentor). `limit < 1` is `400 BAD_REQUEST` (PageRequest); the expertise-only search sorts `rating desc, created_at desc` (Java left ties undefined).
+- A missing `expertise` list, a missing or malformed `startsAt`/`endsAt` answer `400 BAD_REQUEST` (Java: a null pointer / not-null column).
+- Jobs: `mentoring-complete-finished` (`REDE_MENTORING_SESSION_COMPLETION_[INITIAL_]DELAY_MS`, 120000/300000) and `mentoring-settle-expired` (600000/3600000). Config: `REDE_MENTORING_JITSI_BASE_URL` (default `https://meet.jit.si`).
