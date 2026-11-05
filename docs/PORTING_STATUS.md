@@ -688,15 +688,20 @@ Slug `jobs`, branch `port/jobs`. Modules installed in `Main.kf`: `ProfileModule`
 | importlinkedin (`src/importlinkedin`) | 4/6 (`POST /texto`, `GET /contatos/resumo`, `PUT /contatos/auto-convite`, `GET /contatos`); `POST /me/import/linkedin` and `POST /me/import/linkedin/contatos` wait for the binary lane | `tests/importlinkedin/*` | 18/20 (the two `LinkedinImportUploadLimitTests` are transport tests, they wait for the lane) |
 | importresume (`src/importresume`) | 0/2 over HTTP: `POST /me/import/resume` and `POST /me/import/resume/prefill/{jobId}` are multipart uploads, so they wait for the binary lane; the services behind them (`ResumeImportService.parse/extractText/prefill`, `ResumePrefillService`) are complete and tested on the uploaded temp file | `tests/importresume/ResumeImportServiceTest` | 9/9 |
 
-### What waits for the binary lane
+### What wait for the binary lane
 
-The web runtime only carries UTF-8 String bodies (G161), and `src/kernel/http/BinaryLane.kf` is not on `main` yet. The four upload routes are NOT registered (an unregistered route answers `200` with an empty body, so the front would see a silent success: the routes must be added together with the lane). Everything behind them is done and tested with files on disk, which is what the lane hands over (`UploadFiles`, a temp path):
+`src/kernel/http/BinaryLane.kf` and `BinaryFront.kf` are on `main` and merged here, but they do not fit these four endpoints yet, so the routes are NOT registered (an unregistered route answers `200` with an empty body, so the front would see a silent success). Measured in `BinaryFront.kf`: the upload branch is `method == "PUT"` only (the download branch `GET`), the claim is a path PREFIX (`BinaryLane.owns` uses `startsWith`) and the body that reaches the route is the raw request body in a temp file. The four endpoints are `POST` `multipart/form-data`, and their prefixes share paths with ordinary routes (`PUT /me/import/linkedin/contatos/auto-convite`, `GET .../contatos`, `POST .../texto`), which a prefix claim would pull into the upload dance. What the lane needs for them (a kernel change owned by the media/lane work, not done here to avoid redesigning another agent's file):
+
+1. `POST` accepted in the upload branch next to `PUT`, with claims matched by method and exact path (or a claim list of `(method, path)`).
+2. A multipart step that extracts the `file` part of the temp file (boundary from `Content-Type`) into its own temp file.
+
+Everything behind the upload is done and tested with files on disk, which is what step 2 would hand over (`UploadFiles`, a temp path); wiring each route is then a few lines:
 
 - `POST /me/import/linkedin` -> `LinkedinImportService.parseArchive(path)` (413 `IMPORT_TOO_LARGE` zip-bomb guard, `REDE_IMPORT_LINKEDIN_MAX_UNCOMPRESSED_BYTES`, 5 MB `FILE_TOO_LARGE`).
 - `POST /me/import/linkedin/contatos` -> `LinkedinImportService.parseContacts(path)` then `LinkedinContactInviteService.importContacts(userId, contacts)`.
 - `POST /me/import/resume` -> `ResumeImportService.parse(path, originalName, contentType)`.
 - `POST /me/import/resume/prefill/{jobId}` -> `ResumePrefillService.prefill(userId, jobId, ResumeImportService.extractText(path, name, type))`.
-- The multipart envelope itself (the `file` part of `multipart/form-data`) is the lane's job; the Java `LinkedinImportUploadLimitTests` (a 3 MB zip reaches the controller, an 8.45 MB one gets 413 `FILE_TOO_LARGE` over a real socket) belong with it.
+- The Java `LinkedinImportUploadLimitTests` (a 3 MB zip reaches the controller, an 8.45 MB one gets 413 `FILE_TOO_LARGE` over a real socket) belong with the lane wiring; a module that claims a prefix must also stop the platform at the end of its suite (see `tests/media/MediaContractTest`).
 
 ### Seams replaced by real module APIs
 

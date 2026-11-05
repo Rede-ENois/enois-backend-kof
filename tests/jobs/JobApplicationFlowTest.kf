@@ -5,7 +5,6 @@ import kernel.time.*
 
 // Port of JobApplicationFlowTests: the application end to end (form built by the poster, validation, candidate
 // portrait, delivery by email and DM, the poster's list), closing, triage and rejection feedback.
-
 String fieldIdsBody(jobId: String, viewer: String, values: List<String>) {
     var res = JobsTestKit.get("/jobs/" + jobId, viewer)
     Check.status(res, 200)
@@ -42,7 +41,6 @@ test "employerDefinesFieldsAndReceivesTheApplicationWithTheCandidateProfile" {
     addExperience(candidate, "Desenvolvedora Back-end", yearsAgo(6))
     addExperience(candidate, "Desenvolvedora Junior", yearsAgo(2))
     var jobId = JobsTestKit.createJob(employer, "Pessoa Desenvolvedora", "[{\"label\":\"Anos de experiência com Java\",\"type\":\"NUMBER\",\"required\":true},{\"label\":\"Link do portfólio\",\"type\":\"LINK\",\"required\":false},{\"label\":\"Por que essa vaga?\",\"type\":\"TEXTAREA\",\"required\":false}]")
-
     var view = JobsTestKit.get("/jobs/" + jobId, candidate)
     Check.status(view, 200)
     Check.eqInt("fields", 3, view.jsonSize("applicationFields"))
@@ -50,19 +48,16 @@ test "employerDefinesFieldsAndReceivesTheApplicationWithTheCandidateProfile" {
     Check.jsonEq(view, "applicationFields.0.required", "true")
     Check.jsonEq(view, "author.username", employer)
     Check.jsonEq(view, "author.identityVerified", "true")
-
     var missing = JobsTestKit.post("/jobs/" + jobId + "/applications", candidate, "{\"message\":\"Tenho interesse\",\"answers\":[]}")
     Check.apiError(missing, 400, "MISSING_REQUIRED_ANSWERS")
     JobsTestKit.has("names the missing field", missing.json("message"), "Anos de experiência")
     Check.apiError(JobsTestKit.post("/jobs/" + jobId + "/applications", candidate, fieldIdsBody(jobId, candidate, listOf("varios anos"))), 400, "INVALID_ANSWER")
-
     var valid = fieldIdsBody(jobId, candidate, listOf("6", "", "Porque quero crescer"))
     var applied = JobsTestKit.post("/jobs/" + jobId + "/applications", candidate, valid)
     Check.status(applied, 201)
     Check.jsonEq(applied, "status", "APPLIED")
     Check.jsonEq(applied, "answersCount", "2")
     Check.isTrue("has id", applied.jsonHas("id"))
-
     // The poster gets it by email with the profile and the answers, always through the professional identity.
     var mails = JobsTestKit.mailer().sent()
     Check.eqInt("one email", 1, mails.size())
@@ -77,7 +72,6 @@ test "employerDefinesFieldsAndReceivesTheApplicationWithTheCandidateProfile" {
     JobsTestKit.has("reputation", html, "Reputação: 300")
     JobsTestKit.has("verified", html, "conta verificada")
     JobsTestKit.has("experience", html, "Experiência: 6 anos (2 experiências)")
-
     // ... and in the direct message created on the spot between the two.
     var conversations = JobsTestKit.get("/conversations", employer)
     Check.status(conversations, 200)
@@ -89,7 +83,6 @@ test "employerDefinesFieldsAndReceivesTheApplicationWithTheCandidateProfile" {
     JobsTestKit.has("dm", messages.body, "Experiência: 6 anos (2 experiências)")
     JobsTestKit.has("dm", messages.body, "Anos de experiência com Java: 6")
     JobsTestKit.has("dm", messages.body, "Por que essa vaga?: Porque quero crescer")
-
     var list = JobsTestKit.get("/jobs/" + jobId + "/applications", employer)
     Check.status(list, 200)
     Check.jsonEq(list, "0.candidate.username", proUsername)
@@ -98,7 +91,6 @@ test "employerDefinesFieldsAndReceivesTheApplicationWithTheCandidateProfile" {
     Check.jsonEq(list, "0.candidate.experiencesCount", "2")
     Check.jsonEq(list, "0.message", "Quero muito essa vaga")
     Check.eqInt("answers", 2, list.jsonSize("0.answers"))
-
     Check.apiError(JobsTestKit.get("/jobs/" + jobId + "/applications", candidate), 403, "NOT_OWNER")
     Check.apiError(JobsTestKit.post("/jobs/" + jobId + "/applications", candidate, valid), 409, "ALREADY_APPLIED")
 }
@@ -146,17 +138,14 @@ test "closingStopsNewApplicationsAndPreservesTheOnesAlreadyReceived" {
     var outsider = JobsTestKit.login("close_outsider")
     var jobId = JobsTestKit.createJob(employer, "Pessoa Desenvolvedora", "[]")
     Check.status(JobsTestKit.post("/jobs/" + jobId + "/applications", candidate, emptyApplication("Tenho interesse")), 201)
-
     Check.apiError(JobsTestKit.post("/jobs/" + jobId + "/close", outsider, ""), 403, "NOT_OWNER")
     Check.status(JobsTestKit.send("POST", "/jobs/" + jobId + "/close", null, "", JobsTestKit.nextKey()), 401)
     Check.jsonEq(JobsTestKit.get("/jobs/" + jobId, employer), "status", "OPEN")
-
     var closed = JobsTestKit.post("/jobs/" + jobId + "/close", employer, "")
     Check.status(closed, 200)
     Check.jsonEq(closed, "status", "CLOSED")
     Check.isTrue("closedAt", closed.json("closedAt").length() > 0)
     Check.jsonEq(JobsTestKit.get("/jobs/" + jobId, null), "status", "CLOSED")
-
     Check.apiError(JobsTestKit.post("/jobs/" + jobId + "/applications", outsider, emptyApplication("Tarde demais")), 409, "JOB_CLOSED")
     // The closed state wins over "already applied".
     Check.apiError(JobsTestKit.post("/jobs/" + jobId + "/applications", candidate, emptyApplication("De novo")), 409, "JOB_CLOSED")
@@ -177,7 +166,6 @@ test "employerTriagesTheApplicationAndTheCandidateIsTold" {
     Check.status(applied, 201)
     Check.jsonEq(applied, "status", "APPLIED")
     var url = "/jobs/" + jobId + "/applications/" + applied.json("id")
-
     Check.status(JobsTestKit.send("PATCH", url, null, "{\"status\":\"IN_REVIEW\"}", JobsTestKit.nextKey()), 401)
     Check.apiError(JobsTestKit.patch(url, outsider, "{\"status\":\"IN_REVIEW\"}"), 403, "NOT_OWNER")
     Check.status(JobsTestKit.patch(url, candidate, "{\"status\":\"ADVANCED\"}"), 403)
@@ -186,17 +174,14 @@ test "employerTriagesTheApplicationAndTheCandidateIsTold" {
     var review = JobsTestKit.patch(url, employer, "{\"status\":\"IN_REVIEW\"}")
     Check.status(review, 200)
     Check.jsonEq(review, "status", "IN_REVIEW")
-
     var notifications = JobsTestKit.get("/notifications", candidate)
     Check.status(notifications, 200)
     JobsTestKit.has("kind", notifications.body, "JOB_APPLICATION_STATUS")
     JobsTestKit.has("href", notifications.body, "/vagas/" + jobId)
     JobsTestKit.has("body", notifications.body, "em análise")
-
     Check.jsonEq(JobsTestKit.get("/jobs/" + jobId + "/applications", employer), "0.status", "IN_REVIEW")
     Check.status(JobsTestKit.patch(url, employer, "{\"status\":\"IN_REVIEW\"}"), 409)
     Check.apiError(JobsTestKit.patch("/jobs/" + jobId + "/applications/999999", employer, "{\"status\":\"IN_REVIEW\"}"), 404, "APPLICATION_NOT_FOUND")
-
     // Two emails: the poster's (new application) and the CANDIDATE's (status change).
     var mails = JobsTestKit.mailer().sent()
     Check.eqInt("emails", 2, mails.size())
