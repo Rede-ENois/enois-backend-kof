@@ -29,7 +29,9 @@ class ModerationModule {
     ModerationPanel panel
     ModerationProposals proposals
     ModerationModeratorStore moderators
-    public constructor(service: ModerationService, store: ModerationStore, targets: ModerationTargets, decisions: ModerationDecisions, sanctions: ModerationSanctionService, sanctionStore: ModerationSanctionStore, banCleanup: ModerationBanCleanup, quarantine: ModerationQuarantine, learning: ModerationLearning, verdicts: ModerationVerdicts, suspensions: ModerationSuspensions, contentTargets: ModerationContentTargets, panel: ModerationPanel, proposals: ModerationProposals, moderators: ModerationModeratorStore) {
+    ModerationPreTriageService preTriage
+    ModerationSignalWeights weights
+    public constructor(service: ModerationService, store: ModerationStore, targets: ModerationTargets, decisions: ModerationDecisions, sanctions: ModerationSanctionService, sanctionStore: ModerationSanctionStore, banCleanup: ModerationBanCleanup, quarantine: ModerationQuarantine, learning: ModerationLearning, verdicts: ModerationVerdicts, suspensions: ModerationSuspensions, contentTargets: ModerationContentTargets, panel: ModerationPanel, proposals: ModerationProposals, moderators: ModerationModeratorStore, preTriage: ModerationPreTriageService, weights: ModerationSignalWeights) {
         this.service = service
         this.store = store
         this.targets = targets
@@ -45,6 +47,8 @@ class ModerationModule {
         this.panel = panel
         this.proposals = proposals
         this.moderators = moderators
+        this.preTriage = preTriage
+        this.weights = weights
     }
     static ModerationModule install(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications) = ModerationModule.installWith(platform, shared, parts, feed, groups, profiles, mail, notifications, ModerationReportEvents(), ModerationCompanies(platform.db), ModerationSanctionHooks())
     static ModerationModule installWith(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications, events: ModerationReportEvents, companies: ModerationCompanies, sanctionHooks: ModerationSanctionHooks) {
@@ -70,7 +74,10 @@ class ModerationModule {
         var gate = SanctionGateReader(platform.db)
         var panel = ModerationPanel(platform.db, moderators, store, service, decisions, sanctions, sanctionStore, targets, notifications, profiles.directory, profiles.reputation, gate, feed.moderation, cfg.getInt("REDE_MODERATION_MODERATOR_MIN_REPUTATION", 200), cfg.getInt("REDE_MODERATION_VOTE_QUORUM", 3))
         var proposals = ModerationProposals(platform.db, moderators, sanctions, notifications, profiles.directory, gate)
+        var weights = ModerationSignalWeights(platform.db)
+        var preTriage = ModerationPreTriageService(platform.db, store, targets, profiles.directory, weights, cfg.getBool("MODERATION_PRETRIAGE_ENABLED", true), cfg.getInt("MODERATION_PRETRIAGE_MIN_SCORE", 30), 24)
+        learning.schedule(shared.jobs, weights)
         ModerationPanelRoutes.register(platform.server, panel, proposals, quarantine)
-        return ModerationModule(service, store, targets, decisions, sanctions, sanctionStore, banCleanup, quarantine, learning, verdicts, suspensions, contentTargets, panel, proposals, moderators)
+        return ModerationModule(service, store, targets, decisions, sanctions, sanctionStore, banCleanup, quarantine, learning, verdicts, suspensions, contentTargets, panel, proposals, moderators, preTriage, weights)
     }
 }

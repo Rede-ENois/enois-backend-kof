@@ -1,0 +1,76 @@
+package moderation
+
+import kernel.db.*
+import kernel.time.*
+
+// The signals of the pre-triage and their base weights (ModerationSignalCatalog).
+class ModerationSignalCatalog {
+    static String reasonViolence() = "REASON_VIOLENCE"
+    static String reasonSexual() = "REASON_SEXUAL"
+    static String reasonAutomation() = "REASON_AUTOMATION"
+    static String reasonSpam() = "REASON_SPAM"
+    static String reasonOther() = "REASON_OTHER"
+    static String repeatedTarget() = "REPEATED_TARGET"
+    static String newAccount() = "NEW_ACCOUNT"
+    static String detailedReport() = "DETAILED_REPORT"
+    static String contentLink() = "CONTENT_LINK"
+    static String shortContent() = "SHORT_CONTENT"
+    static String systemReport() = "SYSTEM_REPORT"
+    static Int baseWeight(signal: String) {
+        if (signal == "REASON_VIOLENCE") {
+            return 50
+        }
+        if (signal == "REASON_SEXUAL") {
+            return 60
+        }
+        if (signal == "REASON_AUTOMATION") {
+            return 55
+        }
+        if (signal == "REASON_SPAM") {
+            return 25
+        }
+        if (signal == "REASON_OTHER") {
+            return 5
+        }
+        if (signal == "REPEATED_TARGET") {
+            return 30
+        }
+        if (signal == "NEW_ACCOUNT") {
+            return 15
+        }
+        if (signal == "DETAILED_REPORT" || signal == "CONTENT_LINK" || signal == "SHORT_CONTENT") {
+            return 10
+        }
+        if (signal == "SYSTEM_REPORT") {
+            return 20
+        }
+        return 0
+    }
+}
+
+// ModerationSignalWeights: the learned weight of a signal (moderation_signal_weights) or its base weight, read through a
+// 60 s cache.
+class ModerationSignalWeights {
+    Db store
+    Map<String,Int> cached = mapOf<String, Int>()
+    Long loadedAt = 0L
+    public constructor(store: Db) {
+        this.store = store
+    }
+    Int weightOf(signal: String) {
+        var now = Time.nowMillis()
+        if (now - loadedAt > 60000L) {
+            var fresh = mapOf<String, Int>()
+            for (var r in store.queryList("select signal_key, weight from moderation_signal_weights", DbParams())) {
+                fresh.put(r.getStr("signal_key"), r.getInt("weight"))
+            }
+            cached = fresh
+            loadedAt = now
+        }
+        return cached.getOrDefault(signal, ModerationSignalCatalog.baseWeight(signal))
+    }
+    // The next read goes to the table (after the learning job wrote new weights, and in tests).
+    invalidate() {
+        loadedAt = 0L
+    }
+}

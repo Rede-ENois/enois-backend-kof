@@ -2,6 +2,7 @@ package moderation
 
 import kernel.db.*
 import kernel.id.*
+import kernel.jobs.*
 import kernel.time.*
 
 record ModerationPreTriage(List<String>? signals)
@@ -43,5 +44,80 @@ class ModerationLearning {
             return
         }
         store.execute("insert into moderation_feedback (id, report_id, decision, source, decided_by, signals, score, created_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(Ids.prefixed("mfb_")).bindStr(report.id).bindStr(decision).bindStr(source).bindStr(decidedBy).bindStrOrNull(signals).bindIntOrNull(report.preTriageScore).bindInstant(Time.nowIso()))
+    }
+    schedule(jobs: Scheduler, weights: ModerationSignalWeights) {
+        var self = this
+        jobs.fixedDelay("moderation-learn-weights", 60000L, 600000L, () -> {
+    self.learnWeights()
+    weights.invalidate()
+})
+    }
+    // Recomputes the weight of each signal from the last 5000 decisions (ModerationLearningService.learnWeights): punish
+    // decisions (PUNISH, BAN, APPROVE, AUTO_PENALIZE) against DISMISS; WARN counts for neither side. At least 5 samples and a
+    // known signal; the weight moves at most 15 points from its base and stays within 1..100.
+    Int learnWeights() {
+        var rows = store.queryList("select decision, signals from moderation_feedback order by created_at desc limit 5000", DbParams())
+        if (rows.size() == 0) {
+            return 0
+        }
+        var punish = mapOf<String, Int>()
+        var dismiss = mapOf<String, Int>()
+        for (var r in rows) {
+            var stored = r.getStrOrNull("signals")
+            if (stored == null) {
+                continue
+            }
+            String csv = stored
+            if (csv.trim().length() == 0) {
+                continue
+            }
+            var decision = r.getStr("decision")
+            var isPunish = decision == "PUNISH" || decision == "BAN" || decision == "APPROVE" || decision == "AUTO_PENALIZE"
+            var isDismiss = decision == "DISMISS"
+            if (!isPunish && !isDismiss) {
+                continue
+            }
+            for (var raw in csv.split(",")) {
+                var signal = raw.trim()
+                if (signal.length() == 0) {
+                    continue
+                }
+                if (isPunish) {
+                    punish.put(signal, punish.getOrDefault(signal, 0) + 1)
+                }
+                if (isDismiss) {
+                    dismiss.put(signal, dismiss.getOrDefault(signal, 0) + 1)
+                }
+            }
+        }
+        var seen = listOf<String>()
+        for (var s in punish.keys()) {
+            seen.add(s)
+        }
+        for (var s in dismiss.keys()) {
+            if (!seen.contains(s)) {
+                seen.add(s)
+            }
+        }
+        var updated = 0
+        var now = Time.nowIso()
+        for (var signal in seen) {
+            var p = punish.getOrDefault(signal, 0)
+            var d = dismiss.getOrDefault(signal, 0)
+            var total = p + d
+            var base = ModerationSignalCatalog.baseWeight(signal)
+            if (total < 5 || base == 0) {
+                continue
+            }
+            var rate = (p as Double) / total as Double
+            var learned = math.floor((base as Double) + 30.0 * (rate - 0.5) + 0.5) as Int
+            var clamped = ModerationContentTargets.clampInt(learned, 1, 100)
+            var changed = store.execute("update moderation_signal_weights set weight = ?, samples = ?, updated_at = ? where signal_key = ?", DbParams().bindInt(clamped).bindInt(total).bindInstant(now).bindStr(signal))
+            if (changed == 0) {
+                store.execute("insert into moderation_signal_weights (signal_key, weight, samples, updated_at) values (?, ?, ?, ?)", DbParams().bindStr(signal).bindInt(clamped).bindInt(total).bindInstant(now))
+            }
+            updated = updated + 1
+        }
+        return updated
     }
 }
