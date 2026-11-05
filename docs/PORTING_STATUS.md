@@ -4,6 +4,7 @@
 |---|---|---|---|
 | shared/web + shared/security (request pipeline) + `apiv1` origin gate | `GET/POST /admin/panic` 2/2 (the `/v1` index and `/developers/origins` CRUD belong to `apiv1`) | 87 / 100 Java tests (149 Kof tests in `tests/security/`) | G28 to G35 |
 | notifications, push, messaging, calls (slug `messaging`) | notifications 8/8, push 3/3, messaging 24/24 (`GET /conversations/stream` answers but cannot stream, G201), calls 13/13 | 117 / 122 Java tests (notifications 34/34, push 21/21, messaging 51/55, calls 11/12; 127 Kof tests in `tests/notifications`, `tests/push`, `tests/messaging`, `tests/calls`, `tests/kernel/WebPushAdapterTest.kf`) | G200 to G212 |
+| games, dailygames (slug `games`) | games 42/42, dailygames 13/13 | 41 / 41 Java tests (games 28/28, dailygames 13/13; the `null` event list assertion of `BlocksEngineTest` has no Kof counterpart; 52 Kof tests in `tests/games`, `tests/dailygames`, `tests/kernel/GamesAdaptersTest.kf`) | G260 to G265 |
 
 ## Request pipeline (`kernel.security`)
 
@@ -472,3 +473,45 @@ Total: 49 of 49 endpoints, 102 of 103 Java tests ported.
 ### Kernel files added or changed by this slice
 
 `kernel/http/Req.kf` (`queryAll`, `queryParam`, `formDecode`, raw-query decoding), `kernel/http/OutboundHttp.kf` (later merged into `Outbound.kf`), `kernel/text/{Regexes,Texts,Contrast,HtmlTemplate,Numbers}.kf`, `kernel/url/OriginNormalizer.kf`, `kernel/time/ZoneDates.kf`, `kernel/log/Log.kf` (`LogTap`), `kernel/db/Db.kf` (`poolStats`), `kernel/monitoring/{DayLog,HostResources,RequestMetrics,EventBuffer}.kf`. Gaps found: G220 to G230 in `KOF_GAPS.md`.
+
+## games and dailygames
+
+Ported: the store catalogue (submit, review, publish, edit, slug change, suspend, favorites, trending, stats,
+analytics, boost), developer pages and follows, reviews, ratings and comments, collections, the identity token
+that games use to talk to the platform (`POST /games/:gameId/identity`, validated once by `POST /games/tokens/validate`), the spend confirmation, the share to
+the feed, the URL guard, and the three daily games (words, maze, blocks) with the prize settlement. Every code
+and pt-BR message is the Java one. The daily maze and blocks are generated from `java.util.Random` through
+`kernel.text.JavaRandom`, so the same stored seed gives the same maze, the same bag of pieces and the same replay:
+`tests/dailygames/DailyMazeTest.kf` and `DailyBlocksEngineTest.kf` compare against values produced by running the
+Java `MazeRules` and `BlocksEngine`.
+
+The cron `DailyGameRewardsScheduler` runs on `kernel.jobs` (`daily-game-rewards`, 00:20 America/Sao_Paulo, look-back
+7 days).
+
+### Seams owned by this slice (pending-port)
+
+| Seam | Owner to come | Default |
+|---|---|---|
+| `GamesCoins` | coin | runs the ledger SQL the Java `CoinService` runs for `grant` (hash-chained entry, optimistic balance update, treasury `coin_tesouraria`, rate from `coin_rate_history`, encrypted message, idempotent by `kind:ref`); `recordPresence` is a no-op (the streak belongs to coin) |
+| `GamesFeed` (`publishShare`) | feed | age gate and sanction gate through the real modules, then inserts the INSIGHT post with its tags and media; it omits the feed side effects (mentions, fan-out, counters) |
+| `GamesHosts` (`classify`) | none | real DNS classification; tests override it with a DNS-free stub (names are public, literal IPs are classified for real) |
+
+Profile, notifications, age and sanctions are called through their real module APIs (`ProfileDirectory`,
+`Notifications`, `AgeGate`, `SanctionGate`), not through seams.
+
+### Decisions and deliberate differences
+
+- **followers of a developer**: `followersOf` returns the follower ids (`follower_id`); the Java query selected the followed id, so the new-update notification reached the developer instead of the followers.
+- **play counter** is incremented atomically in SQL (`plays = plays + 1`), not read-modify-write.
+- **identity token** is claimed with one atomic `UPDATE ... WHERE used_at IS NULL`, so two parallel validations cannot both succeed.
+- **blocks window**: the 409 `GAME_FINISHED` past 600 s is thrown inside the transaction like Java, so the TIMED_OUT mark it tried to write is rolled back; the state still reports TIMED_OUT by replay.
+- **coin default** skips a credit whose idempotency key already exists instead of failing.
+- **tests**: wallets are seeded with a `coin_accounts` row (the Java airdrop belongs to coin); settlement rows are read from `coin_entries`.
+- **`BlocksEngineTest`**: Java also passes a `null` event list; Kof lists are never null, the other five assertions are kept. Golden tests (bag sequences, scripted replays WON and LOST) were added.
+- **router order**: literal routes are registered before the `:slug` ones, because the Kof router takes the first registered match (Spring prefers the literal one by itself).
+
+### Kernel files added by this slice
+
+`kernel/text/JavaRandom.kf`, `kernel/time/IsoWeeks.kf`, `kernel/url/HostAddresses.kf`, `kernel/url/UrlParts.kf`
+(documented in `docs/KERNEL.md`), proven by `tests/kernel/GamesAdaptersTest.kf`. `src/Main.kf` wires `GamesModule` and
+`DailyGamesModule` and keeps the `ProfileModule` result.

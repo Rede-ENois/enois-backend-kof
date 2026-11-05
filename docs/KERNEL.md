@@ -856,3 +856,21 @@ Java interop for the identity flows lives here; domain code only sees Strings.
 - `Log.installTap(LogTap)`: observer of every written line (a line logged inside the tap is not tapped again).
 - `Db.poolStats()`: `DbPoolStats(active, idle, total, waiting, max, min)` or null.
 - `kernel.monitoring`: `DayLog(dir, retentionDays)` (UTC day JSONL files, `append`, `rotate`, `scan` newest first in blocks), `RequestMetrics` (60 minute buckets, per-second counts, in-flight gauge, `overview(nowMs)`), `EventBuffer` (bounded queue, recent window, per-minute cap, level/type counters), `HostResources` (JVM, system memory from `/proc/meminfo`, cgroup memory and CPU, pool).
+
+## kernel additions of the games port
+
+```kotlin
+import kernel.text.*   import kernel.time.*   import kernel.url.*
+
+var rng = JavaRandom(seed)        // java.util.Random: the same sequence the Java service draws
+rng.nextInt(bound)                // Random.nextInt(int); shuffles are written by the caller
+JavaRandom.secureLong()           // SecureRandom.nextLong, an unguessable challenge seed
+
+IsoWeeks.key("2026-11-04")        // "2026-W45": ISO week, no zero padding (weekBasedYear + "-W" + week)
+
+HostAddresses.classify(host)      // "OK" | "INTERNAL" (loopback, any-local, link-local, site-local, multicast, fc00::/7) | "UNRESOLVED"
+UrlParser.parse(value)            // UrlParts(scheme, userInfo, host, text) or null; tolerates a space or a brace in the path
+```
+
+`HostAddresses.classify` resolves names through DNS; games inject it as the `GamesHosts` seam so tests never
+touch the network. All four are covered by `tests/kernel/GamesAdaptersTest.kf`.
