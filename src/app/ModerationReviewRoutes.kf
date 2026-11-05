@@ -1,0 +1,110 @@
+package app
+
+import games.*
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+import moderation.*
+import profile.*
+import services.*
+
+record ModerationGameReviewView(String id, String userId, String? username, String title, String? description, String? cover, String url, String? tags, String aspect, String submittedAt)
+
+record ModerationReviewDecision(String id, String status)
+
+record ModerationReviewRejection(String id, String status, String reviewNote)
+
+// The community review queues the moderation team works besides reports (ModeratorController): submitted games and service
+// offers. The decisions are the owners' own use cases (GamesService, ServiceOfferService); this adapter only adds the team
+// guard and the conflict-of-interest rule: whoever moderates does not approve their own submission (an admin may).
+class ModerationReviewRoutes {
+    static register(server: HttpServer, games: GamesService, offers: ServiceOfferService, profiles: ProfileDirectory) {
+        server.get("/moderation/games", () -> ModerationReviewRoutes.pendingGames(games, profiles))
+        server.post("/moderation/games/:gameId/approve", () -> ModerationReviewRoutes.approveGame(games))
+        server.post("/moderation/games/:gameId/reject", () -> ModerationReviewRoutes.rejectGame(games))
+        server.get("/moderation/services", () -> ModerationReviewRoutes.pendingServices(offers))
+        server.post("/moderation/services/:serviceId/approve", () -> ModerationReviewRoutes.approveService(offers))
+        server.post("/moderation/services/:serviceId/reject", () -> ModerationReviewRoutes.rejectService(offers))
+        server.post("/moderation/services/:serviceId/suspend", () -> ModerationReviewRoutes.suspendService(offers))
+    }
+    static Bool isAdmin(userId: String) {
+        var guard = Auth.adminGuard
+        if (guard == null) {
+            return false
+        }
+        return guard.isAdmin(userId)
+    }
+    // `@RequestBody(required = false)`: an empty body means no note.
+    static String? optionalNote() {
+        var text = Req.bodyText()
+        if (text.trim().length() == 0) {
+            return null
+        }
+        return ModerationReviewRoutes.decode(text).note
+    }
+    // `@RequestBody` required: a missing body is a 400.
+    static String? requiredBody() = ModerationReviewRoutes.decode(Req.bodyText()).note
+    static ModerationDecisionBody decode(text: String) {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ModerationDecisionBody>(text)
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String pendingGames(games: GamesService, profiles: ProfileDirectory) {
+        Auth.requireModerator()
+        var out = listOf<ModerationGameReviewView>()
+        for (var g in games.pending(Req.queryInt("limit", 30))) {
+            var author = profiles.findById(g.userId())
+            var username = ModerationModeratorRules.noString()
+            if (author != null) {
+                username = author.username
+            }
+            out.add(ModerationGameReviewView(g.id(), g.userId(), username, g.title(), g.description(), g.cover(), g.url(), g.tags(), g.aspect(), g.submittedAt()))
+        }
+        return json.encode(out)
+    }
+    static String approveGame(games: GamesService) {
+        var userId = Auth.requireModerator()
+        var gameId = Req.pathParam("gameId")
+        if (!ModerationReviewRoutes.isAdmin(userId) && games.game(gameId).userId() == userId) {
+            throw Errors.api(403, "OWN_SUBMISSION", "Quem modera não aprova o próprio jogo.")
+        }
+        var approved = games.approve(gameId, userId, ModerationReviewRoutes.optionalNote())
+        return json.encode(ModerationReviewDecision(approved.id(), approved.status()))
+    }
+    static String rejectGame(games: GamesService) {
+        var userId = Auth.requireModerator()
+        var rejected = games.reject(Req.pathParam("gameId"), userId, ModerationReviewRoutes.optionalNote())
+        return json.encode(ModerationReviewDecision(rejected.id(), rejected.status()))
+    }
+    static String pendingServices(offers: ServiceOfferService) {
+        var userId = Auth.requireModerator()
+        var out = listOf<ServiceOfferView>()
+        for (var o in offers.pending(Req.queryInt("limit", 30))) {
+            out.add(ServicesViews.offer(o, offers.usernameOf(o), userId))
+        }
+        return json.encode(out)
+    }
+    static String approveService(offers: ServiceOfferService) {
+        var userId = Auth.requireModerator()
+        var serviceId = Req.pathParam("serviceId")
+        if (!ModerationReviewRoutes.isAdmin(userId)) {
+            offers.requireNotOwnSubmission(serviceId, userId)
+        }
+        var approved = offers.approve(serviceId, userId, ModerationReviewRoutes.optionalNote())
+        return json.encode(ModerationReviewDecision(approved.id(), approved.status()))
+    }
+    static String rejectService(offers: ServiceOfferService) {
+        var userId = Auth.requireModerator()
+        var rejected = offers.reject(Req.pathParam("serviceId"), userId, ModerationReviewRoutes.requiredBody())
+        return json.encode(ModerationReviewRejection(rejected.id(), rejected.status(), ModerationService.orEmpty(rejected.reviewNote())))
+    }
+    static String suspendService(offers: ServiceOfferService) {
+        var userId = Auth.requireModerator()
+        var suspended = offers.suspend(Req.pathParam("serviceId"), userId, ModerationReviewRoutes.optionalNote())
+        return json.encode(ModerationReviewDecision(suspended.id(), suspended.status()))
+    }
+}

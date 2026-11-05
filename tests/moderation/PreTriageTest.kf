@@ -1,0 +1,94 @@
+import kernel.db.*
+import kernel.testkit.*
+import kernel.time.*
+import moderation.*
+
+// Port of ReportPreTriageServiceTests and ModerationLearningServiceTests over the real tables: the deterministic score of a
+// pending report, the AI gate under the minimum score, and the learned weights moving with the human decisions.
+String preTriageOf(reportId: String) {
+    var row = ModerationTestKit.db().queryOptional("select pre_triage from reports where id = ?", DbParams().bindStr(reportId))
+    if (row == null) {
+        return ""
+    }
+    return ModerationTestKit.str2(row.getStrOrNull("pre_triage"))
+}
+
+Int scoreOf(reportId: String) {
+    var row = ModerationTestKit.db().queryOptional("select pre_triage_score from reports where id = ?", DbParams().bindStr(reportId))
+    if (row == null) {
+        return -1
+    }
+    return row.getInt("pre_triage_score")
+}
+
+String aiOf(reportId: String) {
+    var row = ModerationTestKit.db().queryOptional("select ai_triage from reports where id = ?", DbParams().bindStr(reportId))
+    if (row == null) {
+        return ""
+    }
+    return ModerationTestKit.str2(row.getStrOrNull("ai_triage"))
+}
+
+test "a high risk report on a repeated target by a new author with a link passes the AI gate" {
+    var author = ModerationTestKit.login("pt_author")
+    var r1 = ModerationTestKit.login("pt_rep1")
+    var r2 = ModerationTestKit.login("pt_rep2")
+    var r3 = ModerationTestKit.login("pt_rep3")
+    var postId = ModerationTestKit.publish(author, "promoção em http://spam.example/oferta")
+    Check.status(ModerationTestKit.report(r1, "POST", postId, "VIOLENCE", "x"), 201)
+    Check.status(ModerationTestKit.report(r2, "POST", postId, "SCAM", "x"), 201)
+    var last = ModerationTestKit.str(ModerationTestKit.report(r3, "POST", postId, "HARASSMENT", "x"), "id")
+    Check.isTrue("scored", ModerationTestKit.module().preTriage.preTriagePending(100) >= 3)
+    var json = preTriageOf(last)
+    Check.isTrue("violence signal", json.contains("REASON_VIOLENCE"))
+    Check.isTrue("repeated target " + json, json.contains("REPEATED_TARGET"))
+    Check.isTrue("new account", json.contains("NEW_ACCOUNT"))
+    Check.isTrue("link", json.contains("CONTENT_LINK"))
+    Check.isTrue("score passes the gate", scoreOf(last) >= 30)
+    Check.isTrue("no automatic human review", aiOf(last) == "")
+}
+
+test "a low score report skips the AI and goes to a human" {
+    var author = ModerationTestKit.login("pt_author2")
+    var reporter = ModerationTestKit.login("pt_rep4")
+    ModerationTestKit.db().execute("update users set created_at = ? where id = ?", DbParams().bindInstant(Time.fromMillis(Time.nowMillis() - 60L * 86400000L)).bindStr(author))
+    var postId = ModerationTestKit.publish(author, "um texto comum e longo o bastante para nao ser curto")
+    var id = ModerationTestKit.str(ModerationTestKit.report(reporter, "POST", postId, "OTHER", "x"), "id")
+    ModerationTestKit.module().preTriage.preTriagePending(100)
+    Check.isTrue("low score", scoreOf(id) < 30)
+    Check.isTrue("human review verdict", aiOf(id).contains("HUMAN_REVIEW") && aiOf(id).contains("pre-triage"))
+    var report = ModerationTestKit.module().store.findById(id)
+    Check.isTrue("loaded", report != null)
+}
+
+test "the learned weight rises when humans punish a signal and falls when they dismiss it" {
+    var module = ModerationTestKit.module()
+    var db = ModerationTestKit.db()
+    var now = Time.nowIso()
+    var i = 0
+    while (i < 5) {
+        db.execute("insert into moderation_feedback (id, report_id, decision, source, decided_by, signals, score, created_at) values (?, ?, \'PUNISH\', \'HUMAN\', \'admin\', \'REASON_SPAM\', 25, ?)", DbParams().bindStr("mfb_up" + i).bindStr("r" + i).bindInstant(now))
+        i = i + 1
+    }
+    db.execute("insert into moderation_feedback (id, report_id, decision, source, decided_by, signals, score, created_at) values (\'mfb_up9\', \'r9\', \'DISMISS\', \'HUMAN\', \'admin\', \'REASON_SPAM\', 25, ?)", DbParams().bindInstant(now))
+    i = 0
+    while (i < 6) {
+        db.execute("insert into moderation_feedback (id, report_id, decision, source, decided_by, signals, score, created_at) values (?, ?, \'DISMISS\', \'HUMAN\', \'admin\', \'CONTENT_LINK\', 10, ?)", DbParams().bindStr("mfb_dn" + i).bindStr("rd" + i).bindInstant(now))
+        i = i + 1
+    }
+    Check.isTrue("learned", module.learning.learnWeights() >= 2)
+    var spam = db.queryOptional("select weight, samples from moderation_signal_weights where signal_key = \'REASON_SPAM\'", DbParams())
+    Check.isTrue("spam row", spam != null)
+    if (spam != null) {
+        Check.isTrue("spam above its base 25", spam.getInt("weight") > 25)
+        Check.isTrue("six samples", spam.getInt("samples") == 6)
+    }
+    var link = db.queryOptional("select weight from moderation_signal_weights where signal_key = \'CONTENT_LINK\'", DbParams())
+    Check.isTrue("link row", link != null)
+    if (link != null) {
+        Check.isTrue("link below its base 10", link.getInt("weight") < 10)
+    }
+    module.weights.invalidate()
+    Check.isTrue("cache reads the learned weight", module.weights.weightOf("REASON_SPAM") > 25)
+    ModerationTestKit.finish()
+}

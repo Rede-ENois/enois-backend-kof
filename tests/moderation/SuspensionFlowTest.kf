@@ -1,0 +1,50 @@
+import kernel.db.*
+import kernel.sanctions.*
+import kernel.testkit.*
+import kernel.time.*
+import moderation.*
+
+// Port of SuspensionFlowTests: a suspension blocks access at once; without an appeal it becomes a BAN when the grace ends,
+// with an appeal pending the conversion waits for the human decision.
+String typeOf(userId: String) {
+    var row = ModerationTestKit.module().sanctionStore.findActiveByUser(userId)
+    if (row == null) {
+        return ""
+    }
+    return row.type
+}
+
+String suspendOld(userId: String, tag: String) {
+    var id = "sanc_susp_" + tag
+    var old = Time.fromMillis(Time.nowMillis() - 8L * 86400000L)
+    ModerationTestKit.module().sanctionStore.save(ModerationSanctions.suspended(id, userId, "admin:susp_admin", "Suspensao antiga para o teste de expiracao.", old))
+    return id
+}
+
+test "a suspended account loses its session and the access gate closes" {
+    var admin = ModerationTestKit.loginAdmin("susp_admin")
+    var target = ModerationTestKit.login("susp_target")
+    var reporter = ModerationTestKit.login("susp_reporter")
+    var reportId = ModerationTestKit.publishReported(target, reporter, "post de quem sera suspenso", "SCAM")
+    Check.status(ModerationTestKit.post(admin, "/admin/reports/" + reportId + "/ban", ""), 200)
+    Check.status(ModerationTestKit.get(target, "/me/sanctions"), 401)
+    Check.isTrue("type suspended", typeOf(target) == "SUSPENDED")
+    Check.isTrue("login gate closed", SanctionGateReader(ModerationTestKit.db()).banned(target))
+}
+
+test "expiry without an appeal converts the suspension to a BAN" {
+    var target = ModerationTestKit.login("susp_target4")
+    suspendOld(target, "exp")
+    Check.isTrue("converted", ModerationTestKit.module().suspensions.expireSuspensions() >= 1)
+    Check.isTrue("ban", typeOf(target) == "BAN")
+    Check.isTrue("gate", SanctionGateReader(ModerationTestKit.db()).banned(target))
+}
+
+test "a pending appeal blocks the expiry" {
+    var target = ModerationTestKit.login("susp_target5")
+    var id = suspendOld(target, "pend")
+    ModerationTestKit.module().sanctionStore.saveAppeal(ModerationSanctions.newAppeal("appl_susp_pend", id, target, "Recurso dentro do prazo de graça.", Time.nowIso()))
+    ModerationTestKit.module().suspensions.expireSuspensions()
+    Check.isTrue("still suspended", typeOf(target) == "SUSPENDED")
+    ModerationTestKit.finish()
+}

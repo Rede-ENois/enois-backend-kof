@@ -1,0 +1,176 @@
+import kernel.db.*
+import kernel.sanctions.*
+import kernel.testkit.*
+import moderation.*
+
+// The decisions of ModerationService on a pending report (penalize, warn, ban, approve, dismiss, remove company) and
+// ApprovedCommentReportTests (an approved or banning report on a comment removes it and keeps the counter consistent).
+String postStatus(postId: String) {
+    var row = ModerationTestKit.db().queryOptional("select status from posts where id = ?", DbParams().bindStr(postId))
+    if (row == null) {
+        return ""
+    }
+    return row.getStr("status")
+}
+
+String noteOf(reportId: String) {
+    var row = ModerationTestKit.db().queryOptional("select resolution_note from reports where id = ?", DbParams().bindStr(reportId))
+    if (row == null) {
+        return ""
+    }
+    return ModerationTestKit.str2(row.getStrOrNull("resolution_note"))
+}
+
+Int countOf(sql: String, id: String) = ModerationTestKit.db().queryLong(sql, DbParams().bindStr(id)) as Int
+
+test "approve removes the post and records the note, dismiss keeps it" {
+    var admin = ModerationTestKit.loginAdmin("dec_admin")
+    var author = ModerationTestKit.login("dec_author1")
+    var reporter = ModerationTestKit.login("dec_reporter1")
+    var postA = ModerationTestKit.publish(author, "conteudo a remover")
+    var reportA = ModerationTestKit.str(ModerationTestKit.report(reporter, "POST", postA, "SPAM", "x"), "id")
+    var res = ModerationTestKit.post(admin, "/admin/reports/" + reportA + "/approve", "{\"note\":\"violacao confirmada\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "status", "APPROVED")
+    Check.isTrue("post deleted", postStatus(postA) == "DELETED")
+    Check.isTrue("note stored", noteOf(reportA) == "violacao confirmada")
+    var postB = ModerationTestKit.publish(author, "conteudo que fica")
+    var reportB = ModerationTestKit.str(ModerationTestKit.report(reporter, "POST", postB, "SPAM", "x"), "id")
+    var dismissed = ModerationTestKit.post(admin, "/admin/reports/" + reportB + "/dismiss", "{\"note\":\"sem violacao\"}")
+    Check.status(dismissed, 200)
+    Check.jsonEq(dismissed, "status", "DISMISSED")
+    Check.isTrue("post kept", postStatus(postB) == "ACTIVE")
+    // A decided report cannot be decided again; unknown report; non-admin.
+    var again = ModerationTestKit.post(admin, "/admin/reports/" + reportA + "/dismiss", "{\"note\":\"tarde\"}")
+    Check.status(again, 409)
+    Check.jsonEq(again, "code", "ALREADY_REVIEWED")
+    Check.status(ModerationTestKit.post(admin, "/admin/reports/report_missing/approve", "{\"note\":\"x\"}"), 404)
+    Check.status(ModerationTestKit.post(reporter, "/admin/reports/" + reportB + "/approve", "{\"note\":\"x\"}"), 403)
+}
+
+test "warn keeps the content, notifies the author and releases a quarantined post" {
+    var admin = ModerationTestKit.loginAdmin("dec_admin2")
+    var author = ModerationTestKit.login("dec_author2")
+    var reporter = ModerationTestKit.login("dec_reporter2")
+    var postId = ModerationTestKit.publish(author, "post que sera avisado")
+    var reportId = ModerationTestKit.str(ModerationTestKit.report(reporter, "POST", postId, "HARASSMENT", "x"), "id")
+    Check.isTrue("quarantined", ModerationTestKit.feed().moderation.quarantine(admin, postId, "teste"))
+    var res = ModerationTestKit.post(admin, "/admin/reports/" + reportId + "/warn", "")
+    Check.status(res, 200)
+    Check.jsonEq(res, "status", "APPROVED")
+    Check.isTrue("note", noteOf(reportId) == "AVISO da moderação (conteúdo mantido)")
+    Check.isTrue("released", postStatus(postId) == "ACTIVE")
+    Check.isTrue("author notified", countOf("select count(*) from notifications where user_id = ? and kind = \'MODERACAO\'", author) == 1)
+}
+
+test "penalize restricts the author and removes the content, only once" {
+    var admin = ModerationTestKit.loginAdmin("dec_admin3")
+    var author = ModerationTestKit.login("dec_author3")
+    var reporter = ModerationTestKit.login("dec_reporter3")
+    var postId = ModerationTestKit.publish(author, "post a penalizar")
+    var reportId = ModerationTestKit.str(ModerationTestKit.report(reporter, "POST", postId, "SCAM", "x"), "id")
+    var res = ModerationTestKit.post(admin, "/admin/reports/" + reportId + "/penalize", "")
+    Check.status(res, 200)
+    Check.jsonEq(res, "status", "AUTO_PENALIZED")
+    Check.isTrue("post deleted", postStatus(postId) == "DELETED")
+    Check.isTrue("restricted", SanctionGateReader(ModerationTestKit.db()).restricted(author))
+    var again = ModerationTestKit.post(admin, "/admin/reports/" + reportId + "/penalize", "")
+    Check.status(again, 409)
+    Check.jsonEq(again, "code", "ALREADY_REVIEWED")
+    // A target without an unambiguous author is not penalizable (the human uses another action).
+    var job = ModerationTestKit.str(ModerationTestKit.report(reporter, "JOB", "job_x", "SPAM", "x"), "id")
+    var refused = ModerationTestKit.post(admin, "/admin/reports/" + job + "/penalize", "")
+    Check.status(refused, 409)
+    Check.jsonEq(refused, "code", "CANNOT_PENALIZE")
+}
+
+test "ban suspends the author, purges the content and revokes the session" {
+    var admin = ModerationTestKit.loginAdmin("dec_admin4")
+    var author = ModerationTestKit.login("dec_author4")
+    var reporter = ModerationTestKit.login("dec_reporter4")
+    var postId = ModerationTestKit.publish(author, "post de quem sera banido")
+    var reportId = ModerationTestKit.str(ModerationTestKit.report(reporter, "POST", postId, "SCAM", "x"), "id")
+    var res = ModerationTestKit.post(admin, "/admin/reports/" + reportId + "/ban", "")
+    Check.status(res, 200)
+    Check.isTrue("note", noteOf(reportId) == "BANIMENTO da conta")
+    Check.isTrue("post deleted", postStatus(postId) == "DELETED")
+    var gate = SanctionGateReader(ModerationTestKit.db())
+    Check.isTrue("blocked", gate.banned(author))
+    Check.status(ModerationTestKit.get(author, "/me/sanctions"), 401)
+    // A suspension does not purge: the archive and the purge wait for the conversion to BAN.
+    Check.isTrue("not archived yet", countOf("select count(*) from ban_content_archive where user_id = ?", author) == 0)
+    // No author, company target.
+    var noAuthor = ModerationTestKit.str(ModerationTestKit.report(reporter, "JOB", "job_y", "SPAM", "x"), "id")
+    var refused = ModerationTestKit.post(admin, "/admin/reports/" + noAuthor + "/ban", "")
+    Check.status(refused, 409)
+    Check.jsonEq(refused, "code", "NO_AUTHOR")
+    var company = ModerationTestKit.str(ModerationTestKit.report(reporter, "COMPANY", "comp_x", "SPAM", "x"), "id")
+    Check.jsonEq(ModerationTestKit.post(admin, "/admin/reports/" + company + "/ban", ""), "code", "COMPANY_TARGET")
+    Check.jsonEq(ModerationTestKit.post(admin, "/admin/reports/" + company + "/penalize", ""), "code", "COMPANY_TARGET")
+}
+
+test "approving a comment report removes the comment and keeps the counter consistent" {
+    var admin = ModerationTestKit.loginAdmin("acr_admin")
+    var author = ModerationTestKit.login("acr_author")
+    var commenter = ModerationTestKit.login("acr_commenter")
+    var reporter = ModerationTestKit.login("acr_reporter")
+    var postId = ModerationTestKit.publish(author, "Post para testar denuncia de comentario.")
+    var reported = ModerationTestKit.comment(commenter, postId, "Comentario que vai ser denunciado.", null)
+    var reply = ModerationTestKit.comment(reporter, postId, "Resposta ao comentario denunciado.", reported)
+    Check.jsonEq(ModerationTestKit.get(author, "/feed/posts/" + postId), "counters.comments", "2")
+    var reportId = ModerationTestKit.str(ModerationTestKit.report(reporter, "COMMENT", reported, "SPAM", "comentario com spam"), "id")
+    Check.status(ModerationTestKit.post(admin, "/admin/reports/" + reportId + "/approve", "{\"note\":\"violacao confirmada\"}"), 200)
+    var list = ModerationTestKit.get(author, "/feed/posts/" + postId + "/comments")
+    Check.status(list, 200)
+    Check.jsonEq(list, "items.0.id", reply)
+    Check.isTrue("only the reply is left", list.jsonSize("items") == 1)
+    Check.jsonEq(ModerationTestKit.get(author, "/feed/posts/" + postId), "counters.comments", "1")
+    // The reviewed content stays readable to the panel (soft delete).
+    Check.jsonEq(ModerationTestKit.get(admin, "/admin/reports/" + reportId), "content", "Comentario que vai ser denunciado.")
+}
+
+test "banning from a comment report removes the comment and keeps the counter consistent" {
+    var admin = ModerationTestKit.loginAdmin("acr_ban_admin")
+    var author = ModerationTestKit.login("acr_ban_author")
+    var commenter = ModerationTestKit.login("acr_ban_commenter")
+    var reporter = ModerationTestKit.login("acr_ban_reporter")
+    var postId = ModerationTestKit.publish(author, "Post para testar ban por comentario.")
+    var reported = ModerationTestKit.comment(commenter, postId, "Comentario de quem vai ser banido.", null)
+    ModerationTestKit.comment(reporter, postId, "Resposta que fica no ar.", reported)
+    var reportId = ModerationTestKit.str(ModerationTestKit.report(reporter, "COMMENT", reported, "SPAM", "spam"), "id")
+    Check.status(ModerationTestKit.post(admin, "/admin/reports/" + reportId + "/ban", ""), 200)
+    var list = ModerationTestKit.get(author, "/feed/posts/" + postId + "/comments")
+    Check.isTrue("reported comment gone", list.jsonSize("items") == 1)
+    Check.jsonEq(ModerationTestKit.get(author, "/feed/posts/" + postId), "counters.comments", "1")
+}
+
+test "company report: the mail offers the company action and the admin removes the page" {
+    var admin = ModerationTestKit.loginAdmin("crep_admin")
+    var owner = ModerationTestKit.login("crep_owner")
+    var reporter = ModerationTestKit.login("crep_reporter")
+    var companyId = ModerationTestKit.company(owner, "Empresa Denunciada crep")
+    var created = ModerationTestKit.report(reporter, "COMPANY", companyId, "SPAM", "A pagina usa o diretorio para divulgar golpe.")
+    Check.status(created, 201)
+    var reportId = ModerationTestKit.str(created, "id")
+    var html = ModerationTestKit.mail().last().html
+    Check.isTrue("company action", html.contains("?acao=empresa"))
+    Check.isTrue("no ban action", !html.contains("?acao=banir") && !html.contains("?acao=penalizar") && !html.contains("?acao=excluir"))
+    var review = ModerationTestKit.get(admin, "/admin/reports/" + reportId)
+    Check.jsonEq(review, "authorId", owner)
+    Check.isTrue("content", ModerationTestKit.str(review, "content").contains("Empresa Denunciada crep"))
+    var ban = ModerationTestKit.post(admin, "/admin/reports/" + reportId + "/ban", "")
+    Check.status(ban, 400)
+    Check.jsonEq(ban, "code", "COMPANY_TARGET")
+    Check.status(ModerationTestKit.post(reporter, "/admin/reports/" + reportId + "/remove-company", ""), 403)
+    Check.isTrue("still active", countOf("select count(*) from companies where id = ? and status = \'ACTIVE\'", companyId) == 1)
+    var removed = ModerationTestKit.post(admin, "/admin/reports/" + reportId + "/remove-company", "")
+    Check.status(removed, 200)
+    Check.jsonEq(removed, "status", "APPROVED")
+    Check.isTrue("closed", countOf("select count(*) from companies where id = ? and status = \'CLOSED\'", companyId) == 1)
+    Check.isTrue("owner notified", countOf("select count(*) from notifications where user_id = ? and kind = \'MODERACAO\'", owner) == 1)
+    // A report on a post is not a company removal.
+    var postId = ModerationTestKit.publish(owner, "post comum")
+    var other = ModerationTestKit.str(ModerationTestKit.report(reporter, "POST", postId, "SPAM", "x"), "id")
+    Check.jsonEq(ModerationTestKit.post(admin, "/admin/reports/" + other + "/remove-company", ""), "code", "NOT_A_COMPANY")
+    ModerationTestKit.finish()
+}

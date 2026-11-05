@@ -1,0 +1,50 @@
+import kernel.db.*
+import kernel.sanctions.*
+import kernel.testkit.*
+import moderation.*
+
+// The content sweep (SuspiciousContentSweepWorker) over the posts table with the signatures set for this file, plus the
+// target parser tests of SuspiciousContentTargetsTests.
+Bool banned(userId: String) = SanctionGateReader(ModerationTestKit.db()).banned(userId)
+
+Long stored(content: String) = ModerationTestKit.db().queryLong("select count(*) from posts where content = ?", DbParams().bindStr(content))
+
+test "the target and pattern settings parse with validated identifiers" {
+    var parsed = ModerationContentTargets.parseTargets("communities:created_by:id:name|description:created_at;freelances:user_id:id:title|scope:created_at;entrada-invalida")
+    Check.eqInt("two targets", 2, parsed.size())
+    Check.eqStr("table", "communities", parsed.get(0).table)
+    Check.eqStr("author", "created_by", parsed.get(0).authorColumn)
+    Check.eqStr("texts", "name,description", String.join(",", parsed.get(0).textColumns))
+    Check.eqStr("created", "created_at", parsed.get(1).createdColumn)
+    Check.eqInt("unsafe identifiers are refused", 0, ModerationContentTargets.parseTargets("communities:created_by:id:name;drop table users:created_at").size())
+    Check.eqStr("lowercased", "<script,mass assignment,onerror=", String.join(",", ModerationContentTargets.parsePatterns("<SCRIPT, Mass Assignment ,,onerror=")))
+}
+
+test "the sweep deletes suspicious rows and bans hard signatures or repeated soft ones" {
+    ModerationTestKit.setting("CONTENT_SWEEP_PATTERNS", "mass assignment,onerror=")
+    ModerationTestKit.setting("CONTENT_SWEEP_TARGETS", "posts:author_id:id:content:created_at")
+    var hard = ModerationTestKit.login("sw_hard")
+    var soft = ModerationTestKit.login("sw_soft")
+    var repeated = ModerationTestKit.login("sw_repeated")
+    var clean = ModerationTestKit.login("sw_clean")
+    var admin = ModerationTestKit.loginAdmin("sw_admin")
+    var hardPost = ModerationTestKit.publish(hard, "teste de mass assignment aqui")
+    var softPost = ModerationTestKit.publish(soft, "um trecho com onerror= isolado")
+    ModerationTestKit.publish(repeated, "primeiro onerror= do lote")
+    ModerationTestKit.publish(repeated, "segundo onerror= do lote")
+    var cleanPost = ModerationTestKit.publish(clean, "conversa normal sobre arquitetura")
+    ModerationTestKit.publish(admin, "admin citando mass assignment em um guia")
+    var report = ModerationTestKit.module().contentSweep.sweep()
+    Check.eqInt("found", 5, report.found)
+    Check.eqInt("deleted", 5, report.deleted)
+    Check.eqInt("hard and repeated authors are banned, the admin is not", 2, report.banned)
+    Check.isTrue("hard signature bans on one item", banned(hard))
+    Check.isTrue("two soft items ban", banned(repeated))
+    Check.isTrue("one soft item deletes without a ban", !banned(soft))
+    Check.isTrue("a clean author is untouched", !banned(clean))
+    Check.isTrue("the admin is never punished", !banned(admin))
+    Check.status(ModerationTestKit.get("", "/feed/posts/" + hardPost), 404)
+    Check.status(ModerationTestKit.get("", "/feed/posts/" + softPost), 404)
+    Check.status(ModerationTestKit.get("", "/feed/posts/" + cleanPost), 200)
+    ModerationTestKit.finish()
+}

@@ -1,0 +1,82 @@
+package moderation
+
+import kernel.db.*
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.time.*
+import profile.*
+
+record ModerationRiskView(String id, String userId, String action, String level, Int score, List<String> signals, String ruleVersion, String decision, String createdAt)
+
+// What an admin may see about the declared age: the state and the band, never the exact date (a sensitive datum that does not
+// belong in a moderation panel).
+record ModerationAgeView(String state, String? ageBand)
+
+// Admin reading tools on one account (ModeratorController): the declared age band and the risk history of the engine, which
+// answers "why was this person flagged?" with the level, the signals and the rule version of each assessment.
+class ModerationInsightRoutes {
+    static register(server: HttpServer, store: Db, profiles: ProfileDirectory) {
+        server.get("/admin/users/:username/age", () -> ModerationInsightRoutes.age(store, profiles))
+        server.get("/admin/users/:username/risco", () -> ModerationInsightRoutes.risk(store, profiles))
+    }
+    static ProfileRecord target(profiles: ProfileDirectory) {
+        var found = profiles.findByUsername(Req.pathParam("username").trim())
+        if (found == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuário não encontrado.")
+        }
+        return found
+    }
+    static ModerationAgeView ageView(birthDate: String?, today: String) {
+        if (birthDate == null) {
+            return ModerationAgeView("BIRTH_DATE_REQUIRED", null)
+        }
+        var age = Dates.yearsBetween(birthDate, today)
+        if (age >= 18) {
+            return ModerationAgeView("ADULT_DECLARED", "ADULTO")
+        }
+        if (age <= 13) {
+            return ModerationAgeView("MINOR_DECLARED", "ATE_13")
+        }
+        return ModerationAgeView("MINOR_DECLARED", "14_17")
+    }
+    static String age(store: Db, profiles: ProfileDirectory) {
+        Auth.requireAdmin()
+        var found = ModerationInsightRoutes.target(profiles)
+        var row = store.queryOptional("select birth_date from users where id = ?", DbParams().bindStr(found.id))
+        var birth = ModerationModeratorRules.noString()
+        if (row != null) {
+            birth = row.getStrOrNull("birth_date")
+        }
+        var view = ModerationInsightRoutes.ageView(birth, Dates.todayBrazil())
+        // Java answers a Map: the band is absent (not null) while the date is missing.
+        if (view.ageBand == null) {
+            return "{\"state\":\"BIRTH_DATE_REQUIRED\"}"
+        }
+        return json.encode(view)
+    }
+    static String risk(store: Db, profiles: ProfileDirectory) {
+        Auth.requireAdmin()
+        var found = ModerationInsightRoutes.target(profiles)
+        var limit = ModerationContentTargets.clampInt(Req.queryInt("limit", 20), 1, 100)
+        var out = listOf<ModerationRiskView>()
+        for (var r in store.queryList("select id, user_id, action_type, level, score, signals, rule_version, decision, created_at from risk_assessments where user_id = ? order by created_at desc limit ?", DbParams().bindStr(found.id).bindInt(limit))) {
+            out.add(ModerationRiskView(r.getStr("id"), r.getStr("user_id"), r.getStr("action_type"), r.getStr("level"), r.getInt("score"), ModerationInsightRoutes.signals(r.getStrOrNull("signals")), r.getStr("rule_version"), r.getStr("decision"), r.getInstant("created_at")))
+        }
+        return json.encode(out)
+    }
+    // The stored JSON array of codes (`["ROBOTIC_CADENCE","NEW_ACCOUNT"]`) back to a list.
+    static List<String> signals(raw: String?) {
+        var out = listOf<String>()
+        if (raw == null) {
+            return out
+        }
+        var clean = raw.replace("[", "").replace("]", "").replace("\"", "")
+        for (var part in clean.split(",")) {
+            if (part.trim().length() > 0) {
+                out.add(part.trim())
+            }
+        }
+        return out
+    }
+}

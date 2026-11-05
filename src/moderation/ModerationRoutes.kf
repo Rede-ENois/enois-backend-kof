@@ -1,0 +1,104 @@
+package moderation
+
+import kernel.error.*
+import kernel.http.*
+import kernel.idempotency.*
+import kernel.security.*
+import kernel.time.*
+import kernel.url.*
+
+// HTTP adapter of ReportController: opening a report, the reporter's own list and the admin reading side.
+class ModerationRoutes {
+    static register(server: HttpServer, service: ModerationService, store: ModerationStore, decisions: ModerationDecisions, idem: Idempotency) {
+        server.post("/reports", () -> ModerationRoutes.report(service, store, idem))
+        server.get("/reports/mine", () -> ModerationRoutes.mine(service))
+        server.get("/admin/reports/:reportId/e2e-key", () -> ModerationRoutes.e2eKey(store))
+        server.get("/admin/reports/:reportId", () -> ModerationRoutes.review(service))
+        server.get("/admin/reports", () -> ModerationRoutes.pending(service))
+        server.post("/admin/reports/:reportId/penalize", () -> json.encode(ModerationRules.view(decisions.penalize(Req.pathParam("reportId"), Auth.requireAdmin()))))
+        server.post("/admin/reports/:reportId/warn", () -> json.encode(ModerationRules.view(decisions.warn(Req.pathParam("reportId"), Auth.requireAdmin()))))
+        server.post("/admin/reports/:reportId/ban", () -> json.encode(ModerationRules.view(decisions.ban(Req.pathParam("reportId"), Auth.requireAdmin()))))
+        server.post("/admin/reports/:reportId/remove-company", () -> ModerationRoutes.removeCompany(decisions, idem))
+        server.post("/admin/reports/:reportId/approve", () -> ModerationRoutes.review(decisions, idem, true))
+        server.post("/admin/reports/:reportId/dismiss", () -> ModerationRoutes.review(decisions, idem, false))
+    }
+    static ModerationReportBody body() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ModerationReportBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String report(service: ModerationService, store: ModerationStore, idem: Idempotency) {
+        var userId = Auth.requireUser()
+        var request = ModerationRoutes.body()
+        var hash = Idempotency.hash(json.encode(request))
+        return idem.handle(userId, "POST", "/api/reports", hash, 201, () -> ModerationRoutes.create(service, store, userId, request))
+    }
+    static String create(service: ModerationService, store: ModerationStore, userId: String, request: ModerationReportBody) {
+        var created = service.report(userId, request.targetType, request.targetId, request.reason, request.description)
+        var key = request.e2eConversationKey
+        if (key != null && key.trim().length() > 0 && key.length() <= 8192) {
+            store.saveE2eKey(created.id, key, Time.nowIso())
+        }
+        return json.encode(ModerationRules.view(created))
+    }
+    static String mine(service: ModerationService) {
+        var userId = Auth.requireUser()
+        var out = listOf<ModerationMyReportView>()
+        for (var r in service.reportsOf(userId, 100)) {
+            out.add(ModerationRules.mine(r))
+        }
+        return json.encode(out)
+    }
+    // The conversation key attached to a message report (the moderator decrypts it in the browser).
+    static String e2eKey(store: ModerationStore) {
+        Auth.requireAdmin()
+        var key = store.e2eKey(Req.pathParam("reportId"))
+        if (key == null) {
+            return "{}"
+        }
+        return json.encode(ModerationConversationKey(key))
+    }
+    static String pending(service: ModerationService) {
+        Auth.requireAdmin()
+        var out = listOf<ModerationReportView>()
+        for (var r in service.listPending(Req.queryInt("limit", 20))) {
+            out.add(ModerationRules.view(r))
+        }
+        return json.encode(out)
+    }
+    static String review(service: ModerationService) {
+        Auth.requireAdmin()
+        return json.encode(service.review(Req.pathParam("reportId")))
+    }
+    static String removeCompany(decisions: ModerationDecisions, idem: Idempotency) {
+        var admin = Auth.requireAdmin()
+        var reportId = Req.pathParam("reportId")
+        var hash = Idempotency.hash(json.encode(ModerationIdempotencyKey(reportId, "remove-company")))
+        return idem.handle(admin, "POST", "/api/admin/reports/{reportId}/remove-company", hash, 200, () -> json.encode(ModerationRules.view(decisions.removeCompany(reportId, admin))))
+    }
+    // approve and dismiss take the same body ({note}) and differ only in the decision.
+    static String review(decisions: ModerationDecisions, idem: Idempotency, approve: Bool) {
+        var admin = Auth.requireAdmin()
+        var reportId = Req.pathParam("reportId")
+        SafeLinks.checkRequest()
+        ModerationReviewBody body
+        try {
+            body = json.decode<ModerationReviewBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        var note = body.note
+        var noteText = ""
+        if (note != null) {
+            noteText = note
+        }
+        var hash = Idempotency.hash(json.encode(ModerationIdempotencyNote(reportId, noteText)))
+        if (approve) {
+            return idem.handle(admin, "POST", "/api/admin/reports/{reportId}/approve", hash, 200, () -> json.encode(ModerationRules.view(decisions.approve(reportId, admin, note))))
+        }
+        return idem.handle(admin, "POST", "/api/admin/reports/{reportId}/dismiss", hash, 200, () -> json.encode(ModerationRules.view(decisions.dismiss(reportId, admin, note))))
+    }
+}

@@ -1,0 +1,283 @@
+package moderation
+
+import identity.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.sanctions.*
+import kernel.time.*
+import notifications.*
+import profile.*
+
+// A sanction put to a vote of the moderators (SanctionProposal): PENDING, APPLIED, REJECTED or CANCELLED.
+record ModerationProposal(String id, String targetUserId, String targetUsername, String type, String reason, String proposerId, String status, Int requiredVotes, String createdAt, String? decidedAt)
+
+record ModerationProposalVote(String id, String proposalId, String moderatorId, String vote, String? note, String createdAt)
+
+record ModerationProposalVoteView(String moderatorId, String? username, String? name, String vote, String? note, String createdAt)
+
+record ModerationProposalView(String id, String targetUserId, String? targetUsername, String? targetName, String type, String reason, String proposerId, String? proposer, String? proposerName, String status, Int requiredVotes, Long moderatorCount, Int approveVotes, Int rejectVotes, String? myVote, String createdAt, String? decidedAt, List<ModerationProposalVoteView> votes)
+
+record ModerationProposalDecision(Int approveVotes, Int rejectVotes, Int requiredVotes, String myVote, String status, String decision, String message)
+
+record ModerationProposalBody(String? username, String? type, String? reason)
+
+record ModerationProposalVoteBody(String? vote, String? note)
+
+// SanctionProposalService: punishment by vote exists only with 10 active moderators; the threshold is more than half (total / 2 + 1),
+// recomputed at every vote. Reaching it applies the sanction through the panel path; more than half rejecting closes it unpunished.
+class ModerationProposals {
+    Db database
+    ModerationModeratorStore moderators
+    ModerationSanctionService sanctions
+    Notifications notifications
+    ProfileDirectory profiles
+    SanctionGateReader gate
+    public constructor(database: Db, moderators: ModerationModeratorStore, sanctions: ModerationSanctionService, notifications: Notifications, profiles: ProfileDirectory, gate: SanctionGateReader) {
+        this.database = database
+        this.moderators = moderators
+        this.sanctions = sanctions
+        this.notifications = notifications
+        this.profiles = profiles
+        this.gate = gate
+    }
+    static String columns() = "id, target_user_id, target_username, sanction_type, reason, proposer_id, status, required_votes, created_at, decided_at"
+    static ModerationProposal proposal(r: DbRow) = ModerationProposal(r.getStr("id"), r.getStr("target_user_id"), r.getStr("target_username"), r.getStr("sanction_type"), r.getStr("reason"), r.getStr("proposer_id"), r.getStr("status"), r.getInt("required_votes"), r.getInstant("created_at"), r.getInstantOrNull("decided_at"))
+    static Int requiredFor(count: Long) = count / 2L + 1L as Int
+    Long moderatorCount() = moderators.countByStatus("APPROVED")
+    save(p: ModerationProposal) {
+        var changed = database.execute("update moderator_sanction_proposals set status = ?, required_votes = ?, decided_at = ? where id = ?", DbParams().bindStr(p.status).bindInt(p.requiredVotes).bindInstantOrNull(p.decidedAt).bindStr(p.id))
+        if (changed == 0) {
+            database.execute("insert into moderator_sanction_proposals (id, target_user_id, target_username, sanction_type, reason, proposer_id, status, required_votes, created_at, decided_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(p.id).bindStr(p.targetUserId).bindStr(p.targetUsername).bindStr(p.type).bindStr(p.reason).bindStr(p.proposerId).bindStr(p.status).bindInt(p.requiredVotes).bindInstant(p.createdAt).bindInstantOrNull(p.decidedAt))
+        }
+    }
+    ModerationProposal? find(id: String) {
+        var row = database.queryOptional("select " + ModerationProposals.columns() + " from moderator_sanction_proposals where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return ModerationProposals.proposal(row)
+    }
+    ModerationProposal? pendingByTarget(targetUserId: String) {
+        var row = database.queryOptional("select " + ModerationProposals.columns() + " from moderator_sanction_proposals where target_user_id = ? and status = \'PENDING\' order by created_at desc limit 1", DbParams().bindStr(targetUserId))
+        if (row == null) {
+            return null
+        }
+        return ModerationProposals.proposal(row)
+    }
+    saveVote(v: ModerationProposalVote) {
+        var changed = database.execute("update moderator_sanction_votes set vote = ?, note = ? where id = ?", DbParams().bindStr(v.vote).bindStrOrNull(v.note).bindStr(v.id))
+        if (changed == 0) {
+            database.execute("insert into moderator_sanction_votes (id, proposal_id, moderator_id, vote, note, created_at) values (?, ?, ?, ?, ?, ?)", DbParams().bindStr(v.id).bindStr(v.proposalId).bindStr(v.moderatorId).bindStr(v.vote).bindStrOrNull(v.note).bindInstant(v.createdAt))
+        }
+    }
+    List<ModerationProposalVote> votesOf(proposalId: String) {
+        var out = listOf<ModerationProposalVote>()
+        for (var r in database.queryList("select id, proposal_id, moderator_id, vote, note, created_at from moderator_sanction_votes where proposal_id = ? order by created_at", DbParams().bindStr(proposalId))) {
+            out.add(ModerationProposalVote(r.getStr("id"), r.getStr("proposal_id"), r.getStr("moderator_id"), r.getStr("vote"), r.getStrOrNull("note"), r.getInstant("created_at")))
+        }
+        return out
+    }
+    static Int tally(votes: List<ModerationProposalVote>, type: String) {
+        var n = 0
+        for (var v in votes) {
+            if (v.vote == type) {
+                n = n + 1
+            }
+        }
+        return n
+    }
+    requireModerator(userId: String) {
+        if (moderators.findApprovedByUser(userId) == null) {
+            throw Errors.api(403, "NOT_MODERATOR", "Apenas moderadores participam da votação.")
+        }
+    }
+    static String? parseType(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        var t = raw.trim().toUpperCase()
+        if (ModerationSanctions.types().contains(t)) {
+            return t
+        }
+        return null
+    }
+    ModerationProposalView propose(proposerId: String, username: String?, type: String?, reason: String?) {
+        var count = this.moderatorCount()
+        if (count < ModerationModeratorRules.minModeratorsForSanction() as Long) {
+            throw Errors.api(409, "NOT_ENOUGH_MODERATORS", "Punição por votação só existe a partir de " + ModerationModeratorRules.minModeratorsForSanction() + " moderadores. Antes disso, somente administradores podem punir.")
+        }
+        this.requireModerator(proposerId)
+        if (type == null) {
+            throw Errors.api(400, "INVALID_SANCTION_TYPE", "Escolha restrição ou banimento.")
+        }
+        String kind = type
+        var clean = ModerationModeratorRules.trim(reason)
+        if (clean.length() < 10) {
+            throw Errors.api(400, "REASON_REQUIRED", "Explique o motivo da punição (pelo menos 10 caracteres).")
+        }
+        var target = profiles.findByUsername(ModerationModeratorRules.trim(username))
+        if (target == null) {
+            throw Errors.api(404, "USER_NOT_FOUND", "Usuário não encontrado.")
+        }
+        if (gate.banned(target.id)) {
+            throw Errors.api(409, "USER_ALREADY_BANNED", "Este usuário já está banido.")
+        }
+        if (target.id == proposerId) {
+            throw Errors.api(400, "CANNOT_SANCTION_SELF", "Você não pode propor punição contra si.")
+        }
+        if (this.pendingByTarget(target.id) != null) {
+            throw Errors.api(409, "PROPOSAL_ALREADY_PENDING", "Já existe uma votação de punição aberta contra este usuário.")
+        }
+        var now = Time.nowIso()
+        var created = ModerationProposal(Ids.prefixed("sproposal_"), target.id, target.username, kind, clean, proposerId, "PENDING", ModerationProposals.requiredFor(count), now, null)
+        this.save(created)
+        this.saveVote(ModerationProposalVote(Ids.prefixed("svote_"), created.id, proposerId, "APPROVE", "Autor da proposta", now))
+        return this.view(created, proposerId, count)
+    }
+    List<ModerationProposalView> pending(viewerId: String, limit: Int) {
+        var count = this.moderatorCount()
+        var required = ModerationProposals.requiredFor(count)
+        var cap = limit
+        if (cap < 1) {
+            cap = 1
+        }
+        var out = listOf<ModerationProposalView>()
+        for (var r in database.queryList("select " + ModerationProposals.columns() + " from moderator_sanction_proposals where status = \'PENDING\' order by created_at asc limit ?", DbParams().bindInt(cap))) {
+            var p = ModerationProposals.proposal(r)
+            if (gate.banned(p.targetUserId)) {
+                continue
+            }
+            out.add(this.view(ModerationProposals.withRequired(p, required), viewerId, count))
+        }
+        return out
+    }
+    static ModerationProposal withRequired(p: ModerationProposal, required: Int) = ModerationProposal(p.id, p.targetUserId, p.targetUsername, p.type, p.reason, p.proposerId, p.status, required, p.createdAt, p.decidedAt)
+    static ModerationProposal closed(p: ModerationProposal, status: String, at: String) = ModerationProposal(p.id, p.targetUserId, p.targetUsername, p.type, p.reason, p.proposerId, status, p.requiredVotes, p.createdAt, at)
+    ModerationProposalDecision vote(proposalId: String, moderatorId: String, type: String?, note: String?) {
+        this.requireModerator(moderatorId)
+        var choice = ""
+        if (type != null) {
+            choice = type
+        }
+        if (choice != "APPROVE" && choice != "REJECT") {
+            throw Errors.api(400, "INVALID_VOTE", "Escolha concordar ou rejeitar.")
+        }
+        var found = this.find(proposalId)
+        if (found == null) {
+            throw Errors.api(404, "PROPOSAL_NOT_FOUND", "Votação não encontrada.")
+        }
+        ModerationProposal proposal = found
+        if (gate.banned(proposal.targetUserId)) {
+            throw Errors.api(409, "TARGET_ALREADY_BANNED", "O usuário desta votação já está banido.")
+        }
+        if (proposal.status != "PENDING") {
+            throw Errors.api(409, "ALREADY_DECIDED", "Esta votação já foi encerrada.")
+        }
+        if (proposal.targetUserId == moderatorId) {
+            throw Errors.api(403, "TARGET_CANNOT_VOTE", "O alvo da punição não participa da votação.")
+        }
+        var count = this.moderatorCount()
+        if (count < ModerationModeratorRules.minModeratorsForSanction() as Long) {
+            throw Errors.api(409, "NOT_ENOUGH_MODERATORS", "A votação exige pelo menos " + ModerationModeratorRules.minModeratorsForSanction() + " moderadores ativos.")
+        }
+        var required = ModerationProposals.requiredFor(count)
+        if (proposal.requiredVotes != required) {
+            proposal = ModerationProposals.withRequired(proposal, required)
+            this.save(proposal)
+        }
+        var now = Time.nowIso()
+        var clean = ModerationModeratorRules.trimOrNull(note)
+        var own = ModerationProposalVote(Ids.prefixed("svote_"), proposalId, moderatorId, choice, clean, now)
+        for (var v in this.votesOf(proposalId)) {
+            if (v.moderatorId == moderatorId) {
+                own = ModerationProposalVote(v.id, proposalId, moderatorId, choice, clean, v.createdAt)
+            }
+        }
+        this.saveVote(own)
+        var all = this.votesOf(proposalId)
+        var approve = ModerationProposals.tally(all, "APPROVE")
+        var reject = ModerationProposals.tally(all, "REJECT")
+        var status = "PENDING"
+        var decision = "PENDING"
+        var message = "Voto registrado. A votação segue aberta."
+        if (approve >= required) {
+            this.save(ModerationProposals.closed(proposal, "APPLIED", now))
+            this.applySanction(proposal, moderatorId, now)
+            status = "APPLIED"
+            decision = "APPLIED"
+            message = "Mais da metade dos moderadores concordou: a punição foi aplicada."
+            notifications.create(proposal.proposerId, "MODERACAO", moderatorId, "Punição aprovada", "A votação contra @" + proposal.targetUsername + " atingiu o quórum e a punição foi aplicada.", "/moderador", "Abrir painel")
+        }
+        else 
+            if (reject >= required) {
+                this.save(ModerationProposals.closed(proposal, "REJECTED", now))
+                status = "REJECTED"
+                decision = "REJECTED"
+                message = "Mais da metade dos moderadores rejeitou: ninguém foi punido."
+                notifications.create(proposal.proposerId, "MODERACAO", moderatorId, "Punição rejeitada", "A votação contra @" + proposal.targetUsername + " foi encerrada sem punição.", "/moderador", "Abrir painel")
+            }
+        return ModerationProposalDecision(approve, reject, required, own.vote, status, decision, message)
+    }
+    // An administrator closes a vote that must not go on.
+    ModerationProposalView cancel(proposalId: String, adminId: String) {
+        var found = this.find(proposalId)
+        if (found == null) {
+            throw Errors.api(404, "PROPOSAL_NOT_FOUND", "Votação não encontrada.")
+        }
+        ModerationProposal proposal = found
+        if (gate.banned(proposal.targetUserId)) {
+            throw Errors.api(409, "TARGET_ALREADY_BANNED", "O usuário desta votação já está banido.")
+        }
+        if (proposal.status != "PENDING") {
+            throw Errors.api(409, "ALREADY_DECIDED", "Esta votação já foi encerrada.")
+        }
+        var saved = ModerationProposals.closed(proposal, "CANCELLED", Time.nowIso())
+        this.save(saved)
+        notifications.create(proposal.proposerId, "MODERACAO", adminId, "Votação encerrada", "Um administrador encerrou a votação de punição contra @" + proposal.targetUsername + ".", "/moderador", "Abrir painel")
+        return this.view(saved, adminId, this.moderatorCount())
+    }
+    applySanction(proposal: ModerationProposal, reviewerId: String, now: String) {
+        var reference = "proposal:" + proposal.id
+        if (proposal.type == "BAN") {
+            var sanction = ModerationSanctions.suspended(ModerationSanctions.newId(), proposal.targetUserId, reference, proposal.reason, now)
+            sanctions.banAuthor(sanction, proposal.targetUserId, reviewerId)
+            notifications.create(proposal.targetUserId, "SANCAO", "sistema", "Conta suspensa", "Sua conta foi suspensa por decisão de mais da metade dos moderadores: " + proposal.reason + ".", "/api/penalidades", "Ver")
+        }
+        else {
+            sanctions.restrictUser(proposal.targetUserId, reference, proposal.reason)
+        }
+    }
+    ModerationProposalView view(p: ModerationProposal, viewerId: String, count: Long) {
+        var proposer = profiles.findById(p.proposerId)
+        var target = profiles.findById(p.targetUserId)
+        var all = this.votesOf(p.id)
+        var myVote = ModerationModeratorRules.noString()
+        var votes = listOf<ModerationProposalVoteView>()
+        for (var v in all) {
+            if (v.moderatorId == viewerId) {
+                myVote = v.vote
+            }
+            var m = profiles.findById(v.moderatorId)
+            if (m == null) {
+                votes.add(ModerationProposalVoteView(v.moderatorId, null, null, v.vote, v.note, v.createdAt))
+            }
+            else {
+                votes.add(ModerationProposalVoteView(v.moderatorId, m.username, profiles.displayName(v.moderatorId), v.vote, v.note, v.createdAt))
+            }
+        }
+        String? targetUsername = p.targetUsername
+        var targetName = ModerationModeratorRules.noString()
+        if (target != null) {
+            targetUsername = target.username
+            targetName = profiles.displayName(target.id)
+        }
+        var proposerName = ModerationModeratorRules.noString()
+        var proposerUsername = ModerationModeratorRules.noString()
+        if (proposer != null) {
+            proposerUsername = proposer.username
+            proposerName = profiles.displayName(proposer.id)
+        }
+        return ModerationProposalView(p.id, p.targetUserId, targetUsername, targetName, p.type, p.reason, p.proposerId, proposerUsername, proposerName, p.status, p.requiredVotes, count, ModerationProposals.tally(all, "APPROVE"), ModerationProposals.tally(all, "REJECT"), myVote, p.createdAt, p.decidedAt, votes)
+    }
+}

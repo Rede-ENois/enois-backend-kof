@@ -1,0 +1,94 @@
+package moderation
+
+import feed.*
+import groups.*
+import kernel.db.*
+
+// Company pages (CompanyReportReader, CompanyRemovalPort). pending-port: companies, which owns the table. The default
+// reads it and closes a page with the single update CompanyService.closeByModeration does; the owner notice of that
+// method is sent by ModerationService (the notifications API), so the behaviour is complete before companies lands.
+class ModerationCompanies {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    // What the page says about itself (name, sector, location, website, description), at most 4000 characters.
+    String? contentOf(companyId: String) {
+        var r = store.queryOptional("select name, sector, location, website, description from companies where id = ?", DbParams().bindStr(companyId))
+        if (r == null) {
+            return null
+        }
+        var out = listOf<String>()
+        for (var col in listOf("name", "sector", "location", "website", "description")) {
+            var v = r.getStrOrNull(col)
+            if (v != null && v.trim().length() > 0) {
+                out.add(v)
+            }
+        }
+        return FeedModeration.shorten(String.join("\n", out))
+    }
+    // The author of a company report is the owner of the page.
+    String? ownerOf(companyId: String) {
+        var r = store.queryOptional("select owner_user_id from companies where id = ?", DbParams().bindStr(companyId))
+        if (r == null) {
+            return null
+        }
+        var owner = r.getStr("owner_user_id")
+        if (owner.trim().length() == 0) {
+            return null
+        }
+        return owner
+    }
+    // The page name for the owner notice; null when the page does not exist.
+    String? nameOf(companyId: String) {
+        var r = store.queryOptional("select name from companies where id = ?", DbParams().bindStr(companyId))
+        if (r == null) {
+            return null
+        }
+        return r.getStr("name")
+    }
+    // Closes an active page; false when it does not exist or is already closed.
+    Bool close(companyId: String, reviewerId: String, now: String) = store.execute("update companies set status = \'CLOSED\', updated_at = ? where id = ? and status = \'ACTIVE\'", DbParams().bindInstant(now).bindStr(companyId)) > 0
+    // True when `close` already tells the owner (the companies domain does); the decision then sends no second notice.
+    Bool notifiesOwner() = false
+}
+
+// ReportedContentReader + ReportedContentAuthorReader of every target type: the feed answers for posts, comments and
+// profiles, groups for GROUP_POST / GROUP_COMMENT, companies for COMPANY. JOB, GAME and MESSAGE have no reader in
+// the Java service either (no text, no author).
+class ModerationTargets {
+    FeedModeration feed
+    GroupReportReader groups
+    ModerationCompanies companies
+    public constructor(feed: FeedModeration, groups: GroupReportReader, companies: ModerationCompanies) {
+        this.feed = feed
+        this.groups = groups
+        this.companies = companies
+    }
+    String? contentOf(targetType: String, targetId: String) {
+        if (targetType == "COMPANY") {
+            return companies.contentOf(targetId)
+        }
+        if (targetType == "GROUP_POST" || targetType == "GROUP_COMMENT") {
+            var g = groups.read(targetType, targetId)
+            if (g == null) {
+                return null
+            }
+            return FeedModeration.shorten(g.content)
+        }
+        return feed.contentOf(targetType, targetId)
+    }
+    String? authorOf(targetType: String, targetId: String) {
+        if (targetType == "COMPANY") {
+            return companies.ownerOf(targetId)
+        }
+        if (targetType == "GROUP_POST" || targetType == "GROUP_COMMENT") {
+            var g = groups.read(targetType, targetId)
+            if (g == null) {
+                return null
+            }
+            return g.authorId
+        }
+        return feed.authorOf(targetType, targetId)
+    }
+}

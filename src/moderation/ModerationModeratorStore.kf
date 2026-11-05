@@ -1,0 +1,75 @@
+package moderation
+
+import kernel.db.*
+import kernel.security.*
+
+// SQL of moderator_applications and moderation_votes.
+class ModerationModeratorStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String columns() = "id, user_id, motivation, experience, availability, status, created_at, reviewed_by, reviewed_at, review_note"
+    static ModerationApplication application(r: DbRow) = ModerationApplication(r.getStr("id"), r.getStr("user_id"), r.getStr("motivation"), r.getStrOrNull("experience"), r.getStrOrNull("availability"), r.getStr("status"), r.getInstant("created_at"), r.getStrOrNull("reviewed_by"), r.getInstantOrNull("reviewed_at"), r.getStrOrNull("review_note"))
+    static ModerationVote vote(r: DbRow) = ModerationVote(r.getStr("id"), r.getStr("report_id"), r.getStr("moderator_id"), r.getStr("vote"), r.getStrOrNull("note"), r.getInstant("created_at"), r.getInstant("updated_at"))
+    saveApplication(a: ModerationApplication) {
+        var changed = store.execute("update moderator_applications set status = ?, reviewed_by = ?, reviewed_at = ?, review_note = ? where id = ?", DbParams().bindStr(a.status).bindStrOrNull(a.reviewedBy).bindInstantOrNull(a.reviewedAt).bindStrOrNull(a.reviewNote).bindStr(a.id))
+        if (changed == 0) {
+            store.execute("insert into moderator_applications (id, user_id, motivation, experience, availability, status, created_at, reviewed_by, reviewed_at, review_note) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(a.id).bindStr(a.userId).bindStr(a.motivation).bindStrOrNull(a.experience).bindStrOrNull(a.availability).bindStr(a.status).bindInstant(a.createdAt).bindStrOrNull(a.reviewedBy).bindInstantOrNull(a.reviewedAt).bindStrOrNull(a.reviewNote))
+        }
+    }
+    ModerationApplication? one(sql: String, params: DbParams) {
+        var row = store.queryOptional(sql, params)
+        if (row == null) {
+            return null
+        }
+        return ModerationModeratorStore.application(row)
+    }
+    ModerationApplication? findApplication(id: String) = this.one("select " + ModerationModeratorStore.columns() + " from moderator_applications where id = ?", DbParams().bindStr(id))
+    ModerationApplication? findLatestByUser(userId: String) = this.one("select " + ModerationModeratorStore.columns() + " from moderator_applications where user_id = ? order by created_at desc limit 1", DbParams().bindStr(userId))
+    ModerationApplication? findApprovedByUser(userId: String) = this.one("select " + ModerationModeratorStore.columns() + " from moderator_applications where user_id = ? and status = \'APPROVED\' order by created_at desc limit 1", DbParams().bindStr(userId))
+    Bool existsPendingByUser(userId: String) = store.queryLong("select count(*) from moderator_applications where user_id = ? and status = \'PENDING\'", DbParams().bindStr(userId)) > 0L
+    Long countByStatus(status: String) = store.queryLong("select count(*) from moderator_applications where status = ?", DbParams().bindStr(status))
+    // Oldest first, like the Java repository.
+    List<ModerationApplication> findByStatus(status: String, limit: Int) {
+        var cap = limit
+        if (cap < 1) {
+            cap = 1
+        }
+        var out = listOf<ModerationApplication>()
+        for (var r in store.queryList("select " + ModerationModeratorStore.columns() + " from moderator_applications where status = ? order by created_at asc limit ?", DbParams().bindStr(status).bindInt(cap))) {
+            out.add(ModerationModeratorStore.application(r))
+        }
+        return out
+    }
+    saveVote(v: ModerationVote) {
+        var changed = store.execute("update moderation_votes set vote = ?, note = ?, updated_at = ? where id = ?", DbParams().bindStr(v.vote).bindStrOrNull(v.note).bindInstant(v.updatedAt).bindStr(v.id))
+        if (changed == 0) {
+            store.execute("insert into moderation_votes (id, report_id, moderator_id, vote, note, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(v.id).bindStr(v.reportId).bindStr(v.moderatorId).bindStr(v.vote).bindStrOrNull(v.note).bindInstant(v.createdAt).bindInstant(v.updatedAt))
+        }
+    }
+    ModerationVote? findVote(reportId: String, moderatorId: String) {
+        var row = store.queryOptional("select id, report_id, moderator_id, vote, note, created_at, updated_at from moderation_votes where report_id = ? and moderator_id = ?", DbParams().bindStr(reportId).bindStr(moderatorId))
+        if (row == null) {
+            return null
+        }
+        return ModerationModeratorStore.vote(row)
+    }
+    List<ModerationVote> votesOf(reportId: String) {
+        var out = listOf<ModerationVote>()
+        for (var r in store.queryList("select id, report_id, moderator_id, vote, note, created_at, updated_at from moderation_votes where report_id = ? order by created_at", DbParams().bindStr(reportId))) {
+            out.add(ModerationModeratorStore.vote(r))
+        }
+        return out
+    }
+}
+
+// SecurityModerators: the moderator role is an approved application. It needs only the database, so the AppWiring sets it on
+// `hooks` before Security.install.
+class ModerationSecurityModerators extends SecurityModerators {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    Bool isModerator(userId: String) = store.queryLong("select count(*) from moderator_applications where user_id = ? and status = \'APPROVED\'", DbParams().bindStr(userId)) > 0L
+}

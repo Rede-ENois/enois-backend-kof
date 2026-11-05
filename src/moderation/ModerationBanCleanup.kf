@@ -1,0 +1,96 @@
+package moderation
+
+import feed.*
+import kernel.db.*
+import kernel.log.*
+import kernel.time.*
+
+// What follows a ban (BanCleanupService): the author's posts, comments and messages are archived (snapshot JSON, the
+// removal is irreversible), live posts and comments are taken down through the feed, pending and accepted connections are
+// removed and the rows of the sweep modules are deleted. Each item fails alone (logged), never the whole cleanup.
+// A concrete class with a no-op-free default so tests can subclass it (G30).
+class ModerationBanCleanup {
+    Db database
+    ModerationSanctionStore sanctions
+    FeedModeration feed
+    ModerationContentTargets sweepTargets
+    Log log = Log("moderation.bancleanup")
+    public constructor(database: Db, sanctions: ModerationSanctionStore, feed: FeedModeration, sweepTargets: ModerationContentTargets) {
+        this.database = database
+        this.sanctions = sanctions
+        this.feed = feed
+        this.sweepTargets = sweepTargets
+    }
+    cleanup(sanctionId: String, userId: String) {
+        var now = Time.nowIso()
+        var posts = this.archiveAndRemovePosts(sanctionId, userId, now)
+        var comments = this.archiveAndRemoveComments(sanctionId, userId, now)
+        var messages = this.archiveMessages(sanctionId, userId, now)
+        var connections = this.removeConnections(userId, now)
+        var modules = this.removeModuleContent(userId)
+        log.info("ban_cleanup sanction=" + sanctionId + " posts=" + posts + " comments=" + comments + " messages=" + messages + " connections=" + connections + " modules=" + modules)
+    }
+    static String esc(value: String?) {
+        if (value == null) {
+            return ""
+        }
+        return value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r")
+    }
+    Int archiveAndRemovePosts(sanctionId: String, userId: String, now: String) {
+        var rows = database.queryList("select id, type, content, status, created_at from posts where author_id = ?", DbParams().bindStr(userId))
+        for (var r in rows) {
+            var id = r.getStr("id")
+            try {
+                var snapshot = "{\"id\":\"" + ModerationBanCleanup.esc(id) + "\",\"type\":\"" + ModerationBanCleanup.esc(r.getStrOrNull("type")) + "\",\"content\":\"" + ModerationBanCleanup.esc(r.getStrOrNull("content")) + "\",\"status\":\"" + ModerationBanCleanup.esc(r.getStrOrNull("status")) + "\",\"createdAt\":\"" + r.getInstant("created_at") + "\"}"
+                sanctions.archive(sanctionId, userId, "POST", id, snapshot, now)
+                var status = r.getStr("status")
+                if (status == "ACTIVE" || status == "QUARANTINED") {
+                    feed.removeAsModerator("ban-cleanup", id, "BAN:" + sanctionId)
+                }
+            } catch (String e) {
+                log.warn("ban_cleanup_post_failed post=" + id)
+            }
+        }
+        return rows.size()
+    }
+    Int archiveAndRemoveComments(sanctionId: String, userId: String, now: String) {
+        var rows = database.queryList("select id, post_id, content, created_at from comments where author_id = ?", DbParams().bindStr(userId))
+        for (var r in rows) {
+            var id = r.getStr("id")
+            try {
+                var snapshot = "{\"id\":\"" + ModerationBanCleanup.esc(id) + "\",\"postId\":\"" + ModerationBanCleanup.esc(r.getStrOrNull("post_id")) + "\",\"content\":\"" + ModerationBanCleanup.esc(r.getStrOrNull("content")) + "\",\"createdAt\":\"" + r.getInstant("created_at") + "\"}"
+                sanctions.archive(sanctionId, userId, "COMMENT", id, snapshot, now)
+                feed.removeCommentAsModerator("ban-cleanup", id, "BAN:" + sanctionId)
+            } catch (String e) {
+                log.warn("ban_cleanup_comment_failed comment=" + id)
+            }
+        }
+        return rows.size()
+    }
+    Int archiveMessages(sanctionId: String, userId: String, now: String) {
+        var rows = database.queryList("select id, conversation_id, text, created_at from messages where sender_id = ?", DbParams().bindStr(userId))
+        for (var r in rows) {
+            var id = r.getStr("id")
+            try {
+                var snapshot = "{\"id\":\"" + ModerationBanCleanup.esc(id) + "\",\"conversationId\":\"" + ModerationBanCleanup.esc(r.getStrOrNull("conversation_id")) + "\",\"text\":\"" + ModerationBanCleanup.esc(r.getStrOrNull("text")) + "\",\"createdAt\":\"" + r.getInstant("created_at") + "\"}"
+                sanctions.archive(sanctionId, userId, "MESSAGE", id, snapshot, now)
+            } catch (String e) {
+                log.warn("ban_cleanup_message_failed message=" + id)
+            }
+        }
+        return rows.size()
+    }
+    // Pending and accepted connections of either side go to REMOVED.
+    Int removeConnections(userId: String, now: String) = database.execute("update user_connections set status = \'REMOVED\', removed_at = ? where (requester_user_id = ? or receiver_user_id = ?) and status in (\'PENDING\', \'ACCEPTED\')", DbParams().bindInstant(now).bindStr(userId).bindStr(userId))
+    Int removeModuleContent(userId: String) {
+        var removed = 0
+        for (var target in sweepTargets.targets) {
+            try {
+                removed = removed + database.execute("delete from " + target.table + " where " + target.authorColumn + " = ?", DbParams().bindStr(userId))
+            } catch (String e) {
+                log.warn("ban_cleanup_module_failed table=" + target.table)
+            }
+        }
+        return removed
+    }
+}

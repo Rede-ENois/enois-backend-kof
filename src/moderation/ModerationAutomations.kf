@@ -1,0 +1,408 @@
+package moderation
+
+import kernel.config.*
+import kernel.db.*
+import kernel.jobs.*
+import kernel.log.*
+import kernel.sanctions.*
+import kernel.security.*
+import kernel.time.*
+
+// What the automatic ban answers to the admin panel (SuspiciousAutoBanWorker.Status).
+record ModerationAutoBanStatus(Bool enabled, Int riskCeiling, String? lastRunAt, Int banned, Int failed, List<String> blockedIps, String? lastError)
+
+record ModerationAutoBanReport(Int banned, Int failed, List<String> blockedIps)
+
+record ModerationAutoBanned(String username, Int risk, List<String> ips)
+
+// SuspiciousAutoBanWorker: closes the triage loop. Above the risk ceiling (80 by default; the tie stays with the human) an
+// account is banned and its content removed without waiting for someone to open the panel. It never touches staff that does
+// not carry the attack signature, only looks at the recent triage window, punishes one account at a time through the normal
+// sanction flow and blocks the IPs that accumulated banned accounts in the same cycle.
+class ModerationAutoBan {
+    Log log = Log("moderation.auto-ban")
+    ModerationSuspiciousUserService suspects
+    ModerationPanel panel
+    ModerationIpBlocks ipBlocks
+    ModerationSuspectReader reader
+    List<String> patterns
+    Bool enabled
+    Int threshold
+    Int maxPerRun
+    Int ipsToInspect
+    Int accountsPerIpToBlock
+    String lastRunAt = ""
+    ModerationAutoBanReport? lastReport = null
+    String lastError = ""
+    public constructor(suspects: ModerationSuspiciousUserService, panel: ModerationPanel, ipBlocks: ModerationIpBlocks, reader: ModerationSuspectReader, patternsCsv: String, enabled: Bool, threshold: Int, maxPerRun: Int, ipsToInspect: Int, accountsPerIpToBlock: Int) {
+        this.suspects = suspects
+        this.panel = panel
+        this.ipBlocks = ipBlocks
+        this.reader = reader
+        this.patterns = ModerationSuspiciousUserService.patterns(patternsCsv)
+        this.enabled = enabled
+        this.threshold = ModerationContentTargets.clampInt(threshold, 1, 200)
+        this.maxPerRun = ModerationContentTargets.clampInt(maxPerRun, 1, 200)
+        this.ipsToInspect = ModerationContentTargets.clampInt(ipsToInspect, 1, 10)
+        this.accountsPerIpToBlock = ModerationContentTargets.clampInt(accountsPerIpToBlock, 2, 100)
+    }
+    static ModerationAutoBan fromConfig(cfg: Config, suspects: ModerationSuspiciousUserService, panel: ModerationPanel, ipBlocks: ModerationIpBlocks, reader: ModerationSuspectReader) = ModerationAutoBan(suspects, panel, ipBlocks, reader, cfg.getStr("REDE_SECURITY_SUSPICIOUS_NAME_PATTERNS", "probe"), cfg.getBool("REDE_MODERATION_AUTO_BAN_ENABLED", true), cfg.getInt("REDE_MODERATION_AUTO_BAN_RISK", 80), cfg.getInt("REDE_MODERATION_AUTO_BAN_MAX_PER_RUN", 50), cfg.getInt("REDE_MODERATION_AUTO_BAN_IPS_PER_ACCOUNT", 3), cfg.getInt("REDE_MODERATION_AUTO_BAN_ACCOUNTS_PER_IP", 3))
+    // The actor of the trail: the automation, not a person.
+    static String actor() = "automod:risco"
+    static String patternReason() = "Conta com o padrão do ataque em série (moderação automática de contenção)."
+    // Quick containment: first run 15 s after boot, then every 3 minutes.
+    schedule(jobs: Scheduler, cfg: Config) {
+        var self = this
+        jobs.fixedDelay("moderation-auto-ban", cfg.getInt("REDE_MODERATION_AUTO_BAN_INITIAL_DELAY_MS", 15000) as Long, cfg.getInt("REDE_MODERATION_AUTO_BAN_INTERVAL_MS", 180000) as Long, () -> self.run())
+    }
+    run() {
+        if (!enabled) {
+            return
+        }
+        try {
+            // Direct containment of the known pattern: no score, no staff exception. It runs even if the risk triage fails.
+            purgeAttackPatterns()
+            lastReport = sweep()
+            lastError = ""
+        } catch (String e) {
+            lastError = e
+            log.error("auto_ban_round_failed")
+        }
+        lastRunAt = Time.nowIso()
+    }
+    ModerationAutoBanStatus status() {
+        var banned = 0
+        var failed = 0
+        var blocked = listOf<String>()
+        var report = lastReport
+        if (report != null) {
+            banned = report.banned
+            failed = report.failed
+            blocked = report.blockedIps
+        }
+        var run = ModerationAutoBan.orNull(lastRunAt)
+        var err = ModerationAutoBan.orNull(lastError)
+        return ModerationAutoBanStatus(enabled, threshold, run, banned, failed, blocked, err)
+    }
+    static String? orNull(v: String) {
+        if (v.length() == 0) {
+            return null
+        }
+        return v
+    }
+    // Bans and cleans EVERY account whose name or username carries the attack pattern, staff included (that is how the
+    // attacker's account escaped once). Returns how many accounts were purged.
+    Int purgeAttackPatterns() {
+        var purged = 0
+        if (patterns.size() == 0) {
+            return purged
+        }
+        var since = Time.plusSeconds(Time.nowIso(), -(365L * 86400L))
+        for (var c in reader.findMatching(patterns, since, 200)) {
+            try {
+                var result = panel.sanctionUser(ModerationAutoBan.actor(), c.username, "PERMABAN", ModerationAutoBan.patternReason())
+                if (result.status != "ALREADY_BANNED") {
+                    panel.sanitizeUser(ModerationAutoBan.actor(), c.username, ModerationAutoBan.patternReason())
+                    purged = purged + 1
+                    log.warn("attack_pattern_account_banned")
+                }
+            } catch (String e) {
+                log.warn("attack_pattern_ban_failed")
+            }
+        }
+        return purged
+    }
+    String reasonFor(risk: Int, signals: List<String>) = "Risco automático " + risk + " na triagem de contas (" + String.join(", ", signals) + "). Banida e conteúdo removido pela automação."
+    // One pass: the report says who was banned, what failed and which IPs were blocked.
+    ModerationAutoBanReport sweep() {
+        var triage = suspects.list(200, 0)
+        var bans = listOf<ModerationAutoBanned>()
+        var failed = 0
+        for (var target in triage.items) {
+            if (bans.size() >= maxPerRun) {
+                break
+            }
+            if (target.riskScore <= threshold) {
+                continue
+            }
+            var attack = target.signals.contains("NOME_SUSPEITO")
+            if (target.staff && !attack) {
+                log.warn("auto_ban_skip_staff risk=" + target.riskScore)
+                continue
+            }
+            var reason = this.reasonFor(target.riskScore, target.signals)
+            try {
+                var result = panel.sanctionUser(ModerationAutoBan.actor(), target.username, "SUSPENDED", reason)
+                if (result.status == "ALREADY_BANNED") {
+                    continue
+                }
+                var ips = ipBlocks.recentIps(result.userId, ipsToInspect)
+                panel.sanitizeUser(ModerationAutoBan.actor(), target.username, reason)
+                bans.add(ModerationAutoBanned(target.username, target.riskScore, ips))
+                log.warn("auto_ban_done risk=" + target.riskScore)
+            } catch (String e) {
+                failed = failed + 1
+                log.warn("auto_ban_failed risk=" + target.riskScore)
+            }
+        }
+        var blocked = this.blockRepeatIps(bans)
+        log.info("auto_ban_round banned=" + bans.size() + " failed=" + failed)
+        return ModerationAutoBanReport(bans.size(), failed, blocked)
+    }
+    // An IP that produced several banned accounts in one cycle is the signature of the serial attack.
+    List<String> blockRepeatIps(bans: List<ModerationAutoBanned>) {
+        var counts = mapOf<String, Int>()
+        for (var ban in bans) {
+            for (var ip in ban.ips) {
+                counts.put(ip, counts.getOrDefault(ip, 0) + 1)
+            }
+        }
+        var blocked = listOf<String>()
+        for (var ip in counts.keys()) {
+            var n = counts.getOrDefault(ip, 0)
+            if (n < accountsPerIpToBlock) {
+                continue
+            }
+            try {
+                ipBlocks.block(ModerationAutoBan.actor(), ip, "" + n + " contas banidas automaticamente por risco")
+                blocked.add(ip)
+            } catch (String e) {
+                log.warn("auto_ban_ip_block_skipped")
+            }
+        }
+        return blocked
+    }
+}
+
+// What one content sweep did (SuspiciousContentSweepWorker.Report).
+record ModerationSweepReport(Int found, Int deleted, Int deleteFailures, Int banned, List<String> authorIds)
+
+record ModerationSweepHit(String id, String? authorId, String pattern)
+
+// SuspiciousContentSweepWorker: looks for content that carries an attack signature in every module that accepts public data
+// (the tables come from ModerationContentTargets), deletes the row and bans the author permanently through the normal sanction
+// flow. Never punishes an admin; a moderator only falls with a hard signature; soft signatures need two items to ban. SQL is
+// built from validated identifiers, never from user text; a foreign-key failure on one row does not stop the sweep.
+class ModerationContentSweep {
+    Log log = Log("moderation.content-sweep")
+    Db store
+    ModerationContentTargets config
+    ModerationPanel panel
+    ModerationModeratorStore moderators
+    SanctionGateReader gate
+    AdminGuard admins
+    public constructor(store: Db, config: ModerationContentTargets, panel: ModerationPanel, moderators: ModerationModeratorStore, gate: SanctionGateReader, admins: AdminGuard) {
+        this.store = store
+        this.config = config
+        this.panel = panel
+        this.moderators = moderators
+        this.gate = gate
+        this.admins = admins
+    }
+    static String actor() = "automod:varredura"
+    // Signatures that only exist in an attack (never in a legitimate conversation).
+    static List<String> hardPatterns() = listOf("mass assignment", "quota probe", "idem probe", "probe zq", "msm125")
+    schedule(jobs: Scheduler, cfg: Config) {
+        var self = this
+        jobs.fixedDelay("moderation-content-sweep", cfg.getInt("REDE_MODERATION_CONTENT_SWEEP_INITIAL_DELAY_MS", 20000) as Long, cfg.getInt("REDE_MODERATION_CONTENT_SWEEP_INTERVAL_MS", 120000) as Long, () -> self.run())
+    }
+    run() {
+        if (!config.enabled) {
+            return
+        }
+        try {
+            sweep()
+        } catch (String e) {
+            log.error("content_sweep_failed")
+        }
+    }
+    List<ModerationSweepHit> find(target: ModerationContentTarget, since: String) {
+        var sql = "select " + target.idColumn + ", " + target.authorColumn
+        for (var text in target.textColumns) {
+            sql = sql + ", " + text
+        }
+        sql = sql + " from " + target.table + " where " + target.createdColumn + " >= ? and ("
+        var params = DbParams().bindInstant(since)
+        var first = true
+        for (var text in target.textColumns) {
+            for (var pattern in config.patterns) {
+                if (!first) {
+                    sql = sql + " or "
+                }
+                first = false
+                sql = sql + "lower(coalesce(" + text + ", \'\')) like ?"
+                params = params.bindStr("%" + pattern + "%")
+            }
+        }
+        sql = sql + ")"
+        // An imported external job is not community content: only the ones someone submitted.
+        if (target.table == "external_jobs") {
+            sql = sql + " and submitted_by is not null"
+        }
+        sql = sql + " limit ?"
+        params = params.bindInt(config.maxRowsPerTarget)
+        var hits = listOf<ModerationSweepHit>()
+        for (var r in store.queryList(sql, params)) {
+            hits.add(ModerationSweepHit(r.getStr(target.idColumn), r.getStrOrNull(target.authorColumn), this.matched(r, target)))
+        }
+        return hits
+    }
+    String matched(r: DbRow, target: ModerationContentTarget) {
+        for (var column in target.textColumns) {
+            var text = r.getStrOrNull(column)
+            if (text == null) {
+                continue
+            }
+            var lower = text.toLowerCase()
+            for (var pattern in config.patterns) {
+                if (lower.contains(pattern)) {
+                    return pattern
+                }
+            }
+        }
+        return "?"
+    }
+    ModerationSweepReport sweep() {
+        if (config.targets.size() == 0 || config.patterns.size() == 0) {
+            return ModerationSweepReport(0, 0, 0, 0, listOf<String>())
+        }
+        var since = Time.plusSeconds(Time.nowIso(), -(config.sinceHours * 3600L))
+        var authors = listOf<String>()
+        var counts = mapOf<String, Int>()
+        var patternsBy = mapOf<String, List<String>>()
+        var tablesBy = mapOf<String, List<String>>()
+        var found = 0
+        var deleted = 0
+        var deleteFailures = 0
+        for (var target in config.targets) {
+            for (var hit in this.find(target, since)) {
+                found = found + 1
+                log.warn("suspicious_content kind=" + target.table + " id=" + hit.id + " pattern=" + hit.pattern + " dryRun=" + config.dryRun)
+                if (!config.dryRun) {
+                    try {
+                        store.execute("delete from " + target.table + " where " + target.idColumn + " = ?", DbParams().bindStr(hit.id))
+                        deleted = deleted + 1
+                    } catch (String e) {
+                        // A foreign key (community with members, job with applications): the content leaves the listing
+                        // through the author's ban and the row stays for manual cleanup.
+                        deleteFailures = deleteFailures + 1
+                    }
+                }
+                var author = hit.authorId
+                if (author != null) {
+                    if (!authors.contains(author)) {
+                        authors.add(author)
+                        patternsBy.put(author, listOf<String>())
+                        tablesBy.put(author, listOf<String>())
+                    }
+                    counts.put(author, counts.getOrDefault(author, 0) + 1)
+                    ModerationContentSweep.addDistinct(patternsBy, author, hit.pattern)
+                    ModerationContentSweep.addDistinct(tablesBy, author, target.table)
+                }
+            }
+        }
+        var banned = 0
+        if (!config.dryRun) {
+            for (var authorId in authors) {
+                if (this.banAuthor(authorId, counts.getOrDefault(authorId, 0), patternsBy.getOrDefault(authorId, listOf<String>()), tablesBy.getOrDefault(authorId, listOf<String>()))) {
+                    banned = banned + 1
+                }
+            }
+        }
+        log.info("content_sweep done found=" + found + " deleted=" + deleted + " deleteFailures=" + deleteFailures + " banned=" + banned)
+        return ModerationSweepReport(found, deleted, deleteFailures, banned, authors)
+    }
+    static addDistinct(into: Map<String,List<String>>, key: String, value: String) {
+        var list = into.getOrDefault(key, listOf<String>())
+        if (!list.contains(value)) {
+            list.add(value)
+        }
+        into.put(key, list)
+    }
+    Bool banAuthor(authorId: String, count: Int, patterns: List<String>, tables: List<String>) {
+        if (gate.banned(authorId)) {
+            return false
+        }
+        var profile = panel.profiles.findById(authorId)
+        if (profile == null) {
+            return false
+        }
+        if (admins.isAdmin(authorId)) {
+            log.error("content_sweep_skip_admin (attack signature, review manually)")
+            return false
+        }
+        var hard = false
+        for (var p in patterns) {
+            if (ModerationContentSweep.hardPatterns().contains(p)) {
+                hard = true
+            }
+        }
+        // Staff and legitimate security content (that quotes <script>/onerror) cannot be banned on one hint: staff only falls
+        // with an attack signature and the soft signatures need more than one item.
+        if (moderators.findApprovedByUser(authorId) != null && !hard) {
+            log.error("content_sweep_skip_moderator (review manually)")
+            return false
+        }
+        if (!hard && count < 2) {
+            log.warn("content_sweep_no_ban hits=" + count + " (deleted, no automatic ban)")
+            return false
+        }
+        var reason = "Varredura automática de conteúdo suspeito: " + count + " item(ns) em " + String.join(", ", tables) + " (" + String.join(", ", patterns) + "). Conteúdo apagado e conta banida permanentemente."
+        try {
+            var result = panel.sanctionUser(ModerationContentSweep.actor(), profile.username, "PERMABAN", reason)
+            if (result.status != "ALREADY_BANNED") {
+                panel.sanitizeUser(ModerationContentSweep.actor(), profile.username, reason)
+                log.warn("content_sweep_banned hits=" + count)
+                return true
+            }
+        } catch (String e) {
+            log.warn("content_sweep_ban_failed")
+        }
+        return false
+    }
+}
+
+// ModerationCleanupWorker: a report against an author who is already BANNED needs no vote (the decision was taken), and a
+// report whose target no longer exists is closed too: both are dismissed and leave the panel. Runs 2 minutes after boot and
+// every 30 minutes.
+class ModerationCleanup {
+    Log log = Log("moderation.cleanup")
+    ModerationStore reports
+    ModerationService service
+    SanctionGateReader gate
+    public constructor(reports: ModerationStore, service: ModerationService, gate: SanctionGateReader) {
+        this.reports = reports
+        this.service = service
+        this.gate = gate
+    }
+    schedule(jobs: Scheduler, cfg: Config) {
+        var self = this
+        jobs.fixedDelay("moderation-cleanup", cfg.getInt("REDE_MODERATION_CLEANUP_INITIAL_DELAY_MS", 120000) as Long, cfg.getInt("REDE_MODERATION_CLEANUP_DELAY_MS", 1800000) as Long, () -> self.closeReportsAgainstBannedOrRemovedUsers())
+    }
+    // Returns how many reports were closed.
+    Int closeReportsAgainstBannedOrRemovedUsers() {
+        var closed = 0
+        for (var report in reports.findByStatus("PENDING", 200)) {
+            try {
+                var review = service.review(report.id)
+                var banned = review.authorId.length() > 0 && gate.banned(review.authorId)
+                var orphan = review.authorId.length() == 0 && review.content.length() == 0
+                if (!banned && !orphan) {
+                    continue
+                }
+                var note = "Alvo removido — denúncia encerrada automaticamente"
+                if (banned) {
+                    note = "Autor banido — denúncia encerrada automaticamente"
+                }
+                reports.update(ModerationRules.decided(report, "DISMISSED", "sistema", Time.nowIso(), note))
+                closed = closed + 1
+            } catch (String e) {
+                log.warn("cleanup_report_failed id=" + report.id)
+            }
+        }
+        if (closed > 0) {
+            log.info("cleanup_closed count=" + closed)
+        }
+        return closed
+    }
+}

@@ -1,0 +1,200 @@
+package moderation
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+
+record ModerationQuarantineReleased(String postId, Bool released)
+
+record ModerationQuarantineRemoved(String postId, Bool removed)
+
+// HTTP adapter of ModeratorController for the moderator panel: the user's state and application, the report queue and votes,
+// the quarantine, the admin management of applications and moderators, direct sanctions and the sanction proposals.
+class ModerationPanelRoutes {
+    static register(server: HttpServer, panel: ModerationPanel, proposals: ModerationProposals, quarantine: ModerationQuarantine) {
+        server.get("/moderation/me", () -> ModerationPanelRoutes.me(panel))
+        server.post("/moderation/applications", () -> ModerationPanelRoutes.apply(panel))
+        server.get("/moderation/reports", () -> ModerationPanelRoutes.reports(panel))
+        server.post("/moderation/reports/:reportId/vote", () -> ModerationPanelRoutes.vote(panel))
+        server.get("/moderation/quarantine", () -> ModerationPanelRoutes.pendingQuarantine(quarantine))
+        server.post("/moderation/quarantine/:postId/release", () -> ModerationPanelRoutes.release(quarantine))
+        server.post("/moderation/quarantine/:postId/remove", () -> ModerationPanelRoutes.removeQuarantined(quarantine))
+        server.get("/admin/moderator-applications", () -> ModerationPanelRoutes.applications(panel))
+        server.post("/admin/moderator-applications/:applicationId/approve", () -> ModerationPanelRoutes.decide(panel, true))
+        server.post("/admin/moderator-applications/:applicationId/reject", () -> ModerationPanelRoutes.decide(panel, false))
+        server.get("/admin/moderators", () -> ModerationPanelRoutes.moderatorList(panel))
+        server.post("/admin/moderators", () -> ModerationPanelRoutes.appoint(panel))
+        server.post("/admin/moderators/:userId/revoke", () -> ModerationPanelRoutes.revoke(panel))
+        server.post("/admin/users/:username/sanction", () -> ModerationPanelRoutes.sanction(panel))
+        server.post("/admin/users/:username/sanitize", () -> ModerationPanelRoutes.sanitize(panel))
+        server.get("/moderation/sanction-proposals", () -> ModerationPanelRoutes.pendingProposals(proposals))
+        server.post("/moderation/sanction-proposals", () -> ModerationPanelRoutes.propose(proposals))
+        server.post("/moderation/sanction-proposals/:proposalId/vote", () -> ModerationPanelRoutes.voteProposal(proposals))
+        server.post("/admin/sanction-proposals/:proposalId/cancel", () -> ModerationPanelRoutes.cancelProposal(proposals))
+    }
+    static Bool isAdmin(userId: String) {
+        var guard = Auth.adminGuard
+        if (guard == null) {
+            return false
+        }
+        return guard.isAdmin(userId)
+    }
+    // An optional body (`@RequestBody(required = false)`): empty means no note.
+    static ModerationDecisionBody optionalNote() {
+        var text = Req.bodyText()
+        if (text.trim().length() == 0) {
+            return ModerationDecisionBody(null)
+        }
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<ModerationDecisionBody>(text)
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static String me(panel: ModerationPanel) {
+        var userId = Auth.requireUser()
+        return json.encode(panel.me(userId, ModerationPanelRoutes.isAdmin(userId)))
+    }
+    static String apply(panel: ModerationPanel) {
+        var userId = Auth.requireUser()
+        SafeLinks.checkRequest()
+        ModerationApplicationBody body
+        try {
+            body = json.decode<ModerationApplicationBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        return json.encode(panel.apply(userId, body.motivation, body.experience, body.availability))
+    }
+    static String reports(panel: ModerationPanel) {
+        var userId = Auth.requireModerator()
+        return json.encode(panel.panelReports(userId, Req.queryInt("limit", 20)))
+    }
+    static String vote(panel: ModerationPanel) {
+        var userId = Auth.requireModerator()
+        SafeLinks.checkRequest()
+        ModerationVoteBody body
+        try {
+            body = json.decode<ModerationVoteBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        var type = body.vote
+        if (type != null && !ModerationModeratorRules.voteTypes().contains(type)) {
+            throw Errors.badRequest()
+        }
+        return json.encode(panel.vote(Req.pathParam("reportId"), userId, type, body.note))
+    }
+    static String pendingQuarantine(quarantine: ModerationQuarantine) {
+        Auth.requireModerator()
+        return json.encode(quarantine.pending(Req.queryInt("limit", 50)))
+    }
+    static String release(quarantine: ModerationQuarantine) {
+        var userId = Auth.requireModerator()
+        var postId = Req.pathParam("postId")
+        return json.encode(ModerationQuarantineReleased(postId, quarantine.release(userId, postId)))
+    }
+    static String removeQuarantined(quarantine: ModerationQuarantine) {
+        var userId = Auth.requireModerator()
+        var postId = Req.pathParam("postId")
+        return json.encode(ModerationQuarantineRemoved(postId, quarantine.remove(userId, postId)))
+    }
+    static String applications(panel: ModerationPanel) {
+        Auth.requireAdmin()
+        var status = Req.queryStr("status", "PENDING")
+        if (!ModerationModeratorRules.applicationStatuses().contains(status)) {
+            throw Errors.badRequest()
+        }
+        return json.encode(panel.applicationsOfStatus(status, Req.queryInt("limit", 50)))
+    }
+    static String decide(panel: ModerationPanel, approve: Bool) {
+        var admin = Auth.requireAdmin()
+        var body = ModerationPanelRoutes.optionalNote()
+        return json.encode(panel.decideApplication(Req.pathParam("applicationId"), admin, approve, body.note))
+    }
+    static String moderatorList(panel: ModerationPanel) {
+        Auth.requireAdmin()
+        return json.encode(panel.approvedModerators(Req.queryInt("limit", 200)))
+    }
+    static String appoint(panel: ModerationPanel) {
+        var admin = Auth.requireAdmin()
+        ModerationAppointBody body
+        try {
+            body = json.decode<ModerationAppointBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        return json.encode(panel.appoint(body.username, admin, body.note))
+    }
+    static String revoke(panel: ModerationPanel) {
+        var admin = Auth.requireAdmin()
+        var body = ModerationPanelRoutes.optionalNote()
+        return json.encode(panel.revoke(Req.pathParam("userId"), admin, body.note))
+    }
+    static String? sanctionType(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        var t = raw.trim().toUpperCase()
+        if (!ModerationSanctions.types().contains(t)) {
+            throw Errors.badRequest()
+        }
+        return t
+    }
+    static String sanction(panel: ModerationPanel) {
+        var userId = Auth.requireModerator()
+        SafeLinks.checkRequest()
+        ModerationSanctionBody body
+        try {
+            body = json.decode<ModerationSanctionBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        return json.encode(panel.sanctionUser(userId, Req.pathParam("username"), ModerationPanelRoutes.sanctionType(body.type), body.reason))
+    }
+    static String sanitize(panel: ModerationPanel) {
+        var userId = Auth.requireModerator()
+        var body = ModerationPanelRoutes.optionalNote()
+        var reason = body.note
+        if (reason == null) {
+            reason = "Limpeza por spam (motivo não informado)"
+        }
+        return json.encode(panel.sanitizeUser(userId, Req.pathParam("username"), reason))
+    }
+    static String pendingProposals(proposals: ModerationProposals) {
+        var userId = Auth.requireModerator()
+        return json.encode(proposals.pending(userId, Req.queryInt("limit", 50)))
+    }
+    static String propose(proposals: ModerationProposals) {
+        var userId = Auth.requireModerator()
+        SafeLinks.checkRequest()
+        ModerationProposalBody body
+        try {
+            body = json.decode<ModerationProposalBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        return json.encode(proposals.propose(userId, body.username, ModerationPanelRoutes.sanctionType(body.type), body.reason))
+    }
+    static String voteProposal(proposals: ModerationProposals) {
+        var userId = Auth.requireModerator()
+        SafeLinks.checkRequest()
+        ModerationProposalVoteBody body
+        try {
+            body = json.decode<ModerationProposalVoteBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        var vote = body.vote
+        if (vote != null && vote != "APPROVE" && vote != "REJECT") {
+            throw Errors.badRequest()
+        }
+        return json.encode(proposals.vote(Req.pathParam("proposalId"), userId, vote, body.note))
+    }
+    static String cancelProposal(proposals: ModerationProposals) {
+        var admin = Auth.requireAdmin()
+        return json.encode(proposals.cancel(Req.pathParam("proposalId"), admin))
+    }
+}

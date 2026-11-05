@@ -1,0 +1,194 @@
+package moderation
+
+import identity.*
+import kernel.db.*
+import kernel.error.*
+import kernel.id.*
+import kernel.log.*
+import kernel.security.*
+import kernel.time.*
+import ops.*
+import profile.*
+
+// What follows a stored report beyond the queue: the sexual-content flow (post taken down at once, the bot decides first)
+// listens here. A concrete class with a no-op default (G30); the automation sub-area subclasses it.
+class ModerationReportEvents {
+    public constructor() {}
+    reportCreated(report: ModerationReport);
+}
+
+// ModerationService: opening reports (people and the automations), the reporter's own list and the review snapshot.
+// The decisions on a report (approve, dismiss, warn, penalize, ban, remove company) live in ModerationDecisions.
+class ModerationService {
+    Db database
+    ModerationStore reports
+    ModerationTargets targets
+    ActionThrottle throttle
+    MailService mail
+    ProfileDirectory profiles
+    ModerationReportEvents events
+    String supportEmail
+    String frontendUrl
+    Int reportsPerHour
+    Log log = Log("moderation.service")
+    public constructor(database: Db, reports: ModerationStore, targets: ModerationTargets, throttle: ActionThrottle, mail: MailService, profiles: ProfileDirectory, events: ModerationReportEvents, supportEmail: String, frontendUrl: String, reportsPerHour: Int) {
+        this.database = database
+        this.reports = reports
+        this.targets = targets
+        this.throttle = throttle
+        this.mail = mail
+        this.profiles = profiles
+        this.events = events
+        this.supportEmail = supportEmail
+        this.frontendUrl = ModerationService.withoutTrailingSlash(frontendUrl)
+        this.reportsPerHour = reportsPerHour
+    }
+    static String withoutTrailingSlash(url: String) {
+        if (url.endsWith("/")) {
+            return url.substring(0, url.length() - 1)
+        }
+        return url
+    }
+    // Validates the target and reason (400), dedupes by reporter and target (409), stores, tells support (best effort).
+    ModerationReport report(reporterId: String, targetType: String?, targetId: String?, reason: String?, description: String?) {
+        // A ceiling per account: mass reporting (coordination) stops being cheap. A limit of frequency, not of content.
+        throttle.requireAllowed("report", reporterId, reportsPerHour, 3600000L)
+        ModerationService.requireFields(targetType, targetId, reason)
+        var type = ModerationService.orEmpty(targetType)
+        var target = ModerationService.orEmpty(targetId)
+        if (reports.existsByReporterAndTarget(reporterId, type, target)) {
+            throw Errors.api(409, "ALREADY_REPORTED", "Voce ja denunciou este conteudo.")
+        }
+        return this.open(reporterId, type, target, ModerationService.orEmpty(reason), ModerationService.orEmpty(description))
+    }
+    // A report the system itself opens (barrier automations). No per-account ceiling (the ceiling restrains people, not the
+    // defense of the network); one queue per target: null when the system already opened one.
+    ModerationReport? systemReport(targetType: String?, targetId: String?, reason: String?, description: String?) {
+        ModerationService.requireFields(targetType, targetId, reason)
+        var type = ModerationService.orEmpty(targetType)
+        var target = ModerationService.orEmpty(targetId)
+        if (reports.existsByReporterAndTarget(ModerationRules.systemReporter(), type, target)) {
+            return null
+        }
+        return this.open(ModerationRules.systemReporter(), type, target, ModerationService.orEmpty(reason), ModerationService.orEmpty(description))
+    }
+    ModerationReport open(reporterId: String, type: String, target: String, reason: String, description: String) {
+        var report = ModerationReport(Ids.prefixed("report_"), reporterId, type, target, reason, description, "PENDING", Time.nowIso(), null, null, null, null, null, null, null, null)
+        reports.insert(report)
+        this.notifySupport(report)
+        events.reportCreated(report)
+        return report
+    }
+    static requireFields(targetType: String?, targetId: String?, reason: String?) {
+        var type = ModerationService.orEmpty(targetType)
+        var id = ModerationService.orEmpty(targetId)
+        var why = ModerationService.orEmpty(reason)
+        if (type.trim().length() == 0) {
+            throw Errors.api(400, "INVALID_TARGET_TYPE", "Tipo do alvo da denuncia e obrigatorio.")
+        }
+        if (id.trim().length() == 0) {
+            throw Errors.api(400, "INVALID_TARGET_ID", "Alvo da denuncia e obrigatorio.")
+        }
+        if (why.trim().length() == 0) {
+            throw Errors.api(400, "INVALID_REASON", "Motivo da denuncia e obrigatorio.")
+        }
+        // An unknown constant is a body Jackson cannot read.
+        if (!ModerationRules.targetTypes().contains(type) || !ModerationRules.reasons().contains(why)) {
+            throw Errors.badRequest()
+        }
+    }
+    static String orEmpty(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    // The reporter's own reports, newest first. Nothing about third parties.
+    List<ModerationReport> reportsOf(reporterId: String, limit: Int) {
+        var cap = limit
+        if (cap < 1) {
+            cap = 1
+        }
+        return reports.findByReporter(reporterId, cap)
+    }
+    List<ModerationReport> listPending(limit: Int) = reports.findByStatus("PENDING", limit)
+    ModerationReport requireReport(reportId: String) {
+        var r = reports.findById(reportId)
+        if (r == null) {
+            throw Errors.api(404, "REPORT_NOT_FOUND", "Denuncia nao encontrada.")
+        }
+        return r
+    }
+    // The full snapshot of a report for the review panel opened from the e-mail: who, who, what.
+    ModerationReviewView review(reportId: String) {
+        var report = this.requireReport(reportId)
+        var authorId = targets.authorOf(report.targetType, report.targetId)
+        var content = targets.contentOf(report.targetType, report.targetId)
+        var author = ""
+        var authorKey = ""
+        if (authorId != null) {
+            author = this.describeUser(authorId)
+            authorKey = authorId
+        }
+        return ModerationReviewView(ModerationRules.view(report), this.describeUser(report.reporterId), authorKey, author, ModerationService.orEmpty(content))
+    }
+    String describeUser(userId: String) {
+        var p = profiles.findById(userId)
+        if (p == null) {
+            return userId
+        }
+        return p.displayWithNickname() + " (@" + p.username + ", id " + userId + ")"
+    }
+    static String truncate(value: String, max: Int) {
+        if (value.length() <= max) {
+            return value
+        }
+        return value.substring(0, max) + "… [cortado]"
+    }
+    // The support notice is best effort: the report is already saved, a mail failure loses nothing.
+    notifySupport(report: ModerationReport) {
+        if (supportEmail.trim().length() == 0) {
+            return
+        }
+        try {
+            mail.sendHtml(supportEmail, "[Denúncia " + report.id + "] " + report.reason + " em " + report.targetType, this.supportBody(report), "HTML")
+        } catch (String failure) {
+            log.warn("support_notice_failed report=" + report.id)
+        }
+    }
+    String supportBody(report: ModerationReport) {
+        var reporter = IdentityMailer.escapeHtml(this.describeUser(report.reporterId))
+        var authorId = targets.authorOf(report.targetType, report.targetId)
+        var reported = IdentityMailer.escapeHtml("(autor nao identificado para este alvo)")
+        if (authorId != null) {
+            reported = IdentityMailer.escapeHtml(this.describeUser(authorId))
+        }
+        var content = targets.contentOf(report.targetType, report.targetId)
+        var body = "<h2 style=\"margin:0 0 12px\">Denúncia recebida</h2>"
+        body = body + "<ul><li><b>Denunciante:</b> " + reporter + "</li><li><b>Denunciado:</b> " + reported + "</li>"
+        body = body + "<li><b>Tipo da denúncia:</b> " + report.reason + " (alvo: " + report.targetType + ")</li>"
+        body = body + "<li><b>ID da denúncia:</b> " + report.id + "</li></ul>"
+        if (content != null) {
+            if (report.targetType == "COMPANY") {
+                body = body + "<p><b>O que a página diz sobre si:</b></p>"
+            }
+            else {
+                body = body + "<p><b>Conteúdo do post denunciado:</b></p>"
+            }
+            body = body + "<blockquote style=\"margin:8px 0;padding:8px 12px;border-left:3px solid #ccc;white-space:pre-wrap\">" + IdentityMailer.escapeHtml(ModerationService.truncate(content, 2000)) + "</blockquote>"
+        }
+        if (report.description.trim().length() > 0) {
+            body = body + "<p><b>Relato de quem denunciou:</b> " + IdentityMailer.escapeHtml(report.description) + "</p>"
+        }
+        var base = frontendUrl + "/moderacao/" + report.id
+        body = body + "<p style=\"margin-top:16px\"><b>Ações rápidas</b> (abrem o painel; a ação é confirmada lá, com a sua sessão de admin):</p><ul>"
+        if (report.targetType == "COMPANY") {
+            // A company page has its own action: offering the post and ban actions led to a path the server refuses.
+            body = body + "<li><a href=\"" + base + "?acao=empresa\">Remover a página</a></li><li><a href=\"" + base + "?acao=avisar\">Avisar o dono</a></li>"
+        }
+        else {
+            body = body + "<li><a href=\"" + base + "?acao=penalizar\">Penalizar o autor</a></li><li><a href=\"" + base + "?acao=avisar\">Avisar o autor</a></li><li><a href=\"" + base + "?acao=excluir\">Excluir o post</a></li><li><a href=\"" + base + "?acao=banir\">Banir o autor</a></li>"
+        }
+        return body + "</ul>"
+    }
+}

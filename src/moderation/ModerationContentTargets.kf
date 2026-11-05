@@ -1,0 +1,104 @@
+package moderation
+
+import kernel.config.*
+
+// One table the content sweep looks at: owner column, id column, text columns and date column.
+record ModerationContentTarget(String table, String authorColumn, String idColumn, List<String> textColumns, String createdColumn)
+
+// Where the suspicious-content sweep and the ban purge look (SuspiciousContentTargets). Format of the targets setting,
+// separated by `;`: `table:owner_column:id_column:text1|text2:date_column`. Identifiers are validated as names; the SQL is
+// built from them only, never from user text.
+class ModerationContentTargets {
+    Bool enabled
+    Bool dryRun
+    List<String> patterns
+    List<ModerationContentTarget> targets
+    Long sinceHours
+    Int maxRowsPerTarget
+    public constructor(enabled: Bool, dryRun: Bool, patterns: String, targets: String, sinceHours: Long, maxRowsPerTarget: Int) {
+        this.enabled = enabled
+        this.dryRun = dryRun
+        this.patterns = ModerationContentTargets.parsePatterns(patterns)
+        this.targets = ModerationContentTargets.parseTargets(targets)
+        this.sinceHours = ModerationContentTargets.clampLong(sinceHours, 1L, 720L)
+        this.maxRowsPerTarget = ModerationContentTargets.clampInt(maxRowsPerTarget, 1, 500)
+    }
+    static ModerationContentTargets fromConfig(cfg: Config) = ModerationContentTargets(cfg.getBool("REDE_MODERATION_CONTENT_SWEEP_ENABLED", true), cfg.getBool("REDE_MODERATION_CONTENT_SWEEP_DRY_RUN", false), cfg.getStr("CONTENT_SWEEP_PATTERNS", ModerationContentTargets.defaultPatterns()), cfg.getStr("CONTENT_SWEEP_TARGETS", ModerationContentTargets.defaultTargets()), cfg.getInt("REDE_MODERATION_CONTENT_SWEEP_SINCE_HOURS", 48) as Long, cfg.getInt("REDE_MODERATION_CONTENT_SWEEP_MAX_ROWS_PER_TARGET", 50))
+    static String defaultPatterns() = "probe,idor,redteam,red team,duplo aceite,reembolso integral,teste de escrow,autorizacao de objetos,contrato para testar,msm"
+    static String defaultTargets() = "service_listings:seller_id:id:title|description:created_at;service_requests:requester_id:id:title|description:created_at;communities:created_by:id:name|description:created_at;events:created_by:id:title|host:created_at;freelances:user_id:id:title|scope:created_at"
+    static Long clampLong(v: Long, lo: Long, hi: Long) {
+        if (v < lo) {
+            return lo
+        }
+        if (v > hi) {
+            return hi
+        }
+        return v
+    }
+    static Int clampInt(v: Int, lo: Int, hi: Int) {
+        if (v < lo) {
+            return lo
+        }
+        if (v > hi) {
+            return hi
+        }
+        return v
+    }
+    static Bool identifier(name: String) {
+        if (name.length() == 0) {
+            return false
+        }
+        var i = 0
+        while (i < name.length()) {
+            var c = name.substring(i, i + 1)
+            var letter = "abcdefghijklmnopqrstuvwxyz_".contains(c)
+            var digit = "0123456789".contains(c)
+            if (!letter && !(digit && i > 0)) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    static List<String> parsePatterns(raw: String) {
+        var out = listOf<String>()
+        if (raw.trim().length() == 0) {
+            return out
+        }
+        for (var p in raw.split(",")) {
+            var clean = p.trim().toLowerCase()
+            if (clean.length() > 0) {
+                out.add(clean)
+            }
+        }
+        return out
+    }
+    static List<ModerationContentTarget> parseTargets(raw: String) {
+        var out = listOf<ModerationContentTarget>()
+        if (raw.trim().length() == 0) {
+            return out
+        }
+        for (var entry in raw.split(";")) {
+            var parts = entry.trim().split(":")
+            if (parts.length != 5) {
+                continue
+            }
+            var table = parts[0].trim()
+            var author = parts[1].trim()
+            var id = parts[2].trim()
+            var created = parts[4].trim()
+            var texts = listOf<String>()
+            for (var t in parts[3].split("\\|")) {
+                var clean = t.trim()
+                if (ModerationContentTargets.identifier(clean)) {
+                    texts.add(clean)
+                }
+            }
+            if (texts.size() == 0 || !ModerationContentTargets.identifier(table) || !ModerationContentTargets.identifier(author) || !ModerationContentTargets.identifier(id) || !ModerationContentTargets.identifier(created)) {
+                continue
+            }
+            out.add(ModerationContentTarget(table, author, id, texts, created))
+        }
+        return out
+    }
+}

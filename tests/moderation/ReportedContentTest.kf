@@ -1,0 +1,37 @@
+import kernel.testkit.*
+import moderation.*
+
+// Port of ReportedContentAdapterTests (what the triage receives as the content of a reported target) through the
+// ModerationTargets reader, plus the BanCleanupService test of QuestionAcceptedAnswerTests.
+test "the reader gives the post text, the page html, the comment text and the profile" {
+    var author = ModerationTestKit.login("user_reported_content1")
+    var targets = ModerationTestKit.module().targets
+    var postId = ModerationTestKit.publish(author, "Compre seguidores barato no meu site")
+    Check.isTrue("post text", ModerationTestKit.str2(targets.contentOf("POST", postId)).contains("Compre seguidores barato no meu site"))
+    var page = ModerationTestKit.post(author, "/feed/posts", "{\"topic\":\"TECNOLOGIA\",\"type\":\"PAGE\",\"content\":\"Titulo da pagina\",\"pageHtml\":\"<h1>corpo da pagina denunciada</h1>\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(page, 201)
+    var pageText = ModerationTestKit.str2(targets.contentOf("POST", ModerationTestKit.str(page, "id")))
+    Check.isTrue("page html", pageText.contains("corpo da pagina denunciada") && pageText.contains("Titulo da pagina"))
+    var commentId = ModerationTestKit.comment(author, postId, "seu idiota, some daqui", null)
+    Check.isTrue("comment text", ModerationTestKit.str2(targets.contentOf("COMMENT", commentId)).contains("seu idiota"))
+    Check.isTrue("profile", ModerationTestKit.str2(targets.contentOf("USER", author)).contains("user_reported_content1"))
+    Check.isTrue("job has no text", targets.contentOf("JOB", "job_inexistente") == null)
+    Check.isTrue("missing post", targets.contentOf("POST", "post_inexistente") == null)
+}
+
+test "the ban cleanup removing the accepted answer reopens the question" {
+    var asker = ModerationTestKit.login("qaa_asker12")
+    var helper = ModerationTestKit.login("qaa_helper12")
+    var created = ModerationTestKit.post(asker, "/feed/posts", "{\"topic\":\"TECNOLOGIA\",\"type\":\"QUESTION\",\"content\":\"Duvida respondida por conta banida\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(created, 201)
+    var questionId = ModerationTestKit.str(created, "id")
+    var answerId = ModerationTestKit.comment(helper, questionId, "Resposta de quem vai ser banido", null)
+    var accepted = ModerationTestKit.post(asker, "/feed/posts/" + questionId + "/accepted-answer", "{\"commentId\":\"" + answerId + "\"}")
+    Check.status(accepted, 200)
+    ModerationTestKit.module().banCleanup.cleanup("sanc_qaa12", helper)
+    var read = ModerationTestKit.get(asker, "/feed/posts/" + questionId)
+    Check.status(read, 200)
+    Check.isTrue("accepted answer cleared", !read.jsonHas("acceptedCommentId") || read.jsonIsNull("acceptedCommentId"))
+    Check.jsonEq(read, "resolved", "false")
+    ModerationTestKit.finish()
+}

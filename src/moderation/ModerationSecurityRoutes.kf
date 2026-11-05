@@ -1,0 +1,134 @@
+package moderation
+
+import feed.*
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+
+record ModerationSuspiciousPostView(String postId, String reportId, Int score, String reason, String? preTriage)
+
+record ModerationBulkDeleteBody(List<String>? postIds, String? reason)
+
+record ModerationBulkDeleteItem(String postId, String status)
+
+record ModerationBulkDeleteResult(Int total, List<ModerationBulkDeleteItem> items)
+
+// HTTP adapter for the account and post cleanup tools of the moderation team: the IP block list, the suspicious accounts
+// queue with the bulk ban, and the suspicious posts queue with the bulk delete (ModeratorController, ReportController).
+class ModerationBulkDelete {
+    static String reasonOf(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v.trim()
+    }
+}
+
+class ModerationSecurityRoutes {
+    static register(server: HttpServer, ipBlocks: ModerationIpBlocks, suspects: ModerationSuspiciousUserService, bulkBan: ModerationBulkBan, store: ModerationStore, feed: FeedModeration, autoBan: ModerationAutoBan) {
+        server.get("/admin/users/:username/ips", () -> ModerationSecurityRoutes.userIps(ipBlocks))
+        server.post("/admin/blocked-ips", () -> ModerationSecurityRoutes.blockIp(ipBlocks))
+        server.get("/admin/blocked-ips", () -> ModerationSecurityRoutes.blockedIps(ipBlocks))
+        server.post("/admin/blocked-ips/:ip/unblock", () -> ModerationSecurityRoutes.unblock(ipBlocks))
+        server.get("/moderation/users/suspicious", () -> ModerationSecurityRoutes.suspiciousUsers(suspects))
+        server.post("/moderation/users/bulk-ban", () -> ModerationSecurityRoutes.bulkBan(bulkBan))
+        server.get("/admin/automod/status", () -> ModerationSecurityRoutes.automodStatus(autoBan))
+        server.get("/moderation/posts/suspicious", () -> ModerationSecurityRoutes.suspiciousPosts(store))
+        server.post("/moderation/posts/bulk-delete", () -> ModerationSecurityRoutes.bulkDelete(feed))
+    }
+    static String automodStatus(autoBan: ModerationAutoBan) {
+        Auth.requireAdmin()
+        return json.encode(autoBan.status())
+    }
+    static String userIps(ipBlocks: ModerationIpBlocks) {
+        Auth.requireModerator()
+        return json.encode(ipBlocks.ipsOfUser(Req.pathParam("username")))
+    }
+    static String blockIp(ipBlocks: ModerationIpBlocks) {
+        var userId = Auth.requireModerator()
+        SafeLinks.checkRequest()
+        ModerationBlockIpBody body
+        try {
+            body = json.decode<ModerationBlockIpBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        return json.encode(ipBlocks.block(userId, body.ip, body.reason))
+    }
+    static String blockedIps(ipBlocks: ModerationIpBlocks) {
+        Auth.requireModerator()
+        return json.encode(ipBlocks.list(Req.queryInt("limit", 100)))
+    }
+    static String unblock(ipBlocks: ModerationIpBlocks) {
+        Auth.requireModerator()
+        var ip = Req.pathParam("ip")
+        ipBlocks.unblock(ip)
+        return json.encode(ModerationIpUnblocked(ip, "false"))
+    }
+    static String suspiciousUsers(suspects: ModerationSuspiciousUserService) {
+        Auth.requireModerator()
+        return json.encode(suspects.list(Req.queryInt("limit", 100), Req.queryInt("days", 30)))
+    }
+    static String bulkBan(bulkBan: ModerationBulkBan) {
+        var userId = Auth.requireModerator()
+        SafeLinks.checkRequest()
+        ModerationBulkBanBody body
+        try {
+            body = json.decode<ModerationBulkBanBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        return json.encode(bulkBan.ban(userId, body.usernames, ModerationPanelRoutes.sanctionType(body.type), body.reason))
+    }
+    static String suspiciousPosts(store: ModerationStore) {
+        Auth.requireModerator()
+        var minScore = ModerationContentTargets.clampInt(Req.queryInt("minScore", 30), 0, 1000000)
+        var limit = ModerationContentTargets.clampInt(Req.queryInt("limit", 50), 1, 200)
+        var out = listOf<ModerationSuspiciousPostView>()
+        for (var r in store.findPendingPostsByScore(minScore, limit)) {
+            var score = r.preTriageScore
+            var shown = 0
+            if (score != null) {
+                shown = score
+            }
+            out.add(ModerationSuspiciousPostView(r.targetId, r.id, shown, r.reason, r.preTriage))
+        }
+        return json.encode(out)
+    }
+    // Soft delete with audit of the selected suspicious posts; one failure never stops the others.
+    static String bulkDelete(feed: FeedModeration) {
+        var userId = Auth.requireModerator()
+        SafeLinks.checkRequest()
+        ModerationBulkDeleteBody body
+        try {
+            body = json.decode<ModerationBulkDeleteBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+        var postIds = ModerationBulkBan.namesOf(body.postIds)
+        if (postIds.size() == 0) {
+            throw Errors.api(400, "NO_POSTS_SELECTED", "Selecione pelo menos um post.")
+        }
+        var reason = ModerationBulkDelete.reasonOf(body.reason)
+        if (reason.length() < 10) {
+            throw Errors.api(400, "REASON_REQUIRED", "Explique o motivo da exclusão (pelo menos 10 caracteres).")
+        }
+        var ids = listOf<String>()
+        for (var id in postIds) {
+            if (id != null && id.trim().length() > 0 && !ids.contains(id.trim()) && ids.size() < 100) {
+                ids.add(id.trim())
+            }
+        }
+        var items = listOf<ModerationBulkDeleteItem>()
+        for (var id in ids) {
+            try {
+                feed.removeAsModerator(userId, id, "ADMIN:" + reason)
+                items.add(ModerationBulkDeleteItem(id, "DELETED"))
+            } catch (String e) {
+                items.add(ModerationBulkDeleteItem(id, "FAILED"))
+            }
+        }
+        return json.encode(ModerationBulkDeleteResult(items.size(), items))
+    }
+}

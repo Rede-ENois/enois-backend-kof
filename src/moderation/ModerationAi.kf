@@ -1,0 +1,227 @@
+package moderation
+
+import kernel.config.*
+import kernel.http.*
+import kernel.jobs.*
+import kernel.log.*
+import kernel.time.*
+
+// The wire to the LLM (chat completions). A concrete class so a test subclasses it and answers a canned reply (no network);
+// the default goes through kernel.http.Outbound. Returns the reply body of a 2xx, null otherwise (unreachable, error status).
+class ModerationLlmTransport {
+    public constructor() {}
+    String? complete(baseUrl: String, apiKey: String, body: String) {
+        var reply = Outbound.attempt("POST", baseUrl + "/chat/completions", listOf("Content-Type: application/json", "User-Agent: enois-moderacao/1.0", "Authorization: Bearer " + apiKey), body, 30000)
+        if (reply.status / 100 != 2) {
+            return null
+        }
+        return reply.body
+    }
+}
+
+// The images of a reported target for the vision call, as base64 JPEG (ReportedMediaReader). The media domain owns the
+// real reader (wiring sub-area); the default has none.
+class ModerationImages {
+    public constructor() {}
+    List<String> imagesOf(targetType: String, targetId: String, max: Int) = listOf<String>()
+}
+
+record ModerationChatMessage(String? content)
+
+record ModerationChatChoice(ModerationChatMessage? message)
+
+record ModerationChatReply(List<ModerationChatChoice>? choices)
+
+// ModerationAiService: report triage by an LLM. The model only leaves a recorded guess; it never executes anything. A verdict
+// that is not valid JSON, out of the policy or a PENALIZAR below the gate is dropped and the report stays for a human.
+class ModerationAi {
+    ModerationStore reports
+    ModerationTargets targets
+    ModerationImages images
+    ModerationLlmTransport transport
+    String baseUrl
+    String apiKey
+    String model
+    Log log = Log("moderation.ai")
+    public constructor(reports: ModerationStore, targets: ModerationTargets, images: ModerationImages, transport: ModerationLlmTransport, baseUrl: String, apiKey: String, model: String) {
+        this.reports = reports
+        this.targets = targets
+        this.images = images
+        this.transport = transport
+        this.baseUrl = ModerationService.withoutTrailingSlash(baseUrl)
+        this.apiKey = apiKey
+        this.model = model
+    }
+    static ModerationAi fromConfig(cfg: Config, reports: ModerationStore, targets: ModerationTargets, images: ModerationImages, transport: ModerationLlmTransport) = ModerationAi(reports, targets, images, transport, cfg.getStr("MODERATION_LLM_BASE_URL", "https://infer.flatt.com.br/v1"), cfg.getStr("MODERATION_LLM_API_KEY", ""), cfg.getStr("MODERATION_LLM_MODEL", "qwen3.8-27b"))
+    static Int maxReportImages() = 2
+    Bool available() = apiKey.trim().length() > 0
+    // The report prompt: the CONTENT of the target enters (post, comment or profile), never its id; no readable content becomes
+    // "(conteudo indisponivel)" so the model hands it to a human instead of judging an identifier.
+    String reportUserPrompt(report: ModerationReport) {
+        var content = targets.contentOf(report.targetType, report.targetId)
+        var text = "(conteudo indisponivel)"
+        if (content != null) {
+            text = content
+        }
+        return ModerationPrompts.user(text, report.reason, report.description)
+    }
+    List<String> reportImages(report: ModerationReport) {
+        try {
+            return images.imagesOf(report.targetType, report.targetId, ModerationAi.maxReportImages())
+        } catch (String e) {
+            return listOf<String>()
+        }
+    }
+    // Plain string content without images (the format the endpoint always got); with images the user content becomes the
+    // parts list of the vision protocol, text first, each image as a JPEG data URL.
+    String requestBody(systemInstruction: String, userText: String, base64Images: List<String>) {
+        var userContent = json.encode(userText)
+        if (base64Images.size() > 0) {
+            var parts = listOf("{\"type\":\"text\",\"text\":" + json.encode(userText) + "}")
+            for (var image in base64Images) {
+                parts.add("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64," + image + "\"}}")
+            }
+            userContent = "[" + String.join(",", parts) + "]"
+        }
+        return "{\"model\":" + json.encode(model) + ",\"messages\":[{\"role\":\"system\",\"content\":" + json.encode(systemInstruction) + "},{\"role\":\"user\",\"content\":" + userContent + "}],\"temperature\":0.1}"
+    }
+    // A call with its own instruction (the image classifier has another contract). Empty/error = no guess (null).
+    String? triageVision(systemInstruction: String, userText: String, base64Images: List<String>) {
+        if (!this.available()) {
+            return null
+        }
+        try {
+            var reply = transport.complete(baseUrl, apiKey, this.requestBody(systemInstruction, userText, base64Images))
+            if (reply == null) {
+                return null
+            }
+            var found = json.decode<ModerationChatReply>(reply).choices
+            if (found == null) {
+                return null
+            }
+            List<ModerationChatChoice> choices = found
+            if (choices.size() == 0) {
+                return null
+            }
+            var message = choices.get(0).message
+            if (message == null) {
+                return null
+            }
+            var content = message.content
+            if (content == null) {
+                return null
+            }
+            String text = content
+            if (text.trim().length() == 0) {
+                return null
+            }
+            return text
+        } catch (String e) {
+            return null
+        }
+    }
+    String? triage(userText: String, base64Images: List<String>) = this.triageVision(ModerationPrompts.system(), userText, base64Images)
+    // Extracts and validates the guess JSON. PENALIZAR passes only above the confidence floor and unambiguous; any other action
+    // or a missing/out-of-range confidence invalidates the whole verdict (fail-safe: the report goes to a human).
+    ModerationVerdict? parseVerdict(modelOutput: String?) {
+        if (modelOutput == null) {
+            return null
+        }
+        String output = modelOutput
+        if (output.trim().length() == 0) {
+            return null
+        }
+        var verdict = ModerationVerdicts.parse(output)
+        if (verdict == null) {
+            return null
+        }
+        var confidence = verdict.confianca
+        if (confidence == null || confidence < 0.0 || confidence > 1.0) {
+            return null
+        }
+        var action = verdict.acao
+        if (action == null) {
+            return null
+        }
+        if (action == "NENHUMA" || action == "HUMAN_REVIEW") {
+            return verdict
+        }
+        if (action == "PENALIZAR" && ModerationVerdicts.canAutoPenalize(verdict)) {
+            return verdict
+        }
+        return null
+    }
+    // Triages the PENDING reports without a guess: calls the LLM for each and attaches the validated JSON. The scan window is
+    // wider than the batch so low-score reports at the head of the queue cannot starve a newer high-score one.
+    Int triagePendingReports(limit: Int, preTriage: ModerationPreTriageService) {
+        var scan = ModerationContentTargets.clampInt(limit * 10, 50, 200)
+        var triaged = 0
+        for (var report in reports.findPendingWithoutAiTriage(scan)) {
+            if (triaged >= limit) {
+                break
+            }
+            if (!preTriage.shouldCallAi(report)) {
+                continue
+            }
+            var output = this.triage(this.reportUserPrompt(report), this.reportImages(report))
+            if (output == null) {
+                continue
+            }
+            String raw = output
+            if (this.parseVerdict(raw) == null) {
+                continue
+            }
+            reports.saveAiTriage(report.id, raw.trim(), Time.nowIso())
+            triaged = triaged + 1
+        }
+        return triaged
+    }
+}
+
+// ReportAiTriageScheduler: pre-triage first (a report without signals costs no LLM call), then the LLM triage, then the
+// application of the verdicts that passed the gate.
+class ModerationTriageJob {
+    ModerationAi ai
+    ModerationPreTriageService preTriage
+    ModerationVerdicts verdicts
+    Bool enabled
+    Bool autoPenalty
+    Log log = Log("moderation.triage")
+    public constructor(ai: ModerationAi, preTriage: ModerationPreTriageService, verdicts: ModerationVerdicts, enabled: Bool, autoPenalty: Bool) {
+        this.ai = ai
+        this.preTriage = preTriage
+        this.verdicts = verdicts
+        this.enabled = enabled
+        this.autoPenalty = autoPenalty
+    }
+    schedule(jobs: Scheduler) {
+        var self = this
+        jobs.fixedDelay("moderation-ai-triage", 30000L, 60000L, () -> self.triagePending())
+    }
+    triagePending() {
+        if (!enabled) {
+            return
+        }
+        try {
+            var scored = preTriage.preTriagePending(50)
+            if (scored > 0) {
+                log.info("reports_pretriaged count=" + scored)
+            }
+            if (!ai.available()) {
+                return
+            }
+            var triaged = ai.triagePendingReports(10, preTriage)
+            if (triaged > 0) {
+                log.info("reports_ai_triaged count=" + triaged)
+            }
+            if (autoPenalty) {
+                var penalized = verdicts.applyPendingVerdicts(10)
+                if (penalized > 0) {
+                    log.info("reports_auto_penalized count=" + penalized)
+                }
+            }
+        } catch (String e) {
+            log.warn("ai_triage_failed")
+        }
+    }
+}

@@ -1,0 +1,125 @@
+package moderation
+
+import kernel.db.*
+import kernel.time.*
+import profile.*
+
+record ModerationScore(Int score, List<String> signals)
+
+// ReportPreTriageService: a deterministic score of each pending report from objective signals (reason, repeated target, new
+// author, detailed report, link, short content, system reporter). Below the minimum score the AI is skipped and the report goes
+// to a human.
+class ModerationPreTriageService {
+    Db database
+    ModerationStore reports
+    ModerationTargets targets
+    ProfileDirectory profiles
+    ModerationSignalWeights weights
+    Bool enabled
+    Int minScoreForAi
+    Int duplicateTargetWindowHours
+    public constructor(database: Db, reports: ModerationStore, targets: ModerationTargets, profiles: ProfileDirectory, weights: ModerationSignalWeights, enabled: Bool, minScoreForAi: Int, duplicateTargetWindowHours: Int) {
+        this.database = database
+        this.reports = reports
+        this.targets = targets
+        this.profiles = profiles
+        this.weights = weights
+        this.enabled = enabled
+        this.minScoreForAi = ModerationContentTargets.clampInt(minScoreForAi, 0, 1000000)
+        this.duplicateTargetWindowHours = ModerationContentTargets.clampInt(duplicateTargetWindowHours, 1, 1000000)
+    }
+    // Scores up to `limit` pending reports that have no pre-triage yet; returns how many were scored.
+    Int preTriagePending(limit: Int) {
+        if (!enabled) {
+            return 0
+        }
+        var scored = 0
+        for (var report in reports.findPendingWithoutPreTriage(limit)) {
+            var content = ModerationService.orEmpty(targets.contentOf(report.targetType, report.targetId))
+            var authorId = targets.authorOf(report.targetType, report.targetId)
+            var author = this.authorRecord(authorId)
+            var result = this.score(report, content, author)
+            var now = Time.nowIso()
+            var triaged = report
+            var aiTriage = report.aiTriage
+            var aiAt = report.aiTriagedAt
+            if (result.score < minScoreForAi) {
+                aiTriage = "{\"action\":\"HUMAN_REVIEW\",\"source\":\"pre-triage\"}"
+                aiAt = now
+            }
+            triaged = ModerationReport(report.id, report.reporterId, report.targetType, report.targetId, report.reason, report.description, report.status, report.createdAt, report.reviewedBy, report.reviewedAt, report.resolutionNote, aiTriage, aiAt, this.toJson(result), result.score, now)
+            reports.update(triaged)
+            scored = scored + 1
+        }
+        return scored
+    }
+    ProfileRecord? authorRecord(authorId: String?) {
+        if (authorId == null) {
+            return null
+        }
+        return profiles.findById(authorId)
+    }
+    Bool shouldCallAi(report: ModerationReport) {
+        var score = report.preTriageScore
+        if (!enabled || score == null) {
+            return true
+        }
+        return score >= minScoreForAi
+    }
+    static String reasonSignal(reason: String) {
+        if (reason == "VIOLENCE" || reason == "HARASSMENT" || reason == "DISCRIMINATION" || reason == "PREJUDICE" || reason == "SCAM") {
+            return ModerationSignalCatalog.reasonViolence()
+        }
+        if (reason == "SEXUAL_CONTENT") {
+            return ModerationSignalCatalog.reasonSexual()
+        }
+        if (reason == "AI_GENERATED") {
+            return ModerationSignalCatalog.reasonAutomation()
+        }
+        if (reason == "SPAM" || reason == "FAKE_CONTENT" || reason == "COPYRIGHT") {
+            return ModerationSignalCatalog.reasonSpam()
+        }
+        return ModerationSignalCatalog.reasonOther()
+    }
+    ModerationScore score(report: ModerationReport, content: String, author: ProfileRecord?) {
+        var signals = listOf<String>()
+        var total = 0
+        var reason = ModerationPreTriageService.reasonSignal(report.reason)
+        signals.add(reason)
+        total = total + weights.weightOf(reason)
+        var since = Time.fromMillis(Time.nowMillis() - (duplicateTargetWindowHours as Long) * 3600000L)
+        if (reports.countAgainstTargetSince(report.targetType, report.targetId, since) >= 2L) {
+            signals.add(ModerationSignalCatalog.repeatedTarget())
+            total = total + weights.weightOf(ModerationSignalCatalog.repeatedTarget())
+        }
+        if (author != null && Time.toMillis(author.createdAt) > Time.nowMillis() - 7L * 86400000L) {
+            signals.add(ModerationSignalCatalog.newAccount())
+            total = total + weights.weightOf(ModerationSignalCatalog.newAccount())
+        }
+        if (report.description.trim().length() >= 80) {
+            signals.add(ModerationSignalCatalog.detailedReport())
+            total = total + weights.weightOf(ModerationSignalCatalog.detailedReport())
+        }
+        var normalized = content.toLowerCase()
+        if (normalized.contains("http://") || normalized.contains("https://")) {
+            signals.add(ModerationSignalCatalog.contentLink())
+            total = total + weights.weightOf(ModerationSignalCatalog.contentLink())
+        }
+        if (report.reason == "SPAM" && normalized.trim().length() > 0 && normalized.trim().length() < 20) {
+            signals.add(ModerationSignalCatalog.shortContent())
+            total = total + weights.weightOf(ModerationSignalCatalog.shortContent())
+        }
+        if (report.reporterId == ModerationRules.systemReporter()) {
+            signals.add(ModerationSignalCatalog.systemReport())
+            total = total + weights.weightOf(ModerationSignalCatalog.systemReport())
+        }
+        return ModerationScore(total, signals)
+    }
+    String toJson(s: ModerationScore) {
+        var parts = listOf<String>()
+        for (var signal in s.signals) {
+            parts.add("\"" + signal + "\"")
+        }
+        return "{\"signals\":[" + String.join(",", parts) + "],\"score\":" + s.score + "}"
+    }
+}

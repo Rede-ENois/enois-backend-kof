@@ -1,0 +1,120 @@
+package moderation
+
+import feed.*
+import groups.*
+import identity.*
+import kernel.*
+import kernel.sanctions.*
+import kernel.security.*
+import notifications.*
+import ops.*
+import profile.*
+
+// Composition of the moderation domain. Installed after the domains whose content it reads and whose actions it
+// triggers (feed, groups, profile, notifications); the request-pipeline seams that need only the database (moderators,
+// automatic reports) are set on `hooks` before Security.install by the AppWiring.
+class ModerationModule {
+    ModerationService service
+    ModerationStore store
+    ModerationTargets targets
+    ModerationDecisions decisions
+    ModerationSanctionService sanctions
+    ModerationSanctionStore sanctionStore
+    ModerationBanCleanup banCleanup
+    ModerationQuarantine quarantine
+    ModerationLearning learning
+    ModerationVerdicts verdicts
+    ModerationSuspensions suspensions
+    ModerationContentTargets contentTargets
+    ModerationPanel panel
+    ModerationProposals proposals
+    ModerationModeratorStore moderators
+    ModerationPreTriageService preTriage
+    ModerationSignalWeights weights
+    ModerationAi ai
+    ModerationTriageJob triageJob
+    ModerationIpBlocks ipBlocks
+    ModerationSuspiciousUserService suspects
+    ModerationBulkBan bulkBan
+    ModerationHoneypot honeypot
+    ModerationAutoBan autoBan
+    ModerationContentSweep contentSweep
+    ModerationCleanup cleanup
+    public constructor(service: ModerationService, store: ModerationStore, targets: ModerationTargets, decisions: ModerationDecisions, sanctions: ModerationSanctionService, sanctionStore: ModerationSanctionStore, banCleanup: ModerationBanCleanup, quarantine: ModerationQuarantine, learning: ModerationLearning, verdicts: ModerationVerdicts, suspensions: ModerationSuspensions, contentTargets: ModerationContentTargets, panel: ModerationPanel, proposals: ModerationProposals, moderators: ModerationModeratorStore, preTriage: ModerationPreTriageService, weights: ModerationSignalWeights, ai: ModerationAi, triageJob: ModerationTriageJob, ipBlocks: ModerationIpBlocks, suspects: ModerationSuspiciousUserService, bulkBan: ModerationBulkBan, honeypot: ModerationHoneypot, autoBan: ModerationAutoBan, contentSweep: ModerationContentSweep, cleanup: ModerationCleanup) {
+        this.service = service
+        this.store = store
+        this.targets = targets
+        this.decisions = decisions
+        this.sanctions = sanctions
+        this.sanctionStore = sanctionStore
+        this.banCleanup = banCleanup
+        this.quarantine = quarantine
+        this.learning = learning
+        this.verdicts = verdicts
+        this.suspensions = suspensions
+        this.contentTargets = contentTargets
+        this.panel = panel
+        this.proposals = proposals
+        this.moderators = moderators
+        this.preTriage = preTriage
+        this.weights = weights
+        this.ai = ai
+        this.triageJob = triageJob
+        this.ipBlocks = ipBlocks
+        this.suspects = suspects
+        this.bulkBan = bulkBan
+        this.honeypot = honeypot
+        this.autoBan = autoBan
+        this.contentSweep = contentSweep
+        this.cleanup = cleanup
+    }
+    static ModerationModule install(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications) = ModerationModule.installWith(platform, shared, parts, feed, groups, profiles, mail, notifications, ModerationReportEvents(), ModerationCompanies(platform.db), ModerationSanctionHooks(), ModerationLlmTransport(), ModerationImages(), ModerationModule.honeypotFor(platform, parts), ModerationEarly())
+    // The HoneypotGuard the feed routes use. AppWiring builds it BEFORE the feed install and passes it to installWith.
+    static ModerationHoneypot honeypotFor(platform: Platform, parts: SecurityParts) = ModerationHoneypot(parts.admin, ModerationModeratorStore(platform.db), ModerationSanctionStore(platform.db), platform.cfg.getBool("REDE_SECURITY_HONEYPOT_AUTO_BAN", true))
+    static ModerationModule installWith(platform: Platform, shared: SharedServices, parts: SecurityParts, feed: FeedModule, groups: GroupsModule, profiles: ProfileModule, mail: MailService, notifications: Notifications, events: ModerationReportEvents, companies: ModerationCompanies, sanctionHooks: ModerationSanctionHooks, llm: ModerationLlmTransport, images: ModerationImages, honeypot: ModerationHoneypot, early: ModerationEarly) {
+        var cfg = platform.cfg
+        var store = ModerationStore(platform.db)
+        var targets = ModerationTargets(feed.moderation, groups.reports, companies)
+        var service = ModerationService(platform.db, store, targets, parts.actionThrottle, mail, profiles.directory, events, cfg.getStr("SUPPORT_EMAIL", "suporte@enois.ia.br"), cfg.getStr("FRONTEND_URL", "http://localhost:5173"), cfg.getInt("REDE_MODERATION_REPORTS_PER_HOUR", 10))
+        var contentTargets = ModerationContentTargets.fromConfig(cfg)
+        var sanctionStore = ModerationSanctionStore(platform.db)
+        var banCleanup = ModerationBanCleanup(platform.db, sanctionStore, feed.moderation, contentTargets)
+        var remover = ModerationContentRemover(feed.moderation)
+        var sessions = IdentityStore(platform.db)
+        var sanctions = ModerationSanctionService(platform.db, sanctionStore, store, targets, remover, notifications, banCleanup, sessions, profiles.directory, sanctionHooks)
+        var quarantine = ModerationQuarantine(platform.db, feed.moderation, targets, profiles.directory, notifications)
+        var learning = ModerationLearning(platform.db)
+        var decisions = ModerationDecisions(platform.db, store, targets, companies, remover, quarantine, learning, sanctions, notifications)
+        var verdicts = ModerationVerdicts(store, sanctions, learning)
+        var suspensions = ModerationSuspensions.fromConfig(cfg, sanctionStore, sanctions, banCleanup, sessions, notifications)
+        suspensions.schedule(shared.jobs, cfg)
+        ModerationRoutes.register(platform.server, service, store, decisions, shared.idempotency)
+        ModerationSanctionRoutes.register(platform.server, sanctions)
+        var moderators = ModerationModeratorStore(platform.db)
+        var gate = SanctionGateReader(platform.db)
+        var panel = ModerationPanel(platform.db, moderators, store, service, decisions, sanctions, sanctionStore, targets, notifications, profiles.directory, profiles.reputation, gate, feed.moderation, cfg.getInt("REDE_MODERATION_MODERATOR_MIN_REPUTATION", 200), cfg.getInt("REDE_MODERATION_VOTE_QUORUM", 3))
+        var proposals = ModerationProposals(platform.db, moderators, sanctions, notifications, profiles.directory, gate)
+        var weights = ModerationSignalWeights(platform.db)
+        var preTriage = ModerationPreTriageService(platform.db, store, targets, profiles.directory, weights, cfg.getBool("MODERATION_PRETRIAGE_ENABLED", true), cfg.getInt("MODERATION_PRETRIAGE_MIN_SCORE", 30), 24)
+        learning.schedule(shared.jobs, weights)
+        var ai = ModerationAi.fromConfig(cfg, store, targets, images, llm)
+        var triageJob = ModerationTriageJob(ai, preTriage, verdicts, cfg.getBool("MODERATION_AI_TRIAGE_ENABLED", true), cfg.getBool("MODERATION_AI_AUTO_PENALTY", true))
+        triageJob.schedule(shared.jobs)
+        ModerationPanelRoutes.register(platform.server, panel, proposals, quarantine)
+        honeypot.bind(sanctions)
+        early.bind(service)
+        var ipBlocks = ModerationIpBlocks(platform.db, profiles.directory)
+        var suspects = ModerationSuspiciousUserService(ModerationSuspectReader(platform.db), parts.admin, gate, cfg.getInt("REDE_SECURITY_SUSPICIOUS_DAYS", 90), cfg.getStr("REDE_SECURITY_SUSPICIOUS_NAME_PATTERNS", "probe"))
+        var bulkBan = ModerationBulkBan(panel, ipBlocks, cfg.getInt("REDE_MODERATION_BULK_BAN_MAX", 200), cfg.getBool("REDE_MODERATION_BULK_BAN_BLOCK_IPS", true), cfg.getInt("REDE_MODERATION_BULK_BAN_IPS_MIN_ACCOUNTS", 2))
+        var suspectReader = ModerationSuspectReader(platform.db)
+        var autoBan = ModerationAutoBan.fromConfig(cfg, suspects, panel, ipBlocks, suspectReader)
+        autoBan.schedule(shared.jobs, cfg)
+        var contentSweep = ModerationContentSweep(platform.db, contentTargets, panel, moderators, gate, parts.admin)
+        contentSweep.schedule(shared.jobs, cfg)
+        var cleanup = ModerationCleanup(store, service, gate)
+        cleanup.schedule(shared.jobs, cfg)
+        ModerationInsightRoutes.register(platform.server, platform.db, profiles.directory)
+        ModerationSecurityRoutes.register(platform.server, ipBlocks, suspects, bulkBan, store, feed.moderation, autoBan)
+        return ModerationModule(service, store, targets, decisions, sanctions, sanctionStore, banCleanup, quarantine, learning, verdicts, suspensions, contentTargets, panel, proposals, moderators, preTriage, weights, ai, triageJob, ipBlocks, suspects, bulkBan, honeypot, autoBan, contentSweep, cleanup)
+    }
+}

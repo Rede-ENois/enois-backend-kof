@@ -1,0 +1,98 @@
+package moderation
+
+import kernel.db.*
+import kernel.id.*
+
+// SQL of user_sanctions, appeals and the ban archive (Sanction/Appeal/BanContentArchive persistence adapters).
+class ModerationSanctionStore {
+    Db store
+    public constructor(store: Db) {
+        this.store = store
+    }
+    static String sanctionColumns() = "id, user_id, report_id, type, reason, status, created_at, removed_at, removed_by"
+    static String appealColumns() = "id, sanction_id, user_id, message, status, created_at, reviewed_by, reviewed_at"
+    static ModerationSanction sanction(r: DbRow) = ModerationSanction(r.getStr("id"), r.getStr("user_id"), r.getStrOrNull("report_id"), r.getStr("type"), r.getStrOrNull("reason"), r.getStr("status"), r.getInstant("created_at"), r.getInstantOrNull("removed_at"), r.getStrOrNull("removed_by"))
+    static ModerationAppeal appeal(r: DbRow) = ModerationAppeal(r.getStr("id"), r.getStr("sanction_id"), r.getStr("user_id"), r.getStr("message"), r.getStr("status"), r.getInstant("created_at"), r.getStrOrNull("reviewed_by"), r.getInstantOrNull("reviewed_at"))
+    static Int capped(limit: Int, max: Int) {
+        if (limit > max) {
+            return max
+        }
+        if (limit < 1) {
+            return 1
+        }
+        return limit
+    }
+    List<ModerationSanction> sanctions(rows: List<DbRow>) {
+        var out = listOf<ModerationSanction>()
+        for (var r in rows) {
+            out.add(ModerationSanctionStore.sanction(r))
+        }
+        return out
+    }
+    List<ModerationAppeal> appeals(rows: List<DbRow>) {
+        var out = listOf<ModerationAppeal>()
+        for (var r in rows) {
+            out.add(ModerationSanctionStore.appeal(r))
+        }
+        return out
+    }
+    // Insert or update by id (JpaRepository.save).
+    ModerationSanction save(s: ModerationSanction) {
+        var changed = store.execute("update user_sanctions set user_id = ?, report_id = ?, type = ?, reason = ?, status = ?, removed_at = ?, removed_by = ? where id = ?", DbParams().bindStr(s.userId).bindStrOrNull(s.reportId).bindStr(s.type).bindStrOrNull(s.reason).bindStr(s.status).bindInstantOrNull(s.removedAt).bindStrOrNull(s.removedBy).bindStr(s.id))
+        if (changed == 0) {
+            store.execute("insert into user_sanctions (id, user_id, report_id, type, reason, status, created_at, removed_at, removed_by) values (?, ?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(s.id).bindStr(s.userId).bindStrOrNull(s.reportId).bindStr(s.type).bindStrOrNull(s.reason).bindStr(s.status).bindInstant(s.createdAt).bindInstantOrNull(s.removedAt).bindStrOrNull(s.removedBy))
+        }
+        return s
+    }
+    ModerationSanction? findById(id: String) {
+        var row = store.queryOptional("select " + ModerationSanctionStore.sanctionColumns() + " from user_sanctions where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return ModerationSanctionStore.sanction(row)
+    }
+    // The latest ACTIVE sanction counts (at most one per account is intended).
+    ModerationSanction? findActiveByUser(userId: String) {
+        var row = store.queryOptional("select " + ModerationSanctionStore.sanctionColumns() + " from user_sanctions where user_id = ? and status = \'ACTIVE\' order by created_at desc limit 1", DbParams().bindStr(userId))
+        if (row == null) {
+            return null
+        }
+        return ModerationSanctionStore.sanction(row)
+    }
+    List<ModerationSanction> findByUser(userId: String, limit: Int) {
+        if (limit < 1) {
+            return listOf<ModerationSanction>()
+        }
+        return this.sanctions(store.queryList("select " + ModerationSanctionStore.sanctionColumns() + " from user_sanctions where user_id = ? order by created_at desc limit ?", DbParams().bindStr(userId).bindInt(ModerationSanctionStore.capped(limit, 20))))
+    }
+    List<ModerationSanction> findByStatus(status: String, limit: Int) = this.sanctions(store.queryList("select " + ModerationSanctionStore.sanctionColumns() + " from user_sanctions where status = ? order by created_at desc limit ?", DbParams().bindStr(status).bindInt(ModerationSanctionStore.capped(limit, 200))))
+    // ACTIVE suspensions created before the cutoff (ExpiredSuspensionReader), oldest first.
+    List<ModerationSanction> expiredSuspensions(cutoff: String, limit: Int) = this.sanctions(store.queryList("select " + ModerationSanctionStore.sanctionColumns() + " from user_sanctions where type = \'SUSPENDED\' and status = \'ACTIVE\' and created_at < ? order by created_at asc limit ?", DbParams().bindInstant(cutoff).bindInt(ModerationSanctionStore.capped(limit, 500))))
+    ModerationAppeal saveAppeal(a: ModerationAppeal) {
+        var changed = store.execute("update appeals set status = ?, reviewed_by = ?, reviewed_at = ? where id = ?", DbParams().bindStr(a.status).bindStrOrNull(a.reviewedBy).bindInstantOrNull(a.reviewedAt).bindStr(a.id))
+        if (changed == 0) {
+            store.execute("insert into appeals (id, sanction_id, user_id, message, status, created_at, reviewed_by, reviewed_at) values (?, ?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(a.id).bindStr(a.sanctionId).bindStr(a.userId).bindStr(a.message).bindStr(a.status).bindInstant(a.createdAt).bindStrOrNull(a.reviewedBy).bindInstantOrNull(a.reviewedAt))
+        }
+        return a
+    }
+    ModerationAppeal? findAppeal(id: String) {
+        var row = store.queryOptional("select " + ModerationSanctionStore.appealColumns() + " from appeals where id = ?", DbParams().bindStr(id))
+        if (row == null) {
+            return null
+        }
+        return ModerationSanctionStore.appeal(row)
+    }
+    List<ModerationAppeal> appealsByStatus(status: String, limit: Int) = this.appeals(store.queryList("select " + ModerationSanctionStore.appealColumns() + " from appeals where status = ? order by created_at desc limit ?", DbParams().bindStr(status).bindInt(ModerationSanctionStore.capped(limit, 1000000))))
+    List<ModerationAppeal> appealsByUser(userId: String, limit: Int) {
+        if (limit < 1) {
+            return listOf<ModerationAppeal>()
+        }
+        return this.appeals(store.queryList("select " + ModerationSanctionStore.appealColumns() + " from appeals where user_id = ? order by created_at desc limit ?", DbParams().bindStr(userId).bindInt(ModerationSanctionStore.capped(limit, 20))))
+    }
+    Bool existsPendingAppeal(userId: String) = store.queryLong("select count(*) from appeals where user_id = ? and status = \'PENDING\'", DbParams().bindStr(userId)) > 0L
+    // Atomic claim: only one concurrent decision moves a PENDING appeal (UPDATE ... WHERE status = 'PENDING').
+    Bool claimAppeal(a: ModerationAppeal) = store.execute("update appeals set status = ?, reviewed_by = ?, reviewed_at = ? where id = ? and status = \'PENDING\'", DbParams().bindStr(a.status).bindStrOrNull(a.reviewedBy).bindInstantOrNull(a.reviewedAt).bindStr(a.id)) > 0
+    archive(sanctionId: String, userId: String, contentType: String, contentId: String, snapshot: String, at: String) {
+        store.execute("insert into ban_content_archive (id, sanction_id, user_id, content_type, content_id, content_snapshot, archived_at) values (?, ?, ?, ?, ?, ?, ?)", DbParams().bindStr(Ids.prefixed("archive_")).bindStr(sanctionId).bindStr(userId).bindStr(contentType).bindStr(contentId).bindStr(snapshot).bindInstant(at))
+    }
+}

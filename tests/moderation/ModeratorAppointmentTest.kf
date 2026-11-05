@@ -1,0 +1,142 @@
+import kernel.testkit.*
+import moderation.*
+
+// Port of ModeratorAppointmentAndSanctionTests: only the admin appoints and revokes; punishment by vote needs ten moderators
+// and an absolute majority; a rejecting majority punishes nobody.
+Bool canPublish(userId: String, text: String) = ModerationTestKit.post(userId, "/feed/posts", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"" + text + "\",\"tags\":[],\"mediaIds\":[]}").status == 201
+
+appoint(admin: String, username: String) {
+    var res = ModerationTestKit.post(admin, "/admin/moderators", "{\"username\":\"" + username + "\",\"note\":\"Nomeado para o teste de votação.\"}")
+    Check.status(res, 200)
+    Check.jsonEq(res, "status", "APPROVED")
+}
+
+clearModerators(admin: String) {
+    var listed = ModerationTestKit.get(admin, "/admin/moderators")
+    Check.status(listed, 200)
+    var n = listed.jsonSize("")
+    var k = 0
+    while (k < n) {
+        var res = ModerationTestKit.post(admin, "/admin/moderators/" + ModerationTestKit.str(listed, k + ".userId") + "/revoke", "{\"note\":\"Reset do cenário de teste.\"}")
+        Check.status(res, 200)
+        k = k + 1
+    }
+}
+
+Int moderatorCount(admin: String) = ModerationTestKit.get(admin, "/admin/moderators").jsonSize("")
+
+List<String> moderators(admin: String, prefix: String) {
+    var out = listOf<String>()
+    var i = 1
+    while (i <= 10) {
+        var id = prefix + i
+        ModerationTestKit.login(id)
+        appoint(admin, id)
+        out.add(id)
+        i = i + 1
+    }
+    return out
+}
+
+test "only the admin appoints and revokes moderators" {
+    ModerationTestKit.setting("REDE_MODERATION_MODERATOR_MIN_REPUTATION", "-1")
+    var admin = ModerationTestKit.loginAdmin("ms_admin")
+    var candidate = ModerationTestKit.login("ms_single_mod")
+    var outsider = ModerationTestKit.login("ms_outsider")
+    Check.status(ModerationTestKit.post(outsider, "/admin/moderators", "{\"username\":\"ms_single_mod\"}"), 403)
+    var appointed = ModerationTestKit.post(admin, "/admin/moderators", "{\"username\":\"ms_single_mod\",\"note\":\"Nomeado para o time de moderação.\"}")
+    Check.status(appointed, 200)
+    Check.jsonEq(appointed, "username", "ms_single_mod")
+    Check.jsonEq(appointed, "status", "APPROVED")
+    var me = ModerationTestKit.get(candidate, "/moderation/me")
+    Check.jsonEq(me, "moderator", "true")
+    Check.jsonEq(me, "minModeratorsForSanction", "10")
+    Check.isTrue("count is a number", me.jsonHas("moderatorCount"))
+    var listed = ModerationTestKit.get(admin, "/admin/moderators")
+    Check.status(listed, 200)
+    var again = ModerationTestKit.post(admin, "/admin/moderators", "{\"username\":\"ms_single_mod\"}")
+    Check.status(again, 409)
+    Check.jsonEq(again, "code", "ALREADY_MODERATOR")
+    Check.status(ModerationTestKit.get(candidate, "/admin/moderators"), 403)
+    var revoked = ModerationTestKit.post(admin, "/admin/moderators/" + candidate + "/revoke", "{\"note\":\"Ciclo encerrado.\"}")
+    Check.status(revoked, 200)
+    Check.jsonEq(revoked, "status", "REVOKED")
+    Check.jsonEq(ModerationTestKit.get(candidate, "/moderation/me"), "moderator", "false")
+    Check.jsonEq(ModerationTestKit.post(admin, "/admin/moderators/" + candidate + "/revoke", ""), "code", "NOT_MODERATOR")
+    Check.status(ModerationTestKit.post(admin, "/admin/moderators", "{\"username\":\"nobody_here\"}"), 404)
+}
+
+test "sanction voting requires ten moderators and an absolute majority" {
+    var admin = ModerationTestKit.loginAdmin("ms_admin")
+    clearModerators(admin)
+    Check.isTrue("none left", moderatorCount(admin) == 0)
+    var target = ModerationTestKit.login("ms_target")
+    Check.isTrue("publishes", canPublish(target, "ms-target-inicial"))
+    var early = ModerationTestKit.post(admin, "/moderation/sanction-proposals", "{\"username\":\"ms_target\",\"type\":\"RESTRICTION\",\"reason\":\"Motivo de teste com tamanho suficiente\"}")
+    Check.status(early, 409)
+    Check.jsonEq(early, "code", "NOT_ENOUGH_MODERATORS")
+    var mods = moderators(admin, "ms_mod")
+    Check.isTrue("ten", moderatorCount(admin) == 10)
+    Check.jsonEq(ModerationTestKit.get(mods.get(0), "/moderation/me"), "moderatorCount", "10")
+    var proposed = ModerationTestKit.post(mods.get(0), "/moderation/sanction-proposals", "{\"username\":\"ms_target\",\"type\":\"RESTRICTION\",\"reason\":\"Assédio recorrente em comentários após avisos.\"}")
+    Check.status(proposed, 200)
+    Check.jsonEq(proposed, "approveVotes", "1")
+    Check.jsonEq(proposed, "requiredVotes", "6")
+    Check.jsonEq(proposed, "moderatorCount", "10")
+    Check.jsonEq(proposed, "myVote", "APPROVE")
+    var proposalId = ModerationTestKit.str(proposed, "id")
+    var dupe = ModerationTestKit.post(mods.get(1), "/moderation/sanction-proposals", "{\"username\":\"ms_target\",\"type\":\"RESTRICTION\",\"reason\":\"Outra proposta enquanto a primeira está aberta.\"}")
+    Check.status(dupe, 409)
+    Check.jsonEq(dupe, "code", "PROPOSAL_ALREADY_PENDING")
+    Check.status(ModerationTestKit.post(target, "/moderation/sanction-proposals/" + proposalId + "/vote", "{\"vote\":\"APPROVE\"}"), 403)
+    var i = 1
+    while (i <= 4) {
+        var res = ModerationTestKit.post(mods.get(i), "/moderation/sanction-proposals/" + proposalId + "/vote", "{\"vote\":\"APPROVE\",\"note\":\"Concordo.\"}")
+        Check.status(res, 200)
+        Check.jsonEq(res, "decision", "PENDING")
+        i = i + 1
+    }
+    Check.isTrue("still publishes", canPublish(target, "ms-target-ainda-publica"))
+    var sixth = ModerationTestKit.post(mods.get(5), "/moderation/sanction-proposals/" + proposalId + "/vote", "{\"vote\":\"APPROVE\",\"note\":\"Concordo.\"}")
+    Check.status(sixth, 200)
+    Check.jsonEq(sixth, "approveVotes", "6")
+    Check.jsonEq(sixth, "decision", "APPLIED")
+    Check.jsonEq(sixth, "status", "APPLIED")
+    Check.isTrue("restricted", !canPublish(target, "ms-target-restrito"))
+    var closed = ModerationTestKit.post(mods.get(6), "/moderation/sanction-proposals/" + proposalId + "/vote", "{\"vote\":\"APPROVE\"}")
+    Check.status(closed, 409)
+    Check.jsonEq(closed, "code", "ALREADY_DECIDED")
+}
+
+test "a rejecting majority does not punish and an admin can cancel a vote" {
+    var admin = ModerationTestKit.loginAdmin("ms_admin")
+    clearModerators(admin)
+    var target = ModerationTestKit.login("ms_target_reject")
+    var mods = moderators(admin, "ms_rej_mod")
+    var proposed = ModerationTestKit.post(mods.get(0), "/moderation/sanction-proposals", "{\"username\":\"ms_target_reject\",\"type\":\"BAN\",\"reason\":\"Denúncia grave que a maioria pode rejeitar.\"}")
+    Check.status(proposed, 200)
+    var proposalId = ModerationTestKit.str(proposed, "id")
+    var i = 1
+    while (i <= 6) {
+        Check.status(ModerationTestKit.post(mods.get(i), "/moderation/sanction-proposals/" + proposalId + "/vote", "{\"vote\":\"REJECT\",\"note\":\"Sem evidências suficientes.\"}"), 200)
+        i = i + 1
+    }
+    var open = ModerationTestKit.get(mods.get(1), "/moderation/sanction-proposals")
+    Check.status(open, 200)
+    var n = open.jsonSize("")
+    var k = 0
+    while (k < n) {
+        Check.isTrue("proposal closed", open.jsonStr(k + ".id") != proposalId)
+        k = k + 1
+    }
+    Check.isTrue("still free", canPublish(target, "ms-target-reject-livre"))
+    var other = ModerationTestKit.login("ms_target_cancel")
+    var second = ModerationTestKit.post(mods.get(0), "/moderation/sanction-proposals", "{\"username\":\"ms_target_cancel\",\"type\":\"RESTRICTION\",\"reason\":\"Proposta que o admin vai encerrar.\"}")
+    var secondId = ModerationTestKit.str(second, "id")
+    Check.status(ModerationTestKit.post(mods.get(1), "/admin/sanction-proposals/" + secondId + "/cancel", ""), 403)
+    var cancelled = ModerationTestKit.post(admin, "/admin/sanction-proposals/" + secondId + "/cancel", "")
+    Check.status(cancelled, 200)
+    Check.jsonEq(cancelled, "status", "CANCELLED")
+    Check.isTrue("not punished", canPublish(other, "ms-target-cancel-livre"))
+    ModerationTestKit.finish()
+}

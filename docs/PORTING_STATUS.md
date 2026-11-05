@@ -1032,3 +1032,40 @@ Notes:
 - `GET /mentors` is served with one query per page for the next free slot (Java asked per mentor). `limit < 1` is `400 BAD_REQUEST` (PageRequest); the expertise-only search sorts `rating desc, created_at desc` (Java left ties undefined).
 - A missing `expertise` list, a missing or malformed `startsAt`/`endsAt` answer `400 BAD_REQUEST` (Java: a null pointer / not-null column).
 - Jobs: `mentoring-complete-finished` (`REDE_MENTORING_SESSION_COMPLETION_[INITIAL_]DELAY_MS`, 120000/300000) and `mentoring-settle-expired` (600000/3600000). Config: `REDE_MENTORING_JITSI_BASE_URL` (default `https://meet.jit.si`).
+
+## moderation
+
+Reports, sanctions, appeals, moderators, votes, sanction proposals, IP blocks, bulk ban, suspicious queues, honeypot,
+the automatic jobs and the review queues of games and services. Package `src/moderation` (plus the bridges and the
+review routes in `src/app`). Wired last in `AppWiring`; the seams it owns are in `docs/SEAMS.md`.
+
+- Endpoints: 56 of 56 (ModeratorController 35, ReportController 13, SanctionController 8). The handoff inventory said 58;
+  the Java mappings count 56.
+- Kof tests: 62 in `tests/moderation` (reports, decisions, sanctions, suspensions, moderator panel and appointment,
+  eligibility, pre-triage, AI triage, bulk ban and IP blocks, honeypot and signup guard bounds, automations, content sweep,
+  insight reads, e-mail escaping, reputation fairness) and 5 wiring tests in `tests/integration/ModerationSeamsTest.kf`.
+- Java tests ported: MyReportsTests, SanctionFlowTests, SuspensionFlowTests, AdminSanctionManualTests, ApprovedCommentReportTests,
+  CompanyReportTests, ReportedContentAdapterTests, BanCleanup feed test, ModeratorPanelTests (the game review through the
+  wired suite), ModeratorEligibilityTests, ModeratorAppointmentAndSanctionTests, ModeratorPermissionsTests (its moderation
+  routes), BulkBanAndSuspiciousTests, BulkBanIpBlockTests, SuspiciousSignupGuardTests (rule in `identity`, bound test here),
+  SuspiciousSignupGuardBoundTests, HoneypotGuardTests, SuspiciousAutoBanTests, SuspiciousContentTargetsTests,
+  ReportPreTriageServiceTests, ModerationLearningServiceTests, ModerationAiServiceTests, AiTriageGuardTests,
+  ReportEmailEscapingTests, RiskHistoryEndpointTests, ReputationFairnessTests (the two moderation rules; the feed and
+  recommendation cases belong to those suites).
+- Differences kept on purpose: the `ACCOUNT_BANNED` / `IP_BLOCKED` answers of `/auth/login` are proved through the sanction gate,
+  the revoked session and the wired `IP_BLOCKED` test (the moderation kit does not boot identity); decisions answer the
+  `ReportView` JSON (Java answered the record text); `GET /admin/users/{u}/age` omits `ageBand` while the birth date is missing
+  (a Java `Map`).
+- NOT ported (no code, no tests): `ContentAutomationService` and analyzer, `LinkSafetyService`, `LinkSafetyAnalyzer`,
+  `HttpLinkedPageReader`, `MediaSafetyService`, `MediaSafetyAnalyzer`, `PostSpamAutomodService`, `SexualContentReportService`
+  and their listeners and sweep workers, with their Java tests (ContentAutomationServiceTests, ContentAutomationAnalyzerTests,
+  LinkSafety*, MediaSafety*, PostSpamAutomodTests, SexualContentReport*, AutomationSignalsTests, LinkPolicyTest, PostLinksTest,
+  HttpLinkedPageReaderTest, ModerationImageContentReviewerTests, ContentQuarantineReviewServiceTests are covered by the
+  quarantine port but its own test is not). Consequences: the media upload image reviewer (`MediaImageReviewer`) and the
+  reported-image reader for the AI triage (`ModerationImages`) stay at their defaults (no second opinion, no images in the
+  LLM call).
+- Scheduled jobs on `kernel.jobs`: report AI triage (60 s), learning weights (10 min), suspension expiry (30 min), content sweep
+  (2 min), automatic ban (3 min), report cleanup (30 min).
+- Kernel changes: `DbParams.bindIntOrNull/bindLongOrNull` (G370, same fix as main), `SharedServices.createWith(platform,
+  escalation)`.
+- Gaps found: G370 to G377 in `docs/KOF_GAPS.md`.

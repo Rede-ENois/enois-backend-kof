@@ -1,0 +1,130 @@
+package moderation
+
+import kernel.db.*
+import kernel.error.*
+import kernel.time.*
+import notifications.*
+
+// What a reviewer does with a pending report (ModerationService.penalize / warn / ban / removeCompany / approve / dismiss).
+// Every decision claims the report atomically (UPDATE ... WHERE status = 'PENDING'), so two reviewers never both act.
+class ModerationDecisions {
+    Db database
+    ModerationStore reports
+    ModerationTargets targets
+    ModerationCompanies companies
+    ModerationContentRemover remover
+    ModerationQuarantine quarantine
+    ModerationLearning learning
+    ModerationSanctionService sanctions
+    Notifications notifications
+    public constructor(database: Db, reports: ModerationStore, targets: ModerationTargets, companies: ModerationCompanies, remover: ModerationContentRemover, quarantine: ModerationQuarantine, learning: ModerationLearning, sanctions: ModerationSanctionService, notifications: Notifications) {
+        this.database = database
+        this.reports = reports
+        this.targets = targets
+        this.companies = companies
+        this.remover = remover
+        this.quarantine = quarantine
+        this.learning = learning
+        this.sanctions = sanctions
+        this.notifications = notifications
+    }
+    ModerationReport requireReport(reportId: String) {
+        var r = reports.findById(reportId)
+        if (r == null) {
+            throw Errors.api(404, "REPORT_NOT_FOUND", "Denuncia nao encontrada.")
+        }
+        return r
+    }
+    ModerationReport pendingReport(reportId: String) {
+        var r = this.requireReport(reportId)
+        if (r.status != "PENDING") {
+            throw Errors.api(409, "ALREADY_REVIEWED", "Denuncia ja foi revisada.")
+        }
+        return r
+    }
+    // Moves the report out of PENDING or answers 409 when someone else got there first.
+    ModerationReport claim(report: ModerationReport, status: String, reviewerId: String, note: String?) {
+        var decided = ModerationRules.decided(report, status, reviewerId, Time.nowIso(), note)
+        if (!reports.claim(decided)) {
+            throw Errors.api(409, "ALREADY_REVIEWED", "Denuncia ja foi revisada.")
+        }
+        return decided
+    }
+    String? authorOf(report: ModerationReport) = targets.authorOf(report.targetType, report.targetId)
+    ModerationReport penalize(reportId: String, reviewerId: String) {
+        var report = this.pendingReport(reportId)
+        if (report.targetType == "COMPANY") {
+            throw Errors.api(400, "COMPANY_TARGET", "Pagina empresarial se remove pela acao própria, nao se penaliza o dono por isso.")
+        }
+        if (!sanctions.applyForReport(report, "Penalização manual por uma pessoa do time (motivo da denúncia: " + report.reason + ")")) {
+            throw Errors.api(409, "CANNOT_PENALIZE", "Esta denúncia não pode mais ser penalizada.")
+        }
+        var saved = this.requireReport(reportId)
+        learning.feedback(saved, "PUNISH", "HUMAN", reviewerId)
+        return saved
+    }
+    ModerationReport warn(reportId: String, reviewerId: String) {
+        var report = this.pendingReport(reportId)
+        var saved = this.claim(report, "APPROVED", reviewerId, "AVISO da moderação (conteúdo mantido)")
+        if (report.targetType == "POST") {
+            quarantine.releaseByReport(reviewerId, report.targetId)
+        }
+        learning.feedback(saved, "WARN", "HUMAN", reviewerId)
+        var authorId = this.authorOf(report)
+        if (authorId != null) {
+            notifications.create(authorId, "MODERACAO", reviewerId, "Aviso da moderação", "Uma denúncia sobre seu conteúdo foi revisada e o time decidiu avisar você: revise as diretrizes da rede para não perder o acesso. O conteúdo foi mantido.", "/api/diretrizes", "Ver diretrizes")
+        }
+        return saved
+    }
+    ModerationReport ban(reportId: String, reviewerId: String) {
+        var report = this.pendingReport(reportId)
+        if (report.targetType == "COMPANY") {
+            throw Errors.api(400, "COMPANY_TARGET", "Pagina empresarial se remove pela acao própria, nao se bane o dono por isso.")
+        }
+        var author = this.authorOf(report)
+        if (author == null) {
+            throw Errors.api(409, "NO_AUTHOR", "Este alvo não tem autor identificável.")
+        }
+        String authorId = author
+        var saved = this.claim(report, "APPROVED", reviewerId, "BANIMENTO da conta")
+        remover.remove(report, reviewerId, "BAN")
+        var sanction = ModerationSanctions.suspended(ModerationSanctions.newId(), authorId, report.id, "Banimento por decisão humana (denúncia " + report.id + ")", Time.nowIso())
+        sanctions.banAuthor(sanction, authorId, reviewerId)
+        notifications.create(authorId, "MODERACAO", reviewerId, "Conta banida", "Uma denúncia sobre seu conteúdo foi revisada por uma pessoa do time e a conta foi banida.", "/api/penalidades", "Ver")
+        learning.feedback(saved, "BAN", "HUMAN", reviewerId)
+        return saved
+    }
+    ModerationReport removeCompany(reportId: String, reviewerId: String) {
+        var report = this.pendingReport(reportId)
+        if (report.targetType != "COMPANY") {
+            throw Errors.api(400, "NOT_A_COMPANY", "Esta denuncia nao e sobre uma pagina empresarial.")
+        }
+        var owner = companies.ownerOf(report.targetId)
+        var name = companies.nameOf(report.targetId)
+        if (!companies.close(report.targetId, reviewerId, Time.nowIso())) {
+            throw Errors.api(409, "COMPANY_GONE", "Esta pagina ja foi removida.")
+        }
+        if (owner != null && name != null && !companies.notifiesOwner()) {
+            notifications.create(owner, "MODERACAO", reviewerId, "Sua página empresarial foi removida", "Uma denúncia sobre a página \"" + name + "\" foi revisada pela moderação e a página foi removida do diretório. Se acredita que foi um engano, fale com o suporte pelo canal de recursos.", "/api/suporte", "Falar com o suporte")
+        }
+        var saved = this.claim(report, "APPROVED", reviewerId, "Pagina empresarial removida do diretorio")
+        learning.feedback(saved, "APPROVE", "HUMAN", reviewerId)
+        return saved
+    }
+    ModerationReport approve(reportId: String, reviewerId: String, note: String?) {
+        var report = this.pendingReport(reportId)
+        var saved = this.claim(report, "APPROVED", reviewerId, note)
+        remover.remove(report, reviewerId, "REPORTED")
+        learning.feedback(saved, "APPROVE", "HUMAN", reviewerId)
+        return saved
+    }
+    ModerationReport dismiss(reportId: String, reviewerId: String, note: String?) {
+        var report = this.pendingReport(reportId)
+        var saved = this.claim(report, "DISMISSED", reviewerId, note)
+        if (report.targetType == "POST") {
+            quarantine.releaseByReport(reviewerId, report.targetId)
+        }
+        learning.feedback(saved, "DISMISS", "HUMAN", reviewerId)
+        return saved
+    }
+}

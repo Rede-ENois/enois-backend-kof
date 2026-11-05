@@ -1,0 +1,59 @@
+import kernel.db.*
+import kernel.testkit.*
+import moderation.*
+
+// Port of AdminSanctionManualTests over a sanction created through the service (the /admin/users/{u}/sanction route comes
+// with the moderators sub-area): list, revoke (reason rules, own account) and edit (same record, sessions drop).
+String activeIdOf(admin: String, userId: String) {
+    var res = ModerationTestKit.get(admin, "/admin/sanctions")
+    var n = res.jsonSize("")
+    var k = 0
+    while (k < n) {
+        if (res.jsonStr(k + ".userId") == userId && res.jsonStr(k + ".status") == "ACTIVE") {
+            return ModerationTestKit.str(res, k + ".id")
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+test "the admin lists, revokes and edits a sanction" {
+    var admin = ModerationTestKit.loginAdmin("asanc_admin")
+    var author = ModerationTestKit.login("asanc_author")
+    var sanctions = ModerationTestKit.module().sanctions
+    sanctions.restrictUser(author, "admin:asanc_admin", "Punicao manual de teste do painel")
+    var sanctionId = activeIdOf(admin, author)
+    Check.isTrue("listed", sanctionId.length() > 0)
+    var list = ModerationTestKit.get(admin, "/admin/sanctions")
+    Check.status(list, 200)
+    Check.status(ModerationTestKit.get(author, "/admin/sanctions"), 403)
+    Check.jsonEq(ModerationTestKit.get(admin, "/admin/sanctions?status=NOPE"), "code", "INVALID_STATUS")
+    Check.status(ModerationTestKit.post(admin, "/admin/sanctions/" + sanctionId + "/revoke", "{\"reason\":\"curto\"}"), 400)
+    var revoked = ModerationTestKit.post(admin, "/admin/sanctions/" + sanctionId + "/revoke", "{\"reason\":\"Aplicacao incorreta: discussao tecnica nao e discriminacao\"}")
+    Check.status(revoked, 200)
+    Check.jsonEq(revoked, "sanction.status", "REMOVED")
+    Check.jsonEq(revoked, "status", "REVOKED")
+    Check.status(ModerationTestKit.post(admin, "/admin/sanctions/" + sanctionId + "/revoke", "{\"reason\":\"Aplicacao incorreta: discussao tecnica nao e discriminacao\"}"), 409)
+    var freed = ModerationTestKit.post(author, "/feed/posts", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"Voltei depois da correcao manual.\",\"tags\":[],\"mediaIds\":[]}")
+    Check.status(freed, 201)
+    sanctions.restrictUser(author, "admin:asanc_admin", "Segunda punicao manual de teste")
+    var second = activeIdOf(admin, author)
+    var edited = ModerationTestKit.post(admin, "/admin/sanctions/" + second + "/edit", "{\"type\":\"SUSPENDED\",\"reason\":\"Correcao para suspensao com prazo, decisao humana revisada\"}")
+    Check.status(edited, 200)
+    Check.jsonEq(edited, "sanction.type", "SUSPENDED")
+    Check.jsonEq(edited, "sanction.status", "ACTIVE")
+    Check.jsonEq(edited, "sanction.id", second)
+    Check.status(ModerationTestKit.get(author, "/me/sanctions"), 401)
+    Check.jsonEq(ModerationTestKit.post(admin, "/admin/sanctions/" + second + "/edit", "{\"type\":\"NOPE\",\"reason\":\"motivo suficientemente longo\"}"), "code", "INVALID_SANCTION_TYPE")
+}
+
+test "an admin cannot revise the penalty of their own account" {
+    var admin = ModerationTestKit.loginAdmin("asanc_admin2")
+    var other = ModerationTestKit.loginAdmin("asanc_admin3")
+    ModerationTestKit.module().sanctions.restrictUser(admin, "admin:x", "Restricao da propria conta do admin")
+    var id = activeIdOf(other, admin)
+    var own = ModerationTestKit.post(admin, "/admin/sanctions/" + id + "/revoke", "{\"reason\":\"tentando liberar a propria conta\"}")
+    Check.status(own, 400)
+    Check.jsonEq(own, "code", "CANNOT_REVOKE_OWN")
+    Check.jsonEq(ModerationTestKit.post(admin, "/admin/sanctions/" + id + "/edit", "{\"type\":\"BAN\",\"reason\":\"tentando mexer na propria conta\"}"), "code", "CANNOT_EDIT_OWN")
+}

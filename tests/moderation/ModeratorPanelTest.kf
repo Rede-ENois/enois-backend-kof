@@ -1,0 +1,133 @@
+import kernel.testkit.*
+import moderation.*
+
+// Port of ModeratorPanelTests (application, approval, voting with a quorum of 2, direct sanction) and
+// ModeratorEligibilityTests/ModeratorPermissionsTests for the routes this domain owns. The game review test comes with the
+// games moderation routes (wiring sub-area).
+String apply(userId: String, motivation: String) {
+    var res = ModerationTestKit.post(userId, "/moderation/applications", "{\"motivation\":\"" + motivation + "\"}")
+    Check.status(res, 200)
+    return ModerationTestKit.str(res, "id")
+}
+
+approve(admin: String, applicationId: String) {
+    Check.status(ModerationTestKit.post(admin, "/admin/moderator-applications/" + applicationId + "/approve", "{\"note\":\"ok\"}"), 200)
+}
+
+Bool canPublish(userId: String, text: String) = ModerationTestKit.post(userId, "/feed/posts", "{\"topic\":\"TECNOLOGIA\",\"type\":\"INSIGHT\",\"content\":\"" + text + "\",\"tags\":[],\"mediaIds\":[]}").status == 201
+
+String rowOf(res: TestResponse, key: String, value: String, field: String) {
+    var n = res.jsonSize("")
+    var k = 0
+    while (k < n) {
+        if (res.jsonStr(k + "." + key) == value) {
+            return ModerationTestKit.str(res, k + "." + field)
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+test "application, approval, voting with quorum and direct sanction" {
+    ModerationTestKit.setting("REDE_MODERATION_MODERATOR_MIN_REPUTATION", "-1")
+    ModerationTestKit.setting("REDE_MODERATION_VOTE_QUORUM", "2")
+    var author = ModerationTestKit.login("mp_author")
+    var reporter = ModerationTestKit.login("mp_reporter")
+    var applicant = ModerationTestKit.login("mp_mod")
+    var admin = ModerationTestKit.loginAdmin("mp_admin")
+    var me = ModerationTestKit.get(applicant, "/moderation/me")
+    Check.status(me, 200)
+    Check.jsonEq(me, "eligible", "true")
+    Check.jsonEq(me, "moderator", "false")
+    Check.jsonEq(me, "admin", "false")
+    Check.status(ModerationTestKit.get(applicant, "/moderation/reports"), 403)
+    var applicationId = apply(applicant, "Quero ajudar a comunidade a manter as conversas saudaveis e justas.")
+    var dupe = ModerationTestKit.post(applicant, "/moderation/applications", "{\"motivation\":\"Uma segunda candidatura enquanto a primeira ainda esta na fila.\"}")
+    Check.status(dupe, 409)
+    Check.jsonEq(dupe, "code", "APPLICATION_PENDING")
+    Check.status(ModerationTestKit.get(applicant, "/admin/moderator-applications"), 403)
+    var queue = ModerationTestKit.get(admin, "/admin/moderator-applications")
+    Check.status(queue, 200)
+    Check.isTrue("pending listed", rowOf(queue, "id", applicationId, "status") == "PENDING")
+    var approved = ModerationTestKit.post(admin, "/admin/moderator-applications/" + applicationId + "/approve", "{\"note\":\"Bem-vindo ao time.\"}")
+    Check.status(approved, 200)
+    Check.jsonEq(approved, "status", "APPROVED")
+    Check.jsonEq(ModerationTestKit.get(applicant, "/moderation/me"), "moderator", "true")
+    var reportId = ModerationTestKit.publishReported(author, reporter, "Conteudo que a moderacao vai analisar.", "SCAM")
+    var panel = ModerationTestKit.get(applicant, "/moderation/reports")
+    Check.status(panel, 200)
+    Check.isTrue("quorum shown", rowOf(panel, "reportId", reportId, "quorum") == "2")
+    Check.isTrue("no votes", rowOf(panel, "reportId", reportId, "punishVotes") == "0")
+    var first = ModerationTestKit.post(applicant, "/moderation/reports/" + reportId + "/vote", "{\"vote\":\"PUNISH\",\"note\":\"Ofende a comunidade.\"}")
+    Check.status(first, 200)
+    Check.jsonEq(first, "punishVotes", "1")
+    Check.jsonEq(first, "decision", "PENDING")
+    var denied = ModerationTestKit.post(reporter, "/moderation/reports/" + reportId + "/vote", "{\"vote\":\"PUNISH\"}")
+    Check.status(denied, 403)
+    Check.jsonEq(denied, "code", "FORBIDDEN")
+    var second = ModerationTestKit.post(admin, "/moderation/reports/" + reportId + "/vote", "{\"vote\":\"PUNISH\"}")
+    Check.status(second, 200)
+    Check.jsonEq(second, "punishVotes", "2")
+    Check.jsonEq(second, "decision", "PENALIZED")
+    Check.jsonEq(second, "reportStatus", "AUTO_PENALIZED")
+    Check.isTrue("author restricted", !canPublish(author, "nao deveria passar"))
+    var victim = ModerationTestKit.login("mp_victim")
+    var direct = ModerationTestKit.post(admin, "/admin/users/mp_victim/sanction", "{\"type\":\"RESTRICTION\",\"reason\":\"Descumpriu as diretrizes em conversa privada.\"}")
+    Check.status(direct, 200)
+    Check.jsonEq(direct, "username", "mp_victim")
+    Check.jsonEq(direct, "type", "RESTRICTION")
+    Check.jsonEq(direct, "status", "ACTIVE")
+    Check.isTrue("victim restricted", !canPublish(victim, "vitima nao publica"))
+    var self = ModerationTestKit.post(admin, "/admin/users/mp_admin/sanction", "{\"type\":\"BAN\",\"reason\":\"teste de autopunicao\"}")
+    Check.status(self, 400)
+    Check.jsonEq(self, "code", "CANNOT_SANCTION_SELF")
+    // A second direct sanction on a blocked account answers ALREADY_BANNED; an unknown user and a short reason are refused.
+    var target = ModerationTestKit.login("mp_target")
+    Check.jsonEq(ModerationTestKit.post(admin, "/admin/users/mp_target/sanction", "{\"type\":\"PERMABAN\",\"reason\":\"Spam em serie confirmado.\"}"), "status", "ACTIVE")
+    Check.jsonEq(ModerationTestKit.post(admin, "/admin/users/mp_target/sanction", "{\"type\":\"BAN\",\"reason\":\"Spam em serie confirmado.\"}"), "status", "ALREADY_BANNED")
+    Check.status(ModerationTestKit.get(target, "/me/sanctions"), 401)
+    Check.status(ModerationTestKit.post(admin, "/admin/users/nobody_here/sanction", "{\"type\":\"BAN\",\"reason\":\"Spam em serie confirmado.\"}"), 404)
+    Check.jsonEq(ModerationTestKit.post(admin, "/admin/users/mp_victim/sanction", "{\"type\":\"BAN\",\"reason\":\"curto\"}"), "code", "REASON_REQUIRED")
+    Check.status(ModerationTestKit.post(admin, "/admin/users/mp_victim/sanction", "{\"type\":\"NOPE\",\"reason\":\"Spam em serie confirmado.\"}"), 400)
+}
+
+test "a moderator can change the vote while the report is pending" {
+    var author = ModerationTestKit.login("mp_author2")
+    var reporter = ModerationTestKit.login("mp_reporter2")
+    var applicant = ModerationTestKit.login("mp_mod2")
+    var admin = ModerationTestKit.loginAdmin("mp_admin")
+    approve(admin, apply(applicant, "Quero moderar para manter o feed seguro e acolhedor."))
+    var reportId = ModerationTestKit.publishReported(author, reporter, "Post para o segundo fluxo de voto.", "SCAM")
+    var punish = ModerationTestKit.post(applicant, "/moderation/reports/" + reportId + "/vote", "{\"vote\":\"PUNISH\"}")
+    Check.jsonEq(punish, "punishVotes", "1")
+    var dismiss = ModerationTestKit.post(applicant, "/moderation/reports/" + reportId + "/vote", "{\"vote\":\"DISMISS\",\"note\":\"Revi e nao vejo problema.\"}")
+    Check.status(dismiss, 200)
+    Check.jsonEq(dismiss, "punishVotes", "0")
+    Check.jsonEq(dismiss, "dismissVotes", "1")
+    Check.jsonEq(dismiss, "myVote", "DISMISS")
+    // The author of the reported content and a missing vote are refused; a decided report cannot be voted.
+    var own = ModerationTestKit.post(author, "/moderation/reports/" + reportId + "/vote", "{\"vote\":\"PUNISH\"}")
+    Check.status(own, 403)
+    Check.jsonEq(ModerationTestKit.post(applicant, "/moderation/reports/" + reportId + "/vote", "{}"), "code", "INVALID_VOTE")
+    Check.jsonEq(ModerationTestKit.post(applicant, "/moderation/reports/report_missing/vote", "{\"vote\":\"PUNISH\"}"), "code", "REPORT_NOT_FOUND")
+}
+
+test "a plain user stays out of the panel and a moderator opens only the moderator routes" {
+    var plain = ModerationTestKit.login("melow_plain")
+    ModerationTestKit.login("melow_target")
+    var admin = ModerationTestKit.loginAdmin("melow_admin")
+    Check.status(ModerationTestKit.post(plain, "/admin/users/melow_target/sanction", "{\"type\":\"RESTRICTION\",\"reason\":\"tentativa sem permissao\"}"), 403)
+    Check.status(ModerationTestKit.get(plain, "/admin/appeals"), 403)
+    Check.status(ModerationTestKit.get(plain, "/moderation/quarantine"), 403)
+    // A moderator opens the moderator panel but not the application management, and cannot sanction the own account.
+    var modUser = ModerationTestKit.login("modperm_mod")
+    Check.jsonEq(ModerationTestKit.post(admin, "/admin/moderators", "{\"username\":\"modperm_mod\",\"note\":\"Promovido para o teste de permissões do painel.\"}"), "status", "APPROVED")
+    Check.status(ModerationTestKit.get(modUser, "/admin/appeals"), 200)
+    Check.status(ModerationTestKit.get(modUser, "/moderation/quarantine"), 200)
+    var self = ModerationTestKit.post(modUser, "/admin/users/modperm_mod/sanction", "{\"type\":\"RESTRICTION\",\"reason\":\"Tentativa de autopunição no teste de permissões.\"}")
+    Check.status(self, 400)
+    Check.jsonEq(self, "code", "CANNOT_SANCTION_SELF")
+    Check.status(ModerationTestKit.get(modUser, "/admin/moderator-applications"), 403)
+    Check.status(ModerationTestKit.post(modUser, "/admin/moderator-applications/nao-existe/approve", ""), 403)
+    ModerationTestKit.finish()
+}
