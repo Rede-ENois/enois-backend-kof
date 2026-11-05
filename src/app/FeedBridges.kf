@@ -1,0 +1,88 @@
+package app
+
+import communities.*
+import contributions.*
+import corporate.*
+import feed.*
+import java.util.HashMap
+import kernel.db.*
+import kernel.error.*
+import kernel.time.*
+import profile.*
+
+// Feed seams whose owner sits in a package that would import the feed back (a cycle), so the bridge lives here, in the
+// composition. Each keeps the contract of the seam it replaces.
+
+// feed authors: the profile directory (names, badges, name style), the corporate service (identity of CORPORATE posts)
+// and the contributor seals.
+class ProfileFeedAuthors extends FeedAuthors {
+    ProfileDirectory directory
+    CorporateService corporate
+    ContributionsStore seals
+    public constructor(store: Db, directory: ProfileDirectory, corporate: CorporateService, seals: ContributionsStore) {
+        super(store)
+        this.directory = directory
+        this.corporate = corporate
+        this.seals = seals
+    }
+    Map<String,FeedAuthor> byIds(ids: List<String>) {
+        var out = new HashMap<String, FeedAuthor>()
+        for (var p in directory.findAllByIds(ids)) {
+            out.put(p.id, FeedAuthor(p.id, p.username, p.displayWithNickname(), p.avatar, p.allBadges(), p.avatarFrame, p.nameTheme, p.nameFont, p.nameColor, p.nameplate, p.contributorTagColor))
+        }
+        return out
+    }
+    Map<String,FeedAuthor> corporateByIds(ids: List<String>) {
+        var out = new HashMap<String, FeedAuthor>()
+        for (var c in corporate.byUserIds(ids)) {
+            out.put(c.userId, FeedAuthor(c.userId, c.username, c.name, c.avatar, listOf<String>(), null, null, null, null, null, null))
+        }
+        return out
+    }
+    // CoinService.NEW_ACCOUNT_WINDOW (7 days): an account younger than that never earns the answer reward.
+    Bool isNewAccount(userId: String) {
+        var p = directory.findById(userId)
+        if (p == null) {
+            return true
+        }
+        return Time.toMillis(p.createdAt) > Time.nowMillis() - 7L * 86400000L
+    }
+    String idOfUsername(usernameOrId: String) {
+        var p = directory.findByUsername(usernameOrId)
+        if (p == null) {
+            return usernameOrId
+        }
+        return p.id
+    }
+    Map<String,String> plainNames(ids: List<String>) {
+        var out = new HashMap<String, String>()
+        for (var p in directory.findAllByIds(ids)) {
+            out.put(p.id, p.name)
+        }
+        return out
+    }
+    List<String> contributorIds(ids: List<String>) = seals.activeSealUserIds(ids)
+}
+
+// communities: the pin rule, the community and channel feeds and the pinned post card, served by the feed.
+class FeedCommunityLookup extends CommunityFeedLookup {
+    FeedReader reader
+    FeedService service
+    FeedStore posts
+    public constructor(store: Db, reader: FeedReader, service: FeedService, posts: FeedStore) {
+        super(store)
+        this.reader = reader
+        this.service = service
+        this.posts = posts
+    }
+    CommunityPostRef? postRef(postId: String) {
+        var p = posts.post(postId)
+        if (p == null) {
+            return null
+        }
+        return CommunityPostRef(p.id, p.communityId, p.status == "ACTIVE")
+    }
+    String communityFeed(communityId: String, before: String?, limit: Int, viewerId: String?) = json.encode(reader.communityFeed(communityId, before, limit, viewerId))
+    String channelFeed(communityId: String, channelId: String, before: String?, limit: Int, viewerId: String) = json.encode(reader.channelFeed(communityId, channelId, before, limit, viewerId))
+    String post(postId: String, viewerId: String?) = json.encode(service.getPost(postId, viewerId))
+}

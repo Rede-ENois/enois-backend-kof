@@ -1,0 +1,67 @@
+package feed
+
+import age.*
+import blog.*
+import games.*
+import linkedin.*
+import kernel.db.*
+import kernel.sanctions.*
+
+// The feed duties other domains held while this one did not exist, now backed by FeedService.
+
+// games: sharing an achievement publishes a real INSIGHT post (PublishPostService.publish): age and sanction gates,
+// limiters, risk signals, duplication guard, media ownership, mentions, fan-out counters and the PostPublished event.
+class FeedGamesFeed extends GamesFeed {
+    FeedService service
+    public constructor(store: Db, ageGate: AgeGate, sanctions: SanctionGate, service: FeedService) {
+        super(store, ageGate, sanctions)
+        this.service = service
+    }
+    String publishShare(authorId: String, text: String, tags: List<String>, mediaIds: List<String>) {
+        var body = FeedPublishBody("INSIGHT", text, null, null, tags, mediaIds, null, listOf<String>(), null, null, false, null, null)
+        return service.publish(authorId, body).id()
+    }
+}
+
+// blog: a blog post is also a pointer post in the feed (type BLOG, tag "blog") that only the subscribers see in
+// "Para voce"; its id becomes the id of the blog post. Deleting the blog post soft-deletes the pointer.
+class FeedBlogPointers extends BlogFeedPointers {
+    FeedService service
+    public constructor(service: FeedService) {
+        super()
+        this.service = service
+    }
+    String publish(userId: String, title: String) {
+        var body = FeedPublishBody("BLOG", title, null, null, listOf("blog"), listOf<String>(), null, listOf<String>(), null, null, false, null, null)
+        return service.publish(userId, body).id()
+    }
+    delete(userId: String, postId: String, reason: String) {
+        service.deletePost(userId, postId, reason)
+    }
+}
+
+// The owners of the blogs a reader subscribed to (the "Para voce" ranking), read through the blog store.
+class BlogFeedBlogs extends FeedBlogs {
+    BlogStore blogs
+    public constructor(database: Db, blogs: BlogStore) {
+        super(database)
+        this.blogs = blogs
+    }
+    List<String> authorsFollowedBy(userId: String) = blogs.authorsFollowedBy(userId)
+}
+
+// linkedin: the post behind a PostPublished event, read through the feed store.
+class FeedLinkedInPosts extends LinkedInPostLookup {
+    FeedStore posts
+    public constructor(store: Db, posts: FeedStore) {
+        super(store)
+        this.posts = posts
+    }
+    LinkedInPostRef? findById(postId: String) {
+        var p = posts.post(postId)
+        if (p == null) {
+            return null
+        }
+        return LinkedInPostRef(p.id, p.authorId, p.content, p.status, p.type, p.authorIdentity)
+    }
+}
