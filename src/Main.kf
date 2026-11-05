@@ -1,4 +1,8 @@
 import calls.*
+import coin.*
+import cosmetics.*
+import marketplace.*
+import services.*
 import kernel.*
 import kernel.config.*
 import kernel.log.*
@@ -50,15 +54,26 @@ main() {
         var age = AgeModule.install(platform, identity.mailer)
         OnboardingModule.install(platform, age.policy)
         // profile, network, preferences, presence (seams: ProfileModule.installWith).
-        ProfileModule.install(platform, shared, hooks)
+        // The cosmetics core (catalog + badge ownership) comes first: profile asks it who owns an emblem.
+        var cosmeticsCore = CosmeticsCore.create(platform)
+        var profileModule = ProfileModule.installWith(platform, shared, ProfileNotifier(platform.db), cosmeticsCore.badges, ProfileParentalLinks(platform.db), ProfileForeignCounts(platform.db), PreferencesThemeGallery(platform.db))
+        // economy (coin): the ledger service is built first because the domains below call it (presence, rewards);
+        // the routes, the disputes and the jobs come after notifications (CoinModule.install).
+        var coinCore = CoinCore.create(platform, shared, parts)
         // Domains (one block each, ordered by dependency): notifications is the sink the others write to.
-        var notificationsModule = NotificationsModule.install(platform, shared, hooks, parts)
+        var notificationSeams = NotificationsSeams(platform)
+        notificationSeams.coins = CoinNotificationCoins(coinCore.service)
+        var notificationsModule = NotificationsModule.installWith(platform, shared, notificationSeams)
+        var coinModule = CoinModule.install(platform, shared, parts, coinCore, profileModule, notificationsModule)
+        CosmeticsModule.install(platform, cosmeticsCore, coinModule, profileModule)
         PushModule.install(platform, shared, hooks, parts, notificationsModule)
-        var messagingModule = MessagingModule.install(platform, shared, hooks, parts, notificationsModule)
+        var messagingSeams = MessagingSeamSet(platform)
+        messagingSeams.coins = CoinMessagingCoins(coinCore.service)
+        var messagingModule = MessagingModule.installWith(platform, shared, parts, notificationsModule, messagingSeams)
         CallsModule.install(platform, shared, hooks, parts, notificationsModule, messagingModule)
         // Groups notices go through the Notifications API (push + preferences): see GroupNotificationsBridge.
-        GroupsModule.installWith(platform, shared, GroupProfileLookup(platform.db), GroupAgeGate(platform.db), GroupMediaLookup(platform.db), GroupNotificationsBridge(platform.db, notificationsModule.notifications), GroupCoins())
-        CommunitiesModule.install(platform, shared, hooks)
+        GroupsModule.installWith(platform, shared, GroupProfileLookup(platform.db), GroupAgeGate(platform.db), GroupMediaLookup(platform.db), GroupNotificationsBridge(platform.db, notificationsModule.notifications), CoinGroupCoins(coinCore.service))
+        CommunitiesModule.installWith(platform, shared, hooks, CommunityProfileLookup(platform.db), CommunityFeedLookup(platform.db), CoinCommunityCoins(coinCore.service))
         CommunityProjectsModule.install(platform, shared, hooks)
         StudyPairsModule.install(platform, shared, hooks)
         // Leaf domains: stats, search, themes, projects, notices, releasenotes, suggestions, blog.
@@ -66,10 +81,13 @@ main() {
         NoticeModule.install(platform, shared, hooks)
         ReleaseNoteModule.install(platform, shared, hooks)
         SearchModule.install(platform, shared, hooks)
-        ThemeModule.install(platform, shared, hooks)
+        var themeModule = ThemeModule.install(platform, shared, hooks)
         ProjectsModule.install(platform, shared, hooks)
         SuggestionsModule.install(platform, shared, hooks)
-        BlogModule.install(platform, shared, hooks)
+        BlogModule.withSeams(platform, shared, BlogProfiles(platform.db), BlogFeedPointers(), BlogNotifier(), CoinBlogCoins(coinCore.service), BlogEmailSender(EmailLogStore(platform.db)))
+        // economy: the marketplace (escrow, workers) and the services directory/contracts sit on the coin service.
+        MarketplaceModule.install(platform, shared, coinModule, profileModule, themeModule)
+        ServicesModule.install(platform, shared, coinModule, profileModule, messagingModule)
         log.info("listening on port " + port)
         platform.start(port)
     } catch (String e) {
