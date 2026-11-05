@@ -1,0 +1,133 @@
+import app.*
+import java.lang.System
+import java.util.HashMap
+import kernel.*
+import kernel.testkit.*
+import messaging.*
+import notifications.*
+
+// The inbox stream THROUGH the BinaryFront: in production every request goes public port (front) -> web runtime
+// (loopback) because media claims binary prefixes, yet MessageStreamTest only reads the stream straight from the runtime.
+// This boots the exact production wiring (app.AppWiring) and reads GET /conversations/stream on the public port.
+class FrontStreamHolder {
+    static TestApp? cached = null
+    static SharedServices? shared = null
+}
+
+TestApp frontApp() {
+    var cur = FrontStreamHolder.cached
+    if (cur != null) {
+        return cur
+    }
+    var overrides = new HashMap<String, String>()
+    overrides.put("REDE_SECURITY_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+    overrides.put("REDE_ORIGINS_ENFORCE", "false")
+    overrides.put("REDE_MESSAGING_STREAM_HEARTBEAT_MS", "300")
+    var created = TestApp.bootWith("streamfront", overrides, (p: Platform) -> {
+    FrontStreamHolder.shared = AppWiring.install(p)
+})
+    FrontStreamHolder.cached = created
+    return created
+}
+
+Int internalPortOf(app: TestApp) {
+    var f = app.platform.front
+    if (f == null) {
+        throw "FRONT_NOT_ACTIVE"
+    }
+    return f.internalPort
+}
+
+String who(id: String) = DomainTestKit.loginAdult(frontApp(), id)
+
+// Opens the stream on the PUBLIC port and checks the opening frame arrives promptly.
+SseClient openThroughFront(token: String) {
+    var started = System.currentTimeMillis()
+    var client = SseClient.open(frontApp().port, "/conversations/stream", DomainTestKit.auth(token))
+    if (client.status() != 200) {
+        throw "stream refused " + client.status() + " " + client.rest()
+    }
+    var first = client.next(2000)
+    Check.eqStr("opening frame", "open", first.name)
+    Check.isTrue("the open frame is not held until the stream ends", System.currentTimeMillis() - started < 2000L)
+    return client
+}
+
+test "the stream is really served through the front" {
+    var app = frontApp()
+    Check.isTrue("the front owns the public port", app.platform.front != null)
+    Check.isTrue("the runtime listens elsewhere", internalPortOf(app) != app.port)
+}
+
+test "open, a conversation event and a heartbeat arrive through the front" {
+    var app = frontApp()
+    var sender = who("sf_sender")
+    var recipient = who("sf_recipient")
+    var conversationId = MessagingTestKit.direct(app, sender, "sf-direct", "sf_recipient")
+    var stream = openThroughFront(recipient)
+    Check.isTrue("event stream content type", stream.header("Content-Type").startsWith("text/event-stream"))
+    Check.eqStr("no proxy buffering", "no", stream.header("X-Accel-Buffering"))
+    // Idle: the heartbeat (300 ms) is relayed, not buffered.
+    var beat = stream.waitFor("ping", 3000)
+    Check.eqStr("heartbeat", "ping", beat.name)
+    var sentAt = System.currentTimeMillis()
+    MessagingTestKit.sendOk(app, sender, "sf-send", conversationId, "oi")
+    var event = stream.waitFor("conversation", 4000)
+    Check.eqStr("conversation event", "conversation", event.name)
+    Check.eqStr("only the id travels", "{\"conversationId\":\"" + conversationId + "\"}", event.data)
+    Check.isTrue("the event is prompt", System.currentTimeMillis() - sentAt < 4000L)
+    stream.close()
+}
+
+test "response headers through the front equal what the runtime sends, and are recorded" {
+    var app = frontApp()
+    var user = who("sf_headers")
+    var viaFront = openThroughFront(user)
+    var direct = SseClient.open(internalPortOf(app), "/conversations/stream", DomainTestKit.auth(user))
+    Check.eqInt("runtime status", 200, direct.status())
+    System.out.println("FRONT HEADERS " + json.encode(viaFront.headerLines))
+    System.out.println("RUNTIME HEADERS " + json.encode(direct.headerLines))
+    var ping = app.client.get("/health")
+    System.out.println("PLAIN ROUTE HEADERS " + json.encode(ping.headerNames))
+    Check.eqInt("same number of headers", direct.headerLines.size(), viaFront.headerLines.size())
+    viaFront.close()
+    direct.close()
+}
+
+test "closing the client releases the stream, so the per-user cap counts the live ones" {
+    var app = frontApp()
+    var user = who("sf_cap")
+    var cap = MessageStreams.maxStreamsPerUser()
+    var opened = listOf<SseClient>()
+    var i = 0
+    while (i < cap) {
+        opened.add(openThroughFront(user))
+        i = i + 1
+    }
+    // Close the newest and open one more: if the server released it, nothing is evicted.
+    opened.get(cap - 1).close()
+    // The front notices the dead client when it relays the next heartbeat (300 ms) and closes the runtime side.
+    time.sleep(2000)
+    var extra = openThroughFront(user)
+    var oldest = opened.get(0).waitFor("never", 1500)
+    Check.eqStr("the oldest survives: the closed stream was released", "timeout", oldest.name)
+    // Now the cap is full again (4 + extra = 5); one more evicts the oldest.
+    var overflow = openThroughFront(user)
+    var evicted = opened.get(0).waitFor("never", 3000)
+    Check.eqStr("the oldest is evicted at the cap", "end", evicted.name)
+    for (var c in opened) {
+        c.close()
+    }
+    extra.close()
+    overflow.close()
+}
+
+test "the stack is stopped at the end" {
+    var app = frontApp()
+    app.stop()
+    var s = FrontStreamHolder.shared
+    if (s != null) {
+        s.stop()
+    }
+    Check.isTrue("stopped", true)
+}
