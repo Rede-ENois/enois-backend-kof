@@ -1,0 +1,107 @@
+package githubprofile
+
+import contributions.*
+import kernel.url.*
+
+// Public GitHub profile read for importing projects and the README. The read-only token of the service only raises
+// the limit; a person's token is never asked for nor stored. A base class with inert defaults (G30): the real client
+// and the test doubles extend it.
+class GithubProfileGateway {
+    List<GithubUserRepository> listUserRepositories(login: String, maxPages: Int) = listOf<GithubUserRepository>()
+    // null when there is no public profile README.
+    GithubProfileReadme? profileReadme(login: String) = null
+}
+
+record GhApiRepo(String? full_name, String? name, String? description, String? html_url, String? homepage, String? language, List<String>? topics, Int? stargazers_count, Int? forks_count, Troolean fork, Troolean archived, String? updated_at, String? default_branch)
+record GhApiRepoMeta(String? html_url, String? default_branch)
+record GhApiReadmeMeta(String? download_url)
+
+class GithubProfileClient extends GithubProfileGateway {
+    GithubHttp github
+    public constructor(github: GithubHttp) {
+        super()
+        this.github = github
+    }
+    static String blankNull(v: String?) {
+        if (v == null) {
+            return ""
+        }
+        return v
+    }
+    static String? textOrNull(v: String?) {
+        if (v == null) {
+            return null
+        }
+        if (v.trim().length() == 0) {
+            return null
+        }
+        return v
+    }
+    List<GithubUserRepository> listUserRepositories(login: String, maxPages: Int) {
+        var result = listOf<GithubUserRepository>()
+        var safe = UrlCodec.encode(login)
+        var limit = maxPages
+        if (limit > 20) {
+            limit = 20
+        }
+        if (limit < 1) {
+            limit = 1
+        }
+        var page = 1
+        while (page <= limit) {
+            var array = json.decode<List<GhApiRepo>>(github.get("/users/" + safe + "/repos?per_page=100&page=" + page + "&sort=updated"))
+            if (array.size() == 0) {
+                return result
+            }
+            for (var repo in array) {
+                result.add(GithubProfileClient.fromRepo(repo))
+            }
+            if (array.size() < 100) {
+                return result
+            }
+            page = page + 1
+        }
+        return result
+    }
+    static GithubUserRepository fromRepo(r: GhApiRepo) {
+        var topics = listOf<String>()
+        var raw = r.topics()
+        if (raw != null) {
+            for (var topic in raw) {
+                if (topic.trim().length() > 0) {
+                    topics.add(topic)
+                }
+            }
+        }
+        var branch = GithubProfileClient.blankNull(r.default_branch())
+        if (branch.length() == 0) {
+            branch = "main"
+        }
+        return GithubUserRepository(GithubProfileClient.blankNull(r.full_name()), GithubProfileClient.blankNull(r.name()), GithubProfileClient.textOrNull(r.description()), GithubProfileClient.blankNull(r.html_url()), GithubProfileClient.textOrNull(r.homepage()), GithubProfileClient.textOrNull(r.language()), topics, GithubApiClient.num(r.stargazers_count()), GithubApiClient.num(r.forks_count()), GithubApiClient.flag(r.fork), GithubApiClient.flag(r.archived), GithubApiClient.instant(r.updated_at()), branch)
+    }
+    GithubProfileReadme? profileReadme(login: String) {
+        var safe = UrlCodec.encode(login)
+        var repoText = github.getOptional("/repos/" + safe + "/" + safe)
+        var readmeText = ""
+        if (repoText.length() > 0) {
+            readmeText = github.getOptional("/repos/" + safe + "/" + safe + "/readme")
+        }
+        var markdown = ""
+        var meta = GhApiRepoMeta(null, null)
+        if (readmeText.length() > 0) {
+            meta = json.decode<GhApiRepoMeta>(repoText)
+            var download = GithubProfileClient.blankNull(json.decode<GhApiReadmeMeta>(readmeText).download_url())
+            if (download.startsWith("https://raw.githubusercontent.com/")) {
+                markdown = github.getRaw(download)
+            }
+        }
+        if (markdown.trim().length() == 0) {
+            return null
+        }
+        var branch = GithubProfileClient.blankNull(meta.default_branch())
+        if (branch.length() == 0) {
+            branch = "main"
+        }
+        return GithubProfileReadme(markdown, GithubProfileClient.blankNull(meta.html_url()), branch)
+    }
+}

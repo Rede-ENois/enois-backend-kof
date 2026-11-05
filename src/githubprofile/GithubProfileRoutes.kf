@@ -1,0 +1,30 @@
+package githubprofile
+
+import kernel.error.*
+import kernel.http.*
+import kernel.security.*
+import kernel.url.*
+
+// The import from GitHub into the profile: lists the public repositories of the link, converts the chosen ones into
+// project cards and the profile README into the HTML bio. Everything needs a session and uses the verified handle.
+class GithubProfileRoutes {
+    static register(server: HttpServer, service: GithubProfileImport) {
+        server.get("/me/github/repos", () -> json.encode(GithubProfileViews.repos(service.repositories(Auth.requireUser()))))
+        server.get("/me/github/readme", () -> json.encode(service.readmePreview(Auth.requireUser())))
+        server.post("/me/github/import/projects", () -> GithubProfileRoutes.importProjects(service))
+        server.post("/me/github/import/readme", () -> json.encode(service.importReadme(Auth.requireUser())))
+    }
+    static String importProjects(service: GithubProfileImport) {
+        var userId = Auth.requireUser()
+        SafeLinks.checkRequest()
+        var body = GithubProfileRoutes.parse()
+        return json.encode(service.importProjects(userId, body.repos()))
+    }
+    static GithubImportBody parse() {
+        try {
+            return json.decode<GithubImportBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+}

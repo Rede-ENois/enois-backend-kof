@@ -1,0 +1,27 @@
+package githubprofile
+
+import contributions.*
+import kernel.*
+import kernel.config.*
+import kernel.security.*
+import profile.*
+import projects.*
+
+// Composition of the GitHub profile import. Seam: GithubProfileGateway (the public GitHub reader).
+class GithubProfileModule {
+    GithubProfileImport service
+    public constructor(service: GithubProfileImport) {
+        this.service = service
+    }
+    static GithubProfileModule install(platform: Platform, shared: SharedServices, contributions: ContributionsModule, profiles: ProfileModule, projects: ProjectsModule) {
+        var cfg = platform.cfg
+        var gh = GithubHttp(cfg.getStr("GITHUB_API_BASE", "https://api.github.com"), cfg.getStr("GITHUB_CONTRIBUTIONS_TOKEN", ""), cfg.getStr("GITHUB_USER_AGENT", "EnoisBot/1.0 (+https://enois.ia.br)"))
+        return GithubProfileModule.installWith(platform, shared, contributions, profiles, projects, GithubProfileClient(gh))
+    }
+    static GithubProfileModule installWith(platform: Platform, shared: SharedServices, contributions: ContributionsModule, profiles: ProfileModule, projects: ProjectsModule, gateway: GithubProfileGateway) {
+        var reader = CachedGithubProfileReader(gateway, shared.caches.get("githubRepositories"), shared.caches.get("githubReadme"))
+        var service = GithubProfileImport(reader, contributions.store, profiles.directory, ProfileStore(platform.db), projects.service)
+        GithubProfileRoutes.register(platform.server, service)
+        return GithubProfileModule(service)
+    }
+}
