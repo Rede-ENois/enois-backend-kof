@@ -1,0 +1,279 @@
+package support
+
+import kernel.error.*
+import kernel.http.*
+import kernel.log.*
+import kernel.security.*
+import kernel.url.*
+
+// Webhook payload members the support reads (the rest is ignored).
+record SupportGhRepo(String? full_name)
+record SupportGhIssue(Int? number, String? state)
+record SupportGhUser(String? login)
+record SupportGhComment(Long? id, String? body, SupportGhUser? user)
+record SupportGhEvent(String? action, SupportGhRepo? repository, SupportGhIssue? issue, SupportGhComment? comment)
+
+// /support/* (a session), /admin/support/* (moderators; the infrastructure paths under /admin/support/github are
+// admin-only, the route guard and requireAdmin both enforce it) and the public webhook /webhooks/github, which
+// authenticates with the HMAC of GitHub itself.
+class SupportRoutes {
+    static register(server: HttpServer, service: SupportService, webhook: SupportWebhook, settings: SupportGithubConfig, thread: SupportThread, supportEmail: String) {
+        server.use("webhook-body-limit", -975, () -> SupportRoutes.limitWebhookBody())
+        server.get("/support/settings", () -> json.encode(SupportConfigView(SupportRoutes.emailOrNull(supportEmail))))
+        server.post("/support/requests", () -> SupportRoutes.open(service))
+        server.get("/support/requests/mine", () -> SupportRoutes.mine(service))
+        server.get("/admin/support", () -> SupportRoutes.list(service))
+        server.get("/admin/support/github", () -> SupportRoutes.githubSettings(settings))
+        server.put("/admin/support/github", () -> SupportRoutes.updateGithub(settings))
+        server.patch("/admin/support/:id", () -> SupportRoutes.update(service))
+        server.post("/admin/support/:id/reply", () -> SupportRoutes.reply(service))
+        server.get("/admin/support/:id/messages", () -> SupportRoutes.messages(service, thread))
+        server.post("/webhooks/github", () -> SupportRoutes.receive(webhook, settings))
+    }
+    static String? emailOrNull(email: String) {
+        if (email.trim().length() == 0) {
+            return null
+        }
+        return email.trim()
+    }
+    static String open(service: SupportService) {
+        var userId = Auth.requireUser()
+        var body = SupportRoutes.parseCreate()
+        var category = SupportRoutes.categoryOf(body.category())
+        return status(201, json.encode(SupportViews.request(service.open(userId, body.subject(), body.message(), body.contactEmail(), body.imageUrl(), category))))
+    }
+    static String mine(service: SupportService) {
+        var userId = Auth.requireUser()
+        return json.encode(SupportViews.requests(service.mine(userId, Req.queryInt("limit", 20))))
+    }
+    // An unknown enum constant is a value Jackson / the converter cannot read: a plain 400.
+    static String? categoryOf(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        if (!SupportViews.categories().contains(raw)) {
+            throw Errors.badRequest()
+        }
+        return raw
+    }
+    static String? statusOf(raw: String?) {
+        if (raw == null) {
+            return null
+        }
+        if (!SupportViews.statuses().contains(raw)) {
+            throw Errors.badRequest()
+        }
+        return raw
+    }
+    static String list(service: SupportService) {
+        Auth.requireModerator()
+        var category = SupportRoutes.categoryOf(SupportRoutes.queryOrNull("category"))
+        var status = SupportRoutes.statusOf(SupportRoutes.queryOrNull("status"))
+        return json.encode(SupportViews.admins(service.list(category, status, Req.queryInt("limit", 50))))
+    }
+    // An empty value is "absent" for the Spring converter.
+    static String? queryOrNull(name: String) {
+        var raw = Req.queryParam(name)
+        if (raw == null) {
+            return null
+        }
+        if (raw.length() == 0) {
+            return null
+        }
+        return raw
+    }
+    static String update(service: SupportService) {
+        Auth.requireModerator()
+        var body = SupportRoutes.parseUpdate()
+        var status = SupportRoutes.statusOf(body.status())
+        var category = SupportRoutes.categoryOf(body.category())
+        return json.encode(SupportViews.admin(service.update(Req.pathParam("id"), status, category)))
+    }
+    static String reply(service: SupportService) {
+        var admin = Auth.requireModerator()
+        var body = SupportRoutes.parseReply()
+        return json.encode(SupportViews.admin(service.reply(Req.pathParam("id"), admin, body.message())))
+    }
+    static String messages(service: SupportService, thread: SupportThread) {
+        Auth.requireModerator()
+        return json.encode(SupportViews.messages(thread.thread(Req.pathParam("id"))))
+    }
+    static String githubSettings(settings: SupportGithubConfig) {
+        Auth.requireAdmin()
+        return json.encode(SupportRoutes.githubView(settings))
+    }
+    static String updateGithub(settings: SupportGithubConfig) {
+        Auth.requireAdmin()
+        var body = SupportRoutes.parseGithubSettings()
+        settings.update(body.token(), body.repo(), body.webhookSecret())
+        return json.encode(SupportRoutes.githubView(settings))
+    }
+    static SupportGithubSettingsView githubView(settings: SupportGithubConfig) {
+        var repo = SupportText.none()
+        if (settings.repository().trim().length() > 0) {
+            repo = settings.repository()
+        }
+        return SupportGithubSettingsView(settings.enabled(), repo, settings.tokenConfigured(), settings.webhookSecretConfigured())
+    }
+    static SupportCreateBody parseCreate() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<SupportCreateBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static SupportUpdateBody parseUpdate() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<SupportUpdateBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static SupportReplyBody parseReply() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<SupportReplyBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    static SupportGithubSettingsBody parseGithubSettings() {
+        SafeLinks.checkRequest()
+        try {
+            return json.decode<SupportGithubSettingsBody>(Req.bodyText())
+        } catch (String e) {
+            throw Errors.badRequest()
+        }
+    }
+    // Ceiling of the webhook body before anything reads it: GitHub sends Content-Length, above the ceiling the
+    // request is refused without reading the body. Issue events are far below it.
+    static Long maxWebhookBody() = 2097152L
+    static String limitWebhookBody() {
+        if (RequestPath.current().endsWith("/webhooks/github")) {
+            var raw = Req.headerOrNull("content-length")
+            if (raw != null) {
+                if (SupportRoutes.number(raw) > SupportRoutes.maxWebhookBody()) {
+                    return Http.respond(413, "{\"code\":\"WEBHOOK_TOO_LARGE\",\"message\":\"Corpo do webhook acima do limite.\"}")
+                }
+            }
+        }
+        return Http.next()
+    }
+    static Long number(raw: String) {
+        try {
+            return raw.trim().toLong()
+        } catch (String e) {
+            return 0L
+        }
+    }
+    // 503 without a secret (fail closed), 401 for a missing or wrong signature, 200 for everything else, a
+    // malformed signed body included (GitHub resending it would not help). The body is UTF-8 text (G161): a signed
+    // body in another charset cannot verify; GitHub sends UTF-8 JSON.
+    static String receive(webhook: SupportWebhook, settings: SupportGithubConfig) {
+        var secret = settings.webhookSecret()
+        if (secret.trim().length() == 0) {
+            return status(503, "")
+        }
+        var body = Req.bodyText()
+        if (!SupportRoutes.validSignature(secret, Req.headerOrNull("x-hub-signature-256"), body)) {
+            return status(401, "")
+        }
+        var eventName = Req.headerOrNull("x-github-event")
+        if (eventName == null) {
+            return status(200, "")
+        }
+        try {
+            var event = json.decode<SupportGhEvent>(body)
+            SupportRoutes.dispatch(webhook, eventName, event)
+        } catch (String malformed) {
+            Log("support.webhook").warn("Webhook do GitHub com corpo inválido.")
+        }
+        return status(200, "")
+    }
+    static Bool validSignature(secret: String, signature: String?, body: String) {
+        if (signature == null) {
+            return false
+        }
+        if (!signature.startsWith("sha256=")) {
+            return false
+        }
+        return Tokens.safeEquals("sha256=" + Hashes.hmacSha256Hex(secret, body), signature)
+    }
+    static String repositoryOf(event: SupportGhEvent) {
+        var repo = event.repository()
+        if (repo == null) {
+            return ""
+        }
+        var name = repo.full_name()
+        if (name == null) {
+            return ""
+        }
+        return name
+    }
+    static dispatch(webhook: SupportWebhook, eventName: String, event: SupportGhEvent) {
+        var action = ""
+        var raw = event.action()
+        if (raw != null) {
+            action = raw
+        }
+        var issue = event.issue()
+        var number = 0
+        var state = ""
+        if (issue != null) {
+            var n = issue.number()
+            if (n != null) {
+                number = n
+            }
+            var s = issue.state()
+            if (s != null) {
+                state = s
+            }
+        }
+        if (!webhook.acceptsRepository(SupportRoutes.repositoryOf(event))) {
+            return
+        }
+        if (eventName == "issue_comment") {
+            SupportRoutes.comment(webhook, action, number, event.comment())
+            return
+        }
+        if (eventName != "issues") {
+            return
+        }
+        if (number > 0 && (action == "closed" || action == "reopened")) {
+            webhook.applyIssueState(number, state)
+        }
+    }
+    static Long longOf(v: Long?) {
+        if (v == null) {
+            return 0L
+        }
+        return v
+    }
+    static comment(webhook: SupportWebhook, action: String, number: Int, comment: SupportGhComment?) {
+        if (action != "created") {
+            return
+        }
+        if (comment == null) {
+            return
+        }
+        var id = SupportRoutes.longOf(comment.id())
+        var login = ""
+        var user = comment.user()
+        if (user != null) {
+            var l = user.login()
+            if (l != null) {
+                login = l
+            }
+        }
+        var text = ""
+        var b = comment.body()
+        if (b != null) {
+            text = b
+        }
+        if (number > 0 && id > 0L) {
+            webhook.applyIssueComment(number, id, login, text)
+        }
+    }
+}

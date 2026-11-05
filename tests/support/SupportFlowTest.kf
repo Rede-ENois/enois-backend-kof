@@ -1,0 +1,179 @@
+import kernel.*
+import kernel.db.*
+import kernel.testkit.*
+import notifications.*
+import support.*
+
+// Ports of SupportCategoriesTests, SupportThreadTests and the HTTP essence of SupportRouteAuthorizationTests,
+// plus the validations of SupportService.open/reply.
+TestApp sapp() {
+    SupportTestKit.configure(mapOf("GITHUB_ISSUES_REPO", SupportTestKit.repo(), "GITHUB_ISSUES_WEBHOOK_SECRET", SupportTestKit.secret()))
+    return SupportTestKit.app()
+}
+
+test "an admin filters tickets by category and moves the status, replies and closes" {
+    var app = sapp()
+    var user = SupportTestKit.login("sc_user")
+    var admin = SupportTestKit.loginAdmin("sc_admin")
+    var created = SupportTestKit.send("POST", "/support/requests", user, SupportTestKit.ticketBody("O botão de publicar some no celular", "BUG"))
+    Check.status(created, 201)
+    Check.jsonEq(created, "category", "BUG")
+    Check.jsonEq(created, "status", "OPEN")
+    Check.jsonEq(created, "contactEmail", "***")
+    Check.jsonEq(created, "userId", "sc_user")
+    var id = created.json("id")
+    // A non-admin sees neither the queue nor the e-mail log.
+    Check.apiError(SupportTestKit.send("GET", "/admin/support", user, ""), 403, "FORBIDDEN")
+    var bug = SupportTestKit.send("GET", "/admin/support?category=BUG&status=OPEN", admin, "")
+    Check.status(bug, 200)
+    assert(SupportTestKit.indexOf(bug, id) >= 0)
+    var other = SupportTestKit.send("GET", "/admin/support?category=IDEA", admin, "")
+    Check.status(other, 200)
+    assert(SupportTestKit.indexOf(other, id) < 0)
+    var moved = SupportTestKit.send("PATCH", "/admin/support/" + id, admin, "{\"status\":\"IN_PROGRESS\"}")
+    Check.status(moved, 200)
+    Check.jsonEq(moved, "status", "IN_PROGRESS")
+    var progress = SupportTestKit.send("GET", "/admin/support?status=IN_PROGRESS", admin, "")
+    assert(SupportTestKit.indexOf(progress, id) >= 0)
+    var reply = "Corrigimos o botão na versão mais recente; atualize o app e tente de novo."
+    var replied = SupportTestKit.send("POST", "/admin/support/" + id + "/reply", admin, "{\"message\":\"" + reply + "\"}")
+    Check.status(replied, 200)
+    Check.jsonEq(replied, "adminReply", reply)
+    Check.jsonEq(replied, "status", "IN_PROGRESS")
+    Check.jsonEq(replied, "repliedBy", "sc_admin")
+    var closed = SupportTestKit.send("PATCH", "/admin/support/" + id, admin, "{\"status\":\"CLOSED\"}")
+    Check.status(closed, 200)
+    Check.jsonEq(closed, "status", "CLOSED")
+    Check.jsonEq(closed, "adminReply", reply)
+    // The reply e-mail left through the mailer (kind recorded in the e-mail log) and the author got a notice.
+    assert(SupportTestKit.emailsOfKind("SUPPORT_REPLY", "SENT") >= 1L)
+    assert(SupportTestKit.emailsOfKind("SUPPORT_CLOSED", "SENT") >= 1L)
+    assert(SupportTestKit.emailsOfKind("SUPPORT", "SENT") >= 1L)
+    var notices = SupportTestKit.db().queryLong("select count(*) from notifications where user_id = ? and kind = ?", DbParams().bindStr("sc_user").bindStr("SUPORTE"))
+    assert(notices >= 2L)
+}
+
+test "a failed delivery of the reply is logged as FAILED" {
+    var app = sapp()
+    var user = SupportTestKit.login("sf_user")
+    var admin = SupportTestKit.loginAdmin("sf_admin")
+    var id = SupportTestKit.open(user, "Sem SMTP")
+    SupportTestKit.mailer().delivers = false
+    var before = SupportTestKit.emailsOfKind("SUPPORT_REPLY", "FAILED")
+    var replied = SupportTestKit.send("POST", "/admin/support/" + id + "/reply", admin, "{\"message\":\"Resposta que não sai\"}")
+    SupportTestKit.mailer().delivers = true
+    Check.status(replied, 200)
+    assert(SupportTestKit.emailsOfKind("SUPPORT_REPLY", "FAILED") == before + 1L)
+}
+
+test "the thread joins panel replies and GitHub comments without duplicates" {
+    var app = sapp()
+    var user = SupportTestKit.login("st_user")
+    var admin = SupportTestKit.loginAdmin("st_admin")
+    var id = SupportTestKit.open(user, "Falha no login")
+    SupportTestKit.attach(id, 9101)
+    Check.status(SupportTestKit.send("POST", "/admin/support/" + id + "/reply", admin, "{\"message\":\"Já estamos verificando o acesso.\"}"), 200)
+    var first = SupportTestKit.send("GET", "/admin/support/" + id + "/messages", admin, "")
+    Check.status(first, 200)
+    Check.eqInt("one message", 1, first.jsonSize(""))
+    Check.jsonEq(first, "0.direction", "ENOIS")
+    assert(first.json("0.body").contains("verificando"))
+    var comment = "{\"action\":\"created\",\"issue\":{\"number\":9101},\"comment\":{\"id\":700001,\"body\":\"Consegui reproduzir.\",\"user\":{\"login\":\"octocat\"}},\"repository\":{\"full_name\":\"" + SupportTestKit.repo() + "\"}}"
+    Check.status(SupportTestKit.webhook("issue_comment", comment), 200)
+    // The echo of the same comment id does not duplicate.
+    Check.status(SupportTestKit.webhook("issue_comment", comment), 200)
+    var second = SupportTestKit.send("GET", "/admin/support/" + id + "/messages", admin, "")
+    Check.eqInt("two messages", 2, second.jsonSize(""))
+    Check.jsonEq(second, "1.direction", "GITHUB")
+    Check.jsonEq(second, "1.authorGithubLogin", "octocat")
+    // Without a moderator session the thread is not exposed.
+    Check.apiError(SupportTestKit.send("GET", "/admin/support/" + id + "/messages", user, ""), 403, "FORBIDDEN")
+}
+
+test "opening a ticket validates the request and throttles by day" {
+    var app = sapp()
+    var user = SupportTestKit.login("sv_user")
+    var noSubject = SupportTestKit.send("POST", "/support/requests", user, "{\"subject\":\" \",\"message\":\"Mensagem comprida o bastante.\",\"contactEmail\":\"a@b.com\"}")
+    Check.apiError(noSubject, 400, "INVALID_SUPPORT_REQUEST")
+    var shortMessage = SupportTestKit.send("POST", "/support/requests", user, "{\"subject\":\"Oi\",\"message\":\"curto\",\"contactEmail\":\"a@b.com\"}")
+    Check.apiError(shortMessage, 400, "INVALID_SUPPORT_REQUEST")
+    var noEmail = SupportTestKit.send("POST", "/support/requests", user, "{\"subject\":\"Oi\",\"message\":\"Mensagem comprida o bastante.\",\"contactEmail\":\"sem-arroba\"}")
+    Check.apiError(noEmail, 400, "INVALID_SUPPORT_REQUEST")
+    var badImage = SupportTestKit.send("POST", "/support/requests", user, "{\"subject\":\"Oi\",\"message\":\"Mensagem comprida o bastante.\",\"contactEmail\":\"a@b.com\",\"imageUrl\":\"http://x.com/a.png\"}")
+    Check.apiError(badImage, 400, "INVALID_SUPPORT_REQUEST")
+    var badCategory = SupportTestKit.send("POST", "/support/requests", user, SupportTestKit.ticketBody("Oi", "NOPE"))
+    Check.apiError(badCategory, 400, "BAD_REQUEST")
+    Check.apiError(SupportTestKit.send("POST", "/support/requests", user, "not json"), 400, "BAD_REQUEST")
+    Check.apiError(app.client.send("POST", "/support/requests", listOf("Content-Type: application/json"), "", SupportTestKit.ticketBody("Oi", "BUG")), 401, "UNAUTHENTICATED")
+    var withImage = SupportTestKit.send("POST", "/support/requests", user, "{\"subject\":\"Com print\",\"message\":\"Mensagem comprida o bastante.\",\"contactEmail\":\"a@b.com\",\"imageUrl\":\"https://cdn.enois.ia.br/a.png\"}")
+    Check.status(withImage, 201)
+    Check.jsonEq(withImage, "imageUrl", "https://cdn.enois.ia.br/a.png")
+    Check.jsonEq(withImage, "category", "OTHER")
+    var n = 1
+    while (n < 5) {
+        Check.status(SupportTestKit.send("POST", "/support/requests", user, SupportTestKit.ticketBody("Pedido " + n, "BUG")), 201)
+        n = n + 1
+    }
+    Check.apiError(SupportTestKit.send("POST", "/support/requests", user, SupportTestKit.ticketBody("Pedido extra", "BUG")), 429, "TOO_MANY_SUPPORT_REQUESTS")
+    var mine = SupportTestKit.send("GET", "/support/requests/mine", user, "")
+    Check.status(mine, 200)
+    Check.eqInt("five tickets", 5, mine.jsonSize(""))
+    var limited = SupportTestKit.send("GET", "/support/requests/mine?limit=2", user, "")
+    Check.eqInt("limit honoured", 2, limited.jsonSize(""))
+}
+
+test "the reply and the triage validate their input and the ticket must exist" {
+    var app = sapp()
+    var user = SupportTestKit.login("sr_user")
+    var admin = SupportTestKit.loginAdmin("sr_admin")
+    var id = SupportTestKit.open(user, "Validar resposta")
+    Check.apiError(SupportTestKit.send("POST", "/admin/support/" + id + "/reply", admin, "{\"message\":\"oi\"}"), 400, "INVALID_SUPPORT_REPLY")
+    Check.apiError(SupportTestKit.send("POST", "/admin/support/nope/reply", admin, "{\"message\":\"Resposta válida\"}"), 404, "SUPPORT_REQUEST_NOT_FOUND")
+    Check.apiError(SupportTestKit.send("PATCH", "/admin/support/nope", admin, "{\"status\":\"CLOSED\"}"), 404, "SUPPORT_REQUEST_NOT_FOUND")
+    Check.apiError(SupportTestKit.send("PATCH", "/admin/support/" + id, admin, "{\"status\":\"NOPE\"}"), 400, "BAD_REQUEST")
+    Check.apiError(SupportTestKit.send("GET", "/admin/support?status=NOPE", admin, ""), 400, "BAD_REQUEST")
+    var recategorised = SupportTestKit.send("PATCH", "/admin/support/" + id, admin, "{\"category\":\"IDEA\"}")
+    Check.status(recategorised, 200)
+    Check.jsonEq(recategorised, "category", "IDEA")
+    Check.jsonEq(recategorised, "status", "OPEN")
+}
+
+test "the public config offers the support e-mail" {
+    var app = sapp()
+    var res = app.client.get("/support/settings")
+    Check.status(res, 200)
+    Check.jsonEq(res, "email", "suporte@enois.ia.br")
+}
+
+test "the support routes are closed to anyone without the right session" {
+    var app = sapp()
+    var plain = SupportTestKit.login("route_policy_plain")
+    var admin = SupportTestKit.loginAdmin("route_policy_positive")
+    Check.apiError(app.client.get("/admin/support/github"), 401, "UNAUTHENTICATED")
+    Check.apiError(app.client.send("PUT", "/admin/support/github", listOf("Content-Type: application/json"), "", "{}"), 401, "UNAUTHENTICATED")
+    // A spelling that is not the registered path is an unknown path: 200 and an empty body, no handler.
+    for (var path in listOf("/%61dmin/support/github", "/admin;v=1/support/github", "/admin%2Fsupport/github")) {
+        var anonymous = app.client.get(path)
+        Check.eqInt(path, 200, anonymous.status)
+        Check.eqStr(path, "", anonymous.body)
+        var signed = app.client.getWith(path, SupportTestKit.auth(plain))
+        Check.eqInt(path, 200, signed.status)
+        Check.eqStr(path, "", signed.body)
+    }
+    // A path parameter that spells the settings path is just another ticket id: no settings leak out of it.
+    var spelled = app.client.getWith("/admin/support/github;v=1", SupportTestKit.auth(admin))
+    assert(!spelled.body.contains("tokenConfigured"))
+    // A plain user and a moderator-only role cannot read or write the infrastructure settings.
+    Check.apiError(SupportTestKit.send("GET", "/admin/support/github", plain, ""), 403, "FORBIDDEN")
+    Check.apiError(SupportTestKit.send("PUT", "/admin/support/github", plain, "{}"), 403, "FORBIDDEN")
+    var view = SupportTestKit.send("GET", "/admin/support/github", admin, "")
+    Check.status(view, 200)
+    Check.jsonEq(view, "enabled", "false")
+    Check.jsonEq(view, "tokenConfigured", "false")
+    Check.jsonEq(view, "webhookSecretConfigured", "true")
+    Check.jsonEq(view, "repo", SupportTestKit.repo())
+}
+
+test "finish" {
+    SupportTestKit.finish()
+}

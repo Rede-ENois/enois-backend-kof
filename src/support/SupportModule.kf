@@ -1,0 +1,38 @@
+package support
+
+import identity.*
+import kernel.*
+import kernel.security.*
+import notifications.*
+import profile.*
+
+// Composition of the support domain: tickets, the thread, the GitHub mirror (issues, comments, webhook) and its
+// settings. Seams: SupportGithubGateway (the mirror transport) and SupportGithubPeople (the GitHub identity of
+// the person who answers, from the contributions domain).
+class SupportModule {
+    SupportService service
+    SupportGithubConfig settings
+    SupportThread thread
+    SupportWebhook webhook
+    public constructor(service: SupportService, settings: SupportGithubConfig, thread: SupportThread, webhook: SupportWebhook) {
+        this.service = service
+        this.settings = settings
+        this.thread = thread
+        this.webhook = webhook
+    }
+    static SupportModule install(platform: Platform, shared: SharedServices, profiles: ProfileModule, notifications: NotificationsModule, mailer: IdentityMailer, people: SupportGithubPeople) {
+        var settings = SupportGithubConfig.fromConfig(platform.cfg, SupportStore(platform.db), shared.cipher)
+        var gateway = SupportGithubClient(settings, platform.cfg.getStr("REDE_SUPPORT_GITHUB_API_BASE", "https://api.github.com"))
+        return SupportModule.installWith(platform, settings, gateway, notifications.notifications, mailer, people, platform.cfg.getStr("SUPPORT_EMAIL", "suporte@enois.ia.br"))
+    }
+    static SupportModule installWith(platform: Platform, settings: SupportGithubConfig, gateway: SupportGithubGateway, notifications: Notifications, mailer: IdentityMailer, people: SupportGithubPeople, supportEmail: String) {
+        var store = SupportStore(platform.db)
+        var thread = SupportThread(store)
+        var notifier = SupportStatusNotifier(mailer, notifications)
+        var sync = SupportGithubSync(store, gateway, thread, people)
+        var service = SupportService(platform.db, store, mailer, notifications, notifier, thread, sync, supportEmail)
+        var webhook = SupportWebhook(platform.db, store, thread, notifier, settings)
+        SupportRoutes.register(platform.server, service, webhook, settings, thread, supportEmail)
+        return SupportModule(service, settings, thread, webhook)
+    }
+}

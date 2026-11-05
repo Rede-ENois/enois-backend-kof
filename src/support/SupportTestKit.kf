@@ -1,0 +1,225 @@
+package support
+
+import identity.*
+import kernel.*
+import kernel.config.*
+import kernel.db.*
+import kernel.security.*
+import kernel.testkit.*
+import notifications.*
+import profile.*
+
+// A mailer a test can make fail (the Java suites ran without SMTP: every send ended FAILED in the e-mail log).
+class SupportTestMailer extends IdentityMailer {
+    Bool delivers = true
+    public constructor(cfg: Config, store: IdentityStore) {
+        super(cfg, store, true)
+    }
+    Bool deliver(to: String, subject: String, html: String) = delivers
+}
+
+// A GitHub mirror that records what it was asked and answers from the fields.
+class SupportFakeGateway extends SupportGithubGateway {
+    Bool on = false
+    Int nextNumber = 2468
+    String nextUrl = "https://github.com/Rede-ENois/enois-suporte/issues/2468"
+    Bool failIssue = false
+    Bool failUserComment = false
+    Long nextComment = 5001L
+    List<String> issueTitles = listOf<String>()
+    List<String> issueBodies = listOf<String>()
+    List<Int> closed = listOf<Int>()
+    List<Int> reopened = listOf<Int>()
+    List<String> commentBodies = listOf<String>()
+    List<String> commentTokens = listOf<String>()
+    public constructor() {
+        super()
+    }
+    Bool enabled() = on
+    SupportIssueRef? createIssue(title: String, body: String) {
+        issueTitles.add(title)
+        issueBodies.add(body)
+        if (failIssue) {
+            return null
+        }
+        return SupportIssueRef(nextNumber, nextUrl)
+    }
+    Bool closeIssue(number: Int) {
+        closed.add(number)
+        return true
+    }
+    Bool reopenIssue(number: Int) {
+        reopened.add(number)
+        return true
+    }
+    Long comment(number: Int, body: String, tokenOverride: String?) {
+        commentBodies.add(body)
+        var used = "service"
+        if (tokenOverride != null) {
+            used = tokenOverride
+        }
+        commentTokens.add(used)
+        if (failUserComment && used != "service") {
+            return 0L
+        }
+        nextComment = nextComment + 1L
+        return nextComment
+    }
+}
+
+// A person with a GitHub identity and a write token.
+class SupportFakePeople extends SupportGithubPeople {
+    String? loginOf = SupportText.none()
+    String? tokenOf = SupportText.none()
+    public constructor(directory: ProfileDirectory) {
+        super(directory)
+    }
+    clear() {
+        loginOf = SupportText.none()
+        tokenOf = SupportText.none()
+    }
+    String? login(userId: String) = loginOf
+    String? userToken(userId: String) = tokenOf
+}
+
+// Fixtures of the support suites. One booted app per test file.
+//
+//   var app = SupportTestKit.app()          // the GitHub secret/repository come from SupportTestKit.repo() / secret()
+//   var token = SupportTestKit.login("sup-user")
+class SupportTestKit {
+    static TestApp? cachedApp = null
+    static SupportModule? cachedModule = null
+    static SupportFakeGateway? cachedGateway = null
+    static SupportTestMailer? cachedMailer = null
+    static SupportFakePeople? cachedPeople = null
+    static SharedServices? cachedShared = null
+    static Map<String,String> extra = mapOf<String, String>()
+    static String repo() = "Rede-ENois/enois-suporte"
+    static String secret() = "segredo-de-teste"
+    // Configuration overrides of this file's app; set before the first `app()`.
+    static configure(overrides: Map<String,String>) {
+        SupportTestKit.extra = overrides
+    }
+    static TestApp app() {
+        var cur = SupportTestKit.cachedApp
+        if (cur != null) {
+            return cur
+        }
+        var created = DomainTestKit.boot("support", SupportTestKit.extra, (p: Platform, s: SharedServices, parts: SecurityParts) -> SupportTestKit.wire(p, s, parts))
+        SupportTestKit.cachedApp = created
+        return created
+    }
+    static wire(p: Platform, shared: SharedServices, parts: SecurityParts) {
+        var hooks = SecurityHooks.defaults(p.db)
+        var profiles = ProfileModule.install(p, shared, hooks)
+        var notificationsModule = NotificationsModule.install(p, shared, hooks, parts)
+        var mailer = SupportTestMailer(p.cfg, IdentityStore(p.db))
+        var gateway = SupportFakeGateway()
+        var people = SupportFakePeople(profiles.directory)
+        var settings = SupportGithubConfig.fromConfig(p.cfg, SupportStore(p.db), shared.cipher)
+        SupportTestKit.cachedMailer = mailer
+        SupportTestKit.cachedGateway = gateway
+        SupportTestKit.cachedPeople = people
+        SupportTestKit.cachedShared = shared
+        SupportTestKit.cachedModule = SupportModule.installWith(p, settings, gateway, notificationsModule.notifications, mailer, people, "suporte@enois.ia.br")
+    }
+    static SupportModule module() {
+        SupportTestKit.app()
+        var cur = SupportTestKit.cachedModule
+        if (cur == null) {
+            throw "SupportTestKit: module not wired"
+        }
+        return cur
+    }
+    static SupportFakeGateway gateway() {
+        SupportTestKit.app()
+        var cur = SupportTestKit.cachedGateway
+        if (cur == null) {
+            throw "SupportTestKit: gateway not wired"
+        }
+        return cur
+    }
+    static SupportTestMailer mailer() {
+        SupportTestKit.app()
+        var cur = SupportTestKit.cachedMailer
+        if (cur == null) {
+            throw "SupportTestKit: mailer not wired"
+        }
+        return cur
+    }
+    static SupportFakePeople people() {
+        SupportTestKit.app()
+        var cur = SupportTestKit.cachedPeople
+        if (cur == null) {
+            throw "SupportTestKit: people not wired"
+        }
+        return cur
+    }
+    static Db db() = SupportTestKit.app().db()
+    // A body above the 2 MiB ceiling of the webhook.
+    static String bigBody() = "{\"x\":\"" + SupportTestKit.filler(2200000) + "\"}"
+    static String filler(n: Int) {
+        var chunk = "abcdefghij"
+        var out = chunk
+        while (out.length() < n) {
+            out = out + out
+        }
+        return out
+    }
+    static String tokenOf(userId: String) = "tok-" + userId + "-1234567890"
+    // A verified user with a live session; the id doubles as username. Safe to call twice.
+    static String login(userId: String) {
+        var store = SupportTestKit.db()
+        if (store.queryLong("select count(*) from users where id = ?", DbParams().bindStr(userId)) == 0L) {
+            SecurityFixtures.login(store, userId, SupportTestKit.tokenOf(userId))
+        }
+        return SupportTestKit.tokenOf(userId)
+    }
+    static String loginAdmin(userId: String) {
+        var token = SupportTestKit.login(userId)
+        SupportTestKit.db().execute("update users set is_admin = true where id = ?", DbParams().bindStr(userId))
+        return token
+    }
+    static List<String> auth(token: String) = listOf("X-Session-Token: " + token, "Content-Type: application/json")
+    static TestResponse send(method: String, path: String, token: String, body: String) = SupportTestKit.app().client.send(method, path, SupportTestKit.auth(token), "", body)
+    static String ticketBody(subject: String, category: String) = "{\"subject\":\"" + subject + "\",\"message\":\"O anexo não sobe quando a imagem tem mais de 5 MB no iPhone.\",\"contactEmail\":\"Contato@Test.com\",\"category\":\"" + category + "\"}"
+    // Opens a ticket as `token` and returns its id.
+    static String open(token: String, subject: String) {
+        var res = SupportTestKit.send("POST", "/support/requests", token, SupportTestKit.ticketBody(subject, "BUG"))
+        Check.status(res, 201)
+        return res.json("id")
+    }
+    // The webhook call GitHub makes: signed with the secret of the suites.
+    static TestResponse webhook(eventName: String, body: String) = SupportTestKit.app().client.send("POST", "/webhooks/github", listOf("X-GitHub-Event: " + eventName, "X-Hub-Signature-256: sha256=" + Hashes.hmacSha256Hex(SupportTestKit.secret(), body), "Content-Type: application/json"), "", body)
+    static String issueEvent(number: Int, state: String) {
+        var action = "closed"
+        if (state == "open") {
+            action = "reopened"
+        }
+        return "{\"action\":\"" + action + "\",\"issue\":{\"number\":" + number + ",\"state\":\"" + state + "\"},\"repository\":{\"full_name\":\"" + SupportTestKit.repo() + "\"}}"
+    }
+    // Links a ticket to an issue like the mirror would.
+    static attach(ticketId: String, number: Int) {
+        SupportTestKit.db().execute("update support_requests set github_issue_number = ?, github_issue_url = ? where id = ?", DbParams().bindInt(number).bindStr("https://github.com/" + SupportTestKit.repo() + "/issues/" + number).bindStr(ticketId))
+    }
+    // Position of the item with this id in the top-level array, or -1.
+    static Int indexOf(res: TestResponse, id: String) {
+        var n = res.jsonSize("")
+        var i = 0
+        while (i < n) {
+            if (res.jsonStr(i + ".id") == id) {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+    static Long emailsOfKind(kind: String, status: String) = SupportTestKit.db().queryLong("select count(*) from email_log where kind = ? and status = ?", DbParams().bindStr(kind).bindStr(status))
+    // Last test of every file: the shared jobs keep the test process alive otherwise.
+    static finish() {
+        var shared = SupportTestKit.cachedShared
+        if (shared != null) {
+            shared.stop()
+        }
+    }
+}
