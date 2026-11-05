@@ -1,0 +1,44 @@
+import kernel.db.*
+import kernel.risk.*
+import kernel.testkit.*
+import moderation.*
+
+// Port of RiskHistoryEndpointTests (the engine's history as an admin sees it) and the declared-age endpoint of the moderator
+// panel (state and band only, never the date).
+test "an admin reads the risk history of an account and a common user cannot" {
+    var admin = ModerationTestKit.loginAdmin("ri_admin")
+    var common = ModerationTestKit.login("ri_common")
+    var target = ModerationTestKit.login("ri_target")
+    RiskAssessmentWriter(ModerationTestKit.db()).save(RiskAssessment("risk_ri_1", target, "publish", "MEDIUM", 3, listOf("ROBOTIC_CADENCE"), "v1", "MONITOR", "2026-11-01T10:00:00Z"))
+    var res = ModerationTestKit.get(admin, "/admin/users/ri_target/risco")
+    Check.status(res, 200)
+    Check.jsonEq(res, "0.userId", target)
+    Check.jsonEq(res, "0.level", "MEDIUM")
+    Check.jsonEq(res, "0.signals.0", "ROBOTIC_CADENCE")
+    Check.jsonEq(res, "0.ruleVersion", "v1")
+    Check.jsonEq(res, "0.action", "publish")
+    Check.status(ModerationTestKit.get(common, "/admin/users/ri_target/risco"), 403)
+    Check.apiError(ModerationTestKit.get(admin, "/admin/users/nobody-here/risco"), 404, "USER_NOT_FOUND")
+}
+
+test "the declared age shows the state and the band, never the date" {
+    var admin = ModerationTestKit.loginAdmin("ag_admin")
+    var adult = ModerationTestKit.login("ag_adult")
+    var teen = ModerationTestKit.login("ag_teen")
+    var child = ModerationTestKit.login("ag_child")
+    var none = ModerationTestKit.login("ag_none")
+    var db = ModerationTestKit.db()
+    db.execute("update users set birth_date = ? where id = ?", DbParams().bindDate("2012-01-01").bindStr(child))
+    db.execute("update users set birth_date = ? where id = ?", DbParams().bindDate("2020-01-01").bindStr(teen))
+    db.execute("update users set birth_date = null where id = ?", DbParams().bindStr(none))
+    var adultRes = ModerationTestKit.get(admin, "/admin/users/ag_adult/age")
+    Check.status(adultRes, 200)
+    Check.jsonEq(adultRes, "state", "ADULT_DECLARED")
+    Check.jsonEq(adultRes, "ageBand", "ADULTO")
+    Check.isTrue("no date in the answer", !adultRes.body.contains("1990"))
+    var noneRes = ModerationTestKit.get(admin, "/admin/users/ag_none/age")
+    Check.jsonEq(noneRes, "state", "BIRTH_DATE_REQUIRED")
+    Check.isTrue("no band without a date", !noneRes.body.contains("ageBand"))
+    Check.status(ModerationTestKit.get(adult, "/admin/users/ag_adult/age"), 403)
+    Check.isTrue("teen and child exist", teen.length() > 0 && child.length() > 0)
+}

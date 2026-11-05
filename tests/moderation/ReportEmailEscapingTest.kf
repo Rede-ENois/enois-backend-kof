@@ -1,0 +1,19 @@
+import kernel.db.*
+import kernel.testkit.*
+import moderation.*
+
+// Port of ReportEmailEscapingTests: the report mail to support carries user-controlled names and text, all of it escaped.
+test "the support mail escapes names, content and description" {
+    var reporter = ModerationTestKit.login("rep_escape")
+    ModerationTestKit.db().execute("update users set name = ? where id = ?", DbParams().bindStr("<a href=\"https://x.test\">Admin</a>").bindStr(reporter))
+    var postId = ModerationTestKit.publish(reporter, "<b>post</b> text")
+    var res = ModerationTestKit.report(reporter, "POST", postId, "SCAM", "<img src=x>")
+    Check.status(res, 201)
+    var mail = ModerationTestKit.mail().last()
+    Check.eqStr("sent to support", "support@test.com", mail.to)
+    Check.isTrue("no raw anchor", !mail.html.contains("<a href=\"https://x.test\""))
+    Check.isTrue("no raw image", !mail.html.contains("<img"))
+    Check.isTrue("no raw bold", !mail.html.contains("<b>post"))
+    Check.isTrue("anchor escaped", mail.html.contains("&lt;a href="))
+    Check.isTrue("image escaped", mail.html.contains("&lt;img src=x&gt;"))
+}

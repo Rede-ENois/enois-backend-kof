@@ -1,0 +1,74 @@
+import kernel.db.*
+import kernel.testkit.*
+import moderation.*
+
+// Port of the moderation rules of ReputationFairnessTests (the credibility audit of 19/10): a pending report does not
+// penalise, a confirmed fact counts once per reported content and a dismissed fact gives everything back, and an accepted
+// appeal reverses the fact. The feed and recommendation tests of that class belong to the feed and profile suites.
+Int reputation(userId: String) = ModerationTestKit.profiles().reputation.reputationOf(userId)
+
+Long facts(userId: String) = ModerationTestKit.module().store.confirmedFactsAbout(userId)
+
+Int max0(v: Int) {
+    if (v < 0) {
+        return 0
+    }
+    return v
+}
+
+seedCurriculum(userId: String) {
+    var i = 0
+    while (i < 5) {
+        var year = 2016 + i
+        var start = "" + year + "-01-01"
+        Check.status(ModerationTestKit.post(userId, "/me/experiences", "{\"title\":\"Dev " + i + "\",\"company\":\"Empresa " + i + "\",\"startDate\":\"" + start + "\"}"), 201)
+        Check.status(ModerationTestKit.post(userId, "/me/education", "{\"school\":\"Universidade " + i + "\",\"degree\":\"Bacharelado\",\"field\":\"Computacao\",\"startDate\":\"" + start + "\"}"), 201)
+        Check.status(ModerationTestKit.post(userId, "/me/certifications", "{\"name\":\"Certificacao " + i + "\",\"issuer\":\"Emissor\",\"issueDate\":\"" + start + "\"}"), 201)
+        i = i + 1
+    }
+}
+
+test "pending reports do not penalise and confirmed facts are deduplicated per content" {
+    var author = ModerationTestKit.login("fair_author")
+    var reporter1 = ModerationTestKit.login("fair_reporter_1")
+    var reporter2 = ModerationTestKit.login("fair_reporter_2")
+    seedCurriculum(author)
+    var postId = ModerationTestKit.publish(author, "Post da auditoria de credibilidade.")
+    var base = reputation(author)
+    Check.isTrue("a curriculum gives a visible reputation", base > 60)
+    var first = ModerationTestKit.report(reporter1, "POST", postId, "SPAM", "teste")
+    Check.status(first, 201)
+    Check.status(ModerationTestKit.report(reporter2, "POST", postId, "SPAM", "teste"), 201)
+    Check.eqInt("pending does not move the score", base, reputation(author))
+    var admin = ModerationTestKit.loginAdmin("fair_admin")
+    var firstId = ModerationTestKit.str(first, "id")
+    Check.status(ModerationTestKit.post(admin, "/admin/reports/" + firstId + "/approve", "{\"note\":\"confirmado\"}"), 200)
+    Check.eqInt("one fact for the content", 1, facts(author) as Int)
+    Check.eqInt("one penalty", max0(base - 60), reputation(author))
+    ModerationTestKit.db().execute("update reports set status = \'DISMISSED\' where id = ?", DbParams().bindStr(firstId))
+    Check.eqInt("dismissed fact gone", 0, facts(author) as Int)
+    Check.eqInt("everything back", base, reputation(author))
+}
+
+test "an accepted appeal reverses the confirmed fact and restores the reputation" {
+    var author = ModerationTestKit.login("fair_appeal_author")
+    var reporter = ModerationTestKit.login("fair_appeal_reporter")
+    var admin = ModerationTestKit.loginAdmin("fair_appeal_admin")
+    seedCurriculum(author)
+    var postId = ModerationTestKit.publish(author, "Post alvo do recurso.")
+    var base = reputation(author)
+    var res = ModerationTestKit.report(reporter, "POST", postId, "HARASSMENT", "teste")
+    Check.status(res, 201)
+    var reportId = ModerationTestKit.str(res, "id")
+    Check.status(ModerationTestKit.post(admin, "/admin/reports/" + reportId + "/approve", "{\"note\":\"confirmado\"}"), 200)
+    Check.eqInt("penalised", max0(base - 60), reputation(author))
+    ModerationTestKit.module().sanctions.restrictUser(author, reportId, "conteudo confirmado")
+    var appeal = ModerationTestKit.post(author, "/me/sanctions/appeals", "{\"message\":\"quero revisao humana do caso, por favor\"}")
+    Check.status(appeal, 200)
+    var appealId = ModerationTestKit.str(appeal, "id")
+    Check.status(ModerationTestKit.post(admin, "/admin/appeals/" + appealId + "/approve", ""), 200)
+    Check.eqStr("report dismissed", "DISMISSED", ModerationTestKit.reportStatus(reportId))
+    Check.eqInt("no confirmed fact", 0, facts(author) as Int)
+    Check.eqInt("reputation restored", base, reputation(author))
+    ModerationTestKit.finish()
+}
