@@ -1,22 +1,14 @@
 package support
 
-import identity.*
+import ops.*
 import kernel.*
 import kernel.config.*
 import kernel.db.*
+import kernel.mail.*
 import kernel.security.*
 import kernel.testkit.*
 import notifications.*
 import profile.*
-
-// A mailer a test can make fail (the Java suites ran without SMTP: every send ended FAILED in the e-mail log).
-class SupportTestMailer extends IdentityMailer {
-    Bool delivers = true
-    public constructor(cfg: Config, store: IdentityStore) {
-        super(cfg, store, true)
-    }
-    Bool deliver(to: String, subject: String, html: String) = delivers
-}
 
 // A GitHub mirror that records what it was asked and answers from the fields.
 class SupportFakeGateway extends SupportGithubGateway {
@@ -90,7 +82,7 @@ class SupportTestKit {
     static TestApp? cachedApp = null
     static SupportModule? cachedModule = null
     static SupportFakeGateway? cachedGateway = null
-    static SupportTestMailer? cachedMailer = null
+    static MailCapture? cachedMail = null
     static SupportFakePeople? cachedPeople = null
     static SharedServices? cachedShared = null
     static ProfileModule? cachedProfileModule = null
@@ -114,16 +106,17 @@ class SupportTestKit {
         var hooks = SecurityHooks.defaults(p.db)
         var profiles = ProfileModule.install(p, shared, hooks)
         var notificationsModule = NotificationsModule.install(p, shared, hooks, parts)
-        var mailer = SupportTestMailer(p.cfg, IdentityStore(p.db))
+        var capture = MailCapture()
+        var mail = MailService(p.cfg, capture, EmailLogStore(p.db))
         var gateway = SupportFakeGateway()
         var people = SupportFakePeople(profiles.directory)
         var settings = SupportGithubConfig.fromConfig(p.cfg, SupportStore(p.db), shared.cipher)
         SupportTestKit.cachedProfileModule = profiles
-        SupportTestKit.cachedMailer = mailer
+        SupportTestKit.cachedMail = capture
         SupportTestKit.cachedGateway = gateway
         SupportTestKit.cachedPeople = people
         SupportTestKit.cachedShared = shared
-        SupportTestKit.cachedModule = SupportModule.installWith(p, settings, gateway, notificationsModule.notifications, mailer, people, "suporte@enois.ia.br")
+        SupportTestKit.cachedModule = SupportModule.installWith(p, settings, gateway, notificationsModule.notifications, mail, people, "suporte@enois.ia.br")
     }
     static SupportModule module() {
         SupportTestKit.app()
@@ -141,11 +134,12 @@ class SupportTestKit {
         }
         return cur
     }
-    static SupportTestMailer mailer() {
+    // The mail transport of the suites: what left, and `failWith` makes the next sends fail.
+    static MailCapture mailer() {
         SupportTestKit.app()
-        var cur = SupportTestKit.cachedMailer
+        var cur = SupportTestKit.cachedMail
         if (cur == null) {
-            throw "SupportTestKit: mailer not wired"
+            throw "SupportTestKit: mail not wired"
         }
         return cur
     }
@@ -164,6 +158,15 @@ class SupportTestKit {
             throw "SupportTestKit: profiles not wired"
         }
         return cur
+    }
+    // The first message that left with this subject.
+    static MailMessage? messageWithSubject(subject: String) {
+        for (var m in SupportTestKit.mailer().messages) {
+            if (m.subject == subject) {
+                return m
+            }
+        }
+        return null
     }
     static Db db() = SupportTestKit.app().db()
     // A body above the 2 MiB ceiling of the webhook.

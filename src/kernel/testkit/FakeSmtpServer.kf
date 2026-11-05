@@ -1,0 +1,180 @@
+package kernel.testkit
+
+import java.io.BufferedReader
+import java.io.InputStream
+import java.io.InputStreamReader
+import java.io.OutputStream
+import java.io.Reader
+import java.net.ServerSocket
+import java.net.Socket
+import jakarta.mail.internet.MimeUtility
+
+// What the server captured from one SMTP session (`login` is the base64 AUTH PLAIN initial response).
+record SmtpCapture(String envelopeFrom, List<String> recipients, String raw, String login)
+
+// The mutable state of one SMTP conversation.
+class SmtpState {
+    String from = ""
+    List<String> to = listOf<String>()
+    String login = ""
+    Bool open = true
+    public constructor() {}
+    reset() {
+        from = ""
+        to = listOf<String>()
+    }
+}
+
+// An in-process SMTP server for the mail tests (loopback only, never the network): speaks EHLO, AUTH PLAIN,
+// MAIL FROM, RCPT TO, DATA, RSET, NOOP and QUIT, and keeps every accepted message. STARTTLS is not offered,
+// so tests set MAIL_SMTP_STARTTLS_ENABLE/REQUIRED to false. `rejectWith` answers the DATA end with a 5xx.
+// Usage: var smtp = FakeSmtpServer(); smtp.start() ... smtp.port() ... smtp.stop().
+class FakeSmtpServer {
+    ServerSocket server = new ServerSocket(0)
+    List<SmtpCapture> messages = listOf<SmtpCapture>()
+    String rejectWith = ""
+    Bool running = true
+    public constructor() {}
+    Int port() = server.getLocalPort()
+    start() {
+        server.setSoTimeout(500)
+        spawn this.acceptLoop()
+    }
+    stop() {
+        running = false
+        server.close()
+    }
+    acceptLoop() {
+        while (running) {
+            try {
+                this.session(server.accept())
+            } catch (Exception e) {
+                // The accept timed out or the server was closed: loop on `running`.
+            }
+        }
+    }
+    reply(out: OutputStream, line: String) {
+        var bytes = (line + "\r\n").getBytes()
+        out.write(bytes, 0, bytes.length)
+        out.flush()
+    }
+    session(client: Socket) {
+        var failed = false
+        try {
+            this.talk(client)
+        } catch (Exception e) {
+            failed = true
+        }
+        try {
+            client.close()
+        } catch (Exception e) {
+            failed = true
+        }
+    }
+    // One SMTP conversation; the branches live in `command` and `receiveData`.
+    talk(client: Socket) {
+        var out = client.getOutputStream()
+        var input = client.getInputStream() as InputStream
+        // Kof matches constructor parameters by exact type: the casts select (InputStream, String) and (Reader).
+        var chars = new InputStreamReader(input, "UTF-8") as Reader
+        var reader = new BufferedReader(chars)
+        this.reply(out, "220 fake ESMTP ready")
+        var state = SmtpState()
+        while (state.open) {
+            var line = FakeSmtpServer.nextLine(reader)
+            if (line == FakeSmtpServer.eof()) {
+                state.open = false
+            }
+            else {
+                this.command(line, reader, out, state)
+            }
+        }
+    }
+    command(line: String, reader: BufferedReader, out: OutputStream, state: SmtpState) {
+        var upper = line.toUpperCase()
+        if (upper.startsWith("EHLO") || upper.startsWith("HELO")) {
+            this.reply(out, "250-fake")
+            this.reply(out, "250 AUTH PLAIN")
+            return
+        }
+        if (upper.startsWith("AUTH PLAIN")) {
+            state.login = line.substring(11).trim()
+            this.reply(out, "235 ok")
+            return
+        }
+        if (upper.startsWith("MAIL FROM:")) {
+            state.from = line.substring(10).trim()
+            this.reply(out, "250 ok")
+            return
+        }
+        if (upper.startsWith("RCPT TO:")) {
+            state.to.add(line.substring(8).trim())
+            this.reply(out, "250 ok")
+            return
+        }
+        if (upper.startsWith("DATA")) {
+            this.reply(out, "354 go ahead")
+            this.receiveData(reader, out, state)
+            return
+        }
+        if (upper.startsWith("QUIT")) {
+            this.reply(out, "221 bye")
+            state.open = false
+            return
+        }
+        this.reply(out, "250 ok")
+    }
+    receiveData(reader: BufferedReader, out: OutputStream, state: SmtpState) {
+        var body = this.readBody(reader)
+        if (rejectWith.length() > 0) {
+            this.reply(out, rejectWith)
+        }
+        else {
+            messages.add(SmtpCapture(state.from, state.to, body, state.login))
+            this.reply(out, "250 queued")
+        }
+        state.reset()
+    }
+    // The lines up to the lone "." (dot-unstuffed), CRLF-joined.
+    String readBody(reader: BufferedReader) {
+        // String concatenation: StringBuilder.append as a statement crashes loops (KOF_GAPS G46).
+        var body = ""
+        var data = FakeSmtpServer.nextLine(reader)
+        while (data != FakeSmtpServer.eof() && data != ".") {
+            if (data.startsWith("..")) {
+                body = body + data.substring(1) + "\r\n"
+            }
+            else {
+                body = body + data + "\r\n"
+            }
+            data = FakeSmtpServer.nextLine(reader)
+        }
+        return body
+    }
+    static String eof() = "<<EOF>>"
+    // The next line, or eof() at the end of the stream.
+    static String nextLine(reader: BufferedReader) {
+        var line = reader.readLine()
+        if (line == null) {
+            return FakeSmtpServer.eof()
+        }
+        return line
+    }
+    Int count() = messages.size()
+    SmtpCapture last() = messages.get(messages.size() - 1)
+    // The decoded value of a header of the raw message ("" when absent); folded lines are unfolded.
+    static String header(raw: String, name: String) {
+        var head = raw
+        var split = raw.indexOf("\r\n\r\n")
+        if (split >= 0) {
+            head = raw.substring(0, split)
+        }
+        var unfolded = head.replace("\r\n ", " ").replace("\r\n\t", " ")
+        for (var line in unfolded.split("\r\n")) {
+            if (line.toLowerCase().startsWith(name.toLowerCase() + ":")) {
+                return MimeUtility.decodeText(line.substring(name.length() + 1).trim())
+            }
+        }
+        return ""
+    }
+}

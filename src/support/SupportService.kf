@@ -7,6 +7,7 @@ import kernel.id.*
 import kernel.log.*
 import kernel.time.*
 import notifications.*
+import ops.*
 import profile.*
 
 // Who answers on GitHub: the login of the person and the token they linked with write permission. The contributions
@@ -29,16 +30,16 @@ class SupportGithubPeople {
 
 // Tells who opened a ticket that it was closed or reopened, by e-mail and in the app.
 class SupportStatusNotifier {
-    IdentityMailer mailer
+    MailService mail
     Notifications notifications
-    public constructor(mailer: IdentityMailer, notifications: Notifications) {
-        this.mailer = mailer
+    public constructor(mail: MailService, notifications: Notifications) {
+        this.mail = mail
         this.notifications = notifications
     }
     closed(r: SupportRequestRecord) {
         if (r.contactEmail().trim().length() > 0) {
             var html = "<p>Olá,</p>" + "<p>Seu pedido <b>" + IdentityMailer.escapeHtml(r.subject()) + "</b> foi concluído pelo time do Énóis.</p>" + "<p>Se o problema continuar, é só abrir um novo pedido em " + "<a href=\"https://enois.ia.br/suporte\">enois.ia.br/suporte</a>.</p>" + "<p>— Equipe Énóis</p>"
-            mailer.dispatch("SUPPORT_CLOSED", r.contactEmail(), "Pedido de suporte concluído — " + r.subject(), html)
+            mail.sendBulk(r.contactEmail(), "Pedido de suporte concluído — " + r.subject(), html, "Suporte Énóis", "", "", "SUPPORT_CLOSED")
         }
         if (r.userId().trim().length() > 0) {
             notifications.create(r.userId(), "SUPORTE", "sistema", "Pedido de suporte concluído", "Seu pedido \"" + r.subject() + "\" foi concluído. Se precisar, abra um novo pedido.", "/suporte", "Ver pedidos")
@@ -223,16 +224,16 @@ class SupportGithubSync {
 class SupportService {
     SupportStore store
     Db database
-    IdentityMailer mailer
+    MailService mail
     Notifications notifications
     SupportStatusNotifier notifier
     SupportThread thread
     SupportGithubSync sync
     String supportEmail
-    public constructor(database: Db, store: SupportStore, mailer: IdentityMailer, notifications: Notifications, notifier: SupportStatusNotifier, thread: SupportThread, sync: SupportGithubSync, supportEmail: String) {
+    public constructor(database: Db, store: SupportStore, mail: MailService, notifications: Notifications, notifier: SupportStatusNotifier, thread: SupportThread, sync: SupportGithubSync, supportEmail: String) {
         this.database = database
         this.store = store
-        this.mailer = mailer
+        this.mail = mail
         this.notifications = notifications
         this.notifier = notifier
         this.thread = thread
@@ -304,13 +305,19 @@ class SupportService {
         // The mirror in GitHub is born after the commit (SupportGithubSync).
         return created
     }
+    // The contact of the requester is the Reply-To of the team mail (only an address that has an @).
+    static String replyTo(contact: String) {
+        if (contact.contains("@")) {
+            return contact
+        }
+        return ""
+    }
     mailTeam(r: SupportRequestRecord) {
         if (supportEmail.length() == 0) {
             return
         }
-        // The reply-to header and the "Suporte Énóis" sender name are not carried by the shared mailer.
         var html = "<p>Novo pedido de suporte enviado pelo app.</p>" + "<ul>" + "<li><b>Usuario:</b> " + IdentityMailer.escapeHtml(r.contactEmail()) + "</li>" + "<li><b>Assunto:</b> " + IdentityMailer.escapeHtml(r.subject()) + "</li>" + "</ul>" + "<p><b>Mensagem:</b></p><pre style=\"white-space:pre-wrap\">" + IdentityMailer.escapeHtml(r.message()) + "</pre>"
-        mailer.dispatch("SUPPORT", supportEmail, "[Suporte] " + r.subject(), html)
+        mail.sendBulk(supportEmail, "[Suporte] " + r.subject(), html, "Suporte Énóis", SupportService.replyTo(r.contactEmail()), "", "SUPPORT")
     }
     static Int sized(limit: Int, fallback: Int) {
         if (limit < 1) {
@@ -382,7 +389,7 @@ class SupportService {
     var saved = this.find(id)
     var threadMessage = thread.addFromPanel(id, clean)
     var html = "<p>Olá,</p>" + "<p>Sobre o seu pedido <b>" + IdentityMailer.escapeHtml(saved.subject()) + "</b>:</p>" + "<blockquote style=\"margin:8px 0;padding:8px 12px;border-left:3px solid #ccc;" + "white-space:pre-wrap\">" + IdentityMailer.escapeHtml(clean) + "</blockquote>" + "<p>— Equipe Énóis</p>"
-    mailer.dispatch("SUPPORT_REPLY", saved.contactEmail(), "Resposta do suporte do Énóis — " + saved.subject(), html)
+    mail.sendBulk(saved.contactEmail(), "Resposta do suporte do Énóis — " + saved.subject(), html, "Suporte Énóis", "", "", "SUPPORT_REPLY")
     if (saved.userId().trim().length() > 0) {
         notifications.create(saved.userId(), "SUPORTE", adminId, "Resposta do suporte", clean, "/suporte", "Ver")
     }

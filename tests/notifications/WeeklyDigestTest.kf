@@ -1,3 +1,4 @@
+import ops.*
 import java.util.Base64
 import kernel.*
 import kernel.db.*
@@ -12,8 +13,8 @@ class RecordingMailer extends DigestMailer {
     List<String> bodies = listOf<String>()
     List<String> links = listOf<String>()
     List<String> kinds = listOf<String>()
-    public constructor() {
-        super()
+    public constructor(mail: MailService) {
+        super(mail)
     }
     Bool sendHtml(toEmail: String, subject: String, htmlBody: String, fromName: String, listUnsubscribeUrl: String, kind: String) {
         recipients.add(toEmail)
@@ -34,11 +35,20 @@ class RecordingMailer extends DigestMailer {
     }
 }
 
+RecordingMailer recorderOf() {
+    digestApp()
+    var r = DigestHolder.recorded
+    if (r == null) {
+        throw "MAILER_NOT_WIRED"
+    }
+    return r
+}
+
 class DigestHolder {
     static TestApp? cached = null
     static NotificationsModule? module = null
     static SharedServices? shared = null
-    static RecordingMailer mailer = RecordingMailer()
+    static RecordingMailer? recorded = null
 }
 
 TestApp digestApp() {
@@ -47,8 +57,10 @@ TestApp digestApp() {
         return cur
     }
     var created = DomainTestKit.boot("notifdigest", mapOf("REDE_SECURITY_ENCRYPTION_KEY", SecretCipher.generateKeyBase64()), (p: Platform, s: SharedServices, parts: SecurityParts) -> {
-        var seams = NotificationsSeams(p)
-        seams.digestMailer = DigestHolder.mailer
+        var seams = NotificationsSeams(p, MailTestKit.capturing(p))
+        var recorder = RecordingMailer(MailTestKit.capturing(p))
+        DigestHolder.recorded = recorder
+        seams.digestMailer = recorder
         DigestHolder.shared = s
         DigestHolder.module = NotificationsModule.installWith(p, s, seams)
     })
@@ -100,7 +112,7 @@ test "sends once per week with real content" {
     db.execute("insert into group_posts (id, group_id, topic_id, author_id, content, created_at, updated_at) values ('dgp-1', 'digest-group-1', 'topic', 'digest_send_author', 'Conteudo do grupo', ?, ?)", DbParams().bindInstant(now).bindInstant(now))
     Check.eqStr("first", "SENT", digestOf().sendTo("digest_send_reader"))
     Check.eqStr("second", "ALREADY_SENT", digestOf().sendTo("digest_send_reader"))
-    var mailer = DigestHolder.mailer
+    var mailer = recorderOf()
     Check.eqInt("exactly one e-mail", 1, mailer.countTo("digest_send_reader@test.com"))
     var i = mailer.recipients.indexOf("digest_send_reader@test.com")
     Check.eqStr("subject", "Sua semana no Énóis", mailer.subjects.get(i))
@@ -126,7 +138,7 @@ test "skips silently when there is not enough content" {
     communityPost(app, "digest-empty", "digest_empty_reader", "Outro post meu", 9, "2")
     communityPost(app, "digest-empty", "digest_empty_author", "Unico post de outra pessoa", 1, "3")
     Check.eqStr("empty", "EMPTY", digestOf().sendTo("digest_empty_reader"))
-    Check.eqInt("no mail", 0, DigestHolder.mailer.countTo("digest_empty_reader@test.com"))
+    Check.eqInt("no mail", 0, recorderOf().countTo("digest_empty_reader@test.com"))
     Check.eqInt("no delivery row", 0, app.db().queryList("select user_id from digest_deliveries where user_id = ?", DbParams().bindStr("digest_empty_reader")).size())
     assert(WeeklyDigestStore(app.db()).eligibleUserIds(digestOf().weekKey(), "", 1000000).contains("digest_empty_reader"))
 }
@@ -144,7 +156,7 @@ test "muted and blocked people stay out of the digest" {
     app.db().execute("insert into user_mutes (muter_id, muted_id, created_at) values (?, ?, ?)", DbParams().bindStr("digest_hidden_reader").bindStr("digest_hidden_muted").bindInstant(now))
     app.db().execute("insert into user_blocks (blocker_id, blocked_id, created_at) values (?, ?, ?)", DbParams().bindStr("digest_hidden_blocker").bindStr("digest_hidden_reader").bindInstant(now))
     Check.eqStr("empty", "EMPTY", digestOf().sendTo("digest_hidden_reader"))
-    Check.eqInt("no mail", 0, DigestHolder.mailer.countTo("digest_hidden_reader@test.com"))
+    Check.eqInt("no mail", 0, recorderOf().countTo("digest_hidden_reader@test.com"))
 }
 
 test "never sends to who opted out" {
@@ -161,7 +173,7 @@ test "never sends to who opted out" {
     }
     Check.eqStr("not eligible", "NOT_ELIGIBLE", digestOf().sendTo("digest_optout_reader"))
     assert(!WeeklyDigestStore(app.db()).eligibleUserIds(digestOf().weekKey(), "", 1000000).contains("digest_optout_reader"))
-    Check.eqInt("no mail", 0, DigestHolder.mailer.countTo("digest_optout_reader@test.com"))
+    Check.eqInt("no mail", 0, recorderOf().countTo("digest_optout_reader@test.com"))
 }
 
 String flipLast(token: String) {

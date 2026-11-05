@@ -1,0 +1,151 @@
+package kernel.http
+
+import java.util.HashMap
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import kernel.concurrent.*
+
+// One open event stream (a browser tab). The hub pushes frames into its queue from any thread; the stream
+// handler (HttpServer.sse) takes them out and writes them. A frame is "name\u0001data"; the frames "ping"
+// (nothing arrived within the heartbeat) and "close" (the hub dropped the stream) are produced by `next`.
+class SseSubscriber {
+    String key
+    LinkedBlockingQueue queue = new LinkedBlockingQueue()
+    Bool live = true
+    public constructor(key: String) {
+        this.key = key
+    }
+    push(name: String, data: String) {
+        if (live) {
+            queue.put(name + "\u0001" + data)
+        }
+    }
+    // Wakes the handler with a "close" frame; the stream ends and the client reconnects.
+    close() {
+        live = false
+        queue.put("close\u0001")
+    }
+    Bool isLive() = live
+    // The next frame, waiting at most `timeoutMs`; the "ping" frame when the wait times out.
+    String next(timeoutMs: Long) {
+        var frame = queue.poll(timeoutMs, TimeUnit.MILLISECONDS)
+        if (frame == null) {
+            return "ping\u0001"
+        }
+        return frame.toString()
+    }
+    static String nameOf(frame: String) = frame.substring(0, frame.indexOf("\u0001"))
+    static String dataOf(frame: String) = frame.substring(frame.indexOf("\u0001") + 1)
+}
+
+// The registry of open streams, keyed by whoever they belong to (a user id). In memory, like the Java
+// MessageStreamHub: correct while one backend instance runs; a second instance needs a broadcast between
+// instances before scaling out. At most `maxPerKey` streams per key: the oldest is closed.
+class SseHub {
+    Gate gate = Gate()
+    Map<String,List<SseSubscriber>> streams = new HashMap<String, List<SseSubscriber>>()
+    Int maxPerKey
+    Long heartbeatMs
+    Long timeoutMs
+    public constructor(maxPerKey: Int, heartbeatMs: Long, timeoutMs: Long) {
+        this.maxPerKey = maxPerKey
+        this.heartbeatMs = heartbeatMs
+        this.timeoutMs = timeoutMs
+    }
+    // The list of a key, created on first use (call inside the gate).
+    List<SseSubscriber> listFor(key: String) {
+        var existing = streams.get(key)
+        if (existing != null) {
+            return existing
+        }
+        var fresh = listOf<SseSubscriber>()
+        streams.put(key, fresh)
+        return fresh
+    }
+    SseSubscriber open(key: String) {
+        var sub = SseSubscriber(key)
+        gate.enter()
+        var list = this.listFor(key)
+        list.add(sub)
+        var dropped = listOf<SseSubscriber>()
+        while (list.size() > maxPerKey) {
+            dropped.add(list.remove(0))
+        }
+        gate.leave()
+        for (var old in dropped) {
+            old.close()
+        }
+        return sub
+    }
+    // Sends one event to every open stream of every key in `keys`.
+    publish(keys: List<String>, name: String, data: String) {
+        gate.enter()
+        var targets = listOf<SseSubscriber>()
+        for (var key in keys) {
+            var list = streams.get(key)
+            if (list != null) {
+                for (var sub in list) {
+                    targets.add(sub)
+                }
+            }
+        }
+        gate.leave()
+        for (var sub in targets) {
+            sub.push(name, data)
+        }
+    }
+    remove(sub: SseSubscriber) {
+        gate.enter()
+        var list = streams.get(sub.key)
+        if (list != null) {
+            var kept = listOf<SseSubscriber>()
+            for (var other in list) {
+                if (other != sub) {
+                    kept.add(other)
+                }
+            }
+            if (kept.isEmpty()) {
+                streams.remove(sub.key)
+            }
+            else {
+                streams.put(sub.key, kept)
+            }
+        }
+        gate.leave()
+        sub.live = false
+    }
+    // Closes every open stream (shutdown, tests).
+    closeAll() {
+        gate.enter()
+        var all = listOf<SseSubscriber>()
+        for (var key in streams.keys()) {
+            for (var sub in streams.get(key)) {
+                all.add(sub)
+            }
+        }
+        gate.leave()
+        for (var sub in all) {
+            sub.close()
+        }
+    }
+    Int openStreams(key: String) {
+        gate.enter()
+        var list = streams.get(key)
+        var n = 0
+        if (list != null) {
+            n = list.size()
+        }
+        gate.leave()
+        return n
+    }
+}
+
+// Who a stream belongs to. The base refuses; a domain subclasses it (a Kof interface cannot be implemented
+// across packages, KOF_GAPS G30). `authorize` runs twice: in the filter chain, where a throw becomes the bare
+// status EventSource needs, and again on the stream thread, where it names the key.
+class SseSource {
+    public constructor() {}
+    String authorize() {
+        throw "SSE_SOURCE_NOT_WIRED"
+    }
+}

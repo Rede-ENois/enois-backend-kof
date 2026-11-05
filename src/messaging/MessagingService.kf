@@ -31,7 +31,8 @@ class MessagingService {
     MessagingCorporate corporate
     MessagingCoins coins
     ConversationViewers viewers
-    public constructor(database: Db, store: MessagingStore, notifications: Notifications, userLimiter: UserRateLimiter, timingGuard: BehavioralTimingGuard, agePolicy: MessagingAgePolicy, sanctionGate: SanctionGate, connections: MessagingConnections, blockedUsers: BlockedUsers, corporate: MessagingCorporate, coins: MessagingCoins, viewers: ConversationViewers) {
+    MessageStreams streams
+    public constructor(database: Db, store: MessagingStore, notifications: Notifications, userLimiter: UserRateLimiter, timingGuard: BehavioralTimingGuard, agePolicy: MessagingAgePolicy, sanctionGate: SanctionGate, connections: MessagingConnections, blockedUsers: BlockedUsers, corporate: MessagingCorporate, coins: MessagingCoins, viewers: ConversationViewers, streams: MessageStreams) {
         this.database = database
         this.store = store
         this.notifications = notifications
@@ -44,6 +45,7 @@ class MessagingService {
         this.corporate = corporate
         this.coins = coins
         this.viewers = viewers
+        this.streams = streams
     }
     static Int clamp(value: Int, low: Int, high: Int) {
         if (value < low) {
@@ -305,7 +307,20 @@ class MessagingService {
         notifications.markReadByHref(senderId, MessagingService.conversationHref(conversation.id()))
         store.touchConversation(conversation.id(), now)
         notifyRecipients(conversation, senderId, preview)
+        publishChange(conversation.id())
         coins.recordPresence(senderId)
+    }
+    // Tells every participant's open streams to refetch this conversation, after the commit (outside a
+    // transaction at once), like the Java ConversationChanged listener.
+    publishChange(conversationId: String) {
+        var self = this
+        database.afterCommit(() -> {
+    var ids = listOf<String>()
+    for (var p in self.store.participants(conversationId)) {
+        ids.add(p.userId())
+    }
+    self.streams.conversationChanged(conversationId, ids)
+})
     }
     // One notice per conversation that counts the new messages and pushes each one (tag = conversation).
     notifyRecipients(conversation: ConversationRecord, senderId: String, preview: String) {
@@ -334,6 +349,8 @@ class MessagingService {
         database.transaction(() -> {
     self.store.markRead(conversationId, userId, Time.nowIso())
     self.notifications.markReadByHref(userId, MessagingService.conversationHref(conversationId))
+    // Read receipts: the other side sees "visto" without waiting for the next refetch.
+    self.publishChange(conversationId)
 })
     }
     List<ConversationRecord> listConversations(userId: String, before: String?, context: String?, limit: Int) = store.findByParticipant(userId, before, context, MessagingService.clamp(limit, 1, 100), false)
@@ -393,6 +410,10 @@ class MessagingService {
     added = self.store.toggleReaction(Ids.prefixed("mreac_"), messageId, userId, type, Time.nowIso())
     if (added) {
         self.coins.recordPresence(userId)
+        var reacted = self.store.findMessage(messageId)
+        if (reacted != null) {
+            self.publishChange(reacted.conversationId())
+        }
     }
 })
         return added

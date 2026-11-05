@@ -1038,3 +1038,17 @@ UrlParser.parse(value)            // LinkParts(scheme, userInfo, host, text) or 
 
 `HostAddresses.classify` resolves names through DNS; games inject it as the `GamesHosts` seam so tests never
 touch the network. All four are covered by `tests/kernel/GamesAdaptersTest.kf`.
+
+## kernel.mail, ops.MailService, kernel.http.SseHub
+
+```
+MailService.fromConfig(cfg, EmailLogStore(db))      // SMTP from MAIL_HOST/PORT/USERNAME/PASSWORD
+mail.sendHtml(to, subject, html, kind): Bool          // From = MAIL_USERNAME; email_log row; never throws
+mail.sendBulk(to, subject, html, fromName, replyTo, listUnsubscribeUrl, kind): Bool   // "" = absent
+MailTestKit.capturing(platform)                       // tests: MailCapture transport (messages, failWith)
+FakeSmtpServer()  .start() .port() .messages .rejectWith .stop()   // tests of the real transport
+server.sse(path, source: SseSource, hub: SseHub)      // register BEFORE overlapping param routes
+hub.open(key) hub.publish(keys, name, data) hub.openStreams(key) hub.closeAll()
+SseClient.open(port, path, headers) .status() .next(ms) .waitFor(name, ms) .close()   // tests
+```
+`HtmlTemplate.render` also renders `${#dates.format(#dates.createNow(), 'yyyy')}` and follows Thymeleaf's whitespace rule for the attribute after `th:text`.
