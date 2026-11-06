@@ -139,3 +139,87 @@ unique-prefix fixtures, an ephemeral port per suite.
 - Commits: English, Conventional Commits, atomic. No AI attribution lines of any kind.
 - Scout rule: a broken test, build or lint you find is fixed in the same task, or registered in
   `docs/PORTING_STATUS.md` and called out in the PR.
+
+---
+
+## 9. Quality gate (Q0–Q7) — mandatory
+
+Fix flow: **reproduce → fix the root cause → add the proof test → run the focused suite → run the
+whole suite → hunt edge cases → commit → push.**
+
+- **Q0 — root cause.** A bug is fixed at the cause, not the symptom. The proof test **fails on the
+  old code** and passes on the new one. A test that passes before and after proves nothing.
+- **Q1 — coverage.** Every ported endpoint has its Java test ported; every fix has a regression
+  test; test and implementation share the commit; a refactor preserves the existing proof.
+- **Q2 — green before push.** `scripts/kof-test` green **before** pushing. No exception.
+- **Q3 — edge cases.** Cover when applicable: limit, empty/null, boundary, expected error,
+  idempotency, concurrency, resource failure. **The happy path alone is not enough.**
+- **Q4 — hunt.** Actively look for: extreme input, cross-target divergence, contract boundary,
+  regression in a neighbouring domain, uncovered behaviour.
+- **Q5 — honest green.** No false green, no weakened assertion, no hidden skip. Your red is fixed or
+  reverted.
+- **Q6 — the suite is the floor, not the ceiling.**
+- **Q7 — forbidden.** Stub, placeholder, `TODO`/`FIXME` pretending to be done, empty
+  implementation, a facade returning `null` or `0`, a swallowed unhandled branch, support faked as
+  "not implemented". Unsupported behaviour raises an explicit diagnostic — never "maybe it works".
+
+Cycle rules:
+
+- **Never ask when the repository evidence can answer.** Read the code, the test, the log.
+- **Never end a turn with uncommitted work, and never end a turn with only a summary.**
+- Exactly one todo item may be `in_progress`.
+- **Done means proven, not intended.**
+- **Never claim green without executed proof.** "It should pass" is not a result. An environmental
+  failure (missing JDK, missing `kof` on PATH) is not your regression — but it must be stated in the
+  PR with the evidence that the same failure exists on a clean `main` worktree.
+
+## 10. AI contributions — maximum restraint
+
+This repository is a big-bang rewrite where a subtle divergence silently breaks a production
+contract. AI output is accepted only under these rules:
+
+1. **Declare the use** through the PR template checkbox. No tool name, no `Co-Authored-By`, no
+   "Generated with" line — in commits or in the PR.
+2. **Whoever submits answers for the code.** Read the diff line by line. A ported domain you cannot
+   explain is not a ported domain.
+3. **Proof, not promise.** Run `scripts/kof-test` and describe the result. Never paste output you
+   did not run.
+4. **Zero slop.** No comment narrating the obvious, no mass-generated files, no speculative
+   abstraction, no dependency without justification, no refactor the task did not ask for.
+5. **No invented Kof.** Never write an API, modifier, stdlib function or compiler behaviour you have
+   not verified in the Kof4j source. Measured limits are in section 4; a *new* limit needs a minimal
+   repro in `docs/KOF_GAPS.md` before the workaround lands.
+6. **Port, do not paraphrase.** Business rules, limits, throttles, guards and pt-BR messages are
+   copied behaviour, not reinterpreted behaviour.
+7. **Human review before merge remains the rule**, with approval from someone who did not push.
+
+## 11. Contributing with AI — the short version
+
+The full contract is in [`CONTRIBUTING.md`](CONTRIBUTING.md). The repository-level hard rules are
+section 10 above; this section only exists so that an agent who stops reading early still sees them:
+
+- declare the use through the PR checkbox, and nowhere else;
+- understand every line you submit;
+- run `scripts/kof-test` and describe the result — never paste output you did not run;
+- no stub, no placeholder, no invented Kof API;
+- human review before merge.
+
+## 12. Final self-check
+
+Before saying you are done, verify every item. **If any is false, the state is `not-ready`.**
+
+- [ ] `scripts/kof-test` green on the final tree
+- [ ] root cause fixed, not the symptom
+- [ ] proof test fails on the old code
+- [ ] every Java test of the touched domain ported, or listed in `docs/PORTING_STATUS.md`
+- [ ] edge cases covered (limit, empty, error, idempotency, concurrency)
+- [ ] no false green, no weakened assertion, no hidden skip
+- [ ] no stub, no placeholder, no TODO pretending to be done
+- [ ] Java interop only inside `src/kernel/**`
+- [ ] no invented Kof API; new limit has a repro in `docs/KOF_GAPS.md`
+- [ ] `AppWiring.kf` and `BootRoutesTest.kf` updated for a new module
+- [ ] no secret, no personal data, no security-fix detail in public text
+- [ ] `kof fmt` applied; clean tree; no conflict marker; no one else's work
+- [ ] remote in sync
+
+`if_any_false: state: not-ready — next: fix-before-delivery`
